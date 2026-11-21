@@ -11,9 +11,17 @@ delimiter, and each part's ``Content-Disposition`` gives its field name + (for a
 
 What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block over
 ``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
-``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body in which the
-closing delimiter ``--<boundary>--`` appears nowhere (BACKLOG #5787), and, in
-:func:`parse_single_file_upload`, a body with no file part or with more than one.
+``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body with no
+closing delimiter line, a line that starts with ``--<boundary>`` but is not a delimiter line (both
+BACKLOG #5787), and, in :func:`parse_single_file_upload`, a body with no file part or with more than
+one.
+
+**What a delimiter line is** (BACKLOG #5787). ``--<boundary>`` counts only at the start of the body
+or right after a CR or an LF, so boundary text in the middle of a line is part content. After it come
+an optional ``--`` (the close marker), optional spaces and tabs, then a CR, an LF or the end of the
+body. A bare CR counts as a line break before a delimiter and after one, because HL7 ends its segments
+with one: a close marker right after a file's last segment CR, and a CR run after a delimiter, both
+still parse. A body cut inside its close marker, ending ``--<boundary>-``, is refused as unclosed.
 
 Scope: exactly what an upload form needs — one file part + optional small text fields. It is not a
 general RFC-2388 implementation (no nested multipart/mixed, no transfer-encoding decode); those are out
@@ -143,6 +151,11 @@ _FILE_AS_FIELD_HINT = 'Send a file as a file part with a plain filename paramete
 #: it).
 _NOT_CRLF = re.compile(rb"[^\r\n]")
 
+#: What follows ``--<boundary>`` on a delimiter line, up to its line break: the close marker, if any,
+#: then transport padding (RFC 2046). Both quantifiers are possessive, so a long padding run is walked
+#: once and never backtracked into. It always matches; the byte after it decides the line.
+_DELIM_TAIL = re.compile(rb"(--)?+[ \t]*+")
+
 
 @dataclass(frozen=True)
 class _Part:
@@ -176,22 +189,22 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     if boundary is None:
         raise MultipartError("Content-Type is not multipart/form-data with a boundary")
     delim = b"--" + boundary
+    lines = _DelimiterLines(body, delim)
     # (header start, header end, content start, content end) for each part with a header block.
     spans: list[tuple[int, int, int, int]] = []
     count = 0
     closed = False
-    # Anything before the first delimiter is the ignorable preamble; the closing "--boundary--" is
-    # the first later delimiter followed by b"--", and anything after it is the ignorable epilogue.
-    pos = body.find(delim)
+    # Anything before the first delimiter line is the ignorable preamble; the close marker ends the
+    # walk, and anything after it is the ignorable epilogue.
+    pos = lines.next(0)
     seen = pos != -1
     while pos != -1:
-        start = pos + len(delim)
-        if body.startswith(b"--", start):
-            closed = True
+        start, closed = lines.tail(pos)
+        if closed:
             break
-        nxt = body.find(delim, start)
+        nxt = lines.next(start)
         end = len(body) if nxt == -1 else nxt
-        # After each delimiter comes CRLF, then the part's header block.
+        # After each delimiter line comes CRLF, then the part's header block.
         if body.startswith(b"\r\n", start, end):
             start += 2
         else:
@@ -252,27 +265,77 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
                 f"{_FILE_AS_FIELD_HINT}"
             )
         parts.append(_Part(name=name, filename=filename, start=content_start, end=content_end))
-    # BACKLOG #5787: a body in which the closing delimiter appears nowhere is refused, because a body
-    # that ends before its close marker (for example one built from a file still being written) is
-    # one, and its last part would otherwise run to the end of the body and be taken as complete. Checked last, so a body that fails a check above gets that refusal. A
-    # close marker the walk did not stop on still counts wherever it sits, so this refuses only a
-    # body that carries none. It does not catch a cut-short body whose content holds the close
-    # marker text: the walk takes that text as the close wherever it sits (delimiters are not
-    # anchored to a line start), and the part ends there.
+    # BACKLOG #5787: a body the walk did not close is refused, because a body that ends before its
+    # close marker (for example one built from a file still being written) is one, and its last part
+    # would otherwise run to the end of the body and be taken as complete. Checked last, so a body
+    # that fails a check above gets that refusal. Only a close marker on its own delimiter line ends
+    # the walk, so close-marker text in the middle of a line does not pass a cut-short body.
     if not closed:
         if not seen:
-            # No delimiter at all. At least an empty body, one built with another boundary than the
-            # Content-Type names, and one cut inside its first delimiter line land here. A body
-            # built with a boundary the declared one is a prefix of (declared B, body uses BX)
-            # does not: it has delimiters, so it gets the missing-terminator refusal below.
+            # No delimiter line at all. At least an empty body, one built with another boundary than
+            # the Content-Type names, and one whose only boundary text sits mid-line land here.
             raise MultipartError(
                 "multipart body holds no delimiter for the boundary its Content-Type names"
             )
-        if delim + b"--" not in body:
-            raise MultipartError(
-                "multipart body has no closing boundary delimiter; the upload may be truncated"
-            )
+        raise MultipartError(
+            "multipart body has no closing boundary delimiter; the upload may be truncated"
+        )
     return parts
+
+
+class _DelimiterLines:
+    """Finds each ``--<boundary>`` that starts a line of one body, in order (BACKLOG #5787).
+
+    A line starts at offset 0 or right after a CR or an LF. There are two ``find`` streams, one per
+    line-break byte, and each keeps its last hit until the walk passes it, so each stream scans the
+    body about once however many delimiters it holds. Boundary text in the middle of a line is never
+    a candidate."""
+
+    def __init__(self, body: bytes, delim: bytes) -> None:
+        self._body = body
+        self._delim = delim
+        self._needles = (b"\n" + delim, b"\r" + delim)
+        # Each stream's last hit: the offset of its line-break byte, -1 for none left, -2 unread.
+        self._hits = [-2, -2]
+
+    def next(self, frm: int) -> int:
+        """The offset of the first ``--<boundary>`` at or after ``frm`` that starts a line, or -1."""
+        if frm == 0 and self._body.startswith(self._delim):
+            return 0
+        best = -1
+        for k, needle in enumerate(self._needles):
+            hit = self._hits[k]
+            if hit != -1 and hit < frm - 1:
+                hit = self._body.find(needle, max(frm - 1, 0))
+                self._hits[k] = hit
+            if hit != -1 and (best == -1 or hit + 1 < best):
+                best = hit + 1
+        return best
+
+    def tail(self, pos: int) -> tuple[int, bool]:
+        """Read the delimiter line at ``pos``: the offset just past its padding, and whether it is
+        the close marker.
+
+        Raises :class:`MultipartError` for a line that starts with the delimiter but is not a
+        delimiter line, rather than read it as content. A real client picks a boundary its content
+        never holds, so such a line means a body built with a longer boundary than the one declared,
+        or a part that holds the boundary text at a line start, and splitting or closing there would
+        take a part as other than it was sent. Refusing also means a body of such lines stops at the
+        first one, so only real delimiter lines, which the part cap bounds, keep the walk going."""
+        body = self._body
+        name_end = pos + len(self._delim)
+        if body.endswith(b"-", name_end) and name_end == len(body) - 1:
+            # A body cut inside its close marker: an unclosed delimiter line, not a foreign one, so
+            # the walk refuses it for the missing close marker, the refusal that names the cause.
+            return len(body), False
+        match = _DELIM_TAIL.match(body, name_end)
+        after = match.end() if match is not None else name_end
+        if after < len(body) and body[after] not in b"\r\n":
+            raise MultipartError(
+                "multipart body has a line that starts with the boundary delimiter but is not a "
+                "delimiter line; the body may use another boundary than its Content-Type names"
+            )
+        return after, match is not None and match.group(1) is not None
 
 
 def parse_multipart_form(
@@ -280,12 +343,13 @@ def parse_multipart_form(
 ) -> MultipartForm:
     """Parse a ``multipart/form-data`` body into file parts + text fields.
 
-    Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, its
-    closing delimiter appears nowhere in it, or it holds more than ``_MAX_PARTS`` parts, or a part
-    with no header block exceeds ``_MAX_FIELD_BYTES`` (all HTTP 400 at the route), and
-    :class:`MultipartTooLargeError` if a file part exceeds ``max_file_bytes`` or a non-file part with
-    a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413 at the route). The boundary is trusted not
-    to appear inside a part body (the RFC-2046 invariant every multipart parser relies on).
+    Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, it
+    has no closing delimiter line, or it holds more than ``_MAX_PARTS`` parts, or a part
+    with no header block exceeds ``_MAX_FIELD_BYTES``, or a line starts with the delimiter but is not
+    a delimiter line (all HTTP 400 at the route), and :class:`MultipartTooLargeError` if a file part
+    exceeds ``max_file_bytes`` or a non-file part with a header block exceeds ``_MAX_FIELD_BYTES``
+    (HTTP 413 at the route). The module docstring says what a delimiter line is; boundary text in
+    the middle of a line is part content.
 
     The function is synchronous and walks the whole body. The upload route keeps one file and no
     field, so it calls :func:`parse_upload_off_loop`, which runs :func:`parse_single_file_upload`

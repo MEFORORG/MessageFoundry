@@ -558,8 +558,7 @@ async def test_concurrent_upload_parses_hold_at_most_two_threads(
 
 async def test_the_new_multipart_caps_answer_400_and_413(engine: Engine, tmp_path: Path) -> None:
     """BACKLOG #5522: through the route, too many parts is a 400 (the base ``MultipartError``) and an
-    oversized text field is a 413 (``MultipartTooLargeError``). A truncated body (#5787) is a 400.
-    Nothing is stored in any case."""
+    oversized text field is a 413 (``MultipartTooLargeError``). Nothing is stored in either case."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app, multipart
 
@@ -586,12 +585,37 @@ async def test_the_new_multipart_caps_answer_400_and_413(engine: Engine, tmp_pat
         r = await c.post("/uploads", content=big, headers=h)
         assert r.status_code == 413, r.text
         assert "multipart text field is" in r.json()["detail"], r.text
-        # BACKLOG #5787: a truncated upload, cut before its close marker, is a 400 too.
-        truncated = body_of([file_part])[: -len(b"--\r\n") - 1]
-        r = await c.post("/uploads", content=truncated, headers=h)
-        assert r.status_code == 400, r.text
-        assert "no closing boundary delimiter" in r.json()["detail"], r.text
         assert (await c.get("/uploads", headers=h)).json()["files"] == []
+
+
+async def test_a_truncated_or_misdelimited_upload_answers_400(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #5787: through the route, an upload cut before its close marker, one cut short whose
+    file holds close-marker text mid-line, and one with a file line that starts with the boundary
+    are each a 400, and nothing is stored. The whole body, as a positive control, is stored."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    head = b'--B\r\nContent-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\n'
+    whole = head + BATCH.encode() + b"\r\n--B--\r\n"
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = {**await _login(c, "op"), "Content-Type": "multipart/form-data; boundary=B"}
+        for body, detail in (
+            (whole[: -len(b"--\r\n") - 1], "no closing boundary delimiter"),
+            (head + b"MSH|a--B--b\r\nPID|1", "no closing boundary delimiter"),
+            (head + b"MSH|a\r\n--B--note\r\nPID|1\r\n--B--\r\n", "not a delimiter line"),
+        ):
+            r = await c.post("/uploads", content=body, headers=h)
+            assert r.status_code == 400, r.text
+            assert detail in r.json()["detail"], r.text
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []
+        r = await c.post("/uploads", content=whole, headers=h)
+        assert r.status_code == 200, r.text
+        assert len((await c.get("/uploads", headers=h)).json()["files"]) == 1
 
 
 async def test_upload_over_quota_rejected_409_and_audited(engine: Engine, tmp_path: Path) -> None:
