@@ -780,7 +780,7 @@ def test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone(
         guard.register("file", probe=probe)
         guard.register("stdout", probe=probe)
         if not latched:
-            guard._latch_after_roll = lambda sink, *, now, tripped, closed: None  # type: ignore[method-assign]
+            guard._latch_after_roll = lambda sink, *, now, tripped: None  # type: ignore[method-assign]
             guard._latch_after_failure = lambda sink: None  # type: ignore[method-assign]
         return guard, events
 
@@ -822,47 +822,26 @@ def _without_stamps(guard: LogWriteGuard) -> dict[str, Any]:
     return {name: replace(s, last_event_at=None) for name, s in guard._sinks.items()}
 
 
-def test_a_slow_drip_of_rolls_the_bound_calls_healthy_releases_the_latch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # BACKLOG #5812 item 10. Six rolls trip the bound, then the sink rolls every 30 s: at most
-    # three rolls in each later window of the bound, which it calls healthy, and each within a
-    # minute of the last. The window from 65 s closes at the roll at 155 s with three rolls and no
-    # stage-2 failure, so that roll releases the latch, and the sink reads ``rolled`` again.
-    # NEGATIVE CONTROL: before the fix every roll within a minute of the last kept the latch, so
-    # the sink read ``unwritable`` for as long as the drip went on.
-    clock = _FakeClock()
-    guard, events = _guard_on(clock, monkeypatch)
-    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 35, 65, 95, 125)
-    assert guard.status()[0].state == "unwritable"  # the window from 0 s held seven rolls
-    paged = len(events)
-
-    _roll(guard, clock, 155)
-
-    assert guard.status()[0].state == "rolled"
-    assert guard.can_log() is True
-    assert [e.stage for e in events[paged:]] == ["rolled"]
-    for t in range(185, 1000, 30):
-        _roll(guard, clock, t)
-        assert guard.status()[0].state == "rolled"
-
-
-def test_a_stage2_failure_in_a_quiet_window_keeps_the_latch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The other side of the test above: the same drip, but the sink also fails stage 2 at 100 s,
-    # inside the window from 65 s. That window was not quiet, so the roll at 155 s keeps the latch,
-    # and the next window, from 155 s, closes quiet at 245 s and releases it there.
+def test_a_roll_past_the_bound_never_reads_latch_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    # BACKLOG #5812 item 13. The roll that trips the bound, and a roll past it, leave the sink's
+    # own state ``unwritable``, so neither reads ``latch_only``, even in the gap where the tripping
+    # roll has written ``rolled`` and not yet reached record_unwritable.
     clock = _FakeClock()
     guard, _events = _guard_on(clock, monkeypatch)
-    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 35, 65, 95)
-    _at(clock, 100)
-    guard.record_unwritable("file", reason="the replacement failed too")
-    _roll(guard, clock, 125, 155, 185, 215)
-    assert guard.status()[0].state == "unwritable"
+    seen: list[tuple[str, bool]] = []
+    original = guard.record_unwritable
 
-    _roll(guard, clock, 245)
-    assert guard.status()[0].state == "rolled"
+    def spy(sink: str, *, reason: str, repeat: bool = False) -> None:
+        status = guard.status()[0]
+        seen.append((status.state, status.latch_only))
+        original(sink, reason=reason, repeat=repeat)
+
+    monkeypatch.setattr(guard, "record_unwritable", spy)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
+    assert seen == [("unwritable", False)]
+    assert (guard.status()[0].state, guard.status()[0].latch_only) == ("unwritable", False)
+    _roll(guard, clock, 6)  # past the bound again, in the same window
+    assert (guard.status()[0].state, guard.status()[0].latch_only) == ("unwritable", False)
 
 
 def test_status_tells_a_latch_only_sink_from_one_stage2_declared_dead(

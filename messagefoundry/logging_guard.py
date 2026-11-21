@@ -144,9 +144,9 @@ class LogSinkStatus:
     last_event: str | None = None
     last_event_at: str | None = None
     rolled_aside: str | None = None
-    #: True when ``state`` reads ``unwritable`` only because the flap latch holds the sink: its own
-    #: last record was a roll that landed. False for a sink whose own state is ``unwritable``, so a
-    #: reader can tell a sink stage 2 declared dead from one that keeps needing rolls.
+    #: True when ``state`` reads ``unwritable`` only because the flap latch holds the sink, after a
+    #: roll the bound called a heal. False whenever the sink's own state is ``unwritable``, whatever
+    #: made it so, and while the roll that trips the bound is still on its way to stage 2.
     latch_only: bool = False
 
 
@@ -179,12 +179,14 @@ class LogWriteGuard:
         #: sink -> (window start, rolls in window) — the anti-flap bound, see :meth:`record_rollover`.
         self._roll_flap: dict[str, tuple[float, int]] = {}
         #: sink -> the flap latch, present only while it holds the sink; see :meth:`record_rollover`.
-        #: The value is two ``time.monotonic()`` readings: the roll that set the latch or the sink's
-        #: latest roll or stage-2 failure since, and the latest stage-2 failure while it was held,
-        #: or None. Kept apart from ``_roll_flap`` so that nothing the latch does, and nothing that
-        #: clears it, can move the bound; what the bound and the paging decisions compute does not
-        #: depend on it (BACKLOG #5812).
-        self._flap_latch: dict[str, tuple[float, float | None]] = {}
+        #: The value is the ``time.monotonic()`` of the roll that set the latch, or of the sink's
+        #: latest roll or stage-2 failure since. Kept apart from ``_roll_flap`` so that nothing the
+        #: latch does, and nothing that clears it, can move the bound; what the bound and the paging
+        #: decisions compute does not depend on it (BACKLOG #5812).
+        self._flap_latch: dict[str, float] = {}
+        #: Sinks whose roll tripped the bound and has not yet reached :meth:`record_unwritable`. Their
+        #: own state reads ``rolled`` in that gap, so :meth:`status` does not call them latch-only.
+        self._trip_pending: set[str] = set()
         #: Sinks whose current break fired a stage-2 event that was not delivered, so the event is
         #: fired again later; see :meth:`record_unwritable`.
         self._unanswered: set[str] = set()
@@ -270,7 +272,7 @@ class LogWriteGuard:
 
     def status(self) -> list[LogSinkStatus]:
         """Each sink as ``GET /status`` shows it. A sink the flap latch holds reads ``unwritable``,
-        and one the latch alone holds also reads ``latch_only``; every other field, the cause and
+        and ``latch_only`` says when the latch alone makes it so; every other field, the cause and
         the rolled-aside path included, is what the guard records with or without the latch."""
         with self._lock:
             return sorted((self._reported(s) for s in self._sinks.values()), key=lambda s: s.sink)
@@ -278,7 +280,8 @@ class LogWriteGuard:
     def _reported(self, status: LogSinkStatus) -> LogSinkStatus:
         """``status`` with the latch applied. The latch only ever adds an ``unwritable`` reading."""
         if status.state != "unwritable" and status.sink in self._flap_latch:
-            return replace(status, state="unwritable", latch_only=True)
+            latch_only = status.sink not in self._trip_pending
+            return replace(status, state="unwritable", latch_only=latch_only)
         return status
 
     # --- stage transitions ----------------------------------------------------
@@ -296,14 +299,10 @@ class LogWriteGuard:
         window restarts a minute after its first roll, so a sink still rolling every few seconds
         would otherwise read ``rolled`` again, and :meth:`can_log` True with no probe, until the
         bound trips again. So the roll that trips the bound also latches the sink, in the same hold
-        of the lock that writes the bound's state. A later roll the bound calls a heal releases the
-        latch when it comes more than :data:`_ROLL_FLAP_WINDOW_SECONDS` after the sink's last roll
-        or stage-2 failure, or when it opens a new window of the bound after a whole window that
-        held no more than :data:`_MAX_ROLLS_PER_WINDOW` rolls and no stage-2 failure while the
-        latch held the sink. Otherwise it keeps the latch. The second rule is what releases a slow
-        drip of rolls, each within the window of the last, that the bound itself calls healthy;
-        a flap whose rolls straddle two of the bound's windows can therefore be released where the
-        bound does not trip either. :meth:`revalidate` and :meth:`record_healthy` release it too. The latch is an overlay in its own field and never
+        of the lock that writes the bound's state. A later roll keeps the latch while it comes
+        within :data:`_ROLL_FLAP_WINDOW_SECONDS` of the sink's last roll or stage-2 failure, and
+        the first roll after a longer gap releases it; :meth:`revalidate` and
+        :meth:`record_healthy` release it too. The latch is an overlay in its own field and never
         touches a sink. The bound, the events this method and :meth:`record_unwritable` fire, their
         stop requests and the recorded status do not read it; :meth:`status`, :meth:`can_log`,
         :meth:`revalidate` and the stage-2 stderr line do.
@@ -318,10 +317,7 @@ class LogWriteGuard:
             previous = self._sinks.get(sink)
             now = time.monotonic()
             first_at, streak = self._roll_flap.get(sink, (now, 0))
-            # The window this roll closes, if it closes one, for the latch only.
-            closed: tuple[float, int] | None = None
             if now - first_at > _ROLL_FLAP_WINDOW_SECONDS:
-                closed = (first_at, streak)
                 first_at, streak = now, 0
             streak += 1
             self._roll_flap[sink] = (first_at, streak)
@@ -337,7 +333,9 @@ class LogWriteGuard:
                 last_event_at=_utc_now(),
                 rolled_aside=rolled_aside,
             )
-            self._latch_after_roll(sink, now=now, tripped=tripped, closed=closed)
+            self._latch_after_roll(sink, now=now, tripped=tripped)
+            if tripped and not repeat:
+                self._trip_pending.add(sink)  # cleared by record_unwritable, called below
             if self._sinks[sink].state == "rolled":
                 self._unanswered.discard(sink)  # the break is over, owed event or not
                 self._escalation_failure_said.discard(sink)
@@ -391,6 +389,7 @@ class LogWriteGuard:
 
         ``reason`` arrives already scrubbed; :meth:`record_rollover` states that precondition."""
         with self._lock:
+            self._trip_pending.discard(sink)
             previous = self._sinks.get(sink)
             already_down = previous is not None and previous.state == "unwritable"
             self._sinks[sink] = LogSinkStatus(
@@ -476,37 +475,25 @@ class LogWriteGuard:
             self._unanswered.discard(sink)
             self._escalation_failure_said.discard(sink)
 
-    def _latch_after_roll(
-        self, sink: str, *, now: float, tripped: bool, closed: tuple[float, int] | None
-    ) -> None:
+    def _latch_after_roll(self, sink: str, *, now: float, tripped: bool) -> None:
         """Move the flap latch for one roll. Called under the lock, after the bound has run.
 
-        ``tripped`` is the bound's own verdict on this roll, and ``closed`` the start and roll
-        count of the bound's window this roll closed, if it closed one. A tripping roll latches
-        the sink; a roll the bound calls a heal releases a held latch as
-        :meth:`record_rollover` says, and keeps it otherwise. Reads and writes the latch only."""
-        held = self._flap_latch.get(sink)
-        if held is None:
-            if tripped:
-                self._flap_latch[sink] = (now, None)
-            return
-        last_at, failed_at = held
-        quiet_window = (
-            closed is not None
-            and closed[1] <= _MAX_ROLLS_PER_WINDOW
-            and (failed_at is None or failed_at < closed[0])
-        )
-        if not tripped and (quiet_window or now - last_at > _ROLL_FLAP_WINDOW_SECONDS):
+        ``tripped`` is the bound's own verdict on this roll. It latches the sink; a roll the bound
+        calls a heal keeps a held latch while it comes within :data:`_ROLL_FLAP_WINDOW_SECONDS` of
+        the last failure the latch saw, and releases it otherwise. Reads and writes the latch only."""
+        last_failure_at = self._flap_latch.get(sink)
+        if tripped or (
+            last_failure_at is not None and now - last_failure_at <= _ROLL_FLAP_WINDOW_SECONDS
+        ):
+            self._flap_latch[sink] = now
+        elif last_failure_at is not None:
             del self._flap_latch[sink]
-        else:
-            self._flap_latch[sink] = (now, failed_at)
 
     def _latch_after_failure(self, sink: str) -> None:
         """A stage-2 failure keeps a held latch from reading as a quiet sink. Called under the lock.
         It never starts a latch: only the bound does that."""
         if sink in self._flap_latch:
-            now = time.monotonic()
-            self._flap_latch[sink] = (now, now)
+            self._flap_latch[sink] = time.monotonic()
 
     def _reads_unwritable(self, status: LogSinkStatus) -> bool:
         return status.state == "unwritable" or status.sink in self._flap_latch

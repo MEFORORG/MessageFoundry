@@ -1104,8 +1104,8 @@ class LogSinkInfo(BaseModel):
     last_event: str | None = None  # safe_exc-scrubbed cause, never record content
     last_event_at: str | None = None  # ISO-8601 UTC
     rolled_aside: str | None = None  # where the broken file was renamed to
-    #: True when ``state`` reads ``unwritable`` only through amendment B's flap latch, not because
-    #: the sink's own last write failed, so the two causes of an ``unwritable`` reading differ here.
+    #: True when ``state`` reads ``unwritable`` only through amendment B's flap latch, while the
+    #: sink's own state is ``rolled``; ADR 0162 amendment D says when.
     latch_only: bool = False
 
 

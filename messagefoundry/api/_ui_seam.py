@@ -954,9 +954,8 @@ from typing import Any
 #: Re-derived with ``--write`` on the branch, from ``92b8db415d6730cc`` to ``0c684e8deb86b688``,
 #: and over the merge with BACKLOG #5931 above, from ``fb220e2a1ada115e`` to ``0cb66e183386b7c8``.
 #:
-#: BACKLOG #5812: ``LogSinkInfo`` gains the optional ``latch_only`` flag, so a ``GET /status``
-#: reader can tell a sink the flap latch alone holds from one stage 2 declared dead. The console
-#: does not render it. Re-derived with ``--write``, from ``0cb66e183386b7c8`` to
+#: BACKLOG #5812: ``LogSinkInfo`` gains the optional ``latch_only`` flag (ADR 0162 amendment D).
+#: The console does not render it. Re-derived with ``--write``, from ``0cb66e183386b7c8`` to
 #: ``7e0e885ad57f94b5``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
