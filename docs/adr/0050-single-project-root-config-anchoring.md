@@ -210,6 +210,8 @@ refusal, because doing so would *break* the documented gate invocation `messagef
 - With **no** `--env`, the offline gate behaves exactly as today (no env values loaded, no posture refusal).
 - With `--env`/`--project-root`/`--service-config`, the gate resolves the **identical root + active-env
   `env()` values** as `serve` for those flags, but never enforces the required-env-/posture-refusal.
+  *(Where `validate`/`graph`/`dryrun` still differ: the 2026-11-20 note under
+  [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).)*
   **Amended for `check --env` alone** ([Amendment A](#amendment-a-check---env-matches-serve-2026-11-09)):
   given `--env`, `check`'s settings checks read the name as `serve --env` does.
 
@@ -453,19 +455,24 @@ those settings, and its Handlers still run with no active environment.
   neither.
 
   **SUPERSEDED 2026-11-20 (vault BACKLOG #5554):** the 2026-11-14 note above describes the code
-  before this date. Decided under the owner's delegation (decision d20261119T191501757-b23295),
-  after an adversarial review: build value resolution into the three commands, and do not refuse
-  `--env` without `--project-root`. Given `--env`, `validate`, `graph` and `dryrun` now read the
-  named environment's values with `serve`'s own reader, so the `MEFOR_VALUE_*` variables apply and
-  a value file that cannot be read fails the command, naming the file and no value. They resolve
-  every `env()` reference of each deployed connection, lookup and reference-set source, and report
-  a reference that does not resolve by its key, never its value. `validate` lists it with its
-  other problems; `graph` and `dryrun` exit with it as an error. Without `--env` nothing changes.
-  Where they still differ from `serve`, at least:
+  before this date. The choice is decision record d20261119T191501757-b23295, decided
+  2026-11-19 under the owner's delegation after an adversarial review; the question and the
+  owner's answer are in that record, not here. It chose to build value resolution into the three
+  commands, and not to refuse `--env` without `--project-root`. Given `--env`, `validate`, `graph`
+  and `dryrun` now read the named environment's values with `serve`'s own reader, so the
+  `MEFOR_VALUE_*` variables apply. A value file that cannot be read, or a `--service-config` that
+  names no file, fails the command, naming the file and no value. They resolve every `env()`
+  reference of each deployed connection and lookup, and report one that does not resolve by its
+  key, never its value. `validate` lists it with its other problems; `graph` and `dryrun` exit
+  with it as an error. A reference set is left out, as `serve` and `check` leave an unresolved
+  one to its sync. Without `--env` nothing changes. Where they still differ from `serve`, at least:
 
   - The value file sits under `--project-root`, else under the working directory. A
     `[environments].base_dir` set in the settings file or the environment is not read; `serve`
     reads it.
+  - Under `--project-root` with no `--service-config`, the `[environments].dir` name comes from
+    `<root>/messagefoundry.toml` where one exists, else the default, as the value-file check
+    above reads it, where `serve` reads `./messagefoundry.toml`.
   - No connector is built, so a refusal only the build check makes, such as an egress or hop
     refusal, is still `check --env`'s, as is the posture check.
   - `dryrun`'s Handlers still run with no active environment.

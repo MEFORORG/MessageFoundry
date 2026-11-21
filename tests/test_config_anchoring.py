@@ -186,17 +186,27 @@ def test_env_refs_with_present_file_does_not_fail(
 
 
 def test_env_refs_missing_file_without_root_is_not_the_missing_file_failure(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # env()-referencing graph + --env but NO --project-root -> the silent-empty default is preserved
     # (the fail-loud is scoped to an EXPLICIT root). No missing-file hard failure (exit 2). The
     # empty values then leave peer_host unresolved, which validate --env reports as serve would
     # refuse to build the connection on it (vault BACKLOG #5554).
+    for name in list(os.environ):
+        if name.upper().startswith("MEFOR_"):
+            monkeypatch.delenv(name)
     cfg = _config_dir(tmp_path, _ENV_GRAPH)
+    # An empty working directory, so no checked-in environments/prod.toml or messagefoundry.toml
+    # is read and the value file really is absent.
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
     rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 1
-    assert "missing: peer_host" in out and "no value file" not in out
+    assert "missing: peer_host" in captured.out
+    assert "no value file was found" not in captured.err  # not the AC-3 refusal
+    assert str(Path("environments") / "prod.toml") in captured.err  # the note names the file
 
 
 # --- precedence: relative --config resolves under the root ---------------------------------------

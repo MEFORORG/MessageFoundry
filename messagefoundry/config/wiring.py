@@ -7197,16 +7197,25 @@ class Registry:
     def env_resolution_problems(self, values: Mapping[str, Any]) -> list[str]:
         """One message per deployed settings carrier whose ``env()`` references do not resolve
         against ``values``, by :func:`resolve_env_settings`, which names keys and settings and never
-        a value. A ``deployed=False`` connection is skipped, as the engine never builds one.
+        a value. A ``deployed=False`` connection is skipped, as the engine never builds one. So is a
+        reference set: the engine and ``check``'s build check let one with an unresolved source
+        through, and only that set's sync fails.
 
         For the offline ``validate``, ``graph`` and ``dryrun`` given ``--env`` (vault BACKLOG #5554).
         It is not the build check: no connector is constructed, so a problem only a build finds,
-        such as an egress refusal, is still ``check --env``'s."""
+        such as an egress refusal, is still ``check --env``'s. Each owner is named as the engine's
+        refusals name it (:mod:`messagefoundry.connection_names`)."""
         problems: list[str] = []
         for kind, name, settings, deployed in self.settings_carriers():
-            if not deployed:
+            if not deployed or kind == "reference set":
                 continue
-            connection = name if kind in (_INBOUND_ENCODING_KIND, "outbound connection") else None
+            connection: str | None = None
+            if kind == _INBOUND_ENCODING_KIND:
+                connection = inbound_record_name(name)
+            elif kind == "outbound connection":
+                connection = name
+            elif kind == "fhir lookup":
+                connection = fhir_lookup_record_name(name)
             try:
                 resolve_env_settings(settings, values, connection=connection)
             except WiringError as exc:

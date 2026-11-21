@@ -524,6 +524,52 @@ def test_offline_env_reports_a_malformed_value_file_without_its_content(
     assert _SECRET_HOST not in captured.out + captured.err, captured
 
 
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_leaves_an_unresolved_reference_set_to_its_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # serve starts with a reference set whose source env() does not resolve, and check --env's build
+    # check lets it through: only that set's sync fails. The offline commands must not be stricter.
+    body = _NO_ENV_GRAPH.replace(
+        "from messagefoundry import inbound, outbound, MLLP, router, handler, Send",
+        "from messagefoundry import inbound, outbound, MLLP, router, handler, Send, Reference, "
+        "FileRef, env\n"
+        "    Reference('codes', source=FileRef(path=env('codes_csv')), refresh_seconds=3600)",
+    )
+    assert "codes_csv" in body
+    cfg = _config_dir(tmp_path, body=body)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "dev", 'other = "x"\n')
+    monkeypatch.chdir(cwd)
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "dev"))
+    assert rc == 0, capsys.readouterr()
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_refuses_a_service_config_that_is_no_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # serve refuses a --service-config that is no file. Reading a default value folder in its place
+    # would judge an environment serve never reads.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    monkeypatch.chdir(cwd)
+    typo = ["--service-config", str(tmp_path / "typo.toml")]
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), *typo, "--env", "prod"))
+    captured = capsys.readouterr()
+    assert rc != 0 and "service config not found" in captured.out + captured.err, captured
+    # Control: without --env no values are read, so the flag is not judged here, as before.
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), *typo))
+    assert rc == 0, capsys.readouterr()
+
+
 def test_offline_env_without_project_root_reads_the_dir_named_in_the_working_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
