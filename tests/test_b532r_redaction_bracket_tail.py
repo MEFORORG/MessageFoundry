@@ -46,6 +46,7 @@ _NOW_HIDDEN = (
     ("connect postgres://svc:Kv9x@Zq7;;Wq4@db failed", ("Zq7", "Wq4"), "@db failed"),
     ("connect postgres://svc:Kv9x@Zq7;Wq4;@db failed", ("Zq7", "Wq4"), "@db failed"),
     ("connect postgres://svc:Kv9@Aa1;Bb2@Cc3;Dd4@h2 failed", ("Aa1", "Bb2", "Cc3", "Dd4"), "@h2"),
+    ("connect postgres://svc:Kv9x@Zq7@Wq4;Mx5@db failed", ("Zq7", "Wq4", "Mx5"), "@db failed"),
 )
 
 
@@ -55,6 +56,10 @@ _TWICE = (
     "connect postgres://svc:Kv9@a;b@h1;u2@h2 failed",
     "connect postgres://svc:Kv9x@Zq7;w@db.example.invalid/x failed",
     "connect postgres://svc:Kv9x@Zq7;w@mail.local:587;x@corp failed",
+    # Review round 2: a group with no ";" before or after a ";" group, and an empty group.
+    "connect postgres://svc:Kv9x@Zq7@w;x@db failed",
+    "connect postgres://svc:Kv9@a;b@x.y@z failed",
+    "connect postgres://svc:=@;@@@mail.local:587 failed",
 )
 
 
