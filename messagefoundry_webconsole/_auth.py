@@ -1625,9 +1625,10 @@ async def _refuse_from_new_address(
 def _step_up_continuation(
     reauth_next: Callable[[Request], str] | None,
 ) -> Callable[[Request], str | None]:
-    """The ``step_up_new_address`` a step-up factory hands :func:`require_ui`: the continuation its
-    own refusals carry, ``None`` meaning the request's own path, as :func:`_reauth_redirect` reads
-    it."""
+    """The continuation every refusal of a step-up factory carries to ``/ui/reauth``: the
+    ``step_up_new_address`` and :func:`_reauth_refusal` it hands :func:`require_ui`, and its own
+    stale-window and missing-proof refusals. ``None`` means the request's own path, as
+    :func:`_reauth_redirect` reads it."""
 
     def continuation(request: Request) -> str | None:
         return reauth_next(request) if reauth_next is not None else None
@@ -1733,14 +1734,13 @@ def require_ui_step_up(
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
-        nxt = continuation(request)
         # Unreachable while the base gate stands, as in require_step_up. Kept so this factory never
         # loses its second-factor check if the base is changed; the audited refusal is the one above.
         if not await auth.mfa_satisfied(token):
-            raise _reauth_redirect(request, nxt)
+            raise _reauth_redirect(request, continuation(request))
         # Password step-up window: a stale window forces re-auth.
         if not await auth.has_recent_step_up(token):
-            raise _reauth_redirect(request, nxt)
+            raise _reauth_redirect(request, continuation(request))
         return identity
 
     return mark_route_gate(dependency)
@@ -1859,10 +1859,9 @@ def require_ui_step_up_action(
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
-        nxt = continuation(request)
         # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
         if not await auth.mfa_satisfied(token):
-            raise _reauth_redirect(request, nxt)
+            raise _reauth_redirect(request, continuation(request))
         if await _ui_action_step_up_ok(auth, token, action, spend=spend):
             return identity
         # Asked only once the proof is missing, and after it rather than before: a second POST in
@@ -1876,7 +1875,7 @@ def require_ui_step_up_action(
             and await repeat(request)
         ):
             return identity
-        raise _reauth_redirect(request, nxt)
+        raise _reauth_redirect(request, continuation(request))
 
     return mark_route_gate(dependency)
 
@@ -1921,10 +1920,9 @@ def require_ui_step_up_when_own_sessions_end(
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
-        nxt = continuation(request)
         # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
         if not await auth.mfa_satisfied(token):
-            raise _reauth_redirect(request, nxt)
+            raise _reauth_redirect(request, continuation(request))
         named = await ended(request, auth)
         request.scope[_GATE_ENDED_SESSIONS] = named
         if identity.user_id in named:
@@ -1932,7 +1930,7 @@ def require_ui_step_up_when_own_sessions_end(
         else:
             ok = await auth.has_recent_step_up(token)
         if not ok:
-            raise _reauth_redirect(request, nxt)
+            raise _reauth_redirect(request, continuation(request))
         return identity
 
     return mark_route_gate(dependency)
@@ -2208,7 +2206,6 @@ def require_ui_reauth_only_action(
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
-        nxt = continuation(request)
         # _ui_action_step_up_ok repeats the factor-binding check, so the refusal still holds if the
         # base ever loses its pending_refusal (refuse_pending above).
         if (
@@ -2216,7 +2213,7 @@ def require_ui_reauth_only_action(
             and auth.action_step_up_required
             and await before_spend(request)
         ) or not await _ui_action_step_up_ok(auth, token, action):
-            raise _reauth_redirect(request, nxt)
+            raise _reauth_redirect(request, continuation(request))
         return identity
 
     return mark_route_gate(dependency)
