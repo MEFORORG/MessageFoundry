@@ -4,8 +4,10 @@
 (BACKLOG #5915).
 
 One parse serves both sides of the rule. :mod:`messagefoundry.transports.egress` matches with it,
-and :mod:`messagefoundry.config.settings` refuses at load an entry it cannot read, so an entry that
-loads is one the matcher reads. A leaf module at the package root for that reason: the settings
+and :mod:`messagefoundry.config.settings` refuses at load every entry it cannot read, so an entry
+that loads is one the matcher reads. The load refuses some entries the matcher does read as well,
+at least a URL or a path, a host holding a character no host name does, and a port outside 1 to
+65535: :func:`allow_entry_problem` says which. A leaf module at the package root for that reason: the settings
 module may not import the transports package, which imports every connector. It imports nothing
 outside the standard library.
 """
@@ -131,7 +133,9 @@ def allow_entry_problem(entry: str) -> str | None:
         return "it is a URL or a path, not a host; list the host alone, with ':port' to pin a port"
     parsed = parse_allow_entry(text)
     if parsed is None:
-        if text.startswith("[") and "%" in text:
+        # Bracketed or not: an unbracketed zoned address would otherwise be told to write [v6],
+        # and the bracketed form is refused too.
+        if "%" in text:
             return "it carries a '%' zone id, which no host is matched with"
         if not text.startswith("[") and text.count(":") > 1:
             return "it holds more than one ':' outside brackets; write an IPv6 address as [v6]"

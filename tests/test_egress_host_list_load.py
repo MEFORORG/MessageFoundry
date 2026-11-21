@@ -87,6 +87,10 @@ def test_refusal_does_not_quote_the_entry() -> None:
         ("http://h.example.org:8443", "is a URL or a path"),
         ("https://u:p%40ss@h.example.org", "is a URL or a path"),
         ("[fe80::1%eth0]", "zone id"),
+        # Unbracketed, a zoned address is told about its zone, not to write [v6], which the
+        # bracketed form above is refused for too.
+        ("fe80::1%eth0", "zone id"),
+        ("[fe80::1%eth0]:443", "zone id"),
         ("fe80::1:443", r"more than one ':' outside brackets"),
         ("*.example.org", "no pattern is read"),
         ("h.example.org:99999", "port is not a number"),

@@ -5084,7 +5084,8 @@ class AiSettings(_Section):
     # _FILE_SECRET_KEYS (warns if placed in the file) and _SECRET_SETTING_KEYS (redacted). Never logged.
     api_key: str | None = None
     # SSRF fail-closed allowlist (ADR 0135): each entry is "host" or "[v6]" (any port), or
-    # "host:port" or "[v6]:port"; an entry no host can match is refused at load. The broker
+    # "host:port" or "[v6]:port"; an entry `hostlist.allow_entry_problem` refuses is refused at
+    # load, at least one in no such form, a URL, a pattern or a bad port. The broker
     # validates its configured `endpoint` against THIS list ITSELF — an un-listed host (or an empty list)
     # is REFUSED. Deliberately independent of [egress].allowed_http, which, when empty, allows any
     # host under the audited `[security].block_unlisted_outbound = false` opt-out (see
@@ -5659,8 +5660,8 @@ class EgressSettings(_Section):
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" or "[v6]" (any port), or "host:port"
-    # or "[v6]:port". `_host_entries_are_read` names the lists that refuse at load an entry no host
-    # can match.
+    # or "[v6]:port". `_host_entries_are_read` names the lists that refuse at load an entry
+    # `hostlist.allow_entry_problem` refuses.
     allowed_mllp: list[str] = []
     # Allowed raw-TCP outbound destinations: each entry is an MLLP-style host entry.
     allowed_tcp: list[str] = []
@@ -5813,7 +5814,8 @@ class EgressSettings(_Section):
     )
     @classmethod
     def _host_entries_are_read(cls, value: list[str], info: ValidationInfo) -> list[str]:
-        """Refuse at load an entry the host matcher cannot read (BACKLOG #5915). An ``allowed_db``
+        """Refuse at load an entry :func:`~messagefoundry.hostlist.allow_entry_problem` refuses,
+        every one the host matcher cannot read among them (BACKLOG #5915). An ``allowed_db``
         entry naming an IPv6 address is refused too: while the list is set the DATABASE check
         refuses every server holding a ``:``, so such an entry could never admit one."""
         setting = f"[egress].{info.field_name}"
