@@ -40,9 +40,8 @@ def _compose_doc() -> dict[str, Any]:
     return dict(yaml.safe_load(_COMPOSE.read_text(encoding="utf-8")))
 
 
-@functools.cache
 def _all_services() -> dict[str, dict[str, Any]]:
-    """Every compose service, merge keys resolved."""
+    """Every compose service, merge keys resolved. Shares _compose_doc's objects: never mutate."""
     return dict(_compose_doc().get("services") or {})
 
 

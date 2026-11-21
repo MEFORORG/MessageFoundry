@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import itertools
 import posixpath
 import re
 import tempfile
@@ -197,7 +198,9 @@ def _writable_sources(service: str) -> set[str]:
     return out
 
 
-_HA_ENGINES = ("engine-ha", "engine-standby")
+#: The ha engines: every serving engine on the Postgres store, so a new one is checked too.
+_HA_ENGINES = tuple(n for n in sorted(_ENGINES) if _postgres(n))
+_ANCHOR_MOUNTS = len(_compose_doc()["x-ha-engine"].get("volumes") or [])
 
 
 def _dropped_anchor_mounts(doc: dict[str, Any]) -> dict[str, list[Any]]:
@@ -218,11 +221,12 @@ def test_the_ha_engines_keep_every_anchor_mount() -> None:
     assert not any(dropped.values()), f"an ha engine dropped an anchor mount: {dropped}"
 
 
+@pytest.mark.parametrize("index", range(_ANCHOR_MOUNTS))
 @pytest.mark.parametrize("name", _HA_ENGINES)
-def test_the_anchor_mount_check_sees_a_dropped_mount(name: str) -> None:
-    """Negative control: the check above fails once an engine's copy of an anchor mount is gone."""
+def test_the_anchor_mount_check_sees_a_dropped_mount(name: str, index: int) -> None:
+    """Negative control: the check above fails once an engine's copy of any anchor mount is gone."""
     doc = copy.deepcopy(_compose_doc())
-    removed = doc["x-ha-engine"]["volumes"][0]
+    removed = doc["x-ha-engine"]["volumes"][index]
     doc["services"][name]["volumes"].remove(removed)
     assert _dropped_anchor_mounts(doc)[name] == [removed]
 
@@ -230,9 +234,12 @@ def test_the_anchor_mount_check_sees_a_dropped_mount(name: str) -> None:
 def test_the_ha_engines_share_no_writable_volume() -> None:
     # The spool locks its directory, so two engines writing one volume, at the spool path or
     # anywhere above it, would leave the second without a spool.
-    ha, standby = (_writable_sources(n) for n in _HA_ENGINES)
-    assert ha and standby, "positive control: each ha engine mounts a writable volume"
-    assert not ha & standby, f"the ha engines share a writable volume: {sorted(ha & standby)}"
+    assert len(_HA_ENGINES) >= 2, "positive control: the ha profile runs a pair"
+    sources = {n: _writable_sources(n) for n in _HA_ENGINES}
+    assert all(sources.values()), "positive control: each ha engine mounts a writable volume"
+    for a, b in itertools.combinations(_HA_ENGINES, 2):
+        shared = sources[a] & sources[b]
+        assert not shared, f"{a} and {b} share a writable volume: {sorted(shared)}"
 
 
 def test_retention_is_bounded(filled: tuple[str, ServiceSettings]) -> None:

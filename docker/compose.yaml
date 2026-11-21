@@ -162,8 +162,9 @@ services:
       MEFOR_SECURITY_REQUIRE_MFA: "true"        # the default; covers directory accounts too. Off + exposed = refused under enforce
       MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # keeps the default keyless refusal past the audited opt-out (docs/PHI.md section 3)
       # --- what an enforcing start needs (BACKLOG #5400) ---
-      # As shipped, serve REFUSES to start. It needs at least each line below uncommented with your
-      # own value; x-ha-engine-env above says why they ship commented and what each group is for.
+      # As shipped, serve REFUSES to start. Uncomment each line below with your own value; serve
+      # may still refuse an input this block does not name. x-ha-engine-env above says why they
+      # ship commented and what each group is for.
       # MEFOR_ALERTS_EMAIL_SMTP_HOST: "REPLACE-smtp.example.org"
       # MEFOR_ALERTS_SMTP_ALLOWED_HOSTS: "REPLACE-smtp.example.org"
       # MEFOR_ALERTS_EMAIL_FROM: "REPLACE-mefor@example.org"
@@ -391,9 +392,10 @@ services:
       <<: *ha-engine-env
     # The anchor's volumes plus this engine's own log-spool volume (x-ha-engine-env says why). A
     # service's volumes replace the anchor's, so the first two alias its entries.
-    # `docker compose up --scale engine-standby=2` is UNSUPPORTED: every replica would mount this
-    # one named volume, so all but one would run without a spool. Add a third engine as its own
-    # service with its own spool volume instead.
+    # `--scale` above 1 is UNSUPPORTED here and on engine-ha: the fixed host ports refuse a second
+    # replica, and without them every replica would mount the service's one named spool volume, so all but
+    # one would run without a spool. Add another engine as its own service, with its own spool
+    # volume and host ports, instead.
     volumes:
       - *ha-config-mount
       - *ha-tls-mount
