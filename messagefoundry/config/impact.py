@@ -485,7 +485,7 @@ def prepare_rename(plan: RenamePlan) -> PreparedRename:
     applied: list[LiteralEdit] = []
     stale: list[LiteralEdit] = []
     for file, file_edits in by_file.items():
-        # A UnicodeDecodeError holds the whole file in .object, so only its type name leaves the
+        # A UnicodeDecodeError holds the whole file in .object, so only its type name leaves its
         # handler, and the raise waits until the handler has ended rather than chaining the error.
         unreadable: str | None = None
         try:
@@ -493,7 +493,13 @@ def prepare_rename(plan: RenamePlan) -> PreparedRename:
             # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline
             # read, which breaks on exactly those, so an edit's line is the line it names here too.
             lines = source_lines(raw.decode("utf-8"))
-        except (OSError, UnicodeDecodeError) as exc:
+        except OSError as exc:
+            # An OSError holds no body, so it stays chained for its errno and filename.
+            raise WiringError(
+                f"cannot apply the rename of {plan.target_kind} {plan.old!r}: {file} could not "
+                f"be read ({type(exc).__name__}). Nothing was written"
+            ) from exc
+        except UnicodeDecodeError as exc:
             unreadable = type(exc).__name__
         if unreadable is not None:
             raise WiringError(
