@@ -6428,7 +6428,8 @@ class PostgresStore:
                     # lane moves. A key service that gave no verdict says nothing about the cell, so
                     # its error propagates and the token is retried.
                     async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
-                        if is_transient_open_failure(exc):
+                        # A fault in the engine's own code propagates too, as on a claim.
+                        if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):
                             raise exc
                         log.warning(
                             "ingress_handoff: %s of work-row %s does not decrypt (%s);"
