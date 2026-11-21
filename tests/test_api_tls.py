@@ -4292,18 +4292,14 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
         # and nothing more: what origin/main gave it.
         ("0.0.0.0", (("ip", "0.0.0.0"), ("ip", "127.0.0.1"))),
         ("::", (("ip", "::"), ("ip", "::1"))),
-        # Other spellings of a loopback get all three loopback names, each written once.
-        ("0:0:0:0:0:0:0:1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
-        ("LOCALHOST", (("dns", "LOCALHOST"), ("ip", "127.0.0.1"), ("ip", "::1"))),
+        # A spelling ApiSettings.is_loopback does not list is not a loopback bind here either, as
+        # on origin/main: it names its own host alone.
+        ("0:0:0:0:0:0:0:1", (("ip", "::1"),)),
+        ("LOCALHOST", (("dns", "LOCALHOST"),)),
         # Named by its address without brackets (BACKLOG #5973).
-        ("[::1]", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
-        # A localhost. bind is a loopback bind and names all three loopback names.
-        (
-            "localhost.",
-            (("dns", "localhost."), ("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost")),
-        ),
-        # A zoned IPv6 loopback: the SAN entry cannot carry the zone, so ::1 is written once.
-        ("::1%1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
+        ("[::1]", (("ip", "::1"),)),
+        ("localhost.", (("dns", "localhost."),)),
+        ("::1%1", (("ip", "::1"),)),
         # Another loopback address is not one of the three names.
         ("127.0.0.2", (("ip", "127.0.0.2"),)),
     ],
@@ -4315,7 +4311,7 @@ def test_the_minted_certificate_names_the_loopback_names_for_a_loopback_bind_onl
     d20261119T191457909-25c3aa).
 
     Mutation: mint with the SAN origin/main had before BACKLOG #5790, the bind host plus a wildcard
-    bind's own loopback. Red: every loopback row, in every spelling. Mutation: add the loopback
+    bind's own loopback. Red: the 127.0.0.1, ::1 and localhost rows. Mutation: add the loopback
     names for every bind. Red: every other row."""
     cert, _ = ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path)
     assert tuple(_san_entries(cert)) == names
@@ -4364,10 +4360,13 @@ def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
         ("::", "::1", ["::1", "127.0.0.1", "localhost"]),
         # A loopback bind names all three, whatever the old pair named.
         ("10.0.0.9", "localhost", ["localhost", "127.0.0.1", "::1"]),
-        ("10.0.0.9", "LOCALHOST", ["LOCALHOST", "127.0.0.1", "::1"]),
-        ("10.0.0.9", "0:0:0:0:0:0:0:1", ["::1", "127.0.0.1", "localhost"]),
+        # A spelling is_loopback does not list keeps the default host, as on origin/main.
+        ("10.0.0.9", "LOCALHOST", ["LOCALHOST", "127.0.0.1"]),
+        ("10.0.0.9", "0:0:0:0:0:0:0:1", ["::1", "127.0.0.1"]),
         # A bracketed IPv6 bind is named by the address, not a DNS name spelled "[::1]".
-        ("10.0.0.9", "[::1]", ["::1", "127.0.0.1", "localhost"]),
+        ("10.0.0.9", "[::1]", ["::1", "127.0.0.1"]),
+        # A [::1] pair names ::1 alone, so a move to ::1, which needs all three, re-mints.
+        ("[::1]", "::1", ["::1", "127.0.0.1", "localhost"]),
         # Off loopback, nothing is kept: the CLI defaults cannot reach this bind anyway. A re-mint
         # carries only the fixed loopback set, as origin/main's does, so the old names are dropped.
         ("127.0.0.1", "myhost.example", ["myhost.example"]),
@@ -4439,7 +4438,6 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
         # A bracketed host is minted and checked without its brackets, as the address.
         ("[::1]", "[::1]", True),
         ("::1", "[::1]", True),
-        ("[::1]", "::1", True),
         # An engine shard (renew=False) reuses a loadable pair as found, the bind check included,
         # so a lone restarted shard cannot serve a different certificate from its siblings.
         ("10.0.0.9", "::", False),

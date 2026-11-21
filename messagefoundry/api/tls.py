@@ -248,9 +248,7 @@ _GENERATED_LIFETIME_DAYS = 365
 #: any sign-in, so it names only the bind host and names from this tuple, which say nothing about
 #: the machine (decision d20261119T191457909-25c3aa).
 #: Built from the set ``ApiSettings.is_loopback`` reads, so the two list the same three names;
-#: sorted, so the order is fixed: ``127.0.0.1``, ``::1``, ``localhost``. Which binds count as
-#: loopback here is a different, wider match (:data:`_LOOPBACK_KEYS`) than ``is_loopback``'s
-#: exact spelling.
+#: sorted, so the order is fixed: ``127.0.0.1``, ``::1``, ``localhost``.
 _GENERATED_LOOPBACK_SANS = tuple(sorted(_LOOPBACK_HOSTS))
 
 
@@ -263,12 +261,11 @@ def _generated_sans(host: str) -> list[str]:
       certificate naming it alone verifies against no URL at all. It carries the loopback of its
       own family (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray
       and any other client on this box reach it through (BACKLOG #5973).
-    - A loopback bind carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), less a name
-      that is the same SAN entry as its own subject (:func:`_san_key`). A host is loopback when
-      :func:`_host_key` matches it to one of them (:data:`_LOOPBACK_KEYS`, which
-      :func:`_kept_loopback_names` uses too), so ``LOCALHOST``, ``[::1]``, ``0:0:0:0:0:0:0:1`` and
-      ``localhost.`` count, and a mint and a renewal for one loopback bind agree.
-    - Any other host carries no extra name, ``127.0.0.2`` included.
+    - A bind the engine treats as loopback, by the exact test :attr:`ApiSettings.is_loopback`
+      uses (``127.0.0.1``, ``::1``, ``localhost``), carries the other two of
+      :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), so the certificate and the exposed-bind
+      gate agree on which binds are loopback.
+    - Any other host carries no extra name, ``LOCALHOST``, ``[::1]`` and ``127.0.0.2`` included.
 
     :func:`_replacement_due` re-mints a reused pair that lacks a name :func:`_names_missing`
     requires, and a renewal or bind re-mint adds what :func:`_kept_loopback_names` keeps.
@@ -276,11 +273,9 @@ def _generated_sans(host: str) -> list[str]:
     loopback = wildcard_loopback(host)
     if loopback is not None:
         return [loopback]
-    subject = unbracketed(host)
-    if _host_key(subject) not in _LOOPBACK_KEYS:
+    if host not in _LOOPBACK_HOSTS:
         return []
-    own = _san_key(subject)
-    return [name for name in _GENERATED_LOOPBACK_SANS if _san_key(name) != own]
+    return [name for name in _GENERATED_LOOPBACK_SANS if name != host]
 
 
 def _names_missing(host: str, pem: bytes) -> list[str]:
@@ -321,20 +316,17 @@ def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
 
 
 def _host_key(name: str) -> object:
-    """``name`` matched loosely, to decide which binds count as loopback: an IP by address without
-    an IPv6 zone, so ``0:0:0:0:0:0:0:1`` is ``::1``, and a DNS name without regard to case or a
-    trailing dot. It decides which binds count as loopback (:data:`_LOOPBACK_KEYS`) and, in
-    :func:`_kept_loopback_names`, which loopback name the bind itself names. :func:`_san_key` is
-    the exact SAN entry."""
+    """``name`` matched loosely: an IP by address without an IPv6 zone, so ``0:0:0:0:0:0:0:1``
+    is ``::1``, and a DNS name without regard to case or a trailing dot. :func:`_kept_loopback_names`
+    uses it to decide whether a client dials a bind through a loopback name, and which of them the
+    bind itself names. :func:`_san_key` is the exact SAN entry."""
     try:
         return ipaddress.ip_address(name.split("%", 1)[0])
     except ValueError:
         return name.rstrip(".").lower()
 
 
-#: The loopback names as :func:`_host_key` matches them: a bind whose subject has one of these
-#: keys is a loopback bind for the generated certificate (:func:`_generated_sans`,
-#: :func:`_kept_loopback_names`).
+#: The loopback names as :func:`_host_key` matches them, for :func:`_kept_loopback_names`.
 _LOOPBACK_KEYS = frozenset(_host_key(name) for name in _GENERATED_LOOPBACK_SANS)
 
 
@@ -357,8 +349,9 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     Only for a bind a client on this box dials through one of ``localhost``, ``127.0.0.1`` and
     ``::1``, matched by :func:`_host_key` (:data:`_LOOPBACK_KEYS`): of those three, every one the
     old certificate names, and the default ``[api].host``, which the CLI, the IDE and the harness
-    dial by default, less the one the bind itself names. A loopback bind gets all three from
-    :func:`_generated_sans` anyway, so this matters for a wildcard bind: a re-mint for a move from
+    dial by default, less the one the bind itself names. A bind :attr:`ApiSettings.is_loopback`
+    lists gets all three from :func:`_generated_sans` anyway, so this matters for a wildcard bind
+    and for another spelling, such as ``LOCALHOST`` or ``[::1]``: a re-mint for a move from
     ``::`` to ``0.0.0.0`` keeps the ``::1`` the old certificate named, and a renewal at ``::`` of a
     pair minted for ``::1`` keeps its ``127.0.0.1`` and ``localhost``. A renewal keeps
     them as a bind re-mint does, or the next renewal would drop what the re-mint kept. The set is
