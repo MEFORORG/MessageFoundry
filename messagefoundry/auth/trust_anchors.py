@@ -147,7 +147,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       At least these run first: the API TLS pair is minted or renewed, the store is created and
       migrated, and the startup attestation runs and may alert. Their log records reach stdout
       and the log file but no collector. No listener binds, since uvicorn binds after the
-      lifespan.
+      lifespan. Where the API TLS context also refused a trust anchor, no lifespan runs: ``serve``
+      opens the store itself and runs this preflight on the collector CA, so its row is written
+      with no attestation run (BACKLOG #5391).
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
@@ -376,8 +378,10 @@ class TrustAnchorError(Exception):
 
     ``setting`` names what was refused the way :attr:`AnchorSpec.setting` does, such as
     ``inbound connection 'IB_X' tls_ca_file``, with no path: the pin's setting where the pin did
-    not parse. The audited check sets it (:func:`_preflight_one`), and so does a reload's lane
-    check (:func:`connection_anchor_failure`). ``None`` where the raiser did not know it. A caller
+    not parse. At least these set it: the audited check (:func:`_preflight_one`), a reload's lane
+    check (:func:`connection_anchor_failure`), and the API context build for its
+    ``[api].tls_client_crl_file`` refusal, which has no audit row behind it (BACKLOG #5391). So a
+    set ``setting`` does not mean a row was written. ``None`` where the raiser did not know it. A caller
     that may not show the refusal's own text, such as a DR activation's abort, shows this instead
     (vault BACKLOG #3498).
 

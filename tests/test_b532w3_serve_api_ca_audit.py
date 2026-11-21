@@ -233,6 +233,28 @@ def test_a_refused_collector_ca_is_audited_when_the_crl_refused_the_build(
     assert _anchor_events(db, "api_client") == []
 
 
+def test_a_store_refusing_one_row_does_not_hide_the_next_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """``AnchorStoreUnavailable`` is not a ``TrustAnchorError``: the check passed and the store
+    refused its row. The client CA's is planted, and the collector CA is still checked and gets
+    its row. Red with only ``TrustAnchorError`` caught per anchor."""
+    real = ta.run_anchor_preflight
+
+    async def preflight(specs: list[ta.AnchorSpec], store: Any, **kw: Any) -> object:
+        if specs[0].label == "api_client":
+            raise ta.AnchorStoreUnavailable("planted store refusal")
+        return await real(specs, store, **kw)
+
+    monkeypatch.setattr(ta, "run_anchor_preflight", preflight)
+    extra = _collector_ca_refused(tmp_path, monkeypatch)
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN, extra_toml=extra)
+    assert rc == 2
+    assert "pem_refused" in _anchor_events(db, "logging_forward_ca")
+    head = "no audit row records the refused [api].tls_client_ca_file: the audited check passed"
+    assert [m for m in grab.seen if m.startswith(head)], grab.seen
+
+
 def test_a_store_that_does_not_open_leaves_the_clean_refusal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

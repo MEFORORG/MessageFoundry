@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     # call must not pay for it (see the module docstring on deferred heavy imports).
     import asyncio
 
+    from messagefoundry.api.tls import GeneratedPairReplaced
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.environments import EnvironmentValuesReader
@@ -5127,7 +5128,6 @@ def _serve(args: argparse.Namespace) -> int:
     # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
     # DAST target each decide it their own way, which is the defect this item exists to remove.
     from messagefoundry.api.tls import (
-        GeneratedPairReplaced,
         ensure_api_tls_material,
         generated_state_dir,
     )
@@ -5432,7 +5432,7 @@ def _audit_refused_api_client_ca(
     *,
     enforcing: bool,
     forward_ca_refused: bool,
-    replaced: Sequence[Any],
+    replaced: Sequence[GeneratedPairReplaced],
 ) -> None:
     """Write the audit rows of a start the API TLS context refused for a trust anchor.
 
@@ -5455,13 +5455,16 @@ def _audit_refused_api_client_ca(
     It also writes the rows for any generated API pair this start replaced (``replaced``), which
     the lifespan writes first (ADR 0172 decision 6).
 
-    Every refusal the preflight raises is logged with its reason. A WARNING says when a row may be
-    missing: the store refused it, the check passed after the build refused, or the store did not
-    open. An ``Exception`` is logged and not raised, because a raise would turn the clean exit 2
-    into the uncaught floor's exit 1. An interrupt still propagates."""
+    Every refusal the preflight raises is logged with its reason. A WARNING says a row may be
+    missing in at least these cases: the store refused it, the check passed after the build
+    refused, or the store did not open. A logged refusal does not prove its row exists: a file
+    that cannot be read is refused before any row is written. An ``Exception`` is logged and not
+    raised, because a raise would turn the clean exit 2 into the uncaught floor's exit 1. An
+    interrupt still propagates."""
     from messagefoundry.api.tls import record_generated_pair_replacements
     from messagefoundry.auth.trust_anchors import (
         AnchorSpec,
+        AnchorStoreUnavailable,
         TrustAnchorError,
         api_client_anchor_spec,
         api_client_crl_spec,
@@ -5485,10 +5488,8 @@ def _audit_refused_api_client_ca(
         specs.append(forward_ca)
     if not specs and not replaced:
         return
-    posture = _command_hop_posture(settings)
-    _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
 
-    async def _audit() -> None:
+    async def _audit(posture: HopPosture | None) -> None:
         store = await open_store(
             settings.store,
             create=True,
@@ -5506,6 +5507,15 @@ def _audit_refused_api_client_ca(
                         log.warning("no audit row records the refused %s: %s", spec.setting, reason)
                     else:
                         log.warning("the audited check refused %s: %s", spec.setting, reason)
+                except AnchorStoreUnavailable as unavailable:
+                    # Not a TrustAnchorError: the check passed and the store refused its row. The
+                    # next anchor is still checked.
+                    log.warning(
+                        "no audit row records the refused %s: the audited check passed it after "
+                        "the start refused it, and the store refused its row (%s)",
+                        spec.setting,
+                        scrub_log_argument(safe_exc(unavailable)),
+                    )
                 else:
                     log.warning(
                         "no audit row records the refused %s: the audited check passed it after "
@@ -5516,7 +5526,9 @@ def _audit_refused_api_client_ca(
             await _close_store_quietly(store)  # a failed close is not a missing row
 
     try:
-        run_guarded(_audit())
+        posture = _command_hop_posture(settings)
+        _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
+        run_guarded(_audit(posture))
     except Exception as exc:  # the start is refused already; log it, never mask the exit 2
         log.warning(
             "no audit row records the refused trust anchor: the audit stopped first (%s)",
@@ -5604,7 +5616,6 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     would in serve: the WARNING the renewal logged, with both fingerprints, is then its record.
     """
     from messagefoundry.api.tls import (
-        GeneratedPairReplaced,
         ensure_api_tls_material,
         generated_state_dir,
         record_generated_pair_replacements,
