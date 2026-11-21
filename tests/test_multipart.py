@@ -740,9 +740,9 @@ def _digest(value: bytes) -> bytes | tuple[int, str]:
     return value if len(value) <= 64 else (len(value), hashlib.sha256(value).hexdigest())
 
 
-#: origin/main's outcome for each corpus body, recorded at ec75a5f61bf. Every body here carries
-#: close-marker text. A number that is a cap is written as its constant, so a cap change moves no row;
-#: a computed size is written as main printed it.
+#: origin/main's outcome for each corpus body, as main printed it at ec75a5f61bf. Every body here
+#: carries close-marker text. A cap change moves the rows that print it, which is the price of a
+#: record that says exactly what main did.
 _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "plain": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
     "delim-cr-run": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
@@ -779,12 +779,12 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-at-part-cap": (
         "parsed",
         [("file", "a.hl7", b"MSH|body")],
-        sorted((f"f{i}", b"v") for i in range(multipart._MAX_PARTS - 1)),
+        sorted((f"f{i}", b"v") for i in range(15)),
     ),
     "wk-over-part-cap": (
         "refused",
         "MultipartError",
-        f"multipart body has more parts than the limit of {multipart._MAX_PARTS}",
+        "multipart body has more parts than the limit of 16",
     ),
     "wk-field-at-cap": (
         "parsed",
@@ -794,22 +794,20 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-field-over-cap": (
         "refused",
         "MultipartTooLargeError",
-        f"multipart text field is {multipart._MAX_FIELD_BYTES + 1} bytes; the limit is "
-        f"{multipart._MAX_FIELD_BYTES}. {multipart._FILE_AS_FIELD_HINT}",
+        "multipart text field is 16385 bytes; the limit is 16384. Send a file as a file part with "
+        'a plain filename parameter (filename="...")',
     ),
     "wk-noheader-at-cap": ("parsed", [("file", "a.hl7", b"MSH|body")], []),
     "wk-noheader-over-cap": (
         "refused",
         "MultipartError",
-        f"multipart part of {multipart._MAX_FIELD_BYTES + 1} bytes has no header block ended by a "
-        f"blank CRLF line; a part without one is skipped only up to {multipart._MAX_FIELD_BYTES} bytes",
+        "multipart part of 16385 bytes has no header block ended by a blank CRLF line; a part "
+        "without one is skipped only up to 16384 bytes",
     ),
     "wk-header-over-cap": (
         "refused",
         "MultipartError",
-        # The block is the pad line (its 9 framing bytes plus the cap) and the file part's header.
-        f"multipart part header block is {_MAX_PART_HEADER_BYTES + 9 + len(_FP) - 4} bytes; "
-        f"the limit is {_MAX_PART_HEADER_BYTES}",
+        "multipart part header block is 16454 bytes; the limit is 16384",
     ),
     "wk-epilogue-delims": ("parsed", [("file", "a.hl7", b"MSH|body")], []),
 }
@@ -886,8 +884,8 @@ def test_the_same_body_without_its_close_marker_is_refused(
     """#5787: each corpus body with its close marker turned into a plain delimiter is refused. A body
     that parses is refused for the missing close marker (or, for the epilogue body, for the part
     cap, since the walk now runs on into the delimiter lines that sat after the close marker). A
-    body that is refused keeps that refusal from ``parse_multipart_form``, class and all, because
-    the close check runs last."""
+    body that is refused keeps that refusal from ``parse_multipart_form``, class and all: the close
+    check runs last, and the misdelimited-line refusal is raised by the walk on the same line."""
     marker = _close_marker(content_type)
     unterminated = body.replace(marker, marker[:-2])
     assert marker not in unterminated
@@ -1008,8 +1006,8 @@ def test_mid_line_boundary_text_is_file_content() -> None:
 )
 def test_a_file_line_that_starts_with_the_boundary_is_refused(line: bytes) -> None:
     """A file line that starts with the boundary but is not a delimiter line is refused, by both
-    entry points. Main took ``--B--note`` as the close, ending the file at that line, and split the
-    file at the others."""
+    entry points. Main took each line starting ``--B--`` as the close, ending the file there, and
+    split the file at the others."""
     body = b"--B\r\n" + _FP + b"MSH|x\r\n" + line + b"\r\nPID|1\r\n--B--\r\n"
     for parse in (parse_multipart_form, parse_single_file_upload):
         with pytest.raises(MultipartError, match="not a delimiter line") as caught:
@@ -1063,10 +1061,16 @@ def test_delimiters_alternating_between_cr_and_lf_lines_are_each_found() -> None
     assert [f.data for f in form.files] == [b"1\r", b"2\n", b"3", b"4\r"]
 
 
-def test_the_delimiter_finder_walks_forward_only() -> None:
-    """A rewound search would reuse a cached hit past the delimiters it skipped, so it is refused."""
-    lines = multipart._DelimiterLines(b"--B\r\nx\r\n--B\r\ny\r\n--B--", b"--B")
-    assert lines.next(0) == 0
-    assert lines.next(5) == 8
-    with pytest.raises(ValueError, match="forward only"):
-        lines.next(1)
+def test_a_preamble_line_that_starts_with_the_boundary_is_refused() -> None:
+    """A preamble line is read like any other line: one that starts with the boundary but is not a
+    delimiter line is refused, though main ignored it as preamble. No real client writes one."""
+    body = b"--Bjunk preamble\r\n--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"
+    with pytest.raises(MultipartError, match="not a delimiter line"):
+        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+
+
+def test_a_whole_close_marker_segment_still_ends_the_file() -> None:
+    """The limit the module docstring states: a bare CR is a line break, so an HL7 segment that is
+    exactly the close marker ends the file there. This pins the limit so a change to it is seen."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r--B--\rPID|1\r\n--B--\r\n"
+    assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x\r"
