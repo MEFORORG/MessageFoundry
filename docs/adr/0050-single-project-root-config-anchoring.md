@@ -477,9 +477,12 @@ those settings, and its Handlers still run with no active environment.
   `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Where the settings do not
   load, they print one fixed line with no text of the failure, because a validator message can
   quote the value it refused and these commands printed no settings failure before this note. It
-  names the settings file where one exists and the `messagefoundry check --env <env>` command that
-  prints the reason. They report a value file that cannot be read naming that file. They resolve
-  every `env()` reference of each deployed connection and lookup, and report one that does not resolve by its key, never its value.
+  names the settings file, resolved and quoted, where one exists, and says the reason is not
+  printed because the error text can quote a configured value. A `--service-config` that does not
+  exist is reported as `service config not found: <path>`, naming the path as given. They report
+  a value file that cannot be read naming that file. They resolve every `env()` reference of each
+  deployed connection and lookup, and report one that does not resolve by its key, never its
+  value.
   `validate` lists each of these failures with its other problems and `dryrun` stops on it, so
   both exit 1 on settings that do not load where they exited 0 before this note, for example an
   unparseable settings file with the value file present. `graph` lists it under `env_problems`

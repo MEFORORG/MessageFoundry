@@ -589,7 +589,7 @@ def test_offline_env_refuses_a_service_config_that_is_no_file(
         command,
         rc,
         capsys.readouterr(),
-        "could not load the service settings; run `messagefoundry check --env prod`",
+        "could not load the service settings: service config not found: ",
     )
     # Control: without --env no values are read, so the flag is not judged here, as before.
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), *typo))
@@ -857,8 +857,8 @@ _QUOTING_FAILURES = {
 
 def _fixed_line(settings_file: Path) -> str:
     return (
-        f"could not load the service settings ({settings_file}); run `messagefoundry check "
-        f"--env prod --service-config {settings_file}` to see why"
+        f'could not load the service settings ("{settings_file.resolve()}"); this command does '
+        "not print the reason, because the error text can quote a configured value"
     )
 
 
@@ -877,27 +877,24 @@ def test_offline_env_prints_no_validator_text_for_settings_that_do_not_load(
     failure: str,
 ) -> None:
     # These three commands printed no settings failure before --env read values, so they print
-    # one fixed line naming the file and the check that shows why, and no text of the failure.
+    # one fixed line naming the file, and no text of the failure.
     rc, out = _settings_failure_output(
         command, tmp_path, monkeypatch, capsys, _QUOTING_FAILURES[failure]
     )
+    # The control: the same load does fail, with error text that quotes the password.
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings, settings_error_detail
+
+    settings_file = Path.cwd() / "messagefoundry.toml"
+    with pytest.raises(ValidationError) as caught:
+        load_settings(config_path=str(settings_file), environ={})
+    assert _URL_PASSWORD in settings_error_detail(caught.value)
     assert _URL_PASSWORD not in out, out
     assert "@host" not in out, out
-    settings_file = Path("messagefoundry.toml")  # named as the command names it
     assert _shown(_fixed_line(settings_file), out), out
     # The graph and its value file are good, so the exit code is the settings failure's alone.
     assert rc == (0 if command == "graph" else 1), out
-
-
-def test_the_check_the_fixed_line_names_prints_the_reason(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # The pointer is true: that check, with the same --env, refuses the same settings and says why.
-    _settings_failure_output("validate", tmp_path, monkeypatch, capsys, "[api]\nportt = 1\n")
-    settings_file = Path("messagefoundry.toml")  # named as the command names it
-    rc = main(["check", "--env", "prod", "--service-config", str(settings_file)])
-    out = capsys.readouterr().out
-    assert rc != 0 and "[api].portt" in out, out
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
@@ -908,7 +905,7 @@ def test_offline_env_names_a_settings_path_holding_a_credential_label_as_it_is(
     command: str,
 ) -> None:
     # A --service-config naming a directory fails at the open. A credential scrub once rewrote a
-    # path holding "api_key=" into one that does not exist; the fixed line names it as written.
+    # path holding "api_key=" into one that does not exist; the fixed line names it, resolved.
     cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
     cwd = tmp_path / "cwd"
     _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')

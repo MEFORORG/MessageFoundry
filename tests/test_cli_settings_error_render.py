@@ -213,14 +213,15 @@ _EDIT_ARMS = {"security-set", "alert-add", "alert-remove"}
 #: ``env_problems`` beside the graph.
 _EXIT_0_ARMS = {"support-bundle", "security-show", "graph-env"}
 
-#: The arms that print no text of the failure, only a fixed line naming the settings file and the
-#: `check` that prints the reason: they printed no settings failure before vault BACKLOG #5554.
+#: The arms that print no text of the failure, only a fixed line naming the settings file and
+#: saying the reason is not printed: they printed no settings failure before vault BACKLOG #5554.
 _NO_DETAIL_ARMS = {"validate-env", "graph-env", "dryrun-env"}
 
 
 def _names_the_reason(arm: str, out: str, message: str) -> bool:
     if arm in _NO_DETAIL_ARMS:
-        return "could not load the service settings" in out and message not in out
+        fixed = "this command does not print the reason, because the error text can quote"
+        return "could not load the service settings" in out and fixed in out and message not in out
     return _FIELD in out and message in out
 
 
@@ -276,7 +277,8 @@ def test_an_arm_renders_a_load_failure_without_its_input(
 
     assert calls, f"{arm} never reached load_settings, so this case proves nothing"
     assert _CANARY not in out, f"{arm} printed the input of a settings load failure: {out!r}"
-    # Useful, not just quiet: the section and the reason are still named.
+    # Useful, not just quiet: the section and the reason are still named, except by the
+    # _NO_DETAIL_ARMS, which print their fixed line and no reason.
     assert _names_the_reason(arm, out, _MESSAGE), out
     assert (code == 0) is (arm in _EXIT_0_ARMS), (arm, code)
     if arm in _EDIT_ARMS:

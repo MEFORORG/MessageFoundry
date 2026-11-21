@@ -1567,9 +1567,11 @@ def _offline_env_values(
     ``MEFOR_VALUE_*`` apply. A value file that is absent reads as no values, as serve's read does,
     so each reference it would have supplied is reported missing; a note on stderr names the file
     looked for. Raises :class:`~messagefoundry.config.wiring.WiringError` for settings that do not
-    load, as one fixed line that names the settings file when one exists and the ``check`` command
-    that prints the reason, and holds no text from the failure; and for a value file that cannot
-    be read, naming that file. The callers never print a resolved ``env()`` value."""
+    load, as one fixed line that names the settings file, resolved and quoted, when one exists,
+    says the reason is not printed because the error text can quote a configured value, and holds
+    no text from the failure. A ``--service-config`` that does not exist is refused instead as
+    ``service config not found: <the path as given>``. Also raised for a value file that cannot be
+    read, naming that file. The callers never print a resolved ``env()`` value."""
     from messagefoundry.config.anchor import resolve_project_root
     from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
     from messagefoundry.config.settings import settings_file_path
@@ -1596,21 +1598,18 @@ def _offline_env_values(
         settings_file = settings_file_path(service_config)
         # Name the file only where there is one: with none, the failure is the environment's or
         # the command line's, and a named file would send the operator to the wrong place.
-        exists = settings_file.exists()
-        source = f" ({settings_file})" if exists else ""
+        if service_config is not None and not settings_file.exists():
+            # The loader's own refusal, as main printed it: it quotes only the operator's argument.
+            raise WiringError(
+                f"could not load the service settings: service config not found: {settings_file}"
+            )
         # NO VALIDATOR TEXT (vault BACKLOG #5554). These commands printed no settings failure
         # before --env read values, and a validator message can quote the value it refused, a
-        # URL's password included, into output CI logs keep. `check` prints it, through the
-        # renderer serve uses.
-        # The same --env: check without it can pass settings this load refuses.
-        hint = f"messagefoundry check --env {args.env}"
-        if exists:
-            hint += f" --service-config {settings_file}"
-        if args.project_root is not None:
-            hint += f" --project-root {args.project_root}"
+        # URL's password included, into output CI logs keep.
+        source = f' ("{settings_file.resolve()}")' if settings_file.exists() else ""
         raise WiringError(
-            f"could not load the service settings{source}; run `{hint}` to see why: it prints "
-            "the settings error as serve does"
+            f"could not load the service settings{source}; this command does not print the "
+            "reason, because the error text can quote a configured value"
         )
     cwd = Path.cwd()
     base_dir = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
