@@ -12,13 +12,15 @@ The growth tests hold the widened DSN pattern and the member pattern linear.
 
 from __future__ import annotations
 
+import functools
+import logging
 import re
 from collections.abc import Callable
 
 import pytest
 
 from messagefoundry import secretscrub as scrub_mod
-from messagefoundry.logging_setup import scrub_log_text
+from messagefoundry.logging_setup import _install_phi_filters, scrub_log_text
 from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.support.redact import redact_log_line
 from tests._growth import _growth_between
@@ -78,12 +80,43 @@ _UNCHANGED = (
     "store dsn postgres://svc@db.invalid:5432/mefor",
     "proxy http://user@host.invalid:8080,admin@corp.invalid up",
     "notify smtp://ops@mail.local:587;alerts@corp.example failed",
-    "connect redis://:[REDACTED]@db.invalid failed",
-    "connect redis://:<redacted>@db.invalid failed",
     # After user@host, a run of digits no word character follows is a port (code review).
     "proxy http://user@host.invalid:8080!admin@corp.invalid up",
     "proxy http://user@host.invalid:8080]admin@corp.invalid up",
 )
+
+
+@pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
+@pytest.mark.parametrize("placeholder", ["[REDACTED]", "<redacted>", "[redacted]"])
+def test_a_placeholder_alone_before_the_at_sign_is_read_back(
+    placeholder: str, call: Callable[[str], str]
+) -> None:
+    """In every widened branch a placeholder the "@" follows is read back, so it becomes the
+    surface's own placeholder and nothing else changes; ``origin/main`` left these as they came."""
+    for head in ("redis://:", "postgres://ops@srv:", "postgres://svc:@"):
+        out = call(f"connect {head}{placeholder}@db.invalid failed")
+        assert out in {
+            f"connect {head}<redacted>@db.invalid failed",
+            f"connect {head}[REDACTED]@db.invalid failed",
+        }, out
+
+
+#: The store error text logged and bundled, with an empty user whose password holds a bracket:
+#: wave 3 lets that segment take "[" and "]", so the bundle's first pass writes its placeholder
+#: after ``//:``, and before the read-back the second pass printed ``Zq2x`` (code review).
+_EMPTY_USER_BRACKET_LINES = (
+    "x ws://:p[w9]@h;pwd=x9 state=Zq1@z<Server=h;sslpassword=p%40p userPwd='Zq2x;PWD='",
+    "x ws://:]x@h;pwd=x9 state=Zq1@z<Server=h;sslpassword=p%40p userPwd='Zq2x;PWD='",
+    "x redis://:[Kv9@h;pwd=x9 state=Zq1@z<Server=h;sslpassword=p%40p userPwd='Zq2x;PWD='",
+)
+
+
+@pytest.mark.parametrize("line", _EMPTY_USER_BRACKET_LINES)
+def test_an_empty_users_bracket_password_prints_nothing_main_hid_through_store_log_bundle(
+    line: str,
+) -> None:
+    out = _store_log_bundle(line)
+    assert "Zq2x" not in out, out
 
 
 @pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
@@ -111,6 +144,159 @@ def test_what_origin_main_hid_stays_hidden(
     out = call(line)
     for secret in secrets:
         assert secret not in out, out
+
+
+def _one_handler(text: str) -> str:
+    """``text`` after the filter chain ``_install_phi_filters`` puts on one handler, in order, the
+    helper ``tests/test_log_redaction_secret_domain.py`` keeps, copied so this file imports no
+    other test module."""
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    record = logging.LogRecord("mefor.test", logging.ERROR, __file__, 1, text, None, None)
+    for handler_filter in handler.filters:
+        assert isinstance(handler_filter, logging.Filter)
+        handler_filter.filter(record)
+    return record.getMessage()
+
+
+def _two_handlers(line: str) -> str:
+    return _one_handler(_one_handler(line))
+
+
+def _store_path(line: str) -> str:
+    """The store error text: the bundle's redactor, cut to 300, then one handler."""
+    return _one_handler(redact_log_line(line)[:300])
+
+
+def _store_log_bundle(line: str) -> str:
+    """The store error text redacted, logged through one handler, then read again by the bundle."""
+    return redact_log_line(_one_handler(redact_log_line(line)))
+
+
+_CHAINED = {
+    "chain then bundle": _chain_then_bundle,
+    "two handlers": _two_handlers,
+    "store path": _store_path,
+    "store, log, bundle": _store_log_bundle,
+}
+
+#: The store error text, logged and then bundled, after a user holding an "@": the bundle's first
+#: pass wrote its placeholder after ``ops@srv:``, the write-time chain did not read it back, and
+#: the bundle, finding its own placeholder in the line, did not split on it, so ``Zq2x`` printed
+#: (code review). It printed on ``b532w3-5386`` at ``47e61981770``; ``origin/main`` hides it.
+_STORE_LOG_BUNDLE_LINE = (
+    "x ws://ops@srv:pw@h;pwd=x9 state=Zq1@z<Server=h;sslpassword=p%40p userPwd='Zq2x;PWD='"
+)
+
+#: Lines a password's leading "@" let print on a chained path where ``origin/main`` hid the value:
+#: on the lead arm's first build the segment after the "@" signs was the user's, which takes ";",
+#: "|", "^", "#", "&" and quotes (code review, findings 1 and 2). Each is the line, the path, and
+#: the value. Each printed that value on ``b532w3-5386`` at ``47e61981770`` and is hidden on
+#: ``origin/main``.
+_LEAD_CHAINED = (
+    (
+        "cfg accessToken=redis://ops:@Kv9;w@cache,userPwd='Sec_77;PWD=';UID=u;PWD=p",
+        "chain then bundle",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops:@Kv9\"w@cache,userPwd='Sec_77;PWD=';UID=u;PWD=p",
+        "chain then bundle",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops:@Kv9;w@cache,userPwd='Sec_77;PWD='#UID=u;PWD=p",
+        "two handlers",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops:@@@Kv9'w@cache,userPwd='Sec_77;PWD='|UID=u;PWD=p",
+        "two handlers",
+        "Sec_77",
+    ),
+    (
+        "x ws://svc:Qc7728_Sec-0w@h:587&dbPassword=mrn7728y1t(redis://ops:S7728k2j@h\\nPassword: "
+        "Tk7728x3q;mrn7728y93t<http://a.b:Tk7728x4q@Qc7728_Sec-55w@h:8765+redis://ops:@Tk7728x5q|"
+        "mrn7728y56t@Qc7728_Sec-57w:pw7728Z58v@h:587",
+        "store path",
+        "mrn7728y93t",
+    ),
+    (
+        "x ws://svc:Qc7728_Sec-0w@h:587&dbPassword=mrn7728y1t(redis://ops:S7728k2j@h\\nPassword: "
+        "Tk7728x3q;mrn7728y93t<http://a.b:@Tk7728x4q^Qc7728_Sec-55w@h:8765+redis://ops:@Tk7728x5q#"
+        "mrn7728y56t@Qc7728_Sec-57w:pw7728Z58v@h:587",
+        "store path",
+        "mrn7728y93t",
+    ),
+    (_STORE_LOG_BUNDLE_LINE, "store, log, bundle", "Zq2x"),
+)
+
+#: Controls on the same chained paths, each hidden on ``origin/main`` and on the first build: the
+#: user@host forms of the first four lines above, and the plain-user form of the bundle lines. The
+#: plain-user form through two handlers prints ``Sec_77`` on ``origin/main`` too, so it is no
+#: control.
+_CHAINED_CONTROLS = (
+    (_STORE_LOG_BUNDLE_LINE.replace("ops@srv:", "svc:@"), "store, log, bundle", "Zq2x"),
+    (
+        "cfg accessToken=redis://ops@srv:Kv9;w@cache,userPwd='Sec_77;PWD=';UID=u;PWD=p",
+        "chain then bundle",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops:Kv9;w@cache,userPwd='Sec_77;PWD=';UID=u;PWD=p",
+        "chain then bundle",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops@srv:Kv9\"w@cache,userPwd='Sec_77;PWD=';UID=u;PWD=p",
+        "chain then bundle",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops:Kv9\"w@cache,userPwd='Sec_77;PWD=';UID=u;PWD=p",
+        "chain then bundle",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops@srv:Kv9;w@cache,userPwd='Sec_77;PWD='#UID=u;PWD=p",
+        "two handlers",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops@srv:Kv9'w@cache,userPwd='Sec_77;PWD='|UID=u;PWD=p",
+        "two handlers",
+        "Sec_77",
+    ),
+    (
+        "cfg accessToken=redis://ops@srv:@@Kv9'w@cache,userPwd='Sec_77;PWD='|UID=u;PWD=p",
+        "two handlers",
+        "Sec_77",
+    ),
+)
+
+
+@pytest.mark.parametrize(("line", "path", "secret"), _LEAD_CHAINED + _CHAINED_CONTROLS)
+def test_a_lead_or_user_at_host_dsn_prints_nothing_main_hid_on_a_chained_path(
+    line: str, path: str, secret: str
+) -> None:
+    out = _CHAINED[path](line)
+    assert secret not in out, out
+
+
+def test_a_lead_is_followed_by_the_empty_users_segment() -> None:
+    """After a password's leading "@" signs the segment stops where an empty user's does, so a
+    separator there ends the match; the same password with no lead is the user's, which takes it,
+    as ``_DSN_PASSWORD`` does."""
+    wide = scrub_mod._WIDE_DSN_PASSWORD
+    for sep in (";", "|", "^", "#", "&", "'", '"'):
+        assert wide.search(f"redis://ops:@Kv9{sep}w@cache") is None, sep
+    assert wide.search("redis://ops:Kv9;w@cache") is not None
+    match = wide.search("redis://ops:@Kv9w@cache")
+    assert match is not None and match.group("lead") == "@", match
+    # After user@host a password that opens with "@", and an empty one, are not read: that branch
+    # has no group to keep the "@" signs in (code review).
+    for line in ("postgres://u@h:@pw@x", "smtp://u@h:@x"):
+        assert wide.search(line) is None, line
 
 
 @pytest.mark.parametrize("call", [redact_log_line, _chain_then_bundle], ids=_IDS[2:])
@@ -157,6 +343,16 @@ _KNOWN_RESIDUALS = (
     ("postgres://ops@srv:12-Kv9Az@srv.example.invalid/x", "12-Kv9Az"),
     ("postgres://ops@srv_1:Kv9_Az@srv.example.invalid/x", "Kv9_Az"),
     ("postgres://a@b@srv:Kv9_Az@srv.example.invalid/x", "Kv9_Az"),
+    # After user@host or a lead, the segment is an empty user's, which stops at ";", "#", a quote,
+    # "," and the rest, and an all-digit password reads as a port; after user@host a password that
+    # opens with "@" is not read. The same password after a plain user is hidden.
+    ("x postgres://ops@srv:Kv9;x@db.invalid", "Kv9;x"),
+    ("x postgres://ops@srv:Kv9#x@db.invalid", "Kv9#x"),
+    ("x postgres://ops@srv:Kv9'x@db.invalid", "Kv9'x"),
+    ("x postgres://ops@srv:Kv9,x@db.invalid", "Kv9,x"),
+    ("x postgres://ops@srv:123456@db.invalid", "123456"),
+    ("x postgres://ops@srv:@Kv9x@db.invalid", "Kv9x"),
+    ("x postgres://svc:@Kv9;x@db.invalid", "Kv9;x"),
 )
 
 
@@ -167,8 +363,9 @@ def test_known_residual_prints(line: str, printed: str, call: Callable[[str], st
 
 
 def test_a_placeholder_is_never_crossed_by_an_empty_users_segment() -> None:
-    """The bracket admission stops at a bracketed word of letters, which is every placeholder's
-    shape, so the tail after one prints as it did; control: a bracket around a non-word is taken."""
+    """The bracket admission stops at a bracketed word of letters, the shape of ``<redacted>``,
+    ``[redacted]`` and ``[REDACTED]``, so the tail after one prints as it did; control: a bracket
+    around a non-word is taken."""
     wide = scrub_mod._WIDE_DSN_PASSWORD
     for line in (
         "redis://:[REDACTED]tail@db",
@@ -181,10 +378,11 @@ def test_a_placeholder_is_never_crossed_by_an_empty_users_segment() -> None:
 
 # --- GROWTH -----------------------------------------------------------------------------------
 #
-# 1k to 16k, 16x the length: linear near 16x, quadratic near 256x. The bar is 48x. A 64k input was
-# measured by hand (in the commit) and is not run here: a quadratic regression would stall the
-# suite there rather than fail. The control is a quadratic subject that must exceed the bar on this
-# box, so a bar the shipped code passes is one a quadratic one fails.
+# 1k to 16k, 16x the length: linear near 16x, quadratic near 256x. The bar is 48x. A 64k input is
+# not run here: a quadratic regression would stall the suite there rather than fail. The control is
+# a quadratic subject that must exceed the bar on this box, so a bar the shipped code passes is one
+# a quadratic one fails. It runs in the same test as every shape, so no selection runs the shapes
+# without it.
 
 _SHORT, _LONG = 1024, 16384
 _CONTROL_SHORT, _CONTROL_LONG = 512, 8192
@@ -216,6 +414,10 @@ _SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("lead at signs and letters", lambda n: "postgres://svc:" + ("@a" * n)[:n] + " "),
     ("user at-host pairs", lambda n: "postgres://" + ("x@y:" * n)[:n]),
     ("glued heads with an at-sign user", lambda n: ("a://u@h:" * n)[:n]),
+    ("lead then bracket run", lambda n: "postgres://svc:@" + ("[a" * n)[:n]),
+    ("lead then bracket lookahead run", lambda n: "postgres://svc:@" + ("[aaaa" * n)[:n]),
+    ("lead then equals run", lambda n: "postgres://svc:@" + ("a=" * n)[:n]),
+    ("lead then separators", lambda n: "postgres://svc:@a" + ("=b|" * n)[:n]),
 )
 
 _MEMBER_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
@@ -225,7 +427,8 @@ _MEMBER_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
 )
 
 
-def test_the_backtracking_control_grows_past_the_bar() -> None:
+def test_the_dsn_and_member_patterns_grow_linearly_and_the_control_does_not() -> None:
+    """One test, so the control cannot be deselected apart from the shapes it vouches for."""
     ratio = _growth_between(
         lambda text: _BACKTRACKING_WIDE.sub("x", text),
         "redis://:" + "a" * _CONTROL_SHORT,
@@ -233,13 +436,9 @@ def test_the_backtracking_control_grows_past_the_bar() -> None:
         rounds=2,
     )
     assert ratio > _MAX_GROWTH, f"the backtracking control grew only {ratio:.1f}x"
-
-
-@pytest.mark.parametrize(("label", "shape"), _SHAPES, ids=[s[0] for s in _SHAPES])
-def test_the_widened_dsn_pattern_grows_linearly(label: str, shape: Callable[[int], str]) -> None:
-    _assert_linear(label, lambda text: scrub_mod._WIDE_DSN_PASSWORD.sub("x", text), shape)
-
-
-@pytest.mark.parametrize(("label", "shape"), _MEMBER_SHAPES, ids=[s[0] for s in _MEMBER_SHAPES])
-def test_the_member_pattern_grows_linearly(label: str, shape: Callable[[int], str]) -> None:
-    _assert_linear(label, lambda text: scrub_mod._CONNECTION_STRING_MEMBER.sub("x", text), shape)
+    for pattern, shapes in (
+        (scrub_mod._WIDE_DSN_PASSWORD, _SHAPES),
+        (scrub_mod._CONNECTION_STRING_MEMBER, _MEMBER_SHAPES),
+    ):
+        for label, shape in shapes:
+            _assert_linear(label, functools.partial(pattern.sub, "x"), shape)

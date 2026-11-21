@@ -6,8 +6,8 @@ Synthetic values only. Item 3: an empty user's first password segment refused "%
 so a password-only DSN holding one printed whole. It admits a "%" now, except one that opens an
 encoded HL7 separator, which the PHI pass reads a run by, or the encoded form of a character it
 stops at for structure, such as ",". "[" and "]" it refused, so it never crosses a
-placeholder; since wave 3 it takes them where the "[" opens no bracketed word of letters, which
-is every placeholder's shape. Item 4, a ";" that opens no member in the run after the first
+placeholder; since wave 3 it takes them where the "[" opens no bracketed word of letters, the
+shape of ``<redacted>``, ``[redacted]`` and ``[REDACTED]``. Item 4, a ";" that opens no member in the run after the first
 segment, was built and declined: the declined form printed a value ``origin/main`` hides,
 pinned below. The comment on ``secretscrub._WIDE_DSN_PASSWORD`` says why each was kept or declined.
 """

@@ -3179,7 +3179,7 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     assert first == (
         r"(?>\[[a-z]+\]|<[a-z]+>|(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
     )
-    tail = wide.split(r"(?<!//:)(?P<lead>@*+)" + first + "))", 1)[1]
+    tail = wide.split(r"|" + first + ")))", 1)[1]
     run_head = "(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/"
     assert tail.startswith(run_head) and tail.endswith("])*@"), tail
 
