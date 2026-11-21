@@ -60,8 +60,9 @@ pattern): signing key↔cert public-key match, recipient cert chains to the supp
 misconfig all raise at `check`/dry-run/start — never as a wire-time surprise.
 
 **AMENDED (BACKLOG #5631): one certificate property is checked at send, not refused at construction --
-the validity window.** Construction only logs a WARNING for a recipient cert or issuing anchor outside it;
-each send then refuses before anything is built or dialled, expired or not yet valid, as a permanent
+the validity window.** Construction only logs a WARNING for a recipient cert, issuing anchor or signing cert
+outside it, once per process for the same connection and certificates; each send then refuses before
+anything is built or dialled, expired or not yet valid, as a permanent
 configuration fault (code `direct-cert-validity:<setting>:<bound>`) that stops the lane and keeps the
 queue under the default `credential_fault_policy`. A construction refusal
 would record the lane failed at start instead of stopping it with its queue kept. The trust check's other
