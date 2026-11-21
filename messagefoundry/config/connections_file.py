@@ -1033,7 +1033,7 @@ def _policy(  # noqa: UP047
     ``frozenset``, and its ``start``/``end`` times arrive as strings such as ``"07:00:00"``, which
     strict mode refuses for the model's ``time``. ``connections_edit.list_connections`` writes them
     back in that string form, so every schedule the editor saves carries string times. A boolean
-    in a window's ``days`` is still refused rather than read as a weekday, by the models' shared
+    in a window's ``days`` is refused rather than read as a weekday, by the models' shared
     bool guard and not by strict mode (BACKLOG #5509)."""
     if raw is None:
         return None

@@ -105,7 +105,8 @@ def _bool_read_as_number(given: Any, got: Any, where: str) -> str | None:
 
 
 class NumbersRefuseBool(BaseModel):
-    """A model whose every field refuses a bool that validation would read as a number (#5509)."""
+    """A model whose fields refuse a bool that validation would read as a number (#5509), at least
+    on a scalar, optional or bounded number and a list or set of numbers."""
 
     @field_validator("*", mode="wrap")
     @classmethod

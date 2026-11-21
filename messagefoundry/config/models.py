@@ -623,7 +623,7 @@ class SaturationThreshold(NumbersRefuseBool):
 
     ``min_growth`` is the rise, in messages, the alert needs before it fires (BACKLOG #5768,
     :data:`SATURATION_MIN_GROWTH_DEFAULT`). A boolean on either field is refused rather than read as
-    1 or 0, here as on every numeric settings key (BACKLOG #5509)."""
+    1 or 0, by the guard the settings sections share (BACKLOG #5509)."""
 
     sustain_samples: int | None = Field(default=None, ge=2)
     min_growth: int = Field(
