@@ -2995,7 +2995,8 @@ class LoggingSettings(_Section):
     # The engine writes no log FILE of its own unless `file` below is set (opt-in, #122), but if an
     # operator tells us where the supervisor parks them, GET /status meters that directory's total bytes
     # + filesystem free space alongside the DB metrics (#50). None (the default) = stdout-only, no
-    # metering. Metadata only — the contents are never read.
+    # metering. Other code reads the files' contents; docs/CONFIGURATION.md, the [logging] log_dir
+    # row, says which.
     log_dir: str | None = None
 
     # --- Engine-managed application log file + fail-closed write guard (#122, ADR 0162) ----------
