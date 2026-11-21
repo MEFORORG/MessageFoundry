@@ -2126,9 +2126,11 @@ async def test_the_http_listener_refuses_a_streaming_ed_body_under_a_colliding_h
     ic = _streaming_ic()
     runner = _runner(store, ic)
 
+    from messagefoundry.transports.receipt import RefusalKind
+
     receipt = await runner._handle_inbound_http(ic, _TILDE_HEADER_DOCUMENT.encode("utf-8"))
 
-    assert receipt.refusal is not None
+    assert receipt.refusal is RefusalKind.PERMANENT
     assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
     assert await _attachment_count(store) == 0
     assert await _ingress_count(store, ic.name) == 0

@@ -670,7 +670,8 @@ async def test_a_verbatim_outbound_carries_a_colliding_member_that_does_not_head
     # A verbatim outbound sends each member's own bytes, so a colliding member behind the head is
     # delivered as origin/main delivers it; only the would-be heads are refused (BACKLOG #5972).
     # hl7_raw_separators re-joins the envelope on the delimiters it split it on, so it keeps the
-    # member's bytes and counts as verbatim (PR 3135 finding f394ede3-2).
+    # bytes of a member that holds no structural escape, and a colliding member behind the head is
+    # carried as main carries it (PR 3135 finding f394ede3-2).
     mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
     dest = MllpRecorder(DEST, hl7_raw_separators=True) if raw_separators else None
     rec = await _run_one_batch(store, simulate=False, dest=dest)

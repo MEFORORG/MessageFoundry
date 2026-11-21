@@ -658,8 +658,9 @@ def iter_obx_documents(
     no document of it could be detached and set back (BACKLOG #5972). The claim is judged, not a
     document the scan found, because under some such headers, ``MSH|~|`` among them, no OBX-5
     component reads as written, so the scan finds none and the body would be ACKed with its
-    document in it. So an ED value the detach would not lift out under a readable header, one not
-    Base64, empty or a tombstone, is refused too, as every OBX under a short MSH-2 was before.
+    document in it. So an ED value the detach would not lift out under a readable header is
+    refused too, at least one not Base64, empty, a tombstone or under ``min_b64_len``, as every
+    OBX under a short MSH-2 was before.
 
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the

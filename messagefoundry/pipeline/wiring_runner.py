@@ -11828,8 +11828,8 @@ class RegistryRunner:
         dead-lettered alone, and "all N" above means the rest. So is a member whose short MSH-2
         fills a delimiter with one it already uses, since neither the head's BHS nor a send's
         delimiter rewrite can write it (BACKLOG #5972): wherever it sits on an outbound that
-        rewrites delimiters, and only where it would head the envelope on one that sends each
-        member's own bytes. The envelope's head is then the
+        rewrites delimiters (``encoding_characters``), and only where it would head the envelope
+        on any other, one with ``hl7_raw_separators`` included. The envelope's head is then the
         first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
@@ -12043,8 +12043,9 @@ class RegistryRunner:
             # write, and encode_batch refuses the whole batch for it, so each would-be head is
             # refused alone and the next member heads. Later in the envelope, an outbound that
             # rewrites delimiters would rewrite the member under the BHS's and change what it
-            # reads as, so there it is refused wherever it sits; a verbatim outbound sends the
-            # member's own bytes, as it always has, so there only a would-be head is refused.
+            # reads as, so there it is refused wherever it sits. On any other outbound, one with
+            # hl7_raw_separators included (_rewrites_delimiters says what that one changes), only a
+            # would-be head is refused, as main carried the rest.
             # Each verdict reads a few characters of the member's first line, so it runs here
             # rather than in a thread.
             collides = [batch_member_collides(m) for m in members]
@@ -14799,9 +14800,10 @@ def _rewrites_delimiters(connector: object) -> bool:
     """Whether ``connector`` rewrites a payload's delimiters before it sends it: an MLLP outbound
     with ``encoding_characters`` set (BACKLOG #5972). Read off the instance, so a connector without
     it, or a test double, sends its payload's own bytes. ``hl7_raw_separators`` is not one: it
-    re-joins the envelope on the delimiters it was split on, so a member's delimiters reach the
-    wire as they were written, and a colliding member behind the head is delivered, as it was
-    before the refusal existed."""
+    re-joins the envelope on the delimiters it was split on, so a colliding member behind the head
+    is delivered, as ``main`` delivers it. It does emit a member's structural escapes as the
+    head's raw delimiters, so such a member's data can change on the wire; that holds for any
+    member whose delimiters differ from the head's, and is not judged here."""
     return getattr(connector, "encoding_characters", None) is not None
 
 
