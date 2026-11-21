@@ -54,7 +54,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
-    float_setting,
+    positive_seconds,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -426,7 +426,10 @@ class DicomWebDestination(DestinationConnector):
             # BACKLOG #1241: and the control-char screen alone is not enough for a value that becomes a
             # path SEGMENT — refuse at construction, where the operator sees it, not at the URL layer.
             _reject_non_uid(self.study_uid, "study_uid")
-        self.timeout: float = float_setting(
+        # BACKLOG #5959: positive, as REST's (BACKLOG #5796), because urllib reads a zero timeout as a
+        # non-blocking socket and refuses a negative one, so either would build and then fail every
+        # send.
+        self.timeout: float = positive_seconds(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOMweb destination"
         )
         self.encoding: str = s.get("encoding", "utf-8")

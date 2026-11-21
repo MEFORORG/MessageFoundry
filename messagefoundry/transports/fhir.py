@@ -88,7 +88,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     ReplyBodyDropped,
     encode_wire_body,
-    float_setting,
+    positive_seconds,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -1177,7 +1177,10 @@ class FhirDestination(DestinationConnector):
                 "(ASVS 14.2.1); see docs/SECURITY-LOOSENING.md",
                 config.name,
             )
-        self.timeout: float = float_setting(
+        # BACKLOG #5959: positive, as REST's (BACKLOG #5796), because urllib reads a zero timeout as a
+        # non-blocking socket and refuses a negative one, so either would build and then fail every
+        # send.
+        self.timeout: float = positive_seconds(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="FHIR destination"
         )
         self.encoding: str = s.get("encoding", "utf-8")
@@ -2071,7 +2074,10 @@ class FhirLookupExecutor:
                 )
             refuse_url_credentials(url, f"FhirLookup {cname!r} 'url'")
             self._base[cname] = url
-            self._timeout[cname] = float_setting(
+            # BACKLOG #5959: positive, as REST's (BACKLOG #5796), because urllib reads a zero
+            # timeout as a non-blocking socket and refuses a negative one, so either would build and
+            # then fail every lookup.
+            self._timeout[cname] = positive_seconds(
                 s.get("timeout_seconds", 30.0),
                 knob="timeout_seconds",
                 transport=f"FhirLookup {cname!r}",

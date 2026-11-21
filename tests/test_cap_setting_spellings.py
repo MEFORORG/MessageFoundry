@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import math
 import operator
+import re
 from collections.abc import Callable
 from decimal import Decimal
 from fractions import Fraction
@@ -898,6 +899,57 @@ def test_an_http_reply_timeout_must_be_above_zero() -> None:
         for unset in (None, ""):
             assert getattr(_HTTP_IN({key: unset}), key) == 30.0
         assert getattr(_HTTP_IN({}), key) == 30.0
+
+
+def _smart(over: dict[str, Any]) -> Any:
+    return token_provider_from_settings(
+        {
+            "smart_token_url": "https://auth.example.com/token",
+            "smart_client_id": "c",
+            "smart_private_key": "unused",
+            **over,
+        }
+    )
+
+
+#: BACKLOG #5959: the REST family's other request timeouts, (builder, key, transport label). REST's
+#: own is pinned in tests/test_rest_transport.py (BACKLOG #5796).
+_POSITIVE_TIMEOUTS = [
+    pytest.param(_soap, "timeout_seconds", "SOAP destination", id="soap"),
+    pytest.param(
+        _url_dest(FhirDestination, ConnectorType.FHIR, "https://fhir.example.com/r4"),
+        "timeout_seconds",
+        "FHIR destination",
+        id="fhir",
+    ),
+    pytest.param(
+        _url_dest(DicomWebDestination, ConnectorType.DICOMWEB, "https://pacs.example.com/studies"),
+        "timeout_seconds",
+        "DICOMweb destination",
+        id="dicomweb",
+    ),
+    pytest.param(_fhir_lookup, "timeout_seconds", "FhirLookup 'epic'", id="fhir-lookup"),
+    pytest.param(_smart, "smart_timeout_seconds", "SMART", id="smart-token"),
+    pytest.param(_oauth2, "oauth2_timeout_seconds", "OAuth2", id="oauth2-token"),
+]
+
+
+@pytest.mark.parametrize(("build", "key", "transport"), _POSITIVE_TIMEOUTS)
+@pytest.mark.parametrize("bad", [0, 0.0, "0", "-0", -1, -0.5, "-2"])
+def test_a_request_timeout_that_is_not_positive_is_refused_at_build(
+    build: Build, key: str, transport: str, bad: object
+) -> None:
+    """BACKLOG #5959: ``float_setting`` passes zero and negatives through, and urllib reads a zero
+    timeout as a non-blocking socket and refuses a negative one, so each built a connection that
+    failed every request. Each is refused when the connection is built, naming the key and
+    withholding the value. The positive control for each but the SMART hop, which loads its key
+    material after the timeout, is ``test_a_float_setting_accepts_a_number_or_its_text`` above,
+    which builds each with 2.5."""
+    message = (
+        rf"^{re.escape(transport)} {key} must be a number of seconds above zero \(value withheld"
+    )
+    with pytest.raises(ValueError, match=message):
+        build({key: bad})
 
 
 _RANGE_REFUSALS = [

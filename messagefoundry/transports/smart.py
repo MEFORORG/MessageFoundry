@@ -60,7 +60,12 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.transports.base import DeliveryError, NegativeAckError, float_setting
+from messagefoundry.transports.base import (
+    DeliveryError,
+    NegativeAckError,
+    float_setting,
+    positive_seconds,
+)
 from messagefoundry.transports.bounded_read import (
     MAX_TOKEN_RESPONSE_BYTES,
     EgressReplyError,
@@ -781,7 +786,10 @@ def token_provider_from_settings(
             knob="smart_expiry_skew_seconds",
             transport="SMART",
         ),
-        timeout_seconds=float_setting(
+        # BACKLOG #5959: positive, as REST's (BACKLOG #5796), because urllib reads a zero timeout as a
+        # non-blocking socket and refuses a negative one, so either would build and then fail every
+        # token request.
+        timeout_seconds=positive_seconds(
             s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT),
             knob="smart_timeout_seconds",
             transport="SMART",
