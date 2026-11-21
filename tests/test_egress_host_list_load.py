@@ -4,8 +4,8 @@
 the matcher compares ports as numbers and reads a URL with no port at the port it dials (BACKLOG
 #5915).
 
-On origin/main each of these loaded silently or matched on text: a malformed entry admitted
-nothing, ``06661`` matched ``host:06661`` but not ``host:6661`` while the connector dials 6661, and
+Before engine PR 3095 each of these loaded silently or matched on text: a malformed entry loaded
+without error, ``06661`` matched ``host:06661`` but not ``host:6661`` while the connector dials 6661, and
 ``https://host/`` did not match ``host:443`` although urllib dials 443 for it.
 """
 
@@ -96,6 +96,10 @@ def test_refusal_does_not_quote_the_entry() -> None:
         ("h%2Eexample.org", "character no host name does"),
         ("h%2Eexample.org:443", "character no host name does"),
         ("[::1]x%", r"is not 'host', 'host:port'"),
+        ("[h%2Eexample.org]", r"is not 'host', 'host:port'"),
+        ("[fe80::1%eth0", r"is not 'host', 'host:port'"),
+        ("[fe80::1%eth0]x", r"is not 'host', 'host:port'"),
+        ("db.example.org:5432:%", r"more than one ':' outside brackets"),
         ("fe80::1:443", r"more than one ':' outside brackets"),
         ("*.example.org", "no pattern is read"),
         ("h.example.org:99999", "port is not a number"),
@@ -104,6 +108,13 @@ def test_refusal_does_not_quote_the_entry() -> None:
 def test_refusal_names_the_reason(entry: str, reason: str) -> None:
     with pytest.raises(ValidationError, match=reason):
         EgressSettings(allowed_http=[entry])
+
+
+@pytest.mark.parametrize("entry", ["fe80::1%eth0", "[fe80::1%eth0]", "[fe80::1%eth0]:5432"])
+def test_allowed_db_gives_its_own_reason_for_a_zoned_entry(entry: str) -> None:
+    # allowed_db refuses every IPv6 entry, zoned or not, and names a host name as the remedy.
+    with pytest.raises(ValidationError, match="name the server by a host name"):
+        EgressSettings(allowed_db=[entry])
 
 
 @pytest.mark.parametrize("field", _HOST_LISTS)

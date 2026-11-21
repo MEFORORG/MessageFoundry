@@ -5124,7 +5124,8 @@ class AiSettings(_Section):
     @field_validator("allowed_endpoints", mode="after")
     @classmethod
     def _endpoint_entries_are_read(cls, value: list[str]) -> list[str]:
-        """Refuse at load an entry the broker's host match cannot read (BACKLOG #5915)."""
+        """Refuse at load an entry :func:`~messagefoundry.hostlist.allow_entry_problem` refuses,
+        every one the broker's host match cannot read among them (BACKLOG #5915)."""
         return _host_list_entries(value, "[ai].allowed_endpoints")
 
     @field_validator("provider")

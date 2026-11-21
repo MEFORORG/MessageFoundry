@@ -123,6 +123,24 @@ def _is_host_name(text: str) -> bool:
     return all(unicodedata.category(char)[0] in "LMN" or char in "._-" for char in text)
 
 
+def _is_zoned_v6_entry(text: str) -> bool:
+    """True if ``text`` is ``v6%zone``, ``[v6%zone]`` or ``[v6%zone]:port``: an entry that would
+    read as an IPv6 entry but for its zone id. Anything else holding a ``%`` is not, so it keeps
+    the reason its shape earns."""
+    if text.startswith("["):
+        close = text.find("]")
+        if close == -1 or (text[close + 1 :] and not text[close + 1 :].startswith(":")):
+            return False
+        text = text[1:close]
+    address, pct, zone = text.partition("%")
+    if not pct or not zone or ":" in zone:
+        return False
+    try:
+        return isinstance(ipaddress.ip_address(address), ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
 _HOST_CHARACTER_REASON = (
     "its host holds a character no host name does, such as '*', ',' or a space; list each host by "
     "name, since no pattern is read"
@@ -143,10 +161,9 @@ def allow_entry_problem(entry: str) -> str | None:
     if parsed is None:
         bracketed = text.startswith("[")
         if bracketed or text.count(":") > 1:
-            # An IPv6 shape, bracketed or not: a '%' in its address is a zone id. Unbracketed, it
-            # would otherwise be told to write [v6], and the bracketed form is refused too.
-            address = text[1:].partition("]")[0] if bracketed else text
-            if "%" in address:
+            # A zone id only where the rest is a well-formed IPv6 address with a zone: unbracketed,
+            # it would otherwise be told to write [v6], and the bracketed form is refused too.
+            if _is_zoned_v6_entry(text):
                 return "it carries a '%' zone id, which no host is matched with"
             if not bracketed:
                 return "it holds more than one ':' outside brackets; write an IPv6 address as [v6]"

@@ -168,7 +168,7 @@ transport = "mllp"
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin
   of `6661` (BACKLOG #5915). `allowed_db` also compares the SQL Server preset's `port` setting as
   a number when its check runs, but on `dialect="generic"` it refuses a `PORT` keyword with a
-  leading zero
+  leading zero for a host an entry names
   ([*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)).
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
   cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
