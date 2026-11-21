@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import os
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -387,6 +389,15 @@ def test_offline_env_help_says_the_flag_resolves_values(
     assert "resolves every env() reference" in text
     assert "default: the working directory" in text
     assert "never printed" in text and "left to check --env" in text
+    assert "at least the build and posture checks" in text and "ADR 0050" in text
+    assert "--env as [ai].environment" in text
+    # Each command says what it does with a reference that does not resolve.
+    outcome = {
+        "validate": "reported as a problem",
+        "graph": "listed under env_problems beside the graph",
+        "dryrun": "stops the run",
+    }[command]
+    assert outcome in text
     # Control: check's own help still says it reads the name as serve does.
     assert "read as serve --env reads it" in " ".join(_rendered_help("check", monkeypatch).split())
 
@@ -409,6 +420,18 @@ def _offline_argv(command: str, tmp_path: Path, *extra: str) -> list[str]:
     return argv
 
 
+def _assert_reports_unresolved(command: str, rc: int, captured: Any, key: str) -> None:
+    """validate and dryrun fail on a reference that does not resolve; graph is a viewer and lists
+    it under env_problems beside the graph, exiting 0 (vault BACKLOG #5554, a Manager decision)."""
+    if command == "graph":
+        assert rc == 0, captured
+        problems = json.loads(captured.out)["env_problems"]
+        assert any(key in p for p in problems), problems
+    else:
+        assert rc != 0, captured
+        assert key in captured.out + captured.err, captured
+
+
 def _values_file(base: Path, env_name: str, body: str) -> None:
     (base / "environments").mkdir(parents=True, exist_ok=True)
     (base / "environments" / f"{env_name}.toml").write_text(body, encoding="utf-8")
@@ -429,18 +452,20 @@ def test_offline_env_resolves_the_named_environment_under_project_root(
     _empty_cwd(tmp_path, monkeypatch)
     anchor = ["--project-root", str(tmp_path), "--config", str(cfg)]
     rc = main(_offline_argv(command, tmp_path, *anchor, "--env", "dev"))
-    captured = capsys.readouterr()
-    assert rc != 0, captured
-    assert "peer_host" in captured.out + captured.err
+    _assert_reports_unresolved(command, rc, capsys.readouterr(), "peer_host")
     # The environment that has the key passes, and its value is never printed.
     rc = main(_offline_argv(command, tmp_path, *anchor, "--env", "prod"))
     captured = capsys.readouterr()
     assert rc == 0, captured
     assert _SECRET_HOST not in captured.out + captured.err
+    if command == "graph":
+        assert json.loads(captured.out)["env_problems"] == []
     # Control: with no --env no values are loaded, so the command behaves as before.
     rc = main(_offline_argv(command, tmp_path, *anchor))
     captured = capsys.readouterr()
     assert rc == 0, captured
+    if command == "graph":
+        assert "env_problems" not in json.loads(captured.out)
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
@@ -458,9 +483,7 @@ def test_offline_env_without_project_root_reads_the_working_directory(
     _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
     monkeypatch.chdir(cwd)
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "dev"))
-    captured = capsys.readouterr()
-    assert rc != 0, captured
-    assert "peer_host" in captured.out + captured.err
+    _assert_reports_unresolved(command, rc, capsys.readouterr(), "peer_host")
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "prod"))
     captured = capsys.readouterr()
     assert rc == 0, captured
@@ -468,8 +491,7 @@ def test_offline_env_without_project_root_reads_the_working_directory(
     # A name with no value file in the working directory resolves nothing, as serve's silent-empty
     # read does, so the referenced key is reported missing.
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "qa"))
-    captured = capsys.readouterr()
-    assert rc != 0 and "peer_host" in captured.out + captured.err, captured
+    _assert_reports_unresolved(command, rc, capsys.readouterr(), "peer_host")
 
 
 def test_offline_env_reads_mefor_value_variables(
@@ -623,3 +645,88 @@ def test_offline_env_refuses_a_malformed_service_config(
     captured = capsys.readouterr()
     assert rc == 1, captured
     assert _SECRET_HOST not in captured.out + captured.err
+    # The refusal names the settings file it could not load.
+    assert "messagefoundry.toml" in captured.out, captured
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_overrides_ai_environment_as_serve_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # serve puts --env above MEFOR_AI_ENVIRONMENT and the file's [ai].environment before the
+    # settings validate, so a bad value there does not stop serve --env prod. It must not stop the
+    # offline commands' settings load either.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "bad name!")
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "prod"))
+    assert rc == 0, capsys.readouterr()
+
+
+def test_offline_env_reports_a_deeply_nested_settings_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # tomllib recurses past the limit on a deeply nested document. validate must report it as a
+    # problem in its own output shape, not end on an uncaught RecursionError.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    (cwd / "messagefoundry.toml").write_text("a = " + "[" * 600 + "\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
+    captured = capsys.readouterr()
+    assert rc == 1, captured
+    diags = json.loads(captured.out)
+    assert isinstance(diags, list) and any("messagefoundry.toml" in d["message"] for d in diags)
+
+
+def test_offline_env_check_and_read_name_one_dir_under_a_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Under --project-root with no root settings file, serve reads ./messagefoundry.toml, here
+    # naming dir = "envs". The value-file check and the read must both look in R/envs, as serve
+    # does, not refuse over a guessed R/environments.
+    root = tmp_path / "R"
+    cfg = _config_dir(root, body=_ENV_GRAPH)
+    (root / "envs").mkdir()
+    (root / "envs" / "prod.toml").write_text(f'peer_host = "{_SECRET_HOST}"\n', encoding="utf-8")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "messagefoundry.toml").write_text('[environments]\ndir = "envs"\n', encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    argv = ["validate", "--project-root", str(root), "--config", str(cfg), "--env", "prod"]
+    rc = main([*argv, "--json"])
+    captured = capsys.readouterr()
+    assert rc == 0, captured
+    # Control: with the value file gone the check fails loud on the folder serve reads.
+    (root / "envs" / "prod.toml").unlink()
+    rc = main([*argv, "--json"])
+    err = capsys.readouterr().err
+    assert rc == 2 and str(root / "envs" / "prod.toml") in err, err
+
+
+def test_offline_env_fails_loud_under_a_settings_base_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # serve treats a base_dir from the settings file as the project root, and fails loud when the
+    # graph references env() and the value file under it is missing, even if MEFOR_VALUE_* supply
+    # every key. The offline commands must refuse the same layout, not exit 0.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    deploy = tmp_path / "deploy"
+    deploy.mkdir()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "messagefoundry.toml").write_text(
+        f'[environments]\nbase_dir = "{deploy.as_posix()}"\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("MEFOR_VALUE_PEER_HOST", _SECRET_HOST)
+    rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
+    err = capsys.readouterr().err
+    assert rc == 2 and str(deploy / "environments" / "prod.toml") in err, err
+    assert "[environments].base_dir" in err and _SECRET_HOST not in err

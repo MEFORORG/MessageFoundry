@@ -459,19 +459,23 @@ those settings, and its Handlers still run with no active environment.
   2026-11-19 under the owner's delegation after an adversarial review; the question and the
   owner's answer are in that record, not here. It chose to build value resolution into the three
   commands, and not to refuse `--env` without `--project-root`. Given `--env`, `validate`, `graph`
-  and `dryrun` now find the named environment's value file through the service settings load
-  `serve` runs, with `--project-root` as the `[environments].base_dir` override `serve` applies.
-  They read it with `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings
-  that do not load, or a value file that cannot be read, fail the command, naming the file and no
-  value. They resolve every `env()`
-  reference of each deployed connection and lookup, and report one that does not resolve by its
-  key, never its value. `validate` lists it with its other problems; `graph` and `dryrun` exit
-  with it as an error. A reference set is left out, as `serve` and `check` leave an unresolved
-  one to its sync. Without `--env` nothing changes. Where they still differ from `serve`, at least:
+  and `dryrun` now run the service settings load `serve` runs, with `--env` as the
+  `[ai].environment` override and `--project-root` as the `[environments].base_dir` override that
+  `serve` applies. That one load names the value file for both the missing-file check (AC-3) and
+  the read, and the check fires wherever it names a project root, a `base_dir` from the settings
+  file or the environment included, as `serve`'s does. They read the file with `serve`'s own
+  reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load fail the command,
+  naming the settings file; a value file that cannot be read fails it, naming the value file.
+  Neither failure names a value. They resolve every `env()` reference of each deployed connection
+  and lookup, and report one that does not resolve by its key, never its value. `validate` lists
+  it with its other problems and `dryrun` stops on it. `graph` lists it under `env_problems`
+  beside the graph and exits as it would without it, because it reports a graph and does not gate
+  one (BACKLOG #1648); that is a Manager decision. A reference set is left out, as `serve` and
+  `check` leave an unresolved one to its sync. Without `--env` nothing changes. Where they still
+  differ from `serve`, at least:
 
   - Under `--project-root` with no `--service-config`, the settings file is
-    `<root>/messagefoundry.toml` where one exists, as the value-file check above reads it, where
-    `serve` reads `./messagefoundry.toml`.
+    `<root>/messagefoundry.toml` where one exists, where `serve` reads `./messagefoundry.toml`.
   - No connector is built, so a refusal only the build check makes, such as an egress or hop
     refusal, is still `check --env`'s, as is the posture check.
   - `dryrun`'s Handlers still run with no active environment.
@@ -479,6 +483,8 @@ those settings, and its Handlers still run with no active environment.
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now
 reads `MEFOR_ENVIRONMENTS_DIR` above the file's `[environments].dir`, as `serve`'s settings load
-does. The file it reads that `dir` from can still differ from the one `serve` reads. It does not cover a `[environments].base_dir`
-set in the file or the environment without `--project-root`: `serve` fails loud on a missing value
-file under that root, and the offline check fires only under an explicit `--project-root`.
+does. The file it reads that `dir` from can still differ from the one `serve` reads. For `check`
+it does not cover a `[environments].base_dir` set in the file or the environment without
+`--project-root`: `serve` fails loud on a missing value file under that root, and `check`'s value-file
+check fires only under an explicit `--project-root`. `validate`, `graph` and `dryrun` cover it
+since the 2026-11-20 note above.
