@@ -769,7 +769,9 @@ def _impact(args: argparse.Namespace) -> int:
         if args.apply:
             try:
                 applied = apply_rename(plan)
-            except OSError as exc:
+            except WiringError as exc:
+                # A file changed after the plan, or could not be read or written; apply_rename left
+                # every file as it was, or names the ones it could not restore (BACKLOG #5980).
                 return _emit_error(str(exc), as_json=args.json)
             result["applied"] = len(applied)
             result["dry_run"] = False
