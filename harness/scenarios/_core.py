@@ -285,7 +285,8 @@ def _verify_sink(
     def arrived(records: list[sinks.Record]) -> set[str]:
         return {cid for r in records if (cid := control_id_of(r.payload)) in wanted}
 
-    records = sink.wait_for(lambda rs: arrived(rs) >= wanted, timeout)
+    # A sink fault fails the check whatever else arrives, so the wait ends on one too.
+    records = sink.wait_for(lambda rs: arrived(rs) >= wanted or bool(sink_faults(rs)), timeout)
     got = arrived(records)
     detail = f"{prior}; {len(got)}/{len(wanted)} delivered to the {scenario.sink} sink"
     links = sink_faults(records)
@@ -294,25 +295,57 @@ def _verify_sink(
     return ScenarioResult(scenario, got >= wanted, detail)
 
 
+def record_where(record: sinks.Record) -> str:
+    """Where a sink record says its entry is: its ``relpath``; or, for a name the file sink refused
+    before joining it, that name under its ``meta["folder"]``; or its bare name."""
+    meta = record.meta
+    if "relpath" in meta:
+        return meta["relpath"]
+    name = meta.get("name", "?")
+    folder = meta.get("folder")
+    return name if folder in (None, ".") else f"{folder}/{name}"
+
+
 def sink_faults(records: Iterable[sinks.Record]) -> str:
     """A failure note naming the records a sink took as a link (``meta["symlink"]``), the other
-    entries the file sink recorded unread (a FIFO or device, a refused name), and its scan-wide
-    refusals (a replaced directory, a bounded scan), or "" when there are none. Each is recorded
-    unread, so it carries no control id, and a scan that did not cover the directory may have
-    missed a link: any of them would otherwise be invisible to a check that counts control ids."""
+    entries the file sink recorded unread (a FIFO or device, a refused name, an over-cap file), its
+    scan-wide refusals (a replaced directory, a bounded scan), and a file read that could not be
+    shown to be inside the sink directory (``meta["inside"]`` not true: an escape, or a resolve
+    that failed), or "" when there are none. An unread entry carries no control id, a scan that
+    did not cover the directory may have missed a link, and a file that could not be shown to be
+    inside may carry any control id: each would otherwise be invisible to a check that counts
+    control ids. Not caught: a folder moved out of the directory after the walk entered it and
+    replaced by another at its old name, since ``inside`` is judged by the path afterwards. Names are quoted with ``repr``, since a File
+    outbound can render one from HL7 fields."""
     links: list[str] = []
     unread: list[str] = []
+    other: list[str] = []
     incomplete: list[str] = []
+    outside: list[str] = []
     for r in records:
         refused = r.meta.get("refused")
+        where = record_where(r)
         if r.meta.get("symlink") == "true":
-            links.append(r.meta.get("relpath", r.meta.get("name", "?")))
+            links.append(where)
         elif refused in (NOT_REGULAR, file_sink.UNSAFE_NAME):
-            unread.append(r.meta.get("relpath", r.meta.get("name", "?")))
+            unread.append(where)
         elif refused in (file_sink.ROOT_CHANGED, file_sink.WALK_BOUND):
             incomplete.append(refused)
-    notes = [f"a link appeared in the sink ({', '.join(links)})"] if links else []
+        elif "inside" not in r.meta:
+            continue  # not a file sink's record: no other check here reads it
+        elif refused:
+            other.append(f"{where!r}: {refused}")  # over the cap, or grew past it while read
+        elif r.meta["inside"] != "true":
+            outside.append(where)
+    notes = [f"a link appeared in the sink ({', '.join(map(repr, links))})"] if links else []
     if unread:
         notes.append(f"a non-file entry appeared in the sink ({', '.join(map(repr, unread))})")
+    if other:
+        notes.append(f"an entry in the sink was not read ({', '.join(other)})")
+    if outside:
+        notes.append(
+            "a file was read that could not be shown to be inside the sink directory "
+            f"({', '.join(map(repr, outside))})"
+        )
     notes += [f"the file sink's scan was incomplete: {reason}" for reason in incomplete]
     return "; ".join(notes)
