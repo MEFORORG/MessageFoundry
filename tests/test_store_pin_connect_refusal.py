@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sys
 import types
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -34,9 +35,9 @@ from messagefoundry.auth.trust_anchors import (
     store_pin_anchor_spec,
 )
 from messagefoundry.config.settings import StoreSettings
-from messagefoundry.config.tls_policy import StoreTlsRefused
 from messagefoundry.store.sqlserver import (
     SqlServerStore,
+    StorePinConnectRefused,
     _build_pool_executor,
     check_pinned_certificate,
     refuse_connect_after_pin_refusal,
@@ -59,8 +60,7 @@ def _fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
     monkeypatch.setattr(ta, "_STORE_CONTENT_RECORDED", {})
     monkeypatch.setattr(ta, "_STORE_PIN_FIRST_CHECKED", {})
-    # raising=False: the negative control runs this file against a head without the gate.
-    monkeypatch.setattr(ta, "_STORE_PIN_REFUSED", {}, raising=False)
+    monkeypatch.setattr(ta, "_STORE_PIN_REFUSED", {})
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
 
@@ -105,15 +105,16 @@ async def _refuse_at(store: MessageStore, pin: Path, *, enforcing: bool) -> Stor
 def test_the_off_hop_pin_warning_says_a_restart_accepts_a_renewal(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Red on batch/w5-a 68c1a2d2128, whose warning says what to do only when the change is not a
-    renewal, so an operator who renewed the certificate is not told that only a restart accepts
-    it, and is warned at each check until then."""
+    """Red under: the warning text of batch/w5-a 68c1a2d2128, which says what to do only when the
+    change is not a renewal, so an operator who renewed the certificate is not told that a restart
+    makes the renewed pin the baseline, and is warned at each check until then."""
     spec = _specs(_settings(_pin(tmp_path)))[0]
     ta.note_store_pin_checked(spec, "a" * 64)
     caplog.set_level("WARNING", logger=ta.__name__)
     ta._warn_off_hop_pin_change(spec, "b" * 64)
     (message,) = [r.getMessage() for r in caplog.records]
     assert "If it is a renewal you made, restart each engine process" in message
+    assert "takes the renewed pin as its baseline" in message
     assert "the baseline moves only at a restart" in message
 
 
@@ -121,11 +122,14 @@ def test_the_off_hop_pin_warning_says_a_restart_accepts_a_renewal(
 
 
 async def test_an_enforce_refusal_refuses_new_store_connects(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Red on batch/w5-a 68c1a2d2128, where a refused reload leaves the store connecting."""
+    """Red under: the refusal not held in :func:`_preflight_one`, where a refused reload leaves the
+    store connecting. Holding it logs an ERROR, since the reload's refusal does not say so."""
+    caplog.set_level("ERROR", logger=ta.__name__)
     settings = await _refuse_at(store, _pin(tmp_path), enforcing=True)
-    with pytest.raises(StoreTlsRefused, match="a new store connection was refused"):
+    assert any("now refuses new connections" in r.getMessage() for r in caplog.records)
+    with pytest.raises(StorePinConnectRefused, match="a new store connection was refused"):
         refuse_connect_after_pin_refusal(settings)
 
 
@@ -143,11 +147,39 @@ async def test_a_passing_settings_check_lets_the_store_connect_again(
     pin = _pin(tmp_path)
     good = pin.read_bytes()
     settings = await _refuse_at(store, pin, enforcing=True)
-    with pytest.raises(StoreTlsRefused):  # the control: refused until the check passes
+    with pytest.raises(StorePinConnectRefused):  # the control: refused until the check passes
         refuse_connect_after_pin_refusal(settings)
     pin.write_bytes(good)
     await run_anchor_preflight(_specs(settings), store, enforcing=True)
     refuse_connect_after_pin_refusal(settings)
+
+
+async def test_a_settings_check_that_only_warns_of_the_pin_keeps_the_refusal(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A pin the settings check only warns of, here a file of two certificates, which the store
+    open refuses, does not let the store connect again. Red under: the release run on any pass."""
+    pin = _pin(tmp_path)
+    good = pin.read_bytes()
+    settings = await _refuse_at(store, pin, enforcing=True)
+    other = tmp_path / "other"
+    other.mkdir()
+    pin.write_bytes(good + _pin(other).read_bytes())
+    await run_anchor_preflight(_specs(settings), store, enforcing=True)  # warns, does not refuse
+    with pytest.raises(StorePinConnectRefused):
+        refuse_connect_after_pin_refusal(settings)
+
+
+def test_a_store_with_no_pin_gets_a_plain_pool_executor() -> None:
+    """No pin, so nothing can refuse a connect, and the pool's calls skip the gate's check."""
+    settings = StoreSettings.model_validate(
+        {"backend": "sqlserver", "server": "db.example", "database": "mefor", "username": "mefor"}
+    )
+    executor = _build_pool_executor(settings, 1)
+    try:
+        assert type(executor) is ThreadPoolExecutor
+    finally:
+        executor.shutdown(wait=True)
 
 
 async def test_a_store_open_check_at_enforce_lets_the_store_connect_again(
@@ -158,7 +190,7 @@ async def test_a_store_open_check_at_enforce_lets_the_store_connect_again(
     pin = _pin(tmp_path)
     good = pin.read_bytes()
     settings = await _refuse_at(store, pin, enforcing=True)
-    with pytest.raises(StoreTlsRefused):  # the control: refused until the check passes
+    with pytest.raises(StorePinConnectRefused):  # the control: refused until the check passes
         refuse_connect_after_pin_refusal(settings)
     pin.write_bytes(good)
     check_pinned_certificate(settings)
@@ -188,7 +220,7 @@ async def test_the_pool_executor_refuses_a_pyodbc_connect_after_an_enforce_refus
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The pool dials through its executor, so the executor refuses the connect before it runs.
-    Red on batch/w5-a 68c1a2d2128, where the executor runs it. The controls: another call on the
+    Red under: a plain ``ThreadPoolExecutor``, which runs it. The controls: another call on the
     same executor still runs, and so does the connect once nothing is refused."""
     dialled = _fake_pyodbc(monkeypatch)
     pyodbc: Any = sys.modules["pyodbc"]
@@ -197,9 +229,9 @@ async def test_the_pool_executor_refuses_a_pyodbc_connect_after_an_enforce_refus
     try:
         assert executor.submit(partial(pyodbc.connect, "dsn-before")).result() is not None
         await _refuse_at(store, pin, enforcing=True)
-        with pytest.raises(StoreTlsRefused):
+        with pytest.raises(StorePinConnectRefused):
             executor.submit(partial(pyodbc.connect, "dsn-after"))
-        with pytest.raises(StoreTlsRefused):
+        with pytest.raises(StorePinConnectRefused):
             executor.submit(pyodbc.connect, "dsn-bare")
         assert executor.submit(lambda: 42).result() == 42
         assert dialled == ["dsn-before"]
@@ -210,7 +242,7 @@ async def test_the_pool_executor_refuses_a_pyodbc_connect_after_an_enforce_refus
 async def test_a_claim_holder_connect_is_refused_after_an_enforce_refusal(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Red on batch/w5-a 68c1a2d2128, where the dedicated claim connection dials."""
+    """Red under: no gate in ``_connect_claim_conn``, where the dedicated connection dials."""
     dialled: list[dict[str, Any]] = []
 
     async def connect(**kwargs: Any) -> object:
@@ -223,7 +255,7 @@ async def test_a_claim_holder_connect_is_refused_after_an_enforce_refusal(
     settings = await _refuse_at(store, _pin(tmp_path), enforcing=True)
     claim_store = object.__new__(SqlServerStore)  # the offline-test idiom: no pool, no I/O
     claim_store._settings = settings
-    with pytest.raises(StoreTlsRefused):
+    with pytest.raises(StorePinConnectRefused):
         await claim_store._connect_claim_conn()
     assert dialled == []
 
@@ -231,13 +263,13 @@ async def test_a_claim_holder_connect_is_refused_after_an_enforce_refusal(
 async def test_a_sync_handoff_connect_is_refused_after_an_enforce_refusal(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Red on batch/w5-a 68c1a2d2128, where the sync handoff pool dials."""
+    """Red under: no gate in the sync handoff factory, where the pool dials."""
     dialled = _fake_pyodbc(monkeypatch)
     settings = await _refuse_at(store, _pin(tmp_path), enforcing=True)
     sync_store = object.__new__(SqlServerStore)
     sync_store._settings = settings
     sync_store._sync_pools = {}
-    with pytest.raises(StoreTlsRefused):
+    with pytest.raises(StorePinConnectRefused):
         sync_store.open_sync_handoff_pool("routed", 1)
     assert dialled == []
 
@@ -260,7 +292,7 @@ async def test_aioodbc_dials_through_the_pool_executor_as_pyodbc_connect(
     settings = await _refuse_at(store, _pin(tmp_path), enforcing=True)
     executor = _build_pool_executor(settings, 1)
     try:
-        with pytest.raises(StoreTlsRefused):
+        with pytest.raises(StorePinConnectRefused):
             await aioodbc.connect(dsn="DRIVER=x", executor=executor)
         assert dialled == []
     finally:
