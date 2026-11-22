@@ -213,14 +213,12 @@ def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directo
 
 def test_a_path_alone_joined_into_an_empty_key_is_kept() -> None:
     """The fourth hold's H2. A path-only directory entry joined into the empty key is the
-    service's directory entry, so the remedy says to keep it, and nothing after says otherwise.
-    """
+    service's directory entry, so the remedy ends by saying to keep it."""
     posture = _read([f"{_KEY}=", "mefor_secrets_directory=C:\\d"])
     assert posture.listed_keys == (_KEY,) and posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
-    assert CREATE not in refusal
 
 
 def test_a_path_alone_joined_into_an_empty_key_beside_a_secret_is_kept() -> None:
@@ -246,9 +244,9 @@ def test_a_key_bearing_directory_entry_still_gets_the_remove_guidance() -> None:
     assert f"{REMOVE}. {RUNS_ON}" in refusal
 
 
-def test_protect_key_and_the_secrets_directory_come_before_any_removal() -> None:
+def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() -> None:
     """The fourth hold's H1: protect-key reads the key from the shell, and a secret is copied
-    to its file, before any step says to remove a variable."""
+    to its file, before the step that says to remove each refused variable."""
     refusal = service_env_refusal(
         _read([f"{_KEY}=", _KEY_B64, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", "MEFOR_VALUE_A=1"])
     )

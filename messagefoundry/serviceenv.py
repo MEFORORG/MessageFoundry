@@ -1110,7 +1110,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # The installer refuses an existing directory the service does not name, so this points
         # only at how one is created, only where a non-empty setting goes to one, and before the
         # step that moves it there (the third hold's H2, the fourth hold's H1 and H3).
-        moves = others or any(
+        moves = bool(others) or any(
             v not in posture.empty_value_names and v != _VALUE_PREFIX for v in values
         )
         if _DIRECTORY_VARIABLE not in posture.listed and moves:
