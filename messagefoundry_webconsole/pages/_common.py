@@ -5,8 +5,8 @@
 Small, escape-neutral formatters imported by the per-area page modules (``connections``,
 ``messages``, …) so the rendering conventions live in one place, never copy-pasted per module.
 A route may import one too when it renders the same words outside a page: ``routes.status``
-takes ``_failed_inbound_reason`` so the nav heart and the status page share one sentence
-(BACKLOG #1816), the way ``routes.core`` already takes ``_seg``.
+takes ``_failed_inbound_reason`` and ``_failed_lookup_reason`` so the nav heart and the status
+page share one sentence (BACKLOG #1816), the way ``routes.core`` already takes ``_seg``.
 
 Some of these build a URL or a whole footer rather than format a cell — at least ``_seg`` for one
 path segment, ``_pager`` for a listing's Previous/Next query, and ``_window_note`` for a listing
@@ -227,32 +227,36 @@ def _failed_inbound_reason(count: int, names: list[str]) -> str:
     without learning whose feed it is. Connection NAMES only: the engine's failure reason is a raw
     exception string, and this text lands in a ``title=`` attribute.
     """
+    return _named_failure_reason(
+        count, names, named="inbound", one="inbound connection", many="inbound connections"
+    )
+
+
+def _failed_lookup_reason(names: list[str]) -> str:
+    """The sentence for the isolated ``FhirLookup`` names in ``EngineInfo.fhir_lookups_failed``
+    (vault BACKLOG #3008), for the nav heart and the status page alike, as
+    :func:`_failed_inbound_reason` is for inbounds. Names only, never the engine's reason, for the
+    reason that function gives."""
+    return _named_failure_reason(
+        len(names), names, named="FHIR lookup", one="FHIR lookup", many="FHIR lookups"
+    )
+
+
+def _named_failure_reason(count: int, names: list[str], *, named: str, one: str, many: str) -> str:
+    """``count`` start failures, naming at most :data:`_MAX_NAMED_FAILURES` of ``names``."""
     shown = names[:_MAX_NAMED_FAILURES]
     if count == 1:
         # The scoped caller's single hidden failure takes the second form: "1 inbound connections"
         # is what a shared plural head would produce, and an operator reading a tooltip notices.
         if shown:
-            return f"inbound {shown[0]} failed to start"
-        return "1 inbound connection failed to start"
-    head = f"{count} inbound connections failed to start"
+            return f"{named} {shown[0]} failed to start"
+        return f"1 {one} failed to start"
+    head = f"{count} {many} failed to start"
     if not shown:
         return head
     hidden = count - len(shown)
     listed = ", ".join(shown)
     return f"{head}: {listed}, and {hidden} more" if hidden > 0 else f"{head}: {listed}"
-
-
-def _failed_lookup_reason(names: list[str]) -> str:
-    """The sentence for the isolated ``FhirLookup`` names in ``EngineInfo.fhir_lookups_failed``
-    (vault BACKLOG #3008). Names only, never the engine's reason, for the reason
-    ``_failed_inbound_reason`` gives."""
-    shown = names[:_MAX_NAMED_FAILURES]
-    if len(names) == 1:
-        return f"FHIR lookup {shown[0]} failed to start"
-    hidden = len(names) - len(shown)
-    listed = ", ".join(shown)
-    head = f"{len(names)} FHIR lookups failed to start: {listed}"
-    return f"{head}, and {hidden} more" if hidden > 0 else head
 
 
 def _num(value: object) -> str:

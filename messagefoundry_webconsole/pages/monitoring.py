@@ -37,6 +37,7 @@ from messagefoundry.connection_events import CONNECTION_EVENT_KIND_ORDER
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import (
     _failed_inbound_reason,
+    _failed_lookup_reason,
     _log_forwarder_reason,
     _log_forwarder_text,
     _pager,
@@ -495,6 +496,18 @@ def status(
         if e.channels_failed
         else []
     )
+    # Vault BACKLOG #3008: the isolated FhirLookups, in the heart's own sentence as for inbounds.
+    if e.fhir_lookups_failed:
+        failed_rows.append(
+            [
+                "FHIR lookup start failures",
+                el(
+                    "span",
+                    _failed_lookup_reason(e.fhir_lookups_failed),
+                    class_="status status-failed",
+                ),
+            ]
+        )
     # BACKLOG #2612: no row when no forwarder is configured. This process's forwarder only: under
     # engine shards each process has its own.
     forwarder_reason = _log_forwarder_reason(sys.log_forwarder)

@@ -73,11 +73,13 @@ def _derive_health(
     - running on the DR failover box (``dr.active``) → **warn**; a clustered engine with no leader → **down**.
     - a pooled pipeline stage whose claimer died and has not recovered → **down**, naming
       the stage (BACKLOG #1609).
+    - a ``FhirLookup`` isolated at start → **warn**, naming it (vault BACKLOG #3008). The names
+      reach an estate-wide caller only (``EngineInfo.fhir_lookups_failed`` says why), so a
+      channel-scoped caller's heart does not show this. It is appended after the two inbound rules
+      below and before the disk, pool, forwarder and DR rules, so at the warn level a failed inbound
+      wins the tooltip over it, and it wins over those.
     - any deployed inbound that failed to start → **warn**, naming it (BACKLOG #1741).
     - zero deployed inbounds on a STARTED engine → **warn** (BACKLOG #1741).
-    - a ``FhirLookup`` isolated at start → **warn**, naming it (vault BACKLOG #3008). The engine
-      sends those names to an estate-wide caller only, so a channel-scoped caller's heart does not
-      show this.
 
     The last two are why connection state belongs here at all: without them the heart read ``ok``
     over an empty configuration and over an inbound that never got its port, while the dashboard row
@@ -113,9 +115,7 @@ def _derive_health(
         if eng.channels_total == 0 and eng.uptime_seconds > 0:
             issues.append((1, "no inbound connections deployed"))
         # Vault BACKLOG #3008: a FhirLookup isolated at start fails every Handler call to it
-        # closed while the rest of the graph serves, so it is a warn like a failed inbound. The
-        # engine names lookups to an estate-wide caller only, so a channel-scoped one never sees
-        # this rule fire.
+        # closed while the rest of the graph serves, so it is a warn like a failed inbound.
         if eng.fhir_lookups_failed:
             issues.append((1, _failed_lookup_reason(eng.fhir_lookups_failed)))
         # (label, free bytes, the reason to raise if a null HERE means a failed probe rather than a

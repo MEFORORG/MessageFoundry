@@ -119,6 +119,7 @@ def _sysinfo(
     uptime: float = 1.0,
     journal_mode: str = "wal",
     disk_free_status: str | None = None,
+    fhir_lookups_failed: list[str] | None = None,
 ):
     """A minimal SystemStatus for _derive_health tests — only the fields the rollup reads matter.
 
@@ -142,6 +143,9 @@ def _sysinfo(
     to the engine's own probe: ``"observed"`` over a figure and ``"unobservable"`` over ``None``,
     the SQLite shapes. A server backend passes ``"not_applicable"``. ``journal_mode`` is carried
     only for display now; the rollup no longer reads it.
+
+    ``fhir_lookups_failed`` is the isolated ``FhirLookup`` names an estate-wide caller is shown
+    (vault BACKLOG #3008).
     """
     from messagefoundry.api.models import (
         DbInfo,
@@ -172,6 +176,7 @@ def _sysinfo(
             outbox_by_status={},
             channels_failed=failed,
             channels_failed_names=names,
+            fhir_lookups_failed=list(fhir_lookups_failed or []),
         ),
         db=DbInfo(
             path="db",

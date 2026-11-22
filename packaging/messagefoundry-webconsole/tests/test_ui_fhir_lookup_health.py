@@ -4,38 +4,15 @@
 
 from __future__ import annotations
 
-from messagefoundry.api.models import DbInfo, EngineInfo, SystemStatus
+from _webui_support import _GIB, _sysinfo
+
 from messagefoundry_webconsole.pages._common import _MAX_NAMED_FAILURES, _failed_lookup_reason
 from messagefoundry_webconsole.routes.status import _derive_health
 
 
-def _sys(lookups: list[str]) -> SystemStatus:
-    return SystemStatus(
-        engine=EngineInfo(
-            version="0",
-            uptime_seconds=10.0,
-            pid=1,
-            channels_total=1,
-            channels_running=1,
-            channels_stopped=0,
-            outbox_by_status={},
-            fhir_lookups_failed=lookups,
-        ),
-        db=DbInfo(
-            path="db",
-            size_bytes=1,
-            disk_free_bytes=100 * 1024**3,
-            disk_free_status="observed",
-            journal_mode="wal",
-            messages=0,
-            events=0,
-            audit=0,
-        ),
-    )
-
-
 def test_an_isolated_lookup_turns_the_heart_to_warn_and_names_it() -> None:
-    assert _derive_health(_sys(["FHIR_EMPI"]), None, None, None) == (
+    status = _sysinfo(50 * _GIB, fhir_lookups_failed=["FHIR_EMPI"])
+    assert _derive_health(status, None, None, None) == (
         "warn",
         "FHIR lookup FHIR_EMPI failed to start",
     )
@@ -43,7 +20,19 @@ def test_an_isolated_lookup_turns_the_heart_to_warn_and_names_it() -> None:
 
 def test_no_isolated_lookup_leaves_the_heart_ok() -> None:
     # The control: the same status with an empty list reads ok, so the warn above is this field's.
-    assert _derive_health(_sys([]), None, None, None) == ("ok", None)
+    assert _derive_health(_sysinfo(50 * _GIB), None, None, None) == ("ok", None)
+
+
+def test_a_failed_inbound_wins_the_tooltip_and_the_lookup_wins_over_low_disk() -> None:
+    # The warn-level tie-break is insertion order: the inbound rules first, then the lookup, then
+    # the disk, pool, forwarder and DR rules.
+    both = _sysinfo(50 * _GIB, channels=3, failed_names=["IB_ACME_ADT"], fhir_lookups_failed=["L"])
+    assert _derive_health(both, None, None, None) == ("warn", "inbound IB_ACME_ADT failed to start")
+    low_disk = _sysinfo(2 * _GIB, fhir_lookups_failed=["L"])
+    assert _derive_health(low_disk, None, None, None) == ("warn", "FHIR lookup L failed to start")
+    # A down-level issue still takes the tooltip.
+    full_disk = _sysinfo(0, fhir_lookups_failed=["L"])
+    assert _derive_health(full_disk, None, None, None)[0] == "down"
 
 
 def test_the_sentence_names_at_most_the_cap() -> None:
@@ -52,4 +41,10 @@ def test_the_sentence_names_at_most_the_cap() -> None:
     assert _failed_lookup_reason(names) == (
         f"{len(names)} FHIR lookups failed to start: {listed}, and 2 more"
     )
+    at_cap = names[:_MAX_NAMED_FAILURES]
+    assert _failed_lookup_reason(at_cap) == (
+        f"{_MAX_NAMED_FAILURES} FHIR lookups failed to start: {listed}"
+    )
     assert _failed_lookup_reason(["A", "B"]) == "2 FHIR lookups failed to start: A, B"
+    # No dangling colon on an empty list.
+    assert _failed_lookup_reason([]) == "0 FHIR lookups failed to start"
