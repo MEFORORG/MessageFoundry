@@ -10,9 +10,11 @@ bypass — invisible because the symptom reads as "CI is stuck", not "protection
 ``tests/test_required_contexts.py`` cannot catch that: a disabled workflow keeps its file and job name
 on disk, so resolving a context against YAML passes in the healthy *and* the broken case.
 
-WHY THESE TESTS DRIVE THE REAL ``main()``. Every case below runs the shipped entry point through its
-``--states-json`` seam rather than re-implementing the rule. A guard whose test asserts a local copy of
-the logic is a guard nobody has run — and this repo has been bitten by exactly that.
+WHY THESE TESTS DRIVE THE REAL ``main()``. The behaviour cases call the shipped entry point rather than
+re-implementing the rule, either through its ``--states-json`` seam or with ``subprocess.run`` stubbed
+beneath ``gh_api``. A few static guards near the end read the script or its workflow file and do not
+call ``main()``. A guard whose test asserts a local copy of the logic is a guard nobody has run — and
+this repo has been bitten by exactly that.
 
 MEASUREMENT, DATED so it cannot age into a false claim: on **2026-07-30** MEFORORG had 19 workflows,
 all ``active``, and all 13 required contexts resolved to active workflows. The hazard is real but was
@@ -22,9 +24,11 @@ module — that would make the suite depend on the network and on a mutable serv
 
 from __future__ import annotations
 
+import functools
 import json
 import subprocess
 import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -33,11 +37,16 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 
 from scripts.ci.check_required_workflow_state import main  # noqa: E402
+from tests import _workflow_contexts as workflow_contexts  # noqa: E402
 from tests._workflow_contexts import required_contexts, resolve  # noqa: E402
 
 
-def _required_workflow_files() -> set[str]:
-    """The workflow FILES that own a required context — resolved by the shipped resolver."""
+@functools.cache
+def _required_workflow_files() -> frozenset[str]:
+    """The workflow FILES that own a required context — resolved by the shipped resolver.
+
+    Cached so the tests that clear the workflow scan do not each re-parse every real workflow.
+    """
     out = set()
     for ctx in required_contexts():
         where = resolve(ctx)
@@ -46,7 +55,7 @@ def _required_workflow_files() -> set[str]:
             "tests/test_required_contexts.py owns that assertion."
         )
         out.add(where[0])
-    return out
+    return frozenset(out)
 
 
 def _payload(states: dict[str, str]) -> dict:
@@ -297,6 +306,138 @@ def test_a_malformed_shape_exits_2(tmp_path: Path, payload: object) -> None:
     p = tmp_path / "bad.json"
     p.write_text(json.dumps(payload), encoding="utf-8")
     assert main(["--states-json", str(p)]) == 2
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        pytest.param("dynamic/../.github/workflows/{name}", id="traversal-out-of-dynamic"),
+        pytest.param("dynamic/x/../../.github/workflows/{name}", id="deep-traversal"),
+        pytest.param("dynamic/..", id="dynamic-parent"),
+        pytest.param(".github/workflows/..", id="dotdot-as-the-filename"),
+        pytest.param("dynamic", id="bare-dynamic"),
+        pytest.param("dynamic/", id="bare-dynamic-slash"),
+    ],
+)
+def test_a_path_the_dynamic_skip_must_not_take_exits_2(
+    monkeypatch: pytest.MonkeyPatch, template: str
+) -> None:
+    """Skipping one of these would hide a ``disabled_manually`` beside an active entry: a false pass."""
+    entries = _active_entries()
+    name = Path(str(entries[0]["path"])).name
+    odd = {**entries[0], "path": template.format(name=name), "state": "disabled_manually"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": [*entries, odd]}]))
+    assert main(["--repo", "owner/name"]) == 2
+
+
+def test_a_real_dynamic_entry_is_still_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control for the refusal above: GitHub's own ``dynamic/`` shape does not abort the sweep."""
+    entries = _active_entries()
+    dynamic = {"path": "dynamic/pages/pages-build-deployment", "state": "disabled_manually"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": [*entries, dynamic]}]))
+    assert main(["--repo", "owner/name"]) == 0
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        pytest.param(".github/workflows/nested/{name}", id="nested-under-workflows"),
+        pytest.param(".github/workflows/a/b/{name}", id="deeply-nested"),
+        pytest.param("vendor/.github/workflows/{name}", id="workflows-dir-further-down"),
+        pytest.param(".github/workflows-old/{name}", id="sibling-directory"),
+        pytest.param("/.github/workflows/{name}", id="absolute"),
+        pytest.param("{name}", id="bare-basename"),
+    ],
+)
+def test_a_file_elsewhere_cannot_stand_in_by_basename(
+    monkeypatch: pytest.MonkeyPatch, template: str
+) -> None:
+    """Keyed on the basename, an active file here would report the required workflow as runnable."""
+    entries = _active_entries()
+    name = Path(str(entries[0]["path"])).name
+    entries[0] = {**entries[0], "path": template.format(name=name)}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": entries}]))
+    assert main(["--repo", "owner/name"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "template"),
+    [
+        pytest.param("path", "{} ", id="path-trailing-space"),
+        pytest.param("path", " {}", id="path-leading-space"),
+        pytest.param("path", "{}\n", id="path-trailing-newline"),
+        pytest.param("state", "{} ", id="state-trailing-space"),
+        pytest.param("state", " {}", id="state-leading-space"),
+        pytest.param("state", "{}\t", id="state-trailing-tab"),
+    ],
+)
+def test_a_padded_value_is_malformed(
+    monkeypatch: pytest.MonkeyPatch, field: str, template: str
+) -> None:
+    """Padding is a bad payload, exit 2. It is not a disabled or absent workflow, exit 1."""
+    entries = _active_entries()
+    entries[0] = {**entries[0], field: template.format(entries[0][field])}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": entries}]))
+    assert main(["--repo", "owner/name"]) == 2
+
+
+@pytest.fixture
+def repoint_workflows(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[Path], None]]:
+    """Point the memoised workflow scan at a directory, and leave no cached scan of it behind."""
+
+    def repoint(workflows: Path) -> None:
+        monkeypatch.setattr(workflow_contexts, "WORKFLOWS", workflows)
+        workflow_contexts._reportable_contexts.cache_clear()
+
+    yield repoint
+    workflow_contexts._reportable_contexts.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"\xff\xfe not utf-8", id="undecodable"),
+        pytest.param(b"jobs: [unclosed", id="invalid-yaml"),
+        pytest.param(b"- a list\n", id="not-a-mapping"),
+        pytest.param(b"jobs: [a, b]\n", id="jobs-not-a-mapping"),
+        pytest.param(b"jobs:\n  build: text\n", id="job-not-a-mapping"),
+    ],
+)
+def test_a_bad_local_workflow_file_exits_2(
+    tmp_path: Path, repoint_workflows: Callable[[Path], None], content: bytes
+) -> None:
+    """Failing to read our own files is "could not measure", never the findings code."""
+    states = _write(tmp_path, dict.fromkeys(_required_workflow_files(), "active"))
+    workflows = tmp_path / "workflows"
+    workflows.mkdir()
+    (workflows / "bad.yml").write_bytes(content)
+    repoint_workflows(workflows)
+    assert main(["--states-json", str(states)]) == 2
+
+
+def test_an_unopenable_workflow_file_exits_2(
+    tmp_path: Path, repoint_workflows: Callable[[Path], None]
+) -> None:
+    """A directory named like a workflow raises ``OSError`` on read, on every platform."""
+    states = _write(tmp_path, dict.fromkeys(_required_workflow_files(), "active"))
+    workflows = tmp_path / "workflows"
+    (workflows / "bad.yml").mkdir(parents=True)
+    repoint_workflows(workflows)
+    assert main(["--states-json", str(states)]) == 2
+
+
+@pytest.mark.parametrize(
+    "content", [pytest.param(None, id="missing"), pytest.param(b"\xff\xfe", id="undecodable")]
+)
+def test_an_unreadable_required_contexts_file_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes | None
+) -> None:
+    states = _write(tmp_path, dict.fromkeys(_required_workflow_files(), "active"))
+    contexts = tmp_path / "required-contexts.txt"
+    if content is not None:
+        contexts.write_bytes(content)
+    monkeypatch.setattr(workflow_contexts, "CANONICAL_CONTEXTS", contexts)
+    assert main(["--states-json", str(states)]) == 2
 
 
 def test_undecodable_bytes_exit_2(tmp_path: Path) -> None:

@@ -39,6 +39,8 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+import yaml
+
 _ROOT = Path(__file__).resolve().parents[2]
 
 # Reuse the SAME resolver the doc-drift tests use, rather than re-deriving context -> workflow here.
@@ -54,6 +56,19 @@ from tests._workflow_contexts import required_contexts, resolve  # noqa: E402
 _RUNNABLE = "active"
 
 _WORKFLOW_DIR = PurePosixPath(".github/workflows")
+
+#: What reading the local contexts file and workflow YAML can raise. The resolver asserts a mapping
+#: and then indexes into the parse, so a wrongly shaped file surfaces as an assertion, attribute or
+#: type error. RuntimeError covers RecursionError from deeply nested YAML.
+_LOCAL_READ_ERRORS = (
+    OSError,
+    ValueError,
+    RuntimeError,
+    yaml.YAMLError,
+    AssertionError,
+    AttributeError,
+    TypeError,
+)
 
 
 def _workflow_entries(payload: object) -> list[object]:
@@ -85,13 +100,16 @@ def _workflow_entries(payload: object) -> list[object]:
 def _workflow_state(entry: object) -> tuple[str, str]:
     """``(path, state)`` of one entry, or ``RuntimeError``.
 
-    A missing field must not default to ``""``: that would report a malformed payload as a disabled
-    workflow, exit 1, which is the findings code.
+    A missing field must not default to ``""``, and a padded one must not pass through: either would
+    report a malformed payload as a disabled or absent workflow, exit 1, which is the findings code.
     """
     if not isinstance(entry, dict):
         raise RuntimeError("a workflow entry is not an object")
     path, state = entry.get("path"), entry.get("state")
-    if not (isinstance(path, str) and path.strip() and isinstance(state, str) and state.strip()):
+    # Two isinstance checks rather than one all(): mypy narrows these and not a generator.
+    if not (isinstance(path, str) and isinstance(state, str)) or not all(
+        value and value == value.strip() for value in (path, state)
+    ):
         raise RuntimeError("a workflow entry lacks a usable `path` or `state`")
     return path, state
 
@@ -112,12 +130,15 @@ def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, st
         payload = gh_api(["--paginate", "--slurp", route])
     # Only a file directly in .github/workflows can own a required context. The list also carries
     # GitHub's `dynamic/` entries, skipped so a basename match cannot let one stand in for a real
-    # file; any other path is malformed. A repeat that disagrees is refused, because last-wins could
-    # overwrite a disabled state.
+    # file; any other path is malformed. PurePosixPath keeps `..`, so it is refused first: it could
+    # otherwise ride the skip out of `dynamic/`, or be the "filename" in `.github/workflows/..`. A
+    # repeat that disagrees is refused, because last-wins could overwrite a disabled state.
     states: dict[str, str] = {}
     for path, state in map(_workflow_state, _workflow_entries(payload)):
         where = PurePosixPath(path)
-        if where.parts[:1] == ("dynamic",):  # a slice: the path "." has no parts
+        if ".." in where.parts:
+            raise RuntimeError(f"workflow path {path!r} has a `..` segment")
+        if len(where.parts) > 1 and where.parts[0] == "dynamic":  # bare `dynamic` is no entry
             continue
         if where.parent != _WORKFLOW_DIR:
             raise RuntimeError(f"workflow path {path!r} is outside {_WORKFLOW_DIR}")
@@ -136,7 +157,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    contexts = required_contexts()
+    try:
+        contexts = required_contexts()
+        resolved = {ctx: resolve(ctx) for ctx in contexts}
+    except _LOCAL_READ_ERRORS as exc:
+        # Exit 1 is the findings code, and an uncaught exception would exit 1 too.
+        print(
+            f"::error::could not read the required contexts or workflow files ({exc!r}). Treating "
+            "as a FAILURE.",
+            file=sys.stderr,
+        )
+        return 2
     if not contexts:
         print(
             "::error::.github/required-contexts.txt parsed to ZERO contexts — the format changed under "
@@ -168,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     unresolved: list[str] = []
     checked = 0
     for ctx in contexts:
-        where = resolve(ctx)
+        where = resolved[ctx]
         if where is None:
             unresolved.append(ctx)
             continue
