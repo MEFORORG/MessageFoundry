@@ -781,6 +781,12 @@ REFINED_READING_DENY = [
     ),
     # A comment after the walk: its `#` ends the bound, and the walk before it is still read.
     pytest.param('echo "$((find /proc) )" # note', id="subshell-substitution-before-a-comment"),
+    # Twenty nested `$(($(...) ) )` levels before the walk. Cutting every later site at each
+    # restore spent the budget at about ten levels, so the view gave up and added nothing.
+    pytest.param(
+        'echo "' + "$(($(" * 20 + "echo a" + ") ) )" * 20 + '"; echo "$((find /proc) )"',
+        id="walk-after-nested-subshell-substitutions",
+    ),
 ]
 
 
@@ -930,7 +936,7 @@ EXPECTED_ROW_COUNTS = {
     "POWERSHELL_QUOTE_DENY": 2,
     "TOGGLE_FLOOR_DENY": 5,
     "COMMENT_BOUNDARY_DENY": 6,
-    "REFINED_READING_DENY": 12,
+    "REFINED_READING_DENY": 13,
     "REFINED_FLOOR_DENY": 3,
     "REFINED_CONTROL_ALLOW": 2,
     "REFINED_FALSE_DENY_ALLOW": 14,
