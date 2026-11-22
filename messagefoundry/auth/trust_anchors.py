@@ -236,9 +236,12 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     in-process compare** (vault BACKLOG #3714 step 9) does not read the store: each settings
     preflight of the pin compares the file with the first pin bytes this engine process checked
     and passed, at a store open or else at a preflight (:data:`_STORE_PIN_FIRST_CHECKED`), and logs
-    a WARNING when they differ, at each check until a restart. It writes no row and refuses
-    nothing. A restart starts a new baseline, so it does not see a swap made before the process
-    first checked the pin, and each engine process holds its own. The file
+    a WARNING at each check that finds them different; the baseline does not move until a
+    restart. It writes no row and refuses nothing. It reads the file only when a check runs, so
+    at least a swap undone before the next check is not seen. A restart starts a new baseline, so
+    it does not see a swap made before the process first checked the pin, and each engine process
+    holds its own. A pin that passes a preflight with only a warning, such as an expired one, can
+    become the baseline where no store open in this process passed one first. The file
     checks are judged on the file, not on the store, and refuse or warn as they do elsewhere (the
     next paragraph says which a reload runs); only their rows travel the hop. A file that cannot
     be read refuses before this anchor writes any row. **A refusal at a reload refuses only the
@@ -1717,15 +1720,15 @@ _STORE_PIN_FIRST_CHECKED: dict[tuple[str, str], str] = {}
 def note_store_pin_checked(spec: AnchorSpec, fingerprint: str) -> None:
     """Record ``fingerprint`` as the SQL Server pin's in-process baseline unless one is already
     held (:data:`_STORE_PIN_FIRST_CHECKED`). The store open and the settings preflight call it once
-    their checks of the pin pass, so a refused file never becomes the baseline."""
+    their checks of the pin pass, so a file the open or the preflight refuses never becomes the
+    baseline."""
     _STORE_PIN_FIRST_CHECKED.setdefault((spec.label, spec.path), fingerprint)
 
 
 def _warn_off_hop_pin_change(spec: AnchorSpec, fingerprint: str) -> None:
     """Log a WARNING when the SQL Server pin's bytes differ from its in-process baseline
     (:data:`_STORE_PIN_FIRST_CHECKED`); with no baseline held, do nothing. It reads no store row,
-    so a server the swapped pin admits cannot answer it. It warns at each check until a restart,
-    since the baseline does not move. It writes no row and refuses nothing."""
+    so a server the swapped pin admits cannot answer it. Module item 11 states its limits."""
     first = _STORE_PIN_FIRST_CHECKED.get((spec.label, spec.path))
     if first is None or first == fingerprint:
         return
