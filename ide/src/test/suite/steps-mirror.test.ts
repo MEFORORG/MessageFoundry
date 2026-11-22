@@ -28,6 +28,7 @@ import {
   walkMove,
   type BlockCaptureRow,
   type DropResolution,
+  type HandlerViewModel,
   type LensHandler,
   type LensParseResult,
   type LensRow,
@@ -344,6 +345,7 @@ function generateRowSet(seed: number): GeneratedRowSet {
     const expectSrc = `${"    ".repeat(d.nesting + 1)}stmt_${lineStart}(a & b, "<x>", 'y')`;
     const isReturn = isReturnRow({ kind: d.kind, appended: d.appended, scaffold: d.scaffold });
     web.push({
+      handler: "gen",
       lineStart,
       lineEnd,
       nesting: d.nesting,
@@ -655,6 +657,7 @@ function plain<T>(value: T): T {
 /** The row shape `stepsCtxRows()` yields — i.e. a row AFTER the renderRowHtml → dataset → read-back
  * round trip. The model side is built into the SAME shape from the view models, never from the DOM. */
 interface CtxRow {
+  handler: string;
   lineStart: number;
   lineEnd: number;
   nesting: number;
@@ -672,10 +675,11 @@ interface CtxRow {
  *  drag-interception marker documented in `renderRowHtml`); `isReturn` is recomputed with the
  *  exported {@link isReturnRow} rather than trusting the precomputed `RowViewModel.isReturn`, so the
  *  comparison also pins `buildRowViewModel`'s emission of it. */
-function modelCtxRows(vms: RowViewModel[]): CtxRow[] {
+function modelCtxRows(vms: RowViewModel[], handler: string): CtxRow[] {
   return vms.map((vm) => {
     const draggable = vm.movable === true || vm.kind === "code";
     return {
+      handler,
       lineStart: vm.lineStart,
       lineEnd: vm.lineEnd,
       nesting: vm.nesting,
@@ -694,7 +698,7 @@ function modelCtxRows(vms: RowViewModel[]): CtxRow[] {
  * omits `"raise"` (a `raise` header is neither an `elif` nor an `else`, the only two values any of the
  * drop helpers test for, so the narrowing is behaviour-preserving). */
 function modelDropRows(vms: RowViewModel[], handler: string): BlockCaptureRow[] {
-  const ctx = modelCtxRows(vms);
+  const ctx = modelCtxRows(vms, handler);
   return vms.map((vm, i) => ({
     handler,
     lineStart: ctx[i].lineStart,
@@ -742,6 +746,8 @@ interface Loaded {
   /** `{lineStart, title}` for EVERY row — the webview's `scopeLabel` searches all rows, not just the
    * control headers, so the model side is given the same population. */
   titles: { lineStart: number; title: string }[];
+  /** The view models per handler, so a model-side row carries the handler it belongs to. */
+  handlers: HandlerViewModel[];
 }
 
 function loadCase(c: CorpusCase, opts: LoadOptions = {}): Loaded {
@@ -754,8 +760,9 @@ function loadCase(c: CorpusCase, opts: LoadOptions = {}): Loaded {
     vms,
     handlerName: handlers[0].handler,
     webviewRows: plain(harness.hook.stepsCtxRows()) as CtxRow[],
-    modelRows: modelDropRows(vms, handlers[0].handler),
+    modelRows: handlers.flatMap((h) => modelDropRows(h.rows, h.handler)),
     titles: vms.map((vm) => ({ lineStart: vm.lineStart, title: vm.title })),
+    handlers,
   };
 }
 
@@ -798,7 +805,7 @@ suite("Steps mirror — row context parity (stepsCtxRows vs the view models)", (
         L.modelRows.length,
         `${c.name}: the DOM and the view models disagree on the ROW COUNT`,
       );
-      const expected = modelCtxRows(L.vms);
+      const expected = L.handlers.flatMap((h) => modelCtxRows(h.rows, h.handler));
       for (let i = 0; i < expected.length; i++) {
         assert.deepStrictEqual(
           L.webviewRows[i],

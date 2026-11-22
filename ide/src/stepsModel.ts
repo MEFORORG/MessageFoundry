@@ -2488,11 +2488,11 @@ export function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[
       childrenBySuite.set(r.suite, [r]);
     }
   }
-  const rootRow = rows.find((r) => r.nesting === 0);
+  // Every function's top-level suite, in document order. A module's Steps page holds one section per
+  // Handler or Router, and seeding from the first alone left every later function with no slots, so
+  // its arrows read as already at the end (BACKLOG #5840). {@link walkMove} scopes rows to one function.
+  const rootSuites = [...new Set(rows.filter((r) => r.nesting === 0).map((r) => r.suite))];
   const slots: DropResolution[] = [];
-  if (!rootRow) {
-    return slots;
-  }
   const isContinuation = (r: RowDropContext): boolean =>
     r.control === "elif" || r.control === "else";
   const emitSuite = (suiteId: string): void => {
@@ -2540,7 +2540,9 @@ export function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[
       }
     }
   };
-  emitSuite(rootRow.suite);
+  for (const suiteId of rootSuites) {
+    emitSuite(suiteId);
+  }
   return slots;
 }
 
@@ -2664,14 +2666,20 @@ export function blockLabel(
  * {@link DropResolution} — which maps 1:1 to a drag-to-target `move_row` ({@link buildMoveToRequest}),
  * reusing the verified cross-suite engine path. Returns null when there is no next slot (the block is
  * already at the very top/bottom of the handler) or when it is the SOLE primary child of its suite
- * (moving it would empty the suite — the engine refuses that, so the arrow is a no-op). `rows` must be
- * the full handler row list in document order.
+ * (moving it would empty the suite — the engine refuses that, so the arrow is a no-op). `allRows` is in
+ * document order and may hold several functions' rows (the webview passes the whole page): only the
+ * moving row's own handler is walked, so a step never walks into another function (BACKLOG #5830/#5840).
  */
 export function walkMove(
-  rows: readonly RowDropContext[],
+  allRows: readonly RowDropContext[],
   blockStartLine: number,
   direction: "up" | "down",
 ): DropResolution | null {
+  const start = allRows.find((r) => r.lineStart === blockStartLine);
+  if (!start) {
+    return null;
+  }
+  const rows = allRows.filter((r) => r.handler === start.handler);
   // The block's row span [mi..mj] — the SAME extent {@link captureBlock} joins, so an arrow move and a
   // copy/cut can never disagree about what "the block" is (both go through {@link blockExtent}).
   const extent = blockExtent(rows, blockStartLine);

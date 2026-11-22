@@ -52,6 +52,9 @@
     // moveTo, so an arrow move rides the verified cross-suite engine path.
     function stepsCtxRows() {
       return Array.from(document.querySelectorAll('li.row')).map((el) => ({
+        // The page holds every Handler and Router of the module; walkMove walks only the moving row's
+        // own (BACKLOG #5830).
+        handler: el.dataset.handler,
         lineStart: Number(el.dataset.lineStart),
         lineEnd: Number(el.dataset.lineEnd),
         nesting: Number(el.dataset.nesting),
@@ -106,9 +109,9 @@
     function buildDropSlots(rws) {
       const bySuite = new Map();
       for (const r of rws) { const l = bySuite.get(r.suite); if (l) { l.push(r); } else { bySuite.set(r.suite, [r]); } }
-      const root = rws.find((r) => r.nesting === 0);
+      // Every function's top-level suite, in document order (BACKLOG #5840).
+      const roots = Array.from(new Set(rws.filter((r) => r.nesting === 0).map((r) => r.suite)));
       const slots = [];
-      if (!root) { return slots; }
       const cont = (r) => r.control === 'elif' || r.control === 'else';
       const emit = (suiteId) => {
         const ch = bySuite.get(suiteId) || [];
@@ -126,10 +129,13 @@
           }
         }
       };
-      emit(root.suite);
+      for (const s of roots) { emit(s); }
       return slots;
     }
-    function walkMove(rws, blockStartLine, direction) {
+    function walkMove(allRws, blockStartLine, direction) {
+      const start = allRws.find((r) => r.lineStart === blockStartLine);
+      if (!start) { return null; }
+      const rws = allRws.filter((r) => r.handler === start.handler);
       const mi = rws.findIndex((r) => r.lineStart === blockStartLine);
       if (mi < 0) { return null; }
       const m = rws[mi];
