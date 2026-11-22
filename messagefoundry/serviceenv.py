@@ -169,7 +169,7 @@ class ServiceEnvPosture:
     #: never the refusal itself.
     directory_only_names: tuple[str, ...] = field(default=(), repr=False)
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
-    #: keep it. The remedy alone reads this, never the refusal itself.
+    #: keep it and not to add one back. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
 
     @property
@@ -1274,14 +1274,15 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             "entries it runs on into with it, or the value stays in the registry key"
         )
     if (
-        (others or values)
+        (moving_others or moving_values)
         and _DIRECTORY_VARIABLE not in posture.listed
         and not posture.directory_path_joined
     ):
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
         # the value it is joined to unless the step below keeps it, so only a kept one makes
-        # "add it back" false (Lander ruling on PR 3142, F1).
+        # "add it back" false (the Lander's ruling on handback 7085947392, F1). A refusal
+        # that moves nothing needs no directory.
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.

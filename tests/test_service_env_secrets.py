@@ -627,8 +627,9 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
             False,
             id="directory-listed",
         ),
-        # A joined directory string that no step keeps goes with the run-on (Lander ruling on
-        # PR 3142, F1), in either spelling.
+        # A joined directory string that no step keeps goes with the run-on (the Lander's
+        # ruling on handback 7085947392, F1), in either spelling, and so does a path the
+        # fail-closed rule does not keep.
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1"],
             True,
@@ -638,6 +639,16 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory ==", "MEFOR_VALUE_B=1"],
             True,
             id="directory-joined-spaced",
+        ),
+        pytest.param(
+            [
+                "MEFOR_STORE_PASSWORD=",
+                "mefor_secrets_directory=C:\\d",
+                "MEFOR_VALUE_A=",
+                "synthetic-run-on",
+            ],
+            True,
+            id="directory-path-not-kept",
         ),
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory=C:\\d", "MEFOR_VALUE_B=1"],
@@ -652,8 +663,8 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
 ) -> None:
     """origin/main's step for a secrets directory that exists but the lists no longer name,
     restored by the Lander's hold on PR 3142 (comment 7085002242): printed once, after the Put
-    step and the removal, where the lists set no MEFOR_SECRETS_DIRECTORY and the remedy keeps
-    no joined path entry. A store key alone goes to a key file and gets none."""
+    step and the removal, where a setting moves, the lists set no MEFOR_SECRETS_DIRECTORY and
+    the remedy keeps no joined path entry. A store key alone goes to a key file and gets none."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     assert refusal.count(ADD_BACK) == (1 if adds_back else 0)

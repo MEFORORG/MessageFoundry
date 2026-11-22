@@ -63,17 +63,16 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert posture.value_runs_on
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
-    # The run-on sentence removes the only directory entry, so the remedy says to add one back
-    # (Lander ruling on PR 3142, F1). A store key alone gets no secrets-directory step at all.
-    adds_back = refused.startswith("MEFOR_VALUE_")
-    assert refusal.count(ADD_BACK) == (1 if adds_back else 0)
-    if adds_back:
-        assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
     # A name whose only value is the joined directory entry has nothing to move (the fifth
     # hold on PR 3142, H2; the Lander's hold in comment 7085002242). The spaced spelling is no
     # directory entry, so a MEFOR_VALUE_* name joined to it is moved.
     moved = refused.startswith("MEFOR_VALUE_") and " " in directory
     assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
+    # A moved name needs a directory the lists do not set once the joined string goes, so the
+    # remedy says to add one back (the Lander's ruling on handback 7085947392, F1).
+    assert refusal.count(ADD_BACK) == (1 if moved else 0)
+    if moved:
+        assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
         refused.startswith("MEFOR_VALUE_") and " " not in directory
     )
@@ -88,7 +87,7 @@ def test_the_bare_prefix_joined_to_the_directory_is_deleted() -> None:
     assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
     # Its only value is the directory entry, so nothing goes to the directory (comment
     # 7085002242).
-    assert CREATE not in refusal and "Put " not in refusal
+    assert CREATE not in refusal and "Put " not in refusal and ADD_BACK not in refusal
 
 
 @pytest.mark.parametrize(
@@ -244,7 +243,8 @@ def test_a_value_name_alone_joined_to_a_directory_path_keeps_the_path_entry() ->
     )
     assert refusal is not None
     assert CREATE not in refusal and "Put " not in refusal
-    # The kept entry still sets the directory, so nothing says to add one back (F1).
+    # The kept entry still sets the directory, so nothing says to add one back (the Lander's
+    # ruling on handback 7085947392, F1).
     assert ADD_BACK not in refusal
     order = [
         refusal.index(text)
