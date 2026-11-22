@@ -3749,12 +3749,16 @@ async def test_a_store_pin_swap_warns_off_hop_when_the_store_answers_with_the_ne
     assert swapped in warned[0] and "[store].ssl_root_cert" in warned[0]
 
 
-def test_the_store_open_sets_the_in_process_baseline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_the_store_open_sets_the_in_process_baseline(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Vault BACKLOG #3714 step 9 (a): the store open records the pin bytes it checked as the
-    baseline, and a later open of a swapped file does not move it. Red on origin/main
-    895925f2d3a, where the open records nothing."""
+    baseline, a later open of a swapped file does not move it, and the settings preflight that
+    follows compares with it, so a swap between the open and the first preflight is logged. Red on
+    origin/main 895925f2d3a, where the open records nothing."""
     from messagefoundry.store.sqlserver import check_pinned_certificate
 
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
@@ -3775,6 +3779,11 @@ def test_the_store_open_sets_the_in_process_baseline(
     check_pinned_certificate(settings)
     baseline = ta._STORE_PIN_FIRST_CHECKED
     assert baseline == {("store_sqlserver_pin", str(pin)): first}
+    caplog.set_level("WARNING", logger=ta.__name__)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    await run_anchor_preflight(specs, store, enforcing=True)  # its first preflight
+    (warned,) = _off_hop_warnings(caplog)
+    assert first in warned
 
 
 async def test_an_oversized_postgres_store_ca_is_refused_with_its_row(

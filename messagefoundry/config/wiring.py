@@ -44,6 +44,8 @@ import json
 import logging
 import math
 import ntpath
+import numbers
+import operator
 import os
 import re
 import stat
@@ -406,7 +408,8 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
-    made, and an unreadable one is refused then. Any other callable runs as given. On a boolean
+    made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
+    (vault BACKLOG #1650, :func:`_cast_int`). Any other callable runs as given. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
@@ -484,10 +487,10 @@ def _cast_int(raw: Any) -> int:
     (vault BACKLOG #1650).
 
     The builtin turns ``True`` into 1 and ``2575.9`` into 2575. ``environments/<env>.toml`` is TOML,
-    so either one reaches a cast typed, and a port read that way dialled a port nobody named. So a
-    bool is refused, ``False`` as well as ``True``, and so is a number that is not whole or not
-    finite. Text is read by ``int()``, as before, and so is an integer. A float or other number that
-    is whole, such as ``2575.0``, passes. Anything else is refused.
+    so either one reaches a cast typed, and a port read that way would have dialled a port nobody
+    named. So a bool is refused, ``False`` as well as ``True``, and so is a number that is not whole
+    or not finite. Text is read by ``int()``, as before. An integer passes, and so does another
+    number that is whole, such as ``2575.0`` or ``Decimal("2575")``. Anything else is refused.
 
     Raises ``ValueError`` with the value withheld, by the rule :func:`_cast_bool` states, outside the
     handler, so ``int()``'s own message, which quotes the value, is not left on ``__context__``."""
@@ -499,12 +502,18 @@ def _cast_int(raw: Any) -> int:
             return int(raw)
         except ValueError:
             reason = "text must be a whole number in digits"
-    elif isinstance(raw, int):
-        return raw
-    elif isinstance(raw, float):
-        if math.isfinite(raw) and raw.is_integer():
-            return int(raw)
-        reason = "not a finite whole number, and int() would truncate it"
+    elif isinstance(raw, numbers.Integral):
+        return operator.index(raw)
+    elif isinstance(raw, numbers.Number):
+        number: Any = raw  # numbers.Number promises no int(); a complex makes it raise TypeError
+        try:
+            whole: int = int(number)
+        except (TypeError, ValueError, OverflowError):
+            reason = "not a finite real number"
+        else:
+            if whole == number:
+                return whole
+            reason = "not a whole number, and int() would truncate it"
     else:
         reason = f"a {type(raw).__name__} is not a number or text"
     raise ValueError(f"{reason} (value withheld)")

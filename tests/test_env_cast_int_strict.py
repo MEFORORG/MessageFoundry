@@ -6,12 +6,14 @@ The builtin ``int`` was the cast, and it runs before the connector's own ``port_
 value. ``environments/<env>.toml`` is TOML, so a ``true`` there reached the cast as a bool and became
 port 1, and ``2575.9`` became port 2575; ``port_setting`` then saw a valid int. Measured on engine
 origin/main 895925f2d3a: ``resolve_env_settings({"port": env("p", cast=int)}, {"p": True})`` gave
-``{"port": 1}``. Each refusal test below is red there."""
+``{"port": 1}``. The bools, the floats ``2575.9`` and ``0.5`` and ``Decimal("2575.5")`` among the refused values are red
+there; the builtin already refused the rest, which stay as controls."""
 
 from __future__ import annotations
 
 import math
 import textwrap
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -28,7 +30,18 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import _dest_config
 
-_REFUSED = [True, False, 2575.9, 0.5, math.nan, math.inf, "2575.9", "true", [2575]]
+_REFUSED = [
+    True,
+    False,
+    2575.9,
+    0.5,
+    Decimal("2575.5"),
+    math.nan,
+    math.inf,
+    "2575.9",
+    "true",
+    [2575],
+]
 
 
 @pytest.mark.parametrize("raw", _REFUSED)
@@ -49,7 +62,8 @@ def test_the_named_int_cast_refuses_the_same_values(raw: object) -> None:
 
 
 @pytest.mark.parametrize(
-    ("raw", "want"), [("2575", 2575), (" 2575 ", 2575), (2575, 2575), (2575.0, 2575)]
+    ("raw", "want"),
+    [("2575", 2575), (" 2575 ", 2575), (2575, 2575), (2575.0, 2575), (Decimal("2575"), 2575)],
 )
 def test_env_cast_int_still_reads_a_whole_number(raw: object, want: int) -> None:
     out = resolve_env_settings({"port": env("p", cast=int)}, {"p": raw})
