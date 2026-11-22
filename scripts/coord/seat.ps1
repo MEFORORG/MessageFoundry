@@ -560,6 +560,9 @@ function Get-GitFacts {
     # the column-3 slice one character into the path (BACKLOG #5874). -z also gives each path
     # unquoted, so a space or a non-ASCII letter is recorded as the file's real name.
     $st = Read-GitStatusZ -Dir $Wt
+    # $null is a failed read and '' is a clean tree. The record keeps them apart, with null counts
+    # and statusKnown false (BACKLOG #5875). fleet.ps1's briefing does not read that field yet.
+    $statusKnown = $null -ne $st
     if ($st) {
         $entries = $st.Split([char]0)
         for ($i = 0; $i -lt $entries.Count; $i++) {
@@ -592,16 +595,18 @@ function Get-GitFacts {
         touched   = $touched
         unpushed  = $unpushed
         dirty     = [ordered]@{
-            count          = $dirtyPaths.Count
+            statusKnown    = $statusKnown
+            count          = if ($statusKnown) { $dirtyPaths.Count } else { $null }
+            # Still arrays when the read failed: fleet.ps1 iterates `untracked`.
             paths          = @($dirtyPaths | Select-Object -First 200)
-            trackedCount   = $trackedPaths.Count
-            untrackedCount = $untrackedPaths.Count
+            trackedCount   = if ($statusKnown) { $trackedPaths.Count } else { $null }
+            untrackedCount = if ($statusKnown) { $untrackedPaths.Count } else { $null }
             # Named, not counted: a replacement seat has to copy these by hand.
             untracked      = @($untrackedPaths | Select-Object -First 200)
         }
         stashSha  = $stash
         # What the stash actually covers, so the reader never over-promises recovery.
-        stashCovers = if ($stash) { 'tracked-only' } elseif ($untrackedPaths.Count -gt 0) { 'nothing-untracked-only' } else { 'nothing-clean' }
+        stashCovers = if (-not $statusKnown) { 'unknown' } elseif ($stash) { 'tracked-only' } elseif ($untrackedPaths.Count -gt 0) { 'nothing-untracked-only' } else { 'nothing-clean' }
     }
 }
 
@@ -648,6 +653,39 @@ function Get-Attribution {
     return 'worktree-inherited'
 }
 
+function Read-RegistryEntry {
+    # A claim or allocation file's JSON object, or $null for anything else. One bad file must cost
+    # only its own entry: under StrictMode, reading a member of an empty, null, array or scalar
+    # document throws, and outside a per-file try that lost the whole seat record (BACKLOG #5875).
+    # -NoEnumerate keeps a one-element array from passing as the object inside it.
+    param([string]$Path)
+    try { $j = Read-CoordText $Path | ConvertFrom-Json -NoEnumerate -EA Stop } catch { return $null }
+    if ($j -is [System.Management.Automation.PSCustomObject]) { return $j }
+    return $null
+}
+
+function Select-EntryValue {
+    # The first named field holding a non-null value. Indexing Properties, unlike projecting .Name,
+    # stays safe on an object with no members.
+    param($Entry, [string[]]$Names)
+    foreach ($n in $Names) {
+        $p = $Entry.PSObject.Properties[$n]
+        if ($null -ne $p -and $null -ne $p.Value) { return $p.Value }
+    }
+    return $null
+}
+
+function Select-EntryStamp {
+    # The first named field holding a stamp that names an instant. With none, the first non-null
+    # value, so the record still shows what the file said and attribution reads it as unknown.
+    param($Entry, [string[]]$Names)
+    foreach ($n in $Names) {
+        $v = Select-EntryValue $Entry @($n)
+        if ($null -ne (ConvertTo-StampInstant $v)) { return $v }
+    }
+    return Select-EntryValue $Entry $Names
+}
+
 function Get-ClaimsFor {
     param([string]$Dir, [string]$Wt, $EpisodeStart)
     # Claims are claim.ps1's to write. This reads them and attributes by holder worktree only.
@@ -656,30 +694,23 @@ function Get-ClaimsFor {
     $dir = $Dir
     $norm = $Wt.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.json -EA SilentlyContinue)) {
-        try {
-            $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
-        } catch { continue }
-        $holder = $null
-        foreach ($n in @('worktree', 'holderWorktree', 'cwd')) {
-            if ($j.PSObject.Properties.Name -contains $n) { $holder = [string]$j.$n; break }
-        }
+        $j = Read-RegistryEntry $f.FullName
+        if ($null -eq $j) { continue }
+        $holder = [string](Select-EntryValue $j @('worktree', 'holderWorktree', 'cwd'))
         if (-not $holder) { continue }
         # A claim taken on another machine names a path on THAT machine's disk. The same path string
         # here is a different tree, so the claim is not this one's (docs/COORD-SHARED-ROOT.md).
         if (-not (Test-CoordRecordIsHere $j)) { continue }
         $hnorm = $holder.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
         if ($hnorm -ne $norm) { continue }
-        $at = $null
         # `claimed` is the field claim.ps1 writes; the others are older or foreign shapes.
-        foreach ($n in @('claimed', 'claimedAt', 'at', 'created')) {
-            if ($j.PSObject.Properties.Name -contains $n) { $at = $j.$n; break }
-        }
+        $claimFields = @('claimed', 'claimedAt', 'at', 'created')
         $out += [ordered]@{
             key         = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
-            claimedAt   = $at
+            claimedAt   = (Select-EntryStamp $j $claimFields)
             # `claimed` never moves when a later session re-takes the claim; `refreshed` does, and
             # a claim this episode re-asserted is this episode's.
-            attribution = (Get-Attribution -At $(if ($j.PSObject.Properties.Name -contains 'refreshed') { $j.refreshed } else { $at }) -EpisodeStart $EpisodeStart)
+            attribution = (Get-Attribution -At (Select-EntryStamp $j (@('refreshed') + $claimFields)) -EpisodeStart $EpisodeStart)
         }
     }
     return $out
@@ -693,25 +724,21 @@ function Get-AllocationsFor {
     $norm = $Wt.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     foreach ($kindDir in @(Get-ChildItem -LiteralPath $dir -Directory -EA SilentlyContinue)) {
         foreach ($f in @(Get-ChildItem -LiteralPath $kindDir.FullName -Filter *.json -EA SilentlyContinue)) {
-            try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
-            $aw = $null
-            foreach ($n in @('worktree', 'allocWorktree', 'cwd')) {
-                if ($j.PSObject.Properties.Name -contains $n) { $aw = [string]$j.$n; break }
-            }
+            $j = Read-RegistryEntry $f.FullName
+            if ($null -eq $j) { continue }
+            $aw = [string](Select-EntryValue $j @('worktree', 'allocWorktree', 'cwd'))
             if (-not $aw) { continue }
             # Same reason as Get-ClaimsFor: another machine's allocation at this path is not this tree's.
             if (-not (Test-CoordRecordIsHere $j)) { continue }
             if ((($aw.TrimEnd('\', '/').ToLowerInvariant()) -replace '/', '\') -ne $norm) { continue }
-            $at = $null
-            foreach ($n in @('claimed', 'allocatedAt', 'at')) {
-                if ($j.PSObject.Properties.Name -contains $n) { $at = $j.$n; break }
-            }
+            $at = Select-EntryStamp $j @('claimed', 'allocatedAt', 'at')
+            $branchValue = Select-EntryValue $j @('branch')
             $out += [ordered]@{
                 kind          = $kindDir.Name
                 number        = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
                 allocWorktree = $aw
                 allocatedAt   = $at
-                allocBranch   = if ($j.PSObject.Properties.Name -contains 'branch') { [string]$j.branch } else { $null }
+                allocBranch   = if ($null -ne $branchValue) { [string]$branchValue } else { $null }
                 attribution   = (Get-Attribution -At $at -EpisodeStart $EpisodeStart)
             }
         }
@@ -1228,7 +1255,9 @@ try {
         return $Default
     }
 
-    $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    # Invariant: this becomes the episode start, and a culture's own calendar would write another
+    # year here (th-TH writes 2569 for 2026), which every later comparison would then believe.
+    $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
     $g = Get-GitFacts -Wt $wt
     $cr = Get-ConfigRootLabel
 
@@ -1236,8 +1265,19 @@ try {
     $lifecycleAt = Prior 'lifecycleAt' $now
     # Its own field because -Close moves lifecycleAt: measured against that stamp, a handback would
     # call every claim of the closing episode inherited, which is the case attribution exists for.
-    # A record older than this field falls back to lifecycleAt.
-    $episodeStart = Prior 'episodeStart' $lifecycleAt
+    #
+    # Three cases do not simply carry it (BACKLOG #5875):
+    # - An ended `nosid` record is shared by whoever writes next, and no id tells them apart, so its
+    #   close is the boundary. The cost: a closer's own later nosid pass reads its claims as inherited.
+    # - An ended record with no start (an older writer drops the field) has only a close stamp, which
+    #   is not when the episode began, so the start is null and attribution says unknown.
+    # - An open record with no start still holds its first stamp in lifecycleAt.
+    $priorEnded = $lifecycle -in 'closed', 'handed'
+    $priorStart = Prior 'episodeStart' $null
+    $episodeStart = if ($priorEnded -and $sk.Key -eq 'nosid') { $lifecycleAt }
+                    elseif ($null -ne $priorStart) { $priorStart }
+                    elseif ($priorEnded) { $null }
+                    else { $lifecycleAt }
     if ($Close) {
         $lifecycle = if ($Handback) { 'handed' } else { 'closed' }
         $lifecycleAt = $now

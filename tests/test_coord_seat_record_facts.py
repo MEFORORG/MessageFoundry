@@ -62,19 +62,27 @@ def repo(tmp_path: Path) -> Path:
     return r
 
 
-def seat(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def seat_script(repo: Path) -> Path:
+    return repo / "scripts" / "coord" / "seat.ps1"
+
+
+def seat(
+    repo: Path, *args: str, session: str | None = "record-facts-probe"
+) -> subprocess.CompletedProcess[str]:
+    """`session=None` writes the shared `nosid` record successive occupants of a tree can share."""
+    return run_pwsh(repo, ["-File", str(seat_script(repo)), *args], session)
+
+
+def run_pwsh(
+    repo: Path, pwsh_args: list[str], session: str | None = "record-facts-probe"
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
-    env["CLAUDE_CODE_SESSION_ID"] = "record-facts-probe"
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if session is not None:
+        env["CLAUDE_CODE_SESSION_ID"] = session
     env.pop("MEFOR_COORD_ROOT", None)
     proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(repo / "scripts" / "coord" / "seat.ps1"),
-            *args,
-        ],
+        ["pwsh", "-NoProfile", "-NonInteractive", *pwsh_args],
         cwd=str(repo),
         input="",
         capture_output=True,
@@ -101,10 +109,14 @@ def coord_dir(repo: Path) -> Path:
     return Path(common) / "mefor-coord"
 
 
-def read_record(repo: Path) -> dict[str, Any]:
+def record_path(repo: Path) -> Path:
     found = sorted((coord_dir(repo) / "seats").rglob("*.json"))
     assert len(found) == 1, f"expected exactly one record, got {[p.name for p in found]}"
-    rec: dict[str, Any] = json.loads(found[0].read_text(encoding="utf-8"))
+    return found[0]
+
+
+def read_record(repo: Path) -> dict[str, Any]:
+    rec: dict[str, Any] = json.loads(record_path(repo).read_text(encoding="utf-8"))
     return rec
 
 
@@ -155,6 +167,23 @@ def test_a_clean_tree_records_no_dirty_paths(repo: Path) -> None:
     dirty = declare(repo)["dirty"]
     assert dirty["count"] == 0
     assert dirty["paths"] == []
+
+
+def test_a_failed_status_read_is_not_recorded_as_clean(repo: Path) -> None:
+    clean = declare(repo)
+    assert clean["dirty"]["statusKnown"] is True  # control: the same field, on a readable tree
+    assert clean["stashCovers"] == "nothing-clean"
+    (repo / ".git" / "index").write_bytes(b"this is not a git index")
+    plain_record(repo)
+    after = read_record(repo)
+    assert after["writes"] == clean["writes"] + 1
+    assert after["dirty"]["statusKnown"] is False
+    assert after["dirty"]["count"] is None
+    assert after["dirty"]["trackedCount"] is None
+    assert after["dirty"]["untrackedCount"] is None
+    assert after["dirty"]["paths"] == []
+    assert after["dirty"]["untracked"] == []
+    assert after["stashCovers"] == "unknown"
 
 
 # --- BACKLOG #5875 ------------------------------------------------------------------------------
@@ -243,6 +272,152 @@ def test_a_claim_this_episode_re_took_is_this_episodes(repo: Path) -> None:
     )
     plain_record(repo)
     assert [c["attribution"] for c in read_record(repo)["claims"]] == ["this-episode"]
+
+
+def rewrite_record(repo: Path, *drop: str, **fields: Any) -> None:
+    """Set `fields` on the record and remove the keys named in `drop`."""
+    rec = read_record(repo)
+    rec.update(fields)
+    for key in drop:
+        rec.pop(key, None)
+    put_json(record_path(repo), rec)
+
+
+@pytest.mark.parametrize(
+    "body", ["", "{}", "null", "[]", "42", '"text"', "not json", '[{"worktree": "WT"}]']
+)
+@pytest.mark.parametrize("kind", ["claims", "alloc"])
+def test_one_bad_registry_file_costs_only_that_entry(repo: Path, kind: str, body: str) -> None:
+    rec = declare(repo)
+    stamp = (episode_start(rec) + timedelta(minutes=5)).isoformat()
+    folder = coord_dir(repo) / "claims" if kind == "claims" else coord_dir(repo) / "alloc" / "adr"
+    folder.mkdir(parents=True, exist_ok=True)
+    wt = str(rec["worktree"]).replace("\\", "/")
+    (folder / "8000.json").write_text(body.replace("WT", wt), encoding="utf-8")
+    put_json(folder / "9100.json", {"worktree": rec["worktree"], "claimed": stamp})
+    plain_record(repo)
+    after = read_record(repo)
+    assert after["writes"] == rec["writes"] + 1, "the record was not rewritten"
+    if kind == "claims":
+        assert [c["key"] for c in after["claims"]] == ["9100"]
+    else:
+        assert [a["number"] for a in after["allocations"]] == ["9100"]
+
+
+def test_the_episode_start_is_written_in_the_invariant_calendar(repo: Path) -> None:
+    """th-TH is day-first and defaults to the Buddhist calendar, 543 years ahead."""
+    script = str(seat_script(repo)).replace("'", "''")
+    command = (
+        "[cultureinfo]::CurrentCulture = [cultureinfo]::GetCultureInfo('th-TH'); "
+        f"& '{script}' -Declare -Seat builder -Goal 'culture probe'; exit $LASTEXITCODE"
+    )
+    run_pwsh(repo, ["-Command", command])
+    rec = read_record(repo)
+    for field in ("asOf", "lifecycleAt", "episodeStart"):
+        written = datetime.fromisoformat(str(rec[field]))
+        assert abs(written - datetime.now(UTC)) < timedelta(days=1), f"{field}: {rec[field]}"
+
+
+def test_a_successor_on_a_shared_nosid_record_is_a_new_episode(repo: Path) -> None:
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "first occupant", session=None)
+    rec = read_record(repo)
+    start = episode_start(rec)
+    seat(repo, "-Close", "-Handback", session=None)
+    rewrite_record(repo, lifecycleAt=(start + timedelta(hours=1)).isoformat())
+    for key, minutes in (("9201", 10), ("9202", 120)):
+        put_json(
+            coord_dir(repo) / "claims" / f"{key}.json",
+            {
+                "worktree": rec["worktree"],
+                "claimed": (start + timedelta(minutes=minutes)).isoformat(),
+            },
+        )
+    seat(repo, "-Record", session=None)
+    by_key = {c["key"]: c["attribution"] for c in read_record(repo)["claims"]}
+    assert by_key == {"9201": "worktree-inherited", "9202": "this-episode"}
+
+
+def test_a_named_session_keeps_its_episode_across_its_own_close(repo: Path) -> None:
+    """The control for the case above: only the shared record has successive occupants."""
+    rec = declare(repo)
+    start = episode_start(rec)
+    seat(repo, "-Close", "-Handback")
+    rewrite_record(repo, lifecycleAt=(start + timedelta(hours=1)).isoformat())
+    put_json(
+        coord_dir(repo) / "claims" / "9203.json",
+        {"worktree": rec["worktree"], "claimed": (start + timedelta(minutes=10)).isoformat()},
+    )
+    plain_record(repo)
+    assert [c["attribution"] for c in read_record(repo)["claims"]] == ["this-episode"]
+
+
+@pytest.mark.parametrize("state", ["closed", "handed"])
+def test_a_close_stamp_is_never_pinned_as_the_episode_start(repo: Path, state: str) -> None:
+    """An older writer drops `episodeStart`; on a closed record `lifecycleAt` is the close."""
+    rec = declare(repo)
+    start = episode_start(rec)
+    rewrite_record(
+        repo,
+        "episodeStart",
+        lifecycle=state,
+        lifecycleAt=(start + timedelta(hours=1)).isoformat(),
+    )
+    put_json(
+        coord_dir(repo) / "claims" / "9204.json",
+        {"worktree": rec["worktree"], "claimed": (start + timedelta(minutes=10)).isoformat()},
+    )
+    plain_record(repo)
+    after = read_record(repo)
+    assert after["episodeStart"] is None
+    assert [c["attribution"] for c in after["claims"]] == ["unknown"]
+
+
+def test_an_open_record_with_no_episode_start_still_falls_back(repo: Path) -> None:
+    rec = declare(repo)
+    rewrite_record(repo, "episodeStart")
+    plain_record(repo)
+    after = read_record(repo)
+    assert datetime.fromisoformat(str(after["episodeStart"])) == episode_start(rec)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {"refreshed": None, "claimed": "GOOD"},
+        {"refreshed": "not a stamp", "claimed": "GOOD"},
+        {"refreshed": "2026-11-22T10:00:00", "claimed": "GOOD"},
+        {"claimed": None, "claimedAt": "GOOD"},
+        {"claimed": "not a stamp", "at": "GOOD"},
+        {"refreshed": None, "claimed": None, "created": "GOOD"},
+    ],
+)
+@pytest.mark.parametrize(("minutes", "expected"), [(5, "this-episode"), (-5, "worktree-inherited")])
+def test_a_claim_falls_through_to_the_next_usable_stamp(
+    repo: Path, shape: dict[str, Any], minutes: int, expected: str
+) -> None:
+    rec = declare(repo)
+    good = (episode_start(rec) + timedelta(minutes=minutes)).isoformat()
+    body = {k: (good if v == "GOOD" else v) for k, v in shape.items()}
+    put_json(coord_dir(repo) / "claims" / "9301.json", {"worktree": rec["worktree"], **body})
+    plain_record(repo)
+    claims = read_record(repo)["claims"]
+    assert [c["attribution"] for c in claims] == [expected]
+    assert datetime.fromisoformat(str(claims[0]["claimedAt"])) == datetime.fromisoformat(good)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [{"claimed": None, "allocatedAt": "GOOD"}, {"claimed": "not a stamp", "at": "GOOD"}],
+)
+def test_an_allocation_falls_through_to_the_next_usable_stamp(
+    repo: Path, shape: dict[str, Any]
+) -> None:
+    rec = declare(repo)
+    good = (episode_start(rec) + timedelta(minutes=5)).isoformat()
+    body = {k: (good if v == "GOOD" else v) for k, v in shape.items()}
+    put_json(coord_dir(repo) / "alloc" / "adr" / "9302.json", {"worktree": rec["worktree"], **body})
+    plain_record(repo)
+    assert [a["attribution"] for a in read_record(repo)["allocations"]] == ["this-episode"]
 
 
 # --- BACKLOG #5876 ------------------------------------------------------------------------------
