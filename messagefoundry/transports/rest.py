@@ -1238,13 +1238,17 @@ def refuse_cleartext_credentials(
     http off this machine*, says why and defines which values are credential-shaped. A static
     ``Proxy-Authorization``, in any spelling, is left out when :func:`hop_reaches_a_proxy` answers
     ``True``, since the send-time proxy rule judges it then; otherwise it is judged like any other
-    header. An ``Authorization`` header in the built ``headers``,
-    in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
+    header. An ``Authorization`` header in the built ``headers``, in any spelling
+    :func:`~messagefoundry.transports.http_auth.is_authorization_header_name` reads (BACKLOG
+    #5526), counts as well; the bearer re-checks pass one in, as defense in depth should the
     inventory and the bearer providers ever disagree. As for
     :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
     SOAP, FHIR and DICOMweb cells and the ``FhirLookup`` read path."""
+    # Lazy: http_auth imports this module.
+    from messagefoundry.transports.http_auth import is_authorization_header_name
+
     sent = list(credentials)
-    if not sent and any(str(name).strip().lower() == "authorization" for name in headers):
+    if not sent and any(is_authorization_header_name(str(name)) for name in headers):
         sent = ["Authorization header"]
     if not sent:
         return
