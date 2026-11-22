@@ -3125,8 +3125,10 @@ def driver_sqlstate_of(
     """The SQLSTATE a database driver's own error names: asyncpg's ``sqlstate`` attribute when it
     :func:`reads_as_a_sqlstate` and ``attribute`` says to read it, else ``args[0]`` when that does.
     ``args[0]`` is read past an attribute that is set but is no SQLSTATE only when
-    ``past_attribute`` says so: asyncpg's ``args[0]`` is its message, so the traceback line never
-    does (engine PR 3150, round-999fe74847 finding 3). None for any other exception, so a
+    ``past_attribute`` says so, since asyncpg's ``args[0]`` is its message. An error with no
+    ``sqlstate`` attribute at all, such as asyncpg's client-side errors, is read from ``args[0]``
+    either way, so such a message of five SQLSTATE characters still reads as one, on the
+    traceback line too. None for any other exception, so a
     ``KeyError('MRN42')`` is never read as one, and None for a SQLite error, whose ``args[0]`` is
     its message (vault BACKLOG #1661). The one reading that the DATABASE connector and
     :func:`safe_traceback` share.

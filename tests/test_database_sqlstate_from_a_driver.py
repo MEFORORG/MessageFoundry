@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Only a database driver's own error is read for a SQLSTATE, through one reading the DATABASE
-connector and the log chain share (engine PR 3150 open findings 1, 5 and 6), and two log-path
-changes in the same module (vault BACKLOG #1661, added items 5 and 6).
+"""Only a database driver's own error NAMES a SQLSTATE in text, through one reading the DATABASE
+connector and the log chain share (engine PR 3150 open findings 1, 5 and 6); an error shaped like
+one is still classified by it. Also two log-path changes in the same module (vault BACKLOG #1661,
+added items 5 and 6).
 
 Each test was red on the code before its fix, except where its docstring calls it a control. All
 values are synthetic.
@@ -13,14 +14,19 @@ from __future__ import annotations
 import logging
 import sqlite3
 import sys
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
 
 from messagefoundry.redaction import safe_exc, safe_traceback
 from messagefoundry.transports import database
-from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from tests._fake_dbapi_driver import DriverError
+from tests._odbc_cancel_fakes import RawConn, never
+from tests.test_backlog2394_database_gate import _aioodbc_serving, _destination, _Rig
+from tests.test_backlog5010_database_gate_discard import _WakingPool
 from tests.test_database_transport import _dest, _FakeConn, _FakeCursor, _FakePool
 
 _VALUE = "MRN42"  # five characters of the SQLSTATE alphabet, as an identifier can be
@@ -33,7 +39,7 @@ def _raised[E: BaseException](exc: E) -> E:
         return exc
 
 
-# --- PR 3150 finding 1: a non-driver error is not read as a SQLSTATE ---------------------------
+# --- PR 3150 finding 1: a non-driver error is classified by shape, and its text is withheld ------
 
 
 @pytest.mark.parametrize(
@@ -44,27 +50,51 @@ def _raised[E: BaseException](exc: E) -> E:
         pytest.param(Exception("23000", "synthetic"), id="Exception"),
     ],
 )
-def test_a_non_driver_error_is_not_read_as_a_sqlstate(exc: BaseException) -> None:
-    """Red on main: ``args[0]`` of five SQLSTATE characters read as one, whoever raised it."""
-    assert database._sqlstate(exc) is None
-    assert database._log_sqlstate(exc) is None
+def test_a_non_driver_error_is_classified_by_shape_but_never_named(exc: BaseException) -> None:
+    """The state still classifies the failure, as before this branch; text never names it."""
+    assert database._sqlstate(exc) == exc.args[0]
+    assert database._log_sqlstate(exc) == exc.args[0]
+    assert database._shown_state(exc.args[0], exc) is None
 
 
 async def test_a_non_driver_error_in_a_send_is_never_dead_lettered_with_its_text() -> None:
     """Red on main: ``KeyError('MRN42')`` was dead-lettered as ``database rejected the statement
-    [MRN42]``, a value in ``last_error`` and the alert. It is an internal error now, raised in its
-    place naming its type alone with no chain, so the text the runner stores carries no value."""
-    failure = KeyError(_VALUE)
-    conn = _FakeConn(_FakeCursor(failure))
+    [MRN42]``, a value in ``last_error`` and the alert. It is still dead-lettered, by its shape,
+    but its text and code name no state."""
+    conn = _FakeConn(_FakeCursor(KeyError(_VALUE)))
     dest = _dest()
     dest._pool = _FakePool(conn)
-    with pytest.raises(database.WithheldSendError) as raised:
+    with pytest.raises(NegativeAckError) as refused:
         await dest.send('{"mrn": "1", "val": "x"}')
-    assert str(raised.value) == "KeyError [message withheld]"
-    assert raised.value.__cause__ is None and raised.value.__context__ is None
-    assert not isinstance(raised.value, NegativeAckError)
-    assert _VALUE not in safe_exc(raised.value)  # what the runner's internal-error arm stores
+    assert str(refused.value) == "database rejected the statement [SQLSTATE withheld]"
+    assert refused.value.permanent and refused.value.code == "db"
+    assert _VALUE not in safe_exc(refused.value)  # what the runner stores as last_error
     assert conn.rolledback
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(RuntimeError("08S01", f"link lost ({_VALUE})"), id="08S01"),
+        pytest.param(RuntimeError("HYT00", f"timed out ({_VALUE})"), id="HYT00"),
+    ],
+)
+async def test_a_shaped_transient_send_error_is_retried_naming_no_text(
+    exc: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on the previous head, which made it an internal error: a non-driver error shaped like
+    a transient SQLSTATE is retried as before this branch, and no message text reaches the log or
+    the error the runner stores."""
+    conn = _FakeConn(_FakeCursor(exc))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert not isinstance(raised.value, NegativeAckError)
+    assert str(raised.value) == "database transient error [SQLSTATE withheld]"
+    assert _VALUE not in safe_exc(raised.value)
+    assert _VALUE not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -93,10 +123,10 @@ class _UnreadableState(DriverError):
 
 
 async def test_a_driver_error_whose_sqlstate_cannot_be_read_still_rolls_back() -> None:
-    """The send reads ``args`` alone before its rollback, as main does, so an attribute that
-    raises when read never skips the rollback and leaves the failed statement's transaction open
-    (BACKLOG #5010). The release's connection-lost read of the attribute then raises, as on main.
-    A regression check of this branch's first head, not red on main."""
+    """The send reads ``args`` alone before its rollback, so an attribute that raises when read
+    never skips the rollback and leaves the failed statement's transaction open (BACKLOG #5010).
+    The release's connection-lost read of the attribute then raises. A regression check of this
+    branch's first head, not red on main."""
     conn = _FakeConn(_FakeCursor(_UnreadableState("23000", "synthetic")))
     dest = _dest()
     dest._pool = _FakePool(conn)
@@ -107,8 +137,8 @@ async def test_a_driver_error_whose_sqlstate_cannot_be_read_still_rolls_back() -
 
 @pytest.mark.parametrize("attribute", ["", None, 7])
 def test_an_unusable_sqlstate_attribute_falls_back_to_args(attribute: object) -> None:
-    """As main's log reading did: an attribute that is not a SQLSTATE leaves ``args[0]`` read, so
-    a class-08 link is still seen as a lost connection. A regression check, not red on main."""
+    """An attribute that is not a SQLSTATE leaves ``args[0]`` read for classification, so a
+    class-08 link is still seen as a lost connection. A regression check, not red on main."""
     exc = DriverError("08S01", "synthetic")
     exc.sqlstate = attribute  # type: ignore[attr-defined]
     assert database._log_sqlstate(exc) == "08S01"
@@ -277,15 +307,14 @@ def test_a_member_whose_chain_leads_back_to_its_group_does_not_loop() -> None:
     assert copied.__context__.args == (copy.message,)
 
 
-# --- Review round-999fe74847 repairs: regressions of this branch's earlier heads ---------------
+# --- Regressions of this branch's earlier heads ------------------------------------------------
 
 
-async def test_a_withheld_send_error_still_discards_a_lost_connection(
+async def test_a_wrapped_lost_link_still_discards_the_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Red on the previous head: the withheld error carries no chain, so the release's lost-link
-    read saw no class-08 link under a driver tuple re-raised as a builtin, and the dead handle went
-    back to its pool. The verdict is taken from the original now, as main took it."""
+    """Red on the previous head, whose withheld error carried no chain: a driver's 08S01 under a
+    non-driver error shaped like one is seen by the release's lost-link read, and discarded."""
     try:
         try:
             raise DriverError("08S01", "link lost")
@@ -305,16 +334,16 @@ async def test_a_withheld_send_error_still_discards_a_lost_connection(
     conn = _FakeConn(_FakeCursor(failure))
     dest = _dest()
     dest._pool = _FakePool(conn)
-    with pytest.raises(database.WithheldSendError):
+    with pytest.raises(NegativeAckError, match=r"\[SQLSTATE withheld\]"):
         await dest.send('{"mrn": "1", "val": "x"}')
     assert released == [True]
 
 
 @pytest.mark.parametrize("step", ["fetch", "nextset"])
-async def test_a_capture_error_shaped_like_a_drivers_rolls_the_write_back(step: str) -> None:
-    """Red on the previous head: a non-driver error shaped like a SQLSTATE during the capture read
-    as a client problem, and the write committed. It propagates now, as main did, and the send
-    rolls back."""
+async def test_a_shaped_capture_error_rolls_back_by_its_state(step: str) -> None:
+    """A non-driver error shaped like a transient SQLSTATE during the capture is the statement's
+    failure, as before this branch: it propagates, the send rolls back and retries, and its text
+    is withheld."""
     from tests.test_database_out_params_capture import _FaultCursor, _send_dest
 
     def error() -> Exception:
@@ -326,9 +355,29 @@ async def test_a_capture_error_shaped_like_a_drivers_rolls_the_write_back(step: 
     else:
         cur = _FaultCursor(sets, nextset_raises_on=0, nextset_error=error)
     d, conn = _send_dest(cur)
-    with pytest.raises(database.WithheldSendError):
+    with pytest.raises(DeliveryError) as raised:
         await d.send('{"mrn": "42"}')
+    assert not isinstance(raised.value, NegativeAckError)
+    assert _VALUE not in safe_exc(raised.value)
     assert conn.rolledback and not conn.committed
+
+
+async def test_a_shaped_client_fetch_state_commits_naming_no_text() -> None:
+    """Red on the previous head, which rolled it back: a non-driver error shaped like the client
+    conversion state 07006 is a capture problem, as before this branch, so the write commits; the
+    capture's detail names no state."""
+    from tests.test_database_out_params_capture import _FaultCursor, _send_dest
+
+    cur = _FaultCursor(
+        [([(1,)], [("id",)])],
+        fetch_raises_on=0,
+        fetch_error=lambda: RuntimeError("07006", f"restricted ({_VALUE})"),
+    )
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "unparseable"
+    assert resp.detail == "result-set not readable (RuntimeError)"
+    assert conn.committed and not conn.rolledback
 
 
 class _AsyncpgMessage(Exception):
@@ -359,3 +408,50 @@ def test_a_missing_args_reads_as_no_sqlstate() -> None:
     """Red on the previous head: ``exc.args`` was read with no default, so an error arm raised
     before its rollback. Read with ``getattr`` and a default, as main read it."""
     assert database._sqlstate(_NoArgs()) is None
+
+
+@pytest.fixture
+async def rig() -> AsyncIterator[_Rig]:
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="test-w7-db")
+    r = _Rig(executor)
+    try:
+        yield r
+    finally:
+        r.release.set()  # never leave a worker parked if an arm failed early
+        executor.shutdown(wait=True)
+        for pool in r.pools:
+            pool_executor = database._tracked(database._POOL_EXECUTORS, pool)
+            if pool_executor is not None:
+                pool_executor.shutdown(wait=True)
+
+
+class _ShapedTimeoutSetter(RawConn):
+    """A connection whose ``timeout`` write fails with a non-driver error shaped like HYT00."""
+
+    @property
+    def timeout(self) -> int:
+        return 0
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        if value:  # the fake's own __init__ writes 0
+            raise RuntimeError("HYT00", f"timed out ({_VALUE})")
+
+
+async def test_a_shaped_hyt00_setter_failure_discards_and_retries(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on the previous head, which returned the handle and stopped the lane on a config fault:
+    a non-driver error shaped like HYT00 from the statement-timeout write discards the connection
+    and retries, as before this branch, and no message text reaches the log or the error."""
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_WakingPool, raw_type=_ShapedTimeoutSetter, blocks=never
+    )
+    with pytest.raises(DeliveryError) as caught:
+        await _destination().send('{"a": 1}')
+    assert not isinstance(caught.value, NegativeAckError), caught.value
+    pool = rig.pools[0]
+    assert pool.returned and pool.free == [] and rig.conn.closed
+    assert _VALUE not in safe_exc(caught.value)
+    assert _VALUE not in caplog.text

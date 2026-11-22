@@ -2733,7 +2733,7 @@ def _send_refusal(sqlstate: str | None, exc: BaseException) -> DeliveryError:
     read as a SQLSTATE (vault BACKLOG #1661, added item 2). A ``UnicodeDecodeError``, text the
     driver returned, is not this message's, and the caller raises it as an internal error."""
     if sqlstate is not None:
-        return _classify_db_error(sqlstate, str(exc))
+        return _classify_db_error(sqlstate, str(exc), shown=_shown_state(sqlstate, exc) is not None)
     return NegativeAckError(
         f"database driver could not encode the message's text ({type(exc).__name__})",
         code="db",
@@ -2741,7 +2741,9 @@ def _send_refusal(sqlstate: str | None, exc: BaseException) -> DeliveryError:
     )
 
 
-def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False) -> DeliveryError:
+def _classify_db_error(
+    sqlstate: str, message: str, *, connecting: bool = False, shown: bool = True
+) -> DeliveryError:
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
 
@@ -2760,68 +2762,82 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     (``Key (mrn)=(...) already exists``) — and the returned error is persisted to ``queue.last_error``
     and ``message_events.detail`` and rendered into the ``connection_error`` alert, so interpolating
     it would carry a partner's identifier into all three on a first deployment. The same rule the
-    ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows."""
-    code = _driver_code(message)
-    detail = f"[{sqlstate}]" + (f" driver error {code}" if code else "")
+    ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows.
+
+    ``shown`` false says ``sqlstate`` came from an error that is no driver's
+    (:func:`_shown_state`): the error is classified by it all the same, but the text and ``code``
+    name neither it nor a native number read from ``message``."""
+    code = _driver_code(message) if shown else None
+    detail = (f"[{sqlstate}]" if shown else "[SQLSTATE withheld]") + (
+        f" driver error {code}" if code else ""
+    )
+    sqlstate_code = sqlstate if shown else "db"
     if _is_transient(sqlstate):
         return DeliveryError(f"database transient error {detail}")
     if connecting:
         if sqlstate[:2] in _CREDENTIAL_PREFIXES:
             return NegativeAckError(
                 f"database refused the login {detail}",
-                code=sqlstate,
+                code=sqlstate_code,
                 permanent=True,
                 credential_fault=True,
             )
         if sqlstate[:2] in _CONFIG_PREFIXES or sqlstate in _CONFIG_STATES:
             return NegativeAckError(
                 f"database connection refused by its configuration {detail}",
-                code=sqlstate,
+                code=sqlstate_code,
                 permanent=True,
                 config_fault=True,
             )
         return DeliveryError(f"database connect failed {detail}")
     return NegativeAckError(
         f"database rejected the statement {detail}",
-        code=sqlstate or "db",
+        code=sqlstate_code or "db",
         permanent=True,
     )
 
 
 def _sqlstate(exc: BaseException) -> str | None:
-    """The 5-character SQLSTATE a DB driver's own error carries in ``args[0]`` (pyodbc/aioodbc;
-    :func:`~messagefoundry.redaction.driver_sqlstate_of`), or ``None`` for any other exception,
-    letting a genuine bug propagate as an internal error rather than being misread as a transport
-    failure. A non-driver error whose ``args[0]`` reads like a SQLSTATE, such as ``KeyError('MRN42')``,
-    is not read as one (vault BACKLOG #1661; engine PR 3150, finding 1). Never for a
-    ``UnicodeError``, whose first argument is the codec name. It reads no attribute but ``args``,
-    with ``getattr`` and a default as main did, so an error arm can call it before its cleanup."""
+    """The 5-character SQLSTATE ``exc`` carries in ``args[0]``, the shape pyodbc/aioodbc's error
+    has, or ``None`` if ``exc`` isn't shaped like a DB error, letting a genuine bug propagate as an
+    internal error rather than being misread as a transport failure. It CLASSIFIES the failure, by
+    shape: a non-driver error shaped like one, such as ``KeyError('MRN42')``, is classified the same
+    way, but its state may be a value, so only a driver's own error names it in text
+    (:func:`_shown_state`; vault BACKLOG #1661, engine PR 3150 finding 1). Never for a
+    ``UnicodeError``, whose first argument is the codec name, nor for a SQLite error, whose
+    ``args[0]`` is its message. It reads no attribute but ``args``, with ``getattr`` and a default,
+    so an error arm can call it before its cleanup."""
     if isinstance(exc, UnicodeError):
         return None
-    return driver_sqlstate_of(exc, attribute=False)
+    if raised_by_a_driver(exc):
+        return driver_sqlstate_of(exc, attribute=False)
+    return _shaped_state(getattr(exc, "args", ()))
 
 
 def _log_sqlstate(exc: BaseException) -> str | None:
-    """The SQLSTATE a log line may name for ``exc``: asyncpg's ``sqlstate`` attribute, else
-    :func:`_sqlstate`'s ``args[0]``, from a driver's own error alone. Never for a ``UnicodeError``
-    or an exception that holds one, whose text a codec name can make read like a SQLSTATE."""
+    """:func:`_sqlstate`, read first from asyncpg's ``sqlstate`` attribute when that is a SQLSTATE,
+    for the arms that classify an error a PostgreSQL store's driver may raise. Never for a
+    ``UnicodeError`` or an exception that holds one, whose text a codec name can make read like a
+    SQLSTATE. Like :func:`_sqlstate`, it classifies; :func:`_shown_state` says what text names."""
     if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
         return None
-    return driver_sqlstate_of(exc, past_attribute=True)
+    if raised_by_a_driver(exc):
+        return driver_sqlstate_of(exc, past_attribute=True)
+    state = getattr(exc, "sqlstate", None)
+    return state if reads_as_a_sqlstate(state) else _shaped_state(getattr(exc, "args", ()))
 
 
-def _sqlstate_shaped(exc: BaseException) -> bool:
-    """Whether ``exc``'s first argument reads like a SQLSTATE although :func:`_sqlstate` reads
-    none from it, as pyodbc's error is shaped: ``KeyError('MRN42')``, or a driver's tuple re-raised
-    as a builtin type. Its arguments may carry a value, so its text is withheld (engine PR 3150,
-    finding 1). Never for a ``UnicodeError``, whose first argument is the codec name."""
-    args = getattr(exc, "args", ())
-    return (
-        not isinstance(exc, UnicodeError)
-        and isinstance(args, tuple)
-        and bool(args)
-        and reads_as_a_sqlstate(args[0])
-    )
+def _shaped_state(args: object) -> str | None:
+    """``args[0]`` when ``args`` is a tuple whose first item reads like a SQLSTATE."""
+    first = args[0] if isinstance(args, tuple) and args else None
+    return first if reads_as_a_sqlstate(first) else None
+
+
+def _shown_state(state: str | None, exc: BaseException) -> str | None:
+    """``state`` as text may name it: a driver's own error's SQLSTATE, and ``None`` for any other
+    error's, whose first argument may be a value such as ``KeyError('MRN42')``'s (engine PR 3150,
+    finding 1). The failure is still classified by ``state``; only its text is withheld."""
+    return state if state is not None and raised_by_a_driver(exc) else None
 
 
 def _connection_lost(exc: BaseException | None) -> bool:
@@ -2877,12 +2893,12 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     the argument it could not encode, renders as its type alone (engine PR 2658, finding 4). Anything
     else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful text for a bug or
     an unreachable host, unless ``withhold`` says it is held by a driver error, as a link of its
-    chain (:func:`_redacted_copy`), or its first argument reads like a SQLSTATE
-    (:func:`_sqlstate_shaped`): either renders as its type alone. That is a bound, not a guarantee:
+    chain (:func:`_redacted_copy`), or it carries a SQLSTATE although it is no driver's
+    (:func:`_shown_state`): either renders as its type alone. That is a bound, not a guarantee:
     an error a driver raises as a builtin type with any other arguments, or wraps in another
     library's, is printed as ``safe_exc`` prints it.
 
-    Only a driver's own error names a SQLSTATE (:func:`_sqlstate`), since ``args[0]`` of five
+    Only a driver's own error names a SQLSTATE (:func:`_shown_state`), since ``args[0]`` of five
     letters or digits on any other error may be a value.
 
     A Unicode error, or a non-driver exception holding one, takes ``safe_exc`` or, under
@@ -2897,25 +2913,15 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
             return _withheld(exc)
         state = _log_sqlstate(exc)
         if state is None:
-            if driver:
-                return _withheld(exc)
-            if _sqlstate_shaped(exc):
-                return f"{type(exc).__name__} [message withheld]"
-            return safe_exc(exc)
+            return _withheld(exc) if driver else safe_exc(exc)
+        if not driver:  # shaped like a driver's error: its arguments may carry a value
+            return f"{type(exc).__name__} [message withheld]"
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring
         return (
             f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
         )
     return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
-
-
-class WithheldSendError(Exception):
-    """A send's failure that is no driver's error although its first argument reads like a SQLSTATE
-    (:func:`_sqlstate_shaped`), such as ``KeyError('MRN42')``: still an internal error, raised in
-    its place naming its type alone, with no chain, since the runner stores an internal error's text
-    and its arguments may carry a value (engine PR 3150, finding 1). Unprefixed because its name
-    prints."""
 
 
 class RedactedDbError(Exception):
@@ -3813,13 +3819,16 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float) -> N
     state = _log_sqlstate(failure)
     if state is not None and _is_transient(state):  # _transient_driver_error's test
         await _discard_to_pool(pool, conn)
-        raise _classify_db_error(state, str(failure), connecting=True) from failure
+        raise _classify_db_error(
+            state, str(failure), connecting=True, shown=_shown_state(state, failure) is not None
+        ) from failure
     await _return_to_pool(pool, conn)
+    shown = _shown_state(state, failure)
     raise NegativeAckError(
         "database driver refused statement_timeout"
-        + (f" [{state}]" if state else f" ({type(failure).__name__})")
+        + (f" [{shown}]" if shown else f" ({type(failure).__name__})")
         + "; set statement_timeout = 0 on this connection if it cannot take one",
-        code=state or "db",
+        code=shown or "db",
         permanent=True,
         config_fault=True,
     ) from failure
@@ -4331,7 +4340,9 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
         if state is None:
             # Type alone, never the text: a connect error can carry DSN attributes (#5348).
             raise DeliveryError(f"DATABASE connect failed: {_credential_free_cause(exc)}") from exc
-        raise _classify_db_error(state, str(exc), connecting=True) from exc
+        raise _classify_db_error(
+            state, str(exc), connecting=True, shown=_shown_state(state, exc) is not None
+        ) from exc
 
 
 #: Cursor-allocation states that are the driver refusing the query timeout ``statement_timeout``
@@ -4353,15 +4364,16 @@ def _cursor_refused(exc: Exception, pool: Any) -> DeliveryError | None:
     if state is None:
         return None
     seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
+    shown = _shown_state(state, exc)
     if state in _QUERY_TIMEOUT_REFUSED_STATES and seconds:
         return NegativeAckError(
-            f"database driver refused a cursor [{state}]; if it cannot take the ODBC query "
-            "timeout, set statement_timeout = 0 on this connection",
-            code=state,
+            f"database driver refused a cursor [{shown or 'SQLSTATE withheld'}]; if it cannot take "
+            "the ODBC query timeout, set statement_timeout = 0 on this connection",
+            code=shown or "db",
             permanent=True,
             config_fault=True,
         )
-    return _classify_db_error(state, str(exc), connecting=True)
+    return _classify_db_error(state, str(exc), connecting=True, shown=shown is not None)
 
 
 def _cursor_refusal_discards(refused: DeliveryError) -> bool:
@@ -4404,7 +4416,7 @@ async def _probe_db(
     except Exception as exc:
         state = _sqlstate(exc)
         raise (
-            _classify_db_error(state, str(exc))
+            _classify_db_error(state, str(exc), shown=_shown_state(state, exc) is not None)
             if state
             else DeliveryError(f"DATABASE probe failed: {_credential_free_cause(exc)}")
         ) from exc
@@ -4445,12 +4457,11 @@ async def _fetch_result_set(cur: Any) -> list[Any] | None:
         rows: list[Any] = await cur.fetchall()
     except Exception as exc:
         state = _log_sqlstate(exc)
-        if state is None and _sqlstate_shaped(exc):
-            raise  # shaped like a driver's error, as main read it: the send rolls back
         if state is None:
             raise _ResultUnreadable(type(exc).__name__) from exc
         if state in _CLIENT_FETCH_STATES:
-            raise _ResultUnreadable(f"{type(exc).__name__} [{state}]") from exc
+            shown = _shown_state(state, exc)
+            raise _ResultUnreadable(type(exc).__name__ + (f" [{shown}]" if shown else "")) from exc
         raise
     return rows
 
@@ -4469,10 +4480,11 @@ async def _next_result_set(advance: Callable[[], Awaitable[Any]]) -> bool:
         return bool(await advance())
     except Exception as exc:
         state = _log_sqlstate(exc)
-        if state is None and _sqlstate_shaped(exc):
-            raise  # shaped like a driver's error, as main read it: the send rolls back
         if state in _NO_NEXTSET_STATES:
-            logger.debug("DATABASE: nextset() ended the capture walk with [%s]", state)
+            logger.debug(
+                "DATABASE: nextset() ended the capture walk with [%s]",
+                _shown_state(state, exc) or "SQLSTATE withheld",
+            )
             return False
         if state is None:
             logger.warning(
@@ -4610,7 +4622,6 @@ class DatabaseDestination(DestinationConnector):
                 # the refusal (_cursor_refusal_discards says where a static one keeps it).
                 discard = True
                 raise refused from exc
-            withheld: str | None = None  # a non-driver error's type, raised below with no chain
             try:
                 await cur.execute(self._sql, params)
                 # Capture the RETURNING/OUTPUT rows from the SAME cursor BEFORE commit (re-run-stable:
@@ -4641,17 +4652,9 @@ class DatabaseDestination(DestinationConnector):
                     # would retry a poison message for as long as the retry budget lasts. A
                     # dead-letter can be replayed. The rollback's error stays the context.
                     raise _send_refusal(state, exc) from exc
-                if state is not None or isinstance(exc, UnicodeEncodeError):
-                    raise _send_refusal(state, exc) from exc
-                if not _sqlstate_shaped(exc):
+                if state is None and not isinstance(exc, UnicodeEncodeError):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
-                # The release reads the chain for a lost link (_connection_lost); the withheld error
-                # carries none, so that verdict is taken here, from the original.
-                discard = discard or _connection_lost(exc)
-                withheld = type(exc).__name__
-            if withheld is not None:
-                # Raised outside the handler, so the withheld error is on no chain (BACKLOG #1796).
-                raise WithheldSendError(f"{withheld} [message withheld]")
+                raise _send_refusal(state, exc) from exc
         finally:
             await _close_and_release(pool, conn, cur, discard=discard)
         return captured
@@ -6088,7 +6091,7 @@ class DatabaseLookupExecutor:
         except DbLookupError:
             raise
         except Exception as exc:
-            state = _sqlstate(exc)
+            state = _shown_state(_sqlstate(exc), exc)
             # PHI-free: name the connection + SQLSTATE (if any) only — never the statement/params/rows.
             raise DbLookupError(
                 f"db_lookup query on {connection!r} failed" + (f" [{state}]" if state else "")
