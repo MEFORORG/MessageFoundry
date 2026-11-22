@@ -690,8 +690,12 @@ def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes
 def _framing_error(connector: str, reason: str) -> AmbiguousFramingError:
     # The reason is always a fixed string from this module, never a header value or a body byte, so
     # the message carries nothing the peer supplied.
-    kind = ContentCodedReplyError if reason == _CONTENT_CODED_REASON else AmbiguousFramingError
-    return kind(
+    if is_content_coded_fault(reason):
+        # BACKLOG #5910: named for its coding, not as a body framed ambiguously.
+        return ContentCodedReplyError(
+            f"{connector} sent its response body in {reason}; refusing to read it", reason=reason
+        )
+    return AmbiguousFramingError(
         f"{connector} framed its response body ambiguously ({reason}); refusing to read it",
         reason=reason,
     )

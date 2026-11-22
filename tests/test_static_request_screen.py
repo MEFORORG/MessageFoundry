@@ -41,7 +41,7 @@ _KINDS = list(_URLS)
 
 
 @pytest.mark.parametrize("kind", _KINDS)
-@pytest.mark.parametrize("tail", ["/a b", "/café", "/a b"])
+@pytest.mark.parametrize("tail", ["/a b", "/café", "/a\u00a0b"])
 def test_an_unsendable_static_url_is_refused_at_construction(
     kind: ConnectorType, tail: str
 ) -> None:
@@ -142,3 +142,68 @@ def test_a_refused_lookup_leaves_no_crossing_record_from_an_earlier_lookup(
             egress=_OPEN,
         )
     assert built == []
+
+
+@pytest.mark.parametrize("kind", [ConnectorType.REST, ConnectorType.SOAP])
+@pytest.mark.parametrize(
+    "wrapped", [" {}", "{}\n", "{} "], ids=["lead-space", "trail-lf", "trail-space"]
+)
+def test_whitespace_urllib_strips_is_not_refused_where_the_url_is_sent_as_is(
+    kind: ConnectorType, wrapped: str
+) -> None:
+    """urllib's Request unwraps the url before it sends it, so these delivered on main and must
+    still build (round-16b7ce9851 finding 2)."""
+    assert _build(kind, url=wrapped.format(_URLS[kind])) is not None
+
+
+def test_a_trailing_space_in_a_dicomweb_base_is_refused() -> None:
+    """The STOW-RS target appends /studies after it, so the space lands inside the request line."""
+    with pytest.raises(ValueError, match="'url' must be ASCII with no whitespace"):
+        _build(ConnectorType.DICOMWEB, url=_URLS[ConnectorType.DICOMWEB] + " ")
+
+
+def test_a_fragment_is_refused_on_soap_with_ws_addressing() -> None:
+    """wsa:To carries the url as written, fragment included, while the POST drops it."""
+    with pytest.raises(ValueError, match="no '#' when ws_addressing is on"):
+        _build(
+            ConnectorType.SOAP,
+            url=_URLS[ConnectorType.SOAP] + "#part",
+            ws_addressing=True,
+            soap_version="1.2",
+        )
+
+
+def _smart(token_url: str, **over: Any) -> SmartBackendTokenProvider:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    pem = (
+        rsa.generate_private_key(public_exponent=65537, key_size=3072)
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+    return SmartBackendTokenProvider(token_url=token_url, client_id="cid", private_key=pem, **over)
+
+
+def test_a_fragment_in_a_smart_token_url_with_the_default_audience_is_refused() -> None:
+    """The default aud is the token URL as written, fragment included, while the POST drops it."""
+    with pytest.raises(ValueError, match="no '#' unless smart_audience is set"):
+        _smart("https://as.example.org/token#x")
+    audience = "https://as.example.org/token"
+    assert _smart("https://as.example.org/token#x", audience=audience).audience == audience
+
+
+def test_a_control_character_in_a_proxy_named_value_is_refused_on_fhir() -> None:
+    """The value check runs on a proxy-named header too where the screen judges it at all
+    (round-16b7ce9851 finding 5); the value never reaches the refusal."""
+    with pytest.raises(ValueError, match="control character") as ei:
+        refuse_unsendable_static_request(
+            "https://h.example.org/",
+            {"Proxy-Authorization": "Basic a\x00bc"},
+            setting="FHIR destination",
+        )
+    assert "a\x00bc" not in str(ei.value)

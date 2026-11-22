@@ -471,10 +471,15 @@ class DicomWebDestination(DestinationConnector):
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
-        # the proxy route's hop gate, rather than every message at send time.
+        # the proxy route's hop gate, rather than every message at send time. The url judged is the
+        # STOW-RS target, which is sent with no further path appended.
         self._headers = self._build_headers(s)
         refuse_unsendable_static_request(
-            url, self._headers, setting="DICOMweb destination", leave_proxy_credential_names=True
+            self._resolve_target_url(),
+            self._headers,
+            setting="DICOMweb destination",
+            sent_as_is=True,
+            leave_proxy_credential_names=True,
         )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(

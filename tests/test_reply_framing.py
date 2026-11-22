@@ -216,6 +216,9 @@ def _assert_framing_refusal(exc: BaseException) -> None:
     if isinstance(exc, MalformedReplyHeadError):
         # Refused while the head was read, before the body framing is known (BACKLOG #2052).
         assert "framed its reply ambiguously" in str(exc)
+    elif exc.reason == _CODED_REASON:
+        # BACKLOG #5910: a coded body is named for its coding.
+        assert "sent its response body in a content coding" in str(exc)
     else:
         assert "framed its response body ambiguously" in str(exc)
 

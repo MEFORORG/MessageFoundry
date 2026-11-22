@@ -53,7 +53,6 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
-    ContentCodedReplyError,
     EgressReplyError,
     NoRedirectHandler,
     TruncatedResponseError,
@@ -260,8 +259,6 @@ def jwks_fetcher(
                 body = read_reply_body(
                     resp, _MAX_JWKS_BYTES + 1, connector="OIDC jwks_uri endpoint"
                 )
-            except ContentCodedReplyError:  # BACKLOG #5910: named for its coding, not its length
-                message = _JWKS_CODED
             except AmbiguousFramingError:
                 message = _JWKS_MISFRAMED
             except TruncatedResponseError:

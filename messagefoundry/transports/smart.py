@@ -351,8 +351,9 @@ class _TokenEndpointProvider(abc.ABC):
             token_url, cls._URL_SETTING, use=cls._CREDENTIAL_SETTINGS, error=cls._ERROR
         )
         # BACKLOG #5911: a token URL http.client could never send fails the connection here, not
-        # each mint. The POST goes to the URL as it stands, so a '#' is only dropped by urllib.
-        if unsendable_request_target(token_url, refuse_fragment=False):
+        # each mint. The POST goes to the URL with no path appended, so it is judged as urllib
+        # sends it.
+        if unsendable_request_target(token_url, sent_as_is=True):
             raise cls._ERROR(
                 f"{cls._URL_SETTING} must be ASCII with no whitespace or control character "
                 "(http.client sends it as ASCII); percent-encode it, and give an "
@@ -637,6 +638,13 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             )
         self.client_id = client_id
         self.scope = scope or None
+        if not audience and "#" in token_url:
+            # BACKLOG #5911: the POST drops the fragment, but the default aud keeps it, so an
+            # authorization server matching aud against its own URL would refuse every mint.
+            raise SmartAuthError(
+                "smart_token_url must hold no '#' unless smart_audience is set (the client "
+                "assertion's aud defaults to the URL as written, while the POST drops the fragment)"
+            )
         # SMART: aud = the token endpoint URL unless the server documents another audience.
         self.audience = audience or token_url
         # Loads + validates the key/curve for the algorithm — a bad key fails loud here, before the

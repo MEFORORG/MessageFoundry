@@ -763,16 +763,23 @@ class SoapDestination(DestinationConnector):
         self._refuse_half_credential_pairs(s)
         self._validate_ws(scheme, s)
         # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
-        # the proxy route's hop gate, rather than every message at send time. The url is sent as it
-        # stands, so a '#' is only dropped by urllib and is not refused.
+        # the proxy route's hop gate, rather than every message at send time. The url is sent with no
+        # path appended, so it is judged as urllib sends it.
         self._headers = self._build_headers(s)
         refuse_unsendable_static_request(
             url,
             self._headers,
             setting="SOAP destination",
-            refuse_fragment=False,
+            sent_as_is=True,
             leave_proxy_credential_names=True,
         )
+        if self.ws_addressing and "#" in url:
+            # The POST drops the fragment, but wsa:To carries the url as written, so a server that
+            # matches To against its own address would fault every message.
+            raise ValueError(
+                "SOAP destination 'url' must hold no '#' when ws_addressing is on (it is sent as "
+                "wsa:To as written, while the POST drops the fragment)"
+            )
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(
