@@ -20,6 +20,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
+from tests._serviceenv_remedy import NO_DIRECTORY, REMOVE, RUNS_ON
 
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
 #: A base64url stand-in of a 32-byte secret's length, with one ``=``, a "-" and a "_" in it, and
@@ -144,38 +145,10 @@ def test_an_ordinary_name_set_to_a_key_does_not_join_an_empty_value(entries: lis
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
-    assert "remove those strings with it" not in refusal
+    assert RUNS_ON not in refusal
 
 
 _DIRECTORY_KEY = f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"
-
-#: What the refusal says of a directory string joined to a refused value, whatever it holds, and
-#: how it says to pass the list back, so that string is not passed back with it.
-_REWRITE = (
-    "Remove each such string, whatever it holds, since it may hold that value, and do not keep it "
-    "as the directory's entry. Where the service has a secrets directory, or a step below puts a "
-    "setting in one, the lists must then hold exactly one MEFOR_SECRETS_DIRECTORY entry, written "
-    "as MEFOR_SECRETS_DIRECTORY=<path> on its own"
-)
-_PASS_BACK = (
-    "pass back every entry but those refused above and the strings this step and any step above "
-    "say to remove"
-)
-_CREATE = (
-    'Where no secrets directory exists yet, the bullet "The other secrets: a secrets directory" '
-    'under docs/SERVICE.md, "Protect the store encryption key at rest", says how the directory '
-    "is created"
-)
-_REMOVE_ALL = "so remove those strings with it, or the value stays in the registry key"
-
-
-def _assert_written_again(refusal: str) -> None:
-    """One directory step, which never says to keep or spare the joined string."""
-    assert refusal.count(_REWRITE) == 1, refusal
-    assert _PASS_BACK in refusal[refusal.index(_REWRITE) :]
-    assert "Keep one MEFOR_SECRETS_DIRECTORY entry" not in refusal
-    assert "but for any that sets MEFOR_SECRETS_DIRECTORY" not in refusal
-    assert "The service's lists set no MEFOR_SECRETS_DIRECTORY" not in refusal
 
 
 @pytest.mark.parametrize(
@@ -206,91 +179,66 @@ def _assert_written_again(refusal: str) -> None:
         ),
     ],
 )
-def test_a_joined_directory_string_is_removed_and_written_again(entries: list[str]) -> None:
+def test_a_joined_directory_string_is_removed_with_the_value(entries: list[str]) -> None:
     """A ``MEFOR_SECRETS_DIRECTORY`` string joined below an empty store key may hold the key, so
-    whatever it holds, the remedy says to remove it with the value and write the directory's entry
-    again on its own, and never to keep it (Lander's second hold on PR 3142, H3)."""
+    the remedy says to remove what the value runs on into, whatever it holds, and to leave one
+    directory entry written on its own (the Lander's second hold on PR 3142, H3). It names no
+    list or string to do it in (the third hold, H1)."""
     posture = _read(entries)
     assert posture.listed_keys == (_KEY,), posture.listed
-    assert posture.value_runs_on and posture.directory_joined
+    assert posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert _REMOVE_ALL in refusal
-    _assert_written_again(refusal)
+    assert REMOVE in refusal and RUNS_ON in refusal
 
 
-def test_a_joined_directory_string_keeps_the_create_or_add_back_guidance() -> None:
-    """Beside a secret the directory takes, the refusal still says how to name an existing
-    secrets directory again, or create one, as 9c54e7e9fd80 did."""
-    posture = _read([f"{_KEY}=", _DIRECTORY_KEY, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
-    refusal = service_env_refusal(posture)
-    assert refusal is not None and posture.directory_joined
-    _assert_written_again(refusal)
-    assert (
-        "where the strings removed leave none, write it again in AppEnvironmentExtra, beside its "
-        "other entries" in refusal
+def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directory() -> None:
+    """The third hold's H2. For the store key alone, which goes to a key file, the refusal says
+    nothing of creating a secrets directory, even with a directory string joined to it. Beside a
+    secret the directory takes, with no entry read as naming it, it says how one is created."""
+    key_alone = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
+    assert key_alone is not None
+    assert "DPAPI-protected key file" in key_alone
+    assert NO_DIRECTORY not in key_alone
+    beside = service_env_refusal(
+        _read([f"{_KEY}=", _DIRECTORY_KEY, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
     )
-    assert "where they leave more than one, remove the rest" in refusal
-    assert _CREATE in refusal
+    assert beside is not None and NO_DIRECTORY in beside
 
 
-def test_a_directory_string_joined_past_a_name_alone_beside_a_secret_is_not_set_none() -> None:
-    """A name written alone between the empty value and the directory string carries the join
-    on, so beside a secret the directory takes the refusal still must not say the lists set
-    none (H3)."""
-    posture = _read(
-        [
-            f"{_KEY}=",
-            "MEFOR_VALUE_A",
-            "mefor_secrets_directory=C:\\d",
-            "MEFOR_AUTH_AD_BIND_PASSWORD=x",
-        ]
+def test_a_directory_named_on_its_own_gets_no_create_guidance() -> None:
+    """The control for the arm above: a directory entry read as naming the directory."""
+    refusal = service_env_refusal(
+        _read(["MEFOR_SECRETS_DIRECTORY=C:\\d", "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
     )
-    refusal = service_env_refusal(posture)
-    assert refusal is not None and posture.directory_joined
-    _assert_written_again(refusal)
+    assert refusal is not None
+    assert REMOVE in refusal and NO_DIRECTORY not in refusal
 
 
-def test_a_directory_set_first_in_a_joined_groups_first_string_is_not_joined() -> None:
-    """Only a string after the first of a joined group is joined into a value above it. A
-    directory set on the first line of the group's own first string is the service's entry,
-    and the refusal must not say to remove it (H3)."""
+def test_a_directory_set_first_in_the_strings_own_first_line_is_left_named() -> None:
+    """A refused variable on a later line of the directory's own string: the remedy says to
+    remove that variable with its value and to leave the directory's entry on its own, never to
+    remove the string that names the directory (the third hold, H1)."""
     posture = _read(["MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD=", "abc"])
-    assert posture.value_runs_on and not posture.directory_joined
+    assert posture.value_runs_on
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert _REWRITE not in refusal
+    assert REMOVE in refusal and RUNS_ON in refusal and NO_DIRECTORY not in refusal
 
 
 @pytest.mark.parametrize("prefix", ["", "MEFOR_AI_ENVIRONMENT=prod\n"], ids=["line", "later-line"])
 def test_a_directory_line_in_the_key_string_refuses_as_the_key_alone(prefix: str) -> None:
     """A key-valued directory line inside the empty key's own string is read as the key's
-    value: it refuses as the key, runs on into nothing, and adds no directory step. The rule
-    for joined strings does not reach this form, which is left as it stands (H3, item (c))."""
+    value: it refuses as the key, runs on into nothing, and says nothing of the directory. The
+    rule for joined strings does not reach this form, which is left as it stands (H3, item
+    (c))."""
     posture = _read([f"{prefix}{_KEY}=\n{_DIRECTORY_KEY}"])
     assert posture.listed_keys == (_KEY,), posture.listed
-    assert not posture.value_runs_on and not posture.directory_joined
+    assert not posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert _REWRITE not in refusal
-
-
-def test_two_joined_directory_strings_get_one_directory_step() -> None:
-    """With a path-only and a key-bearing directory string both joined, one step covers both."""
-    posture = _read(
-        [
-            f"{_KEY}=",
-            _DIRECTORY_KEY,
-            "MEFOR_STORE_PASSWORD=",
-            "mefor_secrets_directory=C:\\d",
-            "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic",
-        ]
-    )
-    assert posture.directory_joined
-    refusal = service_env_refusal(posture)
-    assert refusal is not None
-    _assert_written_again(refusal)
+    assert REMOVE in refusal and RUNS_ON not in refusal and NO_DIRECTORY not in refusal
 
 
 def test_a_nameless_key_item_joins_an_empty_value_item() -> None:
@@ -302,7 +250,7 @@ def test_a_nameless_key_item_joins_an_empty_value_item() -> None:
     assert posture.value_runs_on
     assert posture.empty_value_names == ()
     refusal = service_env_refusal(posture)
-    assert refusal is not None and "remove those strings with it" in refusal
+    assert refusal is not None and RUNS_ON in refusal
 
 
 @pytest.mark.parametrize(

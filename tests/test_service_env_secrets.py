@@ -51,6 +51,7 @@ from messagefoundry.serviceenv import (
     service_env_loosenings,
     service_env_refusal,
 )
+from tests._serviceenv_remedy import NO_DIRECTORY, REMOVE
 
 #: Synthetic stand-ins. Never a real key: the tests check that no value is kept, by searching for
 #: these strings in what the reading returns.
@@ -426,7 +427,7 @@ def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
     )
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
+    assert NO_DIRECTORY in refusal
 
 
 def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
@@ -437,7 +438,7 @@ def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert "set no MEFOR_SECRETS_DIRECTORY" not in refusal
+    assert NO_DIRECTORY not in refusal
 
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
@@ -597,7 +598,7 @@ def test_every_other_secret_class_name_in_the_nssm_list_refuses(name: str) -> No
     assert 'enforcement = "warn" does not change this refusal' in refusal
     # The store key's remedy is not offered for a secret that is not the store key.
     assert "protect-key" not in refusal
-    assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
+    assert NO_DIRECTORY in refusal
     # `serve` refuses before it reads the loosenings; an engine it did not start names it there.
     [(entry, twin)] = service_env_loosenings(posture)
     assert entry == "secret_in_service_environment"
@@ -610,33 +611,22 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
     assert serviceenv._DIRECTORY_VARIABLE == SECRETS_DIRECTORY_VARIABLE
     posture = _service(["MEFOR_STORE_PASSWORD=x", "MEFOR_SECRETS_DIRECTORY=C:/s"])
     refusal = service_env_refusal(posture)
-    assert refusal is not None and "set no MEFOR_SECRETS_DIRECTORY" not in refusal
+    assert refusal is not None and NO_DIRECTORY not in refusal
 
 
-def test_the_missing_directory_hint_gives_each_route_with_its_condition() -> None:
-    """The installer refuses an existing directory the service does not name, and it always
-    registers ``serve``, so the hint sends nobody to a re-run: one route re-adds the variable for
-    a directory that exists, reading the list first since ``nssm set`` replaces it whole, and the
-    other points, where none exists, to the SERVICE.md text on how the directory is made. Each
-    route is pinned with its condition, so swapped conditions fail."""
+def test_the_missing_directory_hint_names_no_list_string_or_command() -> None:
+    """The installer refuses an existing directory the service does not name, so the hint sends
+    nobody to a re-run. The remedy says what to remove and points at SERVICE.md for how, and
+    where none exists, how the directory is made. It names no list, registry string or `nssm`
+    command, since which of those applies depends on the host (the Lander's third hold on PR
+    3142, H1)."""
     refusal = service_env_refusal(_service(["MEFOR_STORE_PASSWORD=x"]))
     assert refusal is not None
-    hint = refusal.split("set no MEFOR_SECRETS_DIRECTORY", 1)[1]
-    routes = hint.split(". Where ")[1:]
-    assert len(routes) == 2
-    existing, absent = routes
-    assert existing.startswith("install-service.ps1 already made the secrets directory, add ")
-    assert "MEFOR_SECRETS_DIRECTORY naming that existing path" in existing
-    assert "AppEnvironmentExtra" in existing
-    assert "read it first with `nssm get`" in existing
-    assert "every entry but those refused above" in existing
-    assert '"Start / stop / status"' in existing
-    assert absent.startswith("none exists yet, ")
-    assert '"The other secrets: a secrets directory"' in absent
-    assert '"Protect the store encryption key at rest"' in absent
-    assert "MEFOR_SECRETS_DIRECTORY" not in absent and "AppEnvironmentExtra" not in absent
-    # No route sends the operator to a re-run of the installer.
-    assert "install-service.ps1 again" not in hint and "original parameters" not in hint
+    assert REMOVE in refusal and NO_DIRECTORY in refusal
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith(REMOVE)
+    for named in ("AppEnvironment", "nssm", "registry string", "install-service.ps1"):
+        assert named not in remedy, named
 
 
 def test_a_store_key_and_another_secret_in_the_nssm_list_name_both_remedies() -> None:
@@ -898,7 +888,7 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
         "Put each MEFOR_VALUE_* variable in the secrets directory MEFOR_SECRETS_DIRECTORY names"
     ) in refusal
     assert "environments/<env>.toml" in refusal and '"[environments]"' in refusal
-    assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
+    assert NO_DIRECTORY in refusal
     assert _ENFORCEMENT_NOTE in refusal
     assert "protect-key" not in refusal
     value = entry.split("=", 1)[1]
@@ -945,7 +935,7 @@ def test_env_values_are_counted_per_registry_value() -> None:
     assert "counted once, without regard to case, under the first registry value" in refusal
     assert "remove it from every value that sets it" in refusal
     # Names are printed nowhere, so the shared ending speaks of what was refused, not named.
-    assert "Remove each refused variable from the service's lists" in refusal
+    assert REMOVE in refusal
     assert "each value named" not in refusal and "Remove each name" not in refusal
 
 
@@ -1009,7 +999,7 @@ def test_a_directory_secret_and_an_env_value_share_one_remedy_sentence() -> None
         "MEFOR_SECRETS_DIRECTORY names"
     ) in refusal
     assert refusal.count('"The secrets directory"') == 1
-    assert "set no MEFOR_SECRETS_DIRECTORY" not in refusal
+    assert NO_DIRECTORY not in refusal
 
 
 def test_the_smoke_legs_nssm_list_is_one_serve_does_not_refuse() -> None:
