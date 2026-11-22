@@ -42,13 +42,21 @@ from collections import Counter
 from collections.abc import Callable
 from typing import overload
 
+from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.logging_setup import (
     AUDIT_LOGGER_NAME,
+    FinishedAuditLine,
     ensure_logger_sink,
     scrub_log_text,
     sink_readings,
 )
-from messagefoundry.redaction import _REDACTED, clamp_untrusted, safe_text, safe_text_bound
+from messagefoundry.redaction import (
+    _REDACT_WINDOW,
+    _REDACTED,
+    clamp_untrusted,
+    safe_text,
+    safe_text_bound,
+)
 
 __all__ = [
     "AuditObserver",
@@ -126,14 +134,11 @@ _PLACEHOLDERS = re.compile(r"\[redacted\]|<redacted>")
 _WORD = re.compile(r"[^\W_]+")
 #: Whether this process has logged a field scrub fault; see :func:`_scrub_field`.
 _FIELD_SCRUB_FAULT_LOGGED = False
-#: Whether this process has logged a fault that ships the line before #3045; see
-#: :func:`_log_line_fault`.
-_LINE_SCRUB_FAULT_LOGGED = False
-#: The reasons for shipping a record as the line before #3045 that this process has logged, so
-#: a warning naming none but these is not logged again; see :func:`_tee_line`.
-_OLD_LINE_REASONS_LOGGED: set[str] = set()
-_SHOWS_A_WORD = "show a word the line before it hid"
-_UNPARSED = "leave a sink's reading unparseable where the line before it parsed"
+#: The most passes :func:`_settled` runs before it gives up on a value that is still changing.
+#: The handler chain is not idempotent, and a later handler used to get those extra passes.
+_SETTLE_PASSES = 12
+#: The record's free-text fields, the ones :func:`_tee_line` may cut to keep the line bounded.
+_TEXT_FIELDS = ("action", "actor", "channel_id", "client", "detail")
 
 
 def _read(text: str, stand_in: str) -> str:
@@ -220,8 +225,8 @@ def _window(value: str, *, detail: bool) -> tuple[str, str]:
 def _bounded_detail(kept: str, note: str, old: str) -> str:
     """``kept``, the scrubbed detail, bounded by :func:`~messagefoundry.redaction.safe_text` as
     the value was, with ``note``, the bound note ``safe_text`` gave the value, which the scrub's
-    own window cut off. Where ``old``, the detail the line before #3045 shipped, parses as JSON
-    and the bounded result does not, it ships as the JSON string ``"[redacted]"`` instead."""
+    own window cut off. Where ``old``, the value's own ``safe_text`` form, parses as JSON and the
+    bounded result does not, it ships as the JSON string ``"[redacted]"`` instead."""
     shipped = safe_text(kept) + note
     if _parses(old) and not _parses(shipped):
         return json.dumps(_FIELD_REDACTED)
@@ -253,7 +258,7 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     With ``detail``, a value that parses as JSON and holds no raw control has each JSON escape
     that spells a C0 control decoded first and encoded again after, and the whole field is then
     the JSON string ``"[redacted]"``, as it is where the result no longer parses. On a fault the
-    whole field is returned. :func:`_tee_line` chooses what ships."""
+    whole field is returned. :func:`_finished` then scrubs what this returns, control or none."""
     if value is None:
         return None
     as_json = False
@@ -305,86 +310,93 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
 
 
 def _log_scrub_fault(exc: Exception) -> None:
-    """Log a fault in the C0 field scrub once per process, by type and never with the value."""
+    """Log a fault in the field scrub once per process, by type and never with the value."""
     global _FIELD_SCRUB_FAULT_LOGGED
     if not _FIELD_SCRUB_FAULT_LOGGED:
         _FIELD_SCRUB_FAULT_LOGGED = True
         log.warning(
-            "the audit tee's field scrub failed (%s); the field is hidden whole, unless the "
-            "record then ships as the line before the scrub, and further faults in this process "
-            "are not logged",
+            "the audit tee's field scrub failed (%s); the text it was scrubbing is hidden whole, "
+            "and further faults in this process are not logged",
             type(exc).__name__,
         )
 
 
-def _log_line_fault(exc: Exception) -> None:
-    """Log a fault that ships a record as the line before #3045, once per process, by type and
-    never with the value. Apart from :func:`_log_scrub_fault`, a fault in one field's scrub."""
-    global _LINE_SCRUB_FAULT_LOGGED
-    if not _LINE_SCRUB_FAULT_LOGGED:
-        _LINE_SCRUB_FAULT_LOGGED = True
-        log.warning(
-            "the audit tee's C0 scrub failed (%s); the record ships without it, as the line "
-            "before the scrub, and further such faults in this process are not logged",
-            type(exc).__name__,
-        )
+def _settled(text: str) -> str | None:
+    """``text`` once the handlers' text passes change it no more, or ``None`` if they still do
+    after :data:`_SETTLE_PASSES`. A further pass can redact more than the first."""
+    for _ in range(_SETTLE_PASSES):
+        out = scrub_log_text(text)
+        if out == text:
+            return out
+        text = out
+    return None
 
 
-def _tee_line(
-    before: dict[str, object],
-    after: dict[str, object],
-    whole_detail: Callable[[], str] = lambda: _FIELD_REDACTED,
-) -> str:
-    """The line to log for a record whose fields the C0 scrub turned from ``before`` into
-    ``after`` (BACKLOG #3045). ``before`` is the record as the code before #3045 built it, the old
-    line. A scrubbed candidate ships only if its reading parses as JSON on each sink where the old
-    line's did.
+def _finished(key: str, written: str, scrubbed: str) -> str:
+    """The text to ship for field ``key``, written as ``written`` and scrubbed so far to
+    ``scrubbed`` (BACKLOG #5649). No filter reads the finished line, so this must hide what they
+    would have.
 
-    The candidates, in order: the line with every scrubbed field; the old line with each changed
-    field as :data:`_FIELD_REDACTED` and a changed ``detail`` as what ``whole_detail`` returns;
-    then the old line. A sink's reading is :func:`~messagefoundry.logging_setup.sink_readings`, a
-    model, not the formatter's output. Where the scrubbed candidates fail, a warning names why the
-    last one failed, unless this process has logged each of those reasons. On a fault the old
-    line ships."""
-    old_line = json.dumps(before, ensure_ascii=False)
-    if after == before:
-        return old_line
-    try:
-        # Only a changed detail calls whole_detail; a fault building it ships the old line.
-        whole = {
-            k: v if after[k] == v else whole_detail() if k == "detail" else _FIELD_REDACTED
-            for k, v in before.items()
-        }
-        bars = [(_line_words(r), _parses(r)) for r in sink_readings(old_line)]
-        candidates = (after,) if whole == after else (after, whole)
-        reasons: list[str] = []
-        for candidate in candidates:
-            line = json.dumps(candidate, ensure_ascii=False)
-            paired = list(zip(sink_readings(line), bars, strict=True))
-            shows = not all(_shows_no_more(r, words) for r, (words, _) in paired)
-            # Only the last checked candidate's reasons are reported, so an earlier one that shows
-            # a word is rejected without its parses.
-            if shows and candidate is not candidates[-1]:
-                continue
-            unparsed = not all(not parsed or _parses(r) for r, (_, parsed) in paired)
-            if not (shows or unparsed):
-                return line
-            # The last checked candidate's reasons are the ones that ship the old line.
-            reasons = [_SHOWS_A_WORD] if shows else []
-            if unparsed:
-                reasons.append(_UNPARSED)
-    except Exception as exc:  # noqa: BLE001 - the tee must still ship the record
-        _log_line_fault(exc)
-        return old_line
-    if not _OLD_LINE_REASONS_LOGGED.issuperset(reasons):
-        _OLD_LINE_REASONS_LOGGED.update(reasons)
-        log.warning(
-            "an off-box audit record shipped without the C0 field scrub, because hiding its "
-            "changed fields whole would still %s; later cases are logged only where they name "
-            "a reason not yet logged in this process",
-            " and ".join(reasons),
-        )
-    return old_line
+    ``scrubbed`` is run to :func:`_settled`. Unless that left the field as written, with nothing
+    for ``json.dumps`` or the control scrub to escape, the result must also show no word, counted,
+    beyond what each modelled sink leaves of the field alone as a JSON member, the form the
+    handler chain used to read (:func:`~messagefoundry.logging_setup.sink_readings`). If it shows
+    more, or a reading does not settle, the whole field is :data:`_FIELD_REDACTED`."""
+    settled = _settled(scrubbed)
+    if settled is None:
+        return _FIELD_REDACTED
+    encoded = json.dumps(written, ensure_ascii=False)[1:-1]
+    if settled == written and encoded == written and scrub_control_chars(written) == written:
+        return written
+    # Spelled as the line will be, so an escape splits words here as it does in the readings.
+    shown = scrub_control_chars(json.dumps(settled, ensure_ascii=False)[1:-1])
+    member = json.dumps({key: written}, ensure_ascii=False)
+    if not all(_shows_no_more(shown, _line_words(r)) for r in sink_readings(member)):
+        return _FIELD_REDACTED
+    return settled
+
+
+def _finished_detail(detail: str) -> str:
+    """``detail`` scrubbed and bounded for the line. It keeps its bound note, and where the
+    :func:`~messagefoundry.redaction.safe_text` form parses as JSON the result parses too."""
+    # safe_text(head) + note is safe_text(detail); the note is kept for a scrubbed detail.
+    head, note = safe_text_bound(detail)
+    bounded = safe_text(head) + note
+    kept = _scrub_field(detail, detail=True)
+    # Judged before safe_text bounds it: the bound's own "(+N chars)" is not text of the value.
+    scrubbed = _finished("detail", head, head if kept is detail else kept)
+    if scrubbed == _FIELD_REDACTED:
+        return _bounded_detail(_FIELD_REDACTED, note, bounded)
+    shipped = bounded if scrubbed == head else _bounded_detail(scrubbed, note, bounded)
+    final = _settled(shipped)
+    if final is None:
+        return _bounded_detail(_FIELD_REDACTED, note, bounded)
+    if _parses(bounded) and not _parses(final):
+        return json.dumps(_FIELD_REDACTED)
+    return final
+
+
+def _tee_line(record: dict[str, object]) -> FinishedAuditLine:
+    """``record`` as the finished line, no longer than the handler chain's redaction window.
+
+    The chain bounded the whole line, and it no longer reads this one, so the bound moves here.
+    A line over the window has its longest text field cut, with the clamp's note, until it fits.
+    Each field stays present, so the line still parses and keeps its anchors."""
+    fields = dict(record)
+    for _ in _TEXT_FIELDS:
+        line = FinishedAuditLine(json.dumps(fields, ensure_ascii=False))
+        excess = len(line) - _REDACT_WINDOW
+        if excess <= 0:
+            return line
+        key = max(_TEXT_FIELDS, key=lambda k: len(str(fields[k] or "")))
+        value = str(fields[key] or "")
+        cut = clamp_untrusted(value, window=max(len(value) - excess, 0))
+        fields[key] = cut if len(cut) < len(value) else _FIELD_REDACTED
+    line = FinishedAuditLine(json.dumps(fields, ensure_ascii=False))
+    if len(line) <= _REDACT_WINDOW:
+        return line
+    hidden = {k: _FIELD_REDACTED for k in _TEXT_FIELDS if record[k] is not None}
+    return FinishedAuditLine(json.dumps({**record, **hidden}, ensure_ascii=False))
 
 
 def emit_audit_tee(
@@ -462,24 +474,21 @@ def emit_audit_tee(
     redacting here keeps the off-box guarantee independent of handler config and **identical across
     every backend**.
 
-    **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
-    ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``
-    runs last on every configured handler, and since vault BACKLOG #3012 every escape it writes is
-    valid inside a JSON string (:mod:`messagefoundry.controlchars` says why). So this serializes
-    with plain ``json.dumps`` and adds no escaping of its own. The first handler's filters see each
-    character of the record unescaped, except those ``json.dumps`` must escape in a string: the
-    quote, the backslash and the 32 C0 controls, U+0000 to U+001F. Escaping more here, BEFORE the
-    redaction and credential filters, hid a name or a password from them: an escape such as
-    ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer matched the next
-    word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
+    **Each field is scrubbed, then the record is serialized, and no filter rewrites the result
+    (BACKLOG #5649).** A failed sign-in sets ``actor`` to the typed name, so a client chooses its
+    characters. The handler filters read a line as plain text, so a span they redacted could take a
+    closing quote with it: a typed name of ``password=`` or ``a|b|c`` broke the document, and every
+    handler re-ran them over the one shared record. So ``action``, ``actor``, ``channel_id``,
+    ``client`` and ``detail`` each go through the same text passes here (:func:`_finished`), and
+    the line is a :class:`~messagefoundry.logging_setup.FinishedAuditLine`, which the handlers' text
+    passes leave alone on this logger. Its control characters are escaped when it is built, with
+    escapes valid inside a JSON string (:mod:`messagefoundry.controlchars`). A fault in the scrub
+    hides the text fields whole and never ships them raw.
 
-    **A C0 control in a text field is scrubbed before it is encoded (BACKLOG #3045).**
-    ``json.dumps`` escapes the 32 C0 controls, and each escape ends in a word character, as
-    ``\\u0001`` and ``\\t`` do, so a pattern that needs a word boundary or whitespace missed the
-    text beside one when only the handler chain ran. So ``action``, ``actor``, ``channel_id``,
-    ``client`` and ``detail`` are first scrubbed by the same text passes where they hold a C0
-    control in the window :func:`_scrub_field` scans. :func:`_scrub_field` says how, and
-    :func:`_tee_line` chooses the line that ships. What that leaves, at least:
+    **A C0 control in a text field is read before it is encoded (BACKLOG #3045).** ``json.dumps``
+    escapes the 32 C0 controls, and each escape ends in a word character, so a pattern needing a
+    word boundary or whitespace would miss the text beside one. :func:`_scrub_field` says how the
+    field is read. What the field scrub leaves, at least:
 
     * A control only past the scanned window is not seen.
     * All controls in a value are read the same way, as a space or as nothing, so text that needs
@@ -487,101 +496,75 @@ def emit_audit_tee(
     * A pattern that misses the text with a space, or nothing, in the control's place misses it
       here too. A control the patterns read as whitespace, at least tab, LF and CR, is not
       removed in either reading, so inside a word it splits the word, as on a plain log line.
-    * The comparisons count words, runs of letters and digits, so punctuation the old line hid
-      can ship.
+    * The comparisons count words, runs of letters and digits, so punctuation can ship.
     * A field holding a control can ship whole as ``[redacted]``, so a client can make its own
-      typed sign-in name ship that way. A record can ship as the line before #3045, losing the
-      scrub; a segment-shaped token such as ``ABC|`` after a control in a field can cause that,
-      so a client can turn the scrub off for its own record.
-    * A record whose line is longer than the handler chain's redaction window can ship the line
-      from before #3045, losing the C0 field scrub. At least a large ``action``, ``actor``,
-      ``channel_id`` or ``client`` can make one.
+      typed sign-in name ship that way.
     * In a JSON ``detail``, an escape is decoded only where it spells a C0 control, one level deep,
-      and where the detail parses as JSON within the bound and holds no raw control. Elsewhere,
-      as for ``\\u00a0``, the text beside an escape is read by the handler chain alone.
+      and where the detail parses as JSON within the bound and holds no raw control.
 
-    **At least two residuals remain, and both can break the JSON a collector receives.** The
-    first can also alter it silently.
-
-    * The redaction and credential filters rewrite spans of this document as text, and a span can
-      take a closing quote with it. A typed name of ``password=`` or ``a|b|c`` does that on every
-      sink, with no escaped character involved. When two fields carry attacker-influenced text,
-      the document can instead still parse, with the fields between them missing. Those can be
-      at least ``channel_id``, ``client``, ``detail`` and the row anchors. A field that survives,
-      such as ``actor``, can then carry another field's text. The field scrub adds a case: a
-      credential placeholder it writes just before an escape can be taken, with the escape's
-      backslash, as one credential value, and a quote that backslash escaped then ends the string.
-      :func:`_tee_line` checks the parse only on the modelled sinks.
-    * Every handler re-filters the one shared ``LogRecord``, so the file handler and the forwarder
-      run the chain again over the first handler's escaped text (``_install_phi_filters``). Then
-      ``x%7Cy%7Cz`` followed by DEL, or by U+2028, parses on stdout and not on the later sinks,
-      the forwarder included. ``tests/test_audit_offbox_tee.py`` pins that as a strict xfail.
-
-    Running the chain once per record, rather than once per handler, would close the second. The
-    first needs filters that do not rewrite this document as plain text.
+    **Fields are read one at a time.** A pattern that would have needed text from two fields of
+    the line no longer sees them together, so a value split across two fields is not redacted as
+    one. The line is bounded by :func:`_tee_line`. A reader that re-redacts the stored line as
+    text, such as ``GET /logs/tail`` or a support bundle, is outside this guarantee.
 
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
-    # safe_text(head) + note is safe_text(detail); the note is kept for a scrubbed detail.
-    head, note = safe_text_bound(detail) if detail else ("", "")
-    old_detail = safe_text(head) + note
     texts: dict[str, str | None] = {
         "action": action,
         "actor": actor,
         "channel_id": channel_id,
         "client": client,
     }
-    record: dict[str, object] = {
-        "event": "audit",
-        "ts": ts,
-        **texts,
-        # Anchor fields (BACKLOG #1198): the row's position in the chain and its head hash. Discrete
-        # fields so a SIEM can index them without parsing the redacted blob. See the docstring for
-        # what they close and what the default transport leaves open.
-        "row_id": row_id,
-        "seq": seq,
-        "row_hash": row_hash,
-        # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
-        "detail": old_detail if detail else None,
-    }
     try:
-        # Each text field is scrubbed before json.dumps escapes a C0 control in the window it
-        # scans (#3045).
+        scrubbed: dict[str, str | None]
         try:
-            scrubbed: dict[str, object] = {k: _scrub_field(v) for k, v in texts.items()}
-            if detail:
-                kept = _scrub_field(detail, detail=True)
-                scrubbed["detail"] = (
-                    old_detail if kept is detail else _bounded_detail(kept, note, old_detail)
-                )
-            # A detail hidden whole keeps its bound note, and its JSON-ness where it parsed before.
-            # Built lazily, so a record whose detail the scrub left alone never pays for it.
-            line = _tee_line(
-                record,
-                {**record, **scrubbed},
-                lambda: _bounded_detail(_FIELD_REDACTED, note, old_detail),
-            )
-        except Exception as exc:  # noqa: BLE001 - a scrub fault ships the line before #3045
-            _log_line_fault(exc)
-            line = json.dumps(record, ensure_ascii=False)
+            scrubbed = {
+                k: None if v is None else _finished(k, v, _scrub_field(v)) for k, v in texts.items()
+            }
+            # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
+            # ``is None``, not truthiness: the chain's MAC tells "" from None, so the copy must.
+            scrubbed["detail"] = None if detail is None else _finished_detail(detail)
+        except Exception as exc:  # noqa: BLE001 - no filter reads this line, so never ship it raw
+            _log_scrub_fault(exc)
+            scrubbed = {
+                k: None if v is None else _FIELD_REDACTED
+                for k, v in {**texts, "detail": detail}.items()
+            }
+        line = _tee_line(
+            {
+                "event": "audit",
+                "ts": ts,
+                "action": scrubbed["action"],
+                "actor": scrubbed["actor"],
+                "channel_id": scrubbed["channel_id"],
+                "client": scrubbed["client"],
+                # Anchor fields (BACKLOG #1198): the row's position in the chain and its head hash.
+                # Discrete fields so a SIEM can index them without parsing the redacted blob. See
+                # the docstring for what they close and what the default transport leaves open.
+                "row_id": row_id,
+                "seq": seq,
+                "row_hash": row_hash,
+                "detail": scrubbed["detail"],
+            }
+        )
         # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
         ensure_logger_sink(audit_logger)
-        # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.
         audit_logger.info(line)
-    except Exception:  # noqa: BLE001 — the audit row is durable; the off-box tee is best-effort
+    except Exception as exc:  # noqa: BLE001 — the audit row is durable; the off-box tee is best-effort
         # Once per process, and never naming the row (BACKLOG #1131). A line per failed row named
         # its action, and its COUNT tracked the rows, the hidden lock rows included; ``GET
         # /logs/tail`` serves this log to ``logs:view``, which the Operator holds without
         # ``users:manage``. The first failure is what an operator needs: the sink is broken, and
-        # every row is still in the store's ``audit_log``.
+        # every row is still in the store's ``audit_log``. The exception's type only: its message
+        # and a traceback's source lines can carry text the filters do not catch (BACKLOG #5649).
         global _TEE_FAILURE_LOGGED
         if not _TEE_FAILURE_LOGGED:
             _TEE_FAILURE_LOGGED = True
             log.warning(
-                "off-box audit tee failed; the rows are still in the audit_log table, and further "
-                "tee failures in this process are not logged",
-                exc_info=True,
+                "off-box audit tee failed (%s); the rows are still in the audit_log table, and "
+                "further tee failures in this process are not logged",
+                type(exc).__name__,
             )
     # After the tee, so an observer fault cannot cost the off-box copy. Each is guarded on its own.
     for observer in _OBSERVERS:
