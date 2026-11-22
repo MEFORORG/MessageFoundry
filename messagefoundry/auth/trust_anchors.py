@@ -244,11 +244,17 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     become the baseline where no store open in this process passed one first. The file
     checks are judged on the file, not on the store, and refuse or warn as they do elsewhere (the
     next paragraph says which a reload runs); only their rows travel the hop. A file that cannot
-    be read refuses before this anchor writes any row. **A refusal at a reload refuses only the
-    reload.** The store is not closed: the connections already in its pool can stay open,
-    whichever server they reach, and a new connect reads the file on disk then, as above. So
-    where the refusal follows a swap, correcting the file does not by itself end the pooled
-    connections opened under the swapped pin; a restart after the file is corrected does. Every
+    be read refuses before this anchor writes any row. **A refusal at a reload refuses the
+    reload, and at ``enforce`` it also stops new store connects** in the engine process that ran
+    the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). Its SQL Server store
+    refuses at least the new connects its pool makes and those of its claim holders and sync
+    handoff pools (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`),
+    until a later settings check passes the pin, or a store open in that process passes it at
+    ``enforce``. A store call that needs one of those connects fails until then. The store is not
+    closed: the connections already in its pool can stay open, whichever server they reach, and
+    the store goes on using them. At ``warn`` a new connect reads the file on disk then, as
+    above. So where the refusal follows a swap, correcting the file does not by itself end the
+    pooled connections opened under the swapped pin; a restart after the file is corrected does. Every
     login and query those connections carried went to the server the swapped pin admitted, so
     the store login and that traffic are to be treated as exposed. A
     restart with the swapped file still in place does not undo the swap: the start opens the
@@ -278,8 +284,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     start the store has already been opened with this file when this check runs, so its
     connections may have trusted the file and sent the store login. A command that opens the
     store and runs no preflight does not check the file at all. What the paragraphs above say of the pin's audit riding its own hop, and of a refused reload
-    leaving the pool open, holds for this CA too, except the in-process compare, which runs for
-    the pin alone: a swap of this CA that the store's answer hides is not logged.
+    leaving the pool open, holds for this CA too, except the in-process compare and the refusal
+    of new connects, which run for the pin alone: a swap of this CA that the store's answer hides
+    is not logged, and a refused reload leaves the store connecting.
 12. **A generic DATABASE connection's driver CA** (vault BACKLOG #3090, step 7). The CA file a
     generic-dialect ``Database`` outbound or ``DatabasePoll`` names as ``odbc_params`` ``sslca``
     is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. It
@@ -1738,13 +1745,36 @@ def _warn_off_hop_pin_change(spec: AnchorSpec, fingerprint: str) -> None:
         "the pin secures. Connections the store opened since the change trust the new file. If "
         "the change is not a certificate renewal you made, treat the store login and the traffic "
         "on those connections as exposed, correct the file, and restart each engine process that "
-        "uses this store",
+        "uses this store. If it is a renewal you made, restart each engine process that uses this "
+        "store to accept it: the baseline moves only at a restart, so until then each check of "
+        "the pin logs this warning",
         spec.setting,
         spec.path,
         ANCHOR_DIGEST,
         fingerprint,
         first,
     )
+
+
+#: SQL Server store pins an ``enforce`` settings preflight refused (vault BACKLOG #3714 step 11, as
+#: re-scoped by decision d20261122T111258871-87279a), keyed by label and path, each holding the
+#: refusal's text. While a pin is held here the store refuses new connects
+#: (:func:`store_pin_connect_refusal`); connections already open stay open (module item 11).
+#: :func:`release_store_pin_refusal` says what releases it.
+_STORE_PIN_REFUSED: dict[tuple[str, str], str] = {}
+
+
+def store_pin_connect_refusal(spec: AnchorSpec) -> str | None:
+    """The text of the ``enforce`` settings refusal that holds ``spec``'s new store connects shut,
+    or ``None`` when none does (:data:`_STORE_PIN_REFUSED`)."""
+    return _STORE_PIN_REFUSED.get((spec.label, spec.path))
+
+
+def release_store_pin_refusal(spec: AnchorSpec) -> None:
+    """Let ``spec``'s store connect again (:data:`_STORE_PIN_REFUSED`). A settings preflight that
+    passes the pin calls it, and so does a store open whose checks of the pin pass at
+    ``enforce``."""
+    _STORE_PIN_REFUSED.pop((spec.label, spec.path), None)
 
 
 def enforced_anchor(
@@ -2808,6 +2838,9 @@ async def _preflight_one(
     except TrustAnchorError as refusal:
         if refusal.setting is None:
             refusal.setting = spec.setting
+        if spec.server_pin and enforcing:
+            # Step 11: the store refuses new connects until a preflight passes the pin.
+            _STORE_PIN_REFUSED[(spec.label, spec.path)] = str(refusal)
         raise
 
 
@@ -2896,6 +2929,7 @@ async def _preflight_checks(
         raise
     if spec.server_pin:
         note_store_pin_checked(spec, verdict.fingerprint)  # the file passed (step 9)
+        release_store_pin_refusal(spec)  # new connects again (step 11)
     if store_fault is not None:
         raise store_fault
     return verdict.fingerprint

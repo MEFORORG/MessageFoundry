@@ -38,6 +38,7 @@ import logging
 import math
 import queue
 import re
+import sys
 import time
 from collections.abc import (
     AsyncIterator,
@@ -50,7 +51,7 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import (
     AbstractAsyncContextManager,
     AsyncExitStack,
@@ -3268,6 +3269,7 @@ def check_pinned_certificate(
         TrustAnchorError,
         enforced_anchor,
         note_store_pin_checked,
+        release_store_pin_refusal,
         store_pin_anchor_spec,
     )
     from messagefoundry.pki import (
@@ -3321,6 +3323,30 @@ def check_pinned_certificate(
     # The pin this open checked becomes the in-process baseline the settings preflight compares
     # the file with, off the store hop (vault BACKLOG #3714 step 9); the first one is kept.
     note_store_pin_checked(spec, verdict.fingerprint)
+    if enforcing:
+        # Step 11: this open ran the checks an enforce refusal named, at enforce, and they passed.
+        release_store_pin_refusal(spec)
+
+
+def refuse_connect_after_pin_refusal(settings: StoreSettings) -> None:
+    """Raise :class:`~messagefoundry.config.tls_policy.StoreTlsRefused` when an ``enforce``
+    settings check refused this store's SQL Server pin and nothing has passed it since (vault
+    BACKLOG #3714 step 11, :func:`~messagefoundry.auth.trust_anchors.store_pin_connect_refusal`).
+
+    Called before at least these new connects: the pool's, through :class:`_PinGatedExecutor`,
+    a claim holder's and a sync handoff connection's. A connection already open is not closed.
+    A store with no pin, or one whose pin no ``enforce`` check refused, connects as before."""
+    from messagefoundry.auth.trust_anchors import store_pin_anchor_spec, store_pin_connect_refusal
+
+    spec = store_pin_anchor_spec(settings)
+    if spec is None:
+        return
+    refusal = store_pin_connect_refusal(spec)
+    if refusal is not None:
+        raise StoreTlsRefused(
+            f"[store].ssl_root_cert {spec.path!r}: a new store connection was refused, because a "
+            f"settings check at enforce refused the pin and none has passed it since: {refusal}"
+        )
 
 
 def connection_string(settings: StoreSettings) -> str:
@@ -3409,10 +3435,39 @@ def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) ->
     growth and the window where a closing connection still holds a worker.
     """
     maxsize = max(1, settings.pool_size if maxsize is None else maxsize)
-    return ThreadPoolExecutor(
+    return _PinGatedExecutor(
+        settings,
         max_workers=maxsize + 4,
         thread_name_prefix="mefor-sqlserver",
     )
+
+
+class _PinGatedExecutor(ThreadPoolExecutor):
+    """The pool's executor, which refuses a ``pyodbc.connect`` while an ``enforce`` settings check
+    holds the store's pin refused (:func:`refuse_connect_after_pin_refusal`, vault BACKLOG #3714
+    step 11). The pool opens its connections itself, as it grows or replaces one, and aioodbc
+    0.5.0, pinned exactly, runs each through this executor as a ``functools.partial`` of
+    ``pyodbc.connect``, so this is where a pool connect can be refused before it dials. Every
+    other call runs as before."""
+
+    def __init__(self, settings: StoreSettings, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._store_settings = settings
+
+    def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+        if _is_odbc_connect(fn):
+            refuse_connect_after_pin_refusal(self._store_settings)
+        return super().submit(fn, *args, **kwargs)
+
+
+def _is_odbc_connect(fn: Callable[..., Any]) -> bool:
+    """Whether ``fn`` is ``pyodbc.connect``, bare or as the ``functools.partial`` aioodbc 0.5.0
+    submits. Before pyodbc is imported nothing can submit it."""
+    pyodbc = sys.modules.get("pyodbc")
+    if pyodbc is None:
+        return False
+    target = fn.func if isinstance(fn, partial) else fn
+    return target is getattr(pyodbc, "connect", None)
 
 
 #: The two database options the store wants ON, each with the statement that turns it on. RCSI's
@@ -4121,6 +4176,7 @@ class SqlServerStore:
         import aioodbc
 
         disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
+        refuse_connect_after_pin_refusal(self._settings)  # vault BACKLOG #3714 step 11
         return await aioodbc.connect(
             dsn=connection_string(self._settings),
             autocommit=False,
@@ -6070,10 +6126,12 @@ class SqlServerStore:
         disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         dsn = connection_string(self._settings)
         login_timeout = self._settings.connect_timeout
+        settings = self._settings
 
         def _factory() -> Any:
             # `timeout=` is pyodbc's LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT, #1626); `conn.timeout`
             # below is the separate per-statement bound.
+            refuse_connect_after_pin_refusal(settings)  # vault BACKLOG #3714 step 11
             conn = pyodbc.connect(dsn, autocommit=False, timeout=login_timeout)
             conn.timeout = ct  # seconds; finite (ct==0 refused above) — per-statement bound
             return conn
