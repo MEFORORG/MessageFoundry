@@ -4353,8 +4353,8 @@ def _proven_abandoned(path: Path, owner: object) -> bool:
             return False  # no lock file: no proof either way
         except OSError as exc:
             # A directory with this account's owner whose lock file this account still cannot
-            # open, or one planted there as a link; another owner's directory never reaches here,
-            # since the owner is checked first. Said, not skipped silently.
+            # open, or on POSIX one planted there as a link; another owner's directory never
+            # reaches here, since the owner is checked first. Said, not skipped silently.
             log.warning(
                 "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
                 path,

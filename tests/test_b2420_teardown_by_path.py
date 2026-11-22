@@ -280,6 +280,9 @@ def test_the_re_mark_refuses_an_entry_at_a_mark_name_that_is_not_a_plain_file(
     assert (staging / dr_backup._HELD_MARKER_NAME).is_file()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows creates through _win_create_new, not os.open"
+)
 def test_the_re_mark_creates_a_name_that_went_after_its_create_was_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
