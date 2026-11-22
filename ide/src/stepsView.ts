@@ -239,7 +239,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       );
       // Reveal OFF, always — the lens never un-redacts and the argv never carried `--show-phi`, so every
       // captured value came back as the CLI's "REDACTED" sentinel and folds to the `▸ ⋯` placeholder.
-      return traceRowValues(invocationsForFile(entries, fsPath), false);
+      // Resolve the trace's relative file paths against `ws`, the cwd the trace ran in.
+      return traceRowValues(invocationsForFile(entries, fsPath, ws), false);
     } catch {
       return []; // a live-value failure is never an error — the redacted placeholder stands
     }
@@ -964,7 +965,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.lineEnd === "number" &&
           typeof m.kind === "string" &&
           typeof m.block === "string" &&
-          m.block !== ""
+          m.block !== "" &&
+          // The page sends a position only when it moved a paste off a control header, and then only
+          // "before" (BACKLOG #5839). Accept that value alone: an "after" would override the derived
+          // position and could put the block after a return (inbound webview data is untrusted).
+          (m.position === undefined || m.position === "before")
         ) {
           // Paste the captured block at the selected anchor via the byte-stable `lens rewrite` path
           // (applyStructural). A refusal surfaces the engine LensRewriteError as an error toast with ZERO
@@ -979,13 +984,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             return;
           }
           void applyStructural(
-            buildPasteRequest(anchor, {
-              source: m.block,
-              nesting: 0,
-              kind: anchor.kind,
-              lineCount: 0,
-              label: "",
-            }),
+            buildPasteRequest(
+              anchor,
+              { source: m.block, nesting: 0, kind: anchor.kind, lineCount: 0, label: "" },
+              m.position,
+            ),
           ).then((ok) => {
             if (ok && !disposed) {
               void vscode.window.showInformationMessage(pasteText);

@@ -2801,8 +2801,11 @@ export function buildInsertRequest(
 
 /**
  * Build a paste_block spec: insert the clipboard `clip.source` at the SELECTED anchor, re-indented to the
- * anchor's suite by the engine (pure; unit-testable). The POSITION follows the toolbar-Add rule — a `send`
- * anchor is the handler's return, so a paste must PRECEDE it (`before`); every other anchor pastes `after`.
+ * anchor's suite by the engine (pure; unit-testable). The POSITION follows the toolbar-Add rule: a
+ * terminal return or scaffold footer ({@link isReturnRow}) takes the paste BEFORE it, and every other
+ * anchor, a mid-body append send included, takes it `after`. An explicit `"before"` wins: the page sends
+ * it when {@link resolveInsertAnchor} moved a paste on a control header to "before the block's first
+ * body row" (BACKLOG #5839). There is no explicit `"after"`, so no caller can put a paste after a return.
  * The anchor's projection-time source rides as `expect_src` (the F7 stale guard); only `clip.source` is
  * used from the clipboard (the engine derives the indent from the block text, never from `clip.nesting`).
  */
@@ -2817,10 +2820,11 @@ export function buildPasteRequest(
     scaffold?: string;
   },
   clip: ClipboardBlock,
+  explicit?: "before",
 ): PasteRequest {
   // A terminal return / scaffold footer takes the block BEFORE it (no dead code); a mid-body append send
   // (ADR 0104) takes it after.
-  const position: "before" | "after" = isReturnRow(anchor) ? "before" : "after";
+  const position: "before" | "after" = explicit ?? (isReturnRow(anchor) ? "before" : "after");
   const req: PasteRequest = {
     handler: anchor.handler,
     line_start: anchor.lineStart,

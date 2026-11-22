@@ -559,16 +559,26 @@
     function pasteSelected() {
       const clip = getClipboard();
       if (!clip || !selected) { return; } // empty clipboard / no selection → friendly no-op
-      vscode.postMessage({
+      // A paste on an if/elif/else/for header lands as the block's first statement (BACKLOG #5839), so
+      // the anchor moves to the body's first row and the resolved position rides along. Any other anchor
+      // posts no position and the provider derives it, as before.
+      // Only a control header can move, so a leaf paste skips the row sweep.
+      const res = selected.kind === 'control' ? resolveInsertAnchor(stepsCtxRows(), selected.lineStart, 'after') : null;
+      // resolveInsertAnchor turns an 'after' into a 'before' only when it moved the anchor into a body.
+      const moved = res !== null && res.position === 'before';
+      const at = moved ? res.anchor : selected;
+      const msg = {
         command: 'paste',
-        handler: selected.handler,
-        lineStart: selected.lineStart,
-        lineEnd: selected.lineEnd,
-        kind: selected.kind,
-        expectSrc: selected.expectSrc,
+        handler: at.handler,
+        lineStart: at.lineStart,
+        lineEnd: at.lineEnd,
+        kind: at.kind,
+        expectSrc: at.expectSrc,
         block: clip.source,
         text: 'MessageFoundry: pasted ' + (clip.label || 'the steps') + '.',
-      });
+      };
+      if (moved) { msg.position = res.position; }
+      vscode.postMessage(msg);
     }
 
     for (const el of rows) {

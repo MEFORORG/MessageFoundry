@@ -1413,7 +1413,7 @@ const NOT_A_MIRROR: Record<string, string> = {
   selectedIsMovable: "DOM: reads draggable/kind off the currently selected <li>",
   copySelected: "wiring: captureBlock + setClipboard + a toast postMessage",
   cutSelected: "wiring: copySelected then a deleteRow postMessage",
-  pasteSelected: "wiring: a paste postMessage from the clipboard slot",
+  pasteSelected: "wiring: resolveInsertAnchor + a paste postMessage from the clipboard slot",
   ensureIndicators: "DOM: creates the insertion bar + scope pill elements",
   clearIndicators: "DOM: removes the insertion bar + scope pill and the scope tint",
   rowByLineStart: "DOM: finds an <li> by data-line-start",
