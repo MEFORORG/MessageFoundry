@@ -34,6 +34,8 @@ from types import MappingProxyType
 
 import aiosqlite
 
+from messagefoundry.redaction import safe_exc
+
 __all__ = [
     "IndexShape",
     "SchemaMismatchError",
@@ -435,9 +437,11 @@ async def run_schema_step[T](
     One shape failure gets another remedy: SQLite's re-check of the schema after an ``ALTER``
     names the view or trigger it could not parse, as in "error in view V: no such module". That
     object is another tool's (see ``_ORDINARY_TABLE``), and dropping it lets the migration run past
-    it (BACKLOG #6719). Where the text fits more than one such object, the remedy names each one
-    (see :func:`_foreign_objects`). A view under a name this build creates is not such an object:
-    it holds the place of a table or index, which is the incompatible store the plain remedy names."""
+    it (BACKLOG #6719). The remedy names that object only where the text fits exactly one (see
+    :func:`_foreign_objects`) and the whole remedy survives :func:`~messagefoundry.redaction.safe_exc`
+    uncut and unredacted; otherwise it is the plain remedy. A view under a name this build creates
+    is not such an object: it holds the place of a table or index, which is the incompatible store
+    the plain remedy names."""
     try:
         return await step
     except Exception as exc:
@@ -447,36 +451,18 @@ async def run_schema_step[T](
         foreign = await _foreign_objects(db, cause)
         if len(foreign) == 1:
             ((kind, name),) = foreign
-            # The whole instruction leads and the name follows it. safe_exc's 200-character cut
-            # keeps the instruction on a store path of up to 163 raw characters for a view and 160
-            # for a trigger (measured), fewer where the redactor lengthens a path segment. A long
-            # name, and the text after it, may be cut, and a cut at a space inside a name leaves a
-            # shorter name; safe_exc's cut marker is then all that shows the name is incomplete.
-            raise SchemaMismatchError(
-                f"store {path}: drop this {kind}, then restart. The {kind}: {name!r}. This build did"
-                f" not create it, and it stops the store's upgrade. The schema step failed: {cause}.",
-                cause=cause,
-            ) from exc
-        if foreign:
-            # _foreign_objects does not pick among these, so the remedy names them all rather than
-            # tell the operator to drop one that may be healthy. The instruction, its save step and
-            # the count of names included, leads and is short. safe_exc's 200-character cut keeps
-            # all of it on a store path of up to 102 raw characters with fewer than 10 names, one
-            # character fewer for each further digit of the count (measured), and fewer where the
-            # redactor lengthens a path segment. The names follow it, so a long path or a long list
-            # loses names, and the text after them, to the cut; the count tells a reader of a cut
-            # copy that more names follow.
-            listed = [f"the {kind} {name!r}" for kind, name in foreign]
-            names = f"{', '.join(listed[:-1])} and {listed[-1]}"
-            count = len(foreign)
-            raise SchemaMismatchError(
-                f"store {path}: save each CREATE statement, then drop whichever of these {count}"
-                f" stops the upgrade, and restart. The {count}: {names}. Each CREATE statement is"
-                " the sql column of its sqlite_master row, and saving it lets a healthy one be"
-                " restored. The error's text could name each of them, and this build created none"
-                f" of them. The schema step failed: {cause}.",
-                cause=cause,
-            ) from exc
+            remedy = (
+                f"store {path}: save the CREATE statement of the {kind} {name!r} from sqlite_master,"
+                " drop it, and restart."
+            )
+            message = (
+                f"{remedy} This build did not create it, and it stops the store's upgrade. The"
+                f" schema step failed: {cause}."
+            )
+            # Named only where safe_exc, which prints this error on the paths that cut it, shows
+            # the whole remedy unchanged: a cut or redacted name would name the wrong object.
+            if remedy in safe_exc(SchemaMismatchError(message)):
+                raise SchemaMismatchError(message, cause=cause) from exc
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
         raise SchemaMismatchError(
@@ -509,7 +495,7 @@ async def _foreign_objects(db: aiosqlite.Connection, cause: str) -> tuple[tuple[
     least a healthy first-rank name, or the longest last-rank name, could be named alone. Under a
     suffix " during x", for one, which no test here has measured, a healthy ``vv during x`` beside
     a broken ``vv`` would be named for "error in view vv during x: ...". So where names collide the
-    ambiguity remains, and the remedy names each candidate, which may include a healthy one. With no
+    ambiguity remains, and more than one name is returned, which gets the plain remedy. With no
     first-rank name, the longest last-rank name is the one returned.
 
     The colon and " after " share a rank because a quoted name may hold either: with ``vv`` and

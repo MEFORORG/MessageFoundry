@@ -1,11 +1,10 @@
-- **A SQLite store whose upgrade is stopped by a view or trigger another tool left now names that
-  object.** When SQLite's re-check after a migration's `ALTER` fails on such a view or trigger with
-  an error that names the store's shape, such as "no such module", the open refuses the store with
-  the remedy to drop that object and restart, not to recreate the store. Where the error's text fits
-  more than one such name, as with views `vv` and `vv after drop column`, the remedy names each of
-  them rather than one that may be healthy. A view under the name of a
-  table or index this build creates still gets the recreate remedy, also when it is one of several
-  names the text fits. A failure on the store's shape
-  raised by the check's own read of the live store, after the schema script and the migrations of
-  a writable open, is now refused with the recreate remedy rather than escaping as SQLite's bare error.
-  (`BACKLOG #6719`, `BACKLOG #6720`)
+- **A SQLite store whose upgrade is stopped by a view or trigger another tool left can now name
+  that object.** When SQLite's re-check after a migration's `ALTER` fails on such a view or trigger
+  with an error that names the store's shape, such as "no such module", and the error's text fits
+  exactly one such object, the open refuses the store with the remedy to save that object's CREATE
+  statement, drop it and restart, not to recreate the store. The object is named only when that
+  remedy fits uncut and unredacted in the 200 characters a printed error keeps; otherwise, and
+  whenever the text fits more than one object, the store gets the plain recreate remedy. A failure
+  on the store's shape raised by the check's own read of the live store, after the schema script
+  and the migrations of a writable open, is now refused with the recreate remedy rather than
+  escaping as SQLite's bare error. (`BACKLOG #6719`, `BACKLOG #6720`)

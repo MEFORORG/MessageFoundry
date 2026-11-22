@@ -23,10 +23,12 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from messagefoundry.redaction import _COUNT_OPENER, safe_exc
 from messagefoundry.store import MessageStore
 from messagefoundry.store.schema_verify import (
     _ORDINARY_TABLE,
     SchemaMismatchError,
+    _remedy,
     is_schema_step_error,
     live_schema_differences,
     read_schema_shape,
@@ -444,12 +446,14 @@ def _preset_columns(path: Path) -> set[str]:
     ],
 )
 async def test_a_foreign_object_that_stops_a_migration_gets_the_drop_remedy(
-    tmp_path: Path, kind: str, dependent: str, drop: str
+    tmp_path: Path, kind: str, dependent: str, drop: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A 0.3.2 preset table needs the RENAME COLUMN migration, and SQLite re-checks every view and
     # trigger after it. One that reads an unloaded module fails that check, naming itself. The store
     # is otherwise this build's, so the remedy is to drop that object, not to recreate the store.
-    path = tmp_path / "foreign.db"
+    # A short relative path keeps the remedy inside the cut whatever the runner's temp path is.
+    monkeypatch.chdir(tmp_path)
+    path = Path("foreign.db")
     await _fresh(path)
     _sql(path, "ALTER TABLE search_presets RENAME COLUMN owner_user_id TO owner")
     _plant_unloaded_virtual_table(path, "vt")
@@ -470,7 +474,8 @@ async def test_a_foreign_object_that_stops_a_migration_gets_the_drop_remedy(
     assert cause is not None and cause.startswith(f"error in {kind} {name}: no such module"), cause
     text = str(info.value)
     assert text.startswith(
-        f"store {path}: drop this {kind}, then restart. The {kind}: '{name}'."
+        f"store {path}: save the CREATE statement of the {kind} '{name}' from sqlite_master, drop"
+        " it, and restart."
     ), text
     assert "recreate" not in text and "NEW store key" not in text, text
     # The remedy is true: with that object dropped, the same migration runs and the open succeeds.
@@ -706,106 +711,109 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
         assert await _foreign_objects(db, expected_cause) == tuple(("view", n) for n in found)
 
 
-async def test_names_the_text_cannot_tell_apart_are_all_named_in_the_remedy(
-    tmp_path: Path,
-) -> None:
-    # A broken "vv" beside a healthy "vv after drop column": the remedy must not tell the operator
-    # to drop the healthy view alone, so it names both, the instruction first.
-    path = tmp_path / "both.db"
-    _sql(
-        path,
-        "CREATE TABLE t (a, c)",
-        "CREATE TABLE u (c)",
-        "CREATE VIEW vv AS SELECT c FROM t",
-        'CREATE VIEW "vv after drop column" AS SELECT c FROM u',
+_SERVICE_PATH = r"C:\ProgramData\MessageFoundry\data\stores\production\instance-a\messagefoundry.db"
+_CAUSE = "error in view {} after drop column: no such column: c"
+
+
+def _named(name: str) -> tuple[str, str]:
+    """The one-name remedy for view ``name`` on _SERVICE_PATH, and the whole message."""
+    remedy = (
+        f"store {_SERVICE_PATH}: save the CREATE statement of the view {name!r} from sqlite_master,"
+        " drop it, and restart."
     )
+    message = (
+        f"{remedy} This build did not create it, and it stops the store's upgrade. The schema step"
+        f" failed: {_CAUSE.format(name)}."
+    )
+    return remedy, message
+
+
+async def _refusal(path: Path, broken: str) -> SchemaMismatchError:
+    # The refusal for one broken view, which the DROP COLUMN re-check names.
+    _sql(path, "CREATE TABLE t (a, c)", f'CREATE VIEW "{broken}" AS SELECT c FROM t')
     async with _connected(path) as db:
         with pytest.raises(SchemaMismatchError) as info:
             await run_schema_step(
-                db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
+                db,
+                db.execute("ALTER TABLE t DROP COLUMN c"),
+                path=_SERVICE_PATH,
+                counts_under_dek=False,
             )
-    cause = "error in view vv after drop column: no such column: c"
-    assert info.value.cause == cause
     assert isinstance(info.value.__cause__, sqlite3.OperationalError)
-    assert str(info.value) == (
-        f"store {path}: save each CREATE statement, then drop whichever of these 2 stops the"
-        " upgrade, and restart. The 2: the view 'vv' and the view 'vv after drop column'. Each"
-        " CREATE statement is the sql column of its sqlite_master row, and saving it lets a healthy"
-        " one be restored. The error's text could name each of them, and this build created none"
-        f" of them. The schema step failed: {cause}."
-    )
+    return info.value
 
 
-_CUT_SERVICE_PATHS = (
-    r"C:\ProgramData\MessageFoundry\data\messagefoundry.db",
-    r"C:\ProgramData\MessageFoundry\data\stores\production\instance-a\messagefoundry.db",
-)
+def _plain(cause: str) -> str:
+    return f"store {_SERVICE_PATH} {_remedy(False)} The schema step failed: {cause}."
+
+
+async def test_one_name_is_named_only_while_its_whole_remedy_survives_the_cut(
+    tmp_path: Path,
+) -> None:
+    # safe_exc cuts a printed error at 200 characters, marking the cut with _COUNT_OPENER. The
+    # longest name whose remedy ends before that marker is named, with the whole text pinned; one
+    # character more and the remedy would be cut, so the plain remedy names no object.
+    stem = "daily_census_by_unit_and_attending_for_the_weekly_report_of_the_quality_team"
+    fits = 0
+    for k in range(1, len(stem) + 1):
+        remedy, message = _named(stem[:k])
+        rendered = safe_exc(SchemaMismatchError(message))
+        if not rendered.startswith(f"SchemaMismatchError: {remedy}"):
+            break
+        fits = k
+    assert 0 < fits < len(stem)
+    name, longer = stem[:fits], stem[: fits + 1]
+
+    remedy, message = _named(name)
+    refusal = await _refusal(tmp_path / "fits.db", name)
+    assert str(refusal) == message
+    assert refusal.cause == _CAUSE.format(name)
+    rendered = safe_exc(refusal)
+    assert rendered.index(_COUNT_OPENER) >= len(f"SchemaMismatchError: {remedy}"), rendered
+
+    remedy, message = _named(longer)
+    rendered = safe_exc(SchemaMismatchError(message))
+    assert remedy not in rendered and _COUNT_OPENER in rendered, rendered
+    refusal = await _refusal(tmp_path / "cut.db", longer)
+    assert str(refusal) == _plain(_CAUSE.format(longer))
 
 
 @pytest.mark.parametrize(
-    ("healthy", "lead"),
+    ("broken", "healthy", "cause"),
     [
         pytest.param(
-            True,
-            "save each CREATE statement, then drop whichever of these 2 stops the upgrade, and"
-            " restart.",
-            id="two-names",
+            "vv",
+            "vv after drop column",
+            "error in view vv after drop column: no such column: c",
+            id="healthy-suffix-name",
         ),
-        pytest.param(False, "drop this view, then restart.", id="one-name"),
+        pytest.param(
+            "vv",
+            "vv: no such column",
+            "error in view vv: no such column: missing",
+            id="healthy-message-name",
+        ),
     ],
 )
-async def test_the_drop_instruction_survives_the_cut(
-    tmp_path: Path, healthy: bool, lead: str
+async def test_two_candidates_get_the_plain_remedy(
+    tmp_path: Path, broken: str, healthy: str, cause: str
 ) -> None:
-    # safe_exc cuts a rendered error at 200 characters. With a long name on a service path, the
-    # whole instruction, a save step included, must still reach the operator; the names may not.
-    from messagefoundry.redaction import safe_exc
-
-    long = "daily_census_by_unit_and_attending_for_the_weekly_report"
-    path = tmp_path / "cut.db"
-    _sql(
-        path,
-        "CREATE TABLE t (a, c)",
-        "CREATE TABLE u (c)",
-        f'CREATE VIEW "{long}" AS SELECT c FROM t',
+    # The text fits both views, so naming either could tell the operator to drop the healthy one.
+    path = tmp_path / "both.db"
+    reads = "c FROM t" if "drop column" in cause else "missing FROM t"
+    statement = (
+        "ALTER TABLE t DROP COLUMN c" if "drop column" in cause else "ALTER TABLE t RENAME TO t2"
     )
-    if healthy:
-        _sql(path, f'CREATE VIEW "{long} after drop column" AS SELECT c FROM u')
+    _sql(path, "CREATE TABLE t (a, c)", "CREATE TABLE u (c)")
+    _sql(path, f'CREATE VIEW "{broken}" AS SELECT {reads}')
+    _sql(path, f'CREATE VIEW "{healthy}" AS SELECT c FROM u')
     async with _connected(path) as db:
         with pytest.raises(SchemaMismatchError) as info:
             await run_schema_step(
-                db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
+                db, db.execute(statement), path=_SERVICE_PATH, counts_under_dek=False
             )
-    text = str(info.value)
-    assert text.startswith(f"store {path}: {lead} "), text
-    for service_path in _CUT_SERVICE_PATHS:
-        rendered = safe_exc(SchemaMismatchError(text.replace(str(path), service_path)))
-        assert "(+" in rendered, rendered  # the cut ran
-        assert f"store {service_path}: {lead}" in rendered, rendered
-
-
-async def test_three_names_the_text_cannot_tell_apart_are_listed_in_the_remedy(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "three.db"
-    _sql(
-        path,
-        "CREATE TABLE t (a, c)",
-        "CREATE TABLE u (c)",
-        "CREATE VIEW vv AS SELECT c FROM t",
-        'CREATE VIEW "vv after drop column" AS SELECT c FROM u',
-        'CREATE VIEW "vv after drop column: no such column" AS SELECT c FROM u',
-    )
-    async with _connected(path) as db:
-        with pytest.raises(SchemaMismatchError) as info:
-            await run_schema_step(
-                db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
-            )
-    assert str(info.value).startswith(
-        f"store {path}: save each CREATE statement, then drop whichever of these 3 stops the"
-        " upgrade, and restart. The 3: the view 'vv', the view 'vv after drop column' and the view"
-        " 'vv after drop column: no such column'."
-    ), str(info.value)
+    assert info.value.cause == cause
+    assert str(info.value) == _plain(cause)
 
 
 @pytest.mark.parametrize(
