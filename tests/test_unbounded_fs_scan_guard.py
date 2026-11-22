@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -740,6 +741,147 @@ def test_a_walk_the_plain_toggle_denied_is_still_denied(command: str) -> None:
     assert_denied(run_guard(bash(command)))
 
 
+# THE MISREADINGS THE REFINED VIEW CORRECTS (BACKLOG #5607), each inside a double-quoted span, where
+# the plain toggle blanks the walk too, so the floor above cannot catch it. Each row was allowed on
+# origin/main: `$((cmd) )` read as arithmetic, also with a quoted or escaped paren in the subshell;
+# a glued `cat<<` read as no opener; two heredocs on a line, whose first terminator the bash view
+# blanked as body; and a spaced shift in `(( ))` or `$[ ]` read as a heredoc opener.
+REFINED_READING_DENY = [
+    pytest.param('echo "$((find /proc) )"', id="subshell-substitution-inside-double-quotes"),
+    pytest.param('echo "$(echo $((find /proc) ))"', id="subshell-substitution-in-a-substitution"),
+    pytest.param(
+        "echo \"$(cat<<'EOF'\ndon't\nEOF\n) $(find /proc)\"",
+        id="glued-heredoc-with-a-quoted-delimiter",
+    ),
+    pytest.param(
+        'echo "$(cat<<EOF\ndon\'t\nEOF\n) $(find /proc)"', id="glued-heredoc-with-a-bare-delimiter"
+    ),
+    pytest.param(
+        'echo "$(cat <<A <<B\nx\nA\ny\nB\n) $(find /proc)"', id="two-heredocs-on-one-line"
+    ),
+    pytest.param(
+        'echo "$(cat <<A <<B\nx\'\nA\ny\nB\n) $(find /proc)"',
+        id="two-heredocs-with-an-apostrophe-in-the-first-body",
+    ),
+    pytest.param(
+        "echo \"$(echo $((grep -r 'foo(' /proc) ))\"", id="quoted-paren-in-a-subshell-substitution"
+    ),
+    pytest.param(
+        r'echo "$((echo \(; find /proc) ))"', id="escaped-paren-in-a-subshell-substitution"
+    ),
+    # A combining mark after an apostrophe leaves it a quote to bash, and the later `))` must not
+    # close the arithmetic reading the first `) ` already refused.
+    pytest.param(
+        "echo \"$((echo 'a'́; find /proc) )\"; echo ')) '",
+        id="combining-mark-after-a-quote-in-a-subshell-substitution",
+    ),
+    pytest.param('echo "$( (( a << b ))\nfind /proc)"', id="spaced-shift-in-an-arithmetic-command"),
+    pytest.param(
+        'echo "$(echo $[ a << b ]\nfind /proc)"', id="spaced-shift-in-old-style-arithmetic"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", REFINED_READING_DENY)
+def test_a_walk_the_refined_view_finds_inside_double_quotes_is_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# EACH ROW IS DENIED ON origin/main BY THE VIEWS JUDGED BEFORE THE REFINED ONE, so they pin that
+# adding it keeps those denies. The first is the long-delimiter row an earlier cut of this change
+# allowed: it read the delimiter from a 1024-character slice, in code the bash view runs, so the
+# terminator never matched and every later line was blanked.
+REFINED_FLOOR_DENY = [
+    pytest.param(
+        "echo 'it'\\''s'; cat <<" + "L" * 2000 + "\nx\n" + "L" * 2000 + "\nfind /proc",
+        id="a-heredoc-delimiter-longer-than-1024-characters",
+    ),
+    pytest.param('echo "$( (( a<<b ))\nfind /proc)"', id="glued-shift-in-an-arithmetic-command"),
+    pytest.param('echo "$(echo $[a<<b]\nfind /proc)"', id="glued-shift-in-old-style-arithmetic"),
+]
+
+
+@pytest.mark.parametrize("command", REFINED_FLOOR_DENY)
+def test_a_walk_the_earlier_views_deny_stays_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# THE CONTROLS FOR THE REFINED VIEW: arithmetic that closes with `))` runs nothing, and both bodies
+# of two heredocs opened on one line are data. A glued heredoc's body is not a row here: origin/main
+# denies `echo "$(cat<<EOF` with `find /proc` in the body, and the refined view only adds denies.
+REFINED_CONTROL_ALLOW = [
+    pytest.param('echo "$(( find / 2 ))"', id="arithmetic-that-reads-like-a-walk"),
+    pytest.param(
+        'echo "$(cat <<A <<B\nfind /proc\nA\nfind /proc\nB\n)"', id="both-bodies-of-two-heredocs"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", REFINED_CONTROL_ALLOW)
+def test_what_the_refined_view_reads_as_data_is_allowed(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
+# EACH ROW IS ALLOWED ON origin/main. Most were false denies of an earlier cut of this change: a
+# shared scan budget spent by nested subshells, after which every `$((` read as a subshell; a glued
+# `<<` read as a heredoc in an array subscript or in arithmetic glued to a reserved word, whose body
+# blanked an opening quote and exposed the prose it holds; and a comment blanked in a command with
+# no quote. The last three are controls for the glued opener's line rule.
+REFINED_FALSE_DENY_ALLOW = [
+    pytest.param(
+        "(" * 250 + "true" + ") " * 250 + '; echo "$(( find / 2 ))"',
+        id="arithmetic-after-many-nested-subshells",
+    ),
+    pytest.param('a[x<<y]=1\necho "\ny\nfind /proc\n"', id="glued-shift-in-an-array-subscript"),
+    pytest.param(
+        'a[(i<<k)]=v\necho "\nk\nfind /proc\n"', id="glued-shift-in-parens-in-a-subscript"
+    ),
+    pytest.param(
+        'for i in 1; do((x<<y)); done\necho "\ny\nfind /proc\n"', id="arithmetic-glued-to-do"
+    ),
+    pytest.param(
+        'if true; then((x<<y)); fi\necho "\ny\nfind /proc\n"', id="arithmetic-glued-to-then"
+    ),
+    pytest.param(
+        'if false; then :; else((x<<y)); fi\necho "\ny\nfind /proc\n"',
+        id="arithmetic-glued-to-else",
+    ),
+    pytest.param("cat <<EOF\nx\nEOF\nfind . # see; ls /proc", id="comment-in-a-quote-free-command"),
+    pytest.param('(( x<<y ))\necho "\ny\nfind /proc\n"', id="glued-shift-in-an-arithmetic-command"),
+    pytest.param('x=$((a<<b))\necho "\nb\nfind /proc\n"', id="glued-shift-in-arithmetic"),
+    pytest.param('((x<<y)\necho "\ny\nfind /proc\n"', id="glued-shift-after-a-subshell-pair"),
+]
+
+
+@pytest.mark.parametrize("command", REFINED_FALSE_DENY_ALLOW)
+def test_the_refined_view_adds_no_deny_main_did_not_have(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
+def _guard_seconds(command: str) -> float:
+    started = time.monotonic()
+    run_guard(bash(command))
+    return time.monotonic() - started
+
+
+def test_many_arithmetic_commands_are_read_in_linear_time() -> None:
+    """Doubling the `(( 1 ))` sites must not quadruple the time.
+
+    Every site takes the refined view's `((` frame, because the quote in `"find"` sends the command
+    through the masker. An earlier cut scanned forward from every `((`, and a long run took about
+    98 seconds, past the hook timeout, and a timed-out hook lets the command run. The bound allows
+    for the fixed cost of starting pwsh, which both runs pay, and is loose because both runs are
+    wall-clock timings.
+    """
+    half = _guard_seconds('echo "find"; ' + "(( 1 )); " * 3000)
+    full = _guard_seconds('echo "find"; ' + "(( 1 )); " * 6000)
+    assert full < 3 * half + 3
+
+
+def test_deeply_nested_arithmetic_is_read_in_bounded_time() -> None:
+    assert _guard_seconds('echo "find"; x=' + "$((" * 5000 + "1" + "))" * 5000) < 30
+
+
 # ============================================ the corpora must not quietly shrink
 
 
@@ -769,6 +911,10 @@ EXPECTED_ROW_COUNTS = {
     "POWERSHELL_QUOTE_DENY": 2,
     "TOGGLE_FLOOR_DENY": 5,
     "COMMENT_BOUNDARY_DENY": 6,
+    "REFINED_READING_DENY": 11,
+    "REFINED_FLOOR_DENY": 3,
+    "REFINED_CONTROL_ALLOW": 2,
+    "REFINED_FALSE_DENY_ALLOW": 10,
 }
 
 
