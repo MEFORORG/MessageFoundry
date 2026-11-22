@@ -552,8 +552,10 @@ _PR_PLAIN_VERDICT_AFTER = re.compile(
     rf"{_PR_PLAIN_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
 )
 _PR_VERDICT_STATE_RE = re.compile(rf"(?i){_PR_VERDICT_STATE}")
-#: A modal chained into a record verb ("<id> will remain partial") is as strong as the verb alone.
-_PR_MODAL_STRONG = re.compile(r"(?i)(?:stay|remain)$")
+#: A modal chained into a record verb ("<id> will remain partial") is as strong as the verb alone,
+#: with or without a hedge after the verb ("<id> will remain only partial"): the verb is searched as
+#: a word anywhere in the modal group, not only at its end.
+_PR_MODAL_STRONG = re.compile(r"(?i)(?<![A-Za-z])(?:stay|remain)(?![A-Za-z])")
 #: What may follow a verdict a modal binds: the end of the clause, or a word that starts no object. A
 #: preposition is not one: "<version> will fail on the strict validator" is a verb and its phrase.
 _PR_VERDICT_END = re.compile(
@@ -1258,8 +1260,8 @@ def _pr_loose_columns(units: _PrUnits, blanks: list[int]) -> list[set[int]]:
 
     A unit that is not a row ends this reading, as on main. So does a blank line (``blanks``, as
     _pr_lines counts one) between two rows once the header has had a data row: the pipe lines below
-    it are another block, which the header above does not name (BACKLOG #3364 step 9). This is the
-    one place the reading drops a mark main kept. A blank line above the first data row, or a
+    it are another block, which the header above does not name (BACKLOG #3364 step 9). That drops a
+    mark main kept, on purpose. A blank line above the first data row, or a
     quote-marker-only line anywhere, ends nothing, as on main: a header with no rows yet is read as
     heading the rows below it."""
     columns: list[set[int]] = []

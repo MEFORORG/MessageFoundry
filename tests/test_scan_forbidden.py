@@ -1347,6 +1347,16 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("11", "verdict", f"ASVS {_REQ} has _never_ been {_MET}."),
     ("11", "verdict", f"ASVS {_REQ} has **not** been {_MET}."),
     ("11", "verdict", f"ASVS {_REQ} has  likely been {_MET}."),
+    # A hedge after the modal's record verb keeps it strong, beside an unmarked id or a version.
+    # The "already" pair is flagged by main and was lost by an earlier head of this branch.
+    ("11", "verdict", f"{_REQ} will remain already {_PARTIAL} for the parser"),
+    (
+        "11",
+        "verdict",
+        f"Applies to lxml 5.1.1, which will remain already {_PARTIAL} for the parser",
+    ),
+    ("11", "verdict", f"{_REQ} will remain only {_PARTIAL} for the parser"),
+    ("11", "verdict", f"{_REQ} will stay still {_PARTIAL} for the parser"),
     # Step 11: underscore emphasis on a cell's connective and on a list's "and". Main flags each
     # through the markup-deleted reading of the cell; these pin it.
     ("11", "verdict", f"| ASVS {_REQ} | the limb | {_PASS.title()} _until_ the fix |"),
@@ -1359,8 +1369,9 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
 ]
 #: Step 9 (BACKLOG #3364): a blank line under an ASVS table that has had a data row ends the table, so
 #: the header no longer marks the headerless pipe block below it. Main flags each body at the line
-#: given; head reports nothing. Each superset guard excuses exactly the (body, hit) pairs listed here
-#: and no other, and the test below checks that each listed hit is really dropped.
+#: given; head reports nothing. The constructed-body guard and the harvested-corpus guard excuse
+#: exactly the (body, hit) pairs listed here and no other; the other guards excuse nothing. The
+#: test below checks that each listed hit is really dropped.
 _PR_STEP9_DROPPED: list[tuple[str, int]] = [
     *((f"{_HEAD}| a | b | c |\n{blank}\n{_ROW}", 5) for blank in ("", "  ", "\r")),
     (f"{_HEAD}| a | b | c |\n\n\n{_ROW}", 6),
