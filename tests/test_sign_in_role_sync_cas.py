@@ -9,7 +9,8 @@ both legs that share ``_complete_ad_login``: the Kerberos mint and the OIDC (fed
 - a write in between is what the sign-in replaces: the audit row, the revoke and the
   Administrator-loss report are computed from it, not from the stale read;
 - a write in between that already holds the sign-in's directory roles is success: the sign-in
-  writes nothing more, but still ends the other sessions, as the plain write did;
+  writes nothing more, but still ends the other sessions when the set it first read differs, as
+  the plain write did;
 - two lost compare-and-sets refuse the sign-in closed, with a ``role_sync_contended`` row, and
   leave what the other writer wrote.
 

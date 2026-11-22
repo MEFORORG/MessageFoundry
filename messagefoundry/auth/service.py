@@ -8623,8 +8623,8 @@ class AuthService:
         # reconciler or another sign-in that wrote in between is never overwritten with a stale
         # set. The revoke, the notice and the Administrator alerts below read ``sync.previous``:
         # the set the write replaced, or, for roles found already at the target, the set this
-        # sign-in first read (see ``_SignInRoleSync``). A change's audit row is written with the
-        # write itself.
+        # sign-in first read (see ``_SignInRoleSync``). A change's audit row is written by the
+        # sync itself (``_write_sign_in_change`` says when it is written apart from the roles).
         sync = await self._sync_sign_in_roles(user, role_ids, federated=federated, client=client)
         if sync.refusal is not None:
             # The SIGN-IN is refused, and this sign-in wrote no role: what the other writer left
