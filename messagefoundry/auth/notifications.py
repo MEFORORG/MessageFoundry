@@ -30,7 +30,7 @@ import datetime
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 # Event types. PHI-free by construction. A value is NOT an audit action: each call site audits under
 # its own action name, and the two 6.3.5 kinds map to theirs in auth/service.py.
@@ -141,18 +141,11 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 #: closing at shutdown, is still recorded where only an administrator reads it, as
 #: ``mailed: false`` on the ``auth.lock_notice`` row (vault BACKLOG #3120 for the last two). A full
 #: queue, a closing notifier or a failed send is also recorded on its own
-#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383). A failed send happens on the notifier's
-#: task after the hand-off, so the ``auth.lock_notice`` row still reads ``mailed: true``, and the
-#: throttle matches the failed-send row to it by :data:`LOCK_NOTICE_ID_KEY` (vault BACKLOG #1138
-#: item 2). An instance with no relay at all is reported at startup by the serve gate, unless
-#: enforcement is ``warn`` and the operator waived notices in writing.
+#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383). How the throttle reads a failed send is
+#: ``AuthService._lock_notice_held_back``'s to state. An instance with no relay at all is reported
+#: at startup by the serve gate, unless enforcement is ``warn`` and the operator waived notices in
+#: writing.
 LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
-
-#: The ``detail`` key of an ``ACCOUNT_LOCKED`` event that names the notice, a random token. The
-#: ``auth.lock_notice`` row of a mail the notifier took carries it, and so does the notifier's
-#: ``auth.lock_notice_undelivered`` row when that mail's send fails, so the throttle can tell which
-#: taken mail failed (vault BACKLOG #1138 item 2). No mail body reads it.
-LOCK_NOTICE_ID_KEY: Final = "notice_id"
 
 #: What a general-log line calls each notice kind. A log call names the kind through
 #: :func:`notice_kind_log_label`, never by passing the caller's ``event_type`` through, and an unknown
@@ -246,6 +239,11 @@ class SecurityEvent:
     detail: dict[str, Any] = field(
         default_factory=dict
     )  # PHI-free extras (e.g. role from/to counts)
+    #: A random token naming this notice, set at least on an ``ACCOUNT_LOCKED`` notice: the
+    #: notifier copies it onto the undelivered row it writes for the notice, which is how the
+    #: lock-notice throttle tells which taken mail failed (``AuthService._lock_notice_held_back``,
+    #: vault BACKLOG #1138 item 2). Not a secret, and no mail body reads it.
+    notice_id: str | None = None
 
 
 @runtime_checkable

@@ -20,7 +20,11 @@ import json
 import logging
 from typing import Final, Protocol
 
-from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
+from messagefoundry.auth.audit_visibility import (
+    LOCK_NOTICE_ID_KEY,
+    LOCK_NOTICE_UNDELIVERED_ACTION,
+    NOTICE_SEND_FAILED_REASON,
+)
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
@@ -32,7 +36,6 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
-    LOCK_NOTICE_ID_KEY,
     LOG_SILENT_EVENT_TYPES,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
@@ -813,7 +816,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 )
             # The reason only. The exception's text can quote the relay's reply or the address, and
             # even its class would tell the recipient, in their own feed, that the relay is broken.
-            await self._record_undelivered(event, {"reason": "send_failed"})
+            await self._record_undelivered(event, {"reason": NOTICE_SEND_FAILED_REASON})
 
     async def _record_undelivered(self, event: SecurityEvent, why: dict[str, str]) -> None:
         """Write the audit row that says this notice never left the engine (BACKLOG #2383).
@@ -822,7 +825,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         say which account was never told. The actor is the notice's recipient, so the row also
         reaches that account's ``/me/security-events`` feed. The detail is the notice kind and
         ``why``, plus the holder's username on an issuer's reminder, which says whose credential it
-        was, and a lock notice's lock kind and ``LOCK_NOTICE_ID_KEY`` token. Never the rest of
+        was, and the notice's ``notice_id`` on a lock notice. Never the rest of
         ``event.detail`` or the address: an EMAIL_CHANGED carries an address in its detail. A lock
         notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG #1131). A failed
         write is swallowed, like the send it reports on. It is logged by class, and
@@ -836,13 +839,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         holder = event.detail.get("holder")
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER and isinstance(holder, str):
             detail["holder"] = holder
-        # The lock kind and the notice's token, which the lock-notice throttle matches a failed
-        # send by (vault BACKLOG #1138 item 2). The hidden ``auth.lock_notice`` row carries both.
-        if event.event_type == ACCOUNT_LOCKED:
-            for key in ("lock", LOCK_NOTICE_ID_KEY):
-                value = event.detail.get(key)
-                if isinstance(value, str):
-                    detail[key] = value
+        # What the lock-notice throttle matches a failed send by (vault BACKLOG #1138 item 2).
+        if event.event_type == ACCOUNT_LOCKED and event.notice_id:
+            detail[LOCK_NOTICE_ID_KEY] = event.notice_id
         try:
             await self._audit.record_audit(
                 action, actor=event.username, detail=json.dumps(detail, sort_keys=True)

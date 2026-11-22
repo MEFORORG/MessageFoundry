@@ -331,8 +331,9 @@ discriminator the attacker lacks: the owner's TOTP secret.
    full authentication zeroes both counters and both cycle counts, as `record_login_success` does
    for the columns it clears today.
 7. **Notices.** `ACCOUNT_LOCKED` is throttled by time, not by cycle: at most one mail per lock kind
-   per account per 24 hours, and always a mail for the first lock after 24 hours with none. The
-   throttle cannot key on the `auth.account_locked` row: `_record_suspicious_login` writes that row
+   per account per 24 hours, and always a mail for the first lock after 24 hours with none. A mail
+   whose send the notifier recorded as failed does not count toward that one (vault BACKLOG #1138
+   item 2; `docs/SECURITY.md` states how). The throttle cannot key on the `auth.account_locked` row: `_record_suspicious_login` writes that row
    for every lock, before any mail, so the newest one is always the current lock and a 15-minute
    campaign would look mailed forever. Instead the notifier writes its own audit row for each mail it
    sends (the action name is the build's to choose) and reads the newest such row through

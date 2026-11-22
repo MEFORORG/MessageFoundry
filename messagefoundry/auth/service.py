@@ -56,9 +56,11 @@ from messagefoundry.auth.audit_visibility import (
     CHANNEL_SCOPE_CHANGED_ACTION,
     DIRECTORY_LOGIN_LOCKED_ACTION,
     LOCK_NOTICE_ACTION,
+    LOCK_NOTICE_ID_KEY,
     LOCK_NOTICE_UNDELIVERED_ACTION,
     LOCKED_REFUSAL_DETAIL,
     LOGIN_LOCKED_ACTION,
+    NOTICE_SEND_FAILED_REASON,
 )
 from messagefoundry.auth.audit_visibility import (
     CHANNEL_SCOPE_CHANGE_REFUSED_ACTION as CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
@@ -94,7 +96,6 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
-    LOCK_NOTICE_ID_KEY,
     LOG_SILENT_EVENT_TYPES,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
@@ -22255,7 +22256,8 @@ class AuthService:
                     username=user.username,
                     email=user.notify_email,
                     client=client,
-                    detail={**detail, LOCK_NOTICE_ID_KEY: notice_id},
+                    detail=detail,
+                    notice_id=notice_id,
                 )
                 if wired:
                     await self._record_lock_notice(user, lock, handed=handed, notice_id=notice_id)
@@ -22339,7 +22341,7 @@ class AuthService:
         BACKLOG #1138 item 2). Its ``auth.lock_notice`` row still reads ``mailed: true``, because
         the send fails on the notifier's task. The notifier records the failure on an
         ``auth.lock_notice_undelivered`` row with ``reason: send_failed`` and the notice's
-        :data:`~messagefoundry.auth.notifications.LOCK_NOTICE_ID_KEY` token, which the taken row
+        ``SecurityEvent.notice_id`` token, which the taken row
         carries too. So a mailable account is held back while some taken row of the kind in the
         window has no failed send with its token. A matched pair, not an order or a count, because
         the failure row can land before or after the row it matches. A failure row not read yet,
@@ -22391,7 +22393,7 @@ class AuthService:
             except (TypeError, ValueError, AttributeError):
                 continue
             # A full queue or a closing notifier already wrote ``mailed: false`` on its own row.
-            if reason == "send_failed" and isinstance(notice_id, str):
+            if reason == NOTICE_SEND_FAILED_REASON and isinstance(notice_id, str):
                 taken.discard(notice_id)
         return bool(taken)
 
@@ -22425,6 +22427,7 @@ class AuthService:
         email: str | None,
         client: str | None = None,
         detail: dict[str, Any] | None = None,
+        notice_id: str | None = None,
     ) -> bool:
         """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier and a
         notifier failure are each WARNED and then swallowed — a notification must never break a login
@@ -22489,6 +22492,7 @@ class AuthService:
                     email=email,
                     client_ip=client,
                     detail=detail or {},
+                    notice_id=notice_id,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - best-effort; never propagate into auth

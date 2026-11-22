@@ -833,7 +833,7 @@ async def _sent_and_recorded(relay: SecurityEventNotifier) -> None:
     """Wait, bounded, until the relay's drain loop has handled every queued notice, which includes
     writing a failed send's row."""
     async with asyncio.timeout(_STALL_SECONDS):
-        while relay._undelivered:
+        while relay.undelivered:
             await asyncio.sleep(0.01)
     await asyncio.gather(*relay._recording)
 
