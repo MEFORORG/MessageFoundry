@@ -425,16 +425,19 @@ $now = [DateTime]::UtcNow
 # result treats it as LOCAL, silently adding the UTC offset, and this box reported ages five hours in
 # the FUTURE. The pattern was correct throughout; the TYPE was not what the code assumed, which is
 # why re-reading the parse call finds nothing and dumping the type finds it immediately.
-function Get-AgeHours($iso) {
+function Get-RecordInstantUtc($iso) {
     if (-not $iso) { return $null }
     try {
-        $utc = if ($iso -is [DateTime]) {
-            if ($iso.Kind -eq [DateTimeKind]::Utc) { $iso } else { $iso.ToUniversalTime() }
-        } else {
-            [DateTimeOffset]::Parse([string]$iso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal).UtcDateTime
-        }
-        return [Math]::Round(($now - $utc).TotalHours, 1)
+        if ($iso -is [DateTime]) { return $iso.ToUniversalTime() }
+        return [DateTimeOffset]::Parse([string]$iso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal).UtcDateTime
     } catch { return $null }
+}
+
+# For display and the fold only. Two records can share a rounded age, so ordering them reads
+# Get-RecordInstantUtc instead (BACKLOG #5872).
+function Get-AgeHours($utc) {
+    if ($null -eq $utc) { return $null }
+    return [Math]::Round(($now - $utc).TotalHours, 1)
 }
 
 # EACH RECORD'S TREE: the box its worktree and host key to now (docs/COORD-SHARED-ROOT.md, step 4).
@@ -457,11 +460,21 @@ foreach ($r in $records) {
     $sk = [string](Get-RecordField $r.Rec 'sessionKey')
     $r | Add-Member -NotePropertyName Tree -NotePropertyValue $tree -Force
     $r | Add-Member -NotePropertyName SessionKey -NotePropertyValue $sk -Force
+    $r | Add-Member -NotePropertyName AsOfUtc -NotePropertyValue (Get-RecordInstantUtc (Get-RecordField $r.Rec 'asOf')) -Force
 }
 # Legacy-box records whose OWN SESSION has a record in the new box. No writer reaches them now, so
 # the pointer census below skips them: the seat repairs its pointer in the new record. A different
 # session's legacy record is still counted, because -ClearHandoff can still reach it.
 $frozenLegacy = @{}
+$newBoxSessions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+foreach ($r in $records) {
+    if ($r.SessionKey -and $r.Box -ceq $r.Tree) { [void]$newBoxSessions.Add("$($r.Tree)|$($r.SessionKey)") }
+}
+foreach ($r in $records) {
+    if ($r.SessionKey -and $r.Box -cne $r.Tree -and $newBoxSessions.Contains("$($r.Tree)|$($r.SessionKey)")) {
+        $frozenLegacy[$r.File] = $true
+    }
+}
 
 $rows = @()
 # Seat lookups that threw. Each such seat reads POSSIBLY RUNNING, and the receipt says why.
@@ -507,24 +520,21 @@ foreach ($r in $records) {
     }
 
     $lifecycle = if ($null -ne (Get-RecordField $rec 'lifecycle')) { [string](Get-RecordField $rec 'lifecycle') } else { 'open' }
-    $ageH = Get-AgeHours (Get-RecordField $rec 'asOf')
+    $ageH = Get-AgeHours $r.AsOfUtc
 
-    # SUPERSEDED: a newer record of the same tree (above), or a later record naming this one as
-    # predecessor. Without the tree, a session that crossed the box-key change reads as two seats.
-    # A legacy-box record whose own session also has a record in the new box is superseded outright:
-    # the two can be minutes apart, inside Get-AgeHours's 0.1 h rounding, and the new box is the one
-    # the writer keeps.
+    # SUPERSEDED: a newer record of the same tree (above). Without the tree, a session that crossed
+    # the box-key change reads as two seats. A frozen legacy copy is superseded outright, whichever
+    # is newer, because the new box is the one the writer keeps. It supersedes nothing itself, or a
+    # crashed tree could be left with no row to respawn.
+    # The compare reads instants, not Get-AgeHours's 0.1 h buckets (BACKLOG #5872). asOf has
+    # one-second resolution, so an exact tie supersedes neither: breaking it could hide a crashed
+    # seat from the respawn population.
     $superseded = $false
     foreach ($o in $records) {
         if ($o.File -eq $r.File) { continue }
         if ($o.Tree -cne $r.Tree) { continue }
-        if ($r.Tree -cne $r.Box -and $o.Box -ceq $r.Tree -and $r.SessionKey -and $o.SessionKey -ceq $r.SessionKey) {
-            $superseded = $true
-            $frozenLegacy[$r.File] = $true
-            continue
-        }
-        $oAge = Get-AgeHours (Get-RecordField $o.Rec 'asOf')
-        if ($null -ne $oAge -and $null -ne $ageH -and $oAge -lt $ageH) { $superseded = $true }
+        if ($frozenLegacy.ContainsKey($o.File)) { continue }
+        if ($null -ne $o.AsOfUtc -and $null -ne $r.AsOfUtc -and $o.AsOfUtc -gt $r.AsOfUtc) { $superseded = $true }
     }
 
     $state = switch ($true) {
@@ -533,9 +543,13 @@ foreach ($r in $records) {
         # incomplete record names no checkout to brief.
         { $incomplete }                                { 'POSSIBLY RUNNING'; break }
         { $lifecycle -eq 'handed' }                    { 'HANDED'; break }
+        # Ahead of LIVE: the fence reads one session for both of its records, and only the new-box
+        # record may show it as RUNNING, or one session shows twice.
+        { $frozenLegacy.ContainsKey($r.File) }         { 'SUPERSEDED'; break }
+        # Ahead of an ordinary SUPERSEDED: a newer record in this tree does not end a live session.
+        { $fence -eq 'LIVE' }                          { 'RUNNING'; break }
         { $superseded }                                { 'SUPERSEDED'; break }
         { -not $isHere }                               { "ON $((Get-CoordRecordHost $rec).ToUpperInvariant())"; break }
-        { $fence -eq 'LIVE' }                          { 'RUNNING'; break }
         { $fence -in @('UNVERIFIED', 'UNREADABLE') }   { 'POSSIBLY RUNNING'; break }
         { -not $fenceAvailable }                       { 'UNKNOWN-NO-FENCE'; break }
         default                                        { 'INTERRUPTED' }
