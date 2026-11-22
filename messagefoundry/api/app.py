@@ -10590,15 +10590,18 @@ def create_app(
         # CoreHandlers seam, and the seam digest does not cover keyword names.
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> AlertsConfig:
-        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine
-        access; the store is touched only for the audit row below. No secrets: the webhook URL, SMTP
+        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). The engine is
+        read for its graph's connection names; the store is touched only for the audit row below. No secrets: the webhook URL, SMTP
         password and username are never returned — transports are reported present-or-not. Gated by
         monitoring:read like /stats.
 
         A channel-scoped caller sees only the rules that name no connection outside its scope
         (BACKLOG #1152): ``connection`` is ``"*"`` or a name in its scope, and ``control_target``
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
-        ``IB_ACME_*``, is withheld.
+        ``IB_ACME_*``, is withheld. A rule naming an outbound of the loaded graph that is not also
+        an inbound is withheld from such a caller even when its scope lists that name (BACKLOG
+        #3378). With no graph loaded no name is known as an outbound, so that test withholds
+        nothing.
 
         What such a caller reads of each rule's ``id``, and why, is stated once in
         ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG #3378).
@@ -10609,9 +10612,25 @@ def create_app(
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
 
+        # Read from app.state, not a dependency: the console calls this handler across the seam.
+        engine: Engine | None = getattr(request.app.state, "engine", None)
+        rr = engine.registry_runner if engine is not None else None
+        outbound_only: frozenset[str] = (
+            frozenset(rr.registry.outbound) - rr.registry.inbound_names()
+            if rr is not None
+            else frozenset()
+        )
+
+        def reachable(name: str) -> bool:
+            # An outbound spans channels, so a scope that lists one does not reach it (BACKLOG #3378
+            # item 4, owner ruling 2026-11-04). A name that is also an inbound is that inbound's.
+            return _user.can_access_channel(name) and (
+                _user.allowed_channels is None or name not in outbound_only
+            )
+
         def visible(rule: AlertRule) -> bool:
-            return (rule.connection == "*" or _user.can_access_channel(rule.connection)) and (
-                rule.control_target is None or _user.can_access_channel(rule.control_target)
+            return (rule.connection == "*" or reachable(rule.connection)) and (
+                rule.control_target is None or reachable(rule.control_target)
             )
 
         rules = [r for r in alerts.rules if visible(r)]

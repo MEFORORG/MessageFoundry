@@ -245,6 +245,48 @@ async def test_alert_rules_id_cannot_name_a_connection_outside_the_scope(
     assert await engine.store.list_audit(action="alert_rules_withheld") == []
 
 
+async def test_alert_rules_withhold_an_outbound_the_scope_lists(
+    toml_engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378 item 4, owner ruling 2026-11-04 ("part 4 stays strict"): a scope that lists an
+    outbound by name still sees no rule naming it, as ``connection`` or as ``control_target``, as
+    the flag route refuses that outbound. The control: the in-scope inbound's own rule shows, and an
+    all-channels caller reads every rule."""
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="in", connection="IB_TOML"),
+            AlertRule(id="out", connection="OB_TOML"),
+            AlertRule(
+                id="in-targets-out",
+                event_type="connection_stopped",
+                connection="IB_TOML",
+                control_action="restart_outbound",
+                control_target="OB_TOML",
+            ),
+        ]
+    )
+    service = await _service(toml_engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_TOML", "OB_TOML"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(toml_engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+
+        async def shown(username: str) -> list[tuple[str, str | None]]:
+            r = await c.get("/alerts/rules", headers=await _login(c, username))
+            assert r.status_code == 200, r.text
+            return [(rule["connection"], rule["control_target"]) for rule in r.json()["rules"]]
+
+        assert await shown("wide") == [
+            ("IB_TOML", None),
+            ("OB_TOML", None),
+            ("IB_TOML", "OB_TOML"),
+        ]
+        assert await shown("scoped") == [("IB_TOML", None)]
+    # The withheld count covers these rules too, so the read that withheld two writes one row.
+    rows = await toml_engine.store.list_audit(action="alert_rules_withheld")
+    assert len(rows) == 1, rows
+
+
 async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
     engine: Engine,  # noqa: F811
 ) -> None:

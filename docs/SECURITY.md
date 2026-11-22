@@ -2383,7 +2383,10 @@ the same permission set on the same method reds CI until it is listed here.
 > all-channels caller 404 with no row (BACKLOG #3378).
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it. Each rule it shows has a null `id` (BACKLOG
+> scope, and `control_target` is unset or in it. A rule naming an outbound of the loaded graph that
+> is not also an inbound is withheld too, even from a scope that lists it, as the flag route
+> refuses that outbound (BACKLOG #3378, owner ruling 2026-11-04). With no graph loaded, that test
+> withholds nothing. Each rule it shows has a null `id` (BACKLOG
 > #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
 > connection name in it, and nothing here reliably tells a label that names one from one that
 > does not. An

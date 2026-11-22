@@ -35,6 +35,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
 
 ### Fixed
+- **`GET /alerts/rules` no longer shows a channel-scoped caller the rules of an outbound its scope
+  lists.** Scope membership was exact text, so a scope naming an outbound read that outbound's
+  rules, while the flag route refuses every outbound to such a caller. On a first deployment that
+  would have shown them. The route now withholds a rule naming an outbound of the loaded graph,
+  as `connection` or `control_target`, unless the name is also an inbound (BACKLOG #3378, owner
+  ruling 2026-11-04). `docs/SECURITY.md` says what such a caller reads.
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
   restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
   forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a
