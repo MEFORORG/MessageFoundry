@@ -131,6 +131,111 @@ def test_an_unreadable_payload_fails_closed(tmp_path: Path) -> None:
     assert main(["--states-json", str(p)]) == 2
 
 
+def _active_entries() -> list[dict[str, object]]:
+    """One well-formed workflow entry per required workflow file, all ``active``."""
+    workflows = _payload(dict.fromkeys(_required_workflow_files(), "active"))["workflows"]
+    assert isinstance(workflows, list)
+    return workflows
+
+
+def _stub_gh(monkeypatch: pytest.MonkeyPatch, stdout: str) -> list[dict[str, object]]:
+    """Replace ``subprocess.run`` for the script; returns the recorded calls."""
+    calls: list[dict[str, object]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append({"cmd": cmd, **kwargs})
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("scripts.ci.check_required_workflow_state.subprocess.run", fake_run)
+    return calls
+
+
+def test_two_slurped_pages_are_both_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """More than 100 workflows arrive as several pages, and a context on page two must resolve.
+
+    gh sends ``per_page=100`` under ``--paginate``, so the trigger is more than 100 workflows.
+    """
+    entries = _active_entries()
+    assert len(entries) >= 2, "expected the required set to span at least two workflows"
+    pages = [{"workflows": entries[:1]}, {"workflows": entries[1:]}]
+    calls = _stub_gh(monkeypatch, json.dumps(pages))
+
+    assert main(["--repo", "owner/name"]) == 0
+    assert len(calls) == 1
+    cmd = calls[0]["cmd"]
+    assert isinstance(cmd, list)
+    assert "--paginate" in cmd and "--slurp" in cmd, cmd
+    assert calls[0]["encoding"] == "utf-8"
+
+
+def test_a_disabled_workflow_on_page_two_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control for the two-page pass: page two's states are really read, not just tolerated."""
+    entries = _active_entries()
+    entries[-1] = {**entries[-1], "state": "disabled_manually"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": entries[:-1]}, {"workflows": entries[-1:]}]))
+    assert main(["--repo", "owner/name"]) == 1
+
+
+def test_a_list_of_workflows_is_still_read(tmp_path: Path) -> None:
+    """A saved payload may be a bare workflow list, the other list shape."""
+    p = tmp_path / "list.json"
+    p.write_text(json.dumps(_active_entries()), encoding="utf-8")
+    assert main(["--states-json", str(p)]) == 0
+
+
+def test_concatenated_pages_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The output of ``--paginate`` without ``--slurp`` is not one document: unread, so exit 2."""
+    page = json.dumps({"workflows": _active_entries()})
+    _stub_gh(monkeypatch, page + page)
+    assert main(["--repo", "owner/name"]) == 2
+
+
+_GOOD = {"path": ".github/workflows/ci.yml", "state": "active"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"message": "Not Found"}, id="object-without-workflows"),
+        pytest.param({"workflows": None}, id="workflows-null"),
+        pytest.param({"workflows": "ci.yml"}, id="workflows-string"),
+        pytest.param({"workflows": {"path": "ci.yml"}}, id="workflows-object"),
+        pytest.param({"workflows": ["ci.yml"]}, id="workflow-entry-string"),
+        pytest.param({"workflows": [None]}, id="workflow-entry-null"),
+        pytest.param({"workflows": [{"state": "active"}]}, id="entry-without-path"),
+        pytest.param({"workflows": [{"path": "ci.yml"}]}, id="entry-without-state"),
+        pytest.param({"workflows": [{"path": 7, "state": "active"}]}, id="path-not-string"),
+        pytest.param({"workflows": [{"path": "ci.yml", "state": 1}]}, id="state-not-string"),
+        pytest.param({"workflows": [{"path": "", "state": "active"}]}, id="path-empty"),
+        pytest.param({"workflows": [{"path": "ci.yml", "state": ""}]}, id="state-empty"),
+        pytest.param([], id="empty-list"),
+        pytest.param(["ci.yml"], id="list-of-strings"),
+        pytest.param([None], id="list-of-null"),
+        pytest.param([[_GOOD]], id="list-of-lists"),
+        pytest.param([{"workflows": [_GOOD]}, "page"], id="page-then-string"),
+        pytest.param([{"workflows": [_GOOD]}, _GOOD], id="page-mixed-with-workflow"),
+        pytest.param([{"workflows": [_GOOD]}, {"workflows": None}], id="second-page-malformed"),
+        pytest.param([{"workflows": [_GOOD]}, {"message": "error"}], id="second-page-error"),
+        pytest.param(_GOOD, id="top-level-bare-workflow"),
+        pytest.param("workflows", id="top-level-string"),
+        pytest.param(7, id="top-level-number"),
+        pytest.param(None, id="top-level-null"),
+    ],
+)
+def test_a_malformed_shape_exits_2(tmp_path: Path, payload: object) -> None:
+    """Exit 1 means "a finding", so an unreadable payload must never produce it, or a pass."""
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    assert main(["--states-json", str(p)]) == 2
+
+
+def test_undecodable_bytes_exit_2(tmp_path: Path) -> None:
+    """Bytes that are not UTF-8 are one more unreadable payload."""
+    p = tmp_path / "bad.json"
+    p.write_bytes(b'{"workflows": "\xff"}')
+    assert main(["--states-json", str(p)]) == 2
+
+
 def test_a_context_whose_workflow_is_absent_server_side_is_reported(tmp_path: Path) -> None:
     """A required context pointing at a workflow the server does not have is equally unreportable.
 

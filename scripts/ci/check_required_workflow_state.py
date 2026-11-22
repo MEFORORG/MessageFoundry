@@ -45,12 +45,54 @@ _ROOT = Path(__file__).resolve().parents[2]
 # A second implementation of that mapping is exactly the drift this repo keeps writing parity tests to
 # catch (ruff/bandit scan scope, the required-set prose). One resolver, two callers.
 sys.path.insert(0, str(_ROOT))
+from scripts.ci.required_contexts import gh_api  # noqa: E402
 from tests._workflow_contexts import required_contexts, resolve  # noqa: E402
 
 #: GitHub reports a runnable workflow as ``active``. Everything else -- ``disabled_manually``,
 #: ``disabled_inactivity`` (60 days idle on a fork/scheduled-only repo), ``disabled_fork`` -- means it
 #: will not dispatch, so a required context it owns can never report.
 _RUNNABLE = "active"
+
+
+def _workflow_entries(payload: object) -> list[object]:
+    """The workflow entries in any payload shape this script accepts, or ``RuntimeError``.
+
+    THREE SHAPES: one API page (``{"workflows": [...]}``), the LIST OF PAGES that ``--slurp`` emits, and
+    a saved bare list of workflows. A list is told apart by whether its entries carry ``workflows``, and
+    a list mixing the two is refused rather than guessed at. An error object on any page lands here too,
+    so one bad page cannot pass as a short list.
+    """
+    if isinstance(payload, dict):
+        pages: list[object] = [payload]
+    elif not isinstance(payload, list):
+        raise RuntimeError(f"workflow payload is a {type(payload).__name__}, not an object or list")
+    elif not any(isinstance(entry, dict) and "workflows" in entry for entry in payload):
+        return payload  # bare workflows; _workflow_state refuses a bad one
+    else:
+        pages = payload
+
+    entries: list[object] = []
+    for page in pages:
+        block = page.get("workflows") if isinstance(page, dict) else None
+        if not isinstance(block, list):
+            raise RuntimeError("a workflow page has no `workflows` array")
+        entries.extend(block)
+    return entries
+
+
+def _workflow_state(entry: object) -> tuple[str, str]:
+    """``(filename, state)`` of one entry, or ``RuntimeError``.
+
+    A missing field must not default to ``""``: that would report a malformed payload as a disabled
+    workflow, exit 1, which is the findings code.
+    """
+    if not isinstance(entry, dict):
+        raise RuntimeError("a workflow entry is not an object")
+    path, state = entry.get("path"), entry.get("state")
+    name = Path(path).name if isinstance(path, str) else ""
+    if not name or not isinstance(state, str) or not state:
+        raise RuntimeError("a workflow entry lacks a usable `path` or `state`")
+    return name, state
 
 
 def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, str]:
@@ -63,22 +105,11 @@ def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, st
     if states_json is not None:
         payload = json.loads(states_json.read_text(encoding="utf-8"))
     else:
-        cmd = ["gh", "api", "--paginate"]
-        cmd.append(
-            f"repos/{repo}/actions/workflows" if repo else "repos/{owner}/{repo}/actions/workflows"
-        )
-        # B603 asks whether untrusted input reaches a subprocess. It cannot here: argv is a fixed
-        # literal list, there is no shell, and the only variable element is `--repo`, an operator-typed
-        # CLI argument on a CI runner — not message, config, or network data. Annotated per-line with a
-        # reason, the posture security.yml's bandit notes require.
-        out = subprocess.run(  # noqa: S603  # nosec B603 — fixed argv, no shell, operator-supplied repo
-            cmd, capture_output=True, text=True, timeout=120
-        )
-        if out.returncode != 0:
-            raise RuntimeError(f"gh api failed ({out.returncode}): {out.stderr.strip()[:400]}")
-        payload = json.loads(out.stdout)
-    workflows = payload.get("workflows", payload if isinstance(payload, list) else [])
-    return {Path(str(w.get("path", ""))).name: str(w.get("state", "")) for w in workflows}
+        # --slurp because --paginate alone concatenates one JSON document per page, which does not
+        # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
+        route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
+        payload = gh_api(["--paginate", "--slurp", route])
+    return dict(_workflow_state(entry) for entry in _workflow_entries(payload))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -102,9 +133,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         states = _workflow_states(args.repo, args.states_json)
-    except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+    except (RuntimeError, ValueError, subprocess.SubprocessError, OSError) as exc:
         # FAIL CLOSED. "We could not read workflow state" must never read as "every workflow is fine" —
-        # that is the same blindness this script exists to catch, one level up.
+        # that is the same blindness this script exists to catch, one level up. ValueError covers both
+        # JSONDecodeError and UnicodeDecodeError; RuntimeError covers RecursionError from deep JSON.
         print(
             f"::error::could not read workflow state ({exc!r}). Treating as a FAILURE.",
             file=sys.stderr,
