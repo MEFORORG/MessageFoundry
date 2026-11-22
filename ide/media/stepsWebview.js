@@ -562,8 +562,10 @@
       // A paste on an if/elif/else/for header lands as the block's first statement (BACKLOG #5839), so
       // the anchor moves to the body's first row and the resolved position rides along. Any other anchor
       // posts no position and the provider derives it, as before.
-      const res = resolveInsertAnchor(stepsCtxRows(), selected.lineStart, 'after');
-      const moved = res !== null && res.anchor.lineStart !== selected.lineStart;
+      // Only a control header can move, so a leaf paste skips the row sweep.
+      const res = selected.kind === 'control' ? resolveInsertAnchor(stepsCtxRows(), selected.lineStart, 'after') : null;
+      // resolveInsertAnchor turns an 'after' into a 'before' only when it moved the anchor into a body.
+      const moved = res !== null && res.position === 'before';
       const at = moved ? res.anchor : selected;
       const msg = {
         command: 'paste',

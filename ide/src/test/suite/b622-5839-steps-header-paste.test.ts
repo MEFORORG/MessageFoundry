@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
 
 import { buildPasteRequest } from "../../stepsModel";
 import { loadPage, withControls, type Page } from "./b622-g09-steps-page";
@@ -10,6 +12,7 @@ import { loadPage, withControls, type Page } from "./b622-g09-steps-page";
 // anchor with resolveInsertAnchor and sends the body's first row with an explicit "before", and the
 // provider passes that validated position through to buildPasteRequest.
 
+const STEPS_VIEW_TS = path.join(__dirname, "..", "..", "..", "src", "stepsView.ts");
 const CLIP = { source: "x = 1", nesting: 0, kind: "action" as const, lineCount: 1, label: "1 step" };
 
 function key(page: Page, k: string): void {
@@ -51,6 +54,24 @@ suite("b622 #5839 — Paste on a control header lands as the block's first state
       assert.strictEqual(typeof paste.block, "string");
     });
   }
+
+  // stepsView.ts imports vscode, so the provider cannot be loaded node-side; pin its wiring by scan.
+  test("provider: the paste handler accepts only 'before' and forwards it to buildPasteRequest", () => {
+    const src = fs.readFileSync(STEPS_VIEW_TS, "utf8");
+    const at = src.indexOf('m?.command === "paste"');
+    assert.ok(at >= 0, "stepsView.ts has a paste handler");
+    const next = src.indexOf("m?.command ===", at + 1);
+    const body = src.slice(at, next < 0 ? undefined : next);
+    assert.ok(
+      /\(m\.position === undefined \|\| m\.position === "before"\)\s*\)/.test(body),
+      "the paste guard admits an absent position or 'before', nothing else",
+    );
+    assert.ok(!/m\.position === "after"/.test(body), "the paste guard does not admit 'after'");
+    assert.ok(
+      /buildPasteRequest\(\s*anchor,[\s\S]*?,\s*m\.position,\s*\)/.test(body),
+      "the validated position reaches buildPasteRequest",
+    );
+  });
 
   test("webview: Ctrl+V on a leaf row posts that row and no position, as before", () => {
     const paste = pasteOn(5);
