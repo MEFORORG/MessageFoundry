@@ -2580,9 +2580,10 @@ def test_prove_absences_refuses_an_async_swap(tmp_path: Path) -> None:
 
 # --- BACKLOG #5590 item 79: generator, decorator and nested swaps ----------------------------------
 #
-# Each "refuses" test below is red on the pre-change screen, which compared module-level functions
-# only and whose signature carried neither a generator flag nor decorators. Each "accepts" test is
-# green on it, and pins a shape an earlier attempt at this item wrongly refused.
+# The pre-change screen compared module-level functions only, and its signature carried neither a
+# generator flag nor decorators. So most "refuses" tests below are red on it; where one is green on
+# it, its docstring says so. Each "accepts" test is green on it, and pins a shape an earlier attempt
+# at this item, or a review of this one, found wrongly refused.
 
 
 def _screen(mutation: str, target_source: str, tmp_path: Path) -> list[str]:
@@ -2690,10 +2691,66 @@ def test_prove_absences_screen_refuses_the_dead_stub_under_not_type_checking(
 
 def test_prove_absences_screen_refuses_a_copy_of_a_shadowed_def(tmp_path: Path) -> None:
     """A later ``def`` replaces an earlier one, so a mutation copied from the shadowed one breaks
-    every call the live one takes. An earlier attempt let it pass by matching any definition."""
+    every call the live one takes. An earlier attempt let it pass by matching any definition.
+
+    The module-level pair is green on the pre-change screen, which compared the last module-level
+    def; the pairs under ``if`` and in a class body are read only by the second check."""
     target = "def f(a): ...\ndef f(a, b): ...\n"
     assert _refused("def f(a): ...\n", target, tmp_path)
     assert not _refused("def f(a, b): ...\n", target, tmp_path)
+    guarded = "if X:\n    def f(a): ...\n    def f(a, b): ...\n"
+    assert _refused("def f(a): ...\n", guarded, tmp_path)
+    member = "class C:\n    def m(self, a): ...\n    def m(self, a, b): ...\n"
+    assert _refused("class C(C):\n    def m(self, a): ...\n", member, tmp_path)
+    assert not _refused("class C(C):\n    def m(self, a, b): ...\n", member, tmp_path)
+
+
+def test_prove_absences_screen_accepts_an_override_of_one_inherited_accessor(
+    tmp_path: Path,
+) -> None:
+    """``@C.x.setter`` in a subclass builds a property on the inherited one, so callers of ``obj.x``
+    and ``obj.x = v`` see the same shape. Found refused by review of this item."""
+    prop = "class C:\n    @property\n    def x(self): ...\n    @x.setter\n    def x(self, v): ...\n"
+    setter = "class C(C):\n    @C.x.setter\n    def x(self, v):\n        self._x = v\n"
+    assert _screen(setter, prop, tmp_path) == []
+    getter = "class C(C):\n    @C.x.getter\n    def x(self):\n        return 2\n"
+    assert _screen(getter, prop, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_a_global_in_a_method_as_a_module_name(
+    tmp_path: Path,
+) -> None:
+    """``global scan`` in a method names the MODULE's ``scan``, so it must not hide the class's own
+    ``scan`` from the comparison."""
+    target = "class S:\n    def scan(self, p): ...\n    def reset(self):\n        global scan\n"
+    assert _refused("class S(S):\n    def scan(self): ...\n", target, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_walrus_in_a_lambda_as_the_lambdas(tmp_path: Path) -> None:
+    """A ``:=`` inside a lambda binds in the lambda, so it must not hide the module's ``f``."""
+    target = "if X:\n    def f(a): ...\ng = lambda: (f := 1)\n"
+    assert _refused("def f(): ...\n", target, tmp_path)
+    # Control: a walrus in the module's own expression does rebind f.
+    rebound = "if X:\n    def f(a): ...\ng = (f := 1)\n"
+    assert not _refused("def f(): ...\n", rebound, tmp_path)
+
+
+def test_prove_absences_screen_names_the_first_mismatch_in_source_order(tmp_path: Path) -> None:
+    """The refusal names the first mismatching definition in source order, not one picked by string
+    hashing, so the same input gives the same message on every run."""
+    names = ("alpha", "beta", "gamma", "delta", "eps", "zeta", "eta", "theta")
+    target = "".join(f"def {n}(a): ...\n" for n in names)
+    mutation = "if X:\n" + "".join(f"    def {n}(): ...\n" for n in names)
+    problems = _screen(mutation, target, tmp_path)
+    assert len(problems) == 1 and "redefines alpha()" in problems[0], problems
+
+
+def test_prove_absences_screen_reads_cache_as_an_unbounded_lru_cache(tmp_path: Path) -> None:
+    """``functools.cache`` is ``lru_cache(maxsize=None)``, so swapping one for the other changes no
+    call site. Found refused by review of this item."""
+    target = "import functools\n\n@functools.lru_cache(maxsize=128)\ndef f(a): ...\n"
+    assert _screen("@functools.cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    assert _refused("def f(a):\n    return 1\n", target, tmp_path)
 
 
 def test_prove_absences_screen_reads_a_decorator_name_at_the_point_its_def_runs(

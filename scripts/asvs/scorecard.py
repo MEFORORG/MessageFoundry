@@ -2549,9 +2549,10 @@ def _is_generator(fn: _FunctionNode) -> bool:
 
 #: Decorators that change what a call site gets back, by the origin a decorator expression resolves
 #: to: a property for a method, a context manager for a value, a wrapper that hashes its arguments,
-#: a stub that is never the live binding, a generated constructor. A decorator that resolves to
-#: anything else, or to nothing this screen can name, may come or go freely, because dropping one
-#: can BE the reintroduction (a permission check written as a decorator).
+#: a stub that is never the live binding. A decorator that resolves to anything else, or to nothing
+#: this screen can name, may come or go freely, because dropping one can BE the reintroduction (a
+#: permission check written as a decorator). The class decorators here (a generated constructor)
+#: are resolved too, but no check compares a class's decorators (:func:`_scope_mismatch`).
 _SHAPE_DECORATORS: Final = frozenset(
     {
         "builtins.property",
@@ -2578,6 +2579,8 @@ _SHAPE_DECORATORS: Final = frozenset(
         "pytest.fixture",
     }
 )
+#: Shape decorators that give a call site the same thing: ``cache`` is ``lru_cache(maxsize=None)``.
+_SAME_SHAPE: Final = {"functools.cache": "functools.lru_cache"}
 #: The builtins a bare name resolves to while nothing in its scope has rebound it.
 _SHAPE_BUILTINS: Final = frozenset({"property", "staticmethod", "classmethod"})
 #: The property accessor decorators, ``@x.setter`` and its siblings.
@@ -2644,7 +2647,7 @@ def _merge(states: list[_ScopeState]) -> _ScopeState:
     leaves live, or becomes ``None`` if any path leaves it bound to something else; a binding keeps
     its origin only where every path agrees on it."""
     out = _ScopeState(star=any(s.star for s in states))
-    for name in {n for s in states for n in s.defs}:
+    for name in dict.fromkeys(n for s in states for n in s.defs):
         entries = [s.defs[name] for s in states if name in s.defs]
         if any(e is None for e in entries):
             out.defs[name] = None
@@ -2654,7 +2657,7 @@ def _merge(states: list[_ScopeState]) -> _ScopeState:
             assert entry is not None
             alts.extend(d for d in entry if not any(d is a for a in alts))
         out.defs[name] = tuple(alts)
-    for name in {n for s in states for n in s.bindings}:
+    for name in dict.fromkeys(n for s in states for n in s.bindings):
         origins = {s.lookup(name) for s in states}
         out.bindings[name] = origins.pop() if len(origins) == 1 else None
     return out
@@ -2684,21 +2687,39 @@ _WALRUS_SKIP: Final = frozenset({"body", "orelse", "finalbody", "handlers", "cas
 
 
 def _bind_walrus(node: ast.stmt, state: _ScopeState) -> None:
-    """A ``:=`` in `node`'s own expressions binds in this scope; its nested blocks run later."""
+    """A ``:=`` in `node`'s own expressions binds in this scope; its nested blocks run later, and
+    a lambda body is a scope of its own, though its defaults are evaluated here."""
+    stack: list[ast.AST] = []
     for name, value in ast.iter_fields(node):
-        if name in _WALRUS_SKIP:
+        if name not in _WALRUS_SKIP:
+            stack.extend(
+                i for i in (value if isinstance(value, list) else [value]) if isinstance(i, ast.AST)
+            )
+    while stack:
+        item = stack.pop()
+        if isinstance(item, ast.NamedExpr):
+            state.bind(item.target.id)
+        if isinstance(item, ast.Lambda):
+            stack.extend(item.args.defaults)
+            stack.extend(d for d in item.args.kw_defaults if d is not None)
             continue
-        for item in value if isinstance(value, list) else [value]:
-            if isinstance(item, ast.AST):
-                for sub in ast.walk(item):
-                    if isinstance(sub, ast.NamedExpr):
-                        state.bind(sub.target.id)
+        stack.extend(ast.iter_child_nodes(item))
 
 
 def _is_accessor(node: _FunctionNode, state: _ScopeState, reading: _Reading) -> bool:
     """A ``@x.setter``, ``@x.getter`` or ``@x.deleter`` def named ``x`` while every live ``x`` in
     this scope is a def decorated as a builtin property: it adds an accessor to that property, so
-    it does not replace the property's shape."""
+    it does not replace the property's shape. So is one whose decorator reaches ``x`` through
+    another name (``@Base.x.setter``), the shape of an override of one accessor of an inherited
+    property; it binds a property built on that one, and is not compared."""
+    if any(
+        isinstance(d, ast.Attribute)
+        and d.attr in _ACCESSORS
+        and isinstance(d.value, ast.Attribute)
+        and d.value.attr == node.name
+        for d in node.decorator_list
+    ):
+        return True
     entry = state.defs.get(node.name)
     if not entry:
         return False
@@ -2751,14 +2772,15 @@ def _run_stmt(
     _bind_walrus(node, state)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         reading.decorators[node] = tuple(
-            origin
+            _SAME_SHAPE.get(origin, origin)
             for d in node.decorator_list
             if (origin := _resolve(d, state)) in _SHAPE_DECORATORS
         )
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Global):
-                for name in sub.names:
-                    state.bind(name)
+        if outer is None:  # a `global` anywhere inside binds a MODULE name, never a class member
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Global):
+                    for name in sub.names:
+                        state.bind(name)
         if isinstance(node, ast.ClassDef):
             module = outer if outer is not None else state
             fresh = _ScopeState(bindings=dict(module.bindings), star=module.star)
@@ -2963,8 +2985,9 @@ def _scope_mismatch(
     """The first of the mutation's definitions in `mut` that matches none of the live definitions
     `src` holds for its name, as a clause for the refusal; ``None`` if there is none.
 
-    Only definitions `src` does not already hold are the mutation's. A name `src` does not hold as
-    definitions shadows nothing comparable and is skipped. A class redefined over a class is
+    Only definitions `src` does not already hold are the mutation's. A name is skipped where `src`
+    does not bind it, or where some live binding of it is not a ``def`` or ``class`` (an import, an
+    assignment, ``C = deco(C)``), so it shadows nothing this screen can compare. A class redefined over a class is
     compared member by member, its methods with :func:`_signature`'s ``method``.
 
     NOT COMPARED, at least: the members, annotated fields (a dataclass's constructor arguments),
@@ -2999,6 +3022,8 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
     The second reads both in order (:func:`_run_block`), the mutation continuing from where the
     target ends, since it is appended: it refuses a mutation definition, at module level or inside a
     redefined class, that matches none of the target's definitions still possibly live for its name.
+    It compares nothing for a name the target may leave bound to something other than a ``def`` or
+    ``class``, such as an import under ``try:`` with a fallback ``def`` (:func:`_scope_mismatch`).
 
     A REFUSAL IS PROBLEM-ONLY: it appends a PROVE-ERROR and increments NO counter, which is why the
     accounting identity on :class:`Findings` still closes. That was a choice between three options and
