@@ -3225,8 +3225,10 @@ class _HeldStagingDir:
 
     def __exit__(self, *exc: object) -> None:
         if self.fd is not None:
-            with contextlib.suppress(OSError):
+            try:
                 os.close(self.fd)
+            except OSError as exc:  # never raised over the caller's own outcome
+                log.warning("DR staging: could not close a staging directory: %s", safe_exc(exc))
 
     def owner(self) -> object | None:
         """The directory's owner, read from the open directory (:func:`_owner_of_fd`), or by path
@@ -3262,17 +3264,20 @@ class _HeldStagingDir:
         return True
 
     def mark(self, name: str) -> None:
-        """Create the empty file ``name`` unless an entry has that name; raise ``OSError`` when the
-        entry there is not a plain file. On Windows, and on POSIX where the directory is open, the
-        create is exclusive, so it never opens an existing entry at that name and never follows a
-        link planted there, a dangling one included: on POSIX ``O_EXCL`` with ``O_CREAT`` never
-        follows a final link, and on Windows ``CREATE_NEW`` with ``FILE_FLAG_OPEN_REPARSE_POINT``
-        takes the link itself as the name in use, where an ``os.open`` create would make the file
-        at a dangling link's target. Windows still reaches that name by path. An entry that goes
-        between the refused create and its check is created once more.
+        """Create the empty file ``name`` unless an entry has that name.
+
+        On Windows, and on POSIX where the directory is open, the create is exclusive, so it never
+        follows a link planted at that name, a dangling one included: on POSIX ``O_EXCL`` with
+        ``O_CREAT`` never follows a final link, and on Windows ``CREATE_NEW`` with
+        ``FILE_FLAG_OPEN_REPARSE_POINT`` takes the link itself as the name in use, where an
+        ``os.open`` create would make the file at a dangling link's target. Where that create finds
+        the name taken, the entry there is checked (on Windows by :func:`_win_lstat`, which opens it
+        as itself for its attributes), and ``OSError`` is raised when it is not a plain file.
+        Windows still reaches that name by path. An entry that goes between the refused create and
+        its check is created once more.
 
         Where POSIX goes by path, the open is the one it replaced: ``O_CREAT`` with ``O_NOFOLLOW``
-        and ``O_NONBLOCK``, by path."""
+        and ``O_NONBLOCK``, by path, which opens an entry already there and checks nothing more."""
         if sys.platform != "win32" and self.fd is None:
             flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
             os.close(os.open(self.path / name, flags, 0o600))
