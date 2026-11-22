@@ -707,9 +707,9 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     ceiling, and, for a body that the delivery re-attach's gate opens on
     (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), at least these: the listeners'
     whole **ingest** check on a body ``Peek.parse`` accepts; a **parse** refusal of a body past
-    ``Peek.parse``'s segment cap, or one the parser faults on; and the form limit alone on one
-    only the re-attach's own parse (``Message.parse``) accepts. ``raw`` is returned as is. Strict validation is an inbound's setting,
-    so it never applies there either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
+    ``Peek.parse``'s segment cap, or one the parser faults on; and the form limit on one within
+    that cap that only the re-attach's own parse (``Message.parse``) accepts. ``raw`` is returned
+    as is. Strict validation is an inbound's setting, so it never applies there either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
     rule is ``docs/SECURITY.md`` control 5), so the ceiling is a backstop.
 
     **Not mirrored, and a resubmission can therefore still differ from a sender's body:** document
@@ -723,7 +723,8 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         _raise_if_oversize(len(raw))
         # The delivery re-attach judges a payload its gate opens on, so one that parses as HL7
         # meets the listeners' document-marker refusal here, rather than being committed and then
-        # dead-lettered (BACKLOG #5972). A body the parser refuses is left to the outbound, but a
+        # dead-lettered (BACKLOG #5972). A body the parser refuses within the segment cap is left to
+        # the outbound, but a
         # fault in the parser refuses the body, as the re-attach re-raises one rather than admit
         # what it could not read. A body Peek.parse refuses past its segment cap is refused. Another
         # body it refuses, such as an FHS- or BHS-led batch, is parsed again as the re-attach parses
@@ -745,12 +746,13 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             return raw
         # Message.parse has no segment cap, so a body past the one Peek.parse enforces is refused
         # here, unparsed, rather than parsed whole on the request (BACKLOG #5972).
+        over_cap: str | None = None
         try:
             enforce_size_limits(normalize(raw), max_bytes=None)
         except HL7PeekError as exc:
-            faulted = str(exc)
-        if faulted is not None:
-            raise IngressGuardError(faulted, phase="parse")
+            over_cap = str(exc)
+        if over_cap is not None:
+            raise IngressGuardError(over_cap, phase="parse")
         try:
             message = Message.parse(raw)
         except HL7PeekError as exc:

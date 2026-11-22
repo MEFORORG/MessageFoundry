@@ -402,7 +402,8 @@ def test_guard_direct_path_refuses_a_body_the_parser_faults_on(
 ) -> None:
     # BACKLOG #5972: on the edit-resend direct path (no inbound) a body the re-attach's gate opens
     # on, which the parser faults on, is refused rather than admitted unchecked: the re-attach
-    # re-raises such a fault too. A body the parser refuses as not HL7 is still left to the outbound.
+    # re-raises such a fault too. A short body the parser refuses as not HL7 is still left to the
+    # outbound.
     from messagefoundry.parsing import _builtin_hl7
     from messagefoundry.parsing.binary import DOC_REF_MARKER
 
@@ -467,17 +468,21 @@ def test_guard_direct_path_refuses_a_body_past_the_segment_cap_unparsed(
 
     monkeypatch.setattr(Message, "parse", staticmethod(_counted))
     note = f"NTE|1||{DOC_REF_MARKER}x\r"
-    body = EDITED + note + "ZZZ|1\r" * DEFAULT_MAX_SEGMENTS
+    head = "FHS|^~\\&|APP|FAC\r" + EDITED + note
+    # Peek.parse counts the text after the last segment terminator as one more segment.
+    at_cap = head + "ZZZ|1\r" * (DEFAULT_MAX_SEGMENTS - head.count("\r") - 1)
+    over = at_cap + "ZZZ|1\r"
     with pytest.raises(IngressGuardError) as exc:
-        admit_resubmitted_body(body, None)
+        admit_resubmitted_body(over, None)
     assert exc.value.phase == "parse"
-    assert exc.value.reason.startswith("message exceeds max segments (")
+    assert exc.value.reason == (
+        f"message exceeds max segments ({DEFAULT_MAX_SEGMENTS + 1} > {DEFAULT_MAX_SEGMENTS})"
+    )
     assert exc.value.__cause__ is None and exc.value.__context__ is None
     assert calls == []
-    # Control: an FHS-led batch within the cap still reaches the re-attach's parse.
-    batch = "FHS|^~\\&|APP|FAC\r" + EDITED + note
-    assert admit_resubmitted_body(batch, None) == batch
-    assert calls == [batch]
+    # Control: the same batch at the cap still reaches the re-attach's parse and is admitted.
+    assert admit_resubmitted_body(at_cap, None) == at_cap
+    assert calls == [at_cap]
 
 
 def test_guard_direct_path_gives_the_listeners_reason_on_a_body_they_parse() -> None:
