@@ -190,7 +190,7 @@ function Get-RecordStartedUtc($Record) {
 # Every registry record, with the root it came from attached.
 #
 # -IncludeUnreadable also returns a row for every file that could NOT be parsed (Record = $null,
-# Unreadable = $true). A caller about to destroy something needs those: a record that is half-written
+# Unreadable = $true; Directory = $true when the row is a directory named *.json). A caller about to destroy something needs those: a record that is half-written
 # -- i.e. a session that launched a moment ago -- fails to parse, and DROPPING it silently turns an
 # occupied worktree from SKIP into PRUNE while the receipt reports one fewer record than existed.
 # It is off by default so the read-only roster callers keep the shape they already handle.
@@ -206,18 +206,19 @@ function Get-SessionRecords {
             # SessionStart hook, where a throw replaces the chat's whole starting context.
             $rec = $null
             $err = ''
-            if ($f -is [System.IO.DirectoryInfo]) { $err = 'a directory, not a file, so it cannot be read as a record' }
+            $isDir = $f -is [System.IO.DirectoryInfo]
+            if ($isDir) { $err = 'a directory, not a file, so it cannot be read as a record' }
             else {
                 try { $rec = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $err = $_.Exception.Message }
             }
             if (-not $rec) {
                 if (-not $err) { $err = 'the file parsed to nothing (empty, or being written right now)' }
                 if ($IncludeUnreadable) {
-                    $out += [pscustomobject]@{ Record = $null; Root = $root; File = $f.FullName; Unreadable = $true; Error = $err }
+                    $out += [pscustomobject]@{ Record = $null; Root = $root; File = $f.FullName; Unreadable = $true; Error = $err; Directory = $isDir }
                 }
                 continue
             }
-            $out += [pscustomobject]@{ Record = $rec; Root = $root; File = $f.FullName; Unreadable = $false; Error = '' }
+            $out += [pscustomobject]@{ Record = $rec; Root = $root; File = $f.FullName; Unreadable = $false; Error = ''; Directory = $false }
         }
     }
     return $out

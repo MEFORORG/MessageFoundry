@@ -478,7 +478,9 @@ class TestTheProfileIsReadByItsOwnName:
         f = d / "turn.jsonl"
         f.write_text('{"t":1}\n', encoding="utf-8")
         _back_date(f, 5)
-        assert float(self._age(sandbox, sandbox / home_name)) == pytest.approx(5, abs=0.1)
+        age = self._age(sandbox, sandbox / home_name)
+        assert age != "null", f"no transcript found under the profile {home_name}"
+        assert float(age) == pytest.approx(5, abs=0.1)
 
     def test_an_unset_profile_names_no_root(self, sandbox: Path) -> None:
         """No profile reads as UNEVALUABLE, not as a throw, and not as the current directory."""

@@ -1146,9 +1146,9 @@ def test_a_duplicated_session_id_is_reported_as_ambiguous_not_missing(
 @pytest.mark.parametrize(
     ("directory", "bad_file", "want"),
     [
-        (True, False, "1 registry row(s) are directories; will not self-resolve"),
-        (True, True, "2 registry row(s) unparsed, 1 directories; files maybe mid-write"),
-        (False, True, "1 registry record(s) unparsed, maybe still being written"),
+        (True, False, "MISSING: no record matched this id; 1 registry row(s) are directories"),
+        (True, True, "UNREADABLE: 1 record(s) unparsed, maybe mid-write; 1 directory row(s)"),
+        (False, True, "UNREADABLE: 1 registry record(s) unparsed, maybe still being written"),
     ],
     ids=["directory-only", "directory-and-file", "file-only"],
 )
@@ -1157,8 +1157,9 @@ def test_a_directory_row_is_not_called_a_record_being_written(
 ) -> None:
     """Vault BACKLOG #2985, added item 3. The registry lists a directory named *.json as an
     unreadable row, and the NO_LOGIN receipt called it "maybe still being written". A directory is
-    not a write in progress and stays on every prompt. Red before the fix: the directory cases read
-    as a record being written. The file-only case is the control."""
+    not a record being written, so it is counted apart from the files, and with no unparsed file
+    the receipt reads MISSING. Red before the fix: the directory cases read as a record being
+    written. The file-only case is the control."""
     home = _registry(tmp_path / "home", "00000000-0000-0000-0000-000000000000", ".claude")
     sessions = home / ".claude" / "sessions"
     if directory:
@@ -1169,7 +1170,7 @@ def test_a_directory_row_is_not_called_a_record_being_written(
     run(repo, tmp_path=tmp_path, state_dir=sd, rows=[PEER, ACCT], env={"USERPROFILE": str(home)})
     assert outcomes(sd) == ["NO_LOGIN"], outcomes(sd)
     note = " ".join(receipts(sd))
-    assert f"UNREADABLE: {want}" in note, note
+    assert want in note, note
 
 
 def test_repeated_stand_downs_do_not_arm_the_kill_ladder(repo: Path, tmp_path: Path) -> None:

@@ -811,3 +811,10 @@ def test_a_removal_that_cannot_be_confirmed_gone_is_not_reported_clean(rig: Rig)
     assert proc.returncode != 0, _explain(wt.parent, probe, proc)
     assert "could not be confirmed gone" in _out(proc), _explain(wt.parent, probe, proc)
     assert "Removed worktree" not in _out(proc), _explain(wt.parent, probe, proc)
+
+    # Control: the same layout, with listing allowed, is a clean removal.
+    other = rig.add(rig.primary.parent / "box" / "Repo-listed")
+    proc = rig.run("-Path", str(other))
+    assert proc.returncode == 0, _out(proc)
+    assert "Removed worktree" in _out(proc), _out(proc)
+    assert not other.exists()
