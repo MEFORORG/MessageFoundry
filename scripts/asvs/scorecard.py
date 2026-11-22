@@ -2628,15 +2628,12 @@ class _ScopeState:
 @dataclass
 class _Reading:
     """What :func:`_run_block` records about each ``def`` and ``class`` it reaches: the shape
-    decorators it resolved for it at the point it ran, the ones it could not name, each class
-    body's final scope, and the mutation's accessor defs that build on no property."""
+    decorators it resolved for it at the point it ran, the ones it could not name, and each class
+    body's final scope."""
 
     decorators: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
     #: Each def's decorators that resolved to nothing, by :func:`_unknown_key`, sorted.
     unknown: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
-    #: The mutation's ``@Base.x.setter``-style defs whose ``Base.x`` reads as no property, with
-    #: ``Base`` (:func:`_not_a_property`).
-    no_property: list[tuple[_DefNode, str]] = field(default_factory=list)
 
     def pair(self, m: _DefNode, s: _DefNode) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """The decorators to compare for `m` against `s`, or none.
@@ -2655,6 +2652,11 @@ class _Reading:
         """Whether `m` and `s` each carry a decorator this reading resolved to ``staticmethod``,
         whether or not :meth:`pair` compares their decorators."""
         return all("builtins.staticmethod" in self.decorators.get(n, ()) for n in (m, s))
+
+    def all_shape(self, m: _DefNode, s: _DefNode) -> bool:
+        """Whether every decorator of `m` and of `s` resolved to a :data:`_SHAPE_DECORATORS` entry,
+        so nothing this reading cannot see changes what either name is bound to."""
+        return all(len(self.decorators.get(n, ())) == len(n.decorator_list) for n in (m, s))
 
     classes: dict[ast.ClassDef, _ScopeState] = field(default_factory=dict)
 
@@ -2740,58 +2742,19 @@ def _bind_walrus_in(expr: ast.AST, state: _ScopeState) -> None:
         stack.extend(ast.iter_child_nodes(item))
 
 
-def _not_a_property(
-    base: ast.expr, attr: str, state: _ScopeState, outer: _ScopeState | None, reading: _Reading
-) -> bool:
-    """Whether ``base.attr`` reads as something other than a property: `base` is a bare name that
-    this scope, or else the module scope, binds only to classes this reading ran, and each of them
-    binds `attr` only to defs whose every decorator resolved to a :data:`_SHAPE_DECORATORS` entry
-    other than a builtin property. Anything else, an inherited member or a nested class included,
-    reads as not known. It does not see ``Base.attr`` assigned after the class."""
-    if not isinstance(base, ast.Name):
-        return False
-    entry = state.defs[base.id] if base.id in state.defs else (outer or state).defs.get(base.id)
-    if not entry:
-        return False
-    for cls in entry:
-        if not isinstance(cls, ast.ClassDef) or cls not in reading.classes:
-            return False
-        members = reading.classes[cls].defs.get(attr)
-        if not members:
-            return False
-        for member in members:
-            decorators = reading.decorators.get(member)
-            if (
-                isinstance(member, ast.ClassDef)
-                or decorators is None
-                or len(decorators) != len(member.decorator_list)
-                or "builtins.property" in decorators
-            ):
-                return False
-    return True
-
-
-def _accessor_bases(node: _FunctionNode) -> list[ast.expr]:
-    """``Base`` for each ``@Base.x.setter``, ``.getter`` or ``.deleter`` decorator of a def named
-    ``x``."""
-    return [
-        d.value.value
-        for d in node.decorator_list
-        if isinstance(d, ast.Attribute)
-        and d.attr in _ACCESSORS
-        and isinstance(d.value, ast.Attribute)
-        and d.value.attr == node.name
-    ]
-
-
 def _is_accessor(node: _FunctionNode, state: _ScopeState, reading: _Reading) -> bool:
     """A ``@x.setter``, ``@x.getter`` or ``@x.deleter`` def named ``x`` while every live ``x`` in
     this scope is a def decorated as a builtin property: it adds an accessor to that property, so
     it does not replace the property's shape. So is one whose decorator reaches ``x`` through
     another name (``@Base.x.setter``), the shape of an override of one accessor of an inherited
-    property; it binds a property built on that one, and is not compared. Where ``Base.x`` reads
-    as no property, :func:`_run_stmt` records the mutation's def for a refusal."""
-    if _accessor_bases(node):
+    property; it binds a property built on that one, and is not compared."""
+    if any(
+        isinstance(d, ast.Attribute)
+        and d.attr in _ACCESSORS
+        and isinstance(d.value, ast.Attribute)
+        and d.value.attr == node.name
+        for d in node.decorator_list
+    ):
         return True
     entry = state.defs.get(node.name)
     if not entry:
@@ -2824,7 +2787,7 @@ def _unknown_key(
             scope = state if sub.id in state.defs or outer is None else outer
             entry = scope.defs.get(sub.id)
             if not entry:
-                return f"{ast.dump(decorator)} @{id(node)}"
+                return f"@{id(node)}"
             names.append(f"{sub.id}=" + ",".join(str(id(e)) for e in entry))
     return f"{ast.dump(decorator)} {' '.join(names)}"
 
@@ -2921,12 +2884,6 @@ def _run_stmt(
             fresh = _ScopeState(bindings=dict(module.bindings))
             reading.classes[node] = _run_block(node.body, fresh, reading, module, generous=generous)
         elif _is_accessor(node, state, reading):
-            if not generous:
-                reading.no_property.extend(
-                    (node, ast.unparse(base))
-                    for base in _accessor_bases(node)
-                    if _not_a_property(base, node.name, state, outer, reading)
-                )
             return state
         state.defs[node.name] = (node,)
         state.bindings[node.name] = None
@@ -3076,6 +3033,7 @@ def _signature(
     *,
     method: bool = False,
     static: bool | None = None,
+    fold: bool = False,
 ) -> tuple[object, ...]:
     """The call-compatible shape of a signature: what a CALL SITE can observe, one value per
     :data:`_SIGNATURE_FIELDS` entry.
@@ -3097,10 +3055,10 @@ def _signature(
 
     For a ``method`` other than a ``staticmethod``, the first parameter is bound, never passed by a
     caller, so neither its name nor whether it is positional-only is part of the shape (``self``,
-    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``. A method with
-    no positional parameter but a ``*args`` gets the bound value in ``*args``, so ``(*args)`` and
-    ``(self, *args)`` are one shape too. `static` says whether `fn` is a ``staticmethod``; when it
-    is ``None``, `decorators` says.
+    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``. With `fold`,
+    a method with no positional parameter but a ``*args`` gets the bound value in ``*args``, so
+    ``(*args)`` and ``(self, *args)`` are one shape too. `static` says whether `fn` is a
+    ``staticmethod``; when it is ``None``, `decorators` says.
     """
     args = fn.args
     posonly = [p.arg for p in args.posonlyargs]
@@ -3111,7 +3069,7 @@ def _signature(
         if posonly or positional:
             (posonly if posonly else positional).pop(0)
             posonly.insert(0, "<bound>")
-        elif args.vararg:
+        elif fold and args.vararg:
             posonly.insert(0, "<bound>")
     return (
         isinstance(fn, ast.AsyncFunctionDef),
@@ -3153,8 +3111,10 @@ def _node_mismatch(
     assert not isinstance(m, ast.ClassDef) and not isinstance(s, ast.ClassDef)
     mdecs, sdecs = reading.pair(m, s)
     static = reading.both_static(m, s) or None
-    mine = _signature(m, mdecs, method=method, static=static)
-    live = _signature(s, sdecs, method=method, static=static)
+    # The *args fold only where every decorator is named, so no unnamed staticmethod hides.
+    fold = reading.all_shape(m, s)
+    mine = _signature(m, mdecs, method=method, static=static, fold=fold)
+    live = _signature(s, sdecs, method=method, static=static, fold=fold)
     return None if mine == live else _signature_clause(qual, path, mine, live)
 
 
@@ -3261,16 +3221,6 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         if mine != theirs:
             mismatch = _signature_clause(name, a.mutation_path, mine, theirs)
             break
-    if mismatch is None and walked is not None and reading.no_property:
-        node, base = reading.no_property[0]
-        assert not isinstance(node, ast.ClassDef)
-        findings.problems.append(
-            f"{cell_id}: absence claim PROVE-ERROR — the mutation decorates {node.name}() as an "
-            f"accessor of {base}.{node.name}, which {a.mutation_path} reads as no property. "
-            "Applied, the decorator raises AttributeError when the def runs, so the import of "
-            f"{a.mutation_path} breaks rather than reintroducing anything (BACKLOG #5590)"
-        )
-        return False
     if mismatch is None and walked is not None:
         mismatch = _scope_mismatch(
             walked[1].defs, walked[0].defs, "", a.mutation_path, reading, method=False

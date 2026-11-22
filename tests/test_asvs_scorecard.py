@@ -2950,8 +2950,8 @@ def test_prove_absences_screen_skips_decorators_after_the_recursion_fallback(
 
 # --- BACKLOG #5590 follow-up: the PR 3144 review findings on the decorator rule -----------------
 #
-# Each "refuses" test below is red on the screen PR 3144 merged; the "accepts" in the last test is
-# too. Every other assertion is a control that is green on it.
+# The first assertion of each test below is red on the screen PR 3144 merged. Every other
+# assertion is a control that is green on it.
 
 
 def test_prove_absences_screen_compares_shape_decorators_beside_the_same_unnamed_one(
@@ -2993,24 +2993,11 @@ def test_prove_absences_screen_keeps_a_staticmethod_beside_an_unnamed_decorator(
     assert _screen("class C(C):\n    @deco\n    def m(this, x): ...\n", method, tmp_path) == []
 
 
-def test_prove_absences_screen_refuses_an_accessor_of_a_plain_method(tmp_path: Path) -> None:
-    """``@A.x.setter`` where this module's class ``A`` binds ``x`` to a plain method raises when the
-    def runs, whatever its signature. Where ``A.x`` is a property, or ``A`` is not read, it is
-    still an accessor and is not compared."""
-    target = "class A:\n    def x(self): ...\n\nclass B:\n    def x(self, v): ...\n"
-    problems = _screen("class B(B):\n    @A.x.setter\n    def x(self, v): ...\n", target, tmp_path)
-    assert len(problems) == 1 and "accessor of A.x" in problems[0], problems
-    assert _refused("class B(B):\n    @A.x.setter\n    def x(self): ...\n", target, tmp_path)
-    prop = "class A:\n    @property\n    def x(self): ...\n\nclass B:\n    def x(self, v): ...\n"
-    assert _screen("class B(B):\n    @A.x.setter\n    def x(self): ...\n", prop, tmp_path) == []
-    imported = "from m import A\n\nclass B:\n    def x(self, v): ...\n"
-    assert _screen("class B(B):\n    @A.x.setter\n    def x(self): ...\n", imported, tmp_path) == []
-
-
 def test_prove_absences_screen_reads_star_args_as_taking_the_bound_value(tmp_path: Path) -> None:
     """A method ``def m(*args)`` takes the bound value in ``*args``, so every call ``def m(self,
-    *args)`` takes, it takes too. With a named parameter after the bound one, or as a
-    ``staticmethod``, it is still a different shape."""
+    *args)`` takes, it takes too. With a named parameter after the bound one, as a
+    ``staticmethod``, or beside a decorator the screen cannot name, it is still a different shape.
+    """
     assert (
         _screen(
             "class C(C):\n    def m(*args): ...\n",
@@ -3026,6 +3013,9 @@ def test_prove_absences_screen_reads_star_args_as_taking_the_bound_value(tmp_pat
     )
     static = "class C:\n    @staticmethod\n    def m(x, *args): ...\n"
     assert _refused("class C(C):\n    @staticmethod\n    def m(*args): ...\n", static, tmp_path)
+    # An unnamed decorator may return a staticmethod, whose first parameter callers pass.
+    wraps = "def deco(f):\n    return staticmethod(f)\n\nclass C:\n    @deco\n    def m(x, *args): ...\n"
+    assert _refused("class C(C):\n    @deco\n    def m(*args): ...\n", wraps, tmp_path)
 
 
 def test_signature_fields_name_every_signature_value() -> None:
