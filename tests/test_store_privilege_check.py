@@ -638,16 +638,24 @@ _HOSTILE = "a\x1b[31mb\x7fc\x9bd\u202ee\u2028f"
 
 
 def _assert_escaped(out: str) -> None:
-    """Every line of ``out`` is printable ASCII. With the caller's check that ``out`` decodes back
-    to :data:`_HOSTILE`, that proves each of its characters was written as an escape."""
-    raw = [line for line in out.splitlines() if not (line.isascii() and line.isprintable())]
+    """``out`` is ASCII, and every character in it but a newline is printable. ``str.splitlines``
+    would drop U+2028 as a line break, so the check splits on nothing. With the caller's check
+    that ``out`` decodes back to :data:`_HOSTILE`, that proves each of its characters was written
+    as an escape."""
+    raw = [ch for ch in out if ch != chr(10) and not (ch.isascii() and ch.isprintable())]
     assert not raw, f"--json output carries a raw character: {out!r}"
 
 
 def test_the_escape_assertion_fails_on_unescaped_json() -> None:
-    """The control for :func:`_assert_escaped`: output written without ``ensure_ascii`` fails it."""
+    """The control for :func:`_assert_escaped`: output written without ``ensure_ascii`` fails it,
+    and so does output that leaves only U+2028 raw, which ``json.loads`` accepts."""
     with pytest.raises(AssertionError, match="carries a raw character"):
         _assert_escaped(json.dumps({"error": _HOSTILE}, ensure_ascii=False))
+    escaped_ls, raw_ls = chr(92) + "u2028", chr(0x2028)
+    only_line_separator_raw = json.dumps({"error": _HOSTILE}).replace(escaped_ls, raw_ls)
+    assert json.loads(only_line_separator_raw) == {"error": _HOSTILE}
+    with pytest.raises(AssertionError, match="carries a raw character"):
+        _assert_escaped(only_line_separator_raw)
     _assert_escaped(json.dumps({"error": _HOSTILE}, indent=2))
 
 
