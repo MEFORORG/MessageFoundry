@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A Transit ``plaintext`` that is not base64 once ASCII whitespace is removed is refused as that
-value's own error (BACKLOG #5964). Non-strict decoding drops every character outside the alphabet,
-so ``!!!!`` would have opened as an empty cell and a stray character as a value Transit never
-returned. A reply with whitespace added around or inside its base64 still opens as it did. These tests pin the plain :class:`CipherError` a refused reply has today; they do not decide
-whether it should instead read as an outage. Synthetic data only."""
+"""A Transit ``plaintext`` that is not base64 once the six ASCII whitespace characters are removed
+is refused as that value's own error (BACKLOG #5964). Non-strict decoding drops every character
+outside the alphabet, so ``!!!!`` would have opened as an empty cell and a stray character as a
+value Transit never returned. A reply with ASCII whitespace added around or inside its base64
+still opens as it did. These tests pin the plain :class:`CipherError` a refused reply has today;
+they do not decide whether it should instead read as an outage. Synthetic data only."""
 
 from __future__ import annotations
 
@@ -21,16 +22,13 @@ from messagefoundry.store.crypto import CipherError, cell_aad, gave_no_verdict
 from messagefoundry.store.crypto_transit import _plaintext
 from tests.test_transit_batch import _BatchTransit, _cipher, _sealed
 
-#: Replies refused here that a non-strict decode opens as a value. Form feed and vertical tab are
-#: ASCII whitespace outside the four characters removed.
+#: Replies refused here that a non-strict decode opens as a value.
 _NOT_STRICT = {
     "only-non-alphabet": "!!!!",
     "only-newline": "\n",
     "only-whitespace": " \t\r\n",
     "url-safe-alphabet": "-_-_",
     "stray-inside": "dmFs!dWU=",
-    "form-feed": "dmFs\fdWU=",
-    "vertical-tab": "dmFs\vdWU=",
     "only-padding": "====",
     "excess-padding": "QQ===",
     "padding-after-full-group": "QUJD=",
@@ -49,11 +47,27 @@ _each_bad_reply = pytest.mark.parametrize(
     [*_NOT_STRICT.values(), *_NON_ASCII_SPACES.values(), _NOT_UTF8],
     ids=[*_NOT_STRICT, *_NON_ASCII_SPACES, "not-utf8"],
 )
-#: ``value`` with space, tab, CR or LF added: the same bytes.
+#: ``value`` with ASCII whitespace added: the same bytes.
 _each_wrapped_reply = pytest.mark.parametrize(
     "reply",
-    [" dmFsdWU=", "dmFsdWU=\n", "dmFs\ndWU=", "\tdmFsdWU=\r\n", "dmFsdWU\n="],
-    ids=["leading-space", "trailing-newline", "embedded-newline", "tab-crlf", "inside-padding"],
+    [
+        " dmFsdWU=",
+        "dmFsdWU=\n",
+        "dmFs\ndWU=",
+        "\tdmFsdWU=\r\n",
+        "dmFsdWU\n=",
+        "dmFs\fdWU=",
+        "dmFs\vdWU=",
+    ],
+    ids=[
+        "leading-space",
+        "trailing-newline",
+        "embedded-newline",
+        "tab-crlf",
+        "before-padding",
+        "form-feed",
+        "vertical-tab",
+    ],
 )
 
 
@@ -137,6 +151,10 @@ def test_a_value_that_is_not_a_str_is_none(value: object) -> None:
 
 def test_a_true_empty_reply_opens_as_empty() -> None:
     assert _plaintext("") == ""
+
+
+def test_whitespace_between_two_pad_characters_still_opens() -> None:
+    assert _plaintext("QQ=\n=") == "A"
 
 
 @pytest.mark.parametrize(("reply", "text"), [("QR==", "A"), ("dmFsdWX=", "value")])

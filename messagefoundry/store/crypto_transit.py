@@ -306,8 +306,8 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
         return False, True
 
 
-#: The ASCII whitespace :func:`_plaintext` removes: space, tab, CR and LF, and no other character.
-_B64_WHITESPACE = " \t\r\n"
+#: The six ASCII whitespace characters :func:`_plaintext` removes, and no other character.
+_B64_WHITESPACE = " \t\n\r\f\v"
 
 
 def _plaintext(value: object) -> str | None:
