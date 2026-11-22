@@ -11,11 +11,12 @@ Topology (backlog #14):
 
 Failure model:
 
-* The **Corepoint** leg is the production path. On a *transport* failure (after a few quick retries) the
-  relay is **fail-closed**: it stops accepting on Listener A and drops live Epic connections so Epic sees
-  the outage and queues/retries on its side. It does **not** exit (avoids a crash-loop against a down
-  Corepoint); restart it once Corepoint is healthy. A Corepoint **NAK** is *logged, not* a trip — the
-  partner is reachable, it just rejected one message.
+* The **Corepoint** leg is the production path. On a *transport* failure on every one of a few
+  tries, counting the first, the relay is **fail-closed**: it stops accepting on Listener A and
+  drops live Epic connections so Epic sees the outage and queues/retries on its side. It does
+  **not** exit (avoids a crash-loop against a down Corepoint); restart it once Corepoint is
+  healthy. A Corepoint **NAK** is *logged, not* a trip — the partner is reachable, it just
+  rejected one message.
 * The **MEFOR** leg is shadow-only and fully **decoupled** (a bounded queue drained by its own worker), so
   a slow/down MEFOR never back-pressures or trips the production path. Its failures are logged and dropped.
 
@@ -58,7 +59,8 @@ class RelayConfig:
     receive_timeout: float = 60.0  # close inbound sockets idle this long (None/0 disables)
     connect_timeout: float = 10.0
     send_timeout: float = 30.0
-    corepoint_attempts: int = 3  # quick retries on the Corepoint leg before tripping fail-closed
+    # Tries on the Corepoint leg, counting the first, before fail-closed; 1 means no retry.
+    corepoint_attempts: int = 3
     corepoint_retry_delay: float = 1.0
     mefor_queue_max: int = (
         1000  # bounded shadow buffer; oldest copies dropped (with a log) when full
@@ -73,6 +75,15 @@ class RelayConfig:
         # without persisting the whole Epic->Corepoint input stream. Implied by ``capture_bodies``.
         False
     )
+
+    def __post_init__(self) -> None:
+        # Refuse these here, before any listener binds: a zero/negative attempt count would skip the
+        # Corepoint forward loop, so every ACKed Epic message would trip fail-closed without one
+        # forward being tried; a zero/negative bound makes asyncio.Queue unbounded.
+        for name in ("corepoint_attempts", "mefor_queue_max"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
 
 
 class ForwardError(Exception):
@@ -523,7 +534,7 @@ class TeeRelay:
             logger.error("could not record the cut-off message (%r) control_id=%s", exc, control_id)
 
     async def _forward_corepoint(self, payload: bytes) -> tuple[str, str | None, str | None]:
-        """Forward to Corepoint with a few quick retries; raise :class:`ForwardError` if all fail."""
+        """Try Corepoint up to ``corepoint_attempts`` times; raise :class:`ForwardError` if all fail."""
         cfg = self.config
         last: ForwardError | None = None
         for attempt in range(1, cfg.corepoint_attempts + 1):
@@ -545,7 +556,8 @@ class TeeRelay:
                 )
                 if attempt < cfg.corepoint_attempts:
                     await asyncio.sleep(cfg.corepoint_retry_delay)
-        assert last is not None  # corepoint_attempts >= 1, so the loop ran and set `last`
+        if last is None:  # unreachable: RelayConfig refuses corepoint_attempts < 1
+            raise ForwardError("no Corepoint forward attempt was made")
         raise last
 
     # -- Listener B: Corepoint copies -> MEFOR -------------------------------
