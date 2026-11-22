@@ -964,7 +964,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.lineEnd === "number" &&
           typeof m.kind === "string" &&
           typeof m.block === "string" &&
-          m.block !== ""
+          m.block !== "" &&
+          // The page sends a position only when it moved a paste off a control header (BACKLOG #5839);
+          // validated against the two legal values, as the inserts above do (inbound data is untrusted).
+          (m.position === undefined || m.position === "before" || m.position === "after")
         ) {
           // Paste the captured block at the selected anchor via the byte-stable `lens rewrite` path
           // (applyStructural). A refusal surfaces the engine LensRewriteError as an error toast with ZERO
@@ -979,13 +982,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             return;
           }
           void applyStructural(
-            buildPasteRequest(anchor, {
-              source: m.block,
-              nesting: 0,
-              kind: anchor.kind,
-              lineCount: 0,
-              label: "",
-            }),
+            buildPasteRequest(
+              anchor,
+              { source: m.block, nesting: 0, kind: anchor.kind, lineCount: 0, label: "" },
+              m.position as "before" | "after" | undefined,
+            ),
           ).then((ok) => {
             if (ok && !disposed) {
               void vscode.window.showInformationMessage(pasteText);
