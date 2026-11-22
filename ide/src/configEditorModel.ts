@@ -145,8 +145,10 @@ export function isConfigDirCodeSetFile(
 /**
  * Whether a document IS the config-dir file the CLI edits: an on-disk `file:` document whose path
  * `isConfigDirFile` accepts. The path alone is not enough. A `git:` revision tab, among others, carries
- * the working copy's fsPath, and the CLI writes the working copy, so a save or remove from that tab
- * would overwrite the file on disk with content the tab never showed (BACKLOG #5834).
+ * the working copy's fsPath. The forms render from the CLI's read of the working copy, not from the
+ * document, so that tab would show working-copy data under a revision's label, and a save or remove
+ * from it would write the working copy; for a file since deleted from disk, the blank form's save
+ * would create it (BACKLOG #5834).
  */
 export function isConfigDirDocument(
   uri: { readonly scheme: string; readonly fsPath: string },
@@ -155,6 +157,22 @@ export function isConfigDirDocument(
   isConfigDirFile: (fsPath: string, ws: string, dir: string) => boolean,
 ): boolean {
   return uri.scheme === "file" && isConfigDirFile(uri.fsPath, workspaceDir, configDir);
+}
+
+/**
+ * The static page a config custom editor shows instead of its form: a one-line `notice`, and, for a
+ * document that is not a `file:` document ({@link isConfigDirDocument}), that document's own `text`,
+ * so a diff side shows what that revision holds. Both are escaped, and its CSP allows no script.
+ */
+export function configNoticeHtml(notice: string, text?: string): string {
+  const esc = (s: string): string =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const body = text === undefined ? "" : `<pre style='white-space:pre-wrap'>${esc(text)}</pre>`;
+  return (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
+    "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline';\">" +
+    `</head><body style='font-family:sans-serif;padding:1rem'><p>${esc(notice)}</p>${body}</body></html>`
+  );
 }
 
 /** A connection summary the connections customEditor lists (name/direction/transport) — the fields it

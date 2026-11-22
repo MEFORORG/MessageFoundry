@@ -35,6 +35,7 @@ import {
   isConfigDirDocument,
   isReadOnlyCodeSet,
   pickCurrentConnection,
+  configNoticeHtml,
   shouldPushDocumentChange,
 } from "./configEditorModel";
 
@@ -50,8 +51,13 @@ const SAVE_GUARD_RESET_MS = 1500;
  * workspace-wide) would otherwise be shown — and saved — as the config-dir file. Returns false (proceed
  * with the custom editor) for the canonical config-dir file, or for a `file:` document when there is
  * no workspace folder (a relative configDir can't be resolved, and the CLI-backed editor is already
- * inert there). A document of any other scheme, such as a `git:` revision tab, always opens as text
- * (`isConfigDirDocument`).
+ * inert there).
+ *
+ * A document of any other scheme, such as a `git:` revision tab or one side of an Open Changes diff,
+ * is never the file the CLI writes (`isConfigDirDocument`), so it gets no form and no scripts. It is
+ * shown in place, as its own read-only text, and is not reopened: an `openWith` there would pull the
+ * revision out of the diff into a separate tab. The save and remove handlers re-check the scheme as
+ * defense in depth, though a panel this returns true for never enables scripts and so never posts.
  */
 function reopenAsTextIfNotConfigDirFile(
   document: vscode.TextDocument,
@@ -59,23 +65,30 @@ function reopenAsTextIfNotConfigDirFile(
   expected: string,
   isConfigDirFile: (fsPath: string, ws: string, dir: string) => boolean,
 ): boolean {
-  const ws = workspaceDir();
-  if (ws ? isConfigDirDocument(document.uri, ws, configDir(), isConfigDirFile) : document.uri.scheme === "file") {
-    return false;
+  const nonFile = document.uri.scheme !== "file";
+  if (!nonFile) {
+    const ws = workspaceDir();
+    if (!ws || isConfigDirDocument(document.uri, ws, configDir(), isConfigDirFile)) {
+      return false;
+    }
   }
-  const notice =
-    document.uri.scheme === "file"
-      ? `This file is not ${expected} under the configured config dir (messagefoundry.configDir)`
-      : `This ${document.uri.scheme}: document is not ${expected} on disk`;
-  void vscode.window.showInformationMessage(
-    `MessageFoundry: ${notice}, so it opens as text. The form edits only that file.`,
-  );
-  // Reopen the same resource with the built-in text editor (viewType "default"), replacing this panel.
-  void vscode.commands.executeCommand("vscode.openWith", document.uri, "default");
-  // Leave a static notice in the about-to-be-replaced webview in case the reopen is slow.
-  panel.webview.html =
-    "<!DOCTYPE html><body style=\"font-family:sans-serif;padding:1rem\">" +
-    `${notice}; opening it as text…</body>`;
+  let notice: string;
+  let text: string | undefined;
+  if (nonFile) {
+    // Shown in place as the revision's own text; never reopened (see above).
+    notice = `This ${document.uri.scheme}: document is read-only here; the form edits only the file on disk.`;
+    text = document.getText();
+  } else {
+    const reason = `This file is not ${expected} under the configured config dir (messagefoundry.configDir)`;
+    void vscode.window.showInformationMessage(
+      `MessageFoundry: ${reason}, so it opens as text. The form edits only that file.`,
+    );
+    // Reopen the same resource with the built-in text editor (viewType "default"), replacing this panel.
+    void vscode.commands.executeCommand("vscode.openWith", document.uri, "default");
+    // Leave a static notice in the about-to-be-replaced webview in case the reopen is slow.
+    notice = `${reason}; opening it as text…`;
+  }
+  panel.webview.html = configNoticeHtml(notice, text);
   return true;
 }
 
