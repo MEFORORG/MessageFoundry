@@ -3922,13 +3922,18 @@ _PERSISTED_WITNESS = "2026-10-01"
 @pytest.mark.parametrize("field", ["residual", "reviewed_by"])
 @pytest.mark.parametrize(
     "witness_line",
-    [f'anchor_repaired_at = "{_PERSISTED_WITNESS}"', f"anchor_repaired_at = {_PERSISTED_WITNESS}"],
-    ids=["string", "toml-date"],
+    [
+        f'anchor_repaired_at = "{_PERSISTED_WITNESS}"',
+        f"anchor_repaired_at = {_PERSISTED_WITNESS}",
+        f"anchor_repaired_at = {_PERSISTED_WITNESS}T10:00:00",
+    ],
+    ids=["string", "toml-date", "toml-datetime"],
 )
 def test_an_echoed_repair_flag_does_not_carry_an_omitted_field(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str, witness_line: str
 ) -> None:
-    """The TOML-date arm states the same day as a string, which is still no new repair."""
+    """The TOML-date arm states the same day as a string, which is still no new repair. A datetime
+    witness cannot be compared with the stated date, so it cannot show a new repair either."""
     rec = _record(tmp_path)
     flag = f"anchor_repair = true\n{witness_line}\n"
     rec.write_text(FIXTURE.replace(_FIX_LINE, _FIX_LINE + flag, 1), encoding="utf-8")

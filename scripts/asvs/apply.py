@@ -254,14 +254,16 @@ def _repair_carry(cell: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
     no repair and carries nothing, so deleting a field from such an echo is still refused as field
     loss. The date is compared as a date because the record may hold it as a TOML date literal and
     a JSON payload can only state a string. A second repair on the witness's own day therefore has
-    to state these fields."""
+    to state these fields. A held witness that is not such a date, a TOML datetime for one, cannot
+    show that the date moved, so it counts as unchanged."""
     if not cell.get("anchor_repair"):
         return {}
-    witness = live.get(_REPAIR_WITNESS)
-    if live.get("anchor_repair") and _iso_date(cell.get(_REPAIR_WITNESS, witness)) == _iso_date(
-        witness
-    ):
-        return {}
+    if live.get("anchor_repair"):
+        witness = live.get(_REPAIR_WITNESS)
+        old = _iso_date(witness)
+        new = _iso_date(cell.get(_REPAIR_WITNESS, witness))
+        if new == old or (_REPAIR_WITNESS in live and old is None):
+            return {}
     return {k: live[k] for k in _OPTIONAL_ORDERED if k in live and k not in cell}
 
 
