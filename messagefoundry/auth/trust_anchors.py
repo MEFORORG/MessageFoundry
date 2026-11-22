@@ -250,7 +250,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     refuses at least the new connects its pool makes and those of its claim holders and sync
     handoff pools (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`).
     It lifts when a later settings check passes the pin with no content warning, or a store open
-    in that process passes it at ``enforce`` (:func:`release_store_pin_refusal`). A store call
+    in that process passes it at ``enforce``, in each case only where the pin is unchanged from
+    this process's in-process baseline (:func:`release_store_pin_refusal`). A store call
     that needs one of those connects fails until then. A reload may not reach the pin's check: at
     least an earlier anchor's refusal ends the preflight first, and a reload route that makes a
     store call before the check fails there once the pool has no connection left. A restart once
@@ -1767,6 +1768,10 @@ def _warn_off_hop_pin_change(spec: AnchorSpec, fingerprint: str) -> None:
 #: :func:`release_store_pin_refusal` says what releases it. Holding and releasing each log once.
 _STORE_PIN_REFUSED: dict[tuple[str, str], str] = {}
 
+#: The held pins whose release was refused because their bytes differ from the baseline
+#: (:func:`release_store_pin_refusal`), so that ERROR is logged once per hold.
+_STORE_PIN_RELEASE_REFUSED: set[tuple[str, str]] = set()
+
 
 def store_pin_connect_refusal(spec: AnchorSpec) -> str | None:
     """The text of the ``enforce`` settings refusal that holds ``spec``'s new store connects shut,
@@ -1779,25 +1784,51 @@ def hold_store_pin_refused(spec: AnchorSpec, refusal: str) -> None:
     that starts, since the reload's own refusal does not say that connects stopped."""
     key = (spec.label, spec.path)
     if key not in _STORE_PIN_REFUSED:
+        _STORE_PIN_RELEASE_REFUSED.discard(key)
         log.error(
             "%s: a settings check at enforce refused the SQL Server pin %r, so this engine "
             "process's store now refuses new connections; the ones already open stay open. A "
-            "later settings check at enforce that passes the pin with no content warning lets it "
-            "connect again, but a reload may not reach that check: its route can need a new store "
-            "connection first. A restart once the file is corrected lifts it",
+            "later settings check at enforce that passes the pin with no content warning, and "
+            "finds it unchanged from the pin this process first checked, lets it connect again, "
+            "but a reload may not reach that check: its route can need a new store connection "
+            "first. A restart once the file is corrected lifts it",
             spec.setting,
             spec.path,
         )
     _STORE_PIN_REFUSED[key] = refusal
 
 
-def release_store_pin_refusal(spec: AnchorSpec) -> None:
+def release_store_pin_refusal(spec: AnchorSpec, fingerprint: str) -> None:
     """Let ``spec``'s store connect again (:data:`_STORE_PIN_REFUSED`), logging when a refusal
     is lifted. Called by a settings preflight at ``enforce`` that passes the pin with no content
     warning, and by a store open whose checks of the pin pass at ``enforce``. Each runs the
     checks a refusal at ``enforce`` names, and the store open's refuse what the preflight only
-    warns of."""
-    if _STORE_PIN_REFUSED.pop((spec.label, spec.path), None) is not None:
+    warns of.
+
+    ``fingerprint`` is the pin those checks passed. Unless it equals this process's baseline
+    (:data:`_STORE_PIN_FIRST_CHECKED`), the hold stays and an ERROR is logged once per hold: a
+    swapped pin must not lift the hold its own refusal set by passing after, say, an ACL fix.
+    A renewal then takes a restart, as the off-hop warning says."""
+    key = (spec.label, spec.path)
+    if key not in _STORE_PIN_REFUSED:
+        return
+    if _STORE_PIN_FIRST_CHECKED.get(key) != fingerprint:
+        if key not in _STORE_PIN_RELEASE_REFUSED:
+            _STORE_PIN_RELEASE_REFUSED.add(key)
+            log.error(
+                "%s: the SQL Server pin %r passed a check at enforce, but its bytes (%s %s) "
+                "differ from the pin this engine process first checked, so new store "
+                "connections stay refused. The pin changed: if the change is yours, restart each "
+                "engine process that uses this store; if it is not, treat the store login as "
+                "exposed and correct the file first",
+                spec.setting,
+                spec.path,
+                ANCHOR_DIGEST,
+                fingerprint,
+            )
+        return
+    _STORE_PIN_RELEASE_REFUSED.discard(key)
+    if _STORE_PIN_REFUSED.pop(key, None) is not None:
         log.warning(
             "%s: the SQL Server pin %r passed a check at enforce, so this engine process's store "
             "connects again",
@@ -2959,7 +2990,7 @@ async def _preflight_checks(
     if spec.server_pin:
         note_store_pin_checked(spec, verdict.fingerprint)  # the file passed (step 9)
         if enforcing and pin_warning is None:
-            release_store_pin_refusal(spec)  # new connects again (step 11)
+            release_store_pin_refusal(spec, verdict.fingerprint)  # step 11
     if store_fault is not None:
         raise store_fault
     return verdict.fingerprint

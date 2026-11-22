@@ -7,7 +7,8 @@ made, a restart, since the baseline moves only then.
 
 Step 11, re-scoped: after a settings check at ``enforce`` refuses the SQL Server store pin, the
 store refuses new connects, its pool's (through the pool executor) and its claim holders' and
-sync handoff pools', until a check passes the pin again. A check at ``warn`` does not.
+sync handoff pools', until a check passes the pin again, unchanged from the process's
+baseline. A check at ``warn`` does not.
 
 ``aioodbc`` and ``pyodbc`` are the optional ``sqlserver`` extra, so recording modules stand in for
 them through ``sys.modules``, as ``tests/test_sqlserver_login_timeout.py`` does. The one test that
@@ -61,6 +62,7 @@ def _fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "_STORE_CONTENT_RECORDED", {})
     monkeypatch.setattr(ta, "_STORE_PIN_FIRST_CHECKED", {})
     monkeypatch.setattr(ta, "_STORE_PIN_REFUSED", {})
+    monkeypatch.setattr(ta, "_STORE_PIN_RELEASE_REFUSED", set())
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
 
@@ -168,6 +170,38 @@ async def test_a_settings_check_that_only_warns_of_the_pin_keeps_the_refusal(
     await run_anchor_preflight(_specs(settings), store, enforcing=True)  # warns, does not refuse
     with pytest.raises(StorePinConnectRefused):
         refuse_connect_after_pin_refusal(settings)
+
+
+async def test_a_swapped_pin_does_not_lift_its_own_refusal(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A swapped pin in a broadly writable file is refused at enforce for its ACL. Fixing the ACL
+    alone must not lift the hold, since the bytes still differ from the baseline; the release is
+    refused with one ERROR. A store open of the same file does not lift it either. Red under: the
+    release without the baseline compare (head a6b67798b4a), where the fixed ACL lifts the hold."""
+    pin = _pin(tmp_path)
+    settings = _settings(pin)
+    await run_anchor_preflight(_specs(settings), store, enforcing=True)  # sets the baseline
+    other = tmp_path / "other"
+    other.mkdir()
+    pin.write_bytes(_pin(other).read_bytes())  # the swap
+    owner_only = {"ok": False}
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: owner_only["ok"])
+    with pytest.raises(TrustAnchorError):
+        await run_anchor_preflight(_specs(settings), store, enforcing=True)
+    owner_only["ok"] = True  # the ACL fix the refusal asks for
+    caplog.set_level("ERROR", logger=ta.__name__)
+    for _ in range(2):
+        await run_anchor_preflight(_specs(settings), store, enforcing=True)
+    check_pinned_certificate(settings)
+    with pytest.raises(StorePinConnectRefused):
+        refuse_connect_after_pin_refusal(settings)
+    refused = [r for r in caplog.records if "connections stay refused" in r.getMessage()]
+    assert len(refused) == 1, refused
+    assert "The pin changed" in refused[0].getMessage()
 
 
 def test_a_store_with_no_pin_gets_a_plain_pool_executor() -> None:

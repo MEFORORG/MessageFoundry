@@ -3341,7 +3341,7 @@ def check_pinned_certificate(
     if enforcing:
         # Step 11: these are the store open's checks, which refuse what the settings check only
         # warns of, and they passed at enforce.
-        release_store_pin_refusal(spec)
+        release_store_pin_refusal(spec, verdict.fingerprint)
 
 
 def refuse_connect_after_pin_refusal(settings: StoreSettings) -> None:
