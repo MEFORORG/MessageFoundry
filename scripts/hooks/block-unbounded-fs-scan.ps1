@@ -156,7 +156,9 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         # A site's reading depends only on the text from it and on the state $siteKey records, so
         # a site is keyed by both and kept across a restore. Cutting every later site there
         # instead made each restore re-read the frames nested in it, and about ten nested levels
-        # of `$(($(...) ) )` then spent the budget (BACKLOG #5607).
+        # of `$(($(...) ) )` then spent the budget (BACKLOG #5607). Each restore still re-reads its
+        # own frame, so deeper nesting still spends it, and so can a nesting whose key changes on
+        # the re-read, such as one inside an unclosed `${`.
         $saves = [System.Collections.Generic.List[object]]::new()
         $subshellSites = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
         $siteKey = {
@@ -176,9 +178,9 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         $budget = 8 * $Text.Length + 4096
         $delimRe = [regex]::new('\G-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
         $newSave = {
-            param([int]$Site)
+            param([int]$Site, [string]$Key)
             @{
-                Site = $Site; Key = (& $siteKey $Site); Frame = $kinds.Count; SbLen = $sb.Length
+                Site = $Site; Key = $Key; Frame = $kinds.Count; SbLen = $sb.Length
                 Kinds = [System.Collections.Generic.List[string]]::new($kinds)
                 Depths = [System.Collections.Generic.List[int]]::new($depths)
                 PrevDollar = $prevDollar; WordStart = $wordStart; BraceDepth = $braceDepth
@@ -285,14 +287,15 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         }
         if ($Refined -and $ch -ceq '$' -and $kind -cne 'sq' -and $kind -cne 'ansi') {
             if ($next -ceq '(' -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(') {
-                if ($subshellSites.Contains((& $siteKey $n))) {
+                $key = & $siteKey $n
+                if ($subshellSites.Contains($key)) {
                     # Read again as `$(`, then `(`, as the bash view reads a `$(`.
                     $arithOnLine = $true
                     if ($kind -cne 'top') { $kinds.Add('sub'); $depths.Add(0) }
                     [void]$sb.Append('$('); $prevDollar = $false; $wordStart = $true
                     $n += 2; continue
                 }
-                $saves.Add((& $newSave $n))
+                $saves.Add((& $newSave $n $key))
                 $arithOnLine = $true
                 $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('$(('); $prevDollar = $false
                 $n += 3; continue
@@ -369,8 +372,9 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
                 }
             }
             if ($ch -ceq '(' -and $next -ceq '(') {
-                if ($wordStart -and $braceDepth -eq 0 -and -not $subshellSites.Contains((& $siteKey $n))) {
-                    $saves.Add((& $newSave $n))
+                $key = if ($wordStart -and $braceDepth -eq 0) { & $siteKey $n } else { $null }
+                if ($null -ne $key -and -not $subshellSites.Contains($key)) {
+                    $saves.Add((& $newSave $n $key))
                     $arithOnLine = $true
                     $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('(('); $prevDollar = $false
                     $n += 2; continue
