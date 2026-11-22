@@ -100,9 +100,12 @@ re-arm compressing a swept-discovered backlog.
 
 7. THE CONCURRENCY NUMERATOR IS COUNTED, NOT DERIVED
 ----------------------------------------------------
-``concurrency.n_outbound_rows`` is the time-average of ``N(t) = #transformed<=t - #delivered<=t`` — an
-EXACT counting process over the rung's full event streams. No pairing, no ``claimed_at``, no Little's
-law. Two things it is NOT:
+``concurrency.n_outbound_rows`` is the time-average of ``N(t) = #transformed<=t - #delivered<=t`` — a
+counting process over the rung's full event streams. No pairing, no ``claimed_at``, no Little's law.
+It assumes one outbound row per ``transformed``, which the stores do not guarantee: they write one
+per handler handoff. So it is ``None`` when any cohort message has a different count of the two
+(``concurrency.n_outbound_parity``), and that check is necessary rather than sufficient
+(``_outbound_parity``). Two things it is NOT:
 
 * it is NOT capped at 8. It counts QUEUED **plus** IN-SERVICE outbound rows; only rows in service are
   bounded by the 8 destination lanes. "N is about 8, therefore the lanes are saturated" is a category error.
@@ -212,12 +215,11 @@ def _lane_sql(since: float | None, until: float | None) -> str:
 
 
 def _transformed_sql(since: float | None, until: float | None) -> str:
-    """Every ``transformed`` row of the cohort as a ts stream — the BIRTH of an outbound row.
+    """Every ``transformed`` row of the cohort as a ts stream — one stamp per HANDLER handoff.
 
-    The routed->outbound handoff writes one ``transformed`` per handler and produces the outbound rows in
-    the SAME committed transaction, so a ``transformed`` stamp is the birth of an outbound row and a
-    ``delivered`` stamp is its death. Counting births minus deaths gives ``N_out(t)`` EXACTLY (see
-    ``_counting_n``) — no pairing, no ``claimed_at`` column, no Little's law.
+    The routed->outbound handoff writes one ``transformed`` per handler, however many outbound rows it
+    produced in that transaction. So a stamp is the birth of one outbound row only where each handler
+    delivers once, and ``_outbound_parity`` decides whether births minus deaths may be reported.
     """
     return (
         "SELECT ts FROM message_events "
@@ -558,12 +560,13 @@ def _build_lanes(rows: list[tuple[Any, ...]]) -> list[_Lane]:
 
 
 def _counting_n(births: list[float], deaths: list[float], lo: float, hi: float) -> dict[str, float]:
-    """Time-average and peak of the EXACT counting process ``N(t) = #births<=t - #deaths<=t`` over
+    """Time-average and peak of the counting process ``N(t) = #births<=t - #deaths<=t`` over
     ``[lo, hi]``.
 
     This is the concurrency numerator, and it is measured, not derived. It needs NO pairing of a birth to
     its death (the store does not record which outbound row a ``delivered`` belongs to), NO ``claimed_at``
-    column, and NO Little's law: it is a count.
+    column, and NO Little's law: it is a count. For outbound rows the caller first checks
+    ``_outbound_parity``, because a ``transformed`` stamp is not always one row's birth.
 
     IT IS EXACT ONLY IF EVERY birth AND death IN THE WINDOW IS IN THE STREAMS. So the caller passes the
     FULL RUNG's streams and averages over a SUB-window: a rung's cohort is closed (the store is reset
@@ -579,17 +582,14 @@ def _counting_n(births: list[float], deaths: list[float], lo: float, hi: float) 
         return {"time_avg": 0.0, "peak": 0.0, "at_lo": 0.0, "at_hi": 0.0}
     marks: list[tuple[float, int]] = [(t, 1) for t in births] + [(t, -1) for t in deaths]
     marks.sort()
-    n = 0
+    n = sum(delta for t, delta in marks if t <= lo)
+    at_lo = float(n)
     area = 0.0
     peak = 0.0
     prev = lo
-    at_lo = 0.0
     for t, delta in marks:
         if t <= lo:
-            n += delta
             continue
-        if at_lo == 0.0 and prev == lo:
-            at_lo = float(n)
         clamped = min(t, hi)
         if clamped > prev:
             area += n * (clamped - prev)
@@ -607,6 +607,22 @@ def _counting_n(births: list[float], deaths: list[float], lo: float, hi: float) 
         "at_lo": round(at_lo, 4),
         "at_hi": round(float(n), 4),
     }
+
+
+def _outbound_parity(aggs: list[_Agg]) -> dict[str, int]:
+    """How many messages break the one-birth-one-death premise of ``n_outbound_rows``.
+
+    All three stores write ONE ``transformed`` per handler handoff, with the destination count only
+    in its ``detail``. Weighting births by that text would make this tool read a column its PHI note
+    says it does not, so a message whose two counts differ voids the figure instead. An in-flight or
+    dead-lettered message differs too: from these events it cannot be told from a handoff that
+    produced no row.
+
+    NECESSARY, NOT SUFFICIENT. Handlers delivering 2 and 0 have two births and two deaths, so they
+    pass here while the second birth is stamped at the wrong handoff.
+    """
+    mismatched = sum(1 for m in aggs if m.n_transformed != m.n_delivered)
+    return {"mismatched_messages": mismatched, "messages": len(aggs)}
 
 
 async def _window_report(
@@ -674,7 +690,11 @@ async def _window_report(
         pop = pop[:limit]
 
     delivered_ts = [float(ts) for _, ts in lane_rows]
-    n_out = _counting_n(transformed_ts, delivered_ts, lo, hi)
+    # The whole cohort, because the counting process below reads the whole cohort's streams.
+    parity = _outbound_parity(aggs)
+    n_out = (
+        None if parity["mismatched_messages"] else _counting_n(transformed_ts, delivered_ts, lo, hi)
+    )
     # Messages in flight: born at `received`, dead at the LAST delivery. Same caveat — its time-average is
     # lambda x W by construction, so it corroborates the arithmetic; it cannot validate it.
     n_e2e = _counting_n(
@@ -697,7 +717,9 @@ async def _window_report(
         "lambda_msg_per_s": round(n_recv_win / window_s, 4) if window_s > 0 else 0.0,
         "lambda_del_per_s": round(n_del_win / window_s, 4) if window_s > 0 else 0.0,
         "concurrency": {
-            "n_outbound_rows": n_out,  # EXACT count: transformed(born) - delivered(died)
+            # transformed(born) - delivered(died), or None when parity says that premise failed.
+            "n_outbound_rows": n_out,
+            "n_outbound_parity": parity,
             "n_messages_in_flight": n_e2e,
             "note": (
                 "n_outbound_rows counts QUEUED + IN-SERVICE outbound rows. It has NO cap of 8 — the "
@@ -768,7 +790,7 @@ async def _collect(
             reports: list[dict[str, Any]] = []
             for r in rungs:
                 # The COHORT is always the WHOLE rung (`since`..`until` = the rung's own bounds), so the
-                # counting process N(t) sees every birth and every death and is EXACT. The steady-state
+                # counting process N(t) sees every birth and every death. The steady-state
                 # TRIM is applied INSIDE _window_report, to the ANALYSIS WINDOW (a time interval) and to
                 # the LATENCY POPULATION (which messages) — never to the event streams. That is what makes
                 # trimming safe: it cannot truncate a slow message's deliveries.
@@ -976,12 +998,21 @@ def _render_stages(stages: list[dict[str, Any]]) -> list[str]:
 
 
 def _render_concurrency(c: dict[str, Any]) -> list[str]:
-    o, e = c["n_outbound_rows"], c["n_messages_in_flight"]
+    o, e, parity = c["n_outbound_rows"], c["n_messages_in_flight"], c["n_outbound_parity"]
+    if o is None:
+        outbound = (
+            f"  N_outbound_rows   UNAVAILABLE: {parity['mismatched_messages']} of "
+            f"{parity['messages']} messages have transformed != delivered rows"
+        )
+    else:
+        outbound = (
+            f"  N_outbound_rows   time-avg={o['time_avg']:.3f}  peak={o['peak']:.0f}   "
+            "(transformed = born, delivered = died)"
+        )
     return [
         "",
-        "CONCURRENCY — the EXACT counting process (births - deaths), not lambda x W",
-        f"  N_outbound_rows   time-avg={o['time_avg']:.3f}  peak={o['peak']:.0f}   "
-        f"(transformed = born, delivered = died)",
+        "CONCURRENCY — the counting process (births - deaths), not lambda x W",
+        outbound,
         f"  N_messages_in_flight time-avg={e['time_avg']:.3f}  peak={e['peak']:.0f}",
         "  N_outbound_rows is QUEUED + IN-SERVICE. It is NOT capped at 8 — only rows IN SERVICE are.",
         "  Do not read 'N ~ 8' as 'the 8 lanes are saturated'; read occupancy_accounted for that.",
