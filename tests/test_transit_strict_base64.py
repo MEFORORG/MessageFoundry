@@ -3,8 +3,7 @@
 """A Transit ``plaintext`` that is not base64 once ASCII whitespace is removed is refused as that
 value's own error (BACKLOG #5964). Non-strict decoding drops every character outside the alphabet,
 so ``!!!!`` would have opened as an empty cell and a stray character as a value Transit never
-returned. Whitespace alone still opens, because a hop that rewraps a reply leaves the same bytes.
-These tests pin the plain :class:`CipherError` a refused reply has today; they do not decide
+returned. A reply with whitespace added around or inside its base64 still opens as it did. These tests pin the plain :class:`CipherError` a refused reply has today; they do not decide
 whether it should instead read as an outage. Synthetic data only."""
 
 from __future__ import annotations
@@ -26,6 +25,8 @@ from tests.test_transit_batch import _BatchTransit, _cipher, _sealed
 #: ASCII whitespace outside the four characters removed.
 _NOT_STRICT = {
     "only-non-alphabet": "!!!!",
+    "only-newline": "\n",
+    "only-whitespace": " \t\r\n",
     "url-safe-alphabet": "-_-_",
     "stray-inside": "dmFs!dWU=",
     "form-feed": "dmFs\fdWU=",
@@ -125,9 +126,22 @@ def test_a_whitespace_wrapped_reply_opens_to_the_same_value(reply: str) -> None:
     assert cipher.decrypt_many(items) == ["value 0", "value", "value 2"]
 
 
-@pytest.mark.parametrize("value", [None, 7, 1.5, ["QQ=="], {"a": 1}], ids=repr)
-def test_a_value_that_is_not_text_is_none_and_never_raises(value: object) -> None:
+@pytest.mark.parametrize(
+    "value",
+    [None, 7, 1.5, ["QQ=="], {"a": 1}, b"QQ==", bytearray(b"QQ=="), memoryview(b"QQ==")],
+    ids=["none", "int", "float", "list", "dict", "bytes", "bytearray", "memoryview"],
+)
+def test_a_value_that_is_not_a_str_is_none(value: object) -> None:
     assert _plaintext(value) is None
+
+
+def test_a_true_empty_reply_opens_as_empty() -> None:
+    assert _plaintext("") == ""
+
+
+@pytest.mark.parametrize(("reply", "text"), [("QR==", "A"), ("dmFsdWX=", "value")])
+def test_non_zero_trailing_bits_keep_their_result(reply: str, text: str) -> None:
+    assert _plaintext(reply) == text
 
 
 @pytest.mark.parametrize("text", ["", "a", "ab", "abc", "~~~", "???", "café"])

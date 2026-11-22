@@ -311,20 +311,25 @@ _B64_WHITESPACE = " \t\r\n"
 
 
 def _plaintext(value: object) -> str | None:
-    """Transit's base64 ``plaintext`` as text, with :data:`_B64_WHITESPACE` removed first, since a
-    hop that rewraps the reply leaves the same bytes (BACKLOG #5964). ``None`` for at least a
-    value that is neither text nor bytes-like, any other character outside the alphabet, bad
-    padding, or bytes that are not UTF-8. A bytes-like value has no whitespace removed. Non-zero
-    trailing bits in the last character are still accepted, and a reply of whitespace alone opens
-    as the empty string. Short of running out of memory it never raises, so no error carries the
-    decrypted bytes (BACKLOG #2085)."""
-    # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a value that is not text.
+    """Transit's base64 ``plaintext`` as text, with :data:`_B64_WHITESPACE` removed first, so a
+    reply that a hop rewrapped opens as it does unwrapped (BACKLOG #5964). ``None`` for at least a
+    value that is not a ``str``, a non-empty reply of whitespace alone, any other character outside
+    the alphabet, bad padding, or bytes that are not UTF-8. The empty string opens as itself, and
+    non-zero trailing bits in the last character are still accepted. A decode failure returns
+    ``None`` rather than raising, so its error cannot carry the decrypted bytes (BACKLOG #2085);
+    only ``ValueError`` is caught, so a ``MemoryError`` still propagates."""
+    if not isinstance(value, str):
+        return None
+    # binascii.Error and UnicodeDecodeError are ValueErrors.
     # validate=True: the default drops characters outside the alphabet, so "!!!!" would open as "".
-    with contextlib.suppress(ValueError, TypeError):
-        # Checked first so a clean reply, the normal case, is not copied on the event loop.
-        if isinstance(value, str) and any(c in value for c in _B64_WHITESPACE):
-            value = value.translate(str.maketrans("", "", _B64_WHITESPACE))
-        return base64.b64decode(value, validate=True).decode("utf-8")  # type: ignore[arg-type]
+    with contextlib.suppress(ValueError):
+        compact = value
+        # Checked first so a reply with no whitespace skips the translate.
+        if any(c in value for c in _B64_WHITESPACE):
+            compact = value.translate(str.maketrans("", "", _B64_WHITESPACE))
+            if not compact:
+                return None
+        return base64.b64decode(compact, validate=True).decode("utf-8")
     return None
 
 
