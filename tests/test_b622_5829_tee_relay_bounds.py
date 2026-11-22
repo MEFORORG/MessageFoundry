@@ -17,7 +17,7 @@ import pytest
 from tee import mllp
 from tee.__main__ import _build_parser
 from tee.relay import RelayConfig, TeeRelay
-from tests.test_tee_relay import SAMPLE, _send_from_epic, _unused_address, _wait_until
+from tests.test_tee_relay import SAMPLE, FakeMllpServer, _send_from_epic, _wait_until
 
 _BASE_ARGV = [
     "run",
@@ -45,8 +45,9 @@ def _config(**overrides: int) -> RelayConfig:
 @pytest.mark.parametrize("field", ["corepoint_attempts", "mefor_queue_max"])
 @pytest.mark.parametrize("value", [0, -1])
 def test_config_refuses_non_positive(field: str, value: int) -> None:
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(ValueError, match=field) as exc:
         _config(**{field: value})
+    assert str(value) not in str(exc.value)
 
 
 @pytest.mark.parametrize("field", ["corepoint_attempts", "mefor_queue_max"])
@@ -69,7 +70,10 @@ def test_cli_refuses_non_positive_integer(
     with pytest.raises(SystemExit) as exc:
         _build_parser().parse_args([*_BASE_ARGV, f"{flag}={value}"])
     assert exc.value.code == 2
-    assert "positive integer" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "positive integer" in err
+    # The error names the rule, not the raw input (REVIEW-STANDARDS R12).
+    assert f"'{value}'" not in err
 
 
 def test_cli_accepts_positive_integers() -> None:
@@ -81,14 +85,16 @@ def test_cli_accepts_positive_integers() -> None:
 
 
 async def test_single_attempt_still_forwards_and_trips(tmp_path: Path) -> None:
-    """At the new minimum of one attempt the forward loop still runs once and trips fail-closed."""
-    down = await _unused_address()
-    mefor = await _unused_address()
+    """At the new minimum of one attempt the relay forwards exactly once, then trips fail-closed."""
+    # A live peer that closes without an ACK, not a freed port: a freed port could be handed back to
+    # the relay's own Epic listener, which would ACK the forward.
+    corepoint = await FakeMllpServer(drop=True).start()
+    mefor = await FakeMllpServer().start()
     relay = TeeRelay(
         RelayConfig(
             listen_epic=("127.0.0.1", 0),
-            corepoint=down,
-            mefor=mefor,
+            corepoint=corepoint.address,
+            mefor=mefor.address,
             db_path=str(tmp_path / "tee.db"),
             corepoint_attempts=1,
             mefor_queue_max=1,
@@ -107,5 +113,8 @@ async def test_single_attempt_still_forwards_and_trips(tmp_path: Path) -> None:
             n for n in naks if n.leg == "corepoint" and n.outcome == "transport_error"
         ]
         assert len(corepoint_errors) == 1
+        assert len(corepoint.received) == 1  # one attempt, no retry
     finally:
         await relay.stop()
+        await corepoint.stop()
+        await mefor.stop()

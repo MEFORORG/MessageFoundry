@@ -238,7 +238,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--corepoint-attempts",
         type=_positive_int,
         default=3,
-        help="quick retries on the Corepoint leg before tripping fail-closed",
+        help="tries on the Corepoint leg, counting the first, before tripping fail-closed"
+        " (a positive integer; 1 means no retry)",
     )
     run.add_argument("--corepoint-retry-delay", type=float, default=1.0)
     run.add_argument(
