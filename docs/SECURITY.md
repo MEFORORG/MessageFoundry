@@ -942,13 +942,13 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   sign-on could then serve unfloored sign-ins for as long as `[auth].oidc_max_age_seconds` accepts
   it, and a fresh sign-on starts that again. The engine has no human step to time between such a
   start and its callback, and it cannot check the IdP's own anti-automation. This is a decided
-  limitation of the floors, recorded on 2026-10-09 under BACKLOG #1115. It is no oversight, and it
-  still counts as a gap. The sign-in rate limit would still apply to that path, and it does not
-  detect automation either. Switching it off, or setting its window to 0 or less or both its counts
-  to 0, removes it. [Business-logic limits](#business-logic-limits-asvs-213) gives its size and
-  settings. The [Route to limiter map](#route--limiter-map) lists the routes that charge it, and
-  says when the "you are leaving this site" confirm is shown before the start. That confirm is no control on this
-  path: a script can post the start without loading the page, and nothing times the confirm.
+  limitation of the floors, recorded on 2026-10-09 under BACKLOG #1115. It still counts as a gap.
+  The sign-in rate limit would still apply to that path, and it does not detect automation either.
+  Switching it off, or setting its window to 0 or less or both its counts to 0, removes it.
+  [Business-logic limits](#business-logic-limits-asvs-213) gives its size and settings. The [Route
+  to limiter map](#route--limiter-map) lists the routes that charge it, and says when the "you are
+  leaving this site" confirm is shown before the start. That confirm is no control on this path: a
+  script can post the start without loading the page, and nothing times the confirm.
   Revisit the decision if OIDC ever ships on by default.
 - The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
   refuses a good code until the clocks agree again. A step forward lets a code through early.

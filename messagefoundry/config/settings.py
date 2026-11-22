@@ -4372,7 +4372,7 @@ class AuthSettings(_Section):
     @field_validator("ad_session_recheck_seconds")
     @classmethod
     def _check_ad_recheck_seconds(cls, value: int) -> int:
-        # 0 = off (the default). Anything else is floored at 60 s: a pass costs one LDAP bind per
+        # 0 = off. Anything else must be at least 60 s: a pass costs one LDAP bind per
         # signed-in directory user, so a mistyped `1` would hammer the domain controller.
         if value < 0:
             raise ValueError("ad_session_recheck_seconds must be >= 0 (0 = disabled)")
@@ -6301,7 +6301,7 @@ class AlertsSettings(_Section):
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
     webhook_allowed_hosts: list[str] = []
     # BACKLOG #2193 (ADR 0173 section 12 pattern, owner ruling 2026-10-27): attests that revocation of
-    # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
+    # the webhook host's certificate is covered outside the engine. The POST can carry the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
     # reason. It is the only way across: the webhook rides one shared opener, which no CRL

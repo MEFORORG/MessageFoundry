@@ -1600,7 +1600,7 @@ count is above `0` (vault BACKLOG #2613).
   no posture.
 - **What you lose:** that refusal. A revoked but unexpired certificate is then accepted unless
   something outside the engine stops it. The SMTP hop carries the login password; the webhook
-  carries its path token. **Setting the flag adds no check on the wire.**
+  URL can carry its path token. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** for the SMTP relay, `[tls].crl_file` reaches
   that hop and adds a real check, where you hold the relay issuer's CRL. It is instance-wide:
   every non-loopback hop the `[tls]` policy reaches then needs its issuer's CRL in that file, or

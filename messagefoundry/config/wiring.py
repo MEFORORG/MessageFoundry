@@ -1783,10 +1783,10 @@ def _bool_settings() -> _BoolSettings:
 
 
 def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
-    """One boolean setting, read strictly: ``None`` takes the setting's own ``default``, as
-    :func:`~messagefoundry.config.models.bool_setting` does, so a connector that reads the flag with
-    plain ``bool()`` cannot turn a default-on check off on a ``None``. Anything else is
-    :func:`_cast_bool`, which raises ``ValueError`` with the value withheld."""
+    """One boolean setting, read strictly: ``None`` takes the setting's own ``default``, so a
+    connector that reads the flag with plain ``bool()`` cannot turn a default-on check off on a
+    ``None``. Anything else is :func:`_cast_bool`, which raises ``ValueError``, with the value
+    withheld, on a spelling it does not know, an empty string included."""
     return default if value is None else _cast_bool(value)
 
 
