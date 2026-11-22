@@ -40,9 +40,12 @@ reader rejects, and a record carrying no anchors. None of them may print "nothin
 clean-looking zero off a broken read is the exact failure this item exists to prevent, and exit
 :data:`EXIT_FINDINGS` off one is worse, because that code asserts a measurement that never happened.
 
-A git range that would not resolve is NOT in that class and does not exit 2. The anchor population
-was read, so the main answer stands; only the narrowing is unavailable, and it says UNKNOWN in its
-own row rather than printing a zero.
+A failure AFTER the record loads is :data:`EXIT_INSTRUMENT` too -- at least a git that is missing or
+hangs, a cited file that will not open, and a console that cannot encode the report.
+
+A git range that would not resolve is NOT in that class and does not exit 2. Git ran and answered
+non-zero, the anchor population was read, so the main answer stands; only the narrowing is
+unavailable, and it says UNKNOWN in its own row rather than printing a zero.
 
 Usage::
 
@@ -278,7 +281,20 @@ def _refuse_unreadable(scorecard: Path, exc: BaseException) -> int:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def _refuse_unfinished(exc: BaseException) -> int:
+    """Refuse a run that failed after the record loaded, naming the exception's TYPE only.
+
+    Its message can quote a path or a line of what was being read, and this output goes to a public
+    log, so it stays behind for the same reason :func:`_refuse_unreadable` withholds the reader's.
+    """
+    return _refuse(
+        f"the report could not finish ({type(exc).__name__}). This run is not evidence about any "
+        "anchor, and the exception's own message is withheld because this output goes to a public "
+        "log."
+    )
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # REQUIRED, with no default. The record is not in this repository, so a default would name a path
     # here and quietly measure the wrong tree -- or nothing at all -- while printing a full report.
@@ -301,8 +317,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=f"exit {EXIT_FINDINGS} when any anchor no longer resolves (default: report only)",
     )
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv)
 
+
+def _measure(args: argparse.Namespace) -> int:
     if not args.scorecard.is_file():
         return _refuse(
             f"no scorecard at {args.scorecard}. This run read nothing, so it is not evidence about "
@@ -357,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.changed_since and changed is None:
         # Reported inside the summary rather than fatal: the anchor population was read successfully,
         # so the main answer stands. Only the narrowing is unavailable, and it says so in its own row.
+        # A git that RAISED is not this case; it reaches the guard in main.
         sys.stderr.write(
             f"NOTE: git could not resolve {args.changed_since}...HEAD in {args.root}, so the "
             "changed-file narrowing is UNKNOWN rather than empty.\n"
@@ -373,11 +392,30 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     )
+    # Before the guard ends: a buffered stdout would otherwise fail at interpreter exit instead.
+    sys.stdout.flush()
 
     if any(o.status in UNRESOLVED for o in outcomes) and args.strict:
         return EXIT_FINDINGS
     return EXIT_OK
 
 
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    try:
+        return _measure(args)
+    except Exception as exc:
+        # BROAD for the reason the read boundary in _measure is: at least a missing or hung git, a
+        # cited file that will not open and a console that cannot encode the report land here, and
+        # each would otherwise be a traceback and exit 1, a finding nobody measured.
+        return _refuse_unfinished(exc)
+
+
 if __name__ == "__main__":
+    # A refusal prints paths, so it must survive a console that cannot encode them. Stdout stays
+    # strict on purpose: a report it cannot write is a refusal, never a report with holes in it.
+    # Done here, not in main(), so an in-process caller's stream is left alone; a replaced stream
+    # may have no `reconfigure`.
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(errors="backslashreplace")
     raise SystemExit(main())

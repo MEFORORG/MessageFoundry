@@ -23,9 +23,11 @@ constraint the tool was built under gets an arm here that goes RED if the constr
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -421,6 +423,98 @@ def test_an_unresolvable_range_says_so_in_the_report(
     # failure. Only the narrowing is unavailable, and it must say so rather than print a zero.
     assert code == EXIT_OK, out
     assert "GIT WOULD NOT ANSWER" in out, out
+
+
+def _assert_instrument_refusal(code: int, out: str, exc_name: str) -> None:
+    """A failure after the record loaded: exit 2, the class named, its message and any total absent."""
+    assert code == EXIT_INSTRUMENT, f"exited {code}, not {EXIT_INSTRUMENT}:\n{out}"
+    assert "REFUSING" in out, out
+    assert exc_name in out, f"the refusal did not name {exc_name}:\n{out}"
+    assert SENTINEL_ID not in out, f"the refusal quoted the exception's message:\n{out}"
+    assert "anchors examined" not in out, f"a total was printed off a failed run:\n{out}"
+    for banned in BANNED_CONTENT:
+        assert banned not in out.lower(), f"the refusal leaked {banned!r}:\n{out}"
+
+
+@pytest.mark.parametrize(
+    ("raised", "exc_name"),
+    [
+        (FileNotFoundError(SENTINEL_ID), "FileNotFoundError"),
+        (subprocess.TimeoutExpired(cmd=SENTINEL_ID, timeout=120), "TimeoutExpired"),
+    ],
+)
+@pytest.mark.parametrize("narrowed", [True, False])
+def test_a_git_call_that_raises_is_an_instrument_failure(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    raised: Exception,
+    exc_name: str,
+    narrowed: bool,
+) -> None:
+    """RED when: git being absent or hung exits 1. Both call sites, because the provenance header
+    runs git on every report, with or without ``--changed-since``."""
+    root, record = tree
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise raised
+
+    monkeypatch.setattr("anchor_report.subprocess.run", _raise)
+    argv = ["--scorecard", str(record), "--root", str(root)]
+    if narrowed:
+        argv += ["--changed-since", "main"]
+
+    code, out = _run(argv, capsys)
+
+    _assert_instrument_refusal(code, out, exc_name)
+
+
+def test_an_anchored_file_that_cannot_be_read_is_an_instrument_failure(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a cited file that exists but will not open exits 1, which reads as a broken anchor."""
+    root, record = tree
+    real_read_text = Path.read_text
+
+    def _deny(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.name == "engine_module.py":
+            raise PermissionError(SENTINEL_ID)
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _deny)
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root)], capsys)
+
+    _assert_instrument_refusal(code, out, "PermissionError")
+
+
+def test_a_console_that_cannot_encode_the_report_is_an_instrument_failure(tmp_path: Path) -> None:
+    """RED when: a cp1252 stdout exits 1. A real interpreter, because the codec is the fault, and
+    no ``-I``, which would make it ignore PYTHONIOENCODING. The root's name is what cp1252 lacks."""
+    root = tmp_path / f"engine-{chr(0x4E2D)}"
+    root.mkdir()
+    (root / "engine_module.py").write_text(SOURCE, encoding="utf-8")
+    record = _scorecard(tmp_path / "record.toml")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "asvs" / "anchor_report.py"),
+            "--scorecard",
+            str(record),
+            "--root",
+            str(root),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        timeout=120,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252:strict", "PYTHONUTF8": "0"},
+    )
+    out = (proc.stdout + proc.stderr).decode("cp1252", errors="replace")
+
+    _assert_instrument_refusal(proc.returncode, out, "UnicodeEncodeError")
 
 
 # --------------------------------------------------------------------------------------------
