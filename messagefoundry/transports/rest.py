@@ -1928,7 +1928,7 @@ def refuse_unsendable_static_request(
         ) is not None:
             raise ValueError(
                 f"{setting} header {_shown_header_key(name)} is not a header name the engine "
-                "sends (a header name is an RFC 9110 token)"
+                "sends (RFC 9110 allows only tchar characters in one)"
             )
         if _latin1_refusal_position(value) is not None:
             raise ValueError(
