@@ -9,7 +9,8 @@
 // on Windows. They are vscode-free so the node-side unit suite can drive them.
 import * as path from "node:path";
 
-const IS_WIN32 = path.sep === "\\";
+/** Whether this host is Windows: the default for every `win32` parameter here. */
+export const IS_WIN32 = path.sep === "\\";
 
 /** `p` made absolute against `base` (the folder the CLI ran in) when it is relative, and normalized. */
 export function resolveAgainst(base: string, p: string, win32: boolean = IS_WIN32): string {

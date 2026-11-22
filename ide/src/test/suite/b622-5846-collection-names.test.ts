@@ -66,6 +66,23 @@ suite("b622 #5846 collection names that are Object.prototype keys", () => {
     assert.strictEqual(again["__proto__"].cases.length, 1);
   });
 
+  test("a legacy workspaceState collection named __proto__ survives the migration merge", async () => {
+    const secrets = new FakeSecrets();
+    secrets.data.set(collectionsSecretKey(SCOPE), JSON.stringify({ current: coll("current") }));
+    const legacyMap = JSON.parse(`{"__proto__":${JSON.stringify(coll("__proto__"))}}`) as unknown;
+    let legacyValue: unknown = legacyMap;
+    const memento: LegacyStore = {
+      get: <T>() => legacyValue as T | undefined,
+      update: async (_key: string, value: unknown) => {
+        legacyValue = value;
+      },
+    };
+    const map = await new CollectionStore(secrets, memento, SCOPE).load();
+    assert.deepStrictEqual(Object.keys(map).sort(), ["__proto__", "current"]);
+    assert.strictEqual(map["__proto__"].name, "__proto__");
+    assert.strictEqual(legacyValue, undefined, "the legacy key is removed after the move");
+  });
+
   test("a name such as toString or constructor is not a saved collection until one is saved", async () => {
     const secrets = new FakeSecrets();
     secrets.data.set(collectionsSecretKey(SCOPE), JSON.stringify({ A: coll("A") }));

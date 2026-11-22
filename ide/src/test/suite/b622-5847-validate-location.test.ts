@@ -36,6 +36,22 @@ suite("b622 #5847 validate diagnostic location", () => {
   test("a line in a helper the file imported is not this file's line", () => {
     const m = "error loading config module a.py: NameError in _helpers.py at line 4";
     assert.strictEqual(diagnosticLocation(diag("/ws/config/a.py", m), "/ws", "config", false).line, 0);
+    const upper = "error loading config module a.py: NameError in _Helper.PY at line 4 (withheld)";
+    assert.strictEqual(diagnosticLocation(diag("D:\\ws\\config\\a.py", upper), "D:\\ws", "config", true).line, 0);
+  });
+
+  test("a helper-preload refusal quoting the helper's own line is not this file's line", () => {
+    const m =
+      "error loading config module a.py: config helper _helpers.py failed to load " +
+      "(SyntaxError at line 4; its message is withheld), and a.py imports it outside an ImportError guard";
+    assert.strictEqual(diagnosticLocation(diag("/ws/config/a.py", m), "/ws", "config", false).line, 0);
+  });
+
+  test("a message naming another module is not this file's line; on Windows the name ignores case", () => {
+    const other = "error loading config module b.py: SyntaxError at line 3 (withheld)";
+    assert.strictEqual(diagnosticLocation(diag("/ws/config/a.py", other), "/ws", "config", false).line, 0);
+    const upper = "error loading config module A.PY: SyntaxError at line 3 (withheld)";
+    assert.strictEqual(diagnosticLocation(diag("d:\\ws\\config\\a.py", upper), "d:\\ws", "config", true).line, 2);
   });
 
   test("no line in the message, or no file, stays on the first line", () => {

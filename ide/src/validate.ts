@@ -28,21 +28,25 @@ export function createValidator(context: vscode.ExtensionContext): Validator {
     }
 
     collection.clear();
-    const byFile = new Map<string, vscode.Diagnostic[]>();
+    // Keyed by the Uri's own string, which is how the collection tells files apart: two spellings of
+    // one file (a drive letter's case, say) would otherwise be two entries, and the second set() wins.
+    const byFile = new Map<string, { uri: vscode.Uri; list: vscode.Diagnostic[] }>();
     for (const d of diags) {
       const { file, line } = diagnosticLocation(d, cwd, dir);
+      const uri = vscode.Uri.file(file);
       const severity =
         d.severity === "warning"
           ? vscode.DiagnosticSeverity.Warning
           : vscode.DiagnosticSeverity.Error;
       const diag = new vscode.Diagnostic(new vscode.Range(line, 0, line, 0), d.message, severity);
       diag.source = "messagefoundry";
-      const list = byFile.get(file) ?? [];
-      list.push(diag);
-      byFile.set(file, list);
+      const key = uri.toString();
+      const entry = byFile.get(key) ?? { uri, list: [] };
+      entry.list.push(diag);
+      byFile.set(key, entry);
     }
-    for (const [file, list] of byFile) {
-      collection.set(vscode.Uri.file(file), list);
+    for (const { uri, list } of byFile.values()) {
+      collection.set(uri, list);
     }
   }
 
