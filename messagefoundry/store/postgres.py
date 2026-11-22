@@ -8951,6 +8951,11 @@ class PostgresStore:
             await self._append_operator_audit(conn, written, audit, count)
         return count
 
+    #: Rows one ``cancel_queued`` transaction takes (BACKLOG #5732). Each distinct message holds one
+    #: advisory lock to commit, so this stays well under a stock server's shared lock table of
+    #: about 6,400 (max_locks_per_transaction 64 x max_connections 100).
+    _CANCEL_CHUNK_ROWS = 1000
+
     async def cancel_queued(
         self,
         channel_id: str | None,
@@ -8966,7 +8971,13 @@ class PostgresStore:
         the oldest pending row by ``seq``, the lane predicate and key :meth:`claim_next_fifo` uses --
         even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
         oldest row from that producer, the lane head only when no other inbound feeds the
-        destination. Returns the number cancelled."""
+        destination. Returns the number cancelled.
+
+        **A deep cancel is NOT all-or-nothing** (BACKLOG #5732). It takes the oldest rows in chunks
+        of :attr:`_CANCEL_CHUNK_ROWS`, each its own transaction with its own audit row carrying that
+        chunk's true count, so the rows of one purge sum to the total. If a chunk fails, the chunks
+        before it stay cancelled and audited, that chunk rolls back whole, and the error
+        propagates. It covers the rows PENDING when it started; one enqueued later is left alone."""
         audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
@@ -8981,45 +8992,71 @@ class PostgresStore:
         # picked it returns no row. A claim committed before the pick is not the head: the head is
         # the oldest PENDING row.
         target = f"id=(SELECT id FROM queue WHERE {lane} ORDER BY seq LIMIT 1) AND status=$2"
-        # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
-        async with (
-            AuditedWrite(now) as written,
-            self._timed_acquire() as conn,
-            conn.transaction(isolation=_FINALIZE_ISOLATION),
-        ):
-            # RETURNING promises no order; the events keep the queue's.
-            rows = sorted(
-                await conn.fetch(
-                    f"UPDATE queue SET status=$5, updated_at=$6 WHERE {target if top_only else lane}"
-                    " RETURNING id, message_id, seq",
-                    destination_name,
-                    OutboxStatus.PENDING.value,
-                    channel_id,
-                    Stage.OUTBOUND.value,
-                    OutboxStatus.CANCELLED.value,
-                    now,
-                ),
-                key=lambda r: r["seq"],
+        mark: tuple[int | None, ...] = ()
+        if not top_only:
+            # The walk ends at this mark, so a producer that outpaces it cannot keep it running.
+            record = await self._fetchone(
+                f"SELECT MAX(seq) AS high_water FROM queue WHERE {lane}",
+                destination_name,
+                OutboxStatus.PENDING.value,
+                channel_id,
+                Stage.OUTBOUND.value,
             )
-            if not rows:
-                await self._append_operator_audit(conn, written, audit, 0)
-                return 0
-            for r in rows:
-                await self._event(
-                    conn,
-                    r["message_id"],
-                    "cancelled",
-                    destination_name,
-                    "manual purge",
-                    now,
+            mark = (None if record is None else record["high_water"],)
+            # An array subquery is evaluated once, so a READ COMMITTED re-check cannot re-run it and
+            # take the chunk past its LIMIT.
+            target = (
+                f"id = ANY(ARRAY(SELECT id FROM queue WHERE {lane} AND seq<=$7"
+                f" ORDER BY seq LIMIT {self._CANCEL_CHUNK_ROWS})) AND status=$2"
+            )
+        total = 0
+        while True:
+            # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
+            async with (
+                AuditedWrite(now) as written,
+                self._timed_acquire() as conn,
+                conn.transaction(isolation=_FINALIZE_ISOLATION),
+            ):
+                # RETURNING promises no order; the events keep the queue's.
+                rows = sorted(
+                    await conn.fetch(
+                        f"UPDATE queue SET status=$5, updated_at=$6 WHERE {target}"
+                        " RETURNING id, message_id, seq",
+                        destination_name,
+                        OutboxStatus.PENDING.value,
+                        channel_id,
+                        Stage.OUTBOUND.value,
+                        OutboxStatus.CANCELLED.value,
+                        now,
+                        *mark,
+                    ),
+                    key=lambda r: r["seq"],
                 )
-            # Pre-lock every affected message's finalize lock in canonical order before finalizing
-            # any, so two concurrent multi-message cancels can't form a lock cycle (deadlock).
-            await self._lock_finalize_batch(conn, (r["message_id"] for r in rows))
-            for message_id in {r["message_id"] for r in rows}:
-                await self._maybe_finalize_message(conn, message_id, now)
-            await self._append_operator_audit(conn, written, audit, len(rows))
-        return len(rows)
+                if not rows:
+                    # Only a purge that cancelled nothing records a zero; a walk's last, empty
+                    # chunk has nothing to add to the rows its chunks wrote.
+                    if not total:
+                        await self._append_operator_audit(conn, written, audit, 0)
+                    return total
+                for r in rows:
+                    await self._event(
+                        conn,
+                        r["message_id"],
+                        "cancelled",
+                        destination_name,
+                        "manual purge",
+                        now,
+                    )
+                # Pre-lock every affected message's finalize lock in canonical order before
+                # finalizing any, so two concurrent multi-message cancels can't form a lock cycle
+                # (deadlock).
+                await self._lock_finalize_batch(conn, (r["message_id"] for r in rows))
+                for message_id in {r["message_id"] for r in rows}:
+                    await self._maybe_finalize_message(conn, message_id, now)
+                await self._append_operator_audit(conn, written, audit, len(rows))
+            total += len(rows)
+            if top_only:
+                return total
 
     # --- read helpers (API / console) ----------------------------------------
 

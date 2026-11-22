@@ -9,6 +9,7 @@ claim against a real Postgres or SQL Server, so the race on those two is argued,
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ import pytest
 from messagefoundry.store import MessageStore, OutboxStatus
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
+from messagefoundry.store.store import AuditAppend
 from tests._store_audit import no_purge_audit
 
 
@@ -122,10 +124,119 @@ async def test_sqlite_empty_cancel_with_no_audit_row_commits_nothing(store: Mess
     assert not store._db.in_transaction
 
 
+async def _seed_lane(store: MessageStore, rows: int) -> list[str]:
+    return [
+        await store.enqueue_message(
+            channel_id="c", raw=f"m{n}", deliveries=[("d", f"p{n}")], now=float(n)
+        )
+        for n in range(rows)
+    ]
+
+
+def _counting_audit(seen: list[int], *, fail_on_call: int | None = None) -> Any:
+    def build(cancelled: int) -> AuditAppend:
+        seen.append(cancelled)
+        if len(seen) == fail_on_call:
+            raise RuntimeError("audit refused")
+        return AuditAppend("test.cancel_chunk", actor="test", detail=str(cancelled))
+
+    return build
+
+
+async def _audited_counts(store: MessageStore) -> list[int]:
+    cur = await store._db.execute(
+        "SELECT detail FROM audit_log WHERE action='test.cancel_chunk' ORDER BY seq"
+    )
+    return [int(r["detail"]) for r in await cur.fetchall()]
+
+
+async def test_sqlite_deep_cancel_runs_in_bounded_transactions(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MessageStore, "_CANCEL_CHUNK_ROWS", 5, raising=False)
+    mids = await _seed_lane(store, 12)
+    before = store.committed_txns
+    seen: list[int] = []
+    assert await store.cancel_queued(None, "d", now=50.0, audit=_counting_audit(seen)) == 12
+    assert store.committed_txns - before == 3
+    assert await _audited_counts(store) == [5, 5, 2]
+    assert {await _status(store, m) for m in mids} == {OutboxStatus.CANCELLED.value}
+    assert not store._db.in_transaction
+
+
+async def test_sqlite_failure_in_a_later_chunk_keeps_earlier_chunks_cancelled_and_audited(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MessageStore, "_CANCEL_CHUNK_ROWS", 5, raising=False)
+    mids = await _seed_lane(store, 12)
+    seen: list[int] = []
+    with pytest.raises(RuntimeError, match="audit refused"):
+        await store.cancel_queued(None, "d", now=50.0, audit=_counting_audit(seen, fail_on_call=2))
+    statuses = [await _status(store, m) for m in mids]
+    # Oldest first: the first chunk stands, and the failed chunk rolled back whole.
+    assert statuses == [OutboxStatus.CANCELLED.value] * 5 + [OutboxStatus.PENDING.value] * 7
+    assert await _audited_counts(store) == [5]
+    assert not store._db.in_transaction
+
+
+async def test_sqlite_row_claimed_in_a_later_chunk_stays_claimed(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MessageStore, "_CANCEL_CHUNK_ROWS", 2, raising=False)
+    mids = await _seed_lane(store, 4)
+    claimed_id = (await store.outbox_for(mids[2]))[0]["id"]
+    real = store._db.execute
+    updates = 0
+
+    async def execute(sql: str, *args: Any) -> Any:
+        nonlocal updates
+        if sql.startswith("UPDATE queue SET status=?, updated_at=?"):
+            updates += 1
+            if updates == 2:
+                await real(
+                    "UPDATE queue SET status=? WHERE id=?",
+                    (OutboxStatus.INFLIGHT.value, claimed_id),
+                )
+        return await real(sql, *args)
+
+    store._db.execute = execute  # type: ignore[method-assign,assignment]
+    assert await store.cancel_queued(None, "d", now=50.0, audit=no_purge_audit) == 3
+    assert await _status(store, mids[2]) == OutboxStatus.INFLIGHT.value
+    assert await _status(store, mids[3]) == OutboxStatus.CANCELLED.value
+
+
+async def test_sqlite_row_enqueued_during_a_deep_cancel_is_not_cancelled(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MessageStore, "_CANCEL_CHUNK_ROWS", 2, raising=False)
+    await _seed_lane(store, 4)
+    arrivals: list[asyncio.Task[str]] = []
+
+    def audit(cancelled: int) -> AuditAppend:
+        if not arrivals:
+            # Queues on the writer lock now, so it runs between the first and second chunk.
+            arrivals.append(
+                asyncio.create_task(
+                    store.enqueue_message(
+                        channel_id="c", raw="late", deliveries=[("d", "late")], now=60.0
+                    )
+                )
+            )
+        return AuditAppend("test.cancel_chunk", actor="test", detail=str(cancelled))
+
+    assert await store.cancel_queued(None, "d", now=50.0, audit=audit) == 4
+    assert await _status(store, await arrivals[0]) == OutboxStatus.PENDING.value
+
+
 def _postgres_fake(returned: list[tuple[str, str, int]]) -> tuple[PostgresStore, Any]:
     conn = AsyncMock()
-    conn.fetch.return_value = [
-        {"id": row_id, "message_id": message_id, "seq": seq} for row_id, message_id, seq in returned
+    # The second chunk matches nothing, which ends the walk.
+    conn.fetch.side_effect = [
+        [
+            {"id": row_id, "message_id": message_id, "seq": seq}
+            for row_id, message_id, seq in returned
+        ],
+        [],
     ]
 
     @asynccontextmanager
@@ -140,6 +251,7 @@ def _postgres_fake(returned: list[tuple[str, str, int]]) -> tuple[PostgresStore,
 
     pg = PostgresStore.__new__(PostgresStore)
     pg._timed_acquire = acquire  # type: ignore[method-assign,assignment]
+    pg._fetchone = AsyncMock(return_value={"high_water": 9})  # type: ignore[method-assign]
     pg._event = AsyncMock()  # type: ignore[method-assign]
     pg._lock_finalize_batch = AsyncMock()  # type: ignore[method-assign]
     pg._maybe_finalize_message = AsyncMock()  # type: ignore[method-assign]
@@ -152,18 +264,23 @@ async def test_postgres_one_guarded_update_and_counts_only_returned_rows(top_onl
     pg, conn = _postgres_fake([("q2", "m2", 2), ("q1", "m1", 1)])
     n = await pg.cancel_queued(None, "d", top_only=top_only, now=5.0, audit=no_purge_audit)
     assert n == 2
-    conn.fetch.assert_awaited_once()
+    assert conn.fetch.await_count == (1 if top_only else 2)
     conn.execute.assert_not_awaited()
-    sql = conn.fetch.await_args.args[0]
+    call = conn.fetch.await_args_list[0]
+    sql = call.args[0]
     assert sql.startswith("UPDATE queue SET status=$5, updated_at=$6 WHERE ")
     assert "RETURNING id, message_id, seq" in sql
     assert "FOR UPDATE" not in sql and "SKIP LOCKED" not in sql
+    assert ") AND status=$2 RETURNING" in sql
     if top_only:
-        assert ") AND status=$2 RETURNING" in sql and "ORDER BY seq LIMIT 1" in sql
+        assert "ORDER BY seq LIMIT 1)" in sql and len(call.args) == 7
     else:
-        assert "status=$2" in sql and "LIMIT" not in sql
-    assert conn.fetch.await_args.args[2] == OutboxStatus.PENDING.value
-    assert conn.fetch.await_args.args[5] == OutboxStatus.CANCELLED.value
+        # An array subquery runs once, so a chunk cannot grow past its LIMIT on a re-check.
+        assert "id = ANY(ARRAY(SELECT id FROM queue" in sql
+        assert f"seq<=$7 ORDER BY seq LIMIT {PostgresStore._CANCEL_CHUNK_ROWS}" in sql
+        assert call.args[7] == 9
+    assert call.args[2] == OutboxStatus.PENDING.value
+    assert call.args[5] == OutboxStatus.CANCELLED.value
     # Events keep the queue's order, which RETURNING does not promise.
     assert [c.args[1] for c in pg._event.await_args_list] == ["m1", "m2"]  # type: ignore[attr-defined]
     pg._lock_finalize_batch.assert_awaited_once()  # type: ignore[attr-defined]
@@ -174,6 +291,13 @@ async def test_postgres_lost_race_audits_zero() -> None:
     assert await pg.cancel_queued(None, "d", top_only=True, now=5.0, audit=no_purge_audit) == 0
     pg._event.assert_not_awaited()  # type: ignore[attr-defined]
     assert pg._append_operator_audit.await_args.args[3] == 0  # type: ignore[attr-defined]
+
+
+async def test_postgres_final_empty_chunk_writes_no_second_audit_row() -> None:
+    pg, _conn = _postgres_fake([("q1", "m1", 1)])
+    assert await pg.cancel_queued(None, "d", now=5.0, audit=no_purge_audit) == 1
+    pg._append_operator_audit.assert_awaited_once()  # type: ignore[attr-defined]
+    assert pg._append_operator_audit.await_args.args[3] == 1  # type: ignore[attr-defined]
 
 
 def _sqlserver_fake(returned: list[tuple[str, str, int]]) -> tuple[SqlServerStore, Any]:
@@ -192,7 +316,9 @@ def _sqlserver_fake(returned: list[tuple[str, str, int]]) -> tuple[SqlServerStor
     ms = SqlServerStore.__new__(SqlServerStore)
     ms._acquire = acquire  # type: ignore[method-assign]
     ms._cursor = cursor  # type: ignore[method-assign,assignment]
+    ms._fetchone = AsyncMock(return_value={"high_water": 9})  # type: ignore[method-assign]
     ms._commit = AsyncMock()  # type: ignore[method-assign]
+    ms._commit_read = AsyncMock()  # type: ignore[method-assign]
     ms._event = AsyncMock()  # type: ignore[method-assign]
     ms._lock_finalize_batch = AsyncMock()  # type: ignore[method-assign]
     ms._maybe_finalize = AsyncMock()  # type: ignore[method-assign]
@@ -207,24 +333,24 @@ async def test_sqlserver_one_guarded_update_and_counts_only_output_rows(
 ) -> None:
     output = [("q2", "m2", 2), ("q1", "m1", 1)]
     ms, cur = _sqlserver_fake(output)
-    if top_only:
-        cur.fetchall.side_effect = [[("q1",)], output]
+    cur.fetchall.side_effect = [[("q1",)], output] if top_only else [output, []]
     n = await ms.cancel_queued(channel_id, "d", top_only=top_only, now=5.0, audit=no_purge_audit)
     assert n == 2
-    assert cur.execute.await_count == (2 if top_only else 1)
-    sql, params = cur.execute.await_args.args
+    assert cur.execute.await_count == 2
+    sql, params = cur.execute.await_args_list[1 if top_only else 0].args
     assert sql.startswith("UPDATE queue SET status=?, updated_at=? OUTPUT inserted.id")
-    assert "TOP" not in sql and "UPDLOCK" not in sql and "READPAST" not in sql
+    assert "UPDLOCK" not in sql and "READPAST" not in sql
     assert params[:2] == (OutboxStatus.CANCELLED.value, 5.0)
     if top_only:
         # The head's id is fixed first, so a claimed head cannot slide to the next row.
         head_sql = cur.execute.await_args_list[0].args[0]
         assert head_sql.startswith("SELECT TOP (1) id FROM queue") and "ORDER BY seq" in head_sql
-        assert sql.endswith(" WHERE id=? AND status=?")
+        assert "TOP" not in sql and sql.endswith(" WHERE id=? AND status=?")
         assert params[2:] == ("q1", OutboxStatus.PENDING.value)
     else:
-        assert "status=?" in sql.split(" WHERE ", 1)[1]
-        assert params[-1] == OutboxStatus.PENDING.value
+        assert f"id IN (SELECT TOP ({SqlServerStore._CANCEL_CHUNK_ROWS}) id FROM queue" in sql
+        assert sql.endswith(" AND seq<=? ORDER BY seq) AND status=?")
+        assert params[-2:] == (9, OutboxStatus.PENDING.value)
         assert (channel_id in params) is (channel_id is not None)
     assert [c.args[1] for c in ms._event.await_args_list] == ["m1", "m2"]  # type: ignore[attr-defined]
     ms._lock_finalize_batch.assert_awaited_once()  # type: ignore[attr-defined]
@@ -239,6 +365,25 @@ async def test_sqlserver_claimed_head_returns_zero_and_does_not_slide() -> None:
     ms._event.assert_not_awaited()  # type: ignore[attr-defined]
     assert ms._append_operator_audit.await_args.args[3] == 0  # type: ignore[attr-defined]
     ms._commit.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+async def test_sqlserver_final_empty_chunk_writes_no_audit_and_counts_no_commit() -> None:
+    output = [("q1", "m1", 1)]
+    ms, cur = _sqlserver_fake(output)
+    cur.fetchall.side_effect = [output, []]
+    assert await ms.cancel_queued(None, "d", now=5.0, audit=no_purge_audit) == 1
+    ms._append_operator_audit.assert_awaited_once()  # type: ignore[attr-defined]
+    assert ms._append_operator_audit.await_args.args[3] == 1  # type: ignore[attr-defined]
+    ms._commit.assert_awaited_once()  # type: ignore[attr-defined]
+    ms._commit_read.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+async def test_sqlserver_empty_lane_sends_no_update_and_audits_zero() -> None:
+    ms, cur = _sqlserver_fake([])
+    ms._fetchone.return_value = {"high_water": None}  # type: ignore[attr-defined]
+    assert await ms.cancel_queued(None, "d", now=5.0, audit=no_purge_audit) == 0
+    cur.execute.assert_not_awaited()
+    assert ms._append_operator_audit.await_args.args[3] == 0  # type: ignore[attr-defined]
 
 
 async def test_sqlserver_empty_lane_top_only_sends_no_update() -> None:

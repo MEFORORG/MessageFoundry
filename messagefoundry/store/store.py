@@ -17902,6 +17902,10 @@ class MessageStore:
             await self._commit()
             return upd.rowcount
 
+    #: Rows one ``cancel_queued`` transaction takes (BACKLOG #5732). At a measured 313 us per row
+    #: that holds SQLite's one write lock about 0.3 s, well inside the 5 s busy timeout.
+    _CANCEL_CHUNK_ROWS = 1000
+
     async def cancel_queued(
         self,
         channel_id: str | None,
@@ -17924,62 +17928,81 @@ class MessageStore:
         (dead uses :meth:`replay`). Returns the number cancelled.
 
         ``audit`` builds the operator's audit row from the count, zero included, and the row commits
-        with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
+        with the cancel (BACKLOG #2624, :data:`OperatorAudit`).
+
+        **A deep cancel is NOT all-or-nothing** (BACKLOG #5732). It takes the oldest rows in chunks
+        of :attr:`_CANCEL_CHUNK_ROWS`, each its own transaction with its own audit row carrying that
+        chunk's true count, so the rows of one purge sum to the total. If a chunk fails, the chunks
+        before it stay cancelled and audited, that chunk rolls back whole, and the error
+        propagates. It covers the rows PENDING when it started; one enqueued later is left alone."""
         audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
-        # BEGIN IMMEDIATE: the SELECT names the rows that get events and finalize, so an engine shard
-        # in another process must not claim one before the UPDATE (BACKLOG #5732). Not ``UPDATE ...
-        # RETURNING``, which needs SQLite 3.35, newer than some system libraries a Linux Python links.
-        async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock, immediate=True):
-            # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
-            # ix_queue_fifo_out_seq in rowid order; only outbound rows carry a destination_name anyway.
-            where = ["stage=?", "destination_name=?", "status=?"]
-            params: list[object] = [
-                Stage.OUTBOUND.value,
-                destination_name,
-                OutboxStatus.PENDING.value,
-            ]
-            if channel_id is not None:
-                where.insert(1, "channel_id=?")
-                params.insert(1, channel_id)
-            # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
-            # (rowid = SQLite seq; ADR 0059). Not next_attempt_at first: mark_failed pushes a failed
-            # head's next_attempt_at past the younger rows behind it, so that key would pick a healthy
-            # younger row and leave the backing-off head blocking the lane (vault BACKLOG #2754).
-            query = f"SELECT id, message_id FROM queue WHERE {' AND '.join(where)} ORDER BY rowid"
-            if top_only:
-                query += " LIMIT 1"
-            cur = await self._db.execute(query, tuple(params))
-            rows = list(await cur.fetchall())
-            if not rows:
-                # The audit row commits in this transaction. With none, close it without a commit,
-                # which would count a transaction that wrote nothing.
-                noop_audits = operator_audits(audit, 0)
-                if noop_audits:
-                    written.add(noop_audits, await self._append_audits(noop_audits, now=now))
-                    await self._commit()
-                else:
-                    await self._db.rollback()
-                return 0
-            if top_only:
-                where.append("id=?")
-                params.append(rows[0]["id"])
-            # The lane predicate rather than an id list, so a deep queue cannot exceed SQLite's
-            # bound-variable limit; it carries the PENDING term in both forms.
-            upd = await self._db.execute(
-                f"UPDATE queue SET status=?, updated_at=? WHERE {' AND '.join(where)}",
-                (OutboxStatus.CANCELLED.value, now, *params),
-            )
-            cancelled = upd.rowcount
-            for r in rows:
-                await self._event(
-                    r["message_id"], "cancelled", destination_name, "manual purge", now
+        # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
+        # ix_queue_fifo_out_seq in rowid order; only outbound rows carry a destination_name anyway.
+        where = ["stage=?", "destination_name=?", "status=?"]
+        params: list[object] = [
+            Stage.OUTBOUND.value,
+            destination_name,
+            OutboxStatus.PENDING.value,
+        ]
+        if channel_id is not None:
+            where.insert(1, "channel_id=?")
+            params.insert(1, channel_id)
+        lane = " AND ".join(where)
+        pick, pick_params = lane, tuple(params)
+        if not top_only:
+            # The walk ends at this mark, so a producer that outpaces it cannot keep it running.
+            async with self._read() as db:
+                cur = await db.execute(f"SELECT MAX(rowid) FROM queue WHERE {lane}", pick_params)
+                mark = await cur.fetchone()
+            pick, pick_params = f"{lane} AND rowid<=?", (*pick_params, mark[0] if mark else None)
+        # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+        # (rowid = SQLite seq; ADR 0059). Not next_attempt_at first: mark_failed pushes a failed
+        # head's next_attempt_at past the younger rows behind it, so that key would pick a healthy
+        # younger row and leave the backing-off head blocking the lane (vault BACKLOG #2754).
+        query = f"SELECT rowid, id, message_id FROM queue WHERE {pick} ORDER BY rowid LIMIT ?"
+        limit = 1 if top_only else self._CANCEL_CHUNK_ROWS
+        total = 0
+        while True:
+            # BEGIN IMMEDIATE: the SELECT names the rows that get events and finalize, so an engine
+            # shard in another process must not claim one before the UPDATE (BACKLOG #5732). Not
+            # ``UPDATE ... RETURNING``, which needs SQLite 3.35, newer than some system libraries a
+            # Linux Python links.
+            async with (
+                AuditedWrite(now) as written,
+                _writer_txn(self._db, self._lock, immediate=True),
+            ):
+                cur = await self._db.execute(query, (*pick_params, limit))
+                rows = list(await cur.fetchall())
+                if not rows:
+                    # An audit row commits in this transaction, and only a purge that cancelled
+                    # nothing writes one here. With none, close it without a commit, which would
+                    # count a transaction that wrote nothing.
+                    noop_audits = () if total else operator_audits(audit, 0)
+                    if noop_audits:
+                        written.add(noop_audits, await self._append_audits(noop_audits, now=now))
+                        await self._commit()
+                    else:
+                        await self._db.rollback()
+                    return total
+                # The lane predicate up to this chunk's last row rather than an id list, so a chunk
+                # binds a fixed number of variables; it carries the PENDING term.
+                upd = await self._db.execute(
+                    f"UPDATE queue SET status=?, updated_at=? WHERE {lane} AND rowid<=?",
+                    (OutboxStatus.CANCELLED.value, now, *params, rows[-1]["rowid"]),
                 )
-            for message_id in {r["message_id"] for r in rows}:
-                await self._maybe_finalize_message(message_id, now)
-            await self._append_operator_audit(written, audit, cancelled)
-            await self._commit()
-            return cancelled
+                cancelled = upd.rowcount
+                for r in rows:
+                    await self._event(
+                        r["message_id"], "cancelled", destination_name, "manual purge", now
+                    )
+                for message_id in {r["message_id"] for r in rows}:
+                    await self._maybe_finalize_message(message_id, now)
+                await self._append_operator_audit(written, audit, cancelled)
+                await self._commit()
+            total += cancelled
+            if top_only:
+                return total
 
     # --- read helpers (for API / console / tests) ----------------------------
 

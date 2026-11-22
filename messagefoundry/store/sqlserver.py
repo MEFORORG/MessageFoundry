@@ -13774,6 +13774,10 @@ class SqlServerStore:
                 raise
         return int(count)
 
+    #: Rows one ``cancel_queued`` transaction takes (BACKLOG #5732), which bounds the row locks and
+    #: finalize applocks it holds to commit; ``queue`` has lock escalation disabled.
+    _CANCEL_CHUNK_ROWS = 1000
+
     async def cancel_queued(
         self,
         channel_id: str | None,
@@ -13783,6 +13787,12 @@ class SqlServerStore:
         now: float | None = None,
         audit: OperatorAudit[int],
     ) -> int:
+        """**A deep cancel is NOT all-or-nothing** (BACKLOG #5732). It takes the oldest rows in
+        chunks of :attr:`_CANCEL_CHUNK_ROWS`, each its own transaction with its own audit row
+        carrying that chunk's true count, so the rows of one purge sum to the total. If a chunk
+        fails, the chunks before it stay cancelled and audited, that chunk rolls back whole, and
+        the error propagates. It covers the rows PENDING when it started; one enqueued later is
+        left alone. ``top_only`` is one row in one transaction."""
         audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
@@ -13791,60 +13801,90 @@ class SqlServerStore:
             where.insert(1, "channel_id=?")
             params.insert(1, channel_id)
         lane = " AND ".join(where)
-        # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
-        async with AuditedWrite(now) as written, self._acquire() as conn:
-            try:
-                async with self._cursor(conn) as cur:
-                    # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
-                    # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
-                    # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
-                    # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
-                    # #2754). The head's id is fixed BEFORE the write, because a TOP (1) CTE carrying the
-                    # PENDING term would wait on a head being claimed and then cancel the next row
-                    # (BACKLOG #5732). Under RCSI this read does not wait, so a head claimed after it
-                    # returns zero; with RCSI off it can wait the same way. A claim committed before
-                    # the read is not the head: the head is the oldest PENDING row.
-                    target, bound = lane, tuple(params)
-                    if top_only:
-                        await cur.execute(
-                            f"SELECT TOP (1) id FROM queue WHERE {lane} ORDER BY seq", bound
-                        )
-                        heads = await cur.fetchall()
-                        target = "id=? AND status=?"
-                        bound = (heads[0][0], OutboxStatus.PENDING.value) if heads else ()
-                    message_ids: list[str] = []
-                    if bound:
-                        # One guarded write: its PENDING term decides which rows are cancelled, and
-                        # OUTPUT reports only those, in no promised order; the events keep the queue's.
-                        await cur.execute(
-                            "UPDATE queue SET status=?, updated_at=?"
-                            " OUTPUT inserted.id, inserted.message_id, inserted.seq"
-                            f" WHERE {target}",
-                            (OutboxStatus.CANCELLED.value, now, *bound),
-                        )
-                        message_ids = [
-                            r[1] for r in sorted(await cur.fetchall(), key=lambda r: r[2])
-                        ]
-                    if not message_ids:
-                        await self._append_operator_audit(cur, written, audit, 0)
+        high_water: Any = None
+        if not top_only:
+            # The walk ends at this mark, so a producer that outpaces it cannot keep it running.
+            record = await self._fetchone(
+                f"SELECT MAX(seq) AS high_water FROM queue WHERE {lane}", tuple(params)
+            )
+            high_water = None if record is None else record["high_water"]
+        total = 0
+        while True:
+            # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
+            async with AuditedWrite(now) as written, self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only
+                        # key alone (ADR 0059), even while that head is backing off. Not
+                        # next_attempt_at first: mark_failed pushes a failed head's next_attempt_at
+                        # past the younger rows behind it, so that key would pick a healthy younger
+                        # row and leave the head blocking the lane (vault BACKLOG #2754). The head's
+                        # id is fixed BEFORE the write, because a TOP (1) CTE carrying the PENDING
+                        # term would wait on a head being claimed and then cancel the next row
+                        # (BACKLOG #5732). Under RCSI this read does not wait, so a head claimed
+                        # after it returns zero; with RCSI off it can wait the same way. A claim
+                        # committed before the read is not the head: the head is the oldest PENDING
+                        # row.
+                        bound: tuple[Any, ...] = ()
+                        if top_only:
+                            await cur.execute(
+                                f"SELECT TOP (1) id FROM queue WHERE {lane} ORDER BY seq",
+                                tuple(params),
+                            )
+                            heads = await cur.fetchall()
+                            target = "id=? AND status=?"
+                            if heads:
+                                bound = (heads[0][0], OutboxStatus.PENDING.value)
+                        else:
+                            # A chunk takes the oldest rows up to the mark. Any row the subquery
+                            # passes over is still PENDING-checked by the outer term.
+                            target = (
+                                f"id IN (SELECT TOP ({self._CANCEL_CHUNK_ROWS}) id FROM queue"
+                                f" WHERE {lane} AND seq<=? ORDER BY seq) AND status=?"
+                            )
+                            if high_water is not None:
+                                bound = (*params, high_water, OutboxStatus.PENDING.value)
+                        message_ids: list[str] = []
+                        if bound:
+                            # One guarded write: its PENDING term decides which rows are cancelled,
+                            # and OUTPUT reports only those, in no promised order; the events keep
+                            # the queue's.
+                            await cur.execute(
+                                "UPDATE queue SET status=?, updated_at=?"
+                                " OUTPUT inserted.id, inserted.message_id, inserted.seq"
+                                f" WHERE {target}",
+                                (OutboxStatus.CANCELLED.value, now, *bound),
+                            )
+                            message_ids = [
+                                r[1] for r in sorted(await cur.fetchall(), key=lambda r: r[2])
+                            ]
+                        if not message_ids:
+                            # Only a purge that cancelled nothing records a zero; a walk's last,
+                            # empty chunk wrote nothing, so its commit is not counted.
+                            if total:
+                                await self._commit_read(conn)
+                            else:
+                                await self._append_operator_audit(cur, written, audit, 0)
+                                await self._commit(conn)
+                            return total
+                        for message_id in message_ids:
+                            await self._event(
+                                cur, message_id, "cancelled", destination_name, "manual purge", now
+                            )
+                        mids = set(message_ids)
+                        await self._lock_finalize_batch(cur, mids)
+                        for message_id in sorted(mids):
+                            await self._maybe_finalize(cur, message_id, now)
+                        await self._append_operator_audit(cur, written, audit, len(message_ids))
                         await self._commit(conn)
-                        return 0
-                    for message_id in message_ids:
-                        await self._event(
-                            cur, message_id, "cancelled", destination_name, "manual purge", now
-                        )
-                    mids = set(message_ids)
-                    await self._lock_finalize_batch(cur, mids)
-                    for message_id in sorted(mids):
-                        await self._maybe_finalize(cur, message_id, now)
-                    await self._append_operator_audit(cur, written, audit, len(message_ids))
-                    await self._commit(conn)
-            except Exception:
-                # BACKLOG #2624: the transaction may hold the audit applock and an
-                # audit row. After the cursor closes, so a detached close cannot race it.
-                await self._rollback_or_discard(conn)
-                raise
-        return len(message_ids)
+                except Exception:
+                    # BACKLOG #2624: the transaction may hold the audit applock and an
+                    # audit row. After the cursor closes, so a detached close cannot race it.
+                    await self._rollback_or_discard(conn)
+                    raise
+            total += len(message_ids)
+            if top_only:
+                return total
 
     # --- read helpers --------------------------------------------------------
 
