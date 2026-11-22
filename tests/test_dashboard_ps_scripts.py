@@ -270,7 +270,7 @@ def test_both_ps_sweeps_age_by_creation_time() -> None:
     for name in ("build.ps1", "scheduled-refresh.ps1"):
         text = (_DIR / name).read_text(encoding="utf-8")
         assert "$_.CreationTimeUtc -lt $cutoff" in text, name
-        assert "LastWriteTimeUtc -lt" not in text, name
+        assert "LastWriteTime" not in text, name
 
 
 def test_a_failed_fetch_turns_a_clean_run_red() -> None:

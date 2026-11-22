@@ -10,8 +10,7 @@ session. It runs this driver with ``python -I`` and an allowlisted environment t
 token and no ``GIT_*`` variable, and reads back the JSON below; on a non-zero exit the tail of
 its stderr goes into the error text, which the snapshot keeps. That environment is the
 allowlist ``collect_metrics.py``'s docstring describes; it withholds variables and nothing more,
-and it is no sandbox. The child runs with the full power of
-the same user: it can read and write any file that user can, a ``gh`` credential file among them,
+and it is no sandbox. The child runs with the full power of the same user: it can read and write any file that user can, a ``gh`` credential file among them,
 and so alter the engine files run after it. ``collect_metrics.py``'s docstring states the trust
 this takes.
 

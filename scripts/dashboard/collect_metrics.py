@@ -22,17 +22,16 @@ points at a parent directory, reached only through an explicit ``--git-dir``.
 
 THE VAULT'S CODE RUNS IN A CHILD PROCESS. The ledger census is the vault's own
 ``scripts/docs/ledger_weekly_report.py``, archived from vault ``origin/main``. It runs through
-``_vault_census.py`` under ``python -I`` with an allowlisted environment that holds no token
-variable and no ``GIT_*`` variable, never imported into this process. The vault commit it ran at is
+``_vault_census.py`` under ``python -I``, never imported into this process, with an allowlisted
+environment: only the variables whose names match ``_CHILD_ENV_KEEP`` case-insensitively, plus
+``LC_ALL``, so no token variable and no ``GIT_*`` variable. The vault commit it ran at is
 recorded. That is NO SANDBOX, and the environment scrub does not limit what that code can do: the
 child runs with the full power of the user who runs this script. It can run ``gh`` or ``git`` with
 the user's stored credentials (keyring, ``hosts.yml``), read and write any file that user can, and
 so alter the engine files this process runs after it, such as ``scripts/ci/check_stalled_prs.py``,
-``scripts/asvs/scorecard.py``, ``render_html.py`` and this script. The scrub is an allowlist: the
-child gets only the variables whose names match ``_CHILD_ENV_KEEP`` case-insensitively, plus
-``LC_ALL``, so every other variable, any token and ``GIT_*`` variable among them, is withheld. Running this script therefore trusts
-vault ``origin/main`` as fully as the engine code itself. Pinning the vault code to a reviewed
-commit would narrow that trust; it is not done here.
+``scripts/asvs/scorecard.py``, ``render_html.py`` and this script. Running this script therefore
+trusts vault ``origin/main`` as fully as the engine code itself. Pinning the vault code to a
+reviewed commit would narrow that trust; it is not done here.
 
 STDOUT CARRIES NO RAW VALUE. The console summary is each metric's id, status and whether it holds
 an error; the values, the counts and the error text are only in the snapshot. A status is a banded
@@ -469,7 +468,9 @@ def _run_python(
     try:
         return out.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise CollectError(f"{argv[0]} wrote non-UTF-8 output: {exc}") from None
+        # Raised outside the handler: the decode error's .object is the child's whole stdout.
+        reason = f"{exc.reason} at byte {exc.start}"
+    raise CollectError(f"{argv[0]} wrote non-UTF-8 output: {reason}")
 
 
 def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:

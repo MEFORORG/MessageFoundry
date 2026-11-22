@@ -672,7 +672,7 @@ def test_remove_tree_reports_a_failure(
 
 
 def _backdate(monkeypatch: pytest.MonkeyPatch, *stale: Path) -> None:
-    # The stdlib cannot set a creation time, so the sweep's age read is faked for these.
+    # os.utime cannot set a creation time, so the sweep's age read is faked for these.
     real = cm._created
     monkeypatch.setattr(cm, "_created", lambda p: 1_000_000.0 if p in stale else real(p))
 
@@ -706,8 +706,8 @@ def test_sweep_ages_by_creation_not_modified_time(tmp_path: Path) -> None:
 
     d = tmp_path / "mf-metrics-x"
     d.mkdir()
-    # A modified time far in the past does not make a new directory stale, and a partial sweep
-    # that moves the modified time to now would not make an old one fresh.
+    # A modified time far in the past does not make a new directory stale: the age read is the
+    # creation time, not the modified time.
     os.utime(d, (1_000_000.0, 1_000_000.0))
     st: Any = d.stat()  # st_birthtime is not in every platform's stub
     assert cm._created(d) == st.st_birthtime != st.st_mtime
