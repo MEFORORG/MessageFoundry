@@ -101,9 +101,11 @@ from messagefoundry.store.base import (
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    ServerCipherWalk,
     StoreNotFoundError,
     TableCensusIncomplete,
     acquire_pooled,
+    check_walk_identifiers,
     driver_sqlstate,
     seed_filter_clause,
     warm_pool_connections,
@@ -488,21 +490,23 @@ _MSSQL_EPOCH_NOW = (
 _ATTACHMENT_CHUNK_BATCH = 16
 
 
-def _check_walk_identifiers(*names: str) -> None:
-    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
-    constants (BACKLOG #1719), so this only stops a caller that passed something else."""
-    for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
-
-
 def _key_after(order: tuple[str, ...], after: tuple[Any, ...]) -> tuple[str, list[Any]]:
-    """``(a, b) > (x, y)`` as T-SQL spells it, ``a > x OR (a = x AND b > y)``, and its values in
-    placeholder order: T-SQL has no row-value comparison."""
+    """``(a, b) > (x, y)`` as T-SQL spells it, and its values in placeholder order: T-SQL has no
+    row-value comparison. A composite key leads with ``a >= x``, which the expansion below implies,
+    so the optimizer can seek the key's index to ``x`` rather than scan from its start on every
+    chunk (BACKLOG #1719 item 31)."""
+    bound, values = _key_after_expanded(order, after)
+    if len(order) == 1:
+        return bound, values
+    return f"[{order[0]}] >= ? AND {bound}", [after[0], *values]
+
+
+def _key_after_expanded(order: tuple[str, ...], after: tuple[Any, ...]) -> tuple[str, list[Any]]:
+    """``a > x OR (a = x AND b > y)``, nested for each further key column."""
     column, value = order[0], after[0]
     if len(order) == 1:
         return f"[{column}] > ?", [value]
-    inner, values = _key_after(order[1:], after[1:])
+    inner, values = _key_after_expanded(order[1:], after[1:])
     return f"([{column}] > ? OR ([{column}] = ? AND {inner}))", [value, value, *values]
 
 
@@ -3532,7 +3536,7 @@ def _probed_grant(value: Any) -> bool | None:
     return probed_grant(value)
 
 
-class SqlServerStore:
+class SqlServerStore(ServerCipherWalk):
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
     # The staged ingress pipeline (enqueue_ingress + the ingress->routed->outbound handoffs) is
@@ -4759,24 +4763,28 @@ class SqlServerStore:
         return row is not None
 
     # --- the read-only cipher-cell walk (BACKLOG #1719) ----------------------
-    # The source `cipher_cells.read_server_cipher_cells` reads, for `messagefoundry cipher-audit`.
-    # Each call is one SELECT through `_fetchall`, which ends its read transaction, so none spans
-    # chunks. Every identifier is a declared constant from `cipher_cells`, bracket-quoted because
-    # `key` and `count` are reserved here; only values are parameters.
+    # This dialect's reads; `store/base.py` says what the walk's reads share, and holds the one
+    # read that is not dialect, `cipher_walk_surface_sealed`. Identifiers are bracket-quoted here
+    # because `key` and `count` are reserved.
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
         """The columns of each of ``tables`` this store's schema holds; an absent table is left out.
-        ``OBJECT_ID`` resolves a name the way the store's own unqualified statements do."""
-        found: dict[str, frozenset[str]] = {}
-        for table in tables:
-            _check_walk_identifiers(table)
-            rows = await self._fetchall(
-                "SELECT c.name AS name FROM sys.columns c WHERE c.object_id = OBJECT_ID(?, 'U')",
-                (table,),
-            )
-            if rows:
-                found[table] = frozenset(str(r["name"]) for r in rows)
-        return found
+        ``OBJECT_ID`` resolves a name the way the store's own unqualified statements do. One
+        statement for every table, with each name a parameter (BACKLOG #1719 item 7)."""
+        names = list(dict.fromkeys(tables))
+        if not names:
+            return {}
+        check_walk_identifiers(*names)
+        rows = await self._fetchall(
+            "SELECT t.name AS table_name, c.name AS column_name"
+            f" FROM (VALUES {', '.join('(?)' for _ in names)}) AS t(name)"
+            " JOIN sys.columns c ON c.object_id = OBJECT_ID(t.name, 'U')",
+            tuple(names),
+        )
+        found: dict[str, set[str]] = {}
+        for r in rows:
+            found.setdefault(str(r["table_name"]), set()).add(str(r["column_name"]))
+        return {t: frozenset(c) for t, c in found.items()}
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
@@ -4785,14 +4793,6 @@ class SqlServerStore:
             " ORDER BY surface_table, surface_column"
         )
         return None if row is None else (str(row["surface_table"]), str(row["surface_column"]))
-
-    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
-        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
-        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked."""
-        _check_walk_identifiers(table, column)
-        if keyed and await self._surface_keyed(table, column):
-            return True
-        return await self._surface_holds_ciphertext(table, column, f"{_ENC_MARKER_PREFIX}%")
 
     async def cipher_walk_chunk(
         self,
@@ -4807,9 +4807,12 @@ class SqlServerStore:
     ) -> list[tuple[Any, ...]]:
         """Up to ``limit`` rows of ``table`` whose ``column`` is not NULL, after the ``order`` key
         ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
-        then ``column``'s. ``sealed_only`` keeps a value only when it starts with the marker in any
-        ASCII case, as ``cipher_cells._sealed_test`` reads one."""
-        _check_walk_identifiers(table, column, *select, *order)
+        then ``column``'s. ``sealed_only`` keeps a value that starts with the marker in any ASCII
+        case, as ``cipher_cells._sealed_test`` reads one. The comparison runs under the column's
+        collation, so one that ignores width or accents also keeps a non-ASCII lookalike of the
+        marker; the walk's own marker test then reads that value as unsealed (BACKLOG #1719 item
+        19)."""
+        check_walk_identifiers(table, column, *select, *order)
         params: list[Any] = [int(limit)]
         where = [f"[{column}] IS NOT NULL"]
         if sealed_only:
