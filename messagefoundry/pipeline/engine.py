@@ -171,6 +171,41 @@ _CONFIG_WRITE_DRAIN_SECONDS = 5.0
 #: ``api/app.py``), and spent only while such a write is still running.
 _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
 
+#: How long stop waits for the graph supervisor to exit on its own, an in-flight reconcile
+#: included, before it cancels it and waits for the cancel to land.
+_GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
+
+#: Under a stop budget (BACKLOG #3191, :class:`_StopBudget`): the least any budgeted wait is given,
+#: however little of the budget is left.
+_STOP_WAIT_FLOOR_SECONDS = 0.1
+#: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
+#: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
+_STOP_CLOSE_ALLOWANCE_SECONDS = 0.5
+
+
+class _StopBudget:
+    """What each of :meth:`Engine.stop`'s budgeted waits may spend (BACKLOG #3191).
+
+    Four waits are budgeted: the graph supervisor's exit, the CRL reload runner's stop, the
+    remote-debug refusal watch's stop and the alert-state drain. With no budget each keeps its fixed
+    bound. Under one, a wait gets the shorter of its fixed bound and what is left of the budget once
+    the time kept for the steps after it is taken out, and never less than
+    :data:`_STOP_WAIT_FLOOR_SECONDS`. So a wait is shortened only when its fixed bound would run
+    into what the later steps are kept. A budgeted wait that runs out ends as it does at its fixed
+    bound. The other stop steps are not budgeted, so they can still run past the budget."""
+
+    def __init__(self, seconds: float | None) -> None:
+        self._deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
+
+    def wait(self, fixed: float, *, kept: float) -> float:
+        """The bound for a wait whose fixed bound is ``fixed``, with ``kept`` seconds held back for
+        the steps after it."""
+        if self._deadline is None:
+            return fixed
+        left = self._deadline - asyncio.get_running_loop().time() - kept
+        return max(_STOP_WAIT_FLOOR_SECONDS, min(fixed, left))
+
+
 #: How long a connection flag toggle waits for the lock, then again for the store (BACKLOG #2623). A
 #: write normally takes milliseconds, so this is a stuck or saturated store. Well under the API's
 #: 120 s request deadline (``api/request_timeout.py``), so the caller hears the toggle's own refusal
@@ -4213,14 +4248,28 @@ class Engine:
             count += 1
         return count
 
-    async def stop(self) -> None:
-        """Stop the retention task + the wired graph, then close the store."""
+    async def stop(self, *, budget_seconds: float | None = None) -> None:
+        """Stop the retention task + the wired graph, then close the store.
+
+        ``budget_seconds`` is the time the managed API lifespan hands this stop, a share of NSSM's
+        graceful-stop window (BACKLOG #3191). It bounds the waits :class:`_StopBudget` names and no
+        others. With none, every wait keeps its fixed bound."""
         log.info("engine stopping")
         self._stopping = True
+        budget = _StopBudget(budget_seconds)
+        # Kept back, at each budgeted wait, for the waits after it and the store's close: the
+        # budgeted ones at their floor, the late config-write drain at its fixed bound. The
+        # remote-debug watch's stop makes two waits, which share its one budgeted bound.
+        alert_kept = _STOP_CLOSE_ALLOWANCE_SECONDS
+        watch_kept = alert_kept + _STOP_WAIT_FLOOR_SECONDS + _CONFIG_WRITE_LATE_DRAIN_SECONDS
+        crl_kept = watch_kept + _STOP_WAIT_FLOOR_SECONDS
+        supervisor_kept = crl_kept + _STOP_WAIT_FLOOR_SECONDS
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
-        # half-started graph), falling back to cancel only if a reconcile hangs past the timeout. The
+        # half-started graph), falling back to cancel only if a reconcile runs past the timeout. Under
+        # a stop budget that timeout can be well short of _GRAPH_SUPERVISOR_STOP_SECONDS (BACKLOG
+        # #3191), so a slow reconcile can be cancelled part-way through starting the graph. The
         # graph itself is then stopped by the registry_runner.stop() below, as before.
         if self._graph_supervisor is not None:
             self._graph_stop.set()
@@ -4231,7 +4280,10 @@ class Engine:
             supervisor = self._graph_supervisor
             self._graph_supervisor = None
             try:
-                await asyncio.wait_for(supervisor, timeout=10.0)
+                await asyncio.wait_for(
+                    supervisor,
+                    timeout=budget.wait(_GRAPH_SUPERVISOR_STOP_SECONDS, kept=supervisor_kept),
+                )
             except TimeoutError:
                 # wait_for already cancelled the task on timeout; absorb its cancellation.
                 await asyncio.gather(supervisor, return_exceptions=True)
@@ -4242,7 +4294,8 @@ class Engine:
         if self._cert_expiry_runner is not None:
             await self._cert_expiry_runner.stop()
         if self._crl_reload_runner is not None:
-            await self._crl_reload_runner.stop()
+            crl = self._crl_reload_runner
+            await crl.stop(timeout=budget.wait(crl.stop_timeout_seconds, kept=crl_kept))
             self._crl_reload_runner = None
         if self._log_forward_watch is not None:
             await self._log_forward_watch.stop()
@@ -4300,7 +4353,9 @@ class Engine:
             # reported by the watch's last pass. That pass may write an audit row and raise an alert,
             # so it runs while the store is open, and ahead of the alert-state drain at the end.
             if self._remote_debug_watch is not None:
-                await self._remote_debug_watch.stop()
+                watch = self._remote_debug_watch
+                total = budget.wait(2 * watch.stop_seconds(), kept=watch_kept)
+                await watch.stop(timeout=total / 2)
                 self._remote_debug_watch = None
             # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
             # unused remainder of this process's reserved block and unhooks the refill signal, so anything
@@ -4341,7 +4396,7 @@ class Engine:
             # to land before the store closes. Last, so it covers every stop step above.
             drain = getattr(self._alert_sink, "drain_state", None)
             if drain is not None:
-                await drain(_ALERT_STATE_DRAIN_SECONDS)
+                await drain(budget.wait(_ALERT_STATE_DRAIN_SECONDS, kept=alert_kept))
         except asyncio.CancelledError:
             cancelled = True
         except BaseException as exc:  # noqa: BLE001 - held until the store closes, then re-raised

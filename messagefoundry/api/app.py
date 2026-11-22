@@ -1437,8 +1437,9 @@ async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
 _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
 #: The share of that budget kept back for engine.stop(). Reserved, never a bound: the stop is not cut
 #: short, because it ends in store.close(), and a store left open keeps a non-daemon worker thread
-#: alive, which is the hang BACKLOG #2087 fixed. The stop's own waits are bounded inside the engine,
-#: and nothing here holds them to this reserve.
+#: alive, which is the hang BACKLOG #2087 fixed. The stop is handed the step's bound as its budget,
+#: which holds the waits ``pipeline.engine._StopBudget`` names inside it; its other steps are not
+#: held to it.
 _ENGINE_STOP_RESERVE_SECONDS: Final = 3.0
 #: The part of a step's bound handed to the step's own graceful wait, so that wait ends, and cancels
 #: what it owns, before the teardown cuts the step.
@@ -1790,7 +1791,7 @@ def _managed_teardown_steps(
         _TeardownStep(
             "engine.stop()",
             _ENGINE_STOP_RESERVE_SECONDS,
-            lambda _b: engine.stop(),
+            lambda bound: engine.stop(budget_seconds=bound),
             bounded=False,
         )
     )
@@ -2632,8 +2633,9 @@ async def _reload_and_record(
 #: (:func:`_write_through_cancel`). A store write may have no bound of its own, so a hung write must
 #: not hold the shutdown. A drain's cancel waits for what its grace has left instead
 #: (:func:`_row_cancel_wait`). This is the bound for the rest, at least the convergence reload
-#: engine.stop() cancels and awaits with no bound: nothing hands engine.stop() a remaining time, so
-#: this cap is what keeps that wait well inside _ENGINE_STOP_RESERVE_SECONDS (BACKLOG #3191).
+#: engine.stop() cancels and awaits with no bound: engine.stop()'s budget does not reach that wait
+#: (``pipeline.engine._StopBudget`` names the ones it does), so this cap is what keeps that wait well
+#: inside _ENGINE_STOP_RESERVE_SECONDS (BACKLOG #3191).
 #: tests/test_dual_control_reload.py pins it there.
 _ROW_CANCEL_WAIT_SECONDS: Final = 1.0
 #: The part of a drain's remaining grace a row wait leaves for the reload's task to unwind, so the

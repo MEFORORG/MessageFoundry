@@ -218,9 +218,9 @@ def _probed_app(
 
     real_stop = engine_module.Engine.stop
 
-    async def _stop(self: Any) -> None:
+    async def _stop(self: Any, **kwargs: Any) -> None:
         opened.engine_stops += 1
-        await real_stop(self)
+        await real_stop(self, **kwargs)
 
     monkeypatch.setattr(appmod, "open_store", _open)
     monkeypatch.setattr(appmod, "notifier_from_settings", _notifier)

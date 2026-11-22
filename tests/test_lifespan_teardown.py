@@ -498,7 +498,7 @@ class _Spies:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
-        self.real_stop: Callable[[], Awaitable[None]] | None = None
+        self.real_stop: Callable[..., Awaitable[None]] | None = None
 
     def attach(self, app: Any) -> None:
         calls = self.calls
@@ -516,9 +516,9 @@ class _Spies:
         async def _flush(store: Any) -> None:
             calls.append("flush")
 
-        async def _stop() -> None:
+        async def _stop(**kwargs: Any) -> None:
             calls.append("stop")
-            await real_stop()
+            await real_stop(**kwargs)
 
         class _Executor:
             def shutdown(self, wait: bool) -> None:
@@ -579,9 +579,9 @@ async def test_an_engine_stop_that_raises_does_not_skip_the_steps_after_it(
             real_stop = spies.real_stop
             assert real_stop is not None
 
-            async def _stop_raises() -> None:
+            async def _stop_raises(**kwargs: Any) -> None:
                 spies.calls.append("stop")
-                await real_stop()
+                await real_stop(**kwargs)
                 raise RuntimeError("PROBE: deliberate engine.stop() failure")
 
             app.state.engine.stop = _stop_raises
@@ -611,12 +611,12 @@ async def test_control_is_stopped_before_engine_stop_runs(
         engine = app.state.engine
         real_stop = engine.stop
 
-        async def _stop() -> None:
+        async def _stop(**kwargs: Any) -> None:
             # A control_action rule firing on an alert the stop raises, as the sink's decision
             # path dispatches it.
             notifier._dispatch_control("restart", "IB_TEST_ADT", default_target=False)
             seen_at_stop.append((notifier._control_cb, len(notifier._control_tasks)))
-            await real_stop()
+            await real_stop(**kwargs)
 
         engine.stop = _stop
     assert seen_at_stop == [(None, 0)], (
@@ -771,9 +771,9 @@ async def test_the_managed_teardown_drains_config_writes_under_its_budget(
             calls.append(("drain", timeout))
             await real_drain(timeout)
 
-        async def _stop() -> None:
+        async def _stop(**kwargs: Any) -> None:
             calls.append(("stop", None))
-            await real_stop()
+            await real_stop(**kwargs)
 
         async def _in_flight_write() -> None:
             # Stands in for a write whose caller went: it lands after the teardown began.
@@ -818,10 +818,10 @@ async def test_the_teardown_is_bounded_when_every_drain_hangs(
                 await asyncio.Event().wait()
                 return []
 
-            async def _timed_stop() -> None:
+            async def _timed_stop(**kwargs: Any) -> None:
                 spies.calls.append("stop")
                 began = time.monotonic()
-                await real_stop()
+                await real_stop(**kwargs)
                 stop_took.append(time.monotonic() - began)
 
             engine: Engine = app.state.engine
