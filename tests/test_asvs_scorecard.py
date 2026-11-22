@@ -2966,18 +2966,26 @@ def test_prove_absences_screen_compares_shape_decorators_beside_the_same_unnamed
     # Dropping the unnamed decorator too: the two sides' unnamed decorators differ.
     assert _screen("@cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
     assert _screen("def f(a):\n    return 1\n", target, tmp_path) == []
+    # The same text naming another binding is another decorator: here the new one caches.
+    rebound = "from functools import lru_cache\n\ndef deco(f):\n    return lru_cache(f)\n\n"
+    assert _screen(rebound + "@deco\ndef f(a):\n    return 1\n", target, tmp_path) == []
 
 
 def test_prove_absences_screen_keeps_a_staticmethod_beside_an_unnamed_decorator(
     tmp_path: Path,
 ) -> None:
     """A ``staticmethod``'s first parameter is passed by its callers, so renaming it breaks a
-    keyword call even when a decorator beside it cannot be named."""
+    keyword call even when decorators beside it cannot be named and differ. Only one side read as
+    a ``staticmethod`` is compared as before."""
     target = (
-        "def deco(f):\n    return f\n\nclass C:\n    @staticmethod\n    @deco\n    def m(x): ...\n"
+        "def deco(f):\n    return f\n\ndef deco2(f):\n    return f\n\n"
+        "class C:\n    @staticmethod\n    @deco\n    def m(x): ...\n"
     )
-    renamed = "class C(C):\n    @staticmethod\n    @deco\n    def m(y): ...\n"
+    renamed = "class C(C):\n    @staticmethod\n    @deco2\n    def m(y): ...\n"
     assert _refused(renamed, target, tmp_path)
+    # Control: a decorator that returns a staticmethod is a staticmethod the screen cannot name.
+    wraps = "def deco(f):\n    return staticmethod(f)\n\nclass C:\n    @deco\n    def m(x): ...\n"
+    assert _screen("class C(C):\n    @staticmethod\n    def m(x): ...\n", wraps, tmp_path) == []
     same = "class C(C):\n    @staticmethod\n    @deco\n    def m(x):\n        return 1\n"
     assert _screen(same, target, tmp_path) == []
     # Control: a method's first parameter is still bound, so its name is not part of the shape.
@@ -2985,15 +2993,14 @@ def test_prove_absences_screen_keeps_a_staticmethod_beside_an_unnamed_decorator(
     assert _screen("class C(C):\n    @deco\n    def m(this, x): ...\n", method, tmp_path) == []
 
 
-def test_prove_absences_screen_compares_an_accessor_of_a_plain_method(tmp_path: Path) -> None:
-    """``@A.x.setter`` where this module's class ``A`` binds ``x`` to a plain method builds no
-    property, so the mutation's def is compared too. Where ``A.x`` is a property, or ``A`` is not
-    read, it is still an accessor and is not compared."""
+def test_prove_absences_screen_refuses_an_accessor_of_a_plain_method(tmp_path: Path) -> None:
+    """``@A.x.setter`` where this module's class ``A`` binds ``x`` to a plain method raises when the
+    def runs, whatever its signature. Where ``A.x`` is a property, or ``A`` is not read, it is
+    still an accessor and is not compared."""
     target = "class A:\n    def x(self): ...\n\nclass B:\n    def x(self, v): ...\n"
+    problems = _screen("class B(B):\n    @A.x.setter\n    def x(self, v): ...\n", target, tmp_path)
+    assert len(problems) == 1 and "accessor of A.x" in problems[0], problems
     assert _refused("class B(B):\n    @A.x.setter\n    def x(self): ...\n", target, tmp_path)
-    assert (
-        _screen("class B(B):\n    @A.x.setter\n    def x(self, v): ...\n", target, tmp_path) == []
-    )
     prop = "class A:\n    @property\n    def x(self): ...\n\nclass B:\n    def x(self, v): ...\n"
     assert _screen("class B(B):\n    @A.x.setter\n    def x(self): ...\n", prop, tmp_path) == []
     imported = "from m import A\n\nclass B:\n    def x(self, v): ...\n"
