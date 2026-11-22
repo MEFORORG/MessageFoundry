@@ -1176,7 +1176,7 @@ def test_fidelity_note_never_divides_by_a_zero_offered(fidelity: RungFidelity) -
     # BACKLOG #5861: the guard is on the input, so no verdict can reach a division at offered 0. The
     # counts WERE recorded there, so the note must not say they were not.
     note = shardcert.fidelity_note(fidelity, sent=0, acked=0, offered=0)
-    assert note is not None and "offered no messages" in note
+    assert note is not None and "planned zero messages" in note
     assert "not recorded" not in note
 
 
@@ -1241,7 +1241,54 @@ def test_two_box_zero_offered_climb_rung_is_setup_degraded(with_control: bool) -
     climb = [*([_sustained(0, 16.0)] if with_control else []), _two_box_zero()]
     lad = _consolidated(climb)
     assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
-    assert "offered no messages" in lad.render()
+    assert "planned zero messages" in lad.render()
+
+
+def test_two_box_zero_offered_rung_that_paced_one_message_is_setup_degraded() -> None:
+    # The pacer emits on its first tick, so the real shape of a rounded-to-zero rung is one message on
+    # one lane. It reads SUSTAINED, and the lane bar must not turn that into an engine FAIL.
+    drive = replace(
+        _drive(_ZERO_RATE),
+        sent=1,
+        acked=1,
+        sink_received=4,
+        engine_done=4,
+        lanes_observed=1,
+    )
+    rung = LadderRung(index=1, ingress_rate=_ZERO_RATE, hold_seconds=60.0, drain_timeout=150.0)
+    out = build_rung_outcome(rung, drive, _clean_gate(), None)
+    assert out.offered == 0 and out.verdict.value == "sustained"
+    lad = _consolidated([_sustained(0, 16.0), out])
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+
+
+def test_colocated_zero_offered_rung_that_paced_one_message_is_setup_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paced = _colocated_zero(
+        sent=1,
+        acked=1,
+        achieved_intake=1,
+        delivered_distinct=1,
+        sink_received=1,
+        engine_done=1,
+        lanes_observed=1,
+    )
+    assert paced.no_loss is True
+    lad = _colocated_run(monkeypatch, {20.0: paced})
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+    assert lad.ceiling_void_reason == "zero_offered"
+
+
+def test_colocated_zero_offered_rung_that_lost_its_paced_message_still_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lost = _colocated_zero(
+        sent=1, acked=1, achieved_intake=1, lanes_observed=1, acked_not_delivered=1
+    )
+    assert lost.no_loss is False
+    lad = _colocated_run(monkeypatch, {20.0: lost})
+    assert (lad.exit_code, lad.result_label) == (1, "FAIL")
 
 
 def test_two_box_zero_offered_soak_is_setup_degraded() -> None:
@@ -1273,7 +1320,7 @@ def test_colocated_zero_offered_rung_is_setup_degraded(
     assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
     assert len(lad.records) == 2  # the climb stops at the rung that offered nothing
     rendered = lad.render()
-    assert "offered no messages" in rendered
+    assert "planned zero messages" in rendered
     assert "broke correctness" not in rendered and "not recorded" not in rendered
 
 
@@ -1284,15 +1331,22 @@ def test_colocated_zero_offered_record_is_degraded_without_the_climb() -> None:
 
 
 @pytest.mark.parametrize(
-    "fault", [{"lane_inversions": 1}, {"dead_total": 2}, {"stranded_nonterminal": 1}]
+    "fault",
+    [
+        {"lane_inversions": 1},
+        {"lane_inversions": 1, "drained": False},
+        {"dead_total": 2},
+        {"stranded_nonterminal": 1},
+    ],
 )
 def test_colocated_zero_offered_rung_does_not_hide_a_real_break(
-    monkeypatch: pytest.MonkeyPatch, fault: dict[str, int]
+    monkeypatch: pytest.MonkeyPatch, fault: dict[str, object]
 ) -> None:
     lad = _colocated_run(monkeypatch, {20.0: _colocated_zero(**fault)})
     assert (lad.exit_code, lad.result_label) == (1, "FAIL")
-    assert "measured nothing about the engine. Raise" not in lad.render().split("note:")[0]
-    assert "broke correctness" in lad.render()
+    rendered = lad.render()
+    assert "planned zero messages, so they" not in rendered and "fix the rig" not in rendered
+    assert "broke correctness" in rendered
 
 
 def test_step_record_carries_sent_across_from_the_report() -> None:

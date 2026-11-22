@@ -2485,7 +2485,12 @@ class ConsolidatedLadderReport:
             return False
         if any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in recs):
             return False
-        return all(r.lanes_observed >= 2 for r in recs if r.verdict is RungVerdict.SUSTAINED)
+        # BACKLOG #5861: a zero-offered rung paces one first-tick message, so one lane is its normal shape.
+        return all(
+            r.lanes_observed >= 2
+            for r in recs
+            if r.verdict is RungVerdict.SUSTAINED and r.offered != 0
+        )
 
     @property
     def store_truth_unconfirmed(self) -> bool:
@@ -2501,10 +2506,11 @@ class ConsolidatedLadderReport:
 
     @property
     def zero_offered_rates(self) -> list[float]:
-        """The rates of the climb or soak rungs that offered no messages (BACKLOG #5861). Only these, and
+        """The rates of the climb or soak rungs that planned zero messages (BACKLOG #5861). Only these, and
         not every UNKNOWN rung: an unrecorded ``sent`` on a rung that did offer load keeps its existing
-        reading, because the verdict's other authorities still measured that rung."""
-        return [r.ingress_rate for r in self.all_records if r.offered <= 0]
+        reading, because the verdict's other authorities still measured that rung. A zero-offered soak is
+        therefore SETUP_DEGRADED (exit 2), not the SOAK_UNCONFIRMED an unrecorded soak reads as."""
+        return [r.ingress_rate for r in self.all_records if r.offered == 0]
 
     @property
     def setup_degraded(self) -> bool:
@@ -2522,7 +2528,7 @@ class ConsolidatedLadderReport:
         POOL_BOUND rather than folding it into the generic SETUP_DEGRADED token, because "the pool was the
         wall" is a specific and actionable finding (raise ``--store-pool-size`` and re-run).
 
-        A rung that offered no messages (:attr:`zero_offered_rates`) belongs here too: its verdict is
+        A rung that planned zero messages (:attr:`zero_offered_rates`) belongs here too: its verdict is
         scale-free and can read as a benign FROZEN_TAIL, so without this term the run exits 0."""
         return (
             self.climb_aborted
@@ -2637,7 +2643,9 @@ class ConsolidatedLadderReport:
         """A CLIMB rung broke correctness: the same terms :attr:`correctness_ok` applies, read on the climb
         alone, so the soak's state cannot touch it."""
         return any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in self.climb) or any(
-            r.lanes_observed < 2 for r in self.climb if r.verdict is RungVerdict.SUSTAINED
+            r.lanes_observed < 2
+            for r in self.climb
+            if r.verdict is RungVerdict.SUSTAINED and r.offered != 0
         )
 
     @property
@@ -2907,11 +2915,11 @@ class ConsolidatedLadderReport:
                     "held' would be a readback of the plan, and 'it collapsed' would be a fabrication — "
                     "so this run certifies NOTHING. Add sender workers / drive boxes and re-run"
                 )
-            elif self.zero_offered_rates:
+            elif self.zero_offered_rates and not self.store_truth_unconfirmed:
                 rates = ", ".join(f"{rate:g}" for rate in self.zero_offered_rates)
                 reason = (
-                    f"the rung(s) at {rates} ingress/s offered no messages, so they measured nothing "
-                    "about the engine. Raise the rate or the hold and re-run"
+                    f"the rung(s) at {rates} ingress/s planned zero messages, so they establish no "
+                    "rate. Raise the rate or the hold and re-run"
                 )
             else:
                 reason = (

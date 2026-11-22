@@ -756,9 +756,9 @@ def fidelity_note(
     # Keyed on the INPUT, not the verdict, so that no verdict can reach a division by offered below.
     if offered == 0:
         return (
-            f"FIDELITY UNKNOWN — this rung offered no messages (sent={sent} acked={acked} offered=0), "
-            "for example because rate x hold rounded to zero. It measured nothing about the engine and "
-            "is VOID for the ceiling: SETUP_DEGRADED. Raise the rate or the hold and re-run"
+            f"FIDELITY UNKNOWN — this rung planned zero messages (offered=0 sent={sent} acked={acked}), "
+            "for example because rate x hold rounded to zero, so it has no plan to be faithful to and "
+            "establishes no rate. It is VOID for the ceiling. Raise the rate or the hold and re-run"
         )
     unknown = (
         f"FIDELITY UNKNOWN — the gate's inputs were not recorded (sent={sent} acked={acked} "
@@ -2148,23 +2148,26 @@ class ShardCertStepRecord:
 
     @property
     def correctness_broken(self) -> bool:
-        """The report's FAIL test: :attr:`correctness_ok` failed, and not merely because this rung offered
-        nothing. With nothing offered and no counter showing that anything moved, the loss, acknowledged and
-        lane terms are vacuous, so the rung is a setup fault and not an engine one (BACKLOG #5861). An
-        unrecorded ``-1`` is not evidence of a break here. Any positive count still is."""
-        return not self.correctness_ok and (
-            max(
-                self.offered,
-                self.achieved_intake,
-                self.sent,
-                self.delivered,
-                self.lane_inversions,
-                self.lane_repeats,
-                self.engine_dead,
-                self.dead_total,
-                self.stranded_nonterminal,
-            )
-            > 0
+        """The report's FAIL test: :attr:`correctness_ok` failed, and not merely because this rung planned
+        zero messages (BACKLOG #5861). On such a rung the lane term is vacuous: the pacer still emits its
+        first-tick message, so one message on one lane is the normal shape. The acknowledged term applies
+        only if something was sent, and the loss term is vacuous only if nothing moved at all, because a
+        paced message that went unacknowledged or was lost is a real fault. An unrecorded ``-1`` is not
+        evidence of a break here. Any positive fault count still is."""
+        if self.offered != 0:
+            return not self.correctness_ok
+        nothing_moved = (
+            max(self.achieved_intake, self.sent, self.delivered, self.in_pipeline_peak) <= 0
+        )
+        return not _invariants_held(
+            acked=self.achieved_intake,
+            require_acked=self.sent > 0,
+            lossless=self.no_loss or nothing_moved,
+            lane_inversions=self.lane_inversions,
+            duplicates_ok=self.lane_repeats == 0,
+            engine_dead=max(self.engine_dead, 0),
+            dead_total=max(self.dead_total, 0),
+            stranded_nonterminal=max(self.stranded_nonterminal, 0),
         )
 
     def correctness_faults(self) -> list[str]:
@@ -2461,8 +2464,9 @@ class ShardCertLadderReport:
     ceiling_rate: float | None = None
     #: WHY there is no ``ceiling_rate`` despite the climb stopping (see :data:`_CEILING_VOID_REASONS`):
     #: ``"drive_shortfall"`` (the rig ran out), ``"offer_shortfall"`` (the plan never reached the wire and
-    #: the CAUSE WAS NOT MEASURED) or ``"fidelity_unknown"`` (the gate's inputs were not recorded). All three
-    #: exit 2 — nothing was established about the engine at the stopping rung. ``None`` when the ceiling is
+    #: the CAUSE WAS NOT MEASURED), ``"fidelity_unknown"`` (the gate's inputs were not recorded) or
+    #: ``"zero_offered"`` (the plan held no messages). All four exit 2 unless the rung also broke correctness
+    #: — nothing was established about the engine at the stopping rung. ``None`` when the ceiling is
     #: admissible (or engine-bound, which KEEPS its rate) or the climb never stopped.
     ceiling_void_reason: str | None = None
     #: BACKLOG #5576: the climb stopped because a rung's store reset failed (:class:`StoreResetFailed`).
@@ -2493,9 +2497,10 @@ class ShardCertLadderReport:
 
     @property
     def zero_offered_rates(self) -> list[float]:
-        """The rates of the rungs that offered no messages (BACKLOG #5861). Read at the verdict, so a
-        zero-offered record fails closed by whatever route it reached this report."""
-        return [r.aggregate_rate for r in self.records if r.offered <= 0]
+        """The rates of the rungs that planned zero messages (BACKLOG #5861). Read at the verdict, so a
+        zero-offered record fails closed by whatever route it reached this report. An unrecorded ``-1``
+        is a different fault and is not counted here."""
+        return [r.aggregate_rate for r in self.records if r.offered == 0]
 
     @property
     def ceiling_pool_bound(self) -> bool:
@@ -2526,7 +2531,7 @@ class ShardCertLadderReport:
 
         ARTIFACT 2 adds the POOL: a ceiling measured on a rung that tripped the pre-registered store-pool
         tripwire is a POOL BIND, not an engine ceiling, and must not publish a rate either. A rung that
-        offered no messages (:attr:`zero_offered_rates`) established nothing either."""
+        planned zero messages (:attr:`zero_offered_rates`) established no rate either."""
         return (
             self.ceiling_void_reason is not None
             or self.ceiling_pool_bound
@@ -2765,10 +2770,10 @@ class ShardCertLadderReport:
         elif self.zero_offered_rates and not self._broken:
             rates = ", ".join(f"{rate:g}" for rate in self.zero_offered_rates)
             lines.append(
-                f"  ceiling: NONE — the rung(s) at {rates} msg/s offered no messages, so they measured "
-                "nothing about the engine. Raise the rate or the hold and re-run."
+                f"  ceiling: NONE — the rung(s) at {rates} msg/s planned zero messages, so they "
+                "establish no rate. Raise the rate or the hold and re-run."
             )
-        elif self.ceiling_void_reason is not None:
+        elif self.ceiling_void_reason is not None and not self.zero_offered_rates:
             # NEVER print a rate here: the rung that stopped the climb was not evidence about the engine.
             lines.append(
                 f"  ceiling: NONE PUBLISHED — the climb stopped on a rung that FAILED FIDELITY "
@@ -2918,12 +2923,12 @@ async def run_shardcert_ladder(
         # ARTIFACT 2: the pool tripwire, RECORDED at the rung that tripped it (it gates `ceiling_pool_bound`).
         if rec.pool.tripped and rec.pool.trip_reason is not None:
             report.notes.append(f"{rate:g} msg/s: {rec.pool.trip_reason}")
-        if rec.offered <= 0 and not rec.correctness_broken:
+        if rec.offered == 0 and not rec.correctness_broken:
             # BACKLOG #5861: stopped here so neither branch below can name this rung a correctness break.
-            report.ceiling_void_reason = _CEILING_VOID_REASONS[RungFidelity.UNKNOWN]
+            report.ceiling_void_reason = "zero_offered"
             report.notes.append(
-                f"CLIMB STOPPED at {rate:g} msg/s: the rung offered no messages, a setup fault and not "
-                "an engine result"
+                f"CLIMB STOPPED at {rate:g} msg/s: the rung planned zero messages, a setup fault and "
+                "not an engine result"
             )
             break
         if rec.ceiling:
