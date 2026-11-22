@@ -142,6 +142,21 @@ export function isConfigDirCodeSetFile(
   return segs?.length === 2 && segs[0] === "codesets" && /\.(csv|toml)$/.test(segs[1]);
 }
 
+/**
+ * Whether a document IS the config-dir file the CLI edits: an on-disk `file:` document whose path
+ * `isConfigDirFile` accepts. The path alone is not enough. A `git:` revision tab, among others, carries
+ * the working copy's fsPath, and the CLI writes the working copy, so a save or remove from that tab
+ * would overwrite the file on disk with content the tab never showed (BACKLOG #5834).
+ */
+export function isConfigDirDocument(
+  uri: { readonly scheme: string; readonly fsPath: string },
+  workspaceDir: string,
+  configDir: string,
+  isConfigDirFile: (fsPath: string, ws: string, dir: string) => boolean,
+): boolean {
+  return uri.scheme === "file" && isConfigDirFile(uri.fsPath, workspaceDir, configDir);
+}
+
 /** A connection summary the connections customEditor lists (name/direction/transport) — the fields it
  *  needs from `connection list` to render its picker. */
 export interface ConnectionListItem {

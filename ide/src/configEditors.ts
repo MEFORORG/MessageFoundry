@@ -32,6 +32,7 @@ import {
   codeSetNameFromPath,
   isConfigDirCodeSetFile,
   isConfigDirConnectionsFile,
+  isConfigDirDocument,
   isReadOnlyCodeSet,
   pickCurrentConnection,
   shouldPushDocumentChange,
@@ -47,8 +48,10 @@ const SAVE_GUARD_RESET_MS = 1500;
  * the plain text editor (with a notice) and return true. Both providers read/write via the CLI's
  * `--config <configDir>`, so a same-named file elsewhere in the workspace (the selector globs are
  * workspace-wide) would otherwise be shown — and saved — as the config-dir file. Returns false (proceed
- * with the custom editor) for the canonical config-dir file, or when there is no workspace folder (a
- * relative configDir can't be resolved, and the CLI-backed editor is already inert there).
+ * with the custom editor) for the canonical config-dir file, or for a `file:` document when there is
+ * no workspace folder (a relative configDir can't be resolved, and the CLI-backed editor is already
+ * inert there). A document of any other scheme, such as a `git:` revision tab, always opens as text
+ * (`isConfigDirDocument`).
  */
 function reopenAsTextIfNotConfigDirFile(
   document: vscode.TextDocument,
@@ -57,10 +60,13 @@ function reopenAsTextIfNotConfigDirFile(
   isConfigDirFile: (fsPath: string, ws: string, dir: string) => boolean,
 ): boolean {
   const ws = workspaceDir();
-  if (!ws || isConfigDirFile(document.uri.fsPath, ws, configDir())) {
+  if (ws ? isConfigDirDocument(document.uri, ws, configDir(), isConfigDirFile) : document.uri.scheme === "file") {
     return false;
   }
-  const notice = `This file is not ${expected} under the configured config dir (messagefoundry.configDir)`;
+  const notice =
+    document.uri.scheme === "file"
+      ? `This file is not ${expected} under the configured config dir (messagefoundry.configDir)`
+      : `This ${document.uri.scheme}: document is not ${expected} on disk`;
   void vscode.window.showInformationMessage(
     `MessageFoundry: ${notice}, so it opens as text. The form edits only that file.`,
   );
@@ -74,8 +80,12 @@ function reopenAsTextIfNotConfigDirFile(
 }
 
 /** The refusal to post when a save would write some other file than the tab's: the writer's config
- *  dir, read at save time, may differ from the reader's the tab was opened against. */
+ *  dir, read at save time, may differ from the reader's the tab was opened against, and a tab that is
+ *  not a `file:` document is no file the CLI writes at all. */
 function wrongTargetError(document: vscode.TextDocument, dir: string): string {
+  if (document.uri.scheme !== "file") {
+    return `this tab is a ${document.uri.scheme}: document, not the file on disk, so nothing was written.`;
+  }
   return (
     `the configured config dir (${dir}) no longer holds the file this tab shows ` +
     `(${document.uri.fsPath}), so nothing was written. Reopen the file.`
@@ -220,7 +230,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           if (target === undefined) {
             return;
           }
-          if (!isConfigDirConnectionsFile(document.uri.fsPath, ws, target.configDir)) {
+          if (!isConfigDirDocument(document.uri, ws, target.configDir, isConfigDirConnectionsFile)) {
             postToWebview(panel.webview, { command: "error", message: wrongTargetError(document, target.configDir) });
             return;
           }
@@ -260,7 +270,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           if (target === undefined) {
             return;
           }
-          if (!isConfigDirConnectionsFile(document.uri.fsPath, ws, target.configDir)) {
+          if (!isConfigDirDocument(document.uri, ws, target.configDir, isConfigDirConnectionsFile)) {
             postToWebview(panel.webview, { command: "error", message: wrongTargetError(document, target.configDir) });
             return;
           }
@@ -401,7 +411,7 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           if (dir === undefined) {
             return;
           }
-          if (!isConfigDirCodeSetFile(document.uri.fsPath, ws, dir)) {
+          if (!isConfigDirDocument(document.uri, ws, dir, isConfigDirCodeSetFile)) {
             postToWebview(panel.webview, { command: "error", message: wrongTargetError(document, dir) });
             return;
           }
@@ -433,7 +443,7 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           if (dir === undefined) {
             return;
           }
-          if (!isConfigDirCodeSetFile(document.uri.fsPath, ws, dir)) {
+          if (!isConfigDirDocument(document.uri, ws, dir, isConfigDirCodeSetFile)) {
             postToWebview(panel.webview, { command: "error", message: wrongTargetError(document, dir) });
             return;
           }
