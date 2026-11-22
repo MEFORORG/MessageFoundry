@@ -511,8 +511,9 @@ async def _assert_unreadable_passkeys_beside_a_totp(
     Beside a usable TOTP, the rotation and the removal of the unreadable passkey land, with no
     passkey read. ``disable_totp`` takes the TOTP away, so it reads the set, and with only an
     unreadable passkey left it is refused. Beside a refused TOTP the rotation and the removal fall
-    back to the read, and are refused. RED when: a conditional write reads the set before judging
-    the TOTP (the usable arms raise), or a read failure escapes (the other arms raise)."""
+    back to the read, and are refused, while ``disable_totp`` removes that TOTP with no passkey
+    read. RED when: a conditional write reads the set before judging the TOTP (the usable arms
+    raise), or a read failure escapes (the other arms raise)."""
     from tests._webauthn_store_contract import _cred
 
     def rotate(user_id: str) -> Awaitable[bool]:
@@ -559,6 +560,14 @@ async def _assert_unreadable_passkeys_beside_a_totp(
                 ), f"{case}: the TOTP went with only an unreadable passkey left"
                 user = await store.get_user(user_id)
                 assert user is not None and user.totp_enabled, case
+            else:
+                # Vault BACKLOG #3948 item 26: a KNOWN refusal may go whatever the passkeys hold,
+                # so no passkey is read for it, and the unreadable set does not refuse it.
+                assert await store.disable_totp(
+                    user_id, now=3.0, require_way_past=_opened_totp_state
+                ), f"{case}: a refused TOTP was kept beside an unreadable passkey"
+                user = await store.get_user(user_id)
+                assert user is not None and not user.totp_enabled, case
             # Every leg runs this keyless: on a keyed store the passkey write checks the set
             # against its seal before it deletes, so an unreadable set raises there.
             removed = await store.delete_webauthn_credential(
