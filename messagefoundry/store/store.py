@@ -9943,12 +9943,14 @@ before the one commit. So a crash, or a failed append, keeps both or neither. ``
 result records nothing, as a replay that re-queued no row records nothing. The row's detail can
 carry the result, such as a count, which is why this is a function and not a row.
 
-DECIDED (BACKLOG #5069): a ``None`` return stays allowed, because it is the caller's own per-result
-statement that this result changed nothing worth a row, which :func:`if_applied` relies on for an
-alert id that matched no row. What is refused, with :class:`TypeError` and before any write, is a
-missing audit: ``None`` or anything not callable in its place (:func:`require_operator_audit`).
-The one exception is an operator inject, which always writes a message, so its ``None`` return is
-refused too (BACKLOG #5071, :func:`require_ingress_audit`).
+DECIDED (BACKLOG #5069): a ``None`` return is allowed for a result that changed nothing, because it
+is the caller's own per-result statement that this result needs no row, which :func:`if_applied`
+relies on for an alert id that matched no row. What is refused, with :class:`TypeError` and before
+any write, is a missing audit: ``None`` or anything not callable in its place
+(:func:`require_operator_audit`). On replay, dead-letter replay, resend, re-ingress and purge, a
+``None`` return for a result that did change the store is refused too, inside the transaction, so
+the change rolls back (:func:`require_mutation_audit`). So is an operator inject's, which always
+writes a message (BACKLOG #5071, :func:`require_ingress_audit`).
 
 It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
 row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
@@ -9958,7 +9960,8 @@ not read chain state."""
 def no_audit_row(_result: object) -> None:
     """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
 
-    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Most of its callers end the sessions
+    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Replay, dead-letter replay, resend,
+    re-ingress and purge refuse it for a result that changed the store (BACKLOG #5069). Most of its callers end the sessions
     as the tail of a change that carries its own row, such as a password reset or a disable, so the
     revoke has nothing of its own to record."""
     return None
@@ -10384,6 +10387,46 @@ def require_operator_audit(audit: object, mutation: str) -> None:
         )
 
 
+def mutation_changed(result: object) -> bool:
+    """Whether the result of replay, dead-letter replay, resend, re-ingress or purge says it changed
+    the store (BACKLOG #5069). A count changed the store unless it is ``0``, so a driver's ``-1``,
+    an unknown count, counts as a change. A resend or re-ingress outcome changed nothing only as a
+    ``duplicate``. Any other result type raises :class:`TypeError`, so a new result type must be
+    classified here rather than read as no change."""
+    if isinstance(result, ResendOutcome | ReingressOutcome):
+        return result.status != "duplicate"
+    if isinstance(result, int) and not isinstance(result, bool):
+        return result != 0
+    raise TypeError(
+        f"an operator mutation returned {type(result).__name__}, which mutation_changed does not"
+        " classify (BACKLOG #5069)"
+    )
+
+
+def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> OperatorAudit[R]:
+    """The entry guard of replay, dead-letter replay, resend, re-ingress and purge (BACKLOG #5069),
+    and the audit each then runs.
+
+    It refuses a missing audit as :func:`require_operator_audit` does, before any write. The audit
+    it returns also refuses a ``None`` row for a result that changed the store
+    (:func:`mutation_changed`). The store calls it inside the mutation's transaction, before the
+    commit, so that :class:`TypeError` keeps the change from committing. It keys on the result the
+    mutation returns, not on every write the mutation made. A result that changed nothing may still
+    record nothing."""
+    require_operator_audit(audit, mutation)
+
+    def row_when_changed(result: R) -> AuditAppend | None:
+        row = audit(result)
+        if row is None and mutation_changed(result):
+            raise TypeError(
+                f"{mutation}'s audit returned no row for a result that changed the store, which"
+                " an operator mutation refuses (BACKLOG #5069)"
+            )
+        return row
+
+    return row_when_changed
+
+
 #: The message origins only an operator's action writes (vault BACKLOG #2615). ``enqueue_ingress``
 #: refuses one of these with no audit (BACKLOG #5071). Listed, not derived from a name, so a new
 #: origin is a decision: the test classifies every member as operator or not.
@@ -10438,7 +10481,8 @@ def operator_audits[R](audit: OperatorAudit[R], result: R) -> tuple[AuditAppend,
     """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624).
 
     A return that is neither ``None`` nor an :class:`AuditAppend` raises :class:`TypeError`
-    (BACKLOG #5069); a ``None`` RETURN stays allowed, see :data:`OperatorAudit`. ``None`` in place
+    (BACKLOG #5069). A ``None`` RETURN is allowed here; :func:`require_mutation_audit` wraps the five
+    mutations' audit to refuse one for a result that changed the store. ``None`` in place
     of ``audit`` raises here too. Each mutation already refused it at entry, before any write; this
     is the backstop for a mutation that forgets that line, and here the raise rolls it back."""
     require_operator_audit(audit, "an operator mutation")
@@ -17277,7 +17321,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, and the row commits with the
         replay (BACKLOG #2624, :data:`OperatorAudit`)."""
-        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
@@ -17407,7 +17451,7 @@ class MessageStore:
         commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
         origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
         ``new_message_id`` (vault BACKLOG #2615)."""
-        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -17640,7 +17684,7 @@ class MessageStore:
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
         ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
-        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -17822,7 +17866,7 @@ class MessageStore:
         **A depth-capped pass-through marker is excluded the same way** (:data:`_NOT_PT_MARKER`,
         BACKLOG #1580), through the same shared ``clause``: no worker drains its inbound-only lane, and
         its parent must keep the ``ERROR`` the breach earned rather than revert to ``ROUTED``."""
-        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -17881,7 +17925,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, zero included, and the row commits
         with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
-        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             # The claim's own lane predicate (stage, destination_name, status), so the head query seeks

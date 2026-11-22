@@ -11,14 +11,18 @@ is the subject of ``tests/_operator_audit_atomic_contract.py``, not of these tes
 
 from __future__ import annotations
 
-from messagefoundry.store.store import AuditAppend
+from messagefoundry.store.store import AuditAppend, mutation_changed
+
+#: The row :func:`no_operator_audit` records for a result that changed the store.
+OPERATOR_AUDIT = AuditAppend("test.operator", actor="test")
 
 
-def no_operator_audit(_result: object) -> None:
-    """An operator audit that records nothing, for a test about the replay, resend, re-ingress or
-    cancel alone. It writes what the old ``audit=None`` default wrote: no row (BACKLOG #2624). The
-    store now refuses ``None`` itself (BACKLOG #5069), so a test that wants no row passes this."""
-    return None
+def no_operator_audit(result: object) -> AuditAppend | None:
+    """The least audit the store accepts, for a test about the replay, resend, re-ingress or cancel
+    alone: no row for a result that changed nothing, and :data:`OPERATOR_AUDIT` for one that did.
+    The store refuses ``None`` in place of the audit, and a ``None`` row for a change, since
+    BACKLOG #5069, so a test that is not about the row passes this."""
+    return OPERATOR_AUDIT if mutation_changed(result) else None
 
 
 #: The same audit under the name the purge tests use; one function, not two copies (BACKLOG #5071).
