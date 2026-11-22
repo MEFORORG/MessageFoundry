@@ -3,11 +3,8 @@
 """Key material below an empty secret is that secret's value (vault BACKLOG #5394, added items 6
 and 12).
 
-Synthetic values only: each stand-in is ASCII text, never a real key. On the code before, each
-shape below, in the next item, was read as a variable that ends the empty secret above it, so the
-secret read as unset and the start was not refused. On the next line, ``x=<key>`` and its list and
-quoted forms did the same, while the base64url and ``=``-led shapes already refused there, so
-those next-line cases pass on the code before too.
+Synthetic values only: each stand-in is ASCII text, never a real key. Each shape below, in the
+next item and on the next line, makes the empty secret above it read as set, so the start refuses.
 """
 
 from __future__ import annotations

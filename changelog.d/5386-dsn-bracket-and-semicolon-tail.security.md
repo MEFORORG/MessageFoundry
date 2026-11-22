@@ -6,7 +6,7 @@
   only after a plain user. A host with
   no `.` or `:`, followed by a `;` and a later `@`, as in `smtp://ops:pw@mail;alerts@corp`, is now
   hidden with the password, and the redacted line then names `corp` as the host. What still prints
-  as before, at least: a bracketed run of letters alone, which has a placeholder's shape; a `;`
+  as before, at least: a `;`
   group holding a `.`, a `:` or an `=`; the tail of a DSN that follows a credential label, as in
   `password: postgres://svc:Kv9x@Zq7;w@db` and `dbPassword=postgres://svc:Kv9x@Zq7;w@db`, of which
   at least `;w` prints, and all of `Zq7;w` for the second where the store-error path redacts the

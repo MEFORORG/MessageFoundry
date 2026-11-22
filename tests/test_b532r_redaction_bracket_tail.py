@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Two DSN password shapes the widened reading printed, and the placeholder claim (BACKLOG #5386).
+"""Two DSN password shapes, and where a match may hold a placeholder (BACKLOG #5386).
 
 Synthetic values only. An empty user's password holding a bracket (added item 3) and a
-";"-split tail after a user's own "@" (added item 4) each printed on the code before. Each is
-hidden now on every entry point, and neither rule makes the reading cross a placeholder inside a
-password segment. The reading does take a placeholder that is a whole segment: a user's whole first
-password segment, and, since BACKLOG #5386 wave 3, a placeholder alone before the "@" in every
-widened branch (``secretscrub._DSN_WIDE_SEGMENT``, which reads it back); the inputs below hold
-neither shape. The comment on ``secretscrub._WIDE_DSN_PASSWORD`` says how, and what each rule still
-leaves.
+";"-split tail after a user's own "@" (added item 4). Each line in ``_NOW_HIDDEN`` is hidden, as it
+stands, on the four entry points the tests name. The comment on
+``secretscrub._WIDE_DSN_PASSWORD`` says how, and what each rule still leaves.
 """
 
 from __future__ import annotations
@@ -36,7 +32,7 @@ _ENTRY_POINTS: tuple[Callable[[str], str], ...] = (
 _IDS = ("scrub_credentials", "write-time chain", "redact_log_line", "bundle of a chain line")
 _PLACEHOLDERS = (CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER, REDACTION_PLACEHOLDER)
 
-#: Each printed the secrets named beside it on the code before this change.
+#: Each line as it stands, the secrets every entry point must hide in it, and text it must keep.
 _NOW_HIDDEN = (
     ("connect postgres://:Kv[9]x@db.invalid/x failed", ("Kv", "9]x"), "@db.invalid/x failed"),
     ("connect redis://:p[Kv9x]@db.invalid failed", ("Kv9x",), "@db.invalid failed"),
@@ -210,12 +206,12 @@ def test_an_empty_users_dsn_takes_no_semicolon_tail() -> None:
     assert match is not None and match.group(0) == "redis://:Kv[9a]@", match
 
 
-# --- THE PLACEHOLDER CLAIM ------------------------------------------------------------------------
+# --- PLACEHOLDERS ON THESE LINES ------------------------------------------------------------------
 #
-# A narrower claim than the one ``support.redact`` and ``docs/PHI.md`` made before BACKLOG #5386
-# wave 3 deleted it as false: on these lines, none of which has an empty user's first segment that
-# is a placeholder alone before an "@" (the shape wave 3 reads back), every match the pattern makes must hold no placeholder except
-# right after ``user:``. Each line holds a placeholder some earlier pass could have written.
+# Each line below holds a placeholder some earlier pass could have written. On these lines only,
+# every match the pattern makes holds no placeholder except one right after ``user:``, followed by
+# an "@". That is a pin on these inputs, not a claim about every line: the widened reading also
+# takes, at least, a placeholder alone before the "@" after ``//:``, ``user@host:`` or a lead.
 
 _PLACEHOLDER_SHAPE = re.compile(r"(?i)\[[a-z]+\]|<[a-z]+>")
 _CLAIM_TEMPLATES = (
@@ -236,7 +232,7 @@ _CLAIM_TEMPLATES = (
 
 @pytest.mark.parametrize("placeholder", _PLACEHOLDERS)
 @pytest.mark.parametrize("template", _CLAIM_TEMPLATES)
-def test_the_widened_reading_crosses_no_placeholder_but_a_users_first_segment(
+def test_on_these_lines_a_match_holds_a_placeholder_only_after_a_user(
     template: str, placeholder: str
 ) -> None:
     line = template.format(p=placeholder)
