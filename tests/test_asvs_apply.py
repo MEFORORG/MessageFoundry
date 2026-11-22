@@ -3094,7 +3094,7 @@ def test_review_notes_is_kept_when_a_payload_omits_it(tmp_path: Path) -> None:
     ("reviewed_by", "phrase"),
     [
         ({"reviewer": "a", "ref": "abcdef0"}, "missing ['date']"),
-        ({**_RB, "note": "x"}, "extra ['note']"),
+        ({**_RB, "note": "x"}, "1 extra key(s)"),
         ({**_RB, "ref": "not-a-sha"}, "`reviewed_by.ref`"),
         ({**_RB, "date": "2026-02-30"}, "`reviewed_by.date`"),
         ({**_RB, "reviewer": ""}, "`reviewed_by.reviewer`"),
@@ -3659,7 +3659,7 @@ def test_an_anchor_repair_will_not_carry_a_residual_the_loader_refuses(
     rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
     assert rc == 1
     assert rec.read_bytes() == before
-    assert "so a repair cannot carry it" in capsys.readouterr().out
+    assert "so this run cannot write it, stated or carried" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("field", ["residual", "reviewed_by"])
@@ -3752,7 +3752,7 @@ def test_an_anchor_repair_of_a_closed_cell_may_omit_reviewed_by(tmp_path: Path) 
             'reviewed_by = { reviewer = "fixture", ref = "not-a-sha", date = "unrecorded" }',
             "reviewed_by.ref",
         ),
-        ('reviewed_by = ["x"]', "so a repair cannot carry it"),
+        ('reviewed_by = ["x"]', "so this run cannot write it, stated or carried"),
     ],
 )
 def test_an_anchor_repair_will_not_carry_a_reviewed_by_the_loader_refuses(
@@ -3848,7 +3848,52 @@ def test_an_anchor_repair_will_not_echo_a_value_the_loader_refuses(
     rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
     assert rc == 1
     assert rec.read_bytes() == before
-    assert "so a repair cannot carry it" in capsys.readouterr().out
+    assert "so this run cannot write it, stated or carried" in capsys.readouterr().out
+
+
+_MARKER = "SYNTHETICMARKER"
+
+
+@pytest.mark.parametrize("path", ["carried", "stated-repair", "stated-ordinary"])
+@pytest.mark.parametrize(
+    ("table", "part"),
+    [
+        ({**_RB_FIXTURE, "ref": _MARKER}, "`reviewed_by.ref`"),
+        ({**_RB_FIXTURE, "date": _MARKER}, "`reviewed_by.date`"),
+        ({**_RB_FIXTURE, "reviewer": f" {_MARKER}"}, "`reviewed_by.reviewer`"),
+        ({**_RB_FIXTURE, "ref": [_MARKER]}, "`reviewed_by.ref`"),
+        ({**_RB_FIXTURE, _MARKER: "x"}, "1 extra key(s)"),
+        ({"reviewer": "fixture", "ref": "unrecorded", "note": _MARKER}, "missing ['date']"),
+    ],
+    ids=["ref", "date", "reviewer", "non-string-part", "extra-key-name", "extra-key-value"],
+)
+def test_a_refused_reviewed_by_table_never_prints_its_value(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    path: str,
+    table: dict,
+    part: str,
+) -> None:
+    """On the carried path the value is record text the payload never held. The refusal names the
+    cell and the failing part."""
+    rec = _record(tmp_path)
+    if path == "carried":
+        inline = ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in table.items())
+        rec.write_text(
+            FIXTURE.replace(_FIX_LINE, f"reviewed_by = {{ {inline} }}\n", 1), encoding="utf-8"
+        )
+        cell = _repair_omitting("reviewed_by")
+    elif path == "stated-repair":
+        cell = _cell_with_repair(reviewed_by=table)
+    else:
+        cell = _cell_111(reviewed_by=table)
+    before = rec.read_bytes()
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    captured = capsys.readouterr()
+    assert _MARKER not in captured.out + captured.err
+    assert "cell '1.1.1'" in captured.out and part in captured.out, captured.out
 
 
 def test_a_carried_reviewed_by_table_must_survive_the_re_parse(

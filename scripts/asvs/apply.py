@@ -188,9 +188,10 @@ _ORDERED = ("id", "level", "verdict", "residual", "last_verified", "verified_at"
 #: The ordered fields `render` omits when the payload leaves them empty or does not hold them. Every
 #: other ordered field is always written, which is why `main` requires them; `reviewed_by` is
 #: required too unless the run is an anchor repair. A declared repair that omits one keeps the
-#: record's value, even an empty one (`_repair_carry`, BACKLOG #5867). Two guards in `main` read an
-#: omitted `residual` as empty: the `na` rationale check refuses it, and the closed-cell guard
-#: refuses it unless the record's `residual` is empty too. Neither refuses an omitted `reviewed_by`.
+#: record's value, even an empty one (`_repair_carry`, BACKLOG #5867). At least two guards in `main`
+#: read an omitted `residual` as empty: the `na` rationale check refuses it, and the closed-cell
+#: guard refuses it unless the record's `residual` is empty too. Neither refuses an omitted
+#: `reviewed_by`.
 _OPTIONAL_ORDERED = ("residual", "reviewed_by")
 
 #: AT LEAST these top-level keys carry free text. **NOT every field that can** -- `posture`,
@@ -255,21 +256,44 @@ def _repair_carry(cell: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
 
 def _loader_refusal(cell_id: object, key: str, value: object) -> str | None:
     """Why the loader would refuse `value` for an optional ordered field, by the loader's own rule,
-    or None. Only a malformed table keeps the loader's words: its refusal of a `reviewed_by` of
-    another type quotes the value, and this one names the type alone."""
+    or None. The refusal names the cell and the failing part and NEVER the value, and so never the
+    loader's own words, which quote it: on the carried path that is record text the payload never
+    held (BACKLOG #5867)."""
     try:
         if key == "reviewed_by":
             _reviewed_by_field({"id": cell_id, key: value})
         else:
             _str({key: value}, key, f"cell {cell_id!r}")
-    except ScorecardError as err:
+    except ScorecardError:
+        written = "so this run cannot write it, stated or carried"
         if key == "reviewed_by" and isinstance(value, dict):
-            return _printable(str(err))
+            return _printable(
+                f"cell {cell_id!r}: a structured `reviewed_by` fails the loader's rule at "
+                f"{_reviewed_by_fault(value)}, {written}"
+            )
         return (
             f"{_printable(str(cell_id))}: {key} is a {type(value).__name__}, which the loader "
-            "refuses, so a repair cannot carry it"
+            f"refuses, {written}"
         )
     return None
+
+
+def _reviewed_by_fault(table: dict[str, Any]) -> str:
+    """Which part of a refused table fails, with no text from it. An extra key is counted, not
+    named, because a key is record text too. Each part is put to the loader alone, so this holds
+    the loader's rule rather than a copy of it."""
+    missing = [k for k in REVIEWED_BY_KEYS if k not in table]
+    extra = sum(k not in REVIEWED_BY_KEYS for k in table)
+    if missing or extra:
+        return f"its keys: missing {missing}, {extra} extra key(s)"
+    bad = []
+    unrecorded = dict.fromkeys(REVIEWED_BY_KEYS, UNRECORDED)
+    for part in REVIEWED_BY_KEYS:
+        try:
+            _reviewed_by_field({"reviewed_by": unrecorded | {part: table[part]}})
+        except ScorecardError:
+            bad.append(f"`reviewed_by.{part}`")
+    return ", ".join(bad) or "the table as a whole"
 
 
 #: Keys the WRITER CONSUMES AS INSTRUCTIONS rather than storing as record fields (BACKLOG #1369).
@@ -1012,9 +1036,11 @@ def main(argv: list[str] | None = None) -> int:
         # An ANCHOR REPAIR re-points citations after the code moved; it must not touch anything else.
         # Declaring it lets the payload omit `reviewed_by` and `residual`, which keeps the record's
         # values, and buys that with byte-identity on every prose field, so an omitted empty value
-        # is preserved rather than invented. A stated empty value is not carried, and the key-set
-        # guard refuses it as field loss. A difference in verdict or prose refuses. The glyph scan
-        # still runs.
+        # is preserved rather than invented. A stated empty string is not carried, and what happens
+        # to it depends on the record. Over a non-empty value the byte-identity loop below refuses
+        # it. Over a value that is already empty, `render` drops the key and the key-set guard
+        # refuses it as field loss. Over an absent key NOTHING refuses it: the key stays absent and
+        # the run exits 0. A difference in verdict or prose refuses. The glyph scan still runs.
         anchor_repair = bool(c.get("anchor_repair"))
         if live.get("anchor_repair"):
             # GATED ON THE RECORD, NOT ON THE PAYLOAD, and that is the whole correction. Gating on
