@@ -323,3 +323,31 @@ async def test_converge_keeps_a_newer_own_sync_made_during_the_decrypt(backend: 
     assert refreshed == []
     assert store._reference_versions == {"codes": "v2"}
     assert store._reference_cache["codes"] is own
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_converge_keeps_a_newer_own_sync_made_during_the_read(backend: str) -> None:
+    import importlib
+
+    module = importlib.import_module(f"messagefoundry.store.{backend}")
+    cls = module.PostgresStore if backend == "postgres" else module.SqlServerStore
+    cipher = TransitCipher(_FakeClient(_RecordingTransit()), _KEY)
+    aad = cell_aad("reference", "value", "codes", "v1", "k")
+    row = {"name": "codes", "version": "v1", "key": "k", "value": cipher.encrypt('"old"', aad=aad)}
+    store = object.__new__(cls)
+    store._cipher = cipher
+    own = {"k": "own"}
+    store._reference_cache = {"codes": {"k": "older"}}
+    store._reference_versions = {"codes": "v0"}
+
+    async def fetchall(*_: Any, **__: Any) -> list[dict[str, Any]]:
+        # This handle's own sync commits v2 while the read is in flight; the read still saw v1.
+        store._reference_cache["codes"] = own
+        store._reference_versions["codes"] = "v2"
+        await asyncio.sleep(0)
+        return [row]
+
+    store._fetchall = fetchall
+    assert await store.converge_reference_cache() == []
+    assert store._reference_versions == {"codes": "v2"}
+    assert store._reference_cache["codes"] is own

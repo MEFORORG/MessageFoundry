@@ -3531,8 +3531,9 @@ class PostgresStore:
     ) -> tuple[dict[str, MutableMapping[str, Any]], dict[str, str]]:
         """Read every set's ACTIVE snapshot (rows + version) from the shared store, decrypting values.
 
-        The shared JOIN/decrypt logic behind both the open-time :meth:`_load_reference_cache` and the
-        follower :meth:`converge_reference_cache`. Drives from ``reference_version`` (the authoritative
+        The open-time :meth:`_load_reference_cache` reads through this; the follower
+        :meth:`converge_reference_cache` calls its two halves, :meth:`_reference_rows` and
+        :meth:`_decode_reference_rows`, itself. Drives from ``reference_version`` (the authoritative
         active-version list) LEFT JOIN ``reference`` so a set synced to ZERO rows is still a present
         empty ``{}``. Returns ``({name: {key: value}}, {name: version})``, each set sealed (BACKLOG
         #1174)."""
@@ -3582,12 +3583,12 @@ class PostgresStore:
         versions already match (the leader's own just-written sets). Returns the names refreshed
         (``[]`` when none advanced). The runner only calls this when clustered
         (``coordinator.is_clustered()``), so single-node Postgres never issues this read."""
-        rows = await self._reference_rows()
-        # The versions this handle held when the read returned. Under a cipher that blocks on I/O
-        # the decrypt below suspends (BACKLOG #3929), and this handle's own sync may commit a newer
-        # snapshot meanwhile; a set whose held version moved is left as that sync wrote it, so the
-        # compare is the one made right after the read, as when the decrypt ran inline.
+        # The versions this handle held before the read. The read awaits, and under a cipher that
+        # blocks on I/O so does the decrypt below (BACKLOG #3929); this handle's own sync or purge
+        # may land meanwhile. A set whose held version moved is left as that write left it, for the
+        # next converge to compare again.
         held = dict(self._reference_versions)
+        rows = await self._reference_rows()
         cache, versions = await cipher_call(self._cipher, self._decode_reference_rows, rows)
         refreshed: list[str] = []
         for name, version in versions.items():
