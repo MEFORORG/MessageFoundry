@@ -2993,31 +2993,6 @@ def test_prove_absences_screen_keeps_a_staticmethod_beside_an_unnamed_decorator(
     assert _screen("class C(C):\n    @deco\n    def m(this, x): ...\n", method, tmp_path) == []
 
 
-def test_prove_absences_screen_reads_star_args_as_taking_the_bound_value(tmp_path: Path) -> None:
-    """A method ``def m(*args)`` takes the bound value in ``*args``, so every call ``def m(self,
-    *args)`` takes, it takes too. With a named parameter after the bound one, as a
-    ``staticmethod``, or beside a decorator the screen cannot name, it is still a different shape.
-    """
-    assert (
-        _screen(
-            "class C(C):\n    def m(*args): ...\n",
-            "class C:\n    def m(self, *args): ...\n",
-            tmp_path,
-        )
-        == []
-    )
-    assert _refused(
-        "class C(C):\n    def m(*args): ...\n",
-        "class C:\n    def m(self, x, *args): ...\n",
-        tmp_path,
-    )
-    static = "class C:\n    @staticmethod\n    def m(x, *args): ...\n"
-    assert _refused("class C(C):\n    @staticmethod\n    def m(*args): ...\n", static, tmp_path)
-    # An unnamed decorator may return a staticmethod, whose first parameter callers pass.
-    wraps = "def deco(f):\n    return staticmethod(f)\n\nclass C:\n    @deco\n    def m(x, *args): ...\n"
-    assert _refused("class C(C):\n    @deco\n    def m(*args): ...\n", wraps, tmp_path)
-
-
 def test_signature_fields_name_every_signature_value() -> None:
     """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
     assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))

@@ -2653,11 +2653,6 @@ class _Reading:
         whether or not :meth:`pair` compares their decorators."""
         return all("builtins.staticmethod" in self.decorators.get(n, ()) for n in (m, s))
 
-    def all_shape(self, m: _DefNode, s: _DefNode) -> bool:
-        """Whether every decorator of `m` and of `s` resolved to a :data:`_SHAPE_DECORATORS` entry,
-        so nothing this reading cannot see changes what either name is bound to."""
-        return all(len(self.decorators.get(n, ())) == len(n.decorator_list) for n in (m, s))
-
     classes: dict[ast.ClassDef, _ScopeState] = field(default_factory=dict)
 
 
@@ -3033,7 +3028,6 @@ def _signature(
     *,
     method: bool = False,
     static: bool | None = None,
-    fold: bool = False,
 ) -> tuple[object, ...]:
     """The call-compatible shape of a signature: what a CALL SITE can observe, one value per
     :data:`_SIGNATURE_FIELDS` entry.
@@ -3055,22 +3049,17 @@ def _signature(
 
     For a ``method`` other than a ``staticmethod``, the first parameter is bound, never passed by a
     caller, so neither its name nor whether it is positional-only is part of the shape (``self``,
-    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``. With `fold`,
-    a method with no positional parameter but a ``*args`` gets the bound value in ``*args``, so
-    ``(*args)`` and ``(self, *args)`` are one shape too. `static` says whether `fn` is a
-    ``staticmethod``; when it is ``None``, `decorators` says.
+    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``. `static`
+    says whether `fn` is a ``staticmethod``; when it is ``None``, `decorators` says.
     """
     args = fn.args
     posonly = [p.arg for p in args.posonlyargs]
     positional = [p.arg for p in args.args]
     if static is None:
         static = "builtins.staticmethod" in decorators
-    if method and not static:
-        if posonly or positional:
-            (posonly if posonly else positional).pop(0)
-            posonly.insert(0, "<bound>")
-        elif fold and args.vararg:
-            posonly.insert(0, "<bound>")
+    if method and not static and (posonly or positional):
+        (posonly if posonly else positional).pop(0)
+        posonly.insert(0, "<bound>")
     return (
         isinstance(fn, ast.AsyncFunctionDef),
         _is_generator(fn),
@@ -3111,10 +3100,8 @@ def _node_mismatch(
     assert not isinstance(m, ast.ClassDef) and not isinstance(s, ast.ClassDef)
     mdecs, sdecs = reading.pair(m, s)
     static = reading.both_static(m, s) or None
-    # The *args fold only where every decorator is named, so no unnamed staticmethod hides.
-    fold = reading.all_shape(m, s)
-    mine = _signature(m, mdecs, method=method, static=static, fold=fold)
-    live = _signature(s, sdecs, method=method, static=static, fold=fold)
+    mine = _signature(m, mdecs, method=method, static=static)
+    live = _signature(s, sdecs, method=method, static=static)
     return None if mine == live else _signature_clause(qual, path, mine, live)
 
 
