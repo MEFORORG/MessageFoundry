@@ -97,7 +97,7 @@ def _workflow_state(entry: object) -> tuple[str, str]:
 
 
 def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, str]:
-    """``{workflow filename: state}`` for every workflow in the repo.
+    """``{workflow filename: state}`` for every workflow file directly in ``.github/workflows``.
 
     Keyed on the FILENAME rather than the display name: the display name is what ``workflow_run``
     matches on, but a required context resolves to a FILE, and two workflows may legitimately share a
@@ -110,14 +110,17 @@ def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, st
         # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
         route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
         payload = gh_api(["--paginate", "--slurp", route])
-    # Only a file directly in .github/workflows can own a required context: the list also carries
-    # `dynamic/` entries, and matching on the basename alone would let one stand in for a real file.
-    # A repeat that disagrees is refused, because last-wins could overwrite a disabled state.
+    # Only a file directly in .github/workflows can own a required context. The list also carries
+    # GitHub's `dynamic/` entries, skipped so a basename match cannot let one stand in for a real
+    # file; any other path is malformed. A repeat that disagrees is refused, because last-wins could
+    # overwrite a disabled state.
     states: dict[str, str] = {}
     for path, state in map(_workflow_state, _workflow_entries(payload)):
         where = PurePosixPath(path)
-        if where.parent != _WORKFLOW_DIR:
+        if where.parts[:1] == ("dynamic",):  # a slice: the path "." has no parts
             continue
+        if where.parent != _WORKFLOW_DIR:
+            raise RuntimeError(f"workflow path {path!r} is outside {_WORKFLOW_DIR}")
         if states.setdefault(where.name, state) != state:
             raise RuntimeError(f"workflow {where.name} is listed with conflicting states")
     return states
@@ -155,7 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not states:
         print(
-            "::error::the API returned ZERO workflows — refusing to report success.",
+            "::error::the API returned ZERO workflows in .github/workflows — refusing to report "
+            "success.",
             file=sys.stderr,
         )
         return 2

@@ -187,6 +187,21 @@ def test_a_failed_gh_read_exits_2(
     assert main(["--repo", "owner/name"]) == 2
 
 
+@pytest.mark.parametrize(
+    ("argv", "route"),
+    [
+        pytest.param(["--repo", "owner/name"], "repos/owner/name/actions/workflows", id="named"),
+        pytest.param([], "repos/{owner}/{repo}/actions/workflows", id="default"),
+    ],
+)
+def test_the_gh_route(monkeypatch: pytest.MonkeyPatch, argv: list[str], route: str) -> None:
+    calls = _stub_gh(monkeypatch, json.dumps([{"workflows": _active_entries()}]))
+    assert main(argv) == 0
+    cmd = calls[0]["cmd"]
+    assert isinstance(cmd, list)
+    assert cmd[-1] == route
+
+
 def test_a_gh_timeout_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(cmd, 120)
@@ -255,6 +270,14 @@ _GOOD = {"path": ".github/workflows/ci.yml", "state": "active"}
         pytest.param({"workflows": [{"path": "ci.yml", "state": ""}]}, id="state-empty"),
         pytest.param({"workflows": [{"path": "   ", "state": "active"}]}, id="path-blank"),
         pytest.param({"workflows": [{"path": "ci.yml", "state": "   "}]}, id="state-blank"),
+        pytest.param(
+            {"workflows": [{"path": " .github/workflows/ci.yml", "state": "active"}]},
+            id="path-outside-directory",
+        ),
+        pytest.param(
+            {"workflows": [{"path": "dynamic/x/y", "state": "active"}]}, id="only-dynamic"
+        ),
+        pytest.param({"workflows": [{"path": ".", "state": "active"}]}, id="path-with-no-parts"),
         pytest.param([], id="empty-list"),
         pytest.param(["ci.yml"], id="list-of-strings"),
         pytest.param([None], id="list-of-null"),
