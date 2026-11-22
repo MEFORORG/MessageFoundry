@@ -46,6 +46,7 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
+from messagefoundry.store.custody import _WRAP_BYTES
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     OPEN_STORE_PIN,
@@ -865,10 +866,6 @@ async def a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused(
             await keyless.close()
 
 
-#: The bytes of a version 1 recovery wrap, which ``audit_genesis_detail`` holds a wrap to.
-_RECOVERY_WRAP_BYTES: Final = 65
-
-
 class _EveryRecord(logging.Handler):
     """Each record that reaches the root logger, as a formatter renders it, traceback included."""
 
@@ -886,9 +883,14 @@ async def a_minted_genesis_rows_recovery_wrap_stays_out_of_the_log(b: ChainBacke
     The positive controls: the row read back holds the wrap, and the tee did copy the row."""
     await b.reset()
     store_id = bytes(range(STORE_ID_BYTES))
-    wrap = bytes(range(0x80, 0x80 + _RECOVERY_WRAP_BYTES))
+    wrap = bytes(range(0x80, 0x80 + _WRAP_BYTES))
     capture = _EveryRecord()
     root = logging.getLogger()
+    # INFO, the default [logging].level, so a logger left at the root's level makes its INFO records
+    # for the check. Not DEBUG: at DEBUG the database driver's own logger can write a statement's
+    # parameters, the row's detail among them, which is not the tee's copy.
+    level = root.level
+    root.setLevel(logging.INFO)
     root.addHandler(capture)
     pinned = OPEN_STORE_PIN.set(StorePin(store_id, frozenset({store_id}), wrap))
     try:
@@ -897,6 +899,7 @@ async def a_minted_genesis_rows_recovery_wrap_stays_out_of_the_log(b: ChainBacke
     finally:
         OPEN_STORE_PIN.reset(pinned)
         root.removeHandler(capture)
+        root.setLevel(level)
     genesis = (await _chain(b))[0]
     label = parse_audit_genesis_store_id(genesis["detail"])
     assert label == AuditGenesisStoreId(store_id, refused=False, recovery_wrap=wrap), b.name

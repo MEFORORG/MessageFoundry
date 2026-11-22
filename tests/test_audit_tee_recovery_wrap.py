@@ -28,25 +28,17 @@ from messagefoundry.store import audit_tee
 from messagefoundry.store import store as store_module
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.crypto import STORE_ID_BYTES
+from messagefoundry.store.custody import _WRAP_BYTES
 from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION, audit_genesis_detail
-from tests.test_audit_offbox_tee import _handlerless_process
+from tests.test_audit_offbox_tee import _handlerless_process, _ListHandler
 
 _STORE_ID = bytes(range(STORE_ID_BYTES))
-_WRAP = bytes(range(0x40, 0x40 + 65))
+_WRAP = bytes(range(0x40, 0x40 + _WRAP_BYTES))
 _GENESIS = audit_genesis_detail("d2e36e3289bcfa5b", _STORE_ID, _WRAP)
 
 
-class _Lines(logging.Handler):
-    def __init__(self) -> None:
-        super().__init__()
-        self.lines: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.lines.append(record.getMessage())
-
-
 def _tee(detail: str | None) -> list[str]:
-    handler = _Lines()
+    handler = _ListHandler()
     logger = logging.getLogger("messagefoundry.audit")
     logger.addHandler(handler)
     try:
@@ -62,7 +54,7 @@ def _tee(detail: str | None) -> list[str]:
         )
     finally:
         logger.removeHandler(handler)
-    return handler.lines
+    return handler.messages
 
 
 def test_the_withheld_field_is_the_name_the_genesis_writer_uses() -> None:
@@ -97,29 +89,57 @@ def test_the_wrap_is_withheld_where_the_length_bound_does_not_cut_it(monkeypatch
     assert json.loads(json.loads(line)["detail"])["recovery_wrap"] == "<withheld>"
 
 
+def test_a_nested_wrap_is_withheld_and_the_rest_of_the_detail_kept() -> None:
+    record = {"outer": {"recovery_wrap": _WRAP.hex(), "n": 1}, "list": [{"recovery_wrap": "x"}]}
+    (line,) = _tee(json.dumps(record))
+    assert _WRAP.hex() not in line
+    withheld = {"recovery_wrap": "<withheld>"}
+    assert json.loads(json.loads(line)["detail"]) == {
+        "outer": {**withheld, "n": 1},
+        "list": [withheld],
+    }
+
+
 @pytest.mark.parametrize(
     "detail",
     [
-        json.dumps({"outer": {"recovery_wrap": _WRAP.hex()}, "list": [{"recovery_wrap": "x"}]}),
-        # Names the field but is not JSON, or nests too deep to read: the whole detail is withheld.
-        f'{{"recovery_wrap": "{_WRAP.hex()}"',
-        "[" * 100_000 + f'"recovery_wrap {_WRAP.hex()}"' + "]" * 100_000,
-        # Or quotes the name where it is not a key: the whole detail is withheld.
-        json.dumps({"error": f"recovery_wrap={_WRAP.hex()}"}),
-        json.dumps(f"recovery_wrap {_WRAP.hex()}"),
+        # A name, a reason or text that only quotes the field name is left alone, so a typed name
+        # cannot blank a row's copy.
+        json.dumps({"username": "svc_recovery_wrap", "roles": ["Administrator"]}),
+        json.dumps({"error": "no recovery_wrap"}),
+        "not JSON: recovery_wrap",
     ],
-    ids=["nested", "unparsed", "deep", "in-a-value", "a-json-string"],
+    ids=["a-username", "a-value", "not-json"],
 )
-def test_a_detail_naming_the_field_anywhere_ships_without_its_value(detail: str) -> None:
-    (line,) = _tee(detail)
-    assert _WRAP.hex() not in line
-    assert "<withheld>" in line
+def test_a_detail_that_only_quotes_the_name_is_left_alone(detail: str) -> None:
+    assert audit_tee._withhold_detail(detail) is detail
 
 
 def test_a_detail_that_names_no_withheld_field_is_left_alone() -> None:
     detail = json.dumps({"n": 1, "store_id": _STORE_ID.hex()})
     assert audit_tee._withhold_detail(detail) is detail
     assert audit_tee._withhold_detail(None) is None
+
+
+def test_a_held_key_is_re_encoded_as_the_genesis_writer_encodes_it() -> None:
+    """``json.dumps``'s defaults, so an escaped U+2028 stays escaped."""
+    kept = audit_tee._withhold_detail(json.dumps({"recovery_wrap": "x", "s": "a b"}))
+    assert kept == json.dumps({"recovery_wrap": "<withheld>", "s": "a b"})
+    assert kept is not None and " " not in kept
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "[" * 100_000 + f'{{"recovery_wrap": "{_WRAP.hex()}"}}' + "]" * 100_000,
+        f'{{"recovery_wrap": "{_WRAP.hex()}", "n": 1e999}}',
+    ],
+    ids=["too-deep-to-read", "out-of-range-number"],
+)
+def test_a_fault_while_withholding_withholds_the_whole_detail(detail: str) -> None:
+    (line,) = _tee(detail)
+    assert _WRAP.hex() not in line
+    assert json.loads(json.loads(line)["detail"]) == {"withheld": "<withheld>"}
 
 
 def test_an_observer_is_passed_the_rows_own_detail(monkeypatch) -> None:
