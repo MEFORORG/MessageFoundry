@@ -57,7 +57,7 @@ class IntakeContext:
     """Who handed the engine one body, as the source saw it.
 
     A listen source fills the peer fields from the accepted socket; a poll source has no peer and
-    fills :attr:`source` with the path or server it read. A ``None`` field is left out of the stored
+    fills :attr:`source` with where it read the body. A ``None`` field is left out of the stored
     record; what ``None`` means is on each field."""
 
     #: The source's transport, lower case, such as ``"mllp"``, ``"tcp"`` or ``"file"``.
@@ -75,7 +75,7 @@ class IntakeContext:
     #: ``True`` when the inbound has a ``source_ip_allowlist`` and the peer was on it; ``None`` when
     #: the inbound has none, so the address was not screened.
     address_listed: bool | None = None
-    #: A poll source's origin: the file path, or the remote server and path, it read the body from.
+    #: A poll source's origin, such as the file path the File source read the body from.
     source: str | None = None
 
     def fields(self) -> dict[str, Any]:

@@ -3,9 +3,10 @@
 """Pure helpers for the per-message metadata bag (BACKLOG #150, ADR 0081).
 
 The ``messages.metadata`` column is a single encrypted JSON object per message. It carries two kinds of
-key: engine-internal keys (ADR 0013 correlation lineage — ``correlation_id`` / ``correlation_root_id`` /
-``correlation_depth`` / ``passthrough_from`` / ``reingress_of_seq``), the intake context under the
-reserved :data:`INTAKE_KEY` (vault BACKLOG #2607), and, under a reserved ``"user"`` sub-key, the
+key: engine-internal keys (at least the ADR 0013 correlation lineage — ``correlation_id`` /
+``correlation_root_id`` / ``correlation_depth`` / ``passthrough_from`` / ``reingress_of_seq`` — and the
+intake context under the reserved :data:`INTAKE_KEY`, vault BACKLOG #2607) and, under a reserved
+``"user"`` sub-key, the
 operator/handler-attached bag written by :class:`~messagefoundry.config.wiring.SetMeta`.
 
 :func:`merge_user_metadata` and :func:`user_metadata` shape the split between the ``"user"`` bag and

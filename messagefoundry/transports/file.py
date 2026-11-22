@@ -1569,7 +1569,9 @@ class FileSource(SourceConnector):
             with self._store_call():
                 # Vault BACKLOG #2607: a poll source has no peer, so its intake context is the
                 # path it read.
-                completed = await self._emit(raw, IntakeContext(transport="file", source=str(path)))
+                completed = await self._emit(
+                    raw, IntakeContext(transport="file", source=str(path.absolute()))
+                )
         except Exception as exc:
             # The handler records every message-level outcome (parse/validation/routing → ERROR)
             # itself and returns, so an exception escaping here is an infrastructure failure: the
