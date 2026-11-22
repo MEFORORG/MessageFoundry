@@ -113,9 +113,9 @@ from messagefoundry.config.wiring import (
     EnvRef,
     Registry,
     WiringError,
-    _db_setting,
     _is_secret_header,
     _peer_label,
+    _resolved_setting,
     guarded_env_values,
     static_credential_db_hops,
 )
@@ -281,7 +281,7 @@ def _http_literal_static(
     A table counts only as a ``dict``, the one type every connector's header builder sends.
 
     An ``env()`` reference standing for the whole ``headers`` table, or for the ``url``, is read as
-    the build resolves it (``config.wiring._db_setting``), against ``env_values``, else its literal
+    the build resolves it (``config.wiring._resolved_setting``), against ``env_values``, else its literal
     ``default=``. A ``headers`` reference this reading cannot resolve is listed as possibly a
     credential, as ``static_credential_db_hops`` lists an unresolved dialect, so ``messagefoundry
     check``, which passes no values, does not report as credential-free a hop the serve-time guard
@@ -301,7 +301,7 @@ def _http_literal_static(
 
     out: list[str] = []
     values = env_values or {}
-    headers = _db_setting(settings, "headers", None, values)
+    headers = _resolved_setting(settings, "headers", None, values)
     if headers is _UNRESOLVED:
         out.append(
             "possibly a credential in a headers table from env() this reading cannot resolve"
@@ -313,7 +313,7 @@ def _http_literal_static(
         out.append("a credential in the headers table")
     from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
 
-    url = _db_setting(settings, "url", None, values)
+    url = _resolved_setting(settings, "url", None, values)
     if (
         ctype not in URL_QUERY_REFUSED_DESTINATIONS
         and isinstance(url, str)
@@ -367,7 +367,7 @@ def _dicomweb_build_refused(
 
     view: dict[str, Any] = {}
     for key in ("bearer_token", "basic_user", "basic_password", "headers"):
-        value = _db_setting(settings, key, None, env_values)
+        value = _resolved_setting(settings, key, None, env_values)
         if value is _UNRESOLVED:
             return False
         view[key] = value
