@@ -6621,10 +6621,13 @@ class AuthService:
         # TOTP on makes, reachable with neither factor: its refusal would escape ``login`` as an
         # unpadded 500, and a pool wait can outlast the pad, so either would name the account as
         # enrolled to anyone who knows the username. It would also add a locked round trip on the
-        # account's row to every wrong code. So a wrong code makes the store calls a password-only
-        # sign-in makes. A refusal here still escapes unpadded, as before, but only on a code that
-        # matched a step, which already tells its sender the account is enrolled. The ``int``
-        # signature of ``consume_totp_step`` keeps this short-circuit the only form that type-checks.
+        # account's row to every wrong code. So a wrong code makes no ``consume_totp_step`` call. It
+        # still opens the TOTP cell above (``open_totp_secret``), and under a Transit cipher that
+        # open is a round trip to the cipher service: a timing difference this line does not
+        # settle. A refusal here still escapes unpadded, as before, but only on a code that matched
+        # a step. The ``int`` parameter refuses an unconditional call on ``step`` itself, not a
+        # coerced one such as ``step or 0``; ``tests/test_constant_time_frame_totp_passkey.py``
+        # pins the short-circuit.
         code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
@@ -6742,9 +6745,10 @@ class AuthService:
         audit_bad_signature: bool,
     ) -> webauthn.AssertionResult | None:
         """Verify an assertion's signature against stored passkey ``cred``: the new sign count and
-        UV flag, or ``None`` when it is refused. The one copy of the refusal handling both passkey legs share,
-        :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write`` runs each audit
-        row: at once on the second-factor leg, deferred into the failure pad on the sign-in.
+        UV flag, or ``None`` when it is refused. The one copy of the refusal handling both passkey
+        legs share, :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write``
+        runs each audit row: at once on the second-factor leg, deferred into the failure pad on the
+        sign-in.
 
         * A stored key the registration rule refuses (BACKLOG #1963) will never sign in again, so it
           is logged and audited with a fixed slug, never the refusal text, which can quote the key.
@@ -8745,8 +8749,8 @@ class AuthService:
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
                 # window-gated action demands a real step-up: a directory re-bind, or an engine TOTP
                 # or recovery code at the MFA gate, or a user-verified passkey that completes a
-                # pending factor, for a `kerberos` session, since those stamp the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
-                # #296, #2142).
+                # pending factor, for a `kerberos` session, since those stamp the window, and only
+                # the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG #296, #2142).
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
                 # two Kerberos routes disagreed: `GET /ui/sso` passed False while `POST
@@ -16424,13 +16428,13 @@ class AuthService:
         """Whether the caller's session re-verified its credential within
         ``[auth].step_up_max_age_seconds`` -- the gate for sensitive operations (ASVS 7.5.3).
 
-        A LOCAL login that owes no second factor is the first verification. No directory login is:
+        A LOCAL login that owes no second factor is the first verification, unless it comes from an
+        address first seen for the account (BACKLOG #288), which opens no window. A combined
+        sign-in, which proves its code in the same request, opens one. No directory login is:
         Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5). A Kerberos session
         opens one by at least a step-up, a TOTP or recovery code, or a user-verified passkey that
         completes its pending factor (a passkey never renews a window once the factor is met), an
-        OIDC
-        session only by the IdP step-up
-        (BACKLOG #2142)."""
+        OIDC session only by the IdP step-up (BACKLOG #2142)."""
         if not token:
             return False
         session = await self._load_session(hash_token(token))
@@ -18766,8 +18770,10 @@ class AuthService:
                 # a replay, or a second use inside the same step. Returning here cost no argon2
                 # work, while a WRONG code falls through to the recovery-code walk below. Both answer
                 # False, so the wall clock was the only thing telling them apart. So fall through
-                # to the SAME walk (same store read, same hashes, same slot count) and refuse after
-                # it. A success stays fast: it already reveals its outcome.
+                # to the SAME walk (same hashes, same slot count) and refuse after it. A success
+                # stays fast: it already reveals its outcome. The two still differ by at least one
+                # store call: a wrong code matched no step, so it never reached
+                # ``consume_totp_step``, and ``verify_mfa`` re-reads more for a matched code.
                 totp_refused = True
         normalized = code.upper()  # recovery codes are minted uppercase
         # The hashes the account's seal covered, not a second read nobody checked (BACKLOG #2592).
@@ -19838,18 +19844,20 @@ class AuthService:
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
         factor satisfied and re-key the session (ASVS 7.2.4). The same factor write, when the row it
-        reads in its own transaction has not met its factor, also re-anchors the session to the WP-L3-13 client as
-        :meth:`verify_mfa` does and stamps ``reauth_at`` only when the authenticator reported user
-        verification, clearing it otherwise. A session that had already met its factor when that
-        write ran, and any ``oidc`` session, is neither re-anchored nor stamped (vault BACKLOG #2964
-        item 14, owner rulings 2026-11-14, ADR 0068 amendment of that date). Returns a not-``ok``
-        :class:`Elevation` (never raises) for any invalid input, always audited.
+        reads in its own transaction has not met its factor, also re-anchors the session to the
+        WP-L3-13 client as :meth:`verify_mfa` does and stamps ``reauth_at`` only when the
+        authenticator reported user verification, clearing it otherwise. A session that had already
+        met its factor when that write ran, and any ``oidc`` session, is neither re-anchored nor
+        stamped (vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068 amendment of that
+        date). Returns a not-``ok`` :class:`Elevation` (never raises) for any invalid input, always
+        audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
-        what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
-        0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
-        secrets and a flaky authenticator must not lock the account; abuse is bounded by the
-        route's ``allow_reauth_attempt`` gate + cookie-holder-only reachability + these audits.
+        what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from
+        :meth:`verify_mfa`** (recorded in ADR 0068): assertion failures do NOT feed
+        ``_register_failure`` — signatures are not guessable secrets and a flaky authenticator must
+        not lock the account; abuse is bounded by the route's ``allow_reauth_attempt`` gate +
+        cookie-holder-only reachability + these audits.
 
         A successful assertion DOES clear the failure counter (BACKLOG #1638). That is the other
         direction and the divergence does not cover it — see the call site.
@@ -19983,7 +19991,7 @@ class AuthService:
             )
             if isinstance(fresh, Elevation):
                 return fresh
-            settled = fresh.cred_digest == user.cred_digest
+            settled = constant_time_equal(fresh.cred_digest, user.cred_digest)
             user = fresh
             if settled or standing != "held":
                 break

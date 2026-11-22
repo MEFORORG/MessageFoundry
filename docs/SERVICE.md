@@ -487,10 +487,12 @@ directory to the service account only, as the installer does.
 
 The engine resolves the account with `LookupAccountSid` each time it opens the store. It refuses
 the directory at least when the lookup fails, when the account resolves to anything but a user, such as a
-group, or when the directory names a second account. A refused directory gets a store restricted
-by `_secure_file` (see ADR 0163, *Note (2026-11-05)*), and the engine logs a WARNING naming the
-reason. Then the service and the operator who provisions the first Administrator can lock each
-other out of the store.
+group, or when the directory names a second account, and logs a WARNING naming the reason. In a
+refused directory the engine tries to remove each store file's inherited entries and grant the
+account that opened the store full control of it, and any other entry set on the file itself
+stays (see ADR 0163, *Note (2026-11-05)*). Where that fails, the file keeps the entries it
+inherited, and the engine logs a WARNING. With that fallback, the service and the operator who
+provisions the first Administrator can lock each other out of the store.
 
 At least these are unmeasured:
 
@@ -501,8 +503,8 @@ At least these are unmeasured:
 - **A start with no domain controller.** A gMSA resolves through a domain controller, or through
   the local lookup cache when no controller answers, and a slow or absent controller can delay
   the open or fail the lookup. A later start does not always repair what a failed lookup leaves.
-  Why a time-out can read as an account that does not exist, and what a store restricted by
-  `_secure_file` leaves on each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
+  Why a time-out can read as an account that does not exist, and what that restriction leaves on
+  each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 
@@ -561,7 +563,8 @@ What that changes for you:
 - **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
   leaves the user's site directory out. Install into a virtual environment.
 - **`messagefoundry serve` from a prompt has remote debugging on** unless its environment sets
-  `PYTHON_DISABLE_REMOTE_DEBUG`, so under `enforce` the start refusal for it stops the engine
+  `PYTHON_DISABLE_REMOTE_DEBUG`; give it a non-empty value, such as 1, since some shells delete a
+  variable set to an empty value. With remote debugging on, under `enforce` the start refusal for it stops the engine
   unless `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). The variable works
   there only because the console script passes neither `-I` nor `-E`: a start by hand that keeps
   `-I` and drops `-X disable-remote-debug` has the interface on whatever the variable says, as

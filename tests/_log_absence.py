@@ -16,6 +16,7 @@ through that logger, or that it reached the line that would have logged.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import pytest
 
@@ -36,3 +37,44 @@ def assert_capture_sees(
         f"{log.name!r}, so an absence check over that logger would pass on nothing"
     )
     caplog.records.remove(probes[0])
+
+
+def assert_no_records(
+    caplog: pytest.LogCaptureFixture,
+    logger: str | logging.Logger,
+    pred: Callable[[logging.LogRecord], bool],
+    level: int = logging.WARNING,
+) -> None:
+    """Fail when a captured record from ``logger`` or a child of it matches ``pred``, after
+    :func:`assert_capture_sees_tree` has shown the capture sees ``logger`` and each child created
+    so far at ``level``, so the probe and the absence check cover one set of loggers (vault BACKLOG
+    #3766 item 36)."""
+    log = logger if isinstance(logger, logging.Logger) else logging.getLogger(logger)
+    assert_capture_sees_tree(caplog, log.name, level)
+    # Logger names only, never a message: a check that a value never reaches a log must not print
+    # that value into the failure text.
+    hits = sorted(
+        {
+            r.name
+            for r in caplog.records
+            if (r.name == log.name or r.name.startswith(f"{log.name}.")) and pred(r)
+        }
+    )
+    assert hits == [], f"a record from {hits} matched under {log.name!r}"
+
+
+def assert_capture_sees_tree(
+    caplog: pytest.LogCaptureFixture, root: str, level: int = logging.WARNING
+) -> None:
+    """:func:`assert_capture_sees` for ``root`` and for each logger created under it so far.
+
+    A probe of ``root`` alone does not show that a child's records reach the capture: a child with
+    ``propagate=False``, or a disabled one, would hide them (vault BACKLOG #3766 item 29). A child
+    created after this call is not probed."""
+    names = [
+        name
+        for name, node in list(logging.Logger.manager.loggerDict.items())
+        if isinstance(node, logging.Logger) and (name == root or name.startswith(f"{root}."))
+    ]
+    for name in sorted({root, *names}):
+        assert_capture_sees(caplog, name, level)
