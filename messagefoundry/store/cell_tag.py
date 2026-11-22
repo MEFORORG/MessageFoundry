@@ -81,6 +81,7 @@ __all__ = [
     "NonTextCellError",
     "SealedBlankCellError",
     "UnmarkedCellError",
+    "UnreadableParentMetadataError",
     "audits_cell_tag",
     "dead_letter_on_cell_tag",
     "dead_letters_on_cell_tag",
@@ -261,6 +262,18 @@ class CorruptCellError(CellTagError):
         return (
             f"the {self.table}.{self.column} cell of row {self.row_ref} is corrupt and cannot be"
             " read under the key it names"
+        )
+
+
+class UnreadableParentMetadataError(CorruptCellError):
+    """A pass-through parent's ``metadata`` cell opened, but its text is not a JSON object with a
+    usable ``correlation_depth`` (BACKLOG #5758). Contained as a corrupt cell is: the handoff
+    dead-letters the row rather than re-pending one that fails forever."""
+
+    def _describe(self) -> str:
+        return (
+            f"the {self.table}.{self.column} cell of row {self.row_ref} opened but does not hold"
+            " readable correlation metadata"
         )
 
 

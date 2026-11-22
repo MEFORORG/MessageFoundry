@@ -112,6 +112,7 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.cell_tag import (
     CellTagError,
+    UnreadableParentMetadataError,
     audits_cell_tag,
     dead_letters_on_cell_tag,
     is_row_tagged,
@@ -1396,16 +1397,31 @@ def _finalize_from_message_status(mrows: Sequence[Any]) -> tuple[str, str | None
     return ("update", MessageStatus.FILTERED.value)
 
 
-def _parent_meta_from_row(pmeta_json: str | None) -> dict[str, Any]:
-    """Decode a PT parent's ``metadata`` (already decrypted) into a dict for depth computation — absent
-    / non-dict -> ``{}`` (depth 0). Shared by the async + sync transform twins so the lineage parse
-    can never drift."""
-    parent_meta: dict[str, Any] = {}
-    if pmeta_json:
+def _parent_meta_from_row(
+    pmeta_json: str | None, *, message_id: str, channel_id: str
+) -> dict[str, Any]:
+    """Decode a PT parent's ``metadata`` (already decrypted) into a dict for depth computation —
+    absent -> ``{}`` (depth 0). A cell the depth read cannot use raises
+    :class:`UnreadableParentMetadataError`, so the handoff dead-letters it (BACKLOG #5758). Shared
+    by the async + sync transform twins so the lineage parse can never drift."""
+    if not pmeta_json:
+        return {}
+    loaded: Any = None
+    try:
         loaded = json.loads(pmeta_json)
         if isinstance(loaded, dict):
-            parent_meta = loaded
-    return parent_meta
+            int(loaded.get("correlation_depth", 0) or 0)
+            # The child re-encodes this root, and a nested one can overflow that.
+            if not isinstance(loaded.get("correlation_root_id") or "", str):
+                loaded = None
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        loaded = None
+    if not isinstance(loaded, dict):
+        # Raised outside the except: json's error holds the whole cell.
+        err = UnreadableParentMetadataError("messages", "metadata", message_id, channel_id)
+        log.warning("%s; the handoff was refused", str(err))
+        raise err
+    return loaded
 
 
 def _close_sync_cursor(cur: Any) -> None:
@@ -8002,7 +8018,9 @@ class SqlServerStore:
                             channel_id=msg_channel,
                         )
                 if pt_deliveries:
-                    parent_meta = _parent_meta_from_row(pmeta_dec)
+                    parent_meta = _parent_meta_from_row(
+                        pmeta_dec, message_id=message_id, channel_id=msg_channel
+                    )
                     inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_mssql(
@@ -8213,7 +8231,9 @@ class SqlServerStore:
                         channel_id=msg_channel,
                     )
             if pt_deliveries:
-                parent_meta = _parent_meta_from_row(pmeta_dec)
+                parent_meta = _parent_meta_from_row(
+                    pmeta_dec, message_id=message_id, channel_id=msg_channel
+                )
                 inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = self._insert_passthrough_child_mssql_sync(

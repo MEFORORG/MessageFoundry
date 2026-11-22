@@ -123,6 +123,7 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.cell_tag import (
     CellTagError,
+    UnreadableParentMetadataError,
     audits_cell_tag,
     dead_letters_on_cell_tag,
     is_row_tagged,
@@ -5122,9 +5123,25 @@ class PostgresStore:
                 if pt_deliveries:
                     parent_meta: dict[str, Any] = {}
                     if pmeta_json:
-                        loaded = json.loads(pmeta_json)
-                        if isinstance(loaded, dict):
-                            parent_meta = loaded
+                        # BACKLOG #5758: a cell the depth read below cannot use is content, so it
+                        # dead-letters. Raised outside the except: json's error holds the whole cell.
+                        loaded: Any = None
+                        try:
+                            loaded = json.loads(pmeta_json)
+                            if isinstance(loaded, dict):
+                                int(loaded.get("correlation_depth", 0) or 0)
+                                # The child re-encodes this root; a nested one can overflow that.
+                                if not isinstance(loaded.get("correlation_root_id") or "", str):
+                                    loaded = None
+                        except (ValueError, TypeError, OverflowError, RecursionError):
+                            loaded = None
+                        if not isinstance(loaded, dict):
+                            err = UnreadableParentMetadataError(
+                                "messages", "metadata", message_id, msg_channel
+                            )
+                            log.warning("%s; the handoff was refused", str(err))
+                            raise err
+                        parent_meta = loaded
                     inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_pg(
@@ -5143,7 +5160,9 @@ class PostgresStore:
                         )
                     # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                     await self._inherit_attachments(conn, message_id, inherits)
-                for namespace, key, value in state_ops:
+                # Sorted by (namespace, key) only, as SQL Server does: one lock order across
+                # concurrent handoffs (BACKLOG #5758). The values do not order; the sort is stable.
+                for namespace, key, value in sorted(state_ops, key=lambda op: (op[0], op[1])):
                     value_json = json.dumps(value)
                     await self._apply_state_op(conn, namespace, key, value_json, message_id, now)
                     applied.append(((namespace, key), value))

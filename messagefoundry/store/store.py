@@ -109,6 +109,7 @@ from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.cell_tag import (
     CellTagError,
+    UnreadableParentMetadataError,
     audits_cell_tag,
     dead_letters_on_cell_tag,
     is_row_tagged,
@@ -14910,9 +14911,25 @@ class MessageStore:
             if pt_deliveries:
                 parent_meta: dict[str, Any] = {}
                 if pmeta_json:
-                    loaded = json.loads(pmeta_json)
-                    if isinstance(loaded, dict):
-                        parent_meta = loaded
+                    # BACKLOG #5758: a cell the depth read below cannot use is content, so it
+                    # dead-letters. Raised outside the except: json's error holds the whole cell.
+                    loaded: Any = None
+                    try:
+                        loaded = json.loads(pmeta_json)
+                        if isinstance(loaded, dict):
+                            int(loaded.get("correlation_depth", 0) or 0)
+                            # The child re-encodes this root, and a nested one can overflow that.
+                            if not isinstance(loaded.get("correlation_root_id") or "", str):
+                                loaded = None
+                    except (ValueError, TypeError, OverflowError, RecursionError):
+                        loaded = None
+                    if not isinstance(loaded, dict):
+                        err = UnreadableParentMetadataError(
+                            "messages", "metadata", message_id, msg_channel
+                        )
+                        log.warning("%s; the handoff was refused", str(err))
+                        raise err
+                    parent_meta = loaded
                 inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = await self._insert_passthrough_child(
