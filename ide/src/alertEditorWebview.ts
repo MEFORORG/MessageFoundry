@@ -75,19 +75,16 @@ export function alertEditorScript(
     function invalid(msg) { show(removeIsOff() ? msg + ' ' + REMOVE_OFF : msg); return false; }
     function validate(rule) {
       if (!rule.connection) { return invalid('Connection is required (use * for all).'); }
-      for (const [k, label] of [['min_depth','Min depth'],['min_oldest_seconds','Min oldest'],['cooldown_seconds','Cooldown']]) {
-        if (rule[k] !== undefined && !Number.isFinite(rule[k])) { return invalid(label + ' must be a number.'); }
-      }
-      // The engine's own bounds on AlertRule (messagefoundry/config/settings.py, BACKLOG #5831), so a
-      // value the engine would refuse is refused here, before Add, rather than by the CLI after it.
-      if (rule.min_depth !== undefined && !(Number.isInteger(rule.min_depth) && rule.min_depth >= 1)) {
-        return invalid('Min depth must be a whole number of 1 or more.');
-      }
-      if (rule.min_oldest_seconds !== undefined && !(rule.min_oldest_seconds >= 0)) {
-        return invalid('Min oldest must be 0 or more seconds.');
-      }
-      if (rule.cooldown_seconds !== undefined && !(rule.cooldown_seconds > 0 && rule.cooldown_seconds <= COOLDOWN_MAX)) {
-        return invalid('Cooldown must be more than 0 and at most ' + COOLDOWN_MAX + ' seconds.');
+      // Each in-range test is the engine's own bound on AlertRule (messagefoundry/config/settings.py,
+      // BACKLOG #5831), so a value the engine would refuse is refused here, before Add.
+      for (const [k, label, inRange, bound] of [
+        ['min_depth', 'Min depth', (v) => Number.isInteger(v) && v >= 1, 'a whole number of 1 or more'],
+        ['min_oldest_seconds', 'Min oldest', (v) => v >= 0, '0 or more seconds'],
+        ['cooldown_seconds', 'Cooldown', (v) => v > 0 && v <= COOLDOWN_MAX, 'more than 0 and at most ' + COOLDOWN_MAX + ' seconds'],
+      ]) {
+        if (rule[k] === undefined) { continue; }
+        if (!Number.isFinite(rule[k])) { return invalid(label + ' must be a number.'); }
+        if (!inRange(rule[k])) { return invalid(label + ' must be ' + bound + '.'); }
       }
       if (removeIsOff()) { show(REMOVE_OFF); }
       // An error that arrived before any list rendered is all the page has to show under "Current

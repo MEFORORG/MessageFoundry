@@ -105,26 +105,29 @@ const SETTING_NAME_RE = /^\[[a-z0-9_]{1,64}\]\.[a-z0-9_]{1,64}$/;
  */
 const STEP_LABEL_RE = /^[a-z0-9_]{1,64}$/;
 
+/** `value` as a list of server strings each matching `re`, or undefined for any other shape. The
+ *  one gate on server text bound for a notification, so each list is checked the same way. */
+function printableList(value: unknown, re: RegExp): string[] | undefined {
+  return Array.isArray(value) && value.every((v) => typeof v === "string" && re.test(v))
+    ? (value as string[])
+    : undefined;
+}
+
 /** The degraded sentence, or none for a reload whose follow-on steps all completed. The engine
  *  sends `degraded` on every reply, so a missing or non-boolean value is unreadable, not clean. */
 function degradedShortfall(r: ReloadResult): string[] {
   if (r.degraded === false) {
     return [];
   }
-  const steps = r.failures;
-  if (
-    r.degraded !== true ||
-    !Array.isArray(steps) ||
-    steps.length === 0 ||
-    !steps.every((step) => typeof step === "string" && STEP_LABEL_RE.test(step))
-  ) {
+  const steps = printableList(r.failures, STEP_LABEL_RE);
+  if (r.degraded !== true || steps === undefined || steps.length === 0) {
     return [
-      "check the engine's log for a follow-on step that failed after the swap: the engine's " +
+      "Check the engine's log for a follow-on step that failed after the swap: the engine's " +
         "report of them could not be read.",
     ];
   }
   return [
-    `finish by hand the follow-on steps that failed after the swap: ${steps.join(", ")}. ` +
+    `Finish by hand the follow-on steps that failed after the swap: ${steps.join(", ")}. ` +
       "The new graph is live.",
   ];
 }
@@ -132,23 +135,19 @@ function degradedShortfall(r: ReloadResult): string[] {
 /**
  * The sentences for what a live swap left to do, as far as this reply says. A list, as in the web
  * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, #5836) sits beside the restart
- * sentence, ahead of it as there. An entry that starts a sentence starts lower-case, so the first,
- * which leads the notification, reads on from the message's prefix; the caller capitalises the rest. This reads applied replies only, so null or no value is unreadable, as any other
- * shape is. An unreadable list keeps the counts and says so: the swap did happen, and it must not
- * read as a clean promote.
+ * sentence, ahead of it as there. This reads applied replies only, so null or no value is
+ * unreadable, as any other shape is. An unreadable list keeps the counts and says so: the swap did
+ * happen, and it must not read as a clean promote.
  */
 function reloadShortfall(r: ReloadResult): string[] {
   return [...degradedShortfall(r), ...restartShortfall(r)];
 }
 
 function restartShortfall(r: ReloadResult): string[] {
-  const names = r.restart_required;
-  if (
-    !Array.isArray(names) ||
-    !names.every((name) => typeof name === "string" && SETTING_NAME_RE.test(name))
-  ) {
+  const names = printableList(r.restart_required, SETTING_NAME_RE);
+  if (names === undefined) {
     return [
-      "check the engine's log for trust anchors that take a restart: the engine's list of them " +
+      "Check the engine's log for trust anchors that take a restart: the engine's list of them " +
         "could not be read.",
     ];
   }
@@ -156,7 +155,7 @@ function restartShortfall(r: ReloadResult): string[] {
     return [];
   }
   return [
-    `restart the engine for ${names.join(", ")}: this reload checked each changed CA file but ` +
+    `Restart the engine for ${names.join(", ")}: this reload checked each changed CA file but ` +
       "does not load it, so the engine still trusts the old CA.",
     'The settings list above is not complete: see the section "Outbound TLS trust anchor" of ' +
       "docs/SECURITY.md in the MessageFoundry repository, at the paragraph " +
@@ -206,10 +205,11 @@ export function promoteOutcomeMessage(
   }
   return {
     level: "warning",
-    text: [`MessageFoundry: ${lead}`, `Promoted ${graph}`, ...rest.map(capitalise)].join(" "),
+    // The lead reads on from the prefix, so only it starts lower-case.
+    text: [
+      `MessageFoundry: ${lead.charAt(0).toLowerCase()}${lead.slice(1)}`,
+      `Promoted ${graph}`,
+      ...rest,
+    ].join(" "),
   };
-}
-
-function capitalise(sentence: string): string {
-  return sentence.charAt(0).toUpperCase() + sentence.slice(1);
 }

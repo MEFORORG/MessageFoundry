@@ -119,4 +119,16 @@ suite("b622 #5831 Alert Rules numeric bounds", () => {
     assert.ok(m, "_ALERT_COOLDOWN_MAX_SECONDS not found in settings.py");
     assert.strictEqual(Number(m[1]), ALERT_COOLDOWN_MAX_SECONDS);
   });
+
+  // The page mirrors these by hand, so a change to any of them on the engine fails here first.
+  test("AlertRule still declares the lower bounds the page mirrors", () => {
+    const source = fs.readFileSync(path.resolve(__dirname, "../../../../messagefoundry/config/settings.py"), "utf8");
+    const rule = source.slice(source.indexOf("class AlertRule(BaseModel):"));
+    assert.match(rule, /min_depth: int \| None = Field\(default=None, ge=1\)/);
+    assert.match(rule, /min_oldest_seconds: float \| None = Field\(\s*default=None, ge=0, allow_inf_nan=False\s*\)/);
+    assert.match(
+      rule,
+      /cooldown_seconds: float \| None = Field\(\s*default=None, gt=0, le=_ALERT_COOLDOWN_MAX_SECONDS, allow_inf_nan=False\s*\)/,
+    );
+  });
 });
