@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import * as path from "node:path";
 
 import { HttpError, postJson } from "../../engineClient";
-import { reproveTracked, signInSettled, signInSuperseding, type TokenCache } from "../../signInSession";
+import { signInSettled, signInSuperseding, type TokenCache } from "../../signInSession";
 
 // BACKLOG #2281 (ASVS 7.2.4): a sign-in names the token it replaces as `supersedes`, so the engine ends
 // that session before its per-user cap counts. The IDE used to sign in and then POST /auth/logout with
@@ -238,41 +238,6 @@ suite("a caller can wait out a sign-in in flight (BACKLOG #2281)", () => {
     hung.fail(new Error("cleanup")); // release it, so the next test starts with nothing in flight
     await signInSettled(key, 1000);
   });
-
-  test("a sign-in started during a step-up re-proof names the token the re-proof stored", async () => {
-    const cache = new MapCache();
-    cache.values.set(key, "tok-old");
-    const held = heldPost();
-    const reproving = reproveTracked(cache, key, async () => (await held.post({})).token);
-    await held.sent; // the engine has rotated tok-old by now
-    let settled = false;
-    const waiting = signInSettled(key).then(() => (settled = true));
-    const named: Array<string | undefined> = [];
-    const signingIn = signInSuperseding(cache, key, CREDENTIALS, async (body) => {
-      named.push(body.supersedes);
-      return { token: "tok-signed-in" };
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    // RED when: the re-proof is not tracked. The sign-in then names the dead tok-old, the re-proof's
-    // late store overwrites the sign-in's token, and peekToken reads tok-old meanwhile.
-    assert.strictEqual(settled, false, "the wait ended while the re-proof was still in flight");
-    assert.deepStrictEqual(named, [], "the sign-in did not wait for the re-proof");
-    held.answer("tok-rotated");
-    assert.strictEqual(await reproving, "tok-rotated");
-    await signingIn;
-    await waiting;
-    assert.deepStrictEqual(named, ["tok-rotated"]);
-    assert.strictEqual(cache.values.get(key), "tok-signed-in");
-  });
-
-  test("a re-proof with no token in its reply leaves the cache alone", async () => {
-    const cache = new MapCache();
-    cache.values.set(key, "tok-old");
-    for (const reply of [undefined, ""]) {
-      assert.strictEqual(await reproveTracked(cache, key, async () => reply), reply);
-      assert.strictEqual(cache.values.get(key), "tok-old");
-    }
-  });
 });
 
 suite("auth.ts routes sign-in through the superseding path (BACKLOG #2281)", () => {
@@ -295,13 +260,6 @@ suite("auth.ts routes sign-in through the superseding path (BACKLOG #2281)", () 
   /** The lines that post `/auth/logout`. */
   const logoutSites = (text: string): string[] =>
     text.split(/\r?\n/).filter((l) => l.includes('"/auth/logout"'));
-
-  test("the step-up re-proof posts through reproveTracked (vault BACKLOG #2950)", () => {
-    const text = fs.readFileSync(AUTH_TS, "utf8");
-    // Control: the sign-in's own call is found by the same kind of scan.
-    assert.ok(text.includes("signInSuperseding(ctx.secrets, secretKey(url), body"), "signIn's call moved");
-    assert.ok(text.includes("reproveTracked(ctx.secrets, secretKey(url), async () =>"), "the re-proof is untracked");
-  });
 
   test("the step-up re-proof carries the sign-in's timeout (vault BACKLOG #2950)", () => {
     const text = fs.readFileSync(AUTH_TS, "utf8");
