@@ -10,6 +10,7 @@ pin the fixed shape, and the per-occurrence ``Message.delete_segments`` the fix 
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -222,4 +223,20 @@ def test_an_obx_before_the_first_obr_is_renumbered_too() -> None:
         "OBX|2|NM|SOD^Sodium^L||140||||||F",
         "OBR|1|ORD1",
         "OBX|1|NM|CHLOR^Chloride^L||101||||||F",
+    ]
+
+
+def test_a_blank_test_code_takes_the_code_sets_blank_mapping(tmp_path: Path) -> None:
+    # origin/main looked a blank OBX-3.1 up as "" (field or ""), so a code set row with a blank
+    # local code remapped it. The component write keeps OBX-3.2 onward as they arrived.
+    config = tmp_path / "results_relay"
+    shutil.copytree(RESULTS_RELAY, config)
+    codes = config / "codesets" / "test_codes.csv"
+    codes.write_text(codes.read_text(encoding="utf-8") + ",UNSPEC\n", encoding="utf-8")
+    raw = _HEAD + r"OBX|1|ST|^Note\T\Text^L||x||||||F" + "\rOBX|2|ST|||y||||||F"
+    payload = dry_run(load_config(config), raw).deliveries[0].payload
+    assert isinstance(payload, str)
+    assert [line for line in payload.split("\r") if line][2:] == [
+        r"OBX|1|ST|UNSPEC^Note\T\Text^L||x||||||F",
+        "OBX|2|ST|UNSPEC||y||||||F",
     ]

@@ -84,7 +84,8 @@ def relay_results(msg):  # type: ignore[no-untyped-def]
         if msg.field("OBX-11", occurrence=i) == "X":  # cancelled / not done -> drop
             _drop_result(msg, i)
             continue
-        local_code = msg.field("OBX-3.1", occurrence=i)
+        # A blank code is looked up as "", so a code set row with a blank local code maps it.
+        local_code = msg.field("OBX-3.1", occurrence=i) or ""
         if local_code in TEST_CODES:  # an unmapped code is left exactly as it arrived
             # A component write escapes the new code and leaves OBX-3.2 onward as they were.
             msg.set("OBX-3.1", TEST_CODES[local_code], occurrence=i)
