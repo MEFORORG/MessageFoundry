@@ -63,6 +63,7 @@ from messagefoundry.transports.framing import (
     frame_for_delivery,
     frame_reply_reporting,
 )
+from messagefoundry.transports.intake import IntakeAuth, IntakeContext, deliver
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_PER_HOST,
@@ -679,6 +680,15 @@ class TcpSource(SourceConnector):
                     receive_timeout=self.receive_timeout,
                 )
                 peer = writer.get_extra_info("peername")  # fixed for the connection
+                # Vault BACKLOG #2607: how this connection was admitted, read once. Raw TCP has
+                # no TLS (ADR 0153 decision 4), so the auth mode and allowlist result are all it records.
+                intake = IntakeContext(
+                    transport="tcp",
+                    auth_mode=IntakeAuth.NONE,
+                    # Admitted here, so the address passed source_ip_allowlist when one is set.
+                    address_listed=True if self.source_ip_allowlist is not None else None,
+                )
+                handler = self._handler
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     # The engine's own waits (pacing, an intake pause) do not spend the frame budget.
@@ -705,7 +715,7 @@ class TcpSource(SourceConnector):
                             decoded += 1
                             fault: str | None = None
                             try:
-                                reply = await self._handler(message)
+                                reply = await deliver(handler, message, intake)
                             except Exception as exc:  # noqa: BLE001 -- see recover_handler_fault
                                 # BACKLOG #5022: the decoder read this frame cleanly, so this is a
                                 # handler fault, not a framing fault. Only the scrubbed text leaves
@@ -716,7 +726,7 @@ class TcpSource(SourceConnector):
                                 failed = True
                                 try:
                                     reply = await recover_handler_fault(
-                                        self._handler,
+                                        lambda raw: deliver(handler, raw, intake),
                                         message,
                                         fault,
                                         owes_reply=owes_hl7_reply(self.ack_mode, self.content_type),
