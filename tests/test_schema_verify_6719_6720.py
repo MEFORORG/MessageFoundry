@@ -686,6 +686,13 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
             id="colon-name-prefix",
         ),
         pytest.param(
+            "view",
+            ("vv", "vv after x"),
+            "error in view vv after x: no such module: m",
+            "vv after x",
+            id="colon-outranks-a-shorter-after",
+        ),
+        pytest.param(
             "trigger",
             ("tr", "tr after"),
             "error in trigger tr after rename: no such module: m",
@@ -704,9 +711,9 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
 async def test_a_prefix_name_is_told_apart_in_the_rename_recheck(
     tmp_path: Path, kind: str, names: tuple[str, str], cause: str, found: str
 ) -> None:
-    # The RENAME COLUMN migration's re-check writes the " after rename" suffix. The causes are
-    # SQLite's form written out, as in the test above, because no healthy view this test can plant
-    # breaks under RENAME COLUMN: SQLite rewrites its reference instead.
+    # The RENAME COLUMN migration's re-check writes the " after rename" suffix. These causes are
+    # written out in SQLite's form rather than raised, so one test can cover a colon name and a
+    # trigger pair without a view or trigger built to break under each.
     from messagefoundry.store.schema_verify import _foreign_object
 
     path = tmp_path / "prefix.db"

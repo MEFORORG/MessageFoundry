@@ -81,10 +81,11 @@ _KEYED_DETAIL = (
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
 # The ALTER re-check names an object other than the altered table that fails to parse as
-# "error in <kind> <name>", then ":" or a suffix such as " after rename". Only views and triggers
-# get the drop remedy (see _ORDINARY_TABLE for why they are another tool's); SQLite uses the same
-# form for a table or an index, which may be this build's own. Dropping a view or a trigger removes
-# no row, so that remedy keeps the store and its key.
+# "error in <kind> <name>", then ":" or a suffix, at least " after rename" and " after drop column"
+# (measured on SQLite 3.50.4). Both start " after ", and _foreign_object's ranking assumes every
+# suffix does. Only views and triggers get the drop remedy (see _ORDINARY_TABLE for why they are
+# another tool's); SQLite uses the same form for a table or an index, which may be this build's own.
+# Dropping a view or a trigger removes no row, so that remedy keeps the store and its key.
 _FOREIGN_OBJECTS_SQL = "SELECT type, name FROM sqlite_master WHERE type IN ('view', 'trigger')"
 
 # The reads below skip a table whose stored SQL is LIKE 'CREATE VIRTUAL TABLE%', because a pragma
