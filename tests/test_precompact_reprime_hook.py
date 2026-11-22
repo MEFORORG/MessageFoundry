@@ -629,6 +629,65 @@ def test_a_newer_goal_with_no_seat_is_restored(repo: Worktree) -> None:
     assert "an older goal" not in out, out
 
 
+@pytest.mark.parametrize("goal", ["   ", "\n", 5, {"k": 1}], ids=["blank", "newline", "int", "obj"])
+def test_a_damaged_goal_does_not_displace_a_good_declaration(repo: Worktree, goal: object) -> None:
+    _declaration(repo, goal="the good goal")
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "newer.json",
+        json.dumps({"seat": "builder", "goal": goal, "branch": _BRANCH, "worktree": repo.top}),
+    )
+
+    assert "GOAL: the good goal" in run_hook(repo, _COMPACT_RESTART)
+
+
+@pytest.mark.parametrize("worktree", [5, True, {"p": "x"}], ids=["int", "bool", "object"])
+def test_a_non_string_worktree_is_counted_not_lost(repo: Worktree, worktree: object) -> None:
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "7001.json",
+        json.dumps({"worktree": worktree}),
+    )
+
+    assert _UNATTRIBUTED_ALLOC in run_hook(repo, _COMPACT_RESTART)
+
+
+def test_a_path_differing_by_a_control_character_is_another_tree(repo: Worktree) -> None:
+    """The worktree is an identity, so display folding must not make two paths compare equal."""
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "7004.json",
+        json.dumps({"worktree": repo.top + "\t"}),
+    )
+
+    assert "#7004" not in run_hook(repo, _COMPACT_RESTART)
+
+
+def test_another_hosts_blank_worktree_record_is_not_counted(repo: Worktree) -> None:
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "7003.json",
+        json.dumps({"worktree": "", "host": "OTHERPC"}),
+    )
+
+    assert _UNATTRIBUTED_ALLOC not in run_hook(repo, _COMPACT_RESTART)
+
+
+def test_a_throw_before_the_ledger_scan_says_it_was_not_checked(
+    repo: Worktree, tmp_path: Path
+) -> None:
+    marker = "\n    if ($declared) {"
+    source = HOOK.read_text(encoding="utf-8")
+    assert source.count(marker) == 1
+    planted = _planted_hook(tmp_path, source.replace(marker, f"\n    throw 'planted'{marker}"))
+    _declaration(repo)
+
+    assert "LEDGER NUMBERS: not fully checked" in run_hook(repo, _COMPACT_RESTART, script=planted)
+
+
 def test_a_throwing_ledger_helper_does_not_empty_the_catch(repo: Worktree, tmp_path: Path) -> None:
     """The helper the catch itself calls can be the one that threw on the main path."""
     marker = "function Get-LedgerLines {\n"

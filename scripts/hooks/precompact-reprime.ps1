@@ -88,7 +88,17 @@ function ConvertTo-OneLine {
     # Record text goes into model context, so a line break inside a field could forge a SEAT or GOAL
     # line of its own. alloc.ps1 folds titles for the same reason (BACKLOG #1040).
     param([string]$Text)
-    return $Text -replace '[\p{Cc}\p{Zl}\p{Zp}]+', ' '
+    return $Text -replace '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+', ' '
+}
+
+function Get-RecordWorktree {
+    # The worktree field exactly as stored, '' unless it is a string. It is an IDENTITY, so it is never
+    # folded: folding would let a record naming a different path match this tree.
+    param($Record)
+    if ($null -eq $Record) { return '' }
+    $property = $Record.PSObject.Properties['worktree']
+    if ($property -and $property.Value -is [string]) { return $property.Value }
+    return ''
 }
 
 function Get-RecordText {
@@ -218,6 +228,7 @@ $lines = @()
 $held = @()
 $unreadable = @()
 $unattributed = 0
+$ledgerScanned = $false
 $allocDir = ''
 $branchNow = ''
 $banner = "[precompact] Restoring what this compaction is about to drop.`n"
@@ -243,7 +254,7 @@ try {
     $haveResolver = [bool](Get-Command Resolve-CoordSharedRoot -ErrorAction SilentlyContinue)
     if ($haveResolver) {
         $sr = Resolve-CoordSharedRoot -From $top -LocalRoot $coord
-        if ($sr.Error) { $sharedError = [string]$sr.Error }
+        if ($sr.Error) { $sharedError = ConvertTo-OneLine ([string]$sr.Error) }
         else { $sharedError = ''; $sharedRoot = $sr.Path }
     }
     # Nothing to restore when neither root holds any state. Checked AFTER the shared root is known,
@@ -270,7 +281,7 @@ try {
                  Sort-Object LastWriteTimeUtc -Descending
         foreach ($f in $cands) {
             try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
-            $wt = Get-RecordText $j 'worktree'
+            $wt = Get-RecordWorktree $j
             if (-not $wt) { continue }
             if (($wt -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
             # Another PC can hold a worktree at the same path. Its record is that PC's seat, not this
@@ -286,7 +297,10 @@ try {
             # seat.ps1 always writes the `seat` key, so a record without it is damaged and must not
             # displace a good declaration. A PRESENT null is real: `-Declare -Goal` with no -Seat.
             if (-not $j.PSObject.Properties['seat']) { continue }
-            if ($j.PSObject.Properties['goal'] -and $j.goal) { $declared = $j; break }
+            # seat.ps1 writes a goal as text, so a blank or non-string one is damage too.
+            $goalField = $j.PSObject.Properties['goal']
+            if ($goalField -and $goalField.Value -is [string] -and
+                -not [string]::IsNullOrWhiteSpace((ConvertTo-OneLine $goalField.Value))) { $declared = $j; break }
         }
     }
 
@@ -356,14 +370,14 @@ try {
             # A record that does not parse or names no worktree could be this tree's. They are counted
             # rather than listed, because the registry is shared and this text costs context.
             try { $a = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { $unattributed++; continue }
-            $aw = Get-RecordText $a 'worktree'
+            # Another machine's allocation names a path on that machine's disk, so the same path here
+            # is a different tree and the number is not this one's to lose. No `host` is this machine.
+            if (-not (Test-CoordRecordIsHere $a)) { continue }
+            $aw = Get-RecordWorktree $a
             if ([string]::IsNullOrWhiteSpace($aw)) {
                 if (-not (Test-AllocTombstone $a)) { $unattributed++ }
                 continue
             }
-            # Another machine's allocation names a path on that machine's disk, so the same path here
-            # is a different tree and the number is not this one's to lose. No `host` is this machine.
-            if (-not (Test-CoordRecordIsHere $a)) { continue }
             # EXACT match, never a prefix. Sibling worktrees in this repo are named as extensions of
             # each other (...-cfbf59 and ...-cfbf59-connscale-ci-claim), so a prefix test claims another
             # tree's numbers as your own.
@@ -376,6 +390,7 @@ try {
             $held += "#$($f.BaseName) ($(ConvertTo-OneLine $f.Directory.Name)) $(Get-RecordText $a 'title')"
         }
     }
+    $ledgerScanned = $true
     $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir)
     # Emptied once printed, so the catch below cannot print them a second time.
     $held = @()
@@ -398,6 +413,8 @@ try {
         $why = [string]$_.Exception.Message
         try { $why = ConvertTo-OneLine $why } catch { $why = 'unreadable error' }
         try { $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir) } catch { }
+        # A missing ledger block must not read as "this tree holds no numbers".
+        if (-not $ledgerScanned) { $lines += ''; $lines += 'LEDGER NUMBERS: not fully checked, so this tree may hold some.' }
         try { $lines += @(Get-WorkLines $branchNow) } catch { }
         $lines += ''
         $lines += "RESTORE INCOMPLETE: this hook stopped early ($why)."
