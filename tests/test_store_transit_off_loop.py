@@ -47,6 +47,7 @@ class _RecordingTransit(_FakeTransit):
         super().__init__()
         self.threads: list[int] = []
         self.block = 0.0
+        self.hmacs = 0
 
     def _note(self) -> None:
         self.threads.append(threading.get_ident())
@@ -62,10 +63,12 @@ class _RecordingTransit(_FakeTransit):
         return super().decrypt_data(**kw)
 
     def generate_hmac(self, **kw: Any) -> dict[str, Any]:
+        self.hmacs += 1
         self._note()
         return super().generate_hmac(**kw)
 
     def verify_signed_data(self, **kw: Any) -> dict[str, Any]:
+        self.hmacs += 1
         self._note()
         return super().verify_signed_data(**kw)
 
@@ -81,8 +84,11 @@ def test_only_the_transit_cipher_says_it_blocks_on_io() -> None:
 
 async def test_transit_cell_and_audit_calls_run_off_the_loop(tmp_path: Path) -> None:
     transit = _RecordingTransit()
+    cipher = TransitCipher(_FakeClient(transit), _KEY)
+    # The serve path hands the cipher's MAC to the store as open_store does, so the audit chain
+    # is keyed in Transit and its appends and walk make Transit calls too.
     store = await MessageStore.open(
-        tmp_path / "t.db", cipher=TransitCipher(_FakeClient(transit), _KEY)
+        tmp_path / "t.db", cipher=cipher, audit_mac_fn=cipher.audit_mac_fn()
     )
     try:
         transit.threads.clear()
@@ -100,6 +106,7 @@ async def test_transit_cell_and_audit_calls_run_off_the_loop(tmp_path: Path) -> 
         ok, msg = await store.verify_audit_chain()
         assert ok, msg
         assert transit.threads, "the store made no Transit call, so this test measured nothing"
+        assert transit.hmacs >= 2, "the audit append and walk made no Transit MAC call"
         assert loop_thread not in transit.threads
     finally:
         await store.close()

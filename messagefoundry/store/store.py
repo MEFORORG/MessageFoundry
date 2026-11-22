@@ -7092,6 +7092,21 @@ def audit_seal_next(
     return seq, row_hash
 
 
+def held_append_mac(
+    head: Sequence[Any] | None,
+    expect_prev: str | None,
+    append_mac: Callable[[], tuple[bytes | None, AuditMacFn | None]],
+) -> Callable[[], tuple[bytes | None, AuditMacFn | None]]:
+    """``append_mac``'s answer, taken now, as :func:`audit_seal_next` takes it: after the head check.
+
+    A backend that runs :func:`audit_seal_next` off the event loop (BACKLOG #3929) calls this on the
+    loop first, so the range key is read in the same step as the head, as it was before the hop,
+    and a refusal raises in the same order. The off-loop seal then uses the key read here."""
+    audit_next_link(head, expect_prev)
+    held = append_mac()
+    return lambda: held
+
+
 #: A genesis record writes a store id (vault BACKLOG #3411) as the lowercase hex of its bytes.
 _AUDIT_STORE_ID_FIELD: Final = "store_id"
 #: ``2 * STORE_ID_BYTES`` lowercase hex digits, unanchored: use it with ``fullmatch`` only. The width
@@ -13164,9 +13179,7 @@ class MessageStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                resealed = await cipher_call(
-                    self._cipher, reseal_unless_tag_failure, cipher, r["v"], aad_of(r)
-                )
+                resealed = reseal_unless_tag_failure(cipher, r["v"], aad_of(r))
                 if resealed is None:
                     skipped += 1
                 else:
@@ -19165,7 +19178,11 @@ class MessageStore:
                 audit_seal_next,
                 None if last is None else (last["seq"], last["row_hash"]),
                 expect_prev,
-                self._audit_append_mac,
+                held_append_mac(
+                    None if last is None else (last["seq"], last["row_hash"]),
+                    expect_prev,
+                    self._audit_append_mac,
+                ),
                 ts=now,
                 actor=actor,
                 action=action,

@@ -57,6 +57,7 @@ from messagefoundry.store.crypto import (
     NO_STORE_ID,
     Cipher,
     CipherError,
+    CipherUnavailableError,
     cipher_blocks_on_io,
     derive_row_seal_key,
     row_seal_key_id,
@@ -554,10 +555,12 @@ async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs
     ):  # the pool refused it (shut down), or queued it but could not start a thread
         refused = True
     if refused:
-        # A CipherError, so the sealer reads it as an Outage. Only the hand-off is caught: a
-        # RuntimeError raised BY the call is a defect and propagates as itself. Where the pool
-        # queued the call before failing to start a thread, it may still run later, unawaited.
-        raise CipherError("the Transit row-seal pool could not take the call")
+        # A CipherError, so the sealer reads it as an Outage, and its CipherUnavailableError
+        # subclass, so a store's cell open reads it as no verdict on the value (BACKLOG #3929). Only
+        # the hand-off is caught: a RuntimeError raised BY the call is a defect and propagates as
+        # itself. Where the pool queued the call before failing to start a thread, it may still run
+        # later, unawaited.
+        raise CipherUnavailableError("the Transit row-seal pool could not take the call")
     return await future
 
 

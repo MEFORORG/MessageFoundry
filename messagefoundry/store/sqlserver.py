@@ -380,6 +380,7 @@ from messagefoundry.store.store import (
     global_epoch_or_refuse,
     global_epoch_raise,
     global_epoch_unmoved,
+    held_append_mac,
     held_approval_tombstone_async,
     if_applied,
     inheritance_plan,
@@ -9922,8 +9923,10 @@ class SqlServerStore:
 
     async def _load_state_cache(self) -> None:
         """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
-        self._state_cache = self._decode_state_rows(
-            await self._fetchall("SELECT namespace, [key], value FROM state")
+        self._state_cache = await cipher_call(
+            self._cipher,
+            self._decode_state_rows,
+            await self._fetchall("SELECT namespace, [key], value FROM state"),
         )
 
     def _decode_state_rows(
@@ -10600,9 +10603,7 @@ class SqlServerStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                resealed = await cipher_call(
-                    self._cipher, reseal_unless_tag_failure, self._cipher, r["v"], aad_of(r)
-                )
+                resealed = reseal_unless_tag_failure(self._cipher, r["v"], aad_of(r))
                 if resealed is None:
                     skipped += 1
                 else:
@@ -11265,7 +11266,7 @@ class SqlServerStore:
         for row in rows:
             d = dict(zip(columns, row))  # noqa: B905
             try:
-                payload = self._open_claimed(d, stage)
+                payload = await cipher_call(self._cipher, self._open_claimed, d, stage)
             except CipherError as exc:
                 if await self._dead_letter_unopenable(d, stage, exc) is not None:
                     await self._set_aside_claimed([d], now)
@@ -11491,7 +11492,7 @@ class SqlServerStore:
         if row is None or d is None:
             return None
         try:
-            payload = self._open_claimed(d, stage)
+            payload = await cipher_call(self._cipher, self._open_claimed, d, stage)
         except CipherError as exc:
             if await self._dead_letter_unopenable(d, stage, exc) is not None:
                 await self._set_aside_claimed([d], now)
@@ -11642,7 +11643,7 @@ class SqlServerStore:
         items: list[OutboxItem] = []
         for i, d in enumerate(decoded):
             try:
-                payload = self._open_claimed(d, stage)
+                payload = await cipher_call(self._cipher, self._open_claimed, d, stage)
             except CipherError as exc:
                 if await self._dead_letter_unopenable(d, stage, exc) is not None:
                     await self._set_aside_claimed(decoded[i:], now)
@@ -12167,7 +12168,7 @@ class SqlServerStore:
                 in_order = sorted(lane_rows, key=lambda r: r["seq"])
                 for i, d in enumerate(in_order):
                     try:
-                        payload = self._open_claimed(d, stage)
+                        payload = await cipher_call(self._cipher, self._open_claimed, d, stage)
                     except CipherError as exc:
                         fault = await self._dead_letter_unopenable(d, stage, exc)
                         if fault is not None:
@@ -14502,7 +14503,9 @@ class SqlServerStore:
             audit_seal_next,
             None if last is None else (last[0], last[1]),
             expect_prev,
-            self._audit_append_mac,
+            held_append_mac(
+                None if last is None else (last[0], last[1]), expect_prev, self._audit_append_mac
+            ),
             ts=now,
             actor=actor,
             action=action,

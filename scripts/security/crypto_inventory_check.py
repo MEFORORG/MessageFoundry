@@ -1781,8 +1781,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.encrypt()",
             "cipher:via messagefoundry.store.crypto",
             # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
-            # Since BACKLOG #3929 each such open is handed to row_seal.cipher_call rather than
-            # called here, so the scan no longer counts it as this file's operation.
+            "cipher:via messagefoundry.store.queue_tag",
             # BACKLOG #2593: message cells and preset criteria open under their row tag.
             "cipher:via messagefoundry.store.cell_tag",
             "compare:hmac.compare_digest",

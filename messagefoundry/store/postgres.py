@@ -369,6 +369,7 @@ from messagefoundry.store.store import (
     global_epoch_or_refuse,
     global_epoch_raise,
     global_epoch_unmoved,
+    held_append_mac,
     held_approval_tombstone_async,
     if_applied,
     inheritance_plan,
@@ -3496,8 +3497,8 @@ class PostgresStore:
         rows = await self._fetchall("SELECT namespace, key, value FROM state")
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
-            cache[(r["namespace"], r["key"])] = self._decode_state_cell(
-                r["namespace"], r["key"], r["value"]
+            cache[(r["namespace"], r["key"])] = await cipher_call(
+                self._cipher, self._decode_state_cell, r["namespace"], r["key"], r["value"]
             )
         self._state_cache = cache
         self._state_versions = versions
@@ -3679,7 +3680,12 @@ class PostgresStore:
             seen = self._state_versions.get(ns)
             if seen != version:
                 rows = await self._fetchall("SELECT key, value FROM state WHERE namespace=$1", ns)
-                fresh = {r["key"]: self._decode_state_cell(ns, r["key"], r["value"]) for r in rows}
+                fresh = {
+                    r["key"]: await cipher_call(
+                        self._cipher, self._decode_state_cell, ns, r["key"], r["value"]
+                    )
+                    for r in rows
+                }
                 pending.append((ns, version, seen, fresh))
         refreshed: list[str] = []
         for ns, version, seen, fresh in pending:
@@ -4078,9 +4084,7 @@ class PostgresStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                resealed = await cipher_call(
-                    self._cipher, reseal_unless_tag_failure, cipher, r["v"], aad_of(r)
-                )
+                resealed = reseal_unless_tag_failure(cipher, r["v"], aad_of(r))
                 if resealed is None:
                     skipped += 1
                 else:
@@ -5374,7 +5378,7 @@ class PostgresStore:
         items: list[OutboxItem] = []
         for row in rows:
             try:
-                items.append(self._outbox_item(row))
+                items.append(await cipher_call(self._cipher, self._outbox_item, row))
             except CipherError as exc:
                 if await self._dead_letter_unopenable(row, exc) is not None:
                     await self._set_aside_claimed([row], now)
@@ -5829,7 +5833,7 @@ class PostgresStore:
                 in_order = sorted(lane_rows, key=lambda r: r["seq"])
                 for i, row in enumerate(in_order):
                     try:
-                        items.append(self._outbox_item(row))
+                        items.append(await cipher_call(self._cipher, self._outbox_item, row))
                     except CipherError as exc:
                         fault = await self._dead_letter_unopenable(row, exc)
                         if fault is not None:
@@ -5944,7 +5948,7 @@ class PostgresStore:
         if row is None:
             return None, False  # nothing pending, or the head is backing off — block the lane
         try:
-            return self._outbox_item(row), False
+            return await cipher_call(self._cipher, self._outbox_item, row), False
         except CipherError as exc:
             # An undecryptable head must not stall the lane — dead-letter it and let the next poll
             # advance, rather than raising into the worker (mirrors SQLite).
@@ -9675,7 +9679,11 @@ class PostgresStore:
             audit_seal_next,
             None if last is None else (last["seq"], last["row_hash"]),
             expect_prev,
-            self._audit_append_mac,
+            held_append_mac(
+                None if last is None else (last["seq"], last["row_hash"]),
+                expect_prev,
+                self._audit_append_mac,
+            ),
             ts=now,
             actor=actor,
             action=action,
