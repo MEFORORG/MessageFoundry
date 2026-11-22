@@ -7,8 +7,8 @@
   generated and the operator's API TLS key and the connection key files that `serve` and
   `supervise` judge, which [PHI.md](../docs/PHI.md), *Key files*, names, and to the secrets
   directory and its files. Under `[security].enforcement = "warn"` a key file is warned about
-  rather than refused; the secrets directory is refused under either. A dangling link to a key is
-  now refused rather than passed as a missing file. The directory that holds the file is judged by
+  rather than refused; the secrets directory and its files are refused under either. A dangling
+  link to a key is now judged as a link rather than passed as a missing file. The directory that holds the file is judged by
   its owner and mode. The folders above it are not, except those that hold a link on the path or
   lie above one, which `_posix_link_problem` in `messagefoundry/restricted_file.py` judges, and,
   since the secrets directory is checked as a path of its own, the folder that holds that
