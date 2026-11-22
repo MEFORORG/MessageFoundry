@@ -393,7 +393,10 @@ meets what any empty body meets. What each source does with a non-empty one, at 
   the input; it does not hold the file for the fix.
 - **A `DatabasePoll()` or `Timer()` source** fails to build on such a name, so it never starts.
 
-Bytes invalid in a usable charset are the body's own fault and final: `AR`, or `422`. Why:
+Bytes invalid in a usable charset are the body's own fault and final: `AR`, or `422`. So are
+bytes that decode to a UTF-16 surrogate code point, which at least `utf-7` decodes `+2D8-` to and
+which strict UTF-8 cannot encode, so at least the SQLite store could not write the text
+(BACKLOG #1619). Why:
 the [ADR 0154 amendment of 2026-11-04](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal)
 (BACKLOG #5102). At least the inbound `encoding` rows of the sources above point here.
 

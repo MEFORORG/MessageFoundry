@@ -1246,9 +1246,7 @@ def _label_fits_every_backend(label: str) -> bool:
     measured.
 
     A lone surrogate is deliberately not tested. A label can hold one only when the decoded body
-    does, and the same character then stays in the skeleton, whose ingress write fails on it
-    whatever the label is. Downgrading it would only store an unreferenced attachment first, so
-    ``put_attachment``'s own encode fault propagates instead, writing nothing."""
+    does, and ``decode_body`` refuses such a body before the detach runs."""
     if len(label) > ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
         return False
     return utf16_units(label) <= ATTACHMENT_CONTENT_TYPE_MAX
