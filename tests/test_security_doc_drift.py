@@ -282,8 +282,17 @@ _MAPPED_MODEL_NON_PHI_FIELDS: dict[str, frozenset[str]] = {
             "status",
         }
     ),
-    "OutboxInfo": frozenset({"attempts", "destination_name", "id", "next_attempt_at", "status"}),
-    "EventInfo": frozenset({"destination", "event", "ts"}),
+    "OutboxInfo": frozenset(
+        {
+            "attempts",
+            "destination_name",
+            "id",
+            "last_error_withheld",
+            "next_attempt_at",
+            "status",
+        }
+    ),
+    "EventInfo": frozenset({"destination", "detail_withheld", "event", "ts"}),
     "CapturedResponseInfo": frozenset(
         {
             # PHI, gated INLINE at GET /messages/{id}/responses on messages:view_raw, not via the map.

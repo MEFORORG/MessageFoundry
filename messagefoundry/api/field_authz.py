@@ -250,6 +250,15 @@ def gated_properties(model_cls: type[BaseModel]) -> dict[str, Permission]:
     return PHI_FIELDS.get(model_cls, {})
 
 
+def withheld_flag(
+    model_cls: type[BaseModel], prop: str, identity: Identity, *, withheld: bool
+) -> bool:
+    """Whether to tell this caller that ``prop`` was withheld for a key the store does not hold
+    (BACKLOG #5693). The flag says a value exists, so it follows the permission that unlocks the
+    property; an unmapped property raises ``KeyError`` rather than answering."""
+    return withheld and identity.has(gated_properties(model_cls)[prop])
+
+
 def redact_unauthorized(  # noqa: UP047
     model: M,
     identity: Identity,

@@ -201,6 +201,8 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
     await _assert_foreign_key_cells(store, raw)
     # --- a substituted cell under a held key still fails a list read loudly --------------------
     await _assert_substituted_listed_cells(store, raw, fetch)
+    # --- the per-message detail reads withhold under the same narrow rule ---------------------
+    await _assert_detail_reads(store, raw, fetch)
     # --- under Transit, only a refusal naming a key version withholds a listed cell ----------
     await _assert_transit_listed_refusals(store, raw, fetch)
 
@@ -551,6 +553,91 @@ async def _assert_substituted_listed_cells(store: Any, raw: RawSql, fetch: RawFe
         a.connection == planted and a.reason == "SYNTH-ALERT"
         for a in await store.list_active_alert_instances(allowed_channels=None)
     )
+
+
+async def _assert_detail_reads_fail(store: Any, mid: str, *reads: str) -> None:
+    """Each named per-message read raises the cipher's own error, and withholds nothing."""
+    for name in reads:
+        await _assert_list_fails(getattr(store, name)(mid))
+
+
+async def _assert_detail_reads(store: Any, raw: RawSql, fetch: RawFetch) -> None:
+    """BACKLOG #5693, owner ruling 2026-11-22: ``outbox_for``, ``outbox_payloads_for`` and
+    ``events_for`` withhold a ``last_error`` or event ``detail`` only for a key the store does not
+    hold, and say so on the row. A substituted, malformed or unknown-format cell still raises, and
+    a message body under a key the store does not hold still refuses. Each planted cell is put
+    back, so the untouched read is the control."""
+    foreign = make_cipher(generate_key(), write_v2=True).encrypt("SYNTH-FOREIGN")
+    ch, a_out, b_out = f"IB_CT_D_{_RUN}", f"OB_CT_DA_{_RUN}", f"OB_CT_DB_{_RUN}"
+    mid = await store.enqueue_message(
+        channel_id=ch, raw=_RAW, deliveries=[(a_out, "BODY-A"), (b_out, "BODY-B")]
+    )
+    other = await store.enqueue_message(channel_id=ch, raw=_RAW, deliveries=[(a_out, "BODY-C")])
+    for out in (a_out, b_out, a_out):
+        item = await store.claim_next_fifo(out)
+        assert item is not None
+        await store.dead_letter_now(item.id, "synthetic permanent reject")
+    rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
+    a, b = rows[a_out]["id"], rows[b_out]["id"]
+    assert rows[a_out]["last_error"] and not rows[a_out]["last_error_withheld"]  # control
+    [sibling] = await fetch("SELECT last_error FROM queue WHERE id=?", (b,))
+    [sealed] = await fetch("SELECT last_error FROM queue WHERE id=?", (a,))
+    good = sealed["last_error"]
+
+    await raw("UPDATE queue SET last_error=? WHERE id=?", (foreign, a))
+    for name in ("outbox_for", "outbox_payloads_for"):
+        got = {r["destination_name"]: r for r in await getattr(store, name)(mid)}
+        assert got[a_out]["last_error"] is None and got[a_out]["last_error_withheld"] is True, name
+        assert got[b_out]["last_error"] and got[b_out]["last_error_withheld"] is False, name
+        if name == "outbox_payloads_for":
+            assert got[a_out]["payload"] == "BODY-A"  # only last_error was withheld
+
+    # A cell that was never written is empty, not withheld.
+    await raw("UPDATE queue SET last_error=NULL WHERE id=?", (a,))
+    [blank] = [r for r in await store.outbox_for(mid) if r["id"] == a]
+    assert blank["last_error"] is None and blank["last_error_withheld"] is False
+
+    # Tampered under a held key, malformed, truncated, unknown format, unmarked: all still raise.
+    for bad in (sibling["last_error"], good[:-8], "mfenc:v9:x", "SYNTH-UNMARKED"):
+        await raw("UPDATE queue SET last_error=? WHERE id=?", (bad, a))
+        await _assert_detail_reads_fail(store, mid, "outbox_for", "outbox_payloads_for")
+    await raw("UPDATE queue SET last_error=? WHERE id=?", (good, a))
+
+    # A body under a key the store does not hold still refuses, on a live row.
+    live_out = f"OB_CT_DL_{_RUN}"
+    live = await store.enqueue_message(channel_id=ch, raw=_RAW, deliveries=[(live_out, "BODY-L")])
+    [live_row] = await store.outbox_for(live)
+    [held] = await fetch("SELECT payload, body_ref FROM queue WHERE id=?", (live_row["id"],))
+    await raw("UPDATE queue SET payload=?, body_ref=NULL WHERE id=?", (foreign, live_row["id"]))
+    try:
+        await store.outbox_payloads_for(live)
+    except CipherError:
+        pass
+    else:
+        raise AssertionError("a body under a key the store does not hold did not refuse")
+    await raw(
+        "UPDATE queue SET payload=?, body_ref=? WHERE id=?",
+        (held["payload"], held["body_ref"], live_row["id"]),
+    )
+
+    # The event timeline: the same rule on message_events.detail.
+    pick = "SELECT id, detail FROM message_events WHERE message_id=? AND event=?"
+    event = next(
+        e["event"] for e in await store.events_for(mid) if e["detail"] and e["destination"]
+    )
+    cell = (await fetch(pick, (mid, event)))[0]
+    moved = (await fetch(pick, (other, event)))[0]["detail"]
+    await raw("UPDATE message_events SET detail=? WHERE id=?", (foreign, cell["id"]))
+    timeline = {e["id"]: e for e in await store.events_for(mid)}
+    assert timeline[cell["id"]]["detail"] is None
+    assert timeline[cell["id"]]["detail_withheld"] is True
+    others = [e for i, e in timeline.items() if i != cell["id"]]
+    assert others and not any(e["detail_withheld"] for e in others)  # control
+    for bad in (moved, cell["detail"][:-8], "mfenc:v9:x", "SYNTH-UNMARKED"):
+        await raw("UPDATE message_events SET detail=? WHERE id=?", (bad, cell["id"]))
+        await _assert_detail_reads_fail(store, mid, "events_for")
+    await raw("UPDATE message_events SET detail=? WHERE id=?", (cell["detail"], cell["id"]))
+    assert all(not e["detail_withheld"] for e in await store.events_for(mid))  # control
 
 
 async def _routed(store: Any, fetch: RawFetch, channel_id: str) -> tuple[str, str]:

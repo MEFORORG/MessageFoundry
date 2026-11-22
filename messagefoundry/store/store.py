@@ -112,6 +112,7 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     is_row_tagged,
     message_cell_aad,
+    open_detail_cell,
     open_listed_cell,
     open_message_cell,
     open_message_record,
@@ -18282,7 +18283,8 @@ class MessageStore:
                 (message_id, Stage.OUTBOUND.value),
             )
             return [
-                self._decode_row(r, "queue", (r["id"],), "last_error") for r in await cur.fetchall()
+                open_detail_cell(self._cipher, dict(r), "queue", "last_error", r["id"])
+                for r in await cur.fetchall()
             ]
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
@@ -18303,7 +18305,8 @@ class MessageStore:
             )
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
-                d = self._decode_row(r, "queue", (r["id"],), "last_error")
+                # BACKLOG #5693: last_error alone may be withheld; the body's refusal is unchanged.
+                d = open_detail_cell(self._cipher, dict(r), "queue", "last_error", r["id"])
                 dead = r["status"] == OutboxStatus.DEAD.value
                 try:
                     d["payload"] = (
@@ -18324,8 +18327,14 @@ class MessageStore:
                 "SELECT * FROM message_events WHERE message_id=? ORDER BY id", (message_id,)
             )
             return [
-                self._decode_row(
-                    r, "message_events", (r["message_id"], r["ts"], r["event"]), "detail"
+                open_detail_cell(
+                    self._cipher,
+                    dict(r),
+                    "message_events",
+                    "detail",
+                    r["message_id"],
+                    r["ts"],
+                    r["event"],
                 )
                 for r in await cur.fetchall()
             ]

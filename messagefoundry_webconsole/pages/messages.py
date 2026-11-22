@@ -47,6 +47,10 @@ __all__ = [
     "restore_eol",
 ]
 
+#: Shown for a delivery error or event detail sealed under a key the store does not hold, which the
+#: engine sends as null with a flag, so the cell does not read as "no error" (BACKLOG #5693).
+_WITHHELD_CELL = el("span", "Withheld: sealed under a key this store does not hold", class_="muted")
+
 #: The tail-placement caution ADR 0090 §3 requires the console affordance to carry, worded to the two
 #: things that ADR actually establishes and no further. It rules that a resend lands at the
 #: destination lane's TAIL and MAY be delivered after newer same-partner messages already queued to
@@ -585,7 +589,9 @@ def message_detail(
                 o.destination_name,
                 o.status,
                 o.attempts,
-                _reveal_cell(o.last_error, errors_href, revealed=errors_revealed),
+                _WITHHELD_CELL
+                if o.last_error_withheld
+                else _reveal_cell(o.last_error, errors_href, revealed=errors_revealed),
             ]
             for o in detail.outbox
         ],
@@ -597,7 +603,9 @@ def message_detail(
                 e.ts,
                 e.event,
                 e.destination,
-                _reveal_cell(e.detail, errors_href, revealed=errors_revealed),
+                _WITHHELD_CELL
+                if e.detail_withheld
+                else _reveal_cell(e.detail, errors_href, revealed=errors_revealed),
             ]
             for e in detail.events
         ],

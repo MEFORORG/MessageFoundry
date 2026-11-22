@@ -302,7 +302,7 @@ messagefoundry.api.models.DrStatus: activation_mode, active, enabled, failures, 
 messagefoundry.api.models.EditResendRequest: idempotency_key, raw, reroute, to
 messagefoundry.api.models.EngineInfo: channels_failed, channels_failed_names, channels_running, channels_stopped, channels_total, fhir_lookups_failed, outbox_by_status, pid, stages_degraded, uptime_seconds, version
 messagefoundry.api.models.EngineKpis: connections_not_deployed, connections_running, connections_stopped, connections_total, messages_per_second, messages_total
-messagefoundry.api.models.EventInfo: destination, detail, event, ts
+messagefoundry.api.models.EventInfo: destination, detail, detail_withheld, event, ts
 messagefoundry.api.models.GraphEdge: provenance, source, source_kind, target, target_kind
 messagefoundry.api.models.GraphNode: kind, name, status
 messagefoundry.api.models.GraphResponse: dynamic, edges, nodes
@@ -318,7 +318,7 @@ messagefoundry.api.models.MessageSearchResults: limit, matched, messages, scan_l
 messagefoundry.api.models.MessageSummary: channel_id, control_id, error, event, id, message_type, metadata, received_at, source_type, status, summary
 messagefoundry.api.models.MetricsHistoryResponse: capacity, samples
 messagefoundry.api.models.MetricsHistorySample: outbox_by_status, ts
-messagefoundry.api.models.OutboxInfo: attempts, destination_name, id, last_error, next_attempt_at, status
+messagefoundry.api.models.OutboxInfo: attempts, destination_name, id, last_error, last_error_withheld, next_attempt_at, status
 messagefoundry.api.models.PendingApprovalInfo: approver, caller_is_requester, decided_at, expires_at, id, label, operation, params, release_blocked, requested_at, requester, status
 messagefoundry.api.models.PendingApprovalResponse: approval_id, detail, operation, status
 messagefoundry.api.models.PoolInfo: acquire_wait, backend, claim_pool, idle, max_size, size

@@ -94,6 +94,7 @@ from messagefoundry.api.field_authz import (
     count_masked,
     redact_unauthorized,
     revealable,
+    withheld_flag,
 )
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
@@ -8367,6 +8368,9 @@ def create_app(
                     attempts=o["attempts"],
                     next_attempt_at=o["next_attempt_at"],
                     last_error=o["last_error"],
+                    last_error_withheld=withheld_flag(
+                        OutboxInfo, "last_error", identity, withheld=o["last_error_withheld"]
+                    ),
                 )
                 for o in outbox_rows
             ],
@@ -8376,6 +8380,9 @@ def create_app(
                     event=e["event"],
                     destination=e["destination"],
                     detail=e["detail"],
+                    detail_withheld=withheld_flag(
+                        EventInfo, "detail", identity, withheld=e["detail_withheld"]
+                    ),
                 )
                 for e in event_rows
             ],

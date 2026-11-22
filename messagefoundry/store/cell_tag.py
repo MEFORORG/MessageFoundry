@@ -86,6 +86,7 @@ __all__ = [
     "dead_letters_on_cell_tag",
     "is_row_tagged",
     "message_cell_aad",
+    "open_detail_cell",
     "open_listed_cell",
     "open_message_cell",
     "open_message_record",
@@ -724,6 +725,20 @@ def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: s
     except CipherError as exc:
         withhold_refused_cell(cipher, table, exc, stored)
         return None
+
+
+def open_detail_cell(
+    cipher: Cipher, row: dict[str, Any], table: str, column: str, *pk: object
+) -> dict[str, Any]:
+    """Open ``row[column]``, bound to ``cell_aad(table, column, *pk)``, in place for a per-message
+    detail read, and return ``row`` (BACKLOG #5693, owner ruling 2026-11-22). Under
+    :func:`open_listed_cell`'s rule, only a key the store does not hold withholds the cell, and
+    every other refusal raises. Sets ``row[f"{column}_withheld"]``, so a withheld cell is not read
+    as a cell that was never written, which is ``None`` too."""
+    stored = row[column]
+    row[column] = open_listed_cell(cipher, stored, cell_aad(table, column, *pk), table=table)
+    row[f"{column}_withheld"] = stored is not None and row[column] is None
+    return row
 
 
 def _alert(cipher: object, err: CellTagError) -> None:

@@ -177,6 +177,9 @@ class OutboxInfo(PhiGatedModel):
     attempts: int
     next_attempt_at: float
     last_error: str | None
+    #: True when ``last_error`` is ``None`` because it is sealed under a key the store does not
+    #: hold, so a null here is not "no error" (BACKLOG #5693). Carries no cell content.
+    last_error_withheld: bool = False
 
 
 class EventInfo(PhiGatedModel):
@@ -186,6 +189,9 @@ class EventInfo(PhiGatedModel):
     event: str
     destination: str | None
     detail: str | None
+    #: True when ``detail`` is ``None`` because it is sealed under a key the store does not hold
+    #: (BACKLOG #5693). Carries no cell content.
+    detail_withheld: bool = False
 
 
 class AttachmentInfo(BaseModel):

@@ -1214,6 +1214,190 @@ def test_a_list_read_still_refuses_a_tag_failure_under_a_held_key() -> None:
     assert open_listed_cell(cipher, sealed, aad, table="connection_event") == "SYNTH"  # control
 
 
+_DETAIL_RAW = "MSH|^~\\&|SYNTH|F|R|RF|20260101||ADT^A01|D1|P|2.5.1\rPID|1||SYNTH-300\r"
+
+
+def _detail_store(backend: str, cipher: Any, rows: list[dict[str, Any]]) -> Any:
+    """A Postgres or SQL Server store with no server: ``rows`` are what the driver would return."""
+    from contextlib import asynccontextmanager
+
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    store: Any = object.__new__(PostgresStore if backend == "postgres" else SqlServerStore)
+    store._cipher = cipher
+
+    async def fetchall(*_a: object) -> list[dict[str, Any]]:
+        return [dict(r) for r in rows]
+
+    async def body(_handle: object, row: Any, *, alert: bool = True) -> str:
+        if row["payload"] == "REFUSED":
+            raise CipherError("the body refuses")
+        return str(row["payload"])
+
+    @asynccontextmanager
+    async def handle(*_a: object) -> Any:
+        yield object()
+
+    store._fetchall = fetchall
+    store._open_queue_body = body
+    store._acquire = handle
+    store._cursor = handle
+    return store
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_the_detail_reads_withhold_only_a_key_not_held_on_the_server_backends(
+    backend: str,
+) -> None:
+    """BACKLOG #5693, on the two backends with no server here: a foreign-key cell is withheld and
+    flagged, a substituted cell raises, and a refused body still refuses. The hosted legs run the
+    same rule against real databases through the shared contract."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    foreign = make_cipher(generate_key(), write_v2=True).encrypt("SYNTH-FOREIGN")
+    q_aad = cell_aad("queue", "last_error", "q1")
+    moved_q = cipher.encrypt("SYNTH", aad=cell_aad("queue", "last_error", "q2"))
+
+    def queue(last_error: str | None, payload: str = "BODY") -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "q1",
+                "status": "dead",
+                "last_error": last_error,
+                "payload": payload,
+                "body_ref": None,
+            }
+        ]
+
+    def event(detail: str | None) -> list[dict[str, Any]]:
+        return [{"message_id": "m", "ts": 1.0, "event": "dead", "detail": detail}]
+
+    for read in ("outbox_for", "outbox_payloads_for"):
+        good = cipher.encrypt("SYNTH", aad=q_aad)
+        [opened] = await getattr(_detail_store(backend, cipher, queue(good)), read)("m")
+        assert opened["last_error"] == "SYNTH" and opened["last_error_withheld"] is False
+        [held] = await getattr(_detail_store(backend, cipher, queue(foreign)), read)("m")
+        assert held["last_error"] is None and held["last_error_withheld"] is True
+        [empty] = await getattr(_detail_store(backend, cipher, queue(None)), read)("m")
+        assert empty["last_error"] is None and empty["last_error_withheld"] is False
+        for bad in (moved_q, good[:-8], "mfenc:v9:x", "SYNTH-UNMARKED"):
+            with pytest.raises(CipherError):
+                await getattr(_detail_store(backend, cipher, queue(bad)), read)("m")
+    with pytest.raises(CipherError, match="the body refuses"):
+        await _detail_store(backend, cipher, queue(foreign, "REFUSED")).outbox_payloads_for("m")
+
+    e_aad = cell_aad("message_events", "detail", "m", 1.0, "dead")
+    good = cipher.encrypt("SYNTH", aad=e_aad)
+    moved_e = cipher.encrypt("SYNTH", aad=cell_aad("message_events", "detail", "x", 1.0, "dead"))
+    [opened] = await _detail_store(backend, cipher, event(good)).events_for("m")
+    assert opened["detail"] == "SYNTH" and opened["detail_withheld"] is False
+    [held] = await _detail_store(backend, cipher, event(foreign)).events_for("m")
+    assert held["detail"] is None and held["detail_withheld"] is True
+    [empty] = await _detail_store(backend, cipher, event(None)).events_for("m")
+    assert empty["detail"] is None and empty["detail_withheld"] is False
+    for bad in (moved_e, good[:-8], "mfenc:v9:x", "SYNTH-UNMARKED"):
+        with pytest.raises(CipherError):
+            await _detail_store(backend, cipher, event(bad)).events_for("m")
+
+
+def test_the_withheld_flag_follows_the_cells_own_permission() -> None:
+    """BACKLOG #5693: the flag says a cell exists, so a caller who may not read that property does
+    not get it, and a missing property map entry raises rather than answering."""
+    from types import SimpleNamespace
+
+    from messagefoundry.api.field_authz import withheld_flag
+    from messagefoundry.api.models import EventInfo, OutboxInfo, ReplayResult
+
+    holder: Any = SimpleNamespace(has=lambda _p: True)
+    other: Any = SimpleNamespace(has=lambda _p: False)
+    assert withheld_flag(OutboxInfo, "last_error", holder, withheld=True) is True
+    assert withheld_flag(EventInfo, "detail", holder, withheld=True) is True
+    assert withheld_flag(OutboxInfo, "last_error", holder, withheld=False) is False
+    assert withheld_flag(OutboxInfo, "last_error", other, withheld=True) is False
+    assert withheld_flag(EventInfo, "detail", other, withheld=True) is False
+    with pytest.raises(KeyError):
+        withheld_flag(ReplayResult, "last_error", holder, withheld=True)
+
+
+async def test_the_message_detail_route_and_page_say_a_cell_was_withheld(
+    tmp_path: pathlib.Path,
+) -> None:
+    """BACKLOG #5693: a withheld ``last_error`` or ``detail`` is ``null`` in JSON, which alone would
+    read as "no error". The response flags it, and the console says so instead of a blank cell."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.api.models import EventInfo, MessageDetail, OutboxInfo
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+    from messagefoundry_webconsole.pages import message_detail
+
+    engine = await Engine.create(
+        tmp_path / "detail.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        mid = await engine.store.enqueue_message(
+            channel_id="ch1", raw=_DETAIL_RAW, deliveries=[("archive", _DETAIL_RAW)]
+        )
+        store: Any = engine.store
+        real_outbox, real_events = store.outbox_for, store.events_for
+
+        async def outbox(message_id: str) -> list[dict[str, Any]]:
+            return [
+                {**r, "last_error": None, "last_error_withheld": True}
+                for r in await real_outbox(message_id)
+            ]
+
+        async def events(message_id: str) -> list[dict[str, Any]]:
+            return [
+                {**e, "detail": None, "detail_withheld": True}
+                for e in await real_events(message_id)
+            ]
+
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            plain = (await client.get(f"/messages/{mid}")).json()
+            assert plain["outbox"][0]["last_error_withheld"] is False  # control
+            assert plain["events"][0]["detail_withheld"] is False  # control
+            store.outbox_for, store.events_for = outbox, events
+            body = (await client.get(f"/messages/{mid}", params={"reveal_errors": True})).json()
+    finally:
+        await engine.stop()
+    assert body["outbox"][0]["last_error"] is None
+    assert body["outbox"][0]["last_error_withheld"] is True
+    assert body["events"][0]["detail"] is None
+    assert body["events"][0]["detail_withheld"] is True
+
+    base = {k: v for k, v in body.items() if k not in ("outbox", "events", "attachments")}
+
+    def page(withheld: bool) -> str:
+        detail = MessageDetail(
+            **base,
+            outbox=[
+                OutboxInfo(
+                    id="q",
+                    destination_name="archive",
+                    status="dead",
+                    attempts=1,
+                    next_attempt_at=0.0,
+                    last_error=None,
+                    last_error_withheld=withheld,
+                )
+            ],
+            events=[
+                EventInfo(
+                    ts=0.0, event="dead", destination=None, detail=None, detail_withheld=withheld
+                )
+            ],
+        )
+        return str(message_detail(detail, "MSH|skel", summary_revealed=True, errors_revealed=True))
+
+    assert page(True).count("Withheld") == 2
+    assert "Withheld" not in page(False)  # control
+
+
 def _transit_refusing(text: str) -> Any:
     """A Vault Transit cipher whose every ``decrypt`` gets Vault's HTTP 400 with ``text``."""
     from hvac.exceptions import InvalidRequest

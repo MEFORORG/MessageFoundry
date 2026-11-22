@@ -127,6 +127,7 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     is_row_tagged,
     message_cell_aad,
+    open_detail_cell,
     open_listed_cell,
     open_message_cell,
     open_message_record,
@@ -9349,7 +9350,9 @@ class PostgresStore:
         )
         # Only last_error is decrypted here; the encrypted `payload` body is left as-is on purpose —
         # bodies come through get_message (audited). Don't add `payload` to this projection's decrypt.
-        return [self._decode_record(r, "queue", (r["id"],), "last_error") for r in rows]
+        return [
+            open_detail_cell(self._cipher, dict(r), "queue", "last_error", r["id"]) for r in rows
+        ]
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
         """Like :meth:`outbox_for`, but also decrypts the transformed ``payload`` (PHI body) for the
@@ -9365,7 +9368,8 @@ class PostgresStore:
         # and a dead row whose tag fails is left out, since its claim already reported it.
         out: list[dict[str, Any]] = []
         for r in rows:
-            d = self._decode_record(r, "queue", (r["id"],), "last_error")
+            # BACKLOG #5693: last_error alone may be withheld; the body's refusal is unchanged.
+            d = open_detail_cell(self._cipher, dict(r), "queue", "last_error", r["id"])
             dead = r["status"] == OutboxStatus.DEAD.value
             try:
                 d["payload"] = (
@@ -9385,8 +9389,14 @@ class PostgresStore:
             "SELECT * FROM message_events WHERE message_id=$1 ORDER BY id", message_id
         )
         return [
-            self._decode_record(
-                r, "message_events", (r["message_id"], r["ts"], r["event"]), "detail"
+            open_detail_cell(
+                self._cipher,
+                dict(r),
+                "message_events",
+                "detail",
+                r["message_id"],
+                r["ts"],
+                r["event"],
             )
             for r in rows
         ]

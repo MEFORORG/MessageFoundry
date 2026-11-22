@@ -116,6 +116,7 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     is_row_tagged,
     message_cell_aad,
+    open_detail_cell,
     open_listed_cell,
     open_message_cell,
     open_message_record,
@@ -14100,9 +14101,8 @@ class SqlServerStore:
             (message_id, Stage.OUTBOUND.value),
         )
         for r in rows:
-            r["last_error"] = self._dec(
-                r["last_error"], aad=cell_aad("queue", "last_error", r["id"])
-            )  # H4: last_error ciphered at rest
+            # H4: last_error ciphered at rest.
+            open_detail_cell(self._cipher, r, "queue", "last_error", r["id"])
         return rows
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
@@ -14128,10 +14128,9 @@ class SqlServerStore:
                     if not dead:
                         raise
                     continue
-                r["last_error"] = self._dec(
-                    r["last_error"], aad=cell_aad("queue", "last_error", r["id"])
-                )  # H4: null/legacy-plaintext-safe decrypt
-                out.append(r)
+                # H4: null-safe. BACKLOG #5693: last_error alone may be withheld; the body's
+                # refusal above is unchanged.
+                out.append(open_detail_cell(self._cipher, r, "queue", "last_error", r["id"]))
         return out
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
@@ -14140,9 +14139,8 @@ class SqlServerStore:
         )
         for r in rows:
             # H4: event detail ciphered at rest, bound to (message_id, ts, event) — id is IDENTITY.
-            r["detail"] = self._dec(
-                r["detail"],
-                aad=cell_aad("message_events", "detail", r["message_id"], r["ts"], r["event"]),
+            open_detail_cell(
+                self._cipher, r, "message_events", "detail", r["message_id"], r["ts"], r["event"]
             )
         return rows
 
