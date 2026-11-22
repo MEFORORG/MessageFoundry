@@ -285,6 +285,35 @@ async def test_alert_rules_withhold_an_outbound_the_scope_lists(
     # The withheld count covers these rules too, so the read that withheld two writes one row.
     rows = await toml_engine.store.list_audit(action="alert_rules_withheld")
     assert len(rows) == 1, rows
+    assert json.loads(str(rows[0]["detail"])) == {"shown": 1, "withheld": 2}
+
+
+async def test_alert_rules_withhold_a_restart_outbound_target_with_no_graph(
+    engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378 item 4: a ``restart_outbound`` rule's target is an outbound whatever the graph
+    holds, so it is withheld from a scope that lists it even with no graph loaded. The control: the
+    same rule with ``restart_inbound`` shows, since with no graph nothing else marks the name."""
+    assert engine.registry_runner is None
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(
+                id=f"in-{action}",
+                event_type="connection_stopped",
+                connection="IB_A",
+                control_action=action,
+                control_target="SHARED",
+            )
+            for action in ("restart_outbound", "restart_inbound")
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A", "SHARED"])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.get("/alerts/rules", headers=await _login(c, "scoped"))
+        assert r.status_code == 200, r.text
+        assert [rule["control_action"] for rule in r.json()["rules"]] == ["restart_inbound"]
 
 
 async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
