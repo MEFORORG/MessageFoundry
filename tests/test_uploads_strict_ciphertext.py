@@ -456,7 +456,7 @@ async def test_an_unsealable_upload_is_removed_by_delete(
     root = tmp_path / "uploads"
     fid = await _unsealable_upload(root, break_body)
     store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
-    meta = await store.delete(fid)
+    meta = (await store.delete(fid)).meta
     assert (meta.file_id, meta.uploader_id, meta.filename) == (fid, "", "")
     assert _files(root) == []
     with pytest.raises(UploadNotFoundError):
@@ -497,7 +497,7 @@ async def test_a_delete_told_the_sidecar_was_refused_removes_an_unsealable_uploa
     root = tmp_path / "uploads"
     fid = await _unsealable_upload(root, break_body)
     store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
-    meta = await store.delete(fid, sidecar_refused=True)
+    meta = (await store.delete(fid, sidecar_refused=True)).meta
     assert (meta.file_id, meta.uploader_id, meta.filename) == (fid, "", "")
     assert _files(root) == []
 

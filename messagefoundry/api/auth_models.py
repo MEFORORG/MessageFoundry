@@ -11,6 +11,8 @@ the two bases.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field
@@ -23,9 +25,10 @@ from messagefoundry.api.validation import (
     PermissionId,
     RoleId,
 )
+from messagefoundry.auth.permissions import ROLE_METADATA, Role
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
-from messagefoundry.auth.usernames import username_refusal
+from messagefoundry.auth.usernames import renders_as_nothing, username_refusal
 from messagefoundry.password_bounds import PASSWORD_MAX as _PASSWORD_MAX
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
@@ -275,6 +278,84 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
+#: Unicode's Bidi_Control characters: the explicit embeddings, overrides and isolates, which
+#: reorder how a name and the text beside it display, so ``U+202E`` followed by a reversed spelling
+#: renders as another name, and the invisible marks U+061C, U+200E and U+200F, which move
+#: neutral characters and digits beside the name.
+_BIDI_CONTROLS = (
+    frozenset(range(0x202A, 0x202F))
+    | frozenset(range(0x2066, 0x206A))
+    | frozenset({0x061C, 0x200E, 0x200F})
+)
+
+#: :data:`~messagefoundry.api.validation.PRINTABLE_TEXT_PATTERN` (C0, DEL and C1 refused), spelled
+#: as a literal here because tests/test_security_static.py's ReDoS scan reads a pattern per file
+#: and cannot resolve an imported constant. tests/test_auth_name_rule.py pins that the two agree.
+_PRINTABLE_NAME = re.compile(r"^[^\x00-\x1f\x7f-\x9f]+$")
+
+#: What a browser reads a NUL in an HTML attribute as.
+_REPLACEMENT_CHARACTER = chr(0xFFFD)
+
+
+def name_refusal(name: str) -> str | None:
+    """Why ``name`` may not be stored as an account or role name an administrator sends, or
+    ``None`` when it may (BACKLOG #5784, #5785). Refused, at least:
+
+    * a blank name: nothing left once white space and the characters that draw nothing
+      (``auth.usernames.renders_as_nothing``, such as a zero-width space or a Hangul filler) are
+      set aside;
+    * a C0 control (NUL included), DEL or a C1 control, the characters
+      :data:`~messagefoundry.api.validation.PRINTABLE_TEXT_PATTERN` excludes, a line or paragraph
+      separator (U+2028, U+2029), or a bidirectional control (:data:`_BIDI_CONTROLS`).
+
+    A format character inside a visible name, such as the zero-width non-joiner some scripts need
+    inside a word, passes, and so does white space at an edge. The reason is fixed text that never
+    echoes the value."""
+    if not "".join(c for c in name if not renders_as_nothing(c)).strip():
+        return "must not be blank"
+    if _PRINTABLE_NAME.fullmatch(name) is None or any(
+        unicodedata.category(c) in ("Zl", "Zp") or ord(c) in _BIDI_CONTROLS for c in name
+    ):
+        return "must not contain a control, line separator or bidirectional control character"
+    return None
+
+
+def _as_a_form_posts_it(stored: str) -> str:
+    """``stored`` as a console form posts it back: a browser drops CR and LF from a text input's
+    value and reads a NUL in an attribute as U+FFFD, and the console's route strips the edges."""
+    posted = stored.replace("\r", "").replace("\n", "")
+    return posted.replace("\x00", _REPLACEMENT_CHARACTER).strip()
+
+
+def _resends_stored(name: str, stored: str | None) -> bool:
+    """Whether ``name`` is the stored name re-sent: equal to it, or to what a console form posts
+    for it (:func:`_as_a_form_posts_it`). Only that direction matches, so a client cannot add a
+    control character to a clean stored name under the exemption."""
+    return stored is not None and name in (stored, _as_a_form_posts_it(stored))
+
+
+def changed_name_refusal(name: str | None, stored: str | None) -> str | None:
+    """:func:`name_refusal` for a name an edit sends, with one exemption: the stored name re-sent
+    (:func:`_resends_stored`) passes, so a client re-sending a name another writer stored, such as
+    a directory sync or a save made before this rule, is not refused while it edits another field.
+    A different value takes the rule, so a repair to a clean name is accepted. ``None`` (a clear,
+    where the field allows one) passes too."""
+    if name is None or _resends_stored(name, stored):
+        return None
+    return name_refusal(name)
+
+
+def _printable_name(name: str) -> str:
+    refusal = name_refusal(name)
+    if refusal is not None:
+        raise ValueError(refusal)
+    return name
+
+
+#: A name a create request sends, with no stored value to compare: :func:`name_refusal`'s rule.
+PrintableName = Annotated[str, Field(max_length=_NAME_MAX), AfterValidator(_printable_name)]
+
+
 def _valid_new_username(username: str) -> str:
     """BACKLOG #5521: the rule ``AuthService.create_local_user`` applies, checked here as well so a
     refused name never reaches the route."""
@@ -306,7 +387,8 @@ class UserCreateRequest(RequestModel):
 
     #: Refused, 422, by the new-username rule ``auth/usernames.py`` states (BACKLOG #5521).
     username: NewUsername
-    display_name: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: Refused, 422, by :func:`name_refusal` (BACKLOG #5784).
+    display_name: PrintableName | None = None
     #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
     #: where every security notice goes. An account born without one is told nothing about a change
     #: made to it before its holder's first sign-in, an administrator's password reset included. The
@@ -329,13 +411,22 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # vault BACKLOG #5342. Pinned by tests/test_auth_federated_identity_routes.py::
-    # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
-    username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
+    # vault BACKLOG #5342, BACKLOG #5784: a refused name answers 422 before the directory is
+    # asked. The constraints declared on the Field below, which the published schema carries,
+    # run before :func:`name_refusal`.
+    username: Annotated[
+        str,
+        Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN),
+        AfterValidator(_printable_name),
+    ]
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class UserUpdateRequest(RequestModel):
+    #: An explicit null clears it. A value is checked by the route, not here, against the stored
+    #: name: :func:`changed_name_refusal` refuses a changed value :func:`name_refusal` refuses,
+    #: with a 422, and lets the stored name re-sent through. The value sent is what is written, so
+    #: a console form's variant of the stored name replaces it (BACKLOG #5784).
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
     #: Its shape rule is in ``AuthService.update_user`` (BACKLOG #3278).
@@ -563,13 +654,57 @@ class RoleInfo(BaseModel):
     builtin: bool = True
 
 
+def _fold_role_name(name: str) -> str:
+    """A role name as the built-in name check compares it: the characters that draw nothing
+    (``auth.usernames.renders_as_nothing``, such as a zero-width space, a variation selector or a
+    Hangul filler) dropped, then NFKC, case folding, and each run of white space as one space with
+    none at the edges."""
+    visible = "".join(c for c in name if not renders_as_nothing(c))
+    return " ".join(unicodedata.normalize("NFKC", visible).casefold().split())
+
+
+#: Every built-in role's id and label, folded by :func:`_fold_role_name`.
+_BUILTIN_ROLE_NAMES = frozenset(
+    _fold_role_name(name) for role in Role for name in (role.value, ROLE_METADATA[role][0])
+)
+
+
+def custom_role_name_refusal(name: str, stored: str | None = None) -> str | None:
+    """Why a custom role may not be saved with the name ``name``, or ``None`` when it may (BACKLOG
+    #5785). :func:`changed_name_refusal`'s rule, with its stored-value exemption, plus one more: a
+    name that folds (:func:`_fold_role_name`) to a built-in role's id or label, such as
+    ``ADMINISTRATOR`` or ``Administrator`` with a zero-width space inside, is refused, so a custom
+    role cannot be listed under a built-in role's name. It does not fold letters across scripts: a
+    name that only looks alike, such as one spelled with a Cyrillic or small-capital letter,
+    passes. A save that re-sends the stored name (:func:`_resends_stored`) is exempt from the name
+    rule, so a role stored under a name the rule now refuses can still have its permissions
+    edited. It is exempt from the built-in check only when it folds as the stored name does, so a
+    console's variant of a stored ``Admin`` + LF + ``istrator`` cannot become ``Administrator``."""
+    resent = _resends_stored(name, stored)
+    if not resent:
+        refusal = name_refusal(name)
+        if refusal is not None:
+            return refusal
+    folded = _fold_role_name(name)
+    if folded in _BUILTIN_ROLE_NAMES and not (
+        resent and stored is not None and folded == _fold_role_name(stored)
+    ):
+        return "must not be a built-in role's name"
+    return None
+
+
 class CustomRoleRequest(RequestModel):
     """Create/update an admin-defined custom role (ADR 0045): a named SUBSET of the existing Permission
     catalog. The engine validates the subset (recognized perms only, non-empty, no carved-out
-    escalation primitive) and rejects otherwise."""
+    escalation primitive) and rejects otherwise.
+
+    ``display_name`` is checked by the route, not here, because an update compares it with the
+    stored name: :func:`custom_role_name_refusal`, answered with a 422 (BACKLOG #5785)."""
 
     display_name: str = Field(max_length=_NAME_MAX)
     description: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: A repeated permission is one grant: ``validate_custom_role_permissions`` collects the list
+    #: into a set before anything is stored or audited.
     permissions: list[PermissionId] = Field(max_length=64)
 
 

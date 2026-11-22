@@ -197,7 +197,7 @@ async def test_a_never_sealable_sidecar_with_a_bad_tail_is_deleted(
             await store.get_meta(meta.file_id)
         assert any("damaged, refused" in r.getMessage() for r in caplog.records)
         caplog.clear()
-        removed = await store.delete(meta.file_id)
+        removed = (await store.delete(meta.file_id)).meta
     assert removed.file_id == meta.file_id
     assert not _sidecar(store, meta.file_id).exists()
     assert not any("damaged, refused" in r.getMessage() for r in caplog.records)

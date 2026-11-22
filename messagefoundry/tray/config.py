@@ -48,6 +48,7 @@ from messagefoundry.api_tls_source import (
     GENERATED_CERT_NAME,
     ApiTlsSource,
     api_tls_source,
+    dialled_host,
     wildcard_loopback,
 )
 from messagefoundry.service_status import is_safe_service_name
@@ -336,7 +337,7 @@ def _probe_host(host: str) -> str:
     No client can connect to a wildcard address, and a wildcard bind accepts on loopback too. The
     loopback is :func:`messagefoundry.api_tls_source.wildcard_loopback`, the same rule that names
     it in the certificate the engine mints for a wildcard bind (BACKLOG #5973)."""
-    return wildcard_loopback(host) or host
+    return dialled_host(host)
 
 
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:

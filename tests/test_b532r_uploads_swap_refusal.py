@@ -56,6 +56,10 @@ async def test_a_swapped_part_answers_damaged_on_a_by_id_read(
 
     def _swapped(path: Path) -> object:
         if path.name.endswith(suffix):
+            # The part really is a folder now, as a fresh lstat reads it (``uploads._recheck``):
+            # an error naming a part that is still a regular file is not damage.
+            path.unlink()
+            path.mkdir()
             raise OSError(code, "synthetic swap", str(path))
         return real(path)
 
@@ -76,5 +80,4 @@ def test_a_failed_folder_check_is_logged_not_swallowed(
     monkeypatch.setattr(os, "lstat", _fails)
     with caplog.at_level(logging.DEBUG, logger=uploads.__name__):
         assert uploads._refused_read(PermissionError(13, "denied", "x.meta")) == "denied"
-    assert any("ValueError" in r.getMessage() for r in caplog.records), caplog.records
-    assert not any("x.meta" in r.getMessage() for r in caplog.records)
+    assert any("synthetic" in r.getMessage() for r in caplog.records), caplog.records

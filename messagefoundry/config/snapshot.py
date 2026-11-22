@@ -28,6 +28,7 @@ from pathlib import Path, PurePath
 from types import MappingProxyType
 
 from messagefoundry.config.code_sets import CODESETS_DIR_NAME, is_code_set_name
+from messagefoundry.path_reach import UNREACHABLE_WINERRORS, is_absent
 
 __all__ = [
     "CONNECTIONS_REL",
@@ -82,18 +83,11 @@ class ConfigDirMissing(FileNotFoundError):
 #: (161) and ERROR_FILENAME_EXCED_RANGE (206). Python maps the first to EINVAL, not ENOENT.
 _INVALID_NAME_WINERRORS: frozenset[int] = frozenset({123, 161, 206})
 
-#: The Windows errors that say a network path or share cannot be reached, so nothing is known about
-#: what is there: ERROR_BAD_NETPATH (53) and ERROR_BAD_NET_NAME (67). Python maps both to ENOENT, so
-#: each arrives as a ``FileNotFoundError``. ERROR_PATH_NOT_FOUND (3) and ERROR_INVALID_DRIVE (15) map
-#: the same way and stay absence, so a drive letter this process does not have reads as missing,
-#: even where it is mapped in another session.
-_UNREACHABLE_WINERRORS: frozenset[int] = frozenset({53, 67})
-
-
-def _is_absent(exc: OSError) -> bool:
-    """Whether ``exc`` says nothing is at the path, as against saying the path cannot be reached."""
-    unreachable = getattr(exc, "winerror", None) in _UNREACHABLE_WINERRORS
-    return not unreachable and isinstance(exc, FileNotFoundError)
+#: The Windows errors that say a network path or share cannot be reached, and whether an error says
+#: nothing is there: one answer, kept in the leaf ``messagefoundry.path_reach`` (BACKLOG #5388 added
+#: item 3), which the uploads store reads too.
+_UNREACHABLE_WINERRORS: frozenset[int] = UNREACHABLE_WINERRORS
+_is_absent = is_absent
 
 
 def is_missing_directory(exc: OSError) -> bool:

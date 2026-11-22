@@ -55,6 +55,7 @@ from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
     _CONNECTION_STRING_MEMBER,
     _braced_tail,
+    _dsn_password_repl,
     _mask_member,
     scrub_credentials,
 )
@@ -528,18 +529,12 @@ _KEY_MATERIAL = re.compile(
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
 #
-# THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". The widened reading,
-# an empty user and a password holding an "@" (BACKLOG #5386), is secretscrub's
+# THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". The widened reading
+# (BACKLOG #5386), which reads at least an empty user and a password holding an "@", is secretscrub's
 # ``_WIDE_DSN_PASSWORD``, and :func:`redact_log_line` runs it last of the credential passes, after the
 # member mask and before only the long-base64 sweep, over the whole line. Run here, first, a review
 # measured its run after the password reach past a glued ``\ndbPassword=`` label and print that
-# value's tail on every glue it tried. After the shared
-# vocabulary a value it hid is a placeholder, and the widened reading crosses one only where it is
-# the whole first segment of a password with a user, which is where the narrow pass above writes
-# its own: the run after the password, and the ";"-split tail read after a user's placeholder,
-# stop at "[" and "]"; that first segment otherwise stops at a bracket or an angle too (round 9);
-# and an empty user's first segment stops at every angle and at each "[" that opens a bracketed run
-# of letters, the shape of every placeholder. Nor does any segment of it cross a label: each stops
+# value's tail on every glue it tried. No segment of it crosses a label: each stops
 # where a key of the write-time query filter or a label word secretscrub reads starts, followed by
 # ":" or "=", and where a ``MEFOR_`` name starts, with no separator required after it
 # (``_DSN_RUN_STOP`` and ``_DSN_USER_FIRST_SEGMENT`` there say how, and why). So a value such a
@@ -672,12 +667,11 @@ def redact_log_line(line: str) -> str:
     # this line read the same separators; secretscrub's comment on the pattern says why that matters.
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
-    # The widened DSN reading, last and over the whole line (BACKLOG #5386): a password-only DSN, or
-    # a password holding an "@" that the narrow copy above cut at its first one. A value the passes
-    # above hid is a placeholder by now, and the reading reaches past one only where it is a user's
-    # whole first password segment, which is where the narrow copy wrote its own. Nor past a
-    # label a pass reads, a query key the write-time filter hides included, whether or not a pass
-    # above hid its value; the comment on _DSN_PASSWORD says which labels.
+    # The widened DSN reading, last and over the whole line (BACKLOG #5386): at least a password-only
+    # DSN, and a password holding an "@" that the narrow copy above cut at its first one; the comment
+    # on secretscrub's _WIDE_DSN_PASSWORD says what else. It does not reach
+    # past a label a pass reads, a query key the write-time filter hides included, whether or not a
+    # pass above hid its value; the comment on _DSN_PASSWORD says which labels.
     if "@" in body and "://" in body:
         body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
@@ -734,5 +728,6 @@ def _keep_scheme(m: re.Match[str]) -> str:
 
 
 def _keep_dsn_user(m: re.Match[str]) -> str:
-    """Replace the password span of a URL-shaped DSN, keeping ``scheme://user`` and the ``@``."""
-    return f"{m.group(1)}:{REDACTION_PLACEHOLDER}@"
+    """Replace the password span of a URL-shaped DSN, keeping ``scheme://user`` and the ``@``, by
+    secretscrub's own replacement, so the two surfaces cannot drift apart."""
+    return _dsn_password_repl(m, REDACTION_PLACEHOLDER)

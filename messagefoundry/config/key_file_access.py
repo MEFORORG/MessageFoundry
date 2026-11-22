@@ -34,6 +34,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
+from messagefoundry.path_reach import UNREACHABLE_WINERRORS
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -72,8 +74,8 @@ KEY_FILE_REMEDY: Final = (
 
 
 #: Windows errors CPython raises as FileNotFoundError for a path it could not reach:
-#: ERROR_BAD_NETPATH (53) and ERROR_BAD_NET_NAME (67).
-_UNREACHABLE_WINERRORS: Final = frozenset({53, 67})
+#: ERROR_BAD_NETPATH (53) and ERROR_BAD_NET_NAME (67), from the leaf ``messagefoundry.path_reach``.
+_UNREACHABLE_WINERRORS: Final = UNREACHABLE_WINERRORS
 
 
 def _absent(path: str) -> bool:

@@ -86,29 +86,17 @@ def test_key_material_in_the_next_item_makes_the_empty_key_read_as_set(shape: st
 @pytest.mark.parametrize(
     "line",
     [
-        "PATH=C:\\Windows\\system32;C:\\Windows",
-        "MEFOR_SECURITY_REQUIRE_MEMORY_ENCRYPTION_DECLARATION=1",
-        # Review round 1: each of these was read as key material by a looser rule.
-        "mefor_security_require_memory_encryption_declaration=1",
-        "PYTHONPYCACHEPREFIX=C:/ProgramData/MessageFoundry/pycache/cachedir",
-        "OTEL_SERVICE_NAME=messagefoundry-integration-engine-production-east",
+        "Path=C:\\Windows\\system32;C:\\Windows",
         "MEFOR_SECRETS_DIRECTORY=D:/MessageFoundrySecrets/ProductionEngineSecretsDirectory",
-        # Review round 2: mixed case alone does not make these secrets.
-        "HOME_DIR=/opt/MessageFoundry/ConfigDirectory/ProductionEnvironment",
-        "OTEL_SERVICE_NAME=MessageFoundry-Integration-Engine-Production-East",
-        "Mefor_Security_Require_Memory_Encryption_Declaration=1",
+        # Mixed case alone does not make these secrets.
+        "PSModulePath=C:/Program Files/WindowsPowerShell/Modules/MessageFoundryProduction",
+        "ProgramData=D:/MessageFoundryProductionData/ServiceEnvironmentProgramData",
     ],
 )
 def test_an_ordinary_line_still_ends_the_empty_key(line: str) -> None:
-    """Control: a line with no key material still ends the empty key, on a later line and in the
-    next item alike, so the secret reads as unset. An engine name longer than a key's run is
-    upper case, so it is not read as one."""
+    """Control: a line with no key material, under one of the few names that may end an empty
+    secret-class value (``serviceenv._ends_blank_class``), still ends the empty key, on a later
+    line and in the next item alike, so the secret reads as unset. Every other name refuses there
+    since BACKLOG #5394 wave 3 (``tests/test_b532w3_serviceenv_split_shapes.py``)."""
     for entries in ([f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=\n{line}"], [f"{_KEY}=", line]):
         assert _read(entries).listed_keys == (), (entries, _read(entries).listed)
-
-
-@pytest.mark.parametrize("item", ["=C:=C:\\x", "ab-c_dE="])
-def test_an_item_with_no_key_material_still_ends_the_empty_key(item: str) -> None:
-    """Control for the next-item rule: Windows' own empty-named entry, and a short base64url
-    text, hold no run of a secret's length, so each still ends the empty key above it."""
-    assert _read([f"{_KEY}=", item]).listed_keys == ()

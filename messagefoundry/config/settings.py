@@ -1497,7 +1497,11 @@ class StoreSettings(_Section):
 #: Defined here rather than beside its ADR 0118 use because at least two security decisions in this
 #: module key on it and must not disagree: :attr:`ApiSettings.is_loopback`, which used to inline the
 #: same three hosts as a tuple, and ``_desugar_security``'s refusal of a non-loopback ``listen_address``
-#: under ``local_access_only = true``. This unifies THIS module only. Other packages carry same-named
+#: under ``local_access_only = true``. ``messagefoundry.api.tls`` also reads it as the names a
+#: generated API certificate carries for a loopback bind (BACKLOG #5790), so a name added here is
+#: added to that certificate too, must be one hostname verification can match, and makes every
+#: existing generated pair for a loopback bind re-mint at its next start. Within this module it
+#: is the one definition. Other packages carry same-named
 #: frozensets for their own transports, with different contents (``::ffff:127.0.0.1`` in
 #: ``pipeline.wiring_runner`` and ``transports.dicom``, ``[::1]`` in the harness poller); reconciling
 #: those is a separate question, recorded in ADR 0154.
@@ -5084,7 +5088,8 @@ class AiSettings(_Section):
     # _FILE_SECRET_KEYS (warns if placed in the file) and _SECRET_SETTING_KEYS (redacted). Never logged.
     api_key: str | None = None
     # SSRF fail-closed allowlist (ADR 0135): each entry is "host" or "[v6]" (any port), or
-    # "host:port" or "[v6]:port"; an entry no host can match is refused at load. The broker
+    # "host:port" or "[v6]:port"; an entry `hostlist.allow_entry_problem` refuses is refused at
+    # load, at least one in no such form, a URL, a pattern or a bad port. The broker
     # validates its configured `endpoint` against THIS list ITSELF — an un-listed host (or an empty list)
     # is REFUSED. Deliberately independent of [egress].allowed_http, which, when empty, allows any
     # host under the audited `[security].block_unlisted_outbound = false` opt-out (see
@@ -5123,7 +5128,8 @@ class AiSettings(_Section):
     @field_validator("allowed_endpoints", mode="after")
     @classmethod
     def _endpoint_entries_are_read(cls, value: list[str]) -> list[str]:
-        """Refuse at load an entry the broker's host match cannot read (BACKLOG #5915)."""
+        """Refuse at load an entry :func:`~messagefoundry.hostlist.allow_entry_problem` refuses,
+        every one the broker's host match cannot read among them (BACKLOG #5915)."""
         return _host_list_entries(value, "[ai].allowed_endpoints")
 
     @field_validator("provider")
@@ -5659,8 +5665,8 @@ class EgressSettings(_Section):
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" or "[v6]" (any port), or "host:port"
-    # or "[v6]:port". `_host_entries_are_read` names the lists that refuse at load an entry no host
-    # can match.
+    # or "[v6]:port". `_host_entries_are_read` names the lists that refuse at load an entry
+    # `hostlist.allow_entry_problem` refuses.
     allowed_mllp: list[str] = []
     # Allowed raw-TCP outbound destinations: each entry is an MLLP-style host entry.
     allowed_tcp: list[str] = []
@@ -5813,7 +5819,8 @@ class EgressSettings(_Section):
     )
     @classmethod
     def _host_entries_are_read(cls, value: list[str], info: ValidationInfo) -> list[str]:
-        """Refuse at load an entry the host matcher cannot read (BACKLOG #5915). An ``allowed_db``
+        """Refuse at load an entry :func:`~messagefoundry.hostlist.allow_entry_problem` refuses,
+        every one the host matcher cannot read among them (BACKLOG #5915). An ``allowed_db``
         entry naming an IPv6 address is refused too: while the list is set the DATABASE check
         refuses every server holding a ``:``, so such an entry could never admit one."""
         setting = f"[egress].{info.field_name}"

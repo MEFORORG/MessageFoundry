@@ -7,14 +7,16 @@
   At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip that
   check, so an engine started with `up --no-deps` and a false value would still restart forever.
   The Postgres password's missing-value message now says that `--env-file` reads its file instead of
-  the `.env` beside `compose.yaml`. Both Kubernetes manifests, `docker/k8s/statefulset.yaml` and
-  `docker/k8s/ha-postgres.yaml`, now run the same check as their first init container, on the value
-  they read from the Secret's `tls-revocation-attested` key, so a value such as `0` there passes
-  the kubelet but the engine container never starts: the pod crash-loops in
-  `Init:CrashLoopBackOff`, naming the gate. Each manifest now has four `image:` fields to set.
-  `docker/k8s/secret.example.yaml` ships every value commented out, so applied unedited it holds no
-  key and the pod starts no engine, instead of an engine starting on a placeholder. See
-  docs/CLOUD-DEPLOYMENT.md, section 7. (BACKLOG #5400)
+  the `.env` beside `compose.yaml`. Both Kubernetes manifests,
+  `docker/k8s/statefulset.yaml` and `docker/k8s/ha-postgres.yaml`, now run the same check as a
+  first `revocation-attestation-check` initContainer on the value they read from the Secret's
+  `tls-revocation-attested` key, so a value such as `0` there passes the kubelet and then holds
+  the pod in Init instead of crash-looping the engine; their deploy docs say so. Every value in
+  `docker/k8s/secret.example.yaml` now ships commented out, so applying it unedited creates a
+  Secret the kubelet refuses the pod over rather than one holding placeholders. The compose
+  `engine` and `ha` engines now carry the k8s manifests' block of commented inputs an enforcing
+  `serve --env prod` start needs, and each `ha` engine gets its own named volume for the log
+  spool. See docs/CLOUD-DEPLOYMENT.md, section 7. (BACKLOG #5400)
 - **`install-service.ps1` now counts a "Log on as a service" holder written as an account name.**
   It compared the exported `SeServiceLogonRight` holders with the account's SID only, so a row that
   named the account would have read as missing and the policy would have been re-imported with the

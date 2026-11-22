@@ -696,28 +696,38 @@ _UNSCANNABLE_RE_PATTERNS = {
     # Since the round-5 review of BACKLOG #5386 ``_WIDE_DSN_PASSWORD`` splices ``_DSN_RUN_STOP``, a
     # negative lookahead over an alternation of ``_CREDENTIAL_QUERY_KEYS`` and the label words, built
     # by ``_alternation`` so it stays derived from them. The lookahead holds no repetition. Each
-    # repeated group is that lookahead and ONE character, so no quantifier nests under another:
-    # the empty user's segment is possessive, and the run after it backs off one character at a
-    # time to its last "@", as the literal form it replaced did. Since BACKLOG #5386's added item 3
-    # the empty user's character is a class OR a single "%" the class excludes, behind a
+    # repeated group is that lookahead and ONE character, plus, since wave 3, the bracket lookahead
+    # below: the empty user's segment is possessive, and the run after it backs off one character
+    # at a time to its last "@", as the literal form it replaced did. Since BACKLOG #5386's added
+    # item 3 the empty user's character is a class OR a single "%" the class excludes, behind a
     # fixed-width lookahead, so the two alternatives start on disjoint characters.
     # ``tests/test_b532r_redaction_dsn.py`` holds the growth with a stopwatch. Since round 9 the
     # user's first segment is ``_DSN_USER_FIRST_SEGMENT``, an atomic group of three alternatives
     # that start on disjoint characters: a bracketed word, an angled word, or a possessive run of
-    # that lookahead and one class holding neither bracket nor angle. Since BACKLOG #5386's
-    # bracket and tail work the run is ``_DSN_RUN``, spliced into each alternative; the empty
-    # user's class admits a "]", and its character may also be a "[" behind a lookahead, which
-    # the class excludes; and where the user's first segment is a placeholder (a conditional on
-    # its named group), the alternative ends in tail groups (``_DSN_TAIL``), each an "@" then a
-    # possessive run of ``_DSN_GROUP_CHAR`` or of ``_DSN_TAIL_CHAR``, both refusing "@", before
-    # the next "@", so the repeats tile the text; the final "@" follows both alternatives.
+    # that lookahead and one class holding neither bracket nor angle. Since BACKLOG #5386's wave 3
+    # the empty user's segment is ``_DSN_EMPTY_USER_SEGMENT``, which also takes a "[" behind a
+    # lookahead (a possessive run of letters then "]") and a "]", each starting on a character
+    # no other alternative takes. THAT LOOKAHEAD'S ``[a-z]++`` IS A QUANTIFIER NESTED UNDER THE
+    # SEGMENT'S ``*+``: it runs once per "[", stops at the first character that is not a letter,
+    # and the letters it reads hold no "[", so no character is read by two of them and the cost
+    # stays linear. The segment also serves a user holding one "@", whose host word
+    # ``[a-z0-9.\-]++`` is possessive and stops at the ":" it needs, chosen by the conditional
+    # ``(?(2)...)``, and a password that opens with a possessive run of "@", which the segment
+    # cannot start with. Every widened branch takes it through ``_DSN_WIDE_SEGMENT``, an atomic
+    # group whose first alternative is one bracketed or angled word of letters with "@" after it,
+    # possessive as a group, then the segment. The stopwatch for these shapes is
+    # ``tests/test_b532w3_redaction_5386.py``. The run after every branch is ``_DSN_RUN``, and
+    # where the user's first segment is a placeholder (a conditional on its named group
+    # ``dsn_placeholder``) the run is followed by tail groups (``_DSN_TAIL``), each an "@" then a
+    # possessive run of ``_DSN_GROUP_CHAR`` or of ``_DSN_TAIL_CHAR``, both refusing "@", before the
+    # next "@", so the repeats tile the text; the final "@" follows the tail.
     "messagefoundry/secretscrub.py": (
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')'",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')'",
-        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*):(?:(?<=//:)(?:' + _DSN_RUN_STOP + '(?:[^\\\\s/@?#&=;,()|^~{}<>\\\\[%\\\\x27\\\\x22]|%(?!7c|7e|5e|26|2c|3b|3f|23|27|22|28|29)|\\\\[(?![a-z]+\\\\])))*+' + _DSN_RUN + '|(?<!//:)' + _DSN_USER_FIRST_SEGMENT + _DSN_RUN + _DSN_TAIL + ')@'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)?):(?(2)(?![0-9]++(?![a-z0-9_])|@)' + _DSN_WIDE_SEGMENT + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + _DSN_RUN + _DSN_TAIL + '@'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
     ),

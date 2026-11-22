@@ -3162,13 +3162,20 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     url_arm = r"://[^\s:/@]+:[^\s/@]+@"
     assert url_arm in pattern
     assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
-    # The widened reading (BACKLOG #5386) has no arm. With a user, its first segment takes one
-    # character or more, each of them in the arm's class, and past it the pattern adds only a run
-    # that cannot hold whitespace or "/", then the "@", and after a placeholder optional tail
-    # groups that cannot hold either, each ending in an "@": so every text it rewrites with a user,
-    # the arm reads.
+    # The widened reading (BACKLOG #5386) has no arm. With a user holding no "@", and a password
+    # that does not start with one, its first segment takes one character or more, each of them in
+    # the arm's class, and past it the pattern adds only a run that cannot hold whitespace or "/",
+    # then the "@", and after a placeholder optional tail groups that cannot hold either, each
+    # ending in an "@": so every such text it rewrites, the arm reads. A user holding an "@", or a
+    # password starting with one (wave 3), the arm read neither before the rewrite nor after it,
+    # which keeps the "@" signs; the behaviour arm below each assert holds that.
     wide = secretscrub._WIDE_DSN_PASSWORD.pattern
-    assert r"://[^\s:/@]*):" in wide
+    assert r"://[^\s:/@]*+(?:(@)[a-z0-9.\-]++)?):" in wide
+    for before in ("x postgres://us@er:Kv9x@db", "x postgres://svc:@Kv9x@db"):
+        after = secretscrub.scrub_credentials(before)
+        assert "Kv9x" not in after, after
+        assert redaction._CREDENTIAL_AHEAD.search(before) is None, before
+        assert redaction._CREDENTIAL_AHEAD.search(after) is None, after
     first = secretscrub._DSN_USER_FIRST_SEGMENT
     assert first == (
         r"(?>(?P<dsn_placeholder>\[[a-z]+\]|<[a-z]+>)|(?:"
@@ -3183,13 +3190,13 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     tail_char = secretscrub._DSN_TAIL_CHAR
     tail_head = "(?:;|" + secretscrub._DSN_RUN_STOP + r"[^\s/"
     assert tail_char.startswith(tail_head) and tail_char.endswith("])"), tail_char
-    tail = wide.split(r"(?<!//:)" + first, 1)[1]
+    tail = wide.split(r"|" + first + ")))", 1)[1]
     expected_tail = (
         r"(?(dsn_placeholder)(?:@" + group_char + "*+(?=@)|@" + tail_char + "++(?=@))*+)"
     )
     shipped_tail = secretscrub._DSN_TAIL
     assert shipped_tail == expected_tail, shipped_tail
-    assert tail == run + secretscrub._DSN_TAIL + ")@", tail
+    assert tail == run + secretscrub._DSN_TAIL + "@", tail
 
 
 def test_an_empty_user_dsn_does_not_switch_the_encoded_run_off() -> None:

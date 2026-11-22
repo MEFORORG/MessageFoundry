@@ -118,17 +118,39 @@ interactively-logged-on user can read without elevation. Registry values are tre
 hints (validated, never executed).
 
 **Where the tray finds the engine's host and port.** From `serve --host` and `--port` in
-`AppParameters` only. A part they leave unset is the engine's default, `127.0.0.1` or `8765`. The
-tray takes neither from the engine's settings TOML nor from `MEFOR_*` variables in the service's
-environment, so set `engine_url` in `tray.toml` when the bind comes from either. A LAN bind set
-only through `[security].listen_address` is therefore probed on the loopback default and keeps
-service control. A wildcard `--host`, `0.0.0.0` or `::`, is probed on the loopback address of the
-same family, because no client can connect to a wildcard address, and the tray is monitor-only
-for it, because that bind listens on every interface. A `--host` naming any non-loopback address,
-a wildcard included, with no `--port` is monitor-only too; before BACKLOG #5936 the tray fell back
-to the loopback default for that bind and kept service control. The certificate the engine
-mints for a wildcard bind names that loopback too. An operator certificate on a wildcard bind
-verifies only if it names that loopback. (BACKLOG #5936, #5973)
+`AppParameters` only. A part they leave unset is the engine's default, `127.0.0.1` or `8765`.
+
+**Known limit: the tray does not read the bind from the engine's settings TOML**, nor from
+`MEFOR_*` variables in the service's environment. This is deliberate: ADR 0113 is unchanged, by
+the owner's ruling of 2026-11-20 on PR 3128. A bind set only through `[security].listen_address`
+or `[api].port`, with no `serve --host` or `--port`, is not discovered: the tray probes
+`127.0.0.1:8765` and keeps service control. A LAN `listen_address` does not listen on that
+loopback, so the tray reads a running engine as down. A wildcard one, `0.0.0.0`, does listen there,
+so the probe works, but the tray keeps service control for a bind that listens on every
+interface. A non-default `[api].port` reads a running engine as down. Set the bind with
+`serve --host` and `--port` instead. `scripts/service/install-service.ps1` always writes both into `AppParameters`,
+from its `-ListenHost` and `-Port` parameters (defaults `127.0.0.1` and `8765`), so a service it
+installed is discovered. Otherwise set `engine_url` in `tray.toml`. An `engine_url` naming a
+loopback host (`127.0.0.1`, `localhost` or `::1`) keeps service control; one naming any other host
+makes the tray monitor-only. An explicit `engine_url` also drops the certificate the tray found,
+so set `engine_cacert` beside it (see TLS engines). Do not use a loopback `engine_url` to regain
+service control on a wildcard `--host`: the tray then no longer knows the bind is a wildcard, and
+treats it as loopback-only.
+
+A wildcard `--host` is probed on the loopback address of the same family, `127.0.0.1` for
+`0.0.0.0` and `::1` for `::`, because no client can connect to a wildcard address, and the tray is
+monitor-only for it, because that bind listens on every interface. A `--host` naming any
+non-loopback address, a wildcard included, with no `--port` is monitor-only too; before BACKLOG
+#5936 the tray fell back to the loopback default for that bind and kept service control. The
+certificate the engine mints for a wildcard bind names that same loopback, `127.0.0.1` or `::1`.
+A pair the engine minted earlier for another bind is replaced at the next start when its
+certificate does not name the address the tray dials for the current bind, or, for a bind the
+engine treats as loopback, lacks any of `127.0.0.1`, `::1` and `localhost`. The new one names the
+current bind, and keeps only the loopback names [SERVICE.md](SERVICE.md) lists, so a client that
+dials any other name only the old one carried must change too. SERVICE.md states when the engine
+replaces its pair and what to re-import. An operator certificate is never replaced, and on a wildcard bind it verifies only if
+it names that loopback.
+(BACKLOG #5936, #5973)
 
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its
 extension, so a `log_path` naming a `.bat` or `.lnk` would run it. The tray therefore opens
@@ -210,7 +232,9 @@ as down. See the ADR 0113 amendment.)
 
 The tray discovers the scheme the same way it discovers host and port — from the service's NSSM
 registry entry. There is no `serve` TLS flag, so it also reads the engine's own settings TOML
-(`serve --service-config`, or `messagefoundry.toml` under the service's `AppDirectory`) and takes
+(`serve --service-config`, a relative path resolving under the registered `--project-root` when
+there is one and under the service's `AppDirectory` otherwise; with no `--service-config`,
+`messagefoundry.toml` under `AppDirectory`) and takes
 two facts about the scheme from it: whether `[api].tls_cert_file` is set, and whether
 `[api].tls_terminated_upstream` is declared. That read is read-only and fail-soft — a missing or
 malformed file means the engine is running on its own defaults, which mint, so the tray assumes

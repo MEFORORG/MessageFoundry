@@ -5,13 +5,14 @@
 Synthetic values only. Item 3: an empty user's first password segment refused "%", "[" and "]",
 so a password-only DSN holding one printed whole. It admits a "%" now, except one that opens an
 encoded HL7 separator, which the PHI pass reads a run by, or the encoded form of a character it
-stops at for structure, such as ",". A "[" that opens a bracketed run of letters only, the shape of
-every placeholder, it still refuses, so it never takes a placeholder; other brackets
-``tests/test_b532r_redaction_bracket_tail.py`` covers. Item 4, a ";" that opens no member in the run
-after the first segment, was built and declined: the declined form printed a value ``origin/main``
-hides, pinned below. A ";"-split tail after a user's placeholder is read now, by its own narrower
-rule, which that file covers. The comment on ``secretscrub._WIDE_DSN_PASSWORD`` says why each was
-kept or declined.
+stops at for structure, such as ",". "[" and "]" it refused, so it never crosses a
+placeholder; since wave 3 it takes them where the "[" opens no bracketed word of letters, the
+shape of ``<redacted>``, ``[redacted]`` and ``[REDACTED]``; other brackets
+``tests/test_b532r_redaction_bracket_tail.py`` covers too. Item 4, a ";" that opens no member in
+the run after the first segment, was built and declined: the declined form printed a value
+``origin/main`` hides, pinned below. A ";"-split tail after a user's placeholder is read now, by its
+own narrower rule, which that file covers. The comment on ``secretscrub._WIDE_DSN_PASSWORD`` says
+why each was kept or declined.
 """
 
 from __future__ import annotations
@@ -32,8 +33,10 @@ _ENTRY_POINTS: tuple[Callable[[str], str], ...] = (
 )
 _IDS = ("scrub_credentials", "write-time chain", "redact_log_line")
 
-#: Item 3: a "%" in an empty user's first segment. Each hid nothing on the code before.
+#: Item 3: a "%" in an empty user's first segment. Each hid nothing on the code before. Since
+#: BACKLOG #5386's wave 3, a "[" that opens no bracketed word, and a "]", are taken too.
 _NOW_HIDDEN = (
+    ("connect redis://:p[Kv9x]@db.invalid failed", ("Kv9x",)),
     ("connect redis://:p%40Kv9x@db.invalid failed", ("Kv9x",)),
     ("connect redis://:p%2FKv9x@db.invalid failed", ("Kv9x",)),
     ("connect redis://:Kv9x%Zq7@db.invalid failed", ("Kv9x", "Zq7")),
@@ -53,8 +56,9 @@ def test_a_percent_in_an_empty_users_password_is_hidden_whole(
 
 
 #: Residuals, each matching nothing, so the line prints as it did before #5386: an encoded HL7
-#: separator in either case, an encoded "," or ";", a bracketed run of letters only, which has a
-#: placeholder's shape, and a ";" in the run after the first segment.
+#: separator in either case, an encoded "," or ";", a bracketed word of letters, which is a
+#: placeholder's shape, and a ";" in the run after the first segment. ``p[Kv9x]`` was here until
+#: BACKLOG #5386's wave 3, which hides it; it moved to ``_NOW_HIDDEN``.
 _STILL_STOPPED = (
     "connect redis://:p%7CKv9x@db.invalid failed",
     "connect redis://:p%2CKv9x@db.invalid failed",
@@ -64,6 +68,7 @@ _STILL_STOPPED = (
     "connect redis://:p%26Kv9x@db.invalid failed",
     "connect redis://:p%7EKv9x@db.invalid failed",
     "connect redis://:p[KvZx]@db.invalid failed",
+    "connect redis://:p[Kvxq]Kv9x@db.invalid failed",
     "connect redis://:p;Kv9x@db.invalid failed",
 )
 

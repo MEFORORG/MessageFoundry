@@ -13787,9 +13787,9 @@ class AuthService:
 
     async def _load_role(self, role_id: str) -> RoleRow | None:
         """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_load_custom_roles`, :meth:`_custom_role_held` and :meth:`_ad_map`, the ONLY
-        readers of the store's role and AD role-map readers in this service;
-        ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
+        :meth:`_load_custom_roles`, :meth:`custom_role_stored_name`, :meth:`_role_write_refusal`
+        and :meth:`_sealed_ad_map`, the ONLY callers of the store's role and AD role-map readers
+        in this service; ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
         it grants nothing."""
         found = await self._store.get_role(role_id)
         if found is None:
@@ -13803,7 +13803,9 @@ class AuthService:
     async def _load_custom_roles(self) -> list[tuple[RoleRow, bool]]:
         """Every custom role row, each with whether its seal holds. One that fails is reported, and
         listed with no permissions by the caller, so an administrator can still see it to save it
-        again or delete it, and never sees, or re-saves, a value written outside the store."""
+        again or delete it, and never sees, or re-saves, a permission set written outside the
+        store. Its name and description are listed as stored, so a save can re-send them, and a
+        save that does seals them (:meth:`custom_role_stored_name`)."""
         sealer = self._store.row_sealer()
         out: list[tuple[RoleRow, bool]] = []
         for found in await self._store.list_roles():
@@ -13827,13 +13829,8 @@ class AuthService:
         compares in its database collation (SQL Server) finds the stored row from at least a case
         or trailing-space variant too, and a collation may fold more. A variant is not the role: a
         save under it would seal the stored row under another id, and the SQL Server delete
-        refuses it."""
-        if not is_custom_role_id(role_id):
-            return False
-        found = await self._store.get_role(role_id)
-        if found is None or str(found["id"]) != role_id:
-            return False
-        return not bool(found["builtin"])
+        refuses it. The test is :meth:`custom_role_stored_name`'s, which reads the row."""
+        return await self.custom_role_stored_name(role_id) is not None
 
     async def _role_seal_failed(self, role_id: str) -> None:
         """Report a custom role whose row failed its integrity seal (BACKLOG #2592), through
@@ -20804,6 +20801,26 @@ class AuthService:
                 )
             )
         return out
+
+    async def custom_role_stored_name(self, role_id: str) -> str | None:
+        """The display name the custom role row holding ``role_id`` stores, or ``None`` when no
+        custom role row holds that id: a custom role id, a row whose id equals it exactly, and
+        whose ``builtin`` column is not set (:meth:`_custom_role_held` says why). The API's name
+        rule exempts a save that re-sends this name (BACKLOG #5785), so a role stored under a name
+        the rule refuses can still have its permissions edited, as before the rule existed.
+
+        Its seal is NOT checked, on purpose. A save writes the whole row and seals it, whatever the
+        row held, and never checked this row's seal before the rule; a check here would add one,
+        and with it the log lines a Vault transit Outage brings and a refusal the save never gave.
+        So a name written outside the store is exempt like any other, and saving it re-seals it,
+        as such a save did before the rule. Only the name leaves here, never the row, so nothing
+        can grant from it."""
+        if not is_custom_role_id(role_id):
+            return None
+        found = await self._store.get_role(role_id)
+        if found is None or str(found["id"]) != role_id or bool(found["builtin"]):
+            return None
+        return str(found["display_name"])
 
     async def create_custom_role(
         self,

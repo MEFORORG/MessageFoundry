@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The ``host[:port]`` allowlists refuse at load an entry no host can match, and the matcher
-compares ports as numbers and reads a URL with no port at the port it dials (BACKLOG #5915).
+"""The ``host[:port]`` allowlists refuse at load an entry ``allow_entry_problem`` refuses, and
+the matcher compares ports as numbers and reads a URL with no port at the port it dials (BACKLOG
+#5915).
 
-On origin/main each of these loaded silently or matched on text: a malformed entry admitted
-nothing, ``06661`` matched ``host:06661`` but not ``host:6661`` while the connector dials 6661, and
+Before engine PR 3095 each of these loaded silently or matched on text: a malformed entry loaded
+without error, ``06661`` matched ``host:06661`` but not ``host:6661`` while the connector dials 6661, and
 ``https://host/`` did not match ``host:443`` although urllib dials 443 for it.
 """
 
@@ -87,6 +88,33 @@ def test_refusal_does_not_quote_the_entry() -> None:
         ("http://h.example.org:8443", "is a URL or a path"),
         ("https://u:p%40ss@h.example.org", "is a URL or a path"),
         ("[fe80::1%eth0]", "zone id"),
+        # Unbracketed, a zoned address is told about its zone, not to write [v6], which the
+        # bracketed form above is refused for too.
+        ("fe80::1%eth0", "zone id"),
+        ("[fe80::1%eth0]:443", "zone id"),
+        # A '%' in a host name, or one that leaves no readable entry once cut, is no zone id.
+        ("h%2Eexample.org", "character no host name does"),
+        ("h%2Eexample.org:443", "character no host name does"),
+        ("[::1]x%", r"is not 'host', 'host:port'"),
+        ("[h%2Eexample.org]", r"is not 'host', 'host:port'"),
+        ("[fe80::1%eth0", r"is not 'host', 'host:port'"),
+        ("[fe80::1%eth0]x", r"is not 'host', 'host:port'"),
+        ("db.example.org:5432:%", r"more than one ':' outside brackets"),
+        # An unbracketed zoned address with a port is told about its zone, never to write [v6].
+        ("fe80::1%eth0:443", "zone id"),
+        # Blanks inside the brackets are read as the matcher reads them.
+        ("[ fe80::1%eth0 ]", "zone id"),
+        ("[fe80::1%eth0 ]:443", "zone id"),
+        # An IPv4 address with a '%' suffix is an address, not a name or a pattern.
+        ("192.0.2.4%eth0", "'%' suffix"),
+        ("192.0.2.4%eth0:443", "'%' suffix"),
+        # Cutting the zone out must leave a readable entry; a fault the bracketed entry then has
+        # is named first.
+        ("[fe80::1%eth0]:", r"is not 'host', 'host:port'"),
+        ("[fe80::1%eth0]:abc", "port is not a number"),
+        ("[fe80::1%eth0]:443:1", "port is not a number"),
+        ("fe80::1%eth0]", r"more than one ':' outside brackets"),
+        ("fe80::1%%", r"more than one ':' outside brackets"),
         ("fe80::1:443", r"more than one ':' outside brackets"),
         ("*.example.org", "no pattern is read"),
         ("h.example.org:99999", "port is not a number"),
@@ -95,6 +123,13 @@ def test_refusal_does_not_quote_the_entry() -> None:
 def test_refusal_names_the_reason(entry: str, reason: str) -> None:
     with pytest.raises(ValidationError, match=reason):
         EgressSettings(allowed_http=[entry])
+
+
+@pytest.mark.parametrize("entry", ["fe80::1%eth0", "[fe80::1%eth0]", "[fe80::1%eth0]:5432"])
+def test_allowed_db_gives_its_own_reason_for_a_zoned_entry(entry: str) -> None:
+    # allowed_db refuses every IPv6 entry, zoned or not, and names a host name as the remedy.
+    with pytest.raises(ValidationError, match="name the server by a host name"):
+        EgressSettings(allowed_db=[entry])
 
 
 @pytest.mark.parametrize("field", _HOST_LISTS)

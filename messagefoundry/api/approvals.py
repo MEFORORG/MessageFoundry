@@ -126,6 +126,14 @@ IdentityResolver = Callable[[str], Awaitable[Identity | None]]
 #: half of an operation's authority, which a fixed permission cannot express.
 ScopeCheck = Callable[[Identity, Mapping[str, Any]], bool]
 
+#: A refusal an operation's executor would make that THIS node's state, not the request, decides
+#: (BACKLOG #5906: a reload on a cluster node that lost its lease). :meth:`ApprovalGate.approve`
+#: awaits it before the claim, so a raised :class:`ApprovalError` leaves the request as it was,
+#: where past the claim the executor's own raise is compensated to ``failed``. The gate writes an
+#: ``approval.node_refused`` row against the approver for it. Point in time: a state that changes
+#: after it returns is the executor's to meet.
+BeforeClaim = Callable[[Mapping[str, Any]], Awaitable[None]]
+
 #: What an operator records for an ``interrupted`` release, mapped to the terminal status it writes
 #: (BACKLOG #1562 part B). Each status fits the SQL Server column, which is NVARCHAR(20).
 RESOLVE_OUTCOMES: Mapping[str, str] = {
@@ -505,6 +513,9 @@ class _Operation:
     #: every config when there is no usable one (:func:`held_fingerprint`; vault BACKLOG #3192), so
     #: :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim too.
     requires_fingerprint: bool = False
+    #: Awaited after the requester's standing check and before the approver read and the claim
+    #: (:data:`BeforeClaim`).
+    before_claim: BeforeClaim | None = None
 
 
 class OperationInterrupted(Exception):
@@ -880,13 +891,17 @@ class ApprovalGate:
         in_scope: ScopeCheck | None = None,
         requires_requester: bool = False,
         requires_fingerprint: bool = False,
+        before_claim: BeforeClaim | None = None,
     ) -> None:
         """Register an approvable operation. ``permission`` is REQUIRED, so no operation can become
         approvable without naming the authority its requester must still hold at release.
         ``requires_requester`` declares that ``execute`` refuses params whose ``requester`` is not a
         non-empty string, so the gate refuses such a request before it claims it and the queue
         marks it ``params_no_requester``. ``requires_fingerprint`` declares the same of
-        :func:`held_fingerprint`, marked ``params_no_fingerprint``."""
+        :func:`held_fingerprint`, marked ``params_no_fingerprint``. ``before_claim`` is a node-state
+        refusal approve() asks before its approver read and its claim (:data:`BeforeClaim`), with
+        at least that store read between it and the claim; the queue does not
+        predict it."""
         self._ops[key] = _Operation(
             key=key,
             label=label,
@@ -895,6 +910,7 @@ class ApprovalGate:
             in_scope=in_scope,
             requires_requester=requires_requester,
             requires_fingerprint=requires_fingerprint,
+            before_claim=before_claim,
         )
 
     @property
@@ -1501,7 +1517,9 @@ class ApprovalGate:
         request whose requester no longer holds the authority it needs (:meth:`_requester_standing`),
         one younger than ``[approvals].min_dwell_seconds`` (409, ``approval.too_early``), and one
         whose operation dual control no longer gates (409, ``approval.no_longer_gated``;
-        :meth:`_refuse_ungated`).
+        :meth:`_refuse_ungated`), and one its operation's ``before_claim`` refuses on this node's
+        state (:data:`BeforeClaim`), with the status that hook raises and an
+        ``approval.node_refused`` row.
 
         **The refusal compares user ids, never usernames (BACKLOG #1540).** The stored ``requester``
         and the live ``approver`` are two snapshots of a directory-writable name, taken up to
@@ -1672,6 +1690,32 @@ class ApprovalGate:
                 "the requester no longer holds the authority this operation requires; reject the "
                 "request, and have an authorized user request it again if it is still needed",
             )
+        # BACKLOG #5906: a refusal this node's state decides, asked after the other refusals and
+        # before the claim, so a raise leaves the request pending for a release on another node or
+        # later.
+        if op.before_claim is not None:
+            try:
+                await op.before_claim(params)
+            except ApprovalError as refused:
+                # Against the approver, as the other refusals here are; soft for the same reason.
+                # The detail is the engine's own fixed text, never the params.
+                await self._record_audit_soft(
+                    approval_id,
+                    "approval.node_refused",
+                    actor=approver,
+                    detail=json.dumps(
+                        {
+                            "approval_id": approval_id,
+                            "operation": operation,
+                            "requester": row.requester,
+                            "status": refused.status,
+                            "refusal": refused.detail,
+                        }
+                    ),
+                    client=client,  # ADR 0150: the approver's address, matching this row's actor
+                    context="the release was refused on this node",
+                )
+                raise
         # BACKLOG #315 (b): READ the approver's account now, before the transition, so no store read
         # sits between the transition and the executor. The flag is written in the `finally` below.
         changed = await self._approver_changes(approver_user_id, row.requested_at)
