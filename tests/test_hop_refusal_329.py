@@ -17,6 +17,9 @@ with no escape, because every call sends the api_key. Its tests below pin that r
 
 from __future__ import annotations
 
+import asyncio
+import http.client
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -39,7 +42,11 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.alert_sinks import WebhookTransport, notifier_from_settings
+from messagefoundry.pipeline.alert_sinks import (
+    NotifierAlertSink,
+    WebhookTransport,
+    notifier_from_settings,
+)
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import ai_broker as ai_broker_mod
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_broker_from_settings
@@ -201,6 +208,13 @@ _REFUSED_WEBHOOK_URLS = [
     # At the end, urlsplit keeps it in the host it judges and the dial strips it.
     pytest.param("https://localhost\u2003", ("localhost",), id="trailing-em-space"),
     pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\x85", (), id="trailing-nel"),
+    # Inside the URL: http.client could never send these, and for a space it raises InvalidURL
+    # quoting the path, so each alert POST would log the token.
+    pytest.param(f"https://hooks.example/services/T0 {_WEBHOOK_TOKEN}", (), id="inner-space"),
+    pytest.param(f"https://hooks.example/x\x85{_WEBHOOK_TOKEN}", (), id="inner-nel"),
+    pytest.param(f"https://hooks.example\u2003/{_WEBHOOK_TOKEN}", (), id="em-space-in-host"),
+    pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\ufeff", (), id="trailing-bom"),
+    pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\udc80", (), id="lone-surrogate"),
     # Whitespace both readers strip is stripped, so an http URL inside it is still refused.
     pytest.param(f" http://hooks.example/{_WEBHOOK_TOKEN}\n", (), id="space-http"),
     pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}", ("other.example",), id="off-allowlist"),
@@ -254,6 +268,36 @@ def test_a_listed_webhook_host_loads() -> None:
         webhook_url="https://hooks.example/x", webhook_allowed_hosts=["HOOKS.example"]
     )
     assert alerts.webhook_allowed_hosts == ["HOOKS.example"]
+
+
+class _TokenQuotingTransport:
+    """A transport whose send raises an exception quoting a webhook path, as http.client's
+    InvalidURL does for a URL with a space in it."""
+
+    name = "webhook"
+
+    async def send(self, event: object, **_: object) -> None:
+        raise http.client.InvalidURL(f"URL can't contain control characters. '/{_WEBHOOK_TOKEN}'")
+
+
+async def test_a_failed_send_logs_the_exception_class_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Vault BACKLOG #3533 item 14: the notifier's WARNING for a failed transport names the class
+    # and carries no message and no exc_info, so a send whose exception quotes the URL logs no token.
+    sink = NotifierAlertSink([_TokenQuotingTransport()])
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
+        sink.connection_stopped("OB_X", detail="synthetic")
+        sink.start()
+        for _ in range(500):
+            if any("alert transport webhook failed" in r.getMessage() for r in caplog.records):
+                break
+            await asyncio.sleep(0.01)
+        await sink.aclose()
+    [record] = [r for r in caplog.records if "alert transport webhook failed" in r.getMessage()]
+    assert record.exc_info is None and record.exc_text is None
+    assert record.getMessage().endswith(": InvalidURL")
+    assert _WEBHOOK_TOKEN not in caplog.text
 
 
 def test_the_build_dials_the_value_it_judged() -> None:

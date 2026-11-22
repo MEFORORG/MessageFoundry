@@ -15,11 +15,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.urlscreen import (
     MAX_OUTBOUND_URL_LEN,
     UNCACHED_URLSPLIT,
     refuse_url_credentials,
+    unsendable_request_target,
 )
 
 __all__ = [
@@ -73,17 +73,18 @@ def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> st
     """Refuse a webhook URL on the checks that read no secret, no posture and log nothing, and
     return the value it judged: ``url`` with :data:`_STRIPPED_BY_BOTH` stripped from each end. A
     caller that dials the URL dials that value, so the end whitespace stripped here reaches no
-    later reader. Whitespace inside the URL, such as a space in the path, is not refused here.
+    later reader.
 
     No refusal here prints the URL (BACKLOG #1793): a Slack or Teams hook carries its secret in the
     PATH, and a userinfo URL carries a password. The userinfo screen runs before any check that
     names a part of the URL, and it raises outside urlsplit's own handler, whose text quotes the
     netloc. At least these are refused, in this order:
 
-    * whitespace left at either end, and a control character or lone surrogate inside the value,
-      after :data:`_STRIPPED_BY_BOTH` is
-      stripped from each end (``urlsplit`` drops a tab, CR or LF, so the scheme it read need not
-      be the one urllib dials);
+    * whitespace left at either end after :data:`_STRIPPED_BY_BOTH` is stripped, and a URL
+      ``http.client`` could not send (``unsendable_request_target``, judged as sent): a space, a
+      control character or a non-ASCII character inside it. ``http.client`` raises ``InvalidURL``
+      quoting the path for the first two, and that text would reach the log at every POST;
+      ``urlsplit`` also drops a tab, CR or LF, so the scheme it read need not be the one dialled;
     * a credential in the URL, or a URL that does not parse (``refuse_url_credentials``);
     * any scheme but https. A plaintext http target is refused with no escape, in every posture
       (vault BACKLOG #3533 item 5, ASVS 12.2.1): the URL can carry the hop's credential as a path
@@ -99,10 +100,11 @@ def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> st
             f"{_SETTING} starts or ends with a non-ASCII space; the value is not repeated here, "
             "since its path can carry the webhook's token"
         )
-    if has_control_char(candidate) or has_lone_surrogate(candidate):
+    if unsendable_request_target(candidate, sent_as_is=True):
         raise ValueError(
-            f"{_SETTING} holds a control character or an unpaired surrogate; the value is not "
-            "repeated here, since its path can carry the webhook's token"
+            f"{_SETTING} holds a space, a control character or a non-ASCII character, which "
+            "http.client cannot send; the value is not repeated here, since its path can carry "
+            "the webhook's token. Percent-encode the character, or write the host in punycode"
         )
     refuse_url_credentials(candidate, _SETTING, use="the path token the webhook service issues")
     scheme = UNCACHED_URLSPLIT(candidate).scheme  # urlsplit lower-cases the scheme

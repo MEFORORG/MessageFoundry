@@ -2683,16 +2683,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     event.get("connection"),
                 )
                 return
-            except Exception:
+            except Exception as exc:
                 # Best-effort: a failing transport must not drop the event for the others, nor
                 # ever propagate into the engine. The line names the event's type and connection,
-                # never its free text, which can echo a partner's reply (docs/PHI.md row 10).
+                # never its free text, which can echo a partner's reply (docs/PHI.md row 10). It
+                # names the exception's class only, with no message and no exc_info: a send's
+                # exception text can quote the webhook URL, whose path can carry its token (an
+                # http.client InvalidURL does), or a relay's reply (vault BACKLOG #3533 item 14).
                 log.warning(
-                    "alert transport %s failed for %s/%r",
+                    "alert transport %s failed for %s/%r: %s",
                     transport.name,
                     event.get("type"),
                     event.get("connection"),
-                    exc_info=True,
+                    type(exc).__name__,
                 )
                 return
             observer = self._delivery_observer

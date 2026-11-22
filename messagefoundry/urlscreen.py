@@ -2,7 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The endpoint-URL credential screen, with no engine import (vault BACKLOG #3533 item 14).
 
-:func:`refuse_url_credentials` and the uncached ``urlsplit`` it reads through moved here from
+:func:`refuse_url_credentials`, the request-target screen :func:`unsendable_request_target` and
+the uncached ``urlsplit`` moved here from
 ``transports/rest.py`` and ``transports/proxy_address.py``, so ``config`` can run the same screen
 at settings load without importing the transports package, whose ``__init__`` registers every
 connector. ``rest`` and ``proxy_address`` import them back, so their names are unchanged.
@@ -154,3 +155,29 @@ def _split_or_refuse(
             f"cause this; set credentials in {use} instead"
         )
     return parsed
+
+
+def request_target_as_sent(url: str) -> str:
+    """``url`` with ``urllib.parse.unwrap`` stripping the whitespace around it and the fragment
+    cut at the LAST ``#``, as ``rest._url_segments_sent`` reads it (BACKLOG #5911)."""
+    url = urllib.parse.unwrap(url)
+    return url.rpartition("#")[0] if "#" in url else url
+
+
+def unsendable_request_target(url: str, *, sent_as_is: bool = False) -> bool:
+    """Whether ``url`` holds what this screen refuses in a request target (BACKLOG #5911).
+
+    ``http.client`` sends the target as ASCII and refuses a control character or a space in it,
+    and urllib sets the ``Host`` header from the URL's host, which ``http.client`` encodes as
+    Latin-1 rather than IDNA. Every whitespace character is a control, a space or not ASCII, so
+    all three are refused.
+
+    ``sent_as_is`` is for a caller that sends the URL with no path appended: it is judged as
+    :func:`request_target_as_sent` gives it. Otherwise the URL is judged as written and a ``#`` is
+    refused too: urllib would split it off with every path the caller appends after it.
+    """
+    if sent_as_is:
+        url = request_target_as_sent(url)
+    elif "#" in url:
+        return True
+    return not url.isascii() or any(ch <= " " or ch == "\x7f" for ch in url)
