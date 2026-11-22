@@ -1003,13 +1003,8 @@ function Set-SecretsDirAcl {
       anything left over is a refusal, not a warning. The engine refuses only the known broad groups
       at start, so an entry for some other account would go unnoticed there and could read every
       secret in the directory.
-
-      -AddFile ALSO LETS THE ACCOUNT ADD A FILE TO THE DIRECTORY ITSELF (vault BACKLOG #3411, key
-      custody S3 slice B3c). Under [store].key_provider = 'host' the directory holds the store key,
-      and the service's first start writes its own key file there from the handoff provision-admin
-      left. The grant is on the directory alone, not inherited by its files, and is read back.
     #>
-    param([Parameter(Mandatory)][string]$Path, [string]$Account, [switch]$AddFile)
+    param([Parameter(Mandatory)][string]$Path, [string]$Account)
     $remedy = "Restrict it as docs/CONFIGURATION.md 'The secrets directory' shows, and re-run the installer."
     # Read again here, not only when -SecretsDir was judged: icacls follows a junction to its
     # target, and the path, or a folder above it, may have become one since.
@@ -1035,13 +1030,6 @@ function Set-SecretsDirAcl {
         if ($LASTEXITCODE -ne 0) {
             $problems += ("'$Account' could not be granted read (icacls exit $LASTEXITCODE), so the " +
                 "service could not read the directory")
-        }
-        if ($AddFile) {
-            & icacls $Path /grant "${Account}:(WD)" | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                $problems += ("'$Account' could not be granted the right to add a file (icacls exit " +
-                    "$LASTEXITCODE), so the service could not write its store key file there")
-            }
         }
     }
     # The same well-known broad set Set-SecureDataDirAcl removes, for the reasons it gives.
@@ -1079,18 +1067,6 @@ function Set-SecretsDirAcl {
                     $(try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $accountSid }
                         catch { $false }) })
             if (-not $held) { $problems += "'$Account' holds no read on it, so the service could not read it" }
-            if ($AddFile) {
-                $add = [System.Security.AccessControl.FileSystemRights]::CreateFiles
-                $adds = @($acl.Access | Where-Object {
-                        $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-                        -not ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
-                        ($_.FileSystemRights -band $add) -eq $add -and
-                        $(try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $accountSid }
-                            catch { $false }) })
-                if (-not $adds) {
-                    $problems += "'$Account' cannot add a file to it, so the service could not write its store key file"
-                }
-            }
         }
     } catch {
         $problems += "its access list could not be read back ($($_.Exception.Message))"
@@ -1167,10 +1143,11 @@ function Get-SettingsKeyProvider {
 
       READ AS TEXT. Running the install's interpreter would run its code from this elevated prompt,
       which the interpreter check below declines to do. So this reads at least a key_provider line in
-      a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table,
-      each holding a one-line string with no escape. Any other form reads as $null. What the installer
-      does with the answer is an early refusal and a printed step: the engine applies its own key
-      custody refusals at start whatever this returns.
+      a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table
+      with no table nested before the key, each holding a one-line string with no escape. Names
+      compare case-sensitively, as TOML's do. Any other form reads as $null. What the installer does
+      with the answer is an early refusal: the engine applies its own key custody refusals at start
+      whatever this returns.
     #>
     param([Parameter(Mandatory)][string]$Path)
     $value = '(?:"(?<v>[^"\\]*)"|''(?<v>[^'']*)'')'
@@ -1181,15 +1158,15 @@ function Get-SettingsKeyProvider {
     $found = $null
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
         $line = $line.TrimStart([char]0xFEFF)
-        if ($line -match '^\s*\[\[') { $table = "[[]]"; continue }
-        if ($line -match ('^\s*\[(?<t>[^\]]*)\]' + $tail)) {
-            $table = $Matches.t -replace '[\s"'']', ''
+        if ($line -cmatch '^\s*\[\[') { $table = "[[]]"; continue }
+        if ($line -cmatch ('^\s*\[(?<t>[^\]]*)\]' + $tail)) {
+            $table = $Matches.t -creplace '[\s"'']', ''
             continue
         }
         # A [store] line; a top-level dotted key; a top-level one-line inline table.
-        if (($table -eq "store" -and $line -match ('^\s*' + $key + '\s*=\s*' + $value + $tail)) -or
-            ($table -eq "" -and $line -match ('^\s*' + $store + '\s*(?:\.\s*' + $key + '\s*=\s*' +
-                $value + $tail + '|=\s*\{(?:.*[,{\s])?' + $key + '\s*=\s*' + $value + ')'))) {
+        if (($table -ceq "store" -and $line -cmatch ('^\s*' + $key + '\s*=\s*' + $value + $tail)) -or
+            ($table -ceq "" -and $line -cmatch ('^\s*' + $store + '\s*(?:\.\s*' + $key + '\s*=\s*' +
+                $value + $tail + '|=\s*\{(?:[^{]*[,\s])?' + $key + '\s*=\s*' + $value + ')'))) {
             $found = $Matches.v
         }
     }
@@ -2868,8 +2845,11 @@ $HostCustody = if ($null -ne $RegisteredKeyProvider) { $RegisteredKeyProvider -c
 if ($HostCustody) {
     $custodyAccountProblem = Get-HostCustodyAccountProblem -ServiceAccount $ServiceAccount -AllowLocalSystem:$AllowLocalSystem
     if ($custodyAccountProblem) {
-        throw ("$custodyAccountProblem, and the service's settings name [store].key_provider = " +
-            "'host', whose key custody refuses that account, so the service would not start. Leave " +
+        $namedBy = if ($null -ne $RegisteredKeyProvider) {
+            "the service's own environment sets MEFOR_STORE_KEY_PROVIDER=host"
+        } else { "the settings file '$ServiceConfig' names [store].key_provider = 'host'" }
+        throw ("$custodyAccountProblem, and $namedBy, a key provider whose custody refuses that " +
+            "account, so the service would not start. Leave " +
             "out -AllowLocalSystem to run as the virtual account 'NT SERVICE\$ServiceName', or pass a " +
             "-ServiceAccount of the service's own (docs/SERVICE.md 'Least-privilege service account').")
     }
@@ -3307,7 +3287,7 @@ Set-DataDirOwner -Path $DataDir
 # setting. The service is told where it is through its environment, which holds only the path.
 # A directory left unrestricted is a refusal, and the service is registered by now, so it is
 # disabled first, as the other refusals after registration are.
-try { Set-SecretsDirAcl -Path $SecretsDir -Account $ServiceAccount -AddFile:$HostCustody }
+try { Set-SecretsDirAcl -Path $SecretsDir -Account $ServiceAccount }
 catch {
     throw "$($_.Exception.Message) $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it cannot start with a secrets directory others can read')"
 }
@@ -3463,31 +3443,6 @@ Write-Host "  Logs   : $StdoutLog"
 Write-Host "           $StderrLog"
 Write-Host ""
 Write-Host "Next steps:"
-# Key custody (vault BACKLOG #3411, S3 slice B3c): under the host provider the service starts only
-# once its store key is minted, and provision-admin mints it as the handoff the service converts on
-# its first start. The installer does not run it: it would run the install's code from this
-# elevated prompt, and it asks for a password and the recovery key at the terminal. So the command
-# is printed, naming the account, the settings file, the store path and the secrets directory the
-# service was registered with, so the shell and the service read one directory (vault BACKLOG #8119
-# item 9). Not printed when a store key file is already in that directory.
-if ($HostCustody) {
-    $custodyFile = "master.key", "handoff.key" | ForEach-Object { Join-Path $SecretsDir $_ } |
-        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    if ($custodyFile) {
-        Write-Host ("  Store key: '$custodyFile' is already there ([store].key_provider = " +
-            "'host'), so provision-admin mints no key over it.")
-    } else {
-        $q = { param($s) "'" + ($s -replace "'", "''") + "'" }
-        Write-Host ("  Before the first start, mint the store key for '$RunAsObjectName' " +
-            "([store].key_provider = 'host'), in an elevated PowerShell:")
-        Write-Host "    `$env:MEFOR_SECRETS_DIRECTORY = $(& $q $SecretsDir)"
-        Write-Host ("    & $(& $q $PythonExe) $EngineInterpreterOptions -m messagefoundry provision-admin " +
-            "--username <name> --email <address> --service-config $(& $q $ServiceConfig) " +
-            "--db $(& $q $DbPath) --service-account $(& $q $RunAsObjectName)")
-        Write-Host ("    It shows the store's recovery key once and asks for it back. Keep it off this " +
-            "host: with neither this host nor that key, the store cannot be opened.")
-    }
-}
 # Start-Service needs no nssm.exe, so an operator following this never runs a copy nobody checked
 # (BACKLOG #2364).
 Write-Host "  Start-Service '$ServiceName'"

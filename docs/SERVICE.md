@@ -245,14 +245,12 @@ Administrator from an elevated shell on the host:
 messagefoundry provision-admin --username <name> --email <address> --db C:\ProgramData\MessageFoundry\messagefoundry.db
 ```
 
-When the settings file names `[store].key_provider = 'host'` (vault BACKLOG #3411), skip step 1:
-that provider refuses a second store key source beside it, so leave `MEFOR_STORE_ENCRYPTION_KEY`
-unset. `provision-admin` mints the store key instead. When the install script reads that setting
-(its `Get-SettingsKeyProvider` says in which forms), it prints the command for step 2, with `--service-account` naming the service's account and the secrets directory the
-service was registered with. The script also lets that account add files to the secrets directory,
-where the service writes its own key file at its first start. It refuses `-AllowLocalSystem`, and
-at least the SYSTEM, LOCAL SERVICE and NETWORK SERVICE spellings of `-ServiceAccount`, because that
-provider refuses those accounts and the service would not start.
+Under `[store].key_provider = 'host'` (vault BACKLOG #3411) the service cannot run as SYSTEM,
+LOCAL SERVICE or NETWORK SERVICE: that provider refuses them as the engine account. When the
+install script reads that setting, from the settings file in the forms its
+`Get-SettingsKeyProvider` lists or from `MEFOR_STORE_KEY_PROVIDER` in the service's own
+environment, it refuses such an account before it changes anything: `-AllowLocalSystem` with no
+`-ServiceAccount`, and at least the usual spellings of those accounts as `-ServiceAccount`.
 
 If the service started first, at the shipped posture it refuses to start. Once the earlier start
 checks pass (the store key and `[alerts]` among them), that refusal names `provision-admin` in the
