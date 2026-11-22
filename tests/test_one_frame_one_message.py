@@ -680,6 +680,22 @@ def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
     assert "utf-8" not in warnings[0]
 
 
+def test_the_reporting_variants_flag_a_replaced_reply_every_time() -> None:
+    """BACKLOG #5799 item 1: the warning is once per connection, but the flag a listener writes its
+    ``reply_replaced`` event from is set on every reply replaced, and on no other. A clean reply and
+    the utf-8 fallback for an unusable charset name are not replacements."""
+    reply = MSH + CR + "MSA|AA|CTRL1|\u00e9" + CR
+    for _ in range(2):
+        wire, replaced = framing_mod.frame_reply_reporting(
+            MLLP_CODEC, reply, "ascii", connection="IB_FLAG"
+        )
+        assert replaced and wire == frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_FLAG")
+        assert framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_FLAG")[1]
+    assert not framing_mod.frame_reply_reporting(MLLP_CODEC, CLEAN, "ascii")[1]
+    assert not framing_mod.encode_reply_reporting(reply, "utf-8")[1]
+    assert not framing_mod.encode_reply_reporting(reply, "not-a-real-codec")[1]
+
+
 @pytest.mark.parametrize(
     "msh2",
     ["?~" + BS + "&", "^?" + BS + "&", "^~?&", "^~" + BS + "?"],
@@ -842,8 +858,10 @@ async def test_the_mllp_listener_sends_one_frame_when_its_reply_holds_a_start_by
 def test_the_mllp_handler_fault_nak_is_one_frame_when_the_header_holds_a_start_byte() -> None:
     source = MLLPSource(Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0}))
     header = f"MSH|{ENC}|S|F|R|F|20260101||ADT^A01|C{SB}1|P|2.5{CR}"
-    nak = source._handler_failure_nak(header.encode("utf-8"))
-    assert nak is not None and nak.count(b"\x0b") == 1 and nak.count(b"\x1c") == 1
+    framed = source._handler_failure_nak(header.encode("utf-8"))
+    assert framed is not None
+    nak = framed[0]
+    assert nak.count(b"\x0b") == 1 and nak.count(b"\x1c") == 1
 
 
 async def test_the_tcp_listener_sends_one_frame_when_its_reply_holds_its_start_byte() -> None:

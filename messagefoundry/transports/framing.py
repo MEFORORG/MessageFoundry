@@ -36,6 +36,7 @@ from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 __all__ = [
     "FRAMING_CODE",
     "MULTIPLE_MESSAGES_CODE",
+    "REPLY_REPLACED_REASON",
     "FrameError",
     "FrameByteFault",
     "FramePayloadError",
@@ -49,8 +50,10 @@ __all__ = [
     "codec_for",
     "declared_encoding",
     "encode_reply",
+    "encode_reply_reporting",
     "frame_for_delivery",
     "frame_reply",
+    "frame_reply_reporting",
 ]
 
 logger = logging.getLogger(__name__)
@@ -69,8 +72,17 @@ FRAMING_CODE = "framing"
 _reply_fallback_logged: set[str] = set()
 
 #: The listeners whose reply-character replacement has been logged, once per connection for the
-#: same reason (BACKLOG #5799): a narrow charset meets the same characters on every message.
+#: same reason (BACKLOG #5799): a narrow charset meets the same characters on every message. Each
+#: replaced reply still writes a ``reply_replaced`` connection event, through the listeners that call
+#: :func:`frame_reply_reporting` or :func:`encode_reply_reporting`.
 _reply_replacement_logged: set[str] = set()
+
+#: The ``reason`` of a ``reply_replaced`` connection event. Fixed text: it names neither the charset
+#: setting nor any part of the reply, which echoes the message.
+REPLY_REPLACED_REASON = (
+    "the reply held characters the inbound charset cannot encode; each was replaced before it "
+    "was sent"
+)
 
 
 def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
@@ -153,13 +165,21 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     the ACK builder already puts in place of an echoed CR or LF. The replacement is on bytes, for the
     reason :func:`frame_for_delivery` checks bytes. The reply is encoded by :func:`encode_reply`,
     which says what it does with a charset that cannot hold it."""
-    body = encode_reply(reply, encoding, connection=connection)
+    return frame_reply_reporting(codec, reply, encoding, connection=connection)[0]
+
+
+def frame_reply_reporting(
+    codec: FrameCodec, reply: str, encoding: str, *, connection: str = ""
+) -> tuple[bytes, bool]:
+    """:func:`frame_reply`, and whether characters the charset cannot hold were replaced, so a
+    listener can write a ``reply_replaced`` connection event for that reply (BACKLOG #5799)."""
+    body, replaced = encode_reply_reporting(reply, encoding, connection=connection)
     if codec.start in body or codec.end in body:
         logger.warning(
             "reply held a frame start or end byte; each was replaced by a space before framing"
         )
     # The replacement is the leaf's rule, shared with the test harness's ACK writers.
-    return codec.frame(codec.neutralise(body))
+    return codec.frame(codec.neutralise(body)), replaced
 
 
 def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
@@ -182,6 +202,16 @@ def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
     the warning each fallback logs, once per connection for each, since a narrow charset meets the
     same characters message after message. The charset setting and the reply are never logged: the
     setting is configuration that may hold anything, and the reply echoes the message."""
+    return encode_reply_reporting(reply, encoding, connection=connection)[0]
+
+
+def encode_reply_reporting(
+    reply: str, encoding: str, *, connection: str = ""
+) -> tuple[bytes, bool]:
+    """:func:`encode_reply`, and whether characters the charset cannot hold were replaced. The
+    warning is logged once per connection; the flag is set on every reply replaced, for the
+    listener's ``reply_replaced`` connection event (BACKLOG #5799). A reply sent in ``utf-8``
+    because the charset name is unusable is not a replacement, and the flag is False."""
     unencodable = False
     try:
         body = reply.encode(encoding)
@@ -200,8 +230,8 @@ def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
             )
         body = reply.encode("utf-8")
     if unencodable:
-        body = _encode_replacing(reply, encoding, connection)
-    return body
+        return _encode_replacing(reply, encoding, connection), True
+    return body, False
 
 
 def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:

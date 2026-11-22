@@ -67,7 +67,11 @@ from messagefoundry.transports.base import (
     register_source,
     wait_for_intake,
 )
-from messagefoundry.transports.framing import declared_encoding, encode_reply
+from messagefoundry.transports.framing import (
+    REPLY_REPLACED_REASON,
+    declared_encoding,
+    encode_reply_reporting,
+)
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_PER_HOST,
@@ -1037,9 +1041,9 @@ class X12Source(SourceConnector):
                                 # event is sent outside the except clause, so nothing chains the
                                 # encode error, whose `object` is the whole reply.
                                 reply_fault: str | None = None
-                                wire = b""
+                                wire, replaced = b"", False
                                 try:
-                                    wire = encode_reply(
+                                    wire, replaced = encode_reply_reporting(
                                         reply, self.encoding, connection=self._pacing_name
                                     )
                                 except (LookupError, UnicodeError) as exc:
@@ -1068,6 +1072,13 @@ class X12Source(SourceConnector):
                                         break
                                     continue
                                 writer.write(wire)  # unframed: the interchange is the frame
+                                if replaced:
+                                    # BACKLOG #5799, as the MLLP listener records it.
+                                    await self._emit_event(
+                                        "reply_replaced",
+                                        peer_host=peer_host,
+                                        reason=REPLY_REPLACED_REASON,
+                                    )
                                 await self._drain_reply(writer)
                         if failed:
                             break

@@ -33,6 +33,7 @@ from typing import Any, NoReturn
 import pytest
 
 import messagefoundry.transports.base as base_mod
+import messagefoundry.transports.framing as framing_mod
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
@@ -644,6 +645,70 @@ async def test_a_reply_a_narrow_charset_cannot_hold_is_still_sent() -> None:
         await asyncio.wait_for(source.stop(), timeout=5.0)
     assert b"MSA|AA|MSG1|caf?" in reply, reply
     assert "framing_error" not in cap.kinds(), cap.kinds()
+
+
+async def test_each_reply_a_narrow_charset_altered_writes_a_reply_replaced_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5799 item 1: the replacement's WARNING is logged once per connection per process, so
+    # without an event the second altered ACK left no record at all. Each altered reply now writes
+    # one `reply_replaced` event with a fixed reason; a clean reply writes none. Red on the code
+    # before: the event list holds no `reply_replaced`.
+    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
+    cap = _Capture()
+    source = _mllp(encoding="ascii")
+    source.on_connection_event = cap
+    texts = iter(["café", "plain", "naïve"])
+
+    async def narrow(raw: bytes) -> str:
+        return build_ack(raw, code="AA", text=next(texts))
+
+    await source.start(narrow)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        for _ in range(3):
+            writer.write(frame(_ADT))
+            await writer.drain()
+            await _read_reply(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    replaced = [e for e in cap.events if e[0] == "reply_replaced"]
+    assert len(replaced) == 2, cap.events
+    assert all(reason == framing_mod.REPLY_REPLACED_REASON for _, _, reason in replaced)
+    assert all(host is not None for _, host, _ in replaced)
+
+
+async def test_a_handler_fault_nak_the_charset_altered_writes_a_reply_replaced_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5799 item 1: the handler-fault NAK echoes the control id, and a byte the ascii
+    # inbound cannot decode reaches it as a character ascii cannot encode, so the NAK is altered
+    # too. It writes `reply_replaced` after `handler_error`. Red on the code before: no such event.
+    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
+    cap = _Capture()
+    source = _mllp(encoding="ascii")
+    source.on_connection_event = cap
+    await source.start(_boom)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        writer.write(frame(_ADT.replace("MSG1", "MSG\xe91").encode("latin-1")))
+        await writer.drain()
+        assert b"MSA|AE|MSG?1|" in await _read_reply(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert cap.kinds()[:3] == ["established", "handler_error", "reply_replaced"], cap.kinds()
+
+
+def test_the_handler_fault_nak_flags_a_replacement_only_when_one_was_made() -> None:
+    source = _mllp(encoding="ascii")
+    clean = source._handler_failure_nak(b"MSH|^~\\&|S|F|R|F|20260101||ADT^A01|C1|P|2.5\r")
+    altered = source._handler_failure_nak(b"MSH|^~\\&|S|F|R|F|20260101||ADT^A01|C\xe91|P|2.5\r")
+    assert clean is not None and clean[1] is False
+    assert altered is not None and altered[1] is True
 
 
 async def _raise_locked(*args: Any, **kwargs: Any) -> NoReturn:
