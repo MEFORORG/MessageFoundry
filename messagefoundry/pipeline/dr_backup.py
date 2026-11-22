@@ -6454,8 +6454,9 @@ def _refuse_colliding_config_members(
         if sys.platform == "win32":
             win32_root_key = _win32_path_key(str(config_dest.resolve()))
             store_key = _win32_path_key(str(dest_store_path.resolve()))
-            # Sidecars are suffixed AFTER normalizing: SQLite names them from the file Windows
-            # placed, so `--to D/store.db.` has its WAL at `store.db-wal`, not `store.db.-wal`.
+            # Sidecars are suffixed AFTER normalizing: SQLite names them from the path spelling the
+            # store is opened with, and `--to D/store.db.` places `store.db`, whose plain spelling
+            # has its WAL at `store.db-wal`, not `store.db.-wal`.
             win32_published = {
                 store_key,
                 *(store_key[:-1] + (store_key[-1] + s,) for s in _SIDECAR_SUFFIXES),
@@ -6487,6 +6488,9 @@ def _refuse_colliding_config_members(
                     # resolved here. A plain spelling of it meets the exclusive create; a STREAM on
                     # it would not, and would write onto the store. So a stream on any `~` name in
                     # the store's directory is refused. The generated name itself is not predicted.
+                    # LIMIT: this does not cover a plain `RESTOR~1.DB-wal` member. It lands, and
+                    # becomes the store's WAL if the store is later opened by its 8.3 path, because
+                    # SQLite names sidecars from the spelling the store was opened with.
                     at_store_dir = len(prefix) == win32_depth and prefix[:-1] == store_key[:-1]
                     component = resolved.split("\\")[win32_depth - 1] if at_store_dir else ""
                     stem, stream_mark, _ = component.partition(":")
@@ -6499,8 +6503,8 @@ def _refuse_colliding_config_members(
                         # refusal below does echo it, so it is not safe against such a name.
                         raise BackupError(
                             "destination",
-                            "the archive's config bundle carries a member that Windows resolves "
-                            "to or under a path this restore would publish for the store "
+                            "the archive's config bundle carries a member that may resolve, on "
+                            "Windows, to or under a path this restore would publish for the store "
                             f"({dest_store_path}), so it could replace or corrupt the restored "
                             "database. Nothing was extracted. The archive's own member name is the "
                             "problem, so treat the archive as suspect",
