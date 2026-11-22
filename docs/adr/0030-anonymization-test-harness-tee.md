@@ -236,7 +236,7 @@ below.)* Files:
 - `anon/hl7.py` — a **mutate-capable** MSH-separator field model (read/replace/re-encode + escaping),
   the write-side superset of `tee/hl7_fields.py`. On the **engine/harness** side it delegates to
   [`parsing/message.py`](../../messagefoundry/parsing/message.py) `Message` (already battle-tested:
-  `_encoding_chars` reads MSH-1/MSH-2, whole-field `set()` assigns the surrogate's `^`-joined value
+  `_encoding_chars` returns the delimiters the parser read, whole-field `set()` assigns the surrogate's `^`-joined value
   verbatim, `repetitions()` handles repeating fields); the vendored tee copy carries an **equivalent stdlib
   re-encoder** so the tee needs no engine import. These two re-encoders are **behaviourally parallel, not
   byte-identical** — a divergence risk called out in Consequences.

@@ -46,6 +46,7 @@ WRITERS: frozenset[str] = frozenset(
         "rename_code_set",
         "remove_code_set",
         "apply_rename",
+        "write_rename",
         "replace_validated",
         "scaffold",
         "import_corepoint",

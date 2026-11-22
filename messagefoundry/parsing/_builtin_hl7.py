@@ -59,6 +59,7 @@ __all__ = [
     "FieldEntry",
     "HL7ParseError",
     "DelimiterRewriteRefused",
+    "CollidingDelimitersRefused",
     "parse",
     "clone",
     "extract_field",
@@ -99,6 +100,16 @@ class HL7ParseError(ValueError):
 class DelimiterRewriteRefused(ValueError):
     """:func:`encode_with_separators` met a value the target delimiters cannot carry as data (ADR
     0206 rule 4). Its text is fixed and quotes nothing from the message."""
+
+
+class CollidingDelimitersRefused(ValueError):
+    """A message's first line names too few encoding characters, and a default filled in for one
+    is already another of its delimiters (:func:`filled_default_collides`, BACKLOG #5972), so a
+    write to it, or an OBX-5 document read from it, could not be what the sender wrote. Raised by
+    ``Message``'s writes, by a batch header written in such a head's delimiters, and by
+    ``extract_obx_document`` on an OBX that holds an ED document. Deliberately not a
+    ``BinaryCarriageError``: a Handler that skips an OBX on that error does not skip, and
+    silently drop, such a document. Its text is fixed and quotes nothing from the message."""
 
 
 class FieldEntry(TypedDict):
@@ -205,6 +216,35 @@ def _parse_msh(msh_line: str, seps: tuple[str, str, str, str, str]) -> Segment:
 
 
 _SHORT_HEADER = "message header is too short to read its encoding characters"
+
+
+def header_line_head(segment: Segment) -> str:
+    """A parsed MSH, BHS or FHS segment's id, field separator and encoding characters, closed by
+    the field separator: the head of the line :func:`_extract_separators` and
+    :func:`filled_default_collides` read, rebuilt from the parsed fields 1 and 2 rather than
+    sliced from raw text."""
+    fields = segment["fields"]
+    field_sep = _field_text(fields[1])
+    encoding = _field_text(fields[2]) if len(fields) > 2 else ""
+    return segment["id"] + field_sep + encoding + field_sep
+
+
+def filled_default_collides(line: str) -> bool:
+    """Whether ``line`` names fewer than four encoding characters and the five separators
+    :func:`_extract_separators` reads from it, its defaults filling the rest, are not five distinct
+    characters. A default may be one already declared, as in ``MSH^^...`` (``^`` is the field
+    separator and the default component one) or ``MSH|~|...`` (``~`` the declared component
+    separator and the default repetition one), or the short header may repeat one itself, as
+    ``MSH|^~~|...`` does. Every line is split on the first line's separators, so two structures
+    would share one character and a write joining one would read back as the other (BACKLOG
+    #5972). The parse accepts such a header, as ``Peek`` reads it, so a read sees what the sender
+    sent; ``Message``'s writes refuse it, as every write to a short header was refused before.
+    A header that declares all four is not judged here: it filled nothing, and what it repeats
+    is its own (strict validation refuses that)."""
+    end = line.find(line[3], 4, _SEPARATOR_HEAD)
+    if len(line[4 : end if end != -1 else _SEPARATOR_HEAD]) >= 4:
+        return False
+    return len(set(_extract_separators(line))) < 5
 
 
 def parse(norm: str) -> ParsedMessage:

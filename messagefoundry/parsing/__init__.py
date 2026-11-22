@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from messagefoundry.parsing.binary import (
     BinaryCarriageError,
-    UnreadableDelimitersError,
+    CollidingDelimitersRefused,
     embed_obx_document,
     extract_obx_document,
 )
@@ -120,10 +120,9 @@ __all__ = [
     "DicomPeekError",
     # Binary carriage codec (ADR 0028) — the mfb64:v1: substrate marker (use it via
     # RawMessage.from_bytes/.raw_bytes) + OBX-5 ED embed/extract; full surface under
-    # messagefoundry.parsing.binary. UnreadableDelimitersError is what embed/extract raise for a
-    # message whose delimiters cannot be read, and is not a BinaryCarriageError (BACKLOG #2873).
+    # messagefoundry.parsing.binary.
     "BinaryCarriageError",
-    "UnreadableDelimitersError",
+    "CollidingDelimitersRefused",
     "embed_obx_document",
     "extract_obx_document",
     # Compression codec (ADR 0123) — pure gzip/zlib-deflate/zip, bytes in → bytes out. Deterministic

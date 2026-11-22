@@ -342,18 +342,46 @@ async def test_below_threshold_not_stripped(store: MessageStore) -> None:
     assert (await _get(store, mid))["raw"] == small
 
 
-async def test_unreadable_delimiters_skip_is_logged_once_per_strip_call(
+async def test_a_short_msh2_row_is_stripped_like_any_other(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A row whose HL7 delimiters cannot be read (an MSH-2 shorter than four characters) is left
-    as stored, so its document outlives the window; the pass logs that at WARNING, once, naming
-    the count and an unreadable row's message id and no byte of a body (BACKLOG #5099). A
-    readable row stripped in the same pass is the control: it is stripped, and adds nothing to
-    the record."""
+    """A row whose MSH-2 is shorter than four characters is read under the delimiters the parser
+    fills for it, so its document is stripped in its window like a readable row's, and nothing is
+    logged as skipped (BACKLOG #5972; BACKLOG #5099 used to leave it as stored and warn)."""
     short = HL7_ED_BODY.replace("MSH|^~\\&|", "MSH|^~\\|", 1)
     assert short != HL7_ED_BODY
-    first = await _delivered(store, channel_id="IB", raw=short, now=0.0, control="C-UNR1")
-    second = await _delivered(store, channel_id="IB", raw=short, now=0.0, control="C-UNR2")
+    first = await _delivered(store, channel_id="IB", raw=short, now=0.0, control="C-SHORT")
+    await _delivered(store, channel_id="IB", raw=HL7_ED_BODY, now=0.0, control="C-READ")
+
+    now = 5 * DAY
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"):
+        result = await store.strip_embedded_documents(
+            older_than=float("-inf"),
+            now=PRUNED_AT,
+            connection_cutoffs={"IB": now - 1 * DAY},
+        )
+
+    assert (result.messages_stripped, result.documents_stripped) == (2, 2)
+    assert (await _get(store, first))["raw"] != short
+    assert [r for r in caplog.records if r.name == "messagefoundry.store.document_strip"] == []
+
+
+async def test_an_unwritable_header_skip_is_logged_once_per_strip_call(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A row whose short MSH-2 fills a delimiter with one it already uses cannot be written, so it
+    is left as stored and its document outlives the window; the pass logs that at WARNING, once,
+    naming the count and such a row's message id and no byte of a body (BACKLOG #5972, review
+    finding 6). Under ``MSH|~|`` no OBX-5 component reads as written, and it is still reported.
+    A readable row stripped in the same pass, and a colliding row with no ED document, add
+    nothing to the record."""
+    colliding = HL7_ED_BODY.replace("MSH|^~\\&|", "MSH|^~&|", 1)
+    tilde = HL7_ED_BODY.replace("MSH|^~\\&|", "MSH|~|", 1)
+    no_doc = "MSH|~|SEND|FAC|RECV|FAC|20240101000000||ORU~R01|MSG0002|P|2.5\rOBX|1|TX|||text\r"
+    assert colliding != HL7_ED_BODY and tilde != HL7_ED_BODY
+    first = await _delivered(store, channel_id="IB", raw=colliding, now=0.0, control="C-COL1")
+    second = await _delivered(store, channel_id="IB", raw=tilde, now=0.0, control="C-COL2")
+    quiet = await _delivered(store, channel_id="IB", raw=no_doc, now=0.0, control="C-QUIET")
     readable = await _delivered(store, channel_id="IB", raw=HL7_ED_BODY, now=0.0, control="C-READ")
 
     now = 5 * DAY
@@ -365,16 +393,17 @@ async def test_unreadable_delimiters_skip_is_logged_once_per_strip_call(
         )
 
     assert (result.messages_stripped, result.documents_stripped) == (1, 1)
-    assert (await _get(store, first))["raw"] == short
+    assert (await _get(store, first))["raw"] == colliding
+    assert (await _get(store, second))["raw"] == tilde
     records = [r for r in caplog.records if r.name == "messagefoundry.store.document_strip"]
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING and records[0].exc_info is None
     text = records[0].getMessage()
     assert "skipped 2 stored HL7 bodies" in text
-    # The id it names is an unreadable row's, never the readable one stripped beside them.
+    # The id it names is a colliding row's, never the readable one or the quiet one.
     assert f"message {first}" in text or f"message {second}" in text
-    assert str(readable) not in text
-    for piece in ("SEND", "RECV", "MSG0001", "ORU", "^~", DOC.decode()[:20], "C-UNR"):
+    assert str(readable) not in text and str(quiet) not in text
+    for piece in ("SEND", "RECV", "MSG0001", "ORU", "^~", DOC.decode()[:20], "C-COL"):
         assert piece not in text, piece
 
 
@@ -1233,7 +1262,7 @@ def test_a_refused_cell_is_returned_with_its_traceback_cleared(
         content_types={},
     )
 
-    assert (batch.updates, batch.unreadable, batch.outage) == ([], [], False)
+    assert (batch.updates, batch.unwritable, batch.outage) == ([], [], False)
     [failure] = batch.refused
     assert failure.__traceback__ is None
 

@@ -248,10 +248,10 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   refused (the delimiter-class rule below).
 - **The delivery seam** `RegistryRunner._hydrate_payload` runs **before** `connector.send` on both the
   single-item (`_process_delivery_item`) and batch (`_process_delivery_batch`, per member) paths. A cheap
-  gate (`may_hold_doc_ref`: the `DOC_REF_MARKER` substring, or an `MSH-1`/`MSH-2` that names a character
-  of the marker and so escapes it, BACKLOG #5099) short-circuits the common no-handle case to a
-  **byte-identical** passthrough with **no store read** — so below-threshold, no-detach, and Handler-built (never-detached)
-  deliveries are unchanged. When a handle is present it hydrates via `reattach_documents_in_hl7` with an
+  gate (`may_hold_doc_ref`: the `DOC_REF_MARKER` substring, or a header line whose fields 1 and 2 name a
+  character of the marker and so escape it, BACKLOG #5099, #5972) short-circuits the common no-handle case to a
+  **byte-identical** passthrough with **no store read**. A payload the gate opens on is judged by
+  the re-attach, and can be refused even when it holds no handle (below). When a handle is present it hydrates via `reattach_documents_in_hl7` with an
   async reader over `store.read_attachment` (off the event loop, chunk-by-chunk). **Fail-loud:** a missing
   attachment the message holds whose read then fails (`KeyError`, or `StreamingAttachmentsUnsupported`
   at read time) is turned into a retryable `DeliveryError` — exactly like the
@@ -259,10 +259,14 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   ERROR/retry/dead-letter path and **the connector never receives an un-hydrated handle** (which would
   deliver `mfdoc:v1:ref:…` into the partner's `OBX-5.5` = silent corruption).
 - **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** At least
-  these are refused permanently: the payload does not parse as HL7, or it holds the raw handle
-  marker and its separators cannot be read because it has no `MSH` or its first `MSH`'s `MSH-2` is
-  shorter than four characters (with no raw marker, such a payload is carried as it is). Each of
-  these raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
+  these are refused permanently: the payload does not parse as HL7; it holds a handle and its
+  short `MSH-2` fills a delimiter with one it already uses, so no write to it can be read back
+  (BACKLOG #5972); or a header line after the first names delimiters under which it holds the
+  marker escaped, and it holds a handle or a document, or that marker names a content address
+  (a bare one in a payload that holds nothing is carried as text, as under the first line's
+  delimiters). The ingress detach refuses a body with a document to detach and such a marker,
+  so delivery does not meet one it accepted. Each of these raises `UnreattachableDocumentError`, which `_hydrate_payload`
+  turns into a
   permanent `NegativeAckError` (code `reattach`), so that row dead-letters alone, under either
   `internal_error` policy. On a batched outbound that member is dead-lettered alone and the rest of the
   batch goes out, provided every other member hydrates. A stored
@@ -308,8 +312,9 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   HTTP, before the ACK.
   **One delimiter-class rule (BACKLOG #5099, added 2026-11-04).** `Message.set` escapes a
   delimiter wherever it occurs in a value. So when a message's delimiters, read as
-  `Message._encoding_chars` reads them (`MSH-1` and the first four `MSH-2` characters of the first
-  `MSH`; a fifth, truncation character does not count), include a character of the base64
+  `Message._encoding_chars` reads them (the ones the parser read from the first line, an `MSH`,
+  `BHS` or `FHS` header, a short `MSH-2` filled as the parser fills it, BACKLOG #5972; a fifth,
+  truncation character does not count), include a character of the base64
   alphabet `A-Za-z0-9+/=`: a subcomponent separator in it is escaped inside a document set back
   into `OBX-5.5`, a field, component or repetition separator in it splits the document so the
   detach would store a fragment, and the content address after a copied marker may not read as
@@ -318,11 +323,9 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
      before anything is stored (`Base64DelimiterError`, an `InboundDocRefError`).
   2. *Ingress marker refusal.* Both listeners refuse a body of any size that holds the handle
      marker, raw or as its delimiters escape it (`marker_under_base64_delimiters`, through
-     `ingress_guards.doc_ref_marker_refusal`, which the dry-run runs too). A body whose delimiters
-     cannot be read, because its first `MSH`'s `MSH-2` is shorter than four characters, is refused
-     when it holds the raw marker, as delivery refuses it. A body with no `MSH` never reaches this
-     check: `Peek.parse` refuses it first. The cost is a header read, plus up to two substring scans under such delimiters or
-     the raw-marker scan under such a header.
+     `ingress_guards.doc_ref_marker_refusal`, which the dry-run runs too). A body with no `MSH` never
+     reaches this check: `Peek.parse` refuses it first. The cost is a header read, plus up to two
+     substring scans under such delimiters.
   3. *Egress splice refusal.* The re-attach refuses a handle it would splice before any read, so
      a Handler that changed `MSH-1` or `MSH-2` after the detach cannot corrupt the document.
   4. *Egress copy refusal.* The re-attach refuses any marker it finds with no handle to splice.
@@ -339,10 +342,38 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   if splicing it back under the delimiters it arrived with reproduces it exactly, so the detach
   also refuses an ED Base64 document whose own value `Message._escape_leaf` would change under
   them, such as a non-base64 value holding `&` or a control character under `|^~\&`
-  (`NonVerbatimDocumentError`), the same way. A streaming body with an `OBX` and a first `MSH`
-  whose `MSH-2` is shorter than four characters is refused at the detach the same way too
-  (`UnreadableDelimitersError`), since no `OBX-5.5` of it can be read; a body with no `MSH` never
-  reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
+  (`NonVerbatimDocumentError`), the same way. A body whose `MSH-2` is shorter than four
+  characters is read, detached and re-attached under the delimiters the parser filled for it
+  (BACKLOG #5972), unless a default filled in is already another of its delimiters, as in
+  `MSH|^~&|`: `Message` refuses every write to such a body, so the detach refuses it wherever
+  an `OBX` has `OBX-2` `ED`, whether or not a document reads there, since under `MSH|~|` no
+  `OBX-5` component reads as written (`CollidingDelimitersError`, a `NonVerbatimDocumentError`).
+  A body under such a header that holds the handle marker anywhere, raw or as a header's
+  delimiters escape it, is refused at any size by both listeners
+  (`marker_under_colliding_delimiters`, through `ingress_guards.doc_ref_marker_refusal`, which
+  the dry-run and the loopback re-ingress run too), and by the detach before it judges the claim
+  (`InboundDocRefError`), since a handle in an `OBX-5.5` the header hides is not read as one.
+  Each such check looks for the marker in as many distinct forms as later headers' delimiters
+  give, up to a fixed limit, whatever the body's size
+  (`binary._LATER_HEADER_FORMS_LIMIT`). A body whose later headers give more, and whose first
+  line's forms are not found, is refused without those scans, so the check stays linear in the
+  body: at least by both listeners, the dry-run and the loopback re-ingress under such a
+  header (`HEADER_FORMS_REFUSED_REASON`), and by the streaming detach, under such a
+  header before it reads any `OBX` and under any other where it would detach a document
+  (`HeaderFormsLimitError`, an `InboundDocRefError`). Both listeners, the dry-run and the
+  loopback re-ingress refuse a body past that limit under any other header too, whatever it
+  holds (`binary.later_header_forms_over_limit`, the same reason), because the delivery
+  re-attach looks for each later header's form with a scan of the payload on every attempt. The
+  re-attach bounds its own scans at the same limit and refuses a payload past it
+  (`UnreattachableDocumentError`). The count is read from the header lines alone, which the
+  detach does not change, so a skeleton the detach grew is not refused for a count the
+  listeners admitted; a payload a Handler built can be. The upload resend and both edit-resend
+  paths run the same listener check (`admit_resubmitted_body`). The direct path runs it on a
+  body `Peek.parse` accepts, and on one within that parse's segment cap that only the
+  re-attach's own parse accepts, such as an FHS- or BHS-led batch; on another it runs fewer
+  checks, and `admit_resubmitted_body` says which. So a direct body the listeners would refuse for another
+  marker rule can still be committed and then refused at the re-attach. A
+  body with no `MSH` never reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a
   stored control character is an engine fault for the internal-error policy, as a CR or LF is.
@@ -359,7 +390,8 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   under a new message id, so the store links each child to the parent's documents a handle in its
   `OBX-5.5` names, read as delivery reads one (behind its gate), with one reference of its own, in
   the commit that makes it (`_inherit_attachments`). An address the body carries anywhere else,
-  bare or as a copied handle, is not linked. A document whose header a purge collected first is
+  bare or as a copied handle, is not linked, nor is any handle under a header whose filled
+  default collides with another of its delimiters, which the re-attach refuses (BACKLOG #5972). A document whose header a purge collected first is
   not linked either, so `refcount` still equals the live linkage rows. Purging either message then
   releases only its own reference. A handle naming a document the parent does not hold is not
   linked, and is refused at delivery. A transform with several pass-through Sends makes several

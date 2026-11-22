@@ -30,10 +30,7 @@ document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`), of a re
 handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`), of a document
 under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`) and of a
 document the splice would not set back verbatim
-(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`) and of a body with an OBX
-whose MSH-2 is shorter than four characters
-(:class:`~messagefoundry.parsing.binary.UnreadableDelimitersError`; a body with no MSH never
-reaches the detach, since ``Peek.parse`` refuses it first), each an
+(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`), each an
 ``ERROR`` row on a streaming inbound, which the dry-run never raises because it never detaches. A ``str`` body, which
 only the dry-run accepts: it has nothing to decode, so :func:`decode_body` never tries the codec
 name, and a name that would refuse every received byte body passes. Bytes go through the one name
@@ -78,8 +75,11 @@ from messagefoundry.parsing import RawMessage, normalize
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import (
     BinaryCarriageError,
+    colliding_marker_verdict,
     is_marked,
+    later_header_forms_over_limit,
     marker_under_base64_delimiters,
+    may_hold_doc_ref,
 )
 from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.message import Message
@@ -97,8 +97,10 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.framing import declared_encoding
 
 __all__ = [
+    "COLLIDING_DOC_REF_MARKER_REFUSED_REASON",
     "DOC_REF_MARKER_REFUSED_REASON",
     "FRAME_BYTE_REJECTED_REASON",
+    "HEADER_FORMS_REFUSED_REASON",
     "INGRESS_MAX_BYTES",
     "MULTIPLE_MESSAGES_REJECTED_REASON",
     "NUL_REJECTED_REASON",
@@ -144,22 +146,68 @@ __all__ = [
 STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
 
 #: The stored reason for an HL7 body refused because it holds the document handle marker and a
-#: delimiter is a base64 character, or its delimiters cannot be read because its MSH-2 is shorter
-#: than four characters (BACKLOG #5099). A body with no MSH never reaches this check: ``Peek.parse``
-#: refuses it first. It names no byte of the body.
+#: delimiter is a base64 character (BACKLOG #5099). It names no byte of the body.
 DOC_REF_MARKER_REFUSED_REASON = (
-    "document handle refused: the body holds the handle marker, and either a delimiter is a "
-    "base64 character or the delimiters are unreadable"
+    "document handle refused: the body holds the handle marker, and a delimiter is a base64 "
+    "character"
+)
+
+#: The stored reason for an HL7 body refused because it holds the document handle marker under a
+#: header whose filled default collides with another of its delimiters (BACKLOG #5972). It names
+#: no byte of the body.
+COLLIDING_DOC_REF_MARKER_REFUSED_REASON = (
+    "document handle refused: the body holds the handle marker, and its header fills a delimiter "
+    "it does not name with one it already uses"
+)
+
+#: The stored reason for an HL7 body whose later headers escape the handle marker in more
+#: distinct ways than the checks look for, under any first header, so it
+#: is refused without a scan per form (BACKLOG #5972): under a header whose filled default
+#: collides, where the first line's forms are not found, and under any other header whatever it
+#: holds, since the delivery re-attach would look for each. It names no byte of the body.
+HEADER_FORMS_REFUSED_REASON = (
+    "document handle check refused the body: its later headers escape the handle marker in too "
+    "many ways to look for each"
 )
 
 
+#: The resubmission refusal when the document-marker check itself faults on a header read. Fixed
+#: text, followed only by the fault's type name, so no fault's own message, which may quote the
+#: body, reaches the operator.
+_MARKER_CHECK_FAULT_REASON = "document handle check failed reading the header"
+
+
 def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
-    """The reason to refuse a parsed HL7 body before the ACK, or ``None`` to go on: one that holds
-    the document handle marker under a delimiter in the base64 alphabet, or the raw marker under
-    an MSH-2 shorter than four characters, which delivery would refuse on every outbound (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`,
-    BACKLOG #5099). Pure, so both listeners and the dry-run run the one check."""
-    if marker_under_base64_delimiters(Message(peek.message), text):
+    """The reason to refuse a parsed HL7 body before the ACK, or ``None`` to go on: at least one
+    that holds the document handle marker under a delimiter in the base64 alphabet, which delivery
+    would refuse on every outbound
+    (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`, BACKLOG #5099), and
+    one that holds it under a header whose filled default collides, where a handle in ``OBX-5.5``
+    may not read as one
+    (:func:`~messagefoundry.parsing.binary.marker_under_colliding_delimiters`, BACKLOG #5972),
+    and, under any header, one whose later headers give more distinct forms of the marker than
+    are looked for
+    (:func:`~messagefoundry.parsing.binary.later_header_forms_over_limit`, BACKLOG #5972), so the
+    delivery re-attach never scans a received body once per form past that limit. Pure, so both
+    listeners, the loopback re-ingress and the dry-run run the one check."""
+    return _message_marker_refusal(Message(peek.message), text)
+
+
+def _message_marker_refusal(message: Message, text: str) -> str | None:
+    """:func:`doc_ref_marker_refusal` over an already-parsed ``message``, so the edit-resend direct
+    path runs the same check on a body only the delivery re-attach's ``Message.parse`` accepts,
+    such as an FHS- or BHS-led batch (BACKLOG #5972)."""
+    if marker_under_base64_delimiters(message, text):
         return DOC_REF_MARKER_REFUSED_REASON
+    verdict = colliding_marker_verdict(message, text)
+    if verdict == "held":
+        return COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    if verdict == "over-limit":
+        return HEADER_FORMS_REFUSED_REASON
+    # Under a colliding header the verdict above already counted the forms, within the limit
+    # here, so only another header's are counted: from the parsed fields, with no text scan.
+    if not message._delimiters_collide() and later_header_forms_over_limit(message):
+        return HEADER_FORMS_REFUSED_REASON
     return None
 
 
@@ -193,9 +241,10 @@ class IngressGuardError(Exception):
 
     ``phase`` names which guard fired (``"decode"`` or ``"size"``) and matches the live listener's ACK
     phase labels, so a caller that records dispositions can map it onto the same one the engine writes.
-    :func:`admit_resubmitted_body` adds three more, ``"type"`` for the declared-type sniff,
-    ``"parse"`` for ``Peek.parse`` and ``"strict"`` for strict ``hl7apy`` validation; the dry-run entry
-    points never raise any of them.
+    :func:`admit_resubmitted_body` adds four more, ``"type"`` for the declared-type sniff,
+    ``"parse"`` for a parse refusal, ``Peek.parse``'s among others, ``"ingest"`` for the
+    document-marker check, :func:`doc_ref_marker_refusal` among others, and ``"strict"``
+    for strict ``hl7apy`` validation; the dry-run entry points never raise any of them.
 
     **Never raised with a body-holding error on its chain (BACKLOG #1796).** The caught error can hold
     the body: a ``UnicodeEncodeError``'s or ``UnicodeDecodeError``'s ``.object`` is the WHOLE text or
@@ -654,6 +703,19 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     return text
 
 
+def _raise_if_marker_refused(peek: Peek, text: str) -> None:
+    """Raise the ``ingest`` refusal where :func:`doc_ref_marker_refusal` refuses ``text``. It reads
+    the header too, so a read fault is refused as well, naming the fault's type alone; no reason it
+    raises names a byte of the body."""
+    refused: str | None
+    try:
+        refused = doc_ref_marker_refusal(peek, text)
+    except PEEK_READ_FAULTS as exc:
+        refused = f"{_MARKER_CHECK_FAULT_REASON} ({type(exc).__name__})"
+    if refused is not None:
+        raise IngressGuardError(refused, phase="ingest")
+
+
 def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     """Admit an operator-resubmitted body the way the inbound ``ic`` admits a sender's (BACKLOG #1911).
 
@@ -669,8 +731,11 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
       :func:`peek_max_bytes`, so a connection's own lower ``max_message_bytes`` holds, but never above
       the engine ceiling (see below); the engine ceiling for any other type, in the listener's units.
     * **type** -- the declared-type magic-byte sniff the listener applies to a non-HL7 body.
-    * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check,
-      and then :func:`doc_ref_marker_refusal`, as both listeners run it after the parse.
+    * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check.
+      A fault in the parse is a parse refusal naming its type alone, in the listeners' wording.
+    * **ingest** -- an HL7 body must then pass :func:`doc_ref_marker_refusal`, as both listeners run
+      it after the parse (BACKLOG #5099, #5972). A fault in its header read is an ``ingest``
+      refusal too, so the body is refused rather than admitted.
 
     Strict ``hl7apy`` validation is NOT run here, because the listener times it and a synchronous
     function cannot time itself without a thread of its own. :func:`admit_resubmission` runs this and
@@ -681,9 +746,13 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
 
     ``ic`` is ``None`` only on the edit-resend direct path, which writes an outbound row and so has no
     inbound to guard for; a re-route whose origin inbound is not registered is refused with a 409
-    before this runs. Only the engine-wide rules apply then, the NUL rule and the engine ceiling, and
-    ``raw`` is returned as is. Strict validation is an inbound's setting, so it never applies there
-    either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
+    before this runs. The engine-wide rules apply then, at least the NUL rule and the engine
+    ceiling, and, for a body that the delivery re-attach's gate opens on
+    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), at least these: the listeners'
+    whole **ingest** check on a body ``Peek.parse`` accepts, and on one within its segment cap
+    that only the re-attach's own parse (``Message.parse``) accepts; a **size** refusal of a body
+    past ``Peek.parse``'s segment cap; and a **parse** refusal of one the parser faults on. ``raw`` is returned
+    as is. Strict validation is an inbound's setting, so it never applies there either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
     rule is ``docs/SECURITY.md`` control 5), so the ceiling is a backstop.
 
     **Not mirrored, and a resubmission can therefore still differ from a sender's body:** document
@@ -697,6 +766,58 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         if "\x00" in raw:
             raise IngressNulRejected()
         _raise_if_oversize(len(raw))
+        # The delivery re-attach judges a payload its gate opens on, so one that parses as HL7
+        # meets the listeners' document-marker refusal here, rather than being committed and then
+        # dead-lettered (BACKLOG #5972). A body the parser refuses within the segment cap is left to
+        # the outbound, but a fault in the parser refuses the body, as the re-attach re-raises one
+        # rather than admit what it could not read. A body Peek.parse refuses past its segment cap
+        # is refused. Another body it refuses, such as an FHS- or BHS-led batch, is parsed again as
+        # the re-attach parses it and meets the same marker refusal on that parse.
+        if not may_hold_doc_ref(raw):
+            return raw
+        # Raised once its handler has ended, so the parser's error is on no chain.
+        faulted: str | None = None
+        direct_peek: Peek | None = None
+        try:
+            direct_peek = Peek.parse(raw, max_bytes=DEFAULT_MAX_MESSAGE_BYTES)
+        except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
+            if exc.parser_fault:
+                faulted = f"parse error: {safe_exc(exc)}"
+        except PEEK_READ_FAULTS as exc:
+            # As on the re-route path: a parse refusal naming its type, not an error unaudited.
+            faulted = f"parse error: peek read failed ({type(exc).__name__})"
+        if faulted is not None:
+            raise IngressGuardError(faulted, phase="parse")
+        if direct_peek is not None:
+            _raise_if_marker_refused(direct_peek, raw)
+            return raw
+        # Message.parse has no segment cap, so a body past the one Peek.parse enforces is refused
+        # here, unparsed, rather than parsed whole on the request (BACKLOG #5972).
+        over_cap: str | None = None
+        try:
+            enforce_size_limits(normalize(raw), max_bytes=None)
+        except HL7PeekError as exc:
+            over_cap = str(exc)
+        if over_cap is not None:
+            # The size phase, as the re-route answers the same body.
+            raise IngressGuardError(over_cap, phase="size")
+        try:
+            message = Message.parse(raw)
+        except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
+            if not exc.parser_fault:
+                return raw
+            faulted = f"parse error: {safe_exc(exc)}"
+        except PEEK_READ_FAULTS as exc:
+            faulted = f"parse error: peek read failed ({type(exc).__name__})"
+        if faulted is not None:
+            raise IngressGuardError(faulted, phase="parse")
+        marker_refused: str | None
+        try:
+            marker_refused = _message_marker_refusal(message, raw)
+        except PEEK_READ_FAULTS as exc:
+            marker_refused = f"{_MARKER_CHECK_FAULT_REASON} ({type(exc).__name__})"
+        if marker_refused is not None:
+            raise IngressGuardError(marker_refused, phase="ingest")
         return raw
     # The reason a caught error refused the body, raised once its handler has ended.
     refused: str | None = None
@@ -734,20 +855,21 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             refused = str(exc)
         if refused is not None:
             raise IngressGuardError(refused, phase="size")
-        # The listeners' marker refusal runs at the same point after the parse, so a resend does
-        # not rest on delivery's refusal alone (BACKLOG #5099). A fault in the parse or in the
-        # marker's header read is a parse refusal naming its type alone, in the listeners'
-        # wording, rather than an error the caller cannot audit. Unlike the listeners it logs no
-        # WARNING of its own, and the listeners' own field reads in that block are not run here.
+        # A fault in the parse is a parse refusal naming its type alone, in the listeners' wording,
+        # rather than an error the caller cannot audit (BACKLOG #5099). Unlike the listeners it logs
+        # no WARNING of its own, and the listeners' own field reads are not run here.
         try:
             peek = Peek.parse(text, max_bytes=ceiling)
-            refused = doc_ref_marker_refusal(peek, text)
         except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
             refused = f"parse error: {safe_exc(exc)}"
         except PEEK_READ_FAULTS as exc:
             refused = f"parse error: peek read failed ({type(exc).__name__})"
         if refused is not None:
             raise IngressGuardError(refused, phase="parse")
+        # The listeners' document-marker refusal, after the parse as they run it, so a resubmitted
+        # body they would refuse is not committed and then refused by every outbound's re-attach,
+        # and a resend does not rest on delivery's refusal alone (BACKLOG #5099, #5972).
+        _raise_if_marker_refused(peek, text)
     else:
         check_declared_type(ic, text_sniff_head(text))
     return text

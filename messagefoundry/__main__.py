@@ -6371,16 +6371,25 @@ def _graph(args: argparse.Namespace) -> int:
 
     def edges_out(kind: str, name: str) -> list[dict[str, str]]:
         return [
-            {"target": e.target, "target_kind": e.target_kind, "provenance": e.provenance}
+            {
+                "target": e.target,
+                "target_kind": e.target_kind,
+                "provenance": e.provenance,
+                "relation": e.relation,
+            }
             for e in sorted(graph.targets(kind, name), key=lambda e: (e.target_kind, e.target))
         ]
 
     def out_names(kind: str, name: str, target_kind: str) -> list[str]:
         return sorted({e.target for e in graph.targets(kind, name) if e.target_kind == target_kind})
 
-    def in_names(kind: str, name: str, source_kind: str) -> list[str]:
+    def in_names(kind: str, name: str, source_kind: str, relation: str | None = None) -> list[str]:
         return sorted(
-            {e.source for e in graph.referrers(kind, name) if e.source_kind == source_kind}
+            {
+                e.source
+                for e in graph.referrers(kind, name)
+                if e.source_kind == source_kind and relation in (None, e.relation)
+            }
         )
 
     data = {
@@ -6402,7 +6411,7 @@ def _graph(args: argparse.Namespace) -> int:
                 # Non-empty only for a pass-through (PT) inbound — the handlers that Send here.
                 "receives_from": in_names("inbound", name, "handler"),
                 # Non-empty only for a Loopback inbound — the outbounds whose reingress_to names it.
-                "reingressed_from": in_names("inbound", name, "outbound"),
+                "reingressed_from": in_names("inbound", name, "outbound", "reingress_to"),
             }
             for name, c in reg.inbound.items()
         ],
@@ -6418,6 +6427,8 @@ def _graph(args: argparse.Namespace) -> int:
                 "receives_from": in_names("outbound", name, "handler"),
                 # The reingress_to back-edge into a Loopback inbound, when this outbound has one.
                 "edges": edges_out("outbound", name),
+                # The Http inbounds whose reply_from names this outbound (ADR 0154 D4).
+                "replies_to": in_names("outbound", name, "inbound", "reply_from"),
             }
             for name, c in reg.outbound.items()
         ],

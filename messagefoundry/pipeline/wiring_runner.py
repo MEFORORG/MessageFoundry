@@ -158,11 +158,12 @@ from messagefoundry.parsing import (
 )
 from messagefoundry.parsing.binary import (
     Base64DelimiterError,
+    CollidingDelimitersError,
     DocRefError,
     EscapedDocumentError,
+    HeaderFormsLimitError,
     InboundDocRefError,
     NonVerbatimDocumentError,
-    UnreadableDelimitersError,
     UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
@@ -177,6 +178,7 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
+from messagefoundry.parsing.split import batch_member_collides
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
@@ -184,6 +186,7 @@ from messagefoundry.pipeline.dryrun import (
     UserCodeCalledSysExit as UserCodeCalledSysExit,  # re-exported, one definition (BACKLOG #5105)
 )
 from messagefoundry.pipeline.ingress_guards import (
+    HEADER_FORMS_REFUSED_REASON,
     STRICT_VALIDATE_TIMEOUT_SECONDS,
     IngressBodyRejected,
     IngressCodecUnusable,
@@ -357,15 +360,34 @@ the log line reads (BACKLOG #3043)."""
 #: document (vault BACKLOG #2809): :meth:`RegistryRunner._hydrate_payload` raises it.
 _REATTACH_CODE = "reattach"
 
+#: The :class:`NegativeAckError` code of a batch member whose first line, an MSH, BHS or FHS, names
+#: too few encoding characters and fills a delimiter with one it already uses, so it cannot be written in its own delimiters, as the head's BHS or as a
+#: send's delimiter rewrite would (BACKLOG #5972): :func:`_colliding_member_refusal` raises it.
+_COLLIDING_MEMBER_CODE = "colliding-delimiters"
+
+
+def _colliding_member_refusal() -> NegativeAckError:
+    """The permanent refusal of a batch member whose header cannot be written (BACKLOG #5972). Its
+    text names the header's shape only, never a byte of the member."""
+    return NegativeAckError(
+        "its first line names too few encoding characters and fills a delimiter with one it "
+        "already uses, so it cannot be batched",
+        code=_COLLIDING_MEMBER_CODE,
+        permanent=True,
+    )
+
+
 #: The reason a refused batch member's log line gives, by the refusal's code: ``framing`` is
 #: ADR 0205 rule 1, ``multiple-messages`` ADR 0209, ``encoding`` ``encode_wire_body``'s, and
-#: ``reattach`` the batch path's own re-attach refusal, which no frame check raised.
+#: ``reattach`` the batch path's own re-attach refusal, which no frame check raised, and
+#: ``colliding-delimiters`` a member whose header cannot be written.
 #: A code not named here, or none, reads as the neutral reason below; the line names the code too.
 _MEMBER_REFUSAL_REASONS: Mapping[str, str] = {
     FRAMING_CODE: "its frame cannot carry it",
     MULTIPLE_MESSAGES_CODE: "it holds more than one message",
     ENCODING_CODE: "its charset cannot encode it",
     _REATTACH_CODE: "its document cannot be re-attached",
+    _COLLIDING_MEMBER_CODE: "its header cannot be written in its own delimiters",
 }
 _MEMBER_REFUSAL_REASON_OTHER = "its frame check refused it"
 
@@ -1254,9 +1276,7 @@ def _label_fits_every_backend(label: str) -> bool:
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
-#: by one alone. A body with an OBX and an MSH-2 shorter than four characters is one,
-#: :class:`UnreadableDelimitersError`, rather than the plain ``ValueError`` the OBX reads raise. A
-#: body with no MSH never reaches the detach: both listeners' ``Peek.parse`` refuses it first.
+#: by one alone.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     _StreamBudgetExceeded,
     StreamingAttachmentsUnsupported,
@@ -1264,7 +1284,6 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
-    UnreadableDelimitersError,
 )
 
 #: BACKLOG #4907: the stored reason, and the MSA-3 text, for a message from a sender whose verified
@@ -10249,9 +10268,11 @@ class RegistryRunner:
                 ),
             )
         if marker_refused is not None:
-            # Delivery refuses any handle marker under these delimiters, so the body would be
-            # accepted and then dead-letter on every outbound; refused here instead, at any size
-            # (BACKLOG #5099). The same body fails the same way every time.
+            # Under base64 delimiters delivery refuses any handle marker, under a colliding header
+            # a handle in OBX-5.5 may not read as one, and under any header more later-header
+            # marker forms than are looked for would cost the re-attach a scan each (BACKLOG
+            # #5972), so the body could be accepted and then dead-letter or stall every outbound;
+            # refused here instead (BACKLOG #5099). The same body fails the same way every time.
             return await self._refuse(
                 ic, raw, text, RefusalKind.PERMANENT, error=marker_refused, peek=peek
             )
@@ -10380,10 +10401,10 @@ class RegistryRunner:
         holds an HL7 escape (vault BACKLOG #2809),
         :class:`~messagefoundry.parsing.binary.InboundDocRefError` for a received handle or marker,
         and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
-        delivery's splice would not set back verbatim, and
-        :class:`~messagefoundry.parsing.binary.UnreadableDelimitersError` for a body with an OBX
-        and an MSH-2 shorter than four characters (a body with no MSH never gets here: the caller's
-        ``Peek.parse`` refused it first; BACKLOG #5099) — each, as one of
+        delivery's splice would not set back verbatim (BACKLOG #5099), its subclass
+        :class:`~messagefoundry.parsing.binary.CollidingDelimitersError` among them, for a body
+        whose short MSH-2 fills a delimiter with one it already uses and that has an OBX whose
+        ``OBX-2`` is ``ED``, whether or not a document reads there (BACKLOG #5972) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
@@ -10647,15 +10668,23 @@ class RegistryRunner:
             return ack
 
         if marker_refused is not None:
-            # Delivery refuses any handle marker under these delimiters, so an AA here would be
-            # followed by a dead-letter on every outbound; refused here instead, at any size, and
-            # AR since the same body fails the same way every time (BACKLOG #5099).
+            # Under base64 delimiters delivery refuses any handle marker, under a colliding header
+            # a handle in OBX-5.5 may not read as one, and under any header more later-header
+            # marker forms than are looked for would cost the re-attach a scan each (BACKLOG
+            # #5972), so an AA here could be followed by a dead-letter on every outbound; refused
+            # here instead, and AR since the same body fails the same way every time (BACKLOG
+            # #5099).
             mid = await self._record_refused(ic, raw, text, error=marker_refused, peek=peek)
             ack = (
                 build_ack(
                     peek,
                     code="AR",
-                    text="handle marker refused by its delimiters",
+                    # Judged without a scan per form, so no marker is named (BACKLOG #5972).
+                    text=(
+                        "too many header delimiter sets to check"
+                        if marker_refused == HEADER_FORMS_REFUSED_REASON
+                        else "handle marker refused by its delimiters"
+                    ),
                     ack_mode=ack_mode,
                 )
                 if reply
@@ -10767,20 +10796,23 @@ class RegistryRunner:
                 nak_code = _nak_code(_detach_refusal_kind(exc))
                 if isinstance(exc, EscapedDocumentError):
                     nak_text = "escaped document in OBX-5.5"
+                elif isinstance(exc, CollidingDelimitersError):
+                    # Checked before its base class: the header, not a document (BACKLOG #5972).
+                    nak_text = "MSH-2 default collides with a delimiter"
                 elif isinstance(exc, NonVerbatimDocumentError):
                     # A document's own value, which the splice would escape, not a marker.
                     nak_text = "OBX-5.5 document holds a delimiter or control"
-                elif isinstance(exc, UnreadableDelimitersError):
-                    # The header, not a document: no OBX-5.5 of this body can be read. Only a
-                    # short MSH-2 reaches here, since the listener's parse refuses a body with no
-                    # MSH.
-                    nak_text = "MSH-2 shorter than four characters"
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_text = "document under base64 delimiters"
+                elif isinstance(exc, HeaderFormsLimitError):
+                    # Checked before its base class: the headers' delimiter sets, judged without
+                    # a scan per marker form (BACKLOG #5972).
+                    nak_text = "too many header delimiter sets to check"
                 elif isinstance(exc, InboundDocRefError):
-                    # Either shape: a handle in OBX-5.5, or the marker elsewhere in a body
-                    # with a document to detach.
+                    # At least these shapes: a handle in OBX-5.5, the marker elsewhere in a body
+                    # with a document to detach, or the marker anywhere under a header whose
+                    # filled default collides (BACKLOG #5972).
                     nak_text = "document handle marker in the body"
                 else:
                     nak_text = "streaming detach failed"
@@ -11384,9 +11416,12 @@ class RegistryRunner:
         before it hits the wire (#149, ADR 0105 Phase 1b). A delivery/skeleton row carries a small
         ``mfdoc:v1:ref:`` handle in ``OBX-5.5``; splice the stored VERBATIM base64 back in (Approach B —
         no decode/encode) so the partner receives the full inline document (Epic's MLLP MDM receiver does
-        not cap the frame). A payload with **no** handle is returned byte-identical after a cheap
-        gate (a substring check, plus an MSH-2 read) — the below-threshold / no-detach / Handler-built
-        (never-detached) delivery path is untouched, and no store read happens.
+        not cap the frame). A payload the cheap gate (a substring check, plus a read of each header
+        line) passes over is returned byte-identical, with no store read: at least the
+        below-threshold and no-detach paths, and a Handler-built payload whose headers name no
+        character of the marker. One the gate opens on is judged by the re-attach, which may refuse
+        it with no handle in it, for example for more later-header marker forms than it looks for
+        (BACKLOG #5972).
 
         Hydration is a **pure READ** off the immutable, content-addressed attachment; it does **not**
         decref (the message may fan out to several outbounds and is replayable — the refcount is released
@@ -11442,9 +11477,8 @@ class RegistryRunner:
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
-            # Only failures the MESSAGE causes, at least: the payload does not parse as HL7, or it
-            # holds the raw marker and its separators cannot be read: no MSH, or an MSH-2 shorter
-            # than four characters (vault BACKLOG #2809), or a handle is
+            # Only failures the MESSAGE causes, at least: the payload does not parse as HL7 (vault
+            # BACKLOG #2809), or a handle is
             # malformed, names an attachment its message does not hold, or sits outside the
             # splice, or the splice would escape a character of its stored value (BACKLOG #5099).
             # The same payload fails the same way on every attempt, so a retry could never succeed:
@@ -11889,7 +11923,11 @@ class RegistryRunner:
         The one exception (ADR 0205 rule 1): a member whose payload the frame or its charset cannot
         carry, that holds more than one message (ADR 0209), or that itself breaks the re-attach of
         its detached document (vault BACKLOG #2809), is taken out before the envelope is built and
-        dead-lettered alone, and "all N" above means the rest. The envelope's head is then the
+        dead-lettered alone, and "all N" above means the rest. So is a member whose short MSH-2
+        fills a delimiter with one it already uses, since neither the head's BHS nor a send's
+        delimiter rewrite can write it (BACKLOG #5972): wherever it sits on an outbound that
+        rewrites delimiters (``encoding_characters``), and only where it would head the envelope
+        on any other, one with ``hl7_raw_separators`` included. The envelope's head is then the
         first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
@@ -12098,9 +12136,33 @@ class RegistryRunner:
                 current = None
             else:
                 kept, members = hydrated_items, list[Message | str](hydrated)
-            # Assigned only once both loops are done, so a fault in either leaves it empty and its
+            # A member whose short MSH-2 fills a delimiter with one it already uses cannot be
+            # written in its own delimiters (BACKLOG #5972). As the head, the BHS would be such a
+            # write, and encode_batch refuses the whole batch for it, so each would-be head is
+            # refused alone and the next member heads. Later in the envelope, an outbound that
+            # rewrites delimiters would rewrite the member under the BHS's and change what it
+            # reads as, so there it is refused wherever it sits. On any other outbound, one with
+            # hl7_raw_separators included (_rewrites_delimiters says what that one changes), only a
+            # would-be head is refused: a member behind it is joined into the envelope as queued,
+            # and nothing writes it in its own delimiters, though hl7_raw_separators then re-emits
+            # its structural escapes as raw delimiters.
+            # Each verdict reads a few characters of the member's first line, so it runs here
+            # rather than in a thread.
+            collides = [batch_member_collides(m) for m in members]
+            if not _rewrites_delimiters(connector):
+                heads = next((i for i, hit in enumerate(collides) if not hit), len(collides))
+                collides = [hit and i < heads for i, hit in enumerate(collides)]
+            colliding = [
+                self._refuse_alone_or_raise(it.id, _colliding_member_refusal())
+                for it, hit in zip(kept, collides, strict=True)
+                if hit
+            ]
+            if colliding:
+                kept = [it for it, hit in zip(kept, collides, strict=True) if not hit]
+                members = [m for m, hit in zip(members, collides, strict=True) if not hit]
+            # Assigned only once every loop is done, so a fault in one leaves it empty and its
             # arm takes every member. In claim order, so the refusal lines follow the lane's FIFO.
-            by_id = {r[0]: r for r in unhydratable + unframeable}
+            by_id = {r[0]: r for r in unhydratable + unframeable + colliding}
             refused = [by_id[it.id] for it in items if it.id in by_id]
             ids = [it.id for it in kept]
             if kept:
@@ -12292,8 +12354,9 @@ class RegistryRunner:
         return None
 
     def _refuse_alone_or_raise(self, outbox_id: str, exc: NegativeAckError) -> _RefusedMember:
-        """The ``(id, error, refusal)`` of a batch member refused alone, by the re-attach or the
-        frame check, which share this one rule (vault BACKLOG #5100). A refusal that is not
+        """The ``(id, error, refusal)`` of a batch member refused alone, by the re-attach, the
+        frame check or the header-collision check, which share this one rule (vault BACKLOG
+        #5100, BACKLOG #5972). A refusal that is not
         permanent, or one that must stop the lane, is the whole batch's, so it is re-raised for
         the batch's own arm, as a send would raise it."""
         if not exc.permanent or self._lane_stopping_fault(exc) is not None:
@@ -12303,15 +12366,16 @@ class RegistryRunner:
         return outbox_id, safe_exc(exc), exc.with_traceback(None)
 
     async def _dead_letter_refused(self, name: str, refused: Sequence[_RefusedMember]) -> None:
-        """Dead-letter each batch member :meth:`_check_member_frame` or the batch re-attach
-        refused, alone, then log it. The line used to be written in the frame check, before any write, so
+        """Dead-letter each batch member :meth:`_check_member_frame`, the batch re-attach or the
+        header-collision check refused, alone, then log it. The line used to be written in the frame check, before any write, so
         a member a later refusal sent back with the whole batch was logged as dead-lettered when it
         was not. It goes through the same throttle as the other permanent-refusal lines (BACKLOG
         #3043). Its reason
         follows the refusal's code (``_MEMBER_REFUSAL_REASONS``): a ``framing`` member is one its
         frame cannot carry (ADR 0205 rule 1), a ``multiple-messages`` one holds more than one
         message (ADR 0209), an ``encoding`` one is not in the charset, a ``reattach`` one is a
-        payload that itself breaks its document's re-attach (vault BACKLOG #2809), and any other reads as
+        payload that itself breaks its document's re-attach (vault BACKLOG #2809), a
+        ``colliding-delimiters`` one has a header that cannot be written (BACKLOG #5972), and any other reads as
         refused by the frame check, with its code beside it."""
         for outbox_id, error, exc in refused:
             await self.store.dead_letter_now(outbox_id, error)
@@ -14833,6 +14897,17 @@ async def _read_from_store[T](what: str, read: Callable[[], Awaitable[T]]) -> T:
     except Exception as exc:
         fault = _StoreReadFault(f"store {what} failed: {safe_exc(exc)}")
     raise fault
+
+
+def _rewrites_delimiters(connector: object) -> bool:
+    """Whether ``connector`` rewrites a payload's delimiters before it sends it: an MLLP outbound
+    with ``encoding_characters`` set (BACKLOG #5972). Read off the instance, so a connector without
+    it, or a test double, sends its payload's own bytes. ``hl7_raw_separators`` is not one: it
+    re-joins the envelope on the delimiters it was split on, so a colliding member behind the head
+    is delivered with no write in its own delimiters. It does emit a member's structural escapes
+    as the head's raw delimiters, so such a member's data can change on the wire; that holds for
+    any member whose delimiters differ from the head's, and is not judged here."""
+    return getattr(connector, "encoding_characters", None) is not None
 
 
 def _frames(connector: object) -> bool:

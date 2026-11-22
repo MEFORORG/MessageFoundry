@@ -274,6 +274,16 @@ def test_mllp_noncapture_returns_none_on_positive_ack() -> None:
     assert _mllp(False)._check_ack(_ack("AA")) is None
 
 
+def test_mllp_accepts_an_ack_whose_short_msh_2_fills_a_colliding_default() -> None:
+    """``MSH|~|`` declares ``~`` as the component separator, and the parser fills the repetition
+    separator with ``~`` too. Such a partner ACK is read, not retried as unparseable: only a
+    ``Message`` write refuses that header (BACKLOG #5972)."""
+    ack = b"MSH|~|R|R|S|S|20240101||ACK|1|P|2.5\rMSA|AA|1|"
+    assert _mllp(False)._check_ack(ack) is None
+    r = _mllp(True)._check_ack(ack)
+    assert isinstance(r, DeliveryResponse) and r.outcome == "accepted"
+
+
 @pytest.mark.parametrize(
     "code,permanent", [("AR", True), ("CR", True), ("AE", False), ("CE", False)]
 )
