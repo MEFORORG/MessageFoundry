@@ -399,21 +399,25 @@ def test_security_notifier_unresolvable_reference_fails_closed() -> None:
 
 
 def test_notifier_webhook_refusal_is_not_hidden_by_a_secret_store_outage() -> None:
-    # Vault BACKLOG #3533 item 18: the webhook is built before the SMTP password is read, so a store
-    # that cannot resolve the reference does not hide the cleartext webhook's refusal.
+    # Vault BACKLOG #3533 item 18: the webhook URL's checks that log nothing run before the SMTP
+    # password is read, so a store that cannot resolve the reference does not hide the cleartext
+    # webhook's refusal.
     from messagefoundry.pipeline.alert_sinks import notifier_from_settings
 
+    def settings(url: str) -> AlertsSettings:
+        return _smtp_settings(email_password_secret="mefor/smtp#password", webhook_url=url)
+
     provider = _FakeProvider({})
+    cleartext = settings("http://hooks.example/x")
     with pytest.raises(ValueError, match="cleartext http"):
-        notifier_from_settings(
-            _smtp_settings(
-                email_password_secret="mefor/smtp#password",
-                webhook_url="http://hooks.example/x",
-            ),
-            secret_provider=provider,
-            posture=_NOT_ENFORCING,
-        )
+        notifier_from_settings(cleartext, secret_provider=provider, posture=_NOT_ENFORCING)
     assert provider.calls == []
+    # The control: with an https URL the read is reached, and its failure is what refuses.
+    with pytest.raises(SecretProviderError):
+        notifier_from_settings(
+            settings("https://hooks.example/x"), secret_provider=provider, posture=_NOT_ENFORCING
+        )
+    assert provider.calls == ["mefor/smtp#password"]
 
 
 def test_notifiers_reference_without_provider_fail_closed() -> None:

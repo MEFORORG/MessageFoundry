@@ -3743,8 +3743,8 @@ def smtp_login_approved(
     uses for a CREDENTIAL rather than the escapable shape it uses for a payload hop (at least the
     MLLP and anonymous FTPS contexts, and the SFTP host-key acceptance for a login with no
     password). An escapable send-time check behind an absolute construction-time gate is weaker
-    than the gate it backs up, which is how a backstop becomes a hole. So the parameter is gone rather than wired
-    (BACKLOG #1171; zero deployments, so the narrower signature costs nothing).
+    than the gate it backs up, which is how a backstop becomes a hole. So the parameter is gone
+    rather than wired (BACKLOG #1171; zero deployments, so the narrower signature costs nothing).
 
     ``smtplib.SMTP.login`` is deliberately NOT called: its preference order is internal and puts
     CRAM-MD5 first. ``auth()`` is driven directly against the server's advertised list instead.

@@ -4372,7 +4372,7 @@ class AuthSettings(_Section):
     @field_validator("ad_session_recheck_seconds")
     @classmethod
     def _check_ad_recheck_seconds(cls, value: int) -> int:
-        # 0 = off. Anything else is floored at 60 s: a pass costs one LDAP bind per
+        # 0 = off. Anything else must be at least 60 s: a pass costs one LDAP bind per
         # signed-in directory user, so a mistyped `1` would hammer the domain controller.
         if value < 0:
             raise ValueError("ad_session_recheck_seconds must be >= 0 (0 = disabled)")

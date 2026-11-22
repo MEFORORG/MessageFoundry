@@ -811,9 +811,9 @@ def _refuse_alert_smtp_revocation(
 
 
 def _refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> None:
-    """The webhook URL checks that read no secret and log nothing. :class:`WebhookTransport` runs
-    them first, and :func:`notifier_from_settings` runs them again before it reads the SMTP
-    password, so a secret store that is down cannot hide them (vault BACKLOG #3533 item 18)."""
+    """The webhook URL checks that read no secret and log nothing. :func:`notifier_from_settings`
+    runs them before it reads the SMTP password, so a secret store that is down cannot hide them
+    (vault BACKLOG #3533 item 18), and :class:`WebhookTransport` runs them first in its build."""
     # https is the only scheme (ASVS 12.2.1). A plaintext http:// target is refused with no
     # escape, in every posture (vault BACKLOG #3533 item 5): the URL can carry the hop's
     # credential as a path token.
@@ -841,7 +841,7 @@ def _refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> N
         )
     if scheme != "https":
         raise ValueError(f"[alerts].webhook_url must be https, got scheme {scheme!r}")
-    # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
+    # BACKLOG #5088: the allowlist _post applies, here before the send, so a host it would refuse
     # at every POST refuses the start instead. Before the revocation guard, which reads no
     # allowlist, so that guard never judges a host the egress policy forbids.
     _refuse_off_allowlist_webhook(url, allowed_hosts)
@@ -866,7 +866,7 @@ class WebhookTransport:
     ) -> None:
         _refuse_unbuildable_webhook_url(url, allowed_hosts)
         # BACKLOG #2484: build the shared opener here, so an OpenSSL that refuses the engine's list
-        # refuses the start, as at #5088 above, rather than failing every POST.
+        # refuses the start, as the #5088 allowlist check does, rather than failing every POST.
         _shared_no_redirect_opener()
         # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
         _refuse_webhook_revocation(
