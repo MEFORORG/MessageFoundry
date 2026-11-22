@@ -583,6 +583,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2593: builds the AES-GCM associated data a queue payload cell is sealed under (the
     # row's routing fields) and opens the cell through the store cipher seam. No key of its own.
     "messagefoundry/store/queue_tag.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #5688: builds each reference value's AAD and seals it through the store cipher seam.
+    # No key of its own.
+    "messagefoundry/store/reference_seal.py": frozenset({"messagefoundry.store.crypto"}),
     # BACKLOG #2593: builds the AES-GCM associated data a message cell (bound to its channel) and a
     # preset's criteria (bound to its owner) are sealed under, and opens those cells through the store
     # cipher seam. No key of its own. BACKLOG #5970: to tell a Transit decrypt 400 that names the
@@ -1693,6 +1696,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # tag its row's routing fields build. BACKLOG #5610: reseal_unless_tag_failure re-seals a rotated
     # tagged cell under the active key with the same tag (AES-GCM encrypt through the store cipher).
     "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()", "cipher:.encrypt()"}),
+    # BACKLOG #5688: seals a reference snapshot's values (AES-GCM encrypt through the store cipher)
+    # in a worker thread, after reserving the burst in the persisted invocation bound.
+    "messagefoundry/store/reference_seal.py": frozenset({"cipher:.encrypt()"}),
     # BACKLOG #1719: read_cipher_cells opens each sealed value through the store cipher it is handed,
     # several per call to a batch cipher (decrypt_many, vault BACKLOG #6706), else one at a time
     # through store.crypto's decrypt_or_error.
@@ -1736,6 +1742,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.crypto",
             # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
             "cipher:via messagefoundry.store.queue_tag",
+            # BACKLOG #5688: a reference snapshot is sealed through store.reference_seal.
+            "cipher:via messagefoundry.store.reference_seal",
             # BACKLOG #2593: message cells and preset criteria open under their row tag.
             "cipher:via messagefoundry.store.cell_tag",
             "compare:via messagefoundry.store.store",
@@ -1756,6 +1764,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.crypto",
             # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
             "cipher:via messagefoundry.store.queue_tag",
+            # BACKLOG #5688: a reference snapshot is sealed through store.reference_seal.
+            "cipher:via messagefoundry.store.reference_seal",
             # BACKLOG #2593: message cells and preset criteria open under their row tag.
             "cipher:via messagefoundry.store.cell_tag",
             "compare:via messagefoundry.store.store",
@@ -1782,6 +1792,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.crypto",
             # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
             "cipher:via messagefoundry.store.queue_tag",
+            # BACKLOG #5688: a reference snapshot is sealed through store.reference_seal.
+            "cipher:via messagefoundry.store.reference_seal",
             # BACKLOG #2593: message cells and preset criteria open under their row tag.
             "cipher:via messagefoundry.store.cell_tag",
             "compare:hmac.compare_digest",

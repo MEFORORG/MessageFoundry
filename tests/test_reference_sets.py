@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -35,7 +38,11 @@ from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dryrun import route_message
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+from messagefoundry.store import postgres as pg_store_module
 from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
+from messagefoundry.store.postgres import PostgresStore
+from messagefoundry.store.reference_seal import REFERENCE_INSERT_BATCH
+from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
 
 REF = ReferenceSettings()  # defaults
@@ -1212,3 +1219,282 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
         assert [r["key"] for r in rows] == ["OLD"], "the freshly-eligible rows were destroyed"
     finally:
         await store.close()
+
+
+# --- BACKLOG #5688: reserve first, encrypt off the loop, serialize, batch ------------------------
+
+
+def _drain_reserve(cipher: AesGcmCipher) -> None:
+    """Leave the cipher hydrated with an empty reserve, so the next burst must reserve."""
+    cipher.enable_invocation_bound()
+    cipher.grant_invocations(cipher.invocation_settlement(), cipher.cumulative_invocations())
+
+
+def _spy_encrypt(cipher: AesGcmCipher, events: list[str], threads: set[int]) -> None:
+    real = cipher.encrypt
+
+    def encrypt(plaintext: str, *, aad: bytes | None = None) -> str:
+        events.append("encrypt")
+        threads.add(threading.get_ident())
+        return real(plaintext, aad=aad)
+
+    object.__setattr__(cipher, "encrypt", encrypt)
+
+
+async def test_5688_sqlite_reserves_before_encrypting_off_the_loop(tmp_path: Path) -> None:
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    store = await MessageStore.open(tmp_path / "r.db", cipher=cipher)
+    try:
+        _drain_reserve(cipher)
+        events: list[str] = []
+        threads: set[int] = set()
+        _spy_encrypt(cipher, events, threads)
+        real_add = store.add_cipher_invocations
+
+        async def add(key_id: str, count: int) -> int:
+            events.append("reserve")
+            return await real_add(key_id, count)
+
+        store.add_cipher_invocations = add  # type: ignore[method-assign]
+        await store.write_reference_snapshot(name="codes", version="v1", rows={"A": "1", "B": "2"})
+        assert events[0] == "reserve" and events.count("encrypt") == 2
+        assert threading.get_ident() not in threads
+        assert store.reference_view()["codes"]["B"] == "2"
+    finally:
+        await store.close()
+
+
+async def test_5688_sqlite_refused_reservation_keeps_last_good(tmp_path: Path) -> None:
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    db = tmp_path / "r.db"
+    store = await MessageStore.open(db, cipher=cipher)
+    try:
+        await store.write_reference_snapshot(name="codes", version="v1", rows={"A": "old"})
+        _drain_reserve(cipher)
+        events: list[str] = []
+        _spy_encrypt(cipher, events, set())
+        real_add = store.add_cipher_invocations
+
+        async def refuse(key_id: str, count: int) -> int:
+            raise sqlite3.OperationalError("database is locked")
+
+        store.add_cipher_invocations = refuse  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.OperationalError):
+            await store.write_reference_snapshot(name="codes", version="v2", rows={"A": "new"})
+        assert events == []  # nothing was encrypted past a refused reservation
+        assert store.reference_view()["codes"]["A"] == "old"
+        store.add_cipher_invocations = real_add  # type: ignore[method-assign]
+    finally:
+        await store.close()
+    con = sqlite3.connect(db)
+    try:
+        assert con.execute("SELECT version FROM reference").fetchall() == [("v1",)]
+        assert con.execute("SELECT version FROM reference_version").fetchall() == [("v1",)]
+    finally:
+        con.close()
+
+
+class _PgConn:
+    def __init__(self, events: list[str], fail_on: str | None = None) -> None:
+        self.events = events
+        self.fail_on = fail_on
+
+    def _note(self, event: str) -> None:
+        self.events.append(event)
+        if self.fail_on and self.fail_on in event:
+            raise RuntimeError("synthetic write failure")
+
+    @asynccontextmanager
+    async def _txn(self) -> AsyncIterator[None]:
+        self.events.append("begin")
+        try:
+            yield
+        except BaseException:
+            self.events.append("rollback")
+            raise
+        self.events.append("commit")
+
+    def transaction(self, *, isolation: str | None = None) -> Any:
+        assert isolation == "read_committed"  # the DELETE must see the prior holder's commit
+        return self._txn()
+
+    async def execute(self, sql: str, *args: Any, **kwargs: Any) -> str:
+        if "advisory" in sql:
+            self._note(f"lock:{args[0]}")
+        else:
+            self._note(sql.split()[0])
+        return "OK"
+
+    async def executemany(self, sql: str, rows: list[Any], **kwargs: Any) -> None:
+        self._note(f"insert:{len(rows)}")
+
+
+def _pg_store(conn: _PgConn) -> Any:
+    store: Any = PostgresStore.__new__(PostgresStore)
+    store._cipher = make_cipher(generate_key())
+    store._settings = SimpleNamespace(db_schema=None)
+    store._reference_cache = {}
+    store._reference_versions = {}
+
+    async def add(key_id: str, count: int) -> int:
+        conn.events.append("reserve")
+        return count
+
+    @asynccontextmanager
+    async def acquire(**_: Any) -> AsyncIterator[_PgConn]:
+        yield conn
+
+    store.add_cipher_invocations = add
+    store._timed_acquire = acquire
+    return store
+
+
+async def test_5688_postgres_reserves_locks_and_batches() -> None:
+    events: list[str] = []
+    store = _pg_store(_PgConn(events))
+    rows = {f"K{i}": str(i) for i in range(REFERENCE_INSERT_BATCH + 1)}
+    await store.write_reference_snapshot(name="codes", version="v1", rows=rows)
+    assert events[0] == "reserve"
+    assert events[1:4] == ["begin", f"lock:{pg_store_module._LOCK_CLASS_REFERENCE}", "DELETE"]
+    assert [e for e in events if e.startswith("insert:")] == [
+        f"insert:{REFERENCE_INSERT_BATCH}",
+        "insert:1",
+    ]
+    assert events[-1] == "commit"
+    assert store.reference_view()["codes"]["K0"] == "0"
+
+
+async def test_5688_postgres_failed_insert_keeps_last_good() -> None:
+    events: list[str] = []
+    store = _pg_store(_PgConn(events, fail_on="insert"))
+    store._reference_cache["codes"] = {"A": "old"}
+    store._reference_versions["codes"] = "v1"
+    with pytest.raises(RuntimeError):
+        await store.write_reference_snapshot(name="codes", version="v2", rows={"A": "new"})
+    assert events[-1] == "rollback"
+    assert store._reference_cache["codes"] == {"A": "old"}
+    assert store._reference_versions["codes"] == "v1"
+
+
+class _SsCursor:
+    def __init__(self, events: list[str], params: list[int], applock_rc: int) -> None:
+        self.events = events
+        self.params = params
+        self.applock_rc = applock_rc
+        self._row: Any = None
+
+    async def execute(self, sql: str, args: Any = ()) -> None:
+        if "sp_getapplock" in sql:
+            self.events.append(f"applock:{args[0]}")
+            self._row = (self.applock_rc,)
+            return
+        self._row = None
+        if sql.startswith("INSERT INTO reference "):
+            self.params.append(len(args))
+            self.events.append("insert")
+        else:
+            self.events.append(sql.split()[0])
+
+    async def fetchone(self) -> Any:
+        return self._row
+
+    async def fetchall(self) -> list[Any]:
+        return []
+
+
+class _SsConn:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def commit(self) -> None:
+        self.events.append("commit")
+
+    async def rollback(self) -> None:
+        self.events.append("rollback")
+
+
+def _ss_store(events: list[str], params: list[int], applock_rc: int = 0) -> Any:
+    store: Any = SqlServerStore.__new__(SqlServerStore)
+    store._cipher = make_cipher(generate_key())
+    store._settings = SimpleNamespace(command_timeout=30.0)
+    store._reference_cache = {}
+    store._reference_versions = {}
+    store.committed_txns = 0
+    conn = _SsConn(events)
+
+    async def add(key_id: str, count: int) -> int:
+        events.append("reserve")
+        return count
+
+    @asynccontextmanager
+    async def acquire(**_: Any) -> AsyncIterator[_SsConn]:
+        yield conn
+
+    @asynccontextmanager
+    async def cursor(_conn: Any) -> AsyncIterator[_SsCursor]:
+        yield _SsCursor(events, params, applock_rc)
+
+    store.add_cipher_invocations = add
+    store._acquire = acquire
+    store._cursor = cursor
+    return store
+
+
+async def test_5688_sqlserver_reserves_locks_and_batches() -> None:
+    events: list[str] = []
+    params: list[int] = []
+    store = _ss_store(events, params)
+    rows = {f"K{i}": str(i) for i in range(REFERENCE_INSERT_BATCH + 1)}
+    await store.write_reference_snapshot(name="codes", version="v1", rows=rows)
+    assert events[0] == "reserve"
+    assert events[1] == "SELECT"  # the statement that opens the transaction the applock needs
+    assert events[2].startswith("applock:mefor:reference:") and events[3] == "DELETE"
+    assert params == [REFERENCE_INSERT_BATCH * 4, 4]
+    assert max(params) <= 2100  # SQL Server's per-statement parameter ceiling
+    assert events[-2:] == ["MERGE", "commit"]
+    assert store.reference_view()["codes"]["K0"] == "0"
+
+
+async def test_5688_sqlserver_refused_applock_writes_nothing() -> None:
+    events: list[str] = []
+    store = _ss_store(events, [], applock_rc=-1)
+    store._reference_cache["codes"] = {"A": "old"}
+    store._reference_versions["codes"] = "v1"
+    with pytest.raises(Exception, match="sp_getapplock"):
+        await store.write_reference_snapshot(name="codes", version="v2", rows={"A": "new"})
+    assert "DELETE" not in events and "insert" not in events and events[-1] == "rollback"
+    assert store._reference_cache["codes"] == {"A": "old"}
+
+
+@pytest.mark.parametrize("cls", [PostgresStore, SqlServerStore])
+async def test_5688_converge_does_not_overwrite_a_write_that_landed_mid_read(cls: Any) -> None:
+    store: Any = cls.__new__(cls)
+    store._reference_cache = {"codes": {"A": "v1"}}
+    store._reference_versions = {"codes": "v1"}
+
+    async def read() -> tuple[dict[str, Any], dict[str, str]]:
+        # The write of v2 commits and swaps the cache while this read holds the v0 row.
+        store._reference_cache["codes"] = {"A": "v2"}
+        store._reference_versions["codes"] = "v2"
+        return {"codes": {"A": "v0"}}, {"codes": "v0"}
+
+    store._read_active_reference_snapshots = read
+    assert await store.converge_reference_cache() == []
+    assert store._reference_cache["codes"] == {"A": "v2"}
+    assert store._reference_versions["codes"] == "v2"
+
+
+@pytest.mark.parametrize("cls", [PostgresStore, SqlServerStore])
+async def test_5688_converge_still_pulls_a_newer_version(cls: Any) -> None:
+    store: Any = cls.__new__(cls)
+    store._reference_cache = {"codes": {"A": "v1"}}
+    store._reference_versions = {"codes": "v1"}
+
+    async def read() -> tuple[dict[str, Any], dict[str, str]]:
+        return {"codes": {"A": "v2"}, "new": {}}, {"codes": "v2", "new": "v1"}
+
+    store._read_active_reference_snapshots = read
+    assert sorted(await store.converge_reference_cache()) == ["codes", "new"]
+    assert store._reference_cache["codes"] == {"A": "v2"}

@@ -176,7 +176,6 @@ from messagefoundry.store.gcm_bound import (
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.metadata import (
     decode_response_headers,
-    encode_reference_value,
     encode_response_headers,
     merge_user_metadata,
 )
@@ -201,6 +200,7 @@ from messagefoundry.store.queue_tag import (
     reseal_unless_tag_failure,
     set_aside_deadline,
 )
+from messagefoundry.store.reference_seal import seal_reference_snapshot
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
     APPROVAL_KIND,
@@ -236,7 +236,6 @@ from messagefoundry.store.schema_verify import (
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
-    sealed_reference_set,
 )
 from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.transit_attestation import (
@@ -14679,20 +14678,14 @@ class MessageStore:
         (served from the in-memory cache) until this commits; a **failed** sync rolls back wholesale, so
         the last-good snapshot stays active (graceful degradation). The cache is swapped **only after**
         commit — a rolled-back write never leaks into :meth:`reference_view`. Replaces the whole set
-        (build-new-then-flip), so it is idempotent on a re-run with the same rows."""
-        encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
-        encrypted = [
-            (
-                name,
-                version,
-                k,
-                self._cipher.encrypt(
-                    text,
-                    aad=cell_aad("reference", "value", name, version, k),
-                ),
-            )
-            for k, text in encoded
-        ]
+        (build-new-then-flip), so it is idempotent on a re-run with the same rows.
+
+        BACKLOG #5688: the whole burst is reserved and sealed off the event loop first, before the
+        writer lock, so a large set does not stall the loop or hold up other writers while it seals."""
+        sealed = await seal_reference_snapshot(
+            self._cipher, self.add_cipher_invocations, name=name, version=version, rows=rows
+        )
+        encrypted = sealed.rows
         async with _writer_txn(self._db, self._lock):
             # Drop the set's prior version(s) — we keep only the active snapshot per name.
             await self._db.execute("DELETE FROM reference WHERE name=?", (name,))
@@ -14707,8 +14700,9 @@ class MessageStore:
                 (name, version, time.time(), len(encrypted)),
             )
             await self._commit()
-        # Commit succeeded → swap the active snapshot in the read cache, sealed (BACKLOG #1174).
-        self._reference_cache[name] = sealed_reference_set(name, encoded)
+            # Commit succeeded → swap the active snapshot in the read cache, sealed (BACKLOG #1174).
+            # Under the writer lock, so overlapping writes of a set swap in their commit order.
+            self._reference_cache[name] = sealed.cache
 
     async def converge_reference_cache(self) -> list[str]:
         """No-op on SQLite (Track B Step 6). SQLite is single-node: this handle is the SOLE writer of

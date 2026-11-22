@@ -171,7 +171,6 @@ from messagefoundry.store.gcm_bound import (
 )
 from messagefoundry.store.metadata import (
     decode_response_headers,
-    encode_reference_value,
     encode_response_headers,
     merge_user_metadata,
 )
@@ -204,6 +203,7 @@ from messagefoundry.store.queue_tag import (
     reseal_unless_tag_failure,
     set_aside_deadline,
 )
+from messagefoundry.store.reference_seal import REFERENCE_INSERT_BATCH, seal_reference_snapshot
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
@@ -219,7 +219,6 @@ from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
-    sealed_reference_set,
 )
 from messagefoundry.store.server_schema_verify import (
     ColumnShape,
@@ -504,6 +503,9 @@ _LOCK_CLASS_ADMIN_GUARD = 5
 # Vault BACKLOG #3180: one lock per uploader, so two engine shards' upload reserves for the same
 # uploader cannot both read the same in-flight sums and both insert a slot.
 _LOCK_CLASS_UPLOAD_QUOTA = 6
+# BACKLOG #5688: one lock per reference set, so two writes of it cannot interleave their DELETE and
+# INSERTs. Under READ COMMITTED the second DELETE cannot see the first's uncommitted rows.
+_LOCK_CLASS_REFERENCE = 7
 _AUDIT_LOCK = "mefor_audit_chain"
 _ADMIN_GUARD_LOCK = "mefor_last_admin"
 #: The ``$n`` twin of the SQLite store's ``_SQL_ADMIN_GUARD_HOLDERS`` (BACKLOG #2592), read by
@@ -3544,10 +3546,16 @@ class PostgresStore:
         ``reference_version`` JOIN ``reference`` + per-row decrypt), but mutates nothing when the
         versions already match (the leader's own just-written sets). Returns the names refreshed
         (``[]`` when none advanced). The runner only calls this when clustered
-        (``coordinator.is_clustered()``), so single-node Postgres never issues this read."""
+        (``coordinator.is_clustered()``), so single-node Postgres never issues this read.
+
+        BACKLOG #5688: a set this handle wrote while the read ran is left alone, since the read may
+        predate that write. If the shared version is newer still, the next pass picks it up."""
+        held = dict(self._reference_versions)
         cache, versions = await self._read_active_reference_snapshots()
         refreshed: list[str] = []
         for name, version in versions.items():
+            if self._reference_versions.get(name) != held.get(name):
+                continue
             if self._reference_versions.get(name) != version:
                 self._reference_cache[name] = cache[name]
                 self._reference_versions[name] = version
@@ -5213,46 +5221,42 @@ class PostgresStore:
         """Materialize a new reference snapshot and atomically make it active (ADR 0006). In one
         transaction: drop the set's prior rows, insert the new snapshot (each value JSON-encoded then
         encrypted), and upsert the ``reference_version`` pointer. The read cache swaps only after
-        commit, so a failed sync leaves the last-good snapshot live. Ported, not stubbed."""
-        encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
-        encrypted = [
-            (
-                name,
-                version,
-                k,
-                self._cipher.encrypt(
-                    text,
-                    aad=cell_aad("reference", "value", name, version, k),
-                ),
-            )
-            for k, text in encoded
-        ]
-        async with self._timed_acquire() as conn, conn.transaction():
-            await conn.execute("DELETE FROM reference WHERE name=$1", name)
-            for n, ver, k, v in encrypted:
+        commit, so a failed sync leaves the last-good snapshot live. Ported, not stubbed.
+
+        BACKLOG #5688: the whole burst is reserved and sealed off the event loop first, and a per-set
+        advisory lock serializes overlapping writes of one set."""
+        sealed = await seal_reference_snapshot(
+            self._cipher, self.add_cipher_invocations, name=name, version=version, rows=rows
+        )
+        encrypted = sealed.rows
+        async with self._timed_acquire() as conn:
+            # READ COMMITTED pinned: the DELETE must see what the lock's previous holder committed,
+            # which a repeatable-read snapshot taken before the lock wait would not.
+            async with conn.transaction(isolation="read_committed"):
+                await self._advisory_lock(conn, _LOCK_CLASS_REFERENCE, name)
+                await conn.execute("DELETE FROM reference WHERE name=$1", name)
+                for start in range(0, len(encrypted), REFERENCE_INSERT_BATCH):
+                    await conn.executemany(
+                        "INSERT INTO reference (name, version, key, value) VALUES ($1,$2,$3,$4)",
+                        encrypted[start : start + REFERENCE_INSERT_BATCH],
+                    )
                 await conn.execute(
-                    "INSERT INTO reference (name, version, key, value) VALUES ($1,$2,$3,$4)",
-                    n,
-                    ver,
-                    k,
-                    v,
+                    "INSERT INTO reference_version (name, version, synced_at, row_count)"
+                    " VALUES ($1,$2,$3,$4)"
+                    " ON CONFLICT (name) DO UPDATE SET"
+                    " version=excluded.version, synced_at=excluded.synced_at,"
+                    " row_count=excluded.row_count",
+                    name,
+                    version,
+                    time.time(),
+                    len(encrypted),
                 )
-            await conn.execute(
-                "INSERT INTO reference_version (name, version, synced_at, row_count)"
-                " VALUES ($1,$2,$3,$4)"
-                " ON CONFLICT (name) DO UPDATE SET"
-                " version=excluded.version, synced_at=excluded.synced_at,"
-                " row_count=excluded.row_count",
-                name,
-                version,
-                time.time(),
-                len(encrypted),
-            )
-        # Commit succeeded → swap the active snapshot in the read cache (sealed, BACKLOG #1174) and
-        # record the active version so a follower's converge_reference_cache() (Track B Step 6) can tell
-        # this node already reflects it (no needless re-load on the node that just wrote it).
-        self._reference_cache[name] = sealed_reference_set(name, encoded)
-        self._reference_versions[name] = version
+            # Commit succeeded → swap the active snapshot in the read cache (sealed, BACKLOG #1174) and
+            # record the active version so a follower's converge_reference_cache() (Track B Step 6) can
+            # tell this node already reflects it. Before the connection is released, which can await,
+            # so a later write of this set cannot swap first and then be overwritten by this one.
+            self._reference_cache[name] = sealed.cache
+            self._reference_versions[name] = version
 
     # --- delivery worker path ------------------------------------------------
 

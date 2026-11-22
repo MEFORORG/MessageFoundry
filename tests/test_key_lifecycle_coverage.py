@@ -136,6 +136,8 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/store/row_seal.py": frozenset({_DEK}),
     # BACKLOG #2593: opens queue payload cells, sealed under the DEK, under their routing tag.
     "messagefoundry/store/queue_tag.py": frozenset({_DEK}),
+    # BACKLOG #5688: seals reference snapshot values under the DEK, through the store cipher.
+    "messagefoundry/store/reference_seal.py": frozenset({_DEK}),
     # BACKLOG #2593: opens message cells and preset criteria, sealed under the DEK, under their tag.
     "messagefoundry/store/cell_tag.py": frozenset({_DEK}),
     # BACKLOG #5651: the embedded-document strip opens message bodies sealed under the DEK and

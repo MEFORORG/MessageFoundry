@@ -160,7 +160,6 @@ from messagefoundry.store.gcm_bound import (
 )
 from messagefoundry.store.metadata import (
     decode_response_headers,
-    encode_reference_value,
     encode_response_headers,
     merge_user_metadata,
 )
@@ -196,6 +195,7 @@ from messagefoundry.store.queue_tag import (
     reseal_unless_tag_failure,
     set_aside_deadline,
 )
+from messagefoundry.store.reference_seal import REFERENCE_INSERT_BATCH, seal_reference_snapshot
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
@@ -211,7 +211,6 @@ from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
-    sealed_reference_set,
 )
 from messagefoundry.store.server_schema_verify import (
     ColumnShape,
@@ -9918,30 +9917,36 @@ class SqlServerStore:
         commits; a failed sync rolls back wholesale, so the last-good snapshot stays active. The cache
         (and its Track B Step 6 version token) swaps ONLY after commit — a rolled-back write never
         leaks into :meth:`reference_view`. Same build-new-then-flip contract as SQLite/Postgres, so it
-        is idempotent on a re-run with the same rows."""
+        is idempotent on a re-run with the same rows.
+
+        BACKLOG #5688: the whole burst is reserved and sealed off the event loop first, and a per-set
+        applock serializes overlapping writes of one set."""
         self._guard_reference_widths(name, rows)
-        encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
-        encrypted = [
-            (
-                name,
-                version,
-                k,
-                self._cipher.encrypt(
-                    text,
-                    aad=cell_aad("reference", "value", name, version, k),
-                ),
-            )
-            for k, text in encoded
-        ]
+        sealed = await seal_reference_snapshot(
+            self._cipher, self.add_cipher_invocations, name=name, version=version, rows=rows
+        )
+        encrypted = sealed.rows
         now = time.time()
+        # Hashed: @Resource holds 255 characters and a set name may hold 256.
+        lock = (
+            f"mefor:reference:{hashlib.sha256(name.encode('utf-8', 'surrogatepass')).hexdigest()}"
+        )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # A real statement must open the transaction the applock is scoped to.
+                await cur.execute(
+                    "SELECT TOP (1) version FROM reference_version WHERE name=?", (name,)
+                )
+                await cur.fetchall()
+                await self._applock(cur, lock)
                 # Drop the set's prior version(s) — we keep only the active snapshot per name.
                 await cur.execute("DELETE FROM reference WHERE name=?", (name,))
-                for row in encrypted:
+                for start in range(0, len(encrypted), REFERENCE_INSERT_BATCH):
+                    batch = encrypted[start : start + REFERENCE_INSERT_BATCH]
                     await cur.execute(
-                        "INSERT INTO reference (name, version, [key], value) VALUES (?,?,?,?)",
-                        row,
+                        "INSERT INTO reference (name, version, [key], value) VALUES "
+                        + ",".join(["(?,?,?,?)"] * len(batch)),
+                        tuple(cell for row in batch for cell in row),
                     )
                 await cur.execute(
                     "MERGE reference_version WITH (HOLDLOCK) AS t"
@@ -9955,11 +9960,12 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        # Commit succeeded → swap the active snapshot in the read cache (sealed, BACKLOG #1174) AND
-        # record the active version, so a follower's converge_reference_cache() (Track B Step 6) can
-        # tell this node already reflects it (no needless re-load on the node that just wrote it).
-        self._reference_cache[name] = sealed_reference_set(name, encoded)
-        self._reference_versions[name] = version
+            # Commit succeeded → swap the active snapshot in the read cache (sealed, BACKLOG #1174)
+            # AND record the active version, so a follower's converge_reference_cache() (Track B
+            # Step 6) can tell this node already reflects it. Before the connection is released, so
+            # a later write of this set cannot swap first and then be overwritten by this one.
+            self._reference_cache[name] = sealed.cache
+            self._reference_versions[name] = version
 
     async def converge_reference_cache(self) -> list[str]:
         """Pull any newer shared reference snapshot into this node's local cache (Track B Step 6).
@@ -9971,10 +9977,16 @@ class SqlServerStore:
         JOIN ``reference`` + per-row decrypt) but mutates nothing when the versions already match (the
         leader's own just-written sets). Returns the names refreshed (``[]`` when none advanced). The
         runner only calls this when clustered (``coordinator.is_clustered()``), so a single node never
-        issues this read."""
+        issues this read.
+
+        BACKLOG #5688: a set this handle wrote while the read ran is left alone, since the read may
+        predate that write. If the shared version is newer still, the next pass picks it up."""
+        held = dict(self._reference_versions)
         cache, versions = await self._read_active_reference_snapshots()
         refreshed: list[str] = []
         for name, version in versions.items():
+            if self._reference_versions.get(name) != held.get(name):
+                continue
             if self._reference_versions.get(name) != version:
                 self._reference_cache[name] = cache[name]
                 self._reference_versions[name] = version
