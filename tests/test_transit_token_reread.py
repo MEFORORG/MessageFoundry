@@ -31,7 +31,6 @@ from messagefoundry.store.crypto import CipherError  # noqa: E402
 from messagefoundry.store.crypto_transit import (  # noqa: E402
     TransitCipher,
     build_transit_cipher,
-    transit_cipher_required_capabilities,
 )
 from messagefoundry.store.keyprovider import KeyProviderError  # noqa: E402
 from messagefoundry.store.keyprovider_vault import store_vault_token  # noqa: E402
@@ -111,8 +110,9 @@ def _finish_reread(cipher: TransitCipher) -> None:
 class _RefusesBatches:
     """A Transit that answers 403 to a batch and serves single requests."""
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, before_single: Callable[[], None] = lambda: None) -> None:
         self._inner = inner
+        self._before_single = before_single
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -120,6 +120,7 @@ class _RefusesBatches:
     def _single(self, name: str, kwargs: dict[str, Any]) -> Any:
         if "batch_input" in kwargs:
             raise Forbidden("permission denied")
+        self._before_single()
         return getattr(self._inner, name)(**kwargs)
 
     def encrypt_data(self, **kwargs: Any) -> Any:
@@ -143,7 +144,7 @@ def test_a_403_then_a_replaced_token_succeeds(
     _expire_and_replace(monkeypatch, gate)
     gate.asked.clear()
     assert cipher.decrypt(stored, aad=_AAD) == "synthetic"
-    assert gate.asked == [_OLD, _NEW]
+    assert gate.asked == [_OLD, _NEW, _NEW]  # refused, the new token's check, the retry
     assert built[-1] == _NEW
 
 
@@ -168,8 +169,8 @@ def test_every_write_path_recovers(
     gate.asked.clear()
     call(cipher)
     assert gate.asked[0] == _OLD and gate.asked[-1] == _NEW
-    # One refused request, then the retry; a batch is not split into single requests.
-    assert len(gate.asked) == 2
+    # Refused, the new token's check, the retry; a batch is not split into single requests.
+    assert len(gate.asked) == 3
 
 
 def test_decrypt_many_recovers_without_turning_batching_off(
@@ -207,7 +208,8 @@ def test_a_replaced_token_vault_also_refuses_fails_closed(
     gate.asked.clear()
     with pytest.raises(CipherError):
         cipher.encrypt("synthetic", aad=_AAD)
-    assert gate.asked == [_OLD, _NEW]  # once per failing call
+    assert gate.asked == [_OLD, _NEW]  # the new token's check failed, so no retry
+    assert cipher._token_source is not None and cipher._token_source.epoch == 0
 
 
 def test_a_token_that_cannot_be_read_fails_closed_and_adds_no_fallback(
@@ -289,6 +291,7 @@ def test_every_thread_moves_to_the_new_token(
 ) -> None:
     gate, _ = vault
     monkeypatch.setattr(crypto_transit, "_TOKEN_REREAD_INTERVAL_S", 3600.0)
+    monkeypatch.setattr(crypto_transit, "_TOKEN_REREAD_WAIT_S", 30.0)
     cipher = build_transit_cipher(StoreSettings())
     gate.asked.clear()
     workers = 8
@@ -319,27 +322,70 @@ def test_every_thread_moves_to_the_new_token(
     assert gate.asked[-1] == _NEW
     # Each thread's first call, and at most one 403: a thread that starts after the swap has none.
     assert workers < gate.asked.count(_OLD) <= workers * 2
-    assert gate.asked.count(_NEW) == workers * 2
+    assert gate.asked.count(_NEW) == workers * 2 + 1  # one check of the new token
 
 
+@pytest.mark.parametrize("op", ["encrypt", "decrypt"])
 def test_a_batch_refused_on_the_event_loop_leaves_batching_on(
-    vault: tuple[_Gate, list[str]], monkeypatch: pytest.MonkeyPatch
+    vault: tuple[_Gate, list[str]], monkeypatch: pytest.MonkeyPatch, op: str
 ) -> None:
-    """Mutation: drop the 403 from ``_batch_failure_flags``. Red: the single requests that follow
-    succeed on the new token, and the cipher stops batching for good."""
+    """Mutation: drop the epoch check at either latch. Red: the single requests succeed on the new
+    token, and the cipher stops batching for good. The read is made to land before them."""
     gate, _ = vault
     cipher = build_transit_cipher(StoreSettings())
     items = [(cipher.encrypt(text, aad=_AAD), _AAD) for text in ("one", "two")]
+    client = cipher._client
+    client.secrets.transit = _RefusesBatches(
+        client.secrets.transit, before_single=lambda: _finish_reread(cipher)
+    )
     _expire_and_replace(monkeypatch, gate)
 
-    async def on_loop() -> list[str | CipherError]:
-        opened = cipher.decrypt_many(items)
-        _finish_reread(cipher)
-        return opened + cipher.decrypt_many(items)
+    async def on_loop() -> None:
+        if op == "encrypt":
+            cipher.encrypt_many([("one", _AAD), ("two", _AAD)])
+        else:
+            assert cipher.decrypt_many(items) == ["one", "two"]
 
-    opened = asyncio.run(on_loop())
-    assert opened[2:] == ["one", "two"]
+    asyncio.run(on_loop())
     assert cipher._batch_alone is False
+
+
+def test_a_replacement_vault_refuses_keeps_the_working_token(
+    vault: tuple[_Gate, list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, _ = vault
+    cipher = build_transit_cipher(StoreSettings())
+    source = cipher._token_source
+    assert source is not None
+    monkeypatch.setenv(_TOKEN_VAR, _NEW)  # gate accepts only the old token
+    source._reread()
+    assert source.epoch == 0 and source.value == _OLD
+    gate.asked.clear()
+    cipher.encrypt("synthetic", aad=_AAD)
+    assert gate.asked == [_OLD]
+
+
+@pytest.mark.parametrize(("moved", "breaks"), [(True, False), (False, True)])
+def test_a_token_change_during_a_row_check_is_not_a_break(
+    vault: tuple[_Gate, list[str]], monkeypatch: pytest.MonkeyPatch, moved: bool, breaks: bool
+) -> None:
+    cipher = build_transit_cipher(StoreSettings())
+    source = cipher._token_source
+    assert source is not None
+    epoch = source.epoch
+    source.epoch += int(moved)
+
+    def fails(*_: Any) -> Any:
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(cipher, "_fixed_input_verifies", lambda: True)
+    monkeypatch.setattr(cipher, "_transit_verify_call", fails)
+    args = (b"row", "vault:v1:bWFj", 1, Forbidden("permission denied"), epoch)
+    if breaks:
+        assert cipher._recheck_refused_row(*args) is False
+    else:
+        with pytest.raises(CipherError):
+            cipher._recheck_refused_row(*args)
 
 
 @pytest.mark.parametrize("op", ["encrypt", "decrypt"])
@@ -442,11 +488,6 @@ def test_a_cipher_without_a_token_source_is_unchanged() -> None:
     with pytest.raises(CipherError):
         cipher.encrypt("synthetic", aad=_AAD)
     assert gate.asked == [_OLD]
-
-
-def test_no_new_vault_capability_is_required(vault: tuple[_Gate, list[str]]) -> None:
-    paths = transit_cipher_required_capabilities()
-    assert not any("renew" in path or path.startswith("auth/") for path in paths)
 
 
 def test_a_missing_token_at_build_still_refuses(

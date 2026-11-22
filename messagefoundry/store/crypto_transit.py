@@ -569,13 +569,16 @@ class _StoreToken:
 
     The re-read goes through :func:`~messagefoundry.store.keyprovider_vault.store_vault_token`, the
     source the startup read uses, so it adds no fallback. It runs on its own short-lived thread, one
-    at a time and at most once per :data:`_TOKEN_REREAD_INTERVAL_S`. :attr:`value` is written before
-    :attr:`epoch`, so a client recorded under the current epoch never holds an older token."""
+    at a time and at most once per :data:`_TOKEN_REREAD_INTERVAL_S`. A changed token is adopted only
+    once ``serves`` accepts it, so a value Vault or the client refuses never replaces a working
+    token. :attr:`value` is written before :attr:`epoch`, so a client recorded under the current
+    epoch never holds an older token."""
 
-    __slots__ = ("_lock", "_next_read", "_reader", "_wait_until", "epoch", "value")
+    __slots__ = ("_lock", "_next_read", "_reader", "_serves", "_wait_until", "epoch", "value")
 
-    def __init__(self, value: str) -> None:
+    def __init__(self, value: str, serves: Callable[[str], None]) -> None:
         self.value = value
+        self._serves = serves
         self.epoch = 0
         self._lock = threading.Lock()
         self._reader: threading.Thread | None = None
@@ -614,11 +617,12 @@ class _StoreToken:
         return reader
 
     def _reread(self) -> None:
-        """Adopt the configured token if it changed. A read that fails keeps the current token, and
-        is logged by the failure's class alone."""
+        """Adopt the configured token if it changed and serves. A read or check that fails keeps
+        the current token, and is logged by the failure's class alone."""
         try:
             fresh = store_vault_token()
             if fresh != self.value:
+                self._serves(fresh)  # raises for a token that cannot be used
                 with self._lock:
                     self.value = fresh
                     self.epoch += 1
@@ -898,7 +902,8 @@ class TransitCipher(_UnmarkedPolicy):
         first value that gives no verdict (:func:`~messagefoundry.store.crypto.gave_no_verdict`),
         and every value not yet answered then fails, unasked, with a
         :class:`CipherUnavailableError`. When a refusal other than a 400, or an unechoed reply, is
-        followed by single requests Transit serves, this cipher sends every later value alone. Any
+        followed by single requests Transit serves, this cipher sends every later value alone,
+        unless the store token was replaced meanwhile (BACKLOG #5609). Any
         other reply :func:`_batch_replies` refuses is no verdict on any value of the batch. A batch
         of one is a single request."""
         results: dict[int, str | CipherError] = {}
@@ -1004,7 +1009,8 @@ class TransitCipher(_UnmarkedPolicy):
         raises :class:`CipherUnavailableError`, and so does a reply :func:`_batch_replies` refuses,
         except one with no ``reference`` echo (:data:`UNECHOED`). That reply, or a batch Transit
         refused, a proxy's request-size bound among them, seals each value of the batch alone, and
-        this cipher then sends every later value alone. Vault's 400 to a batch, or a failure the
+        this cipher then sends every later value alone, unless the store token was replaced
+        meanwhile (BACKLOG #5609). Vault's 400 to a batch, or a failure the
         classifier could not read (:func:`_classify_batch_failure`), seals that batch alone and
         leaves batching on. A batch of one is a single request."""
         for _, aad in items:
@@ -1217,6 +1223,7 @@ class TransitCipher(_UnmarkedPolicy):
                 del failure  # else the error's traceback and this frame hold each other
             return False
         failed: Exception | None = None
+        epoch = self._token_epoch()
         try:
             response: Any = self._transit_verify_call(self._audit_key, data, stored)
         except Exception as exc:
@@ -1228,7 +1235,7 @@ class TransitCipher(_UnmarkedPolicy):
             # with it; the error itself stays as the cause of whatever is raised.
             failed = exc.with_traceback(None)
         if failed is not None:
-            return self._recheck_refused_row(data, stored, version, failed)
+            return self._recheck_refused_row(data, stored, version, failed, epoch)
         return self._verify_answer(response)
 
     def _settled_verify_failure(self, exc: Exception, version: int) -> CipherError | None:
@@ -1281,7 +1288,7 @@ class TransitCipher(_UnmarkedPolicy):
         )
 
     def _recheck_refused_row(
-        self, data: bytes, stored: str, version: int, failed: Exception
+        self, data: bytes, stored: str, version: int, failed: Exception, epoch: int
     ) -> bool:
         """:meth:`verify_audit_hmac` for a row whose verify at ``version`` failed with ``failed``,
         which :meth:`_settled_verify_failure` left to this (BACKLOG #2720). Raises
@@ -1294,7 +1301,9 @@ class TransitCipher(_UnmarkedPolicy):
         HTTP 408 or 504 (:func:`is_vault_timeout_reply`), it raises
         :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` in place of ``False``
         (BACKLOG #8222: owner ruling 2026-11-13 on a row's timeout, read as both asks by a Manager
-        decision, and in the chain walk only). Blocking."""
+        decision, and in the chain walk only). A store token replaced since ``epoch`` raises plain
+        :class:`CipherError` in place of ``False``, because the two asks ran under different tokens
+        and so are no evidence against the row (BACKLOG #5609). Blocking."""
         if not self._fixed_input_verifies():
             raise self._verify_failed(failed) from failed
         again: Exception | None = None
@@ -1314,6 +1323,8 @@ class TransitCipher(_UnmarkedPolicy):
                 f"Transit audit HMAC verify timed out on both asks (key={self._audit_key!r}): "
                 f"{vault_failure_text(again)}"
             ) from again
+        if self._token_epoch() != epoch:
+            raise self._verify_failed(again) from again
         _warn_quietly(
             lambda: (
                 "Transit refused the audit MAC verify of one row twice while a verify over fixed "
@@ -1569,25 +1580,38 @@ def build_transit_cipher(
     # #5963). The token is read again only after a Transit 403 (BACKLOG #5609, _StoreToken); the
     # address is not.
     addr, token = store_vault_hop()
-    store_token = _StoreToken(token)
-    # The CA anchor is read once too, like the address and token, and handed to every thread's own
+    # The CA anchor is read once, like the address, and handed to every thread's own
     # client (BACKLOG #5963). Not everything is: each build still reads the settings object, and
     # hvac and requests read their own environment (at least proxies) as each client is made.
     ca_kwargs = _vault_ca_kwargs(addr)
 
-    def build_client() -> Any:
+    def client_for(client_token: str) -> Any:
         # One construction for the first client and for each thread's own (BACKLOG #5963), so every
         # client asserts the same TLS suites, mounts the same strict reader and carries the
         # engine's request timeout (BACKLOG #5983).
         return _build_client(
             addr,
-            store_token.value,
+            client_token,
             revocation_attested=settings.vault_revocation_attested,
             posture=posture,
             revocation_reason=settings.vault_revocation_attested_reason,
             timeout=TRANSIT_REQUEST_TIMEOUT_S,
             ca_kwargs=ca_kwargs,
         )
+
+    def token_serves(candidate: str) -> None:
+        # A read of the data key's metadata, which the startup check already requires, so this
+        # adds no Vault capability. Any refusal raises, and the candidate is not adopted.
+        probe = client_for(candidate)
+        try:
+            probe.secrets.transit.read_key(name=key_name)
+        finally:
+            _close_client(probe, threading.get_ident())
+
+    store_token = _StoreToken(token, token_serves)
+
+    def build_client() -> Any:
+        return client_for(store_token.value)
 
     # OUTSIDE the try on purpose. `_build_client` asserts this hop's TLS suites (ADR 0180) and raises
     # ValueError; the `except Exception` below would relabel that "could not reach a Vault Transit
