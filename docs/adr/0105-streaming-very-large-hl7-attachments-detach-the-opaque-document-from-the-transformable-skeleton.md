@@ -364,9 +364,12 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   loopback re-ingress refuse a body past that limit under any other header too, whatever it
   holds (`binary.later_header_forms_over_limit`, the same reason), because the delivery
   re-attach looks for each later header's form with a scan of the payload on every attempt. The
-  re-attach bounds its own scans by the same limit, and refuses a payload past it
-  (`UnreattachableDocumentError`), which only a payload that did not pass that check can be,
-  such as a child a Handler built or an edit-and-resend's outbound body. A
+  re-attach bounds its own scans at twice that limit (`binary._reattach_forms_limit`), so a
+  payload up to twice its received body's length is not refused for a count the listeners
+  admitted, and refuses a payload past it (`UnreattachableDocumentError`): at least a payload a
+  Handler built or grew past that, and an edit-and-resend's outbound body, which meets no
+  listener check. The upload resend and the edit-resend re-route run the same listener check
+  (`admit_resubmitted_body`). A
   body with no `MSH` never reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a

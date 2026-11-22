@@ -10271,10 +10271,11 @@ class RegistryRunner:
                 ),
             )
         if marker_refused is not None:
-            # Under base64 delimiters delivery refuses any handle marker, and under a colliding
-            # header a handle in OBX-5.5 may not read as one (BACKLOG #5972), so the body could be
-            # accepted and then dead-letter on every outbound; refused here instead, at any size
-            # (BACKLOG #5099). The same body fails the same way every time.
+            # Under base64 delimiters delivery refuses any handle marker, under a colliding header
+            # a handle in OBX-5.5 may not read as one, and under any header more later-header
+            # marker forms than are looked for would cost the re-attach a scan each (BACKLOG
+            # #5972), so the body could be accepted and then dead-letter or stall every outbound;
+            # refused here instead (BACKLOG #5099). The same body fails the same way every time.
             return await self._refuse(
                 ic, raw, text, RefusalKind.PERMANENT, error=marker_refused, peek=peek
             )
@@ -10665,10 +10666,12 @@ class RegistryRunner:
             return ack
 
         if marker_refused is not None:
-            # Under base64 delimiters delivery refuses any handle marker, and under a colliding
-            # header a handle in OBX-5.5 may not read as one (BACKLOG #5972), so an AA here could
-            # be followed by a dead-letter on every outbound; refused here instead, at any size,
-            # and AR since the same body fails the same way every time (BACKLOG #5099).
+            # Under base64 delimiters delivery refuses any handle marker, under a colliding header
+            # a handle in OBX-5.5 may not read as one, and under any header more later-header
+            # marker forms than are looked for would cost the re-attach a scan each (BACKLOG
+            # #5972), so an AA here could be followed by a dead-letter on every outbound; refused
+            # here instead, and AR since the same body fails the same way every time (BACKLOG
+            # #5099).
             mid = await self._record_refused(ic, raw, text, error=marker_refused, peek=peek)
             ack = (
                 build_ack(
@@ -11411,9 +11414,12 @@ class RegistryRunner:
         before it hits the wire (#149, ADR 0105 Phase 1b). A delivery/skeleton row carries a small
         ``mfdoc:v1:ref:`` handle in ``OBX-5.5``; splice the stored VERBATIM base64 back in (Approach B —
         no decode/encode) so the partner receives the full inline document (Epic's MLLP MDM receiver does
-        not cap the frame). A payload with **no** handle is returned byte-identical after a cheap
-        gate (a substring check, plus an MSH-2 read) — the below-threshold / no-detach / Handler-built
-        (never-detached) delivery path is untouched, and no store read happens.
+        not cap the frame). A payload the cheap gate (a substring check, plus a read of each header
+        line) passes over is returned byte-identical, with no store read: at least the
+        below-threshold and no-detach paths, and a Handler-built payload whose headers name no
+        character of the marker. One the gate opens on is judged by the re-attach, which may refuse
+        it with no handle in it, for example for more later-header marker forms than it looks for
+        (BACKLOG #5972).
 
         Hydration is a **pure READ** off the immutable, content-addressed attachment; it does **not**
         decref (the message may fan out to several outbounds and is replayable — the refcount is released

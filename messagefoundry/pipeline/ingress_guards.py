@@ -185,13 +185,14 @@ def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
     message = Message(peek.message)
     if marker_under_base64_delimiters(message, text):
         return DOC_REF_MARKER_REFUSED_REASON
-    # One call names the reason, so the header fields are read once.
     verdict = colliding_marker_verdict(message, text)
     if verdict == "held":
         return COLLIDING_DOC_REF_MARKER_REFUSED_REASON
-    # A colliding header's own over-limit verdict, or any header's: the form count alone, read
-    # from the parsed header fields with no scan of the text.
-    if verdict == "over-limit" or later_header_forms_over_limit(message, text):
+    if verdict == "over-limit":
+        return HEADER_FORMS_REFUSED_REASON
+    # Under a colliding header the verdict above already counted the forms, within the limit
+    # here, so only another header's are counted: from the parsed fields, with no text scan.
+    if not message._delimiters_collide() and later_header_forms_over_limit(message, text):
         return HEADER_FORMS_REFUSED_REASON
     return None
 
@@ -670,6 +671,7 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
       the engine ceiling (see below); the engine ceiling for any other type, in the listener's units.
     * **type** -- the declared-type magic-byte sniff the listener applies to a non-HL7 body.
     * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check.
+    * **ingest** -- an HL7 body must pass :func:`doc_ref_marker_refusal`, as on the listener.
 
     Strict ``hl7apy`` validation is NOT run here, because the listener times it and a synchronous
     function cannot time itself without a thread of its own. :func:`admit_resubmission` runs this and
@@ -732,11 +734,20 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         if refused is not None:
             raise IngressGuardError(refused, phase="size")
         try:
-            Peek.parse(text, max_bytes=ceiling)
+            peek = Peek.parse(text, max_bytes=ceiling)
         except HL7PeekError as exc:
             refused = f"parse error: {safe_exc(exc)}"
         if refused is not None:
             raise IngressGuardError(refused, phase="parse")
+        # The listeners' document-marker refusal, after the parse as they run it, so a resubmitted
+        # body they would refuse is not committed and then refused by every outbound's re-attach
+        # (BACKLOG #5972). Its reason names no byte of the body.
+        try:
+            refused = doc_ref_marker_refusal(peek, text)
+        except HL7PeekError as exc:
+            refused = f"parse error: {safe_exc(exc)}"
+        if refused is not None:
+            raise IngressGuardError(refused, phase="ingest")
     else:
         check_declared_type(ic, text_sniff_head(text))
     return text

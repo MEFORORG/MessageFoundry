@@ -2696,14 +2696,14 @@ async def test_the_reattach_draws_at_most_one_form_past_the_limit(
     monkeypatch: pytest.MonkeyPatch, _floor_limit: int, count_over: int
 ) -> None:
     """The re-attach looked for every later-header form with a scan of the payload. It now draws
-    at most the limit's forms plus one, scans the text for at most the limit's, and refuses a
-    payload past the limit without those scans."""
+    at most its limit's forms plus one, scans the text for at most its limit's, and refuses a
+    payload past the limit without those scans. Its limit is twice the listeners'."""
     from messagefoundry.parsing import binary
     from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
 
     counter = _CountedForms(binary._later_header_forms)
     monkeypatch.setattr(binary, "_later_header_forms", counter)
-    limit = _floor_limit
+    limit = 2 * _floor_limit
     body = _ORDINARY_HEAD + _headers(limit + count_over)
     counted = _counting(body)
     if count_over:
@@ -2726,18 +2726,19 @@ async def test_the_reattach_bounds_the_lander_probe_at_its_real_limit(
     from messagefoundry.parsing import binary
     from messagefoundry.parsing.binary import (
         UnreattachableDocumentError,
-        _later_header_forms_limit,
+        _reattach_forms_limit,
         reattach_documents_in_hl7,
     )
 
     counter = _CountedForms(binary._later_header_forms)
     monkeypatch.setattr(binary, "_later_header_forms", counter)
     body = _lander_probe_body()
+    assert _reattach_forms_limit(len(body)) < 5_040
     counted = _counting(body)
     with pytest.raises(UnreattachableDocumentError, match="more distinct ways"):
         await reattach_documents_in_hl7(counted, _no_read, bound=frozenset())
     assert counted.scans == 0
-    assert counter.drawn <= _later_header_forms_limit(len(body)) + 1
+    assert counter.drawn <= _reattach_forms_limit(len(body)) + 1
 
 
 async def test_a_handler_built_payload_past_the_form_limit_dead_letters_at_delivery(
@@ -2751,7 +2752,7 @@ async def test_a_handler_built_payload_past_the_form_limit_dead_letters_at_deliv
     col = _Collector()
     runner._destinations[DEST] = col  # type: ignore[assignment]
 
-    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
+    over = _ORDINARY_HEAD + _headers(2 * _floor_limit + 1)
     assert may_hold_doc_ref(over)
     _mid, rows = await _deliver(store, runner, over)
     assert _dead_lettered_at_once(rows)
@@ -2762,3 +2763,78 @@ async def test_a_handler_built_payload_past_the_form_limit_dead_letters_at_deliv
     _mid, rows = await _deliver(store, runner, few)
     assert col.deliveries == [few]
     assert [str(r["status"]) for r in rows] == [OutboxStatus.DONE.value]
+
+
+def test_a_payload_longer_than_a_body_the_listeners_admitted_is_not_refused_for_its_forms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round-158ac8b0: the limit falls with the length, so a re-attach measured on a
+    delivery payload one character longer than its received body refused a form count the
+    listeners had admitted. With a budget small enough to put the limit above its floor, a body
+    at the listeners' limit is admitted, and a payload up to twice as long holding it re-attaches;
+    one past twice the limit is refused."""
+    import asyncio
+
+    from messagefoundry.parsing import binary
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import doc_ref_marker_refusal
+
+    probe = _ORDINARY_HEAD + _headers(10)
+    monkeypatch.setattr(binary, "_MARKER_SCAN_BUDGET_CHARS", 10 * len(probe))
+    limit = binary._later_header_forms_limit(len(probe))
+    assert limit == 10 > binary._LATER_HEADER_FORMS_LIMIT
+    assert doc_ref_marker_refusal(Peek.parse(probe), probe) is None
+    for payload in (probe + "NTE|1||x\r", probe + "NTE|1||" + "y" * (len(probe) - 10) + "\r"):
+        assert len(payload) <= 2 * len(probe)
+        assert asyncio.run(reattach_documents_in_hl7(payload, _no_read, bound=frozenset())) == (
+            payload
+        )
+    past = _ORDINARY_HEAD + _headers(2 * binary._later_header_forms_limit(len(probe)) + 1)
+    assert len(past) > len(probe)
+    with pytest.raises(UnreattachableDocumentError, match="more distinct ways"):
+        asyncio.run(reattach_documents_in_hl7(past, _no_read, bound=frozenset()))
+
+
+def test_the_dry_run_and_the_re_ingress_refuse_an_ordinary_header_body_past_the_form_limit(
+    _floor_limit: int,
+) -> None:
+    """The dry-run and the loopback re-ingress run the shared check, so they refuse the body the
+    listeners refuse, with the same reason, and accept one at the limit."""
+    from messagefoundry.pipeline.ingress_guards import HEADER_FORMS_REFUSED_REASON
+    from messagefoundry.pipeline.wiring_runner import _peek_for_loopback
+
+    reg = Registry()
+    reg.add_inbound(_plain_ic())
+    reg.add_router("r", lambda m: [])
+    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
+    at_limit = _ORDINARY_HEAD + _headers(_floor_limit)
+
+    result = dry_run(reg, over.encode("utf-8"))
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == HEADER_FORMS_REFUSED_REASON
+    assert _peek_for_loopback(_plain_ic(), over)[3] == HEADER_FORMS_REFUSED_REASON
+
+    assert dry_run(reg, at_limit.encode("utf-8")).disposition is MessageStatus.UNROUTED
+    assert _peek_for_loopback(_plain_ic(), at_limit)[3] is None
+
+
+def test_a_resubmitted_body_past_the_form_limit_is_refused_before_it_is_committed(
+    _floor_limit: int,
+) -> None:
+    """The upload resend and the edit-resend re-route admit a body through
+    ``admit_resubmitted_body``, which ran the listeners' parse but not their marker check, so a
+    body a listener refuses was committed and then refused by every outbound's re-attach."""
+    from messagefoundry.pipeline.ingress_guards import (
+        HEADER_FORMS_REFUSED_REASON,
+        IngressGuardError,
+        admit_resubmitted_body,
+    )
+
+    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
+    with pytest.raises(IngressGuardError) as caught:
+        admit_resubmitted_body(over, _plain_ic())
+    assert caught.value.phase == "ingest"
+    assert str(caught.value) == HEADER_FORMS_REFUSED_REASON
+    at_limit = _ORDINARY_HEAD + _headers(_floor_limit)
+    assert admit_resubmitted_body(at_limit, _plain_ic()) == at_limit
