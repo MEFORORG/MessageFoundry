@@ -11103,7 +11103,8 @@ class SqlServerStore:
         except Exception:
             # Nothing is returned, so no claimed row may stay inflight behind the error (#5723). A
             # cancellation is not caught and leaves them inflight; release_unreturned says why.
-            await release_unreturned(self, [[d for d in decoded if d["id"] not in settled]])
+            unsettled = [r for r in decoded if r["id"] not in settled]
+            await self._release_after_claim_error(unsettled, d, now)
             raise
         return items
 
@@ -11169,6 +11170,17 @@ class SqlServerStore:
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
         await self.reschedule_claimed([d["id"] for d in tail], set_aside_deadline(now))
+
+    async def _release_after_claim_error(
+        self, rows: Sequence[dict[str, Any]], failed: dict[str, Any], now: float | None
+    ) -> None:
+        """Hand back a claim that is about to re-raise (BACKLOG #5723); the SQLite twin says why
+        ``failed`` is set aside first. Never raises an ``Exception``."""
+        try:
+            await self._set_aside_claimed([failed], now)
+        except Exception as exc:  # noqa: BLE001 -- the release below still runs
+            log.warning("could not set aside a failed claimed row (%s)", type(exc).__name__)
+        await release_unreturned(self, [rows])
 
     async def _open_queue_body(self, cur: Any, row: dict[str, Any], *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
@@ -11321,7 +11333,7 @@ class SqlServerStore:
                     await self._set_aside_claimed([d], now)
                 return None
         except Exception:
-            await release_unreturned(self, [[d]])  # never strand the head (#5723)
+            await self._release_after_claim_error([d], d, now)  # #5723
             raise
         return OutboxItem(
             id=d["id"],
@@ -11491,7 +11503,7 @@ class SqlServerStore:
         except Exception:
             # Nothing is returned, so release the batch (#5723); a dead-lettered row is not
             # inflight and stays as it is. A cancellation leaves the rows inflight.
-            await release_unreturned(self, [decoded])
+            await self._release_after_claim_error(decoded, d, now)
             raise
         return items
 

@@ -15116,7 +15116,8 @@ class MessageStore:
         except Exception:
             # Nothing is returned, so no claimed row may stay inflight behind the error (#5723). A
             # cancellation is not caught and leaves them inflight; release_unreturned says why.
-            await release_unreturned(self, [[r for r in rows if r["id"] not in settled]])
+            unsettled = [r for r in rows if r["id"] not in settled]
+            await self._release_after_claim_error(unsettled, row, now)
             raise
         return items
 
@@ -15225,6 +15226,20 @@ class MessageStore:
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
         await self.reschedule_claimed([r["id"] for r in tail], set_aside_deadline(now))
+
+    async def _release_after_claim_error(
+        self, rows: Sequence[aiosqlite.Row], failed: aiosqlite.Row, now: float | None
+    ) -> None:
+        """Hand back a claim that is about to re-raise (BACKLOG #5723). ``failed`` is set aside
+        first, so it reads not-due and the next pass can take the rows around it, or the FIFO
+        prefix before it, rather than meet the same error. ``rows`` are then released; the release
+        skips a row that is no longer ``inflight``, ``failed`` included. Never raises an
+        ``Exception``, so the caller's error stays the one re-raised."""
+        try:
+            await self._set_aside_claimed([failed], now)
+        except Exception as exc:  # noqa: BLE001 -- the release below still runs
+            log.warning("could not set aside a failed claimed row (%s)", type(exc).__name__)
+        await release_unreturned(self, [rows])
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
@@ -15351,7 +15366,7 @@ class MessageStore:
                 if await self._dead_letter_unopenable(claimed, exc) is not None:
                     await self._set_aside_claimed([claimed], now)
             except Exception:
-                await release_unreturned(self, [[claimed]])  # never strand the head (#5723)
+                await self._release_after_claim_error([claimed], claimed, now)  # #5723
                 raise
             return None
 
@@ -15441,7 +15456,7 @@ class MessageStore:
         except Exception:
             # Nothing is returned, so release the batch (#5723); a dead-lettered row is not
             # inflight and stays as it is. A cancellation leaves the rows inflight.
-            await release_unreturned(self, [ordered])
+            await self._release_after_claim_error(ordered, row, now)
             raise
         return items
 

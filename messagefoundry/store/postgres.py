@@ -5321,7 +5321,8 @@ class PostgresStore:
         except Exception:
             # Nothing is returned, so no claimed row may stay inflight behind the error (#5723). A
             # cancellation is not caught and leaves them inflight; release_unreturned says why.
-            await release_unreturned(self, [[r for r in rows if r["id"] not in settled]])
+            unsettled = [r for r in rows if r["id"] not in settled]
+            await self._release_after_claim_error(unsettled, row, now)
             raise
         return items
 
@@ -5474,7 +5475,7 @@ class PostgresStore:
         try:
             item, _set_aside = await self._fifo_item_or_dead_letter(row, tail=[row], now=now)
         except Exception:
-            await release_unreturned(self, [[row]])  # never strand the head (#5723)
+            await self._release_after_claim_error([row], row, now)  # #5723
             raise
         return item
 
@@ -5591,7 +5592,7 @@ class PostgresStore:
         except Exception:
             # Nothing is returned, so release the batch (#5723); a dead-lettered row is not
             # inflight and stays as it is. A cancellation leaves the rows inflight.
-            await release_unreturned(self, [ordered])
+            await self._release_after_claim_error(ordered, row, now)
             raise
         return items
 
@@ -5948,8 +5949,8 @@ class PostgresStore:
         """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
         (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
         too, its error propagates to the claim, which releases its unsettled rows and re-raises
-        (BACKLOG #5723); if the release fails as well, the rows' lease and startup recovery
-        re-pend them."""
+        (BACKLOG #5723); if the release fails as well, they stay ``inflight`` until startup
+        recovery, or a FIFO lane's reclaim of an expired lease."""
         log.warning(
             "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
             " dead-lettered, for a reason the claim could not settle",
@@ -5957,6 +5958,17 @@ class PostgresStore:
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
         await self.reschedule_claimed([r["id"] for r in tail], set_aside_deadline(now))
+
+    async def _release_after_claim_error(
+        self, rows: Sequence[Any], failed: Any, now: float | None
+    ) -> None:
+        """Hand back a claim that is about to re-raise (BACKLOG #5723); the SQLite twin says why
+        ``failed`` is set aside first. Never raises an ``Exception``."""
+        try:
+            await self._set_aside_claimed([failed], now)
+        except Exception as exc:  # noqa: BLE001 -- the release below still runs
+            log.warning("could not set aside a failed claimed row (%s)", type(exc).__name__)
+        await release_unreturned(self, [rows])
 
     async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite

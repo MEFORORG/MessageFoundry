@@ -1054,7 +1054,57 @@ async def test_a_cancelled_per_lane_claim_leaves_its_rows_inflight(
         monkeypatch.setattr(store, "_set_aside_claimed", cancelled)
         with pytest.raises(asyncio.CancelledError):
             await claim(store)
-        assert _rows(db)[0] == ("inflight", 1)
+        second = ("pending", 0) if claim is _claim_next_fifo else ("inflight", 1)
+        assert _rows(db) == [("inflight", 1), second]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "claim", [_claim_ready, _claim_next_fifo_batch], ids=["claim_ready", "claim_next_fifo_batch"]
+)
+async def test_a_row_that_keeps_raising_does_not_stop_the_rows_before_it(
+    tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row two fails its tag and its dead-letter write hits an engine bug on every pass. It is set
+    aside, so the next pass delivers row one rather than meeting the same error."""
+    store, _cipher, db = await _open(tmp_path)
+    try:
+        _side(
+            db,
+            "UPDATE queue SET handler_name='MOVED' WHERE rowid=(SELECT MAX(rowid) FROM queue"
+            " WHERE destination_name=?)",
+            (_DEST,),
+        )
+        monkeypatch.setattr(store, "dead_letter_now", _broken_dead_letter)
+        with pytest.raises(TypeError):
+            await claim(store)
+        assert _rows(db) == [("pending", 0), ("pending", 0)]
+        assert [i.payload for i in await claim(store)] == ["B1"]
+    finally:
+        await store.close()
+
+
+async def test_a_fifo_top_up_meets_a_set_aside_row_as_not_due(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batching outbound tops up its window with ``claim_next_fifo``. After one raise on row two,
+    the next top-up reads it as not due and returns ``None``, so the window can send row one."""
+    store, _cipher, db = await _open(tmp_path)
+    try:
+        _side(
+            db,
+            "UPDATE queue SET handler_name='MOVED' WHERE rowid=(SELECT MAX(rowid) FROM queue"
+            " WHERE destination_name=?)",
+            (_DEST,),
+        )
+        monkeypatch.setattr(store, "dead_letter_now", _broken_dead_letter)
+        head = await store.claim_next_fifo(_DEST)
+        assert head is not None and head.payload == "B1"
+        with pytest.raises(TypeError):
+            await store.claim_next_fifo(_DEST)
+        assert await store.claim_next_fifo(_DEST) is None
+        assert _rows(db) == [("inflight", 1), ("pending", 0)]
     finally:
         await store.close()
 
@@ -1086,7 +1136,8 @@ async def test_claim_ready_does_not_release_a_row_it_already_set_aside(
         monkeypatch.setattr(store, "dead_letter_now", _broken_dead_letter)
         with pytest.raises(TypeError):
             await store.claim_ready(10, destination_name=_DEST)
-        assert len(set_aside) == 1 and len(released) == 1 and released != set_aside
+        # The first row was set aside and settled; the second, which raised, is set aside too.
+        assert len(set_aside) == 2 and released == [set_aside[1]]
     finally:
         await store.close()
 
