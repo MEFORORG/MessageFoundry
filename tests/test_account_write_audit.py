@@ -485,7 +485,10 @@ async def test_an_unclassified_error_in_the_sign_in_role_row_still_ends_the_sess
     row: the write may have committed, so the roles are written again without it, the stale
     sessions end and the user is told, and only then does the sign-in fail with the error."""
     service, first, _grants, audit_pages = await _signed_in(store)
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    # Through the store, not the service, whose map edit would end ``first`` itself and leave the
+    # stale-session assertion below true whatever the sign-in did (vault BACKLOG #3085 item 19).
+    await store.set_ad_group_role_map([("cn=mf-ops,dc=x", "viewer")])
+    assert await service.identity_for_token(first) is not None
     service._security_notifier.sent.clear()
     raised = _append_fails(monkeypatch, store, error)
     with pytest.raises(type(error)):
@@ -514,7 +517,9 @@ async def test_a_sign_in_whose_role_retry_raises_still_ends_the_sessions_and_tel
     committed, so the account's other sessions still end and the user is still told before the
     sign-in fails with the retry's error."""
     service, first, _grants, audit_pages = await _signed_in(store)
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    # Through the store, as above, so ``first`` is live until the sign-in ends it.
+    await store.set_ad_group_role_map([("cn=mf-ops,dc=x", "viewer")])
+    assert await service.identity_for_token(first) is not None
     service._security_notifier.sent.clear()
     calls: list[int] = []
 
