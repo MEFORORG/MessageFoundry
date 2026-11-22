@@ -527,18 +527,23 @@ async def test_a_failed_refusal_row_write_still_refuses(
     refused and the route body never gets past the check, as in the gate's own decision block."""
     service = await _service(engine, admin_write_rate_limit_per_actor=10)
 
+    attempts: list[str] = []
+
     async def broken(*_: object, **__: object) -> None:
+        attempts.append("audit_gate_refused")
         raise RuntimeError("audit store down")
 
     monkeypatch.setattr(service, "audit_gate_refused", broken)
     ran: list[str] = []
     app = _route_body_app(engine, service, check, ran)
     token = await _login(app)
-    await engine.store.mark_session_reauthed(hash_token(token), now=0.0)  # lapse the window
+    # Lapse the window for the window check; the spend refuses anyway, with no bound proof minted.
+    await engine.store.mark_session_reauthed(hash_token(token), now=0.0)
     transport = httpx.ASGITransport(app=app, client=(_HOME, 12345), raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.post(_PROBE, headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 500, r.text
+    assert attempts == ["audit_gate_refused"], "the 500 must come from the refusal-row write"
     assert ran == []
 
 
