@@ -4,7 +4,8 @@
   the remedy to drop that object and restart, not to recreate the store. Where the error's text fits
   more than one such name, as with views `vv` and `vv after drop column`, the remedy names each of
   them rather than one that may be healthy. A view under the name of a
-  table or index this build creates still gets the recreate remedy. A failure on the store's shape
+  table or index this build creates still gets the recreate remedy, also when it is one of several
+  names the text fits. A failure on the store's shape
   raised by the check's own read of the live store, after the schema script and the migrations of
   a writable open, is now refused with the recreate remedy rather than escaping as SQLite's bare error.
   (`BACKLOG #6719`, `BACKLOG #6720`)

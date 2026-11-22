@@ -461,8 +461,9 @@ async def run_schema_step[T](
             names = f"{', '.join(listed[:-1])} and {listed[-1]}"
             raise SchemaMismatchError(
                 f"store {path}: drop whichever of these stops its upgrade, then restart: {names}."
-                f" The error fits each name, and this build created none of them. The schema step"
-                f" failed: {cause}.",
+                f" The error's text could name each of them, and this build created none of them."
+                f" Save each one's CREATE statement from sqlite_master before you drop it, so a"
+                f" healthy one can be restored. The schema step failed: {cause}.",
                 cause=cause,
             ) from exc
         if counts_under_dek is None:
@@ -484,12 +485,15 @@ async def _foreign_objects(db: aiosqlite.Connection, cause: str) -> tuple[tuple[
     Several names can fit one text (the forms are in the note above ``_FOREIGN_OBJECTS_SQL``):
     ``vv`` and ``vv after`` both fit "error in view vv after rename: ...". A name whose remainder
     starts with ": " or with " after " ranks first, and any other name last. Every name of the first
-    rank is returned, since no rule over the text can pick among them: SQLite writes "error in view
-    vv after drop column: ..." when ``vv`` breaks under the change, and the same text when a view
-    named ``vv after drop column`` was broken already. With ``vv`` and ``vv: no such column``,
-    ``vv``'s own "error in view vv: no such column: c" fits both too. So where names collide like
-    this the ambiguity remains, and the remedy names each candidate, a healthy one among them. With
-    no first-rank name, the longest last-rank name is the one returned.
+    rank is returned, and the code does not pick among them. Some pairs no rule over the text can
+    settle: SQLite writes "error in view vv after drop column: ..." when ``vv`` breaks under the
+    change, and the same text when a view named ``vv after drop column`` was broken already. With
+    ``vv`` and ``vv: no such column``, ``vv``'s own "error in view vv: no such column: c" fits both
+    too. Other pairs a list of SQLite's suffixes could settle, as ``vv`` against ``vv after`` for
+    "error in view vv after after drop column: ...". The code keeps no such list: only some
+    suffixes are measured, and a suffix missing from the list would name a healthy object alone. So
+    where names collide the ambiguity remains, and the remedy names each candidate, which may
+    include a healthy one. With no first-rank name, the longest last-rank name is the one returned.
 
     The colon and " after " share a rank because a quoted name may hold either: with ``vv`` and
     ``vv: x``, "error in view vv: x after rename: ..." must not name ``vv`` alone. Where any name

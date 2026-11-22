@@ -725,8 +725,9 @@ async def test_names_the_text_cannot_tell_apart_are_all_named_in_the_remedy(
     assert isinstance(info.value.__cause__, sqlite3.OperationalError)
     assert str(info.value) == (
         f"store {path}: drop whichever of these stops its upgrade, then restart: the view 'vv' and"
-        " the view 'vv after drop column'. The error fits each name, and this build created none"
-        f" of them. The schema step failed: {cause}."
+        " the view 'vv after drop column'. The error's text could name each of them, and this build"
+        " created none of them. Save each one's CREATE statement from sqlite_master before you"
+        f" drop it, so a healthy one can be restored. The schema step failed: {cause}."
     )
 
 
