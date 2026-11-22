@@ -6396,8 +6396,10 @@ class PostgresStore:
         cases include at least: a work-row that fails its tag, a corrupt reference, a missing or
         erased reply, an origin metadata cell that fails its tag, a depth past the cap, and (BACKLOG
         #5689) a reply or origin metadata cell that does not decrypt, or origin metadata that does
-        not parse. A decrypt failure from a key service that gave no verdict, or one that is also a
-        fault in the engine's own code, propagates instead."""
+        not parse. A decrypt failure from a key service that gave no verdict propagates instead, and
+        so does a fault in the engine's own code on the reply cell. That fault dead-letters the token
+        on its reference, and on origin metadata where the cipher reads it as a corrupt cell; on
+        origin metadata it otherwise propagates."""
 
         class _Noop(Exception):
             pass
@@ -6591,7 +6593,6 @@ class PostgresStore:
                                 exc, "origin metadata", "ingress_handoff(origin-unopenable)"
                             )
                     if open_fault is not None:
-                        del body  # the opened reply must not sit in a frame this traceback reaches
                         raise open_fault
                     refusal: str | None = None
                     if meta_json:

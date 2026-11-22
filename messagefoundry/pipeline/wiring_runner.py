@@ -12992,10 +12992,12 @@ class RegistryRunner:
                 # cause clears, and the fault arm re-pended it at the head of this FIFO lane each
                 # time. Dead-letter it at once, as a claim does an unopenable payload. The cause can
                 # clear later, for example a key the store lacks, so the token keeps its reference
-                # and a replay can recover it. The handoff below is not wrapped: its encrypt's
-                # invocation ceiling is a deliberate hard stop, so any CipherError the handoff
-                # raises still takes the fault arm. Each store's handoff dead-letters on its own
-                # decrypt failures, other than the two kinds above (BACKLOG #5689, #5727).
+                # and a replay can recover it. Each store's handoff contains its own decrypts the
+                # same way (BACKLOG #5689, #5727), and a key service with no verdict at any of them
+                # takes the fault arm. An engine fault propagates from the reply cell. On a token
+                # reference it dead-letters. On origin metadata it dead-letters where the cipher
+                # reads it as a corrupt cell, and propagates otherwise. The handoff's encrypt is
+                # not contained: its invocation ceiling is a deliberate hard stop.
                 log.warning(
                     "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
                     name,
@@ -13007,7 +13009,10 @@ class RegistryRunner:
                 )
                 return _ItemOutcome.PROCESSED, None
         if read_fault is not None:
-            raise read_fault
+            try:
+                raise read_fault
+            finally:
+                del read_fault  # the fault's traceback holds this frame: no cycle through a local
         unstorable = _unstorable_reply(body)
         if unstorable is not None:
             # BACKLOG #5616: a reply holding a lone surrogate. The guards' head sniff raised on one in
@@ -13078,7 +13083,10 @@ class RegistryRunner:
             # frames, whose arguments carry values from the reply, and this frame's own copies,
             # before it goes on. The token is still re-pended by the fault arm.
             del body, control_id, message_type, summary, refused
-            raise handoff_fault.with_traceback(None)
+            try:
+                raise handoff_fault.with_traceback(None)
+            finally:
+                del handoff_fault  # as for read_fault above
         if produced:
             # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op
             # wake for a depth-capped / peek-failed token that produced no ingress row). B12 (ADR

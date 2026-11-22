@@ -9577,7 +9577,6 @@ class SqlServerStore:
                             exc, "origin metadata", "ingress_handoff(origin-unopenable)"
                         )
                 if open_fault is not None:
-                    del body  # the opened reply must not sit in a frame this traceback reaches
                     raise open_fault
                 loaded = json.loads(meta_json) if meta_json else {}
                 origin_meta = loaded if isinstance(loaded, dict) else {}

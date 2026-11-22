@@ -16460,7 +16460,6 @@ class MessageStore:
                 if open_fault is None:
                     return await _dead_unopenable(exc, "origin metadata")
             if open_fault is not None:
-                del body  # the opened reply must not sit in a frame this traceback passes through
                 raise open_fault
             if meta_json:
                 loaded = json.loads(meta_json)
