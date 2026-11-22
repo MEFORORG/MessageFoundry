@@ -4,9 +4,11 @@
   that a group or other account may write without the sticky bit.** Before, it judged the
   mode bits of the file a link named, so a mode `0600` key another account owned, or one in a
   directory others could replace it in, would have passed. The check applies at least to the
-  generated and the operator's API TLS key and each connection's key file, which `serve` and
-  `supervise` judge, and to the secrets directory and its files. A dangling link to a key is now
-  refused rather than passed as a missing file. The directory that holds the file is judged by
+  generated and the operator's API TLS key and the connection key files that `serve` and
+  `supervise` judge, which [PHI.md](../docs/PHI.md), *Key files*, names, and to the secrets
+  directory and its files. Under `[security].enforcement = "warn"` a key file is warned about
+  rather than refused; the secrets directory is refused under either. A dangling link to a key is
+  now refused rather than passed as a missing file. The directory that holds the file is judged by
   its owner and mode. The folders above it are not, except those that hold a link on the path or
   lie above one, which `_posix_link_problem` in `messagefoundry/restricted_file.py` judges, and,
   since the secrets directory is checked as a path of its own, the folder that holds that

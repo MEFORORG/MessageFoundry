@@ -10,9 +10,10 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
   file first and tightening it afterwards.
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group or
   an application package can read it or change it, whether it is a link, whether a link above it
-  is one another account can change, and whether the directory holding it lets another account
-  replace it. On POSIX it also asks whether another account owns the file, and on Windows whether
-  a broad group does.
+  is one an account the check does not trust can change, and whether the directory holding it lets
+  such a group or package (Windows) or a group or other account (POSIX) replace it. On POSIX it
+  also asks whether an account other than the engine's own or root owns the file, and on Windows
+  whether a broad group does. Its own docstring is the record of the rest.
 
 :func:`key_file_handle_problem` is the stricter Windows read check the key custody reads use: the
 owner and the exact list, read through the open handle.

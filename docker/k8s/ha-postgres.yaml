@@ -166,7 +166,7 @@ spec:
           labelSelector:
             matchLabels:
               app: mefor-engine-ha
-      # Under enforce the engine refuses a TLS key reached through a link or readable by a group, and
+      # Under enforce the engine refuses a TLS key whose own name is a link, or one a group may read, and
       # a Secret volume serves each file as a root-owned link, group-readable through fsGroup
       # (docs/PHI.md section 2, *Key files*). copy-tls copies the pair into a memory emptyDir at 0600 as
       # uid 10001, and the engine mounts that, never the Secret. A Secret update reaches the engine at

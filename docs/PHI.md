@@ -449,9 +449,12 @@ than a path is not checked
   the check does not count them as such groups. At least two kinds of key file are held to a
   stricter owner rule. One is the key at the path where the engine mints its TLS key, when
   `serve` or `supervise` starts with no `[api].tls_cert_file` and no
-  `[api].tls_terminated_upstream`, and so mints or reuses that pair (below). Otherwise this rule
-  does not apply to that path. With an operator certificate, the file `[api].tls_key_file` names,
-  or `[api].tls_cert_file` when no key file is set, is judged as a key file you supply, by the
+  `[api].tls_terminated_upstream`, and so mints or reuses that pair: that key must be owned by the
+  engine's own account, SYSTEM or Administrators. An engine running as LOCAL SERVICE or NETWORK
+  SERVICE shares that account with other services, and a key that account owns is accepted, though
+  that owner does not show the engine made it. Otherwise this rule does not apply to that path.
+  With an operator certificate, the file `[api].tls_key_file` names, or `[api].tls_cert_file`
+  when no key file is set, is judged as a key file you supply, by the
   owner screen above rather than this rule, even where it names the mint path. Another is the key
   custody host and handoff files. A separate check,
   `key_file_handle_problem` ([restricted_file.py](../messagefoundry/restricted_file.py)), refuses
@@ -466,21 +469,25 @@ than a path is not checked
   list or take it over, or when that folder's owner is such a group or cannot be read
   (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list
   the engine's account may not read is refused: give that account read access to the folder's
-  permissions. On Windows the TLS key the engine mints must also be owned by the engine's own
-  account, SYSTEM or Administrators; an engine running as LOCAL SERVICE or NETWORK SERVICE shares
-  that account with other services, so that owner does not show the engine made it. Where that
-  folder is read, and what is refused on a network share or a mapped network drive, is in the
-  2026-11-17 entry of the
+  permissions. On both platforms the check also refuses at least a junction or link on the key
+  file's path that an account it does not trust could change or re-point, through the link itself
+  or a folder that holds it or lies above it. On Windows it trusts at least SYSTEM, Administrators,
+  TrustedInstaller and the engine's own account, unless that is LOCAL SERVICE or NETWORK SERVICE;
+  on POSIX, root and the engine's own account. A folder above the one that holds the key file is
+  not judged by owner or access unless a junction or link on the path sits in it or below it, so
+  the folders on a link's target side usually are not. Where that folder is read, and what is
+  refused on a network share or a mapped network drive, is in the 2026-11-17 entry of the
   [ADR 0214 amendments](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments),
   under *The share rule*. It is not a complete check of the file's surroundings. Do not rely on
   this check alone. Restrict the
   secrets directory and every folder above it yourself, and the folder that holds each key file
   and every folder above it.
-- On POSIX the check refuses a key file whose own name is a link, one owned by an account other
-  than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
-  in the group, and one held in a directory that another account owns or that a group or other may
-  write without the sticky bit (vault BACKLOG #5636). A directory a group or other account may write is accepted when it has the sticky
-  bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
+- On POSIX the check refuses at least a key file whose own name is a link, one owned by an account
+  other than the engine's own or root, one whose mode has a group or other read or write bit,
+  whoever is in the group, and one held in a directory that such an account owns or that a group or
+  other may write without the sticky bit (vault BACKLOG #5636). It takes the owner and mode a file
+  system reports as they are, on a network or FUSE file system too. A directory a group or other
+  account may write is accepted when it has the sticky bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
   mints its own TLS key beside the store. **When it mints its own pair and the store directory does
   not exist yet, the engine creates it on POSIX with no group or other write bit (`0755` at most,
   whatever the umask), so a client running as another account can still read the certificate it
