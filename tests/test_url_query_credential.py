@@ -731,6 +731,18 @@ def test_check_reads_an_env_url_against_the_instance_values(tmp_path: Path) -> N
     assert "against the 'dev' environment's values" in detail
 
 
+def test_with_no_value_file_the_line_says_it_read_the_overlays_only(tmp_path: Path) -> None:
+    """A missing value file loads as no file, so the line names the overlays, not the file."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _env_url_config(tmp_path, value=None)
+    (tmp_path / "environments" / "dev.toml").unlink()
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "against the overlays only, with no 'dev' value file" in detail
+    assert "environment's values" not in detail
+
+
 def test_control_an_env_url_the_values_do_not_hold_is_not_read(tmp_path: Path) -> None:
     from messagefoundry.checks import run_checks
 
@@ -753,7 +765,7 @@ def test_refused_settings_still_list_a_literal_hit(tmp_path: Path) -> None:
     r = next(x for x in report.results if x.name == "url-query-credential")
     assert r.ok and not r.required
     assert "OB_KEYED (sig)" in r.detail
-    assert "the settings did not load" in r.detail and "not-a-backend" not in r.detail
+    assert "the settings were refused" in r.detail and "not-a-backend" not in r.detail
 
 
 def test_a_hit_from_a_default_says_the_url_was_read_by_its_default(tmp_path: Path) -> None:

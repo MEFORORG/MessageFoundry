@@ -2528,6 +2528,23 @@ def _instance_env_values(settings: ServiceSettings) -> dict[str, Any]:
     )
 
 
+def _value_file_exists(settings: ServiceSettings, environment: str) -> bool:
+    """Whether the value file :func:`_instance_env_values` would read for ``environment`` is a
+    regular file. A path that cannot be built or stat'ed reads as absent here."""
+    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+    from messagefoundry.config.snapshot import is_regular_file
+
+    try:
+        path = values_file_path(
+            resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
+            settings.environments.dir,
+            environment,
+        )
+        return is_regular_file(path)
+    except (ValueError, OSError):
+        return False
+
+
 def _check_build(
     config_dir: str | Path,
     *,
@@ -3034,22 +3051,32 @@ def _check_url_query_credentials(
         # The graph half needs no settings, so a refusal (which build-check reports) or values
         # that do not load fall back to the defaults rather than drop the hops. Only the error's
         # type is kept: a settings or decoder message can quote a configured value.
-        what = "the settings"
+        # Not "settings did not load": that is the refused settings legs' own line, which a
+        # census of those legs matches (tests/test_checks_settings_memo.py).
+        what = "the settings were refused"
         try:
             settings = _load_check_settings(toml, cli=cli, env=env)
-            what = "the environment values"
+            what = "the environment values did not load"
             values = _instance_env_values(settings)
         except _SETTINGS_LOAD_ERRORS as exc:
-            reading = f"{defaults_only}: {what} did not load ({type(exc).__name__})"
+            reading = f"{defaults_only}: {what} ({type(exc).__name__})"
         else:
             environment = settings.ai.environment
-            reading = (
-                f"an env() url is read against the {environment!r} environment's values, else "
-                "its default= where they hold no such key, so one that neither gives, or whose "
-                "value does not resolve, is not read"
-                if environment is not None
-                else f"{defaults_only}: the settings name no environment"
-            )
+            if environment is None:
+                reading = f"{defaults_only}: the settings name no environment"
+            else:
+                # A missing value file loads as no file, so the values are the overlays alone
+                # (MEFOR_VALUE_* and the secrets directory); say so rather than name the file.
+                source = (
+                    f"the {environment!r} environment's values"
+                    if _value_file_exists(settings, environment)
+                    else f"the overlays only, with no {environment!r} value file"
+                )
+                reading = (
+                    f"an env() url is read against {source}, else its default= where they hold "
+                    "no such key, so one that neither gives, or whose value does not resolve, is "
+                    "not read"
+                )
     found = query_credential_hops(registry, env_values=values)
     if not found:
         return CheckResult(
