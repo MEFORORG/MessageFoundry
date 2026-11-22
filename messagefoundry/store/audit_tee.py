@@ -330,8 +330,8 @@ def _finished(key: str, written: str, scrubbed: str) -> str:
 
     ``scrubbed`` is run to :func:`_settled`. Unless that left the field as written, with nothing
     for ``json.dumps`` or the control scrub to escape, the result must also show no word, counted,
-    beyond what each modelled sink leaves of the field alone as a JSON member, the form the
-    handler chain used to read (:func:`~messagefoundry.logging_setup.sink_readings`). If it shows
+    beyond what each modelled sink leaves of the field alone as a JSON member, written and
+    scrubbed, the forms the handler chain used to read (:func:`~messagefoundry.logging_setup.sink_readings`). If it shows
     more, or a reading does not settle, the whole field is :data:`_FIELD_REDACTED`."""
     settled = _settled(scrubbed)
     if settled is None:
@@ -340,9 +340,14 @@ def _finished(key: str, written: str, scrubbed: str) -> str:
     shown = scrub_control_chars(json.dumps(settled, ensure_ascii=False)[1:-1])
     if settled == written and shown == written:  # escapes only lengthen, so nothing was escaped
         return written
-    member = json.dumps({key: written}, ensure_ascii=False)
-    if not all(_shows_no_more(shown, _line_words(r)) for r in dict.fromkeys(sink_readings(member))):
-        return _FIELD_REDACTED
+    # Both spellings: the chain can hide more of the scrubbed text than of the raw text, as where
+    # a placeholder and the line after it read as one credential value.
+    for text in dict.fromkeys((written, settled)):
+        member = json.dumps({key: text}, ensure_ascii=False)
+        if not all(
+            _shows_no_more(shown, _line_words(r)) for r in dict.fromkeys(sink_readings(member))
+        ):
+            return _FIELD_REDACTED
     return settled
 
 
@@ -356,12 +361,10 @@ def _finished_detail(detail: str) -> str:
     # Judged against the bounded text, the only text that can ship: text past the bound neither
     # reaches the line nor decides whether its head does.
     candidate = bounded if kept is detail else _bounded_detail(kept, note, bounded)
-    final: str | None = _finished("detail", bounded, candidate)
+    final = _finished("detail", bounded, candidate)
     if final == _FIELD_REDACTED:
-        final = None
-    if final is None:
         return _bounded_detail(_FIELD_REDACTED, note, bounded)
-    if _parses(bounded) and not _parses(final):
+    if final != bounded and _parses(bounded) and not _parses(final):
         return json.dumps(_FIELD_REDACTED)
     return final
 
@@ -379,7 +382,10 @@ def _tee_line(record: dict[str, object]) -> FinishedAuditLine:
         if excess <= 0:
             return line
         # By length on the line, where one control can take six characters.
-        spelled = {k: len(FinishedAuditLine(json.dumps(fields[k]))) for k in _TEXT_FIELDS}
+        spelled = {
+            k: len(FinishedAuditLine(json.dumps(fields[k], ensure_ascii=False)))
+            for k in _TEXT_FIELDS
+        }
         key = max(spelled, key=lambda k: spelled[k])
         value = str(fields[key] or "")
         keep = len(value) * max(spelled[key] - excess, 0) // spelled[key]

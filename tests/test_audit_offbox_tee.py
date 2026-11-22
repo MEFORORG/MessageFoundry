@@ -806,8 +806,8 @@ def test_the_values_the_fifth_review_measured_hide_no_less_than_before(
     ],
 )
 def test_a_value_with_no_c0_control_ships_byte_identical(value: str, capsys, monkeypatch) -> None:
-    """A field with no C0 control is not touched, so its line is the line before #3045, byte for
-    byte; a domain account's backslash is not read as an escape. Synthetic values."""
+    """The C0 field scrub leaves a field with no C0 control to :func:`_finished`, so switching it
+    off changes no line; a domain account's backslash is not read as an escape. Synthetic."""
     cases: list[dict[str, str | None]] = [
         {"actor": value},
         {"detail": value},
@@ -1156,8 +1156,8 @@ def test_scrub_log_text_is_the_handler_chain_without_the_control_scrub() -> None
 
 def test_a_field_scrub_fault_returns_the_field_redacted(monkeypatch, caplog) -> None:
     """Fail closed: a fault in the passes makes ``_scrub_field`` return the field as the
-    placeholder, logged once, by type and never with the value. What ships is still
-    ``_tee_line``'s choice, which can be the line before #3045, with the field unscrubbed."""
+    placeholder, logged once, by type and never with the value. A fault in the later passes
+    hides every text field of the record (BACKLOG #5649)."""
 
     def boom(_text: str) -> str:
         raise RuntimeError("synthetic DOE JANE")
@@ -1496,6 +1496,24 @@ def test_the_line_bound_cuts_the_field_that_overflows_it(capsys) -> None:
     parsed = json.loads(line.split("messagefoundry.audit: ", 1)[1])
     assert parsed["actor"] == actor
     assert parsed["client"].startswith(chr(0x7F))
+
+
+@pytest.mark.parametrize("field", ["actor", "detail"])
+def test_a_word_the_chain_hides_after_a_placeholder_stays_hidden(field: str, capsys) -> None:
+    """Review round 2: the chain reads a placeholder and the next line as one credential value, so
+    the field is held to its reading of the scrubbed text too. Synthetic value."""
+    (line,) = _tee_lines([{field: 'pwd="a b"\nSMITH'}], capsys)
+    assert "SMITH" not in line
+
+
+def test_the_line_bound_measures_non_ascii_as_the_line_spells_it(capsys) -> None:
+    """Review round 2: measuring with ASCII escapes overcounted CJK sixfold and blanked the whole
+    record. Short fields keep their text. Synthetic values."""
+    text = (chr(0x5F20) * 9 + " ") * 3300
+    (line,) = _tee_lines([{"actor": text, "channel_id": text, "client": "10.0.0.9"}], capsys)
+    parsed = json.loads(line.split("messagefoundry.audit: ", 1)[1])
+    assert parsed["client"] == "10.0.0.9" and parsed["action"] == "auth.login_failed"
+    assert parsed["actor"].startswith(chr(0x5F20)) or parsed["channel_id"].startswith(chr(0x5F20))
 
 
 def test_an_empty_detail_ships_as_empty_not_null(audit_capture) -> None:
@@ -1923,12 +1941,9 @@ def test_the_fallback_sink_renders_phi_exactly_as_the_configured_sink_does(capsy
     record the fallback emits the SAME BYTES the configured ``serve`` path emits.
 
     Byte identity rather than an assertion about the redacted shape, because the shape is a property
-    of the shared chain and not of this module. Measured 2026-09-03: the handler-level
-    ``RedactionFilter`` re-scrubs the already-``safe_text``'d line, sees ``PID|`` in the rendered JSON
-    as a segment run, and cuts to end-of-line -- so the record ships with its closing brace gone, on
-    the configured stdout path and the syslog forwarder exactly as here. That is inherited behaviour,
-    it errs toward MORE redaction rather than less, and correcting the framing is a separate subject.
-    What this guard pins is that the fallback did not diverge from it.
+    of the shared chain and not of this module. Since BACKLOG #5649 the handlers' text passes do not
+    rewrite the finished tee line on either path. What this guard pins is that the fallback did not
+    diverge from the configured path.
     """
     phi = "PID|1||123456^^^HOSP^MR||DOE^JANE^Q||19800101|F"
     with _handlerless_process():
