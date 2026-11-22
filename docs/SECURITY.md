@@ -2383,17 +2383,16 @@ the same permission set on the same method reds CI until it is listed here.
 > all-channels caller 404 with no row (BACKLOG #3378).
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it. A rule that names an outbound is withheld too,
-> even from a scope that lists it, as the flag route refuses an outbound (BACKLOG #3378, owner
-> ruling 2026-11-04). A name counts as an outbound when the running graph knows it as one, a
-> reload-dropped outbound still draining included, and it is not an inbound anywhere in the
-> deployment, the set the flag route reads. A `restart_outbound` rule is withheld whatever the
-> graph holds, since its action names the outbound side. With no graph loaded no name counts as
-> an outbound, so of these two outbound tests only the `restart_outbound` one withholds; the
-> scope tests above still apply. So at least a scope-listed outbound's other rules show while no
-> graph is loaded, and a rule on a name that is also an inbound shows, whatever its event type.
-> The flag route refuses more than this: at least a name in the scope that exists nowhere, which
-> a rule here may still name. Each rule it shows has a null `id` (BACKLOG #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
+> scope, and `control_target` is unset or in it. Each name a rule carries must also be an inbound
+> in `Registry.inbound_names()`, the set the flag route's scope test reads, even when the scope
+> lists it (BACKLOG #3378, owner ruling 2026-11-04). So a rule naming an outbound, or a name that
+> exists nowhere, is withheld from a scoped caller, and with no graph loaded every rule that
+> names a connection is. A name that is both an inbound and an outbound passes that test. Every
+> `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
+> its action names the outbound side. This narrowing is this route's alone, on purpose: the
+> alert-instance routes below still let a scope that lists an outbound reach that outbound's
+> alerts, because the ruling covers rules and flagging only. Each rule it shows has a null `id`
+> (BACKLOG #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
 > connection name in it, and nothing here reliably tells a label that names one from one that
 > does not. An
 > all-channels caller reads every id. A withheld id writes no audit row, since the rule itself is

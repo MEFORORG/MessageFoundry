@@ -6309,9 +6309,9 @@ def create_app(
         deployment, and a caller's in-scope inbound on a sibling engine shard is no denial. Both
         give the same refusal for an outbound and for a name outside the scope, and so does the web
         console's flag route for a direction that names neither side. A change to that refusal has
-        to be made in at least those three places. :func:`alerts_rules` withholds an outbound's
-        rules from a scoped caller by its own test, so a change to which names count as an
-        outbound has to be made there too."""
+        to be made in at least those three places. :func:`alerts_rules` tests a scoped caller's
+        names against the same ``inbound_names()`` set by its own code, so a change to which names
+        this route admits has to be made there too."""
         rr = engine.registry_runner
         wrong_direction = req.direction != "inbound"
         if identity.allowed_channels is not None and (
@@ -10602,9 +10602,12 @@ def create_app(
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
         ``IB_ACME_*``, is withheld.
 
-        Which outbound rules such a caller is shown, and what it reads of each rule's ``id``, are
+        Which further rules such a caller is denied, and what it reads of each rule's ``id``, are
         stated once in ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG
-        #3378).
+        #3378). That narrowing is this route's only, on purpose: the alert-instance routes, the
+        connection events route and :func:`_control_guard` still admit an outbound a scope lists,
+        so a scoped operator keeps handling its listed outbound's alerts, as docs/SECURITY.md
+        documents, and the owner ruling of 2026-11-04 covers rules and flagging only.
 
         A read that withholds at least one rule writes an audit row; see
         :func:`_audit_alert_rules_withheld`."""
@@ -10616,34 +10619,24 @@ def create_app(
         engine: Engine | None = getattr(request.app.state, "engine", None)
         rr = engine.registry_runner if engine is not None else None
         scoped = _user.allowed_channels is not None
-        # The deployment's inbounds, read once: on an engine shard this is every shard's.
-        inbounds = rr.registry.inbound_names() if rr is not None else frozenset()
+        # An allowlist (BACKLOG #3378 item 4, owner ruling 2026-11-04, "part 4 stays strict"): a
+        # scoped caller reaches a name only when it is in its scope AND an inbound of the
+        # deployment, the set the flag route's scope test reads (on an engine shard, every shard's
+        # inbounds). So an outbound, a name that exists nowhere, and with no graph loaded every
+        # name, are withheld. Read once per scoped request.
+        inbounds = rr.registry.inbound_names() if scoped and rr is not None else frozenset[str]()
 
-        def outbound(name: str) -> bool:
-            # An outbound spans channels, so a scope that lists one does not reach it (BACKLOG #3378
-            # item 4, owner ruling 2026-11-04). knows_outbound also counts a reload-dropped outbound
-            # still draining, as the alert's own control action does. A name that is also an
-            # inbound anywhere in the deployment (inbound_names(), the set the flag route's scope
-            # test reads) counts as the inbound; the flag route itself refuses direction=outbound.
-            return rr is not None and rr.knows_outbound(name) and name not in inbounds
+        def reachable(name: str) -> bool:
+            return _user.can_access_channel(name) and (not scoped or name in inbounds)
 
         def visible(rule: AlertRule) -> bool:
-            if not (rule.connection == "*" or _user.can_access_channel(rule.connection)):
+            if not (rule.connection == "*" or reachable(rule.connection)):
                 return False
-            if rule.control_target is not None and not _user.can_access_channel(
-                rule.control_target
-            ):
+            if rule.control_target is not None and not reachable(rule.control_target):
                 return False
-            if not scoped:
-                return True
             # restart_outbound acts on an outbound whatever the graph holds, a name that is also an
             # inbound and a "*" rule's firing connection included.
-            if _CONTROL_ACTION_SIDE.get(rule.control_action or "") == "outbound":
-                return False
-            return not (
-                (rule.connection != "*" and outbound(rule.connection))
-                or (rule.control_target is not None and outbound(rule.control_target))
-            )
+            return not (scoped and rule.control_action == "restart_outbound")
 
         rules = [r for r in alerts.rules if visible(r)]
         show_ids = not scoped

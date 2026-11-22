@@ -194,12 +194,35 @@ _RULES = AlertsSettings(
 #: What the caller scoped to ``IB_A`` reads of ``_RULES``: ``(id, connection, control_target)``.
 _SCOPED_SHOWN = [(None, "*", None), (None, "IB_A", None), (None, "IB_A", "IB_A")]
 
+#: The inbounds the stand-in graph below declares, for the tests built on ``_RULES``.
+_GRAPH = ("IB_A", "IB_B")
+
+
+def _attach_graph(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    inbounds: tuple[str, ...] = _GRAPH,
+    outbounds: tuple[str, ...] = (),
+) -> None:
+    """Give ``engine`` a stand-in runner whose graph declares ``inbounds`` and ``outbounds``, since
+    ``GET /alerts/rules`` shows a scoped caller only rules on an in-scope inbound of a loaded graph
+    (BACKLOG #3378). The route reads only these attributes. ``monkeypatch`` restores the engine's
+    own (None) runner before the engine fixture stops it, as long as the test names ``engine``
+    first."""
+    registry = SimpleNamespace(
+        inbound_names=lambda: frozenset(inbounds), outbound=dict.fromkeys(outbounds)
+    )
+    stub = SimpleNamespace(registry=registry, knows_outbound=lambda name: name in outbounds)
+    monkeypatch.setattr(engine, "_registry_runner", stub)
+
 
 async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope(
     engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A scoped caller sees a rule only when its ``connection`` is ``*`` or a name in its scope and
     its ``control_target`` is unset or in its scope. An all-channels caller sees every rule."""
+    _attach_graph(engine, monkeypatch)
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
     await _user(service, "empty", Role.OPERATOR, [])
@@ -225,10 +248,12 @@ async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope
 
 async def test_alert_rules_id_cannot_name_a_connection_outside_the_scope(
     engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3378: a rule's id is free text, so an in-scope rule can carry an out-of-scope name
     in its label. A scoped caller reads the rule with a null id, and no byte of the answer holds
     that name. The control: an all-channels caller reads the id whole."""
+    _attach_graph(engine, monkeypatch)
     rules = AlertsSettings(rules=[AlertRule(id="page OB_SECRET on IB_A", connection="IB_A")])
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
@@ -297,16 +322,18 @@ async def test_alert_rules_withhold_an_outbound_the_scope_lists(
     assert json.loads(str(rows[0]["detail"])) == {"shown": 1, "withheld": 3}
 
 
-async def test_alert_rules_withhold_a_restart_outbound_target_with_no_graph(
+async def test_alert_rules_a_name_on_both_sides_counts_as_its_inbound(
     engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3378 item 4: a ``restart_outbound`` rule acts on an outbound whatever the graph
-    holds, so it is withheld from a scoped caller even with no graph loaded, a ``"*"`` rule with no
-    target included. The control: the same rule with ``restart_inbound`` shows, since with no graph
-    nothing else marks the name."""
-    assert engine.registry_runner is None
+    """BACKLOG #3378 item 4: a name the graph declares as both an inbound and an outbound passes the
+    inbound test, so its rules show to a scope that lists it, whatever the event type. A
+    ``restart_outbound`` rule is still withheld, since its action names the outbound side, a
+    ``"*"`` rule with no target included."""
+    _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"), outbounds=("SHARED",))
     rules = AlertsSettings(
         rules=[
+            AlertRule(id="stall", event_type="message_stall", connection="SHARED"),
             *(
                 AlertRule(
                     id=f"in-{action}",
@@ -331,15 +358,76 @@ async def test_alert_rules_withhold_a_restart_outbound_target_with_no_graph(
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         r = await c.get("/alerts/rules", headers=await _login(c, "scoped"))
         assert r.status_code == 200, r.text
-        assert [rule["control_action"] for rule in r.json()["rules"]] == ["restart_inbound"]
+        assert [(rule["connection"], rule["control_action"]) for rule in r.json()["rules"]] == [
+            ("SHARED", None),
+            ("IB_A", "restart_inbound"),
+        ]
+
+
+async def test_alert_rules_with_no_graph_show_a_scoped_caller_no_named_rule(
+    engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378 item 4: with no graph loaded no name is known to be an inbound, so a scoped
+    caller sees no rule that names a connection, even one on a name its scope lists. A rule naming
+    nobody still shows. The control: an all-channels caller reads every rule."""
+    assert engine.registry_runner is None
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="all", connection="*"),
+            AlertRule(id="mine", connection="IB_A"),
+            AlertRule(id="ob", connection="OB_X"),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A", "OB_X"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for username, expected in (("scoped", ["*"]), ("wide", ["*", "IB_A", "OB_X"])):
+            r = await c.get("/alerts/rules", headers=await _login(c, username))
+            assert r.status_code == 200, r.text
+            assert [rule["connection"] for rule in r.json()["rules"]] == expected, username
+
+
+async def test_alert_rules_withhold_an_in_scope_name_the_graph_lacks(
+    toml_engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378 item 4: a name the scope lists but the loaded graph does not declare, such as
+    one a reload removed or a draining outbound dropped from the graph, is withheld as
+    ``connection`` and as ``control_target``, as the flag route refuses it. The control: the
+    in-scope inbound's own rule shows."""
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="in", connection="IB_TOML"),
+            AlertRule(id="gone", connection="IB_GONE"),
+            AlertRule(
+                id="in-targets-gone",
+                event_type="connection_stopped",
+                connection="IB_TOML",
+                control_action="restart_inbound",
+                control_target="IB_GONE",
+            ),
+        ]
+    )
+    service = await _service(toml_engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_TOML", "IB_GONE"])
+    app = create_app(toml_engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.get("/alerts/rules", headers=await _login(c, "scoped"))
+        assert r.status_code == 200, r.text
+        assert [(x["connection"], x["control_target"]) for x in r.json()["rules"]] == [
+            ("IB_TOML", None)
+        ]
 
 
 async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
     engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3403: a read that withholds at least one rule writes ``alert_rules_withheld``, naming
     the counts shown and withheld and no rule's contents. A read that withholds nothing writes none,
     even a channel-scoped one. No read writes ``auth.channel_denied``."""
+    _attach_graph(engine, monkeypatch)
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
     await _user(service, "empty", Role.OPERATOR, [])
@@ -388,6 +476,7 @@ async def _read_rules_while_the_row_raises(
 ) -> httpx.Response:
     """``GET /alerts/rules`` as a scoped caller, with the ``alert_rules_withheld`` write raising
     ``error`` and every other audit write landing."""
+    _attach_graph(engine, monkeypatch)
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
     app = create_app(engine, auth=service, alerts_settings=_RULES)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision, ui_client
@@ -139,8 +140,14 @@ async def test_ui_flag_bad_direction_from_a_scoped_caller_is_the_audited_403(
     assert await engine.store.list_connection_flags() == set()
 
 
-async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) -> None:
+async def test_ui_alerts_page_lists_only_rules_inside_the_scope(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # The page shows each rule's connection, not its id, so the connection names are the markers.
+    # A scoped caller sees only rules on an inbound of a loaded graph (BACKLOG #3378), so a
+    # stand-in runner declares both; the route reads only these attributes.
+    graph = SimpleNamespace(inbound_names=lambda: frozenset({"IB_MINE", "IB_THEIRS"}))
+    monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(registry=graph))
     rules = AlertsSettings(
         rules=[AlertRule(connection="IB_MINE"), AlertRule(connection="IB_THEIRS")]
     )
