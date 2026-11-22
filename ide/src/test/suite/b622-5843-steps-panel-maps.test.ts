@@ -71,8 +71,17 @@ suite("BACKLOG #5843: Steps handler roles and message types are per panel", () =
     const src = fs.readFileSync(STEPS_VIEW_TS, "utf8");
     assert.ok(
       /panelState\.update\(parse as LensParseResult, handlers\);\s+panel\.webview\.html = pageHtml\(/.test(src),
-      "an update before an await would let an interleaved render leave the projection describing another page",
+      "the projection must be updated right beside the HTML it describes",
     );
+    // No await between the update and the end of render (the body up to applyOne's declaration).
+    const noAwaitAfter = (text: string): boolean => {
+      const at = text.indexOf("panelState.update(");
+      const end = text.indexOf("const applyOne", at);
+      return at >= 0 && end > at && !/\bawait\b/.test(text.slice(at, end));
+    };
+    // Negative control: an update that precedes the live-value await fails the check.
+    assert.ok(!noAwaitAfter("panelState.update(p, h);\n const inline = await this.liveValuesFor(f, ws);\n const applyOne"));
+    assert.ok(noAwaitAfter(src), "an update before an await lets an interleaved render leave it describing another page");
   });
 
   // stepsView.ts imports vscode, so the provider cannot be loaded node-side; pin its wiring by scan.

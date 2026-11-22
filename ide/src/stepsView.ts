@@ -92,7 +92,6 @@ import {
   type LensParseResult,
   type LiveInlineValue,
   type OpSchema,
-  type RowKind,
   type StructuralRequest,
 } from "./stepsModel";
 import {
@@ -430,7 +429,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       // ADR 0104 §2.3 P2 and ADR 0076 Amendment D: stash each element's message type (the field picker's
       // scope) and role (the Router purity check), and each row's kind and fan-out flags (the structural
       // insert anchor, BACKLOG #5844), for THIS panel. Updated beside the HTML it describes, after the
-      // last await, so the projection always answers for the page the user sees.
+      // last await, so an interleaved render cannot leave it describing a page it did not set. A message
+      // the old page posts while the new HTML loads is still answered by the new projection; the
+      // anchor's expectSrc match is what keeps that from taking another row's flags.
       panelState.update(parse as LensParseResult, handlers);
       panel.webview.html = pageHtml(
         panel.webview,
@@ -613,6 +614,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         return;
       }
       await render(); // reflect the picked value (no optimistic DOM value) + any drained edits
+    };
+
+    // A structural message whose anchor anchorFor refused (BACKLOG #5844): say so rather than drop it,
+    // and never run the op without the stale check.
+    const refuseAnchor = (): void => {
+      void vscode.window.showErrorMessage(
+        "MessageFoundry: could not apply the change — the selected row's coordinates are malformed. Reopen the Steps view and retry.",
+      );
     };
 
     // Run the native cascading field picker (ADR 0104 §2.3), then write what `build` makes of the picked
@@ -810,7 +819,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // applyStructural path. The anchor's fan-out flags drive the insert position (isReturnRow).
           const anchor = panelState.anchorFor(m as AnchorMessage);
           if (anchor === undefined) {
-            return; // a malformed expectSrc: dropped, never run without the stale check
+            refuseAnchor();
+            return;
           }
           void pickDestination("Add destination", "Destination (fan out)").then((dest) => {
             if (dest !== undefined && dest !== "" && !disposed) {
@@ -881,7 +891,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // derived position puts a mid-body append send before the new step and a footer after it (#5844).
           const anchor = panelState.anchorFor(m as AnchorMessage);
           if (anchor === undefined) {
-            return; // a malformed expectSrc: dropped, never run without the stale check
+            refuseAnchor();
+            return;
           }
           void applyStructural(
             buildToolbarInsertRequest(anchor, m.action, m.position as "before" | "after" | undefined),
@@ -912,7 +923,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // The anchor carries the row's fan-out flags, for a request that derives its position (#5844).
           const anchor = panelState.anchorFor(m as AnchorMessage);
           if (anchor === undefined) {
-            return; // a malformed expectSrc: dropped, never run without the stale check
+            refuseAnchor();
+            return;
           }
           const position = m.position as "before" | "after" | undefined;
           if (item.prompts.length === 0) {
@@ -963,7 +975,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // projection: a block pasted at a mid-body append send lands after it, at a footer before (#5844).
           const anchor = panelState.anchorFor(m as AnchorMessage);
           if (anchor === undefined) {
-            return; // a malformed expectSrc: dropped, never run without the stale check
+            refuseAnchor();
+            return;
           }
           void applyStructural(
             buildPasteRequest(anchor, {

@@ -12,7 +12,6 @@ import {
   buildToolbarInsertRequest,
   type HandlerViewModel,
   type LensParseResult,
-  type RowKind,
   type RowViewModel,
 } from "../../stepsModel";
 
@@ -49,8 +48,8 @@ const pasteMsg = (r: RowViewModel) => ({
 const CLIP = { source: "x = 1", nesting: 0, kind: "code" as const, lineCount: 1, label: "" };
 
 /** anchorFor, asserting it accepted the message. */
-function anchorAt(p: StepsPanelProjection, m: AnchorMessage, fallbackKind?: RowKind): StructuralAnchor {
-  const anchor = p.anchorFor(m, fallbackKind);
+function anchorAt(p: StepsPanelProjection, m: AnchorMessage): StructuralAnchor {
+  const anchor = p.anchorFor(m);
   assert.ok(anchor !== undefined, "anchorFor refused a well-formed message");
   return anchor;
 }
@@ -60,24 +59,24 @@ suite("BACKLOG #5844: Steps insert anchors carry the row's fan-out flags", () =>
   panel.update(parse, handlers);
 
   test("a paste at a mid-body append send lands after it", () => {
-    const anchor = anchorAt(panel, pasteMsg(APPEND), "send");
+    const anchor = anchorAt(panel, pasteMsg(APPEND));
     assert.strictEqual(anchor.appended, true);
     assert.strictEqual(buildPasteRequest(anchor, CLIP).position, "after");
   });
 
   test("a paste at the return-collector footer lands before it", () => {
-    const anchor = anchorAt(panel, pasteMsg(FOOTER), "code");
+    const anchor = anchorAt(panel, pasteMsg(FOOTER));
     assert.strictEqual(anchor.scaffold, "return_collector");
     assert.strictEqual(buildPasteRequest(anchor, CLIP).position, "before");
   });
 
   test("a paste at a terminal return still lands before it", () => {
-    assert.strictEqual(buildPasteRequest(anchorAt(panel, pasteMsg(RETURN), "send"), CLIP).position, "before");
+    assert.strictEqual(buildPasteRequest(anchorAt(panel, pasteMsg(RETURN)), CLIP).position, "before");
   });
 
   test("a derived toolbar insert and Add-menu insert follow the same flags", () => {
-    const append = anchorAt(panel, pasteMsg(APPEND), "send");
-    const footer = anchorAt(panel, pasteMsg(FOOTER), "code");
+    const append = anchorAt(panel, pasteMsg(APPEND));
+    const footer = anchorAt(panel, pasteMsg(FOOTER));
     assert.strictEqual(buildToolbarInsertRequest(append, "set_field").position, "after");
     assert.strictEqual(buildToolbarInsertRequest(footer, "set_field").position, "before");
     const item = ADD_MENU_BY_ID.set_field;
@@ -86,16 +85,20 @@ suite("BACKLOG #5844: Steps insert anchors carry the row's fan-out flags", () =>
   });
 
   test("the projection's kind and flags win over what the message claims", () => {
-    const anchor = anchorAt(panel, { ...pasteMsg(FOOTER), kind: "action", scaffold: 7 }, "code");
+    const anchor = anchorAt(panel, { ...pasteMsg(FOOTER), kind: "action", scaffold: 7 });
     assert.strictEqual(anchor.kind, "code");
     assert.strictEqual(anchor.scaffold, "return_collector");
   });
 
   test("a row the projection does not hold falls back to the message's own fields", () => {
-    const anchor = anchorAt(panel, 
-      { handler: "h", lineStart: 40, lineEnd: 40, kind: "send", appended: true, expectSrc: "y" },
-      "send",
-    );
+    const anchor = anchorAt(panel, {
+      handler: "h",
+      lineStart: 40,
+      lineEnd: 40,
+      kind: "send",
+      appended: true,
+      expectSrc: "y",
+    });
     assert.deepStrictEqual(anchor, {
       handler: "h",
       lineStart: 40,
@@ -108,7 +111,7 @@ suite("BACKLOG #5844: Steps insert anchors carry the row's fan-out flags", () =>
   });
 
   test("a message whose source differs from the projected row's does not take the row's flags", () => {
-    const anchor = anchorAt(panel, { ...pasteMsg(APPEND), expectSrc: "something else" }, "send");
+    const anchor = anchorAt(panel, { ...pasteMsg(APPEND), expectSrc: "something else" });
     assert.strictEqual(anchor.appended, false, "a stale message keeps its own (absent) flags");
     assert.strictEqual(anchor.expectSrc, "something else", "the engine's stale check still sees it");
   });
@@ -121,7 +124,7 @@ suite("BACKLOG #5844: Steps insert anchors carry the row's fan-out flags", () =>
       kind: 3,
       appended: "true",
     });
-    assert.strictEqual(anchor.kind, "send", "the default fallback kind");
+    assert.strictEqual(anchor.kind, "send", "a message naming no kind reads as a send");
     assert.strictEqual(anchor.expectSrc, undefined);
     assert.strictEqual(anchor.appended, false);
   });
@@ -132,10 +135,21 @@ suite("BACKLOG #5844: Steps insert anchors carry the row's fan-out flags", () =>
     }
   });
 
-  test("each handler drops a message anchorFor refused", () => {
+  test("a line coordinate that is not a whole number is refused", () => {
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 6.5]) {
+      assert.strictEqual(panel.anchorFor({ ...pasteMsg(APPEND), lineStart: bad }), undefined);
+      assert.strictEqual(panel.anchorFor({ ...pasteMsg(APPEND), lineEnd: bad }), undefined);
+    }
+  });
+
+  test("each handler refuses a message anchorFor refused, visibly", () => {
     const src = fs.readFileSync(STEPS_VIEW_TS, "utf8");
-    const drops = src.match(/const anchor = panelState\.anchorFor\(m as AnchorMessage\);\s+if \(anchor === undefined\) \{\s+return;/g);
-    assert.strictEqual(drops?.length, 4, "paste, insertToolbar, insertItem and addDestination each drop it");
+    const refuses = /const anchor = panelState\.anchorFor\(m as AnchorMessage\);\s+if \(anchor === undefined\) \{\s+refuseAnchor\(\);\s+return;/g;
+    // Negative control: a silent drop does not match.
+    assert.ok(!refuses.test("const anchor = panelState.anchorFor(m as AnchorMessage);\n if (anchor === undefined) {\n return;"));
+    refuses.lastIndex = 0;
+    assert.strictEqual(src.match(refuses)?.length, 4, "paste, insertToolbar, insertItem and addDestination each refuse it");
+    assert.ok(/const refuseAnchor = \(\): void => \{\s+void vscode\.window\.showErrorMessage\(/.test(src));
   });
 
   // stepsView.ts imports vscode, so the provider cannot be loaded node-side; pin its wiring by scan.

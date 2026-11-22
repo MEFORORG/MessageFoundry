@@ -81,11 +81,15 @@ export class StepsPanelProjection {
    * after it, a return-collector footer before it), and a message built from `kind` alone carries none.
    * So the row's kind and flags come from THIS panel's projection when it holds the row the message
    * names (same handler and line range, and the same source when the message carries one); otherwise
-   * from the message's own fields, as addDestination always sent them. `fallbackKind` is used only when
-   * neither names a kind. Returns undefined for a message whose expectSrc is present but not a string:
-   * dropping it there would run the op with no stale check at all, so the caller drops the message.
+   * from the message's own fields, as addDestination always sent them; a message naming no kind reads
+   * as a send (only addDestination's may lack one). Returns undefined, for the caller to refuse, when a
+   * line coordinate is not a whole number or expectSrc is present but not a string: dropping that value
+   * would run the op with no stale check at all.
    */
-  anchorFor(m: AnchorMessage, fallbackKind: RowKind = "send"): StructuralAnchor | undefined {
+  anchorFor(m: AnchorMessage): StructuralAnchor | undefined {
+    if (!Number.isSafeInteger(m.lineStart) || !Number.isSafeInteger(m.lineEnd)) {
+      return undefined;
+    }
     if (m.expectSrc !== undefined && typeof m.expectSrc !== "string") {
       return undefined;
     }
@@ -95,7 +99,7 @@ export class StepsPanelProjection {
       row !== undefined && (expectSrc === undefined || row.expectSrc === expectSrc)
         ? row
         : {
-            kind: typeof m.kind === "string" ? (m.kind as RowKind) : fallbackKind,
+            kind: typeof m.kind === "string" ? (m.kind as RowKind) : "send",
             appended: m.appended === true,
             scaffold: typeof m.scaffold === "string" ? m.scaffold : undefined,
           };
