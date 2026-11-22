@@ -174,9 +174,8 @@ class ServiceEnvPosture:
     directory_path_joined: bool = False
     #: The ``MEFOR_VALUE_<KEY>`` names no entry sets to content of its own: each variable
     #: :func:`_names` keeps for one has an own value, up to its first line break, that is empty
-    #: or blank, or takes only a joined directory entry.
-    #: A name with content in any entry is not here, so its Put step prints (the Lander's sixth
-    #: hold on PR 3142, H2). The remedy alone reads this, never the refusal itself.
+    #: or blank, or takes only a joined directory entry. The remedy alone reads this, never the
+    #: refusal itself.
     contentless_value_names: tuple[str, ...] = field(default=(), repr=False)
 
     @property
@@ -366,7 +365,8 @@ _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
 #: such run; anything else may be key material, so the remedy treats it as one.
 _PLAIN_PATH = re.compile(
     r"[A-Za-z]:[\\/][A-Za-z0-9 ._()\\/-]*"
-    r"|\\\\[A-Za-z0-9._-]+[\\/][A-Za-z0-9 ._()-]+(?:[\\/][A-Za-z0-9 ._()\\/-]*)?"
+    r"|\\\\[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*[\\/]"
+    r"[A-Za-z0-9 ._()-]*[A-Za-z0-9][A-Za-z0-9 ._()-]*(?:[\\/][A-Za-z0-9 ._()\\/-]*)?"
 )
 _EITHER_KEY_RUN = re.compile(r"[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43}")
 
@@ -1254,7 +1254,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "move it"
             )
         # A value whose only content is a joined directory entry is empty in its own entry.
-        if posture.empty_value_names or any(v in only and v != _VALUE_PREFIX for v in values):
+        if posture.empty_value_names or any(
+            v in posture.contentless_value_names and v != _VALUE_PREFIX for v in values
+        ):
             parts.append(
                 "An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where an "
                 "empty override is really wanted, write it in the value file instead, since the "

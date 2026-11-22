@@ -65,9 +65,9 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     # how one is created (the fifth hold on PR 3142, H3; the seventh hold). An empty value joined
     # to the directory entry is still told to go (the fifth hold, H3).
     assert CREATE not in refusal and "Put " not in refusal
-    assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
-        refused.startswith("MEFOR_VALUE_") and " " not in directory
-    )
+    assert (
+        "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    ) is refused.startswith("MEFOR_VALUE_")
 
 
 def test_the_bare_prefix_joined_to_the_directory_is_only_deleted() -> None:

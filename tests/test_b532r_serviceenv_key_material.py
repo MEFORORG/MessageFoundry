@@ -253,6 +253,8 @@ def test_only_an_entry_the_engine_reads_as_the_directory_is_kept(entry: str) -> 
         pytest.param(r"\\srv\share\secrets", True, id="unc-path"),
         pytest.param("/srv/secrets", False, id="posix-path"),
         pytest.param("\\\\srv\\", False, id="unc-without-a-share"),
+        pytest.param("\\\\srv\\..", False, id="unc-share-of-dots"),
+        pytest.param("\\\\.\\pipe\\x", False, id="unc-device-namespace"),
         pytest.param("   ", False, id="blank"),
         pytest.param("C:\\d", True, id="plain-path"),
     ],
