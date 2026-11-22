@@ -882,7 +882,7 @@ def _refuse_unsendable_conditional_query(query: str, conditional: str | None, ba
         # The request-line rule the static base url is judged by (BACKLOG #5911).
         if unsendable_request_target(query):
             raise ValueError(
-                f"{setting} must be ASCII with no space or '#' for "
+                f"{setting} must be ASCII with no space, control character, DEL or '#' for "
                 "conditional='conditional-update' (it is sent unencoded in the request URL); "
                 "percent-encode the search parameters"
             )

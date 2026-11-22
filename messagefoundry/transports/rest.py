@@ -1934,7 +1934,7 @@ def refuse_unsendable_static_request(
     """
     if unsendable_request_target(url, sent_as_is=sent_as_is):
         refused = (
-            "whitespace or a control character"
+            "whitespace or a control character once the whitespace around it is stripped"
             if sent_as_is
             else ("whitespace, a control character or '#'")
         )
