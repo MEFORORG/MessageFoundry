@@ -6484,13 +6484,17 @@ def _refuse_colliding_config_members(
                     # Resolved first, so an 8.3 spelling of an existing parent is expanded.
                     resolved = ntpath.normpath(str(out.resolve()))
                     prefix = _win32_path_key(resolved)[:win32_depth]
-                    # The store's 8.3 name does not exist until it is placed, so it cannot be
-                    # resolved here. A plain spelling of it meets the exclusive create; a STREAM on
-                    # it would not, and would write onto the store. So a stream on any `~` name in
-                    # the store's directory is refused. The generated name itself is not predicted.
-                    # LIMIT: this does not cover a plain `RESTOR~1.DB-wal` member. It lands, and
-                    # becomes the store's WAL if the store is later opened by its 8.3 path, because
-                    # SQLite names sidecars from the spelling the store was opened with.
+                    # The short-name case applies to the COPY-FALLBACK placement: a hard-linked
+                    # store has no 8.3 name (measured), so there `RESTOR~1.DB` is an unrelated new
+                    # file. A copied store gets its 8.3 name only when placed, so it cannot be
+                    # resolved here. A plain spelling of it then meets the exclusive create; a
+                    # STREAM on it would not, and would write onto the store. So a stream on any
+                    # `~` name in the store's directory is refused under BOTH placements, failing
+                    # closed because which one will run is not known yet. The generated name itself
+                    # is not predicted.
+                    # LIMIT, on the copy path: this does not cover a plain `RESTOR~1.DB-wal` member.
+                    # It lands, and becomes the store's WAL if the store is later opened by its 8.3
+                    # path, because SQLite names sidecars from the spelling the store was opened with.
                     at_store_dir = len(prefix) == win32_depth and prefix[:-1] == store_key[:-1]
                     component = resolved.split("\\")[win32_depth - 1] if at_store_dir else ""
                     stem, stream_mark, _ = component.partition(":")
