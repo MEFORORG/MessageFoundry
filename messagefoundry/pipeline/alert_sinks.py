@@ -691,7 +691,7 @@ def _refuse_webhook_revocation(
 ) -> None:
     """Apply the ADR 0173 revocation-hop guard to the https alert webhook (BACKLOG #2193 slice (d)).
 
-    The POST carries the webhook's path token, which Slack and Teams treat as the credential, over
+    The POST can carry the webhook's path token, which Slack and Teams treat as the credential, over
     https the engine verifies. Stdlib ssl checks no OCSP or CRL there, so a revoked but unexpired
     certificate would be accepted with no refusal and no record.
 
@@ -715,7 +715,7 @@ def _refuse_webhook_revocation(
         host=hop_url_host(url, cell="[alerts].webhook_url"),
         cell="[alerts] webhook POST (verified TLS, no revocation check)",
         description=(
-            "carries the alert webhook's path token over verified https but performs no "
+            "can carry the alert webhook's path token over verified https and performs no "
             "certificate revocation checking"
         ),
         attested=_attested_with_a_reason(attested, attested_reason, flag=_WEBHOOK_ATTESTATION),
@@ -810,6 +810,47 @@ def _refuse_alert_smtp_revocation(
     ).enforce_construction()
 
 
+def _refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> None:
+    """The webhook URL checks that read no secret and log nothing. :func:`notifier_from_settings`
+    runs them before it reads the SMTP password, so a secret store that is down cannot hide them
+    (vault BACKLOG #3533 item 18), and :class:`WebhookTransport` runs them first in its build."""
+    # https is the only scheme (ASVS 12.2.1). A plaintext http:// target is refused with no
+    # escape, in every posture (vault BACKLOG #3533 item 5): the URL can carry the hop's
+    # credential as a path token.
+    # Until then MEFOR_ALLOW_INSECURE_TLS released it at [security].enforcement = warn.
+    #
+    # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
+    # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen
+    # runs first so no later message can reach one. This sink is built outside the connector gate,
+    # so the transports' own construction refusal never saw this URL. Imported lazily to keep this
+    # module's import cost unchanged for the far commoner non-webhook sinks.
+    from messagefoundry.transports.rest import (
+        enforce_outbound_length_limits,
+        refuse_url_credentials,
+    )
+
+    refuse_url_credentials(
+        url, "[alerts].webhook_url", use="the path token the webhook service issues"
+    )
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    # Before the allowlist, so an http URL is never sent to fix an entry it cannot use.
+    if scheme == "http":
+        raise ValueError(
+            "[alerts].webhook_url over cleartext http would send the URL, and any path token in "
+            "it, in clear; refused, with no escape, in every posture — use https"
+        )
+    if scheme != "https":
+        raise ValueError(f"[alerts].webhook_url must be https, got scheme {scheme!r}")
+    # BACKLOG #5088: the allowlist _post applies, here before the send, so a host it would refuse
+    # at every POST refuses the start instead. Before the revocation guard, which reads no
+    # allowlist, so that guard never judges a host the egress policy forbids.
+    _refuse_off_allowlist_webhook(url, allowed_hosts)
+    # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
+    # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
+    # added between here and the wire.
+    enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
+
+
 class WebhookTransport:
     """POST the event as JSON to a configured URL (fronts Slack/Teams/PagerDuty/custom webhooks)."""
 
@@ -823,43 +864,9 @@ class WebhookTransport:
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
     ) -> None:
-        # https is the only scheme (ASVS 12.2.1). A plaintext http:// target is refused with no
-        # escape, in every posture (vault BACKLOG #3533 item 5): every POST carries the path token
-        # the webhook service issues, the hop's credential, as every AI broker call carries its key.
-        # Until then MEFOR_ALLOW_INSECURE_TLS released it at [security].enforcement = warn.
-        #
-        # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
-        # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen
-        # runs first so no later message can reach one. This sink is built outside the connector gate,
-        # so the transports' own construction refusal never saw this URL. Imported lazily to keep this
-        # module's import cost unchanged for the far commoner non-webhook sinks.
-        from messagefoundry.transports.rest import (
-            enforce_outbound_length_limits,
-            refuse_url_credentials,
-        )
-
-        refuse_url_credentials(
-            url, "[alerts].webhook_url", use="the path token the webhook service issues"
-        )
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
-        # Before the allowlist, so an http URL is never sent to fix an entry it cannot use.
-        if scheme == "http":
-            raise ValueError(
-                "[alerts].webhook_url over cleartext http would send the webhook's path token in "
-                "clear; refused, with no escape, in every posture — use https"
-            )
-        if scheme != "https":
-            raise ValueError(f"[alerts].webhook_url must be https, got scheme {scheme!r}")
-        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
-        # at every POST refuses the start instead. Before the revocation guard, which reads no
-        # allowlist, so that guard never judges a host the egress policy forbids.
-        _refuse_off_allowlist_webhook(url, allowed_hosts)
-        # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
-        # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
-        # added between here and the wire.
-        enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
+        _refuse_unbuildable_webhook_url(url, allowed_hosts)
         # BACKLOG #2484: build the shared opener here, so an OpenSSL that refuses the engine's list
-        # refuses the start, as at #5088 above, rather than failing every POST.
+        # refuses the start, as the #5088 allowlist check does, rather than failing every POST.
         _shared_no_redirect_opener()
         # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
         _refuse_webhook_revocation(
@@ -2980,8 +2987,13 @@ def notifier_from_settings(
     if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
         # BACKLOG #5088: before the SMTP password is read, so a relay the allowlist forbids costs no
         # secret-store read for it, and a store that is down cannot hide the relay's refusal. The
-        # build repeats it. The webhook reads no secret, so its check stays in its build.
+        # build repeats it.
         _refuse_off_allowlist_smtp_host(alerts.email_smtp_host, alerts.smtp_allowed_hosts)
+    if alerts.webhook_url:
+        # Vault BACKLOG #3533 item 18: the same reason, for the webhook's checks that log nothing.
+        # The build repeats them. The webhook itself is still built after the read, so its
+        # revocation guard never logs a crossing for a sink the read then stops.
+        _refuse_unbuildable_webhook_url(alerts.webhook_url, alerts.webhook_allowed_hosts)
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,

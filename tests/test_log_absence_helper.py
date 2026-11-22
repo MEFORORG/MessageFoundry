@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
-from tests._log_absence import assert_capture_sees
+from tests._log_absence import assert_capture_sees, assert_capture_sees_tree, assert_no_records
 
 _NAME = "messagefoundry.tests.log_absence_probe"
 
@@ -68,3 +68,34 @@ def test_a_capture_that_cannot_see_the_logger_fails(
         assert not [r for r in caplog.records if r.name == _NAME]
         with pytest.raises(AssertionError, match="would pass on nothing"):
             assert_capture_sees(caplog, _NAME)
+
+
+def test_a_tree_probe_fails_where_a_child_hides_what_a_root_probe_misses(
+    caplog: pytest.LogCaptureFixture, probe_logger: logging.Logger
+) -> None:
+    """Vault BACKLOG #3766 item 29: probing the root alone passes while a child with
+    ``propagate=False`` keeps its records from the capture. The tree probe names that child."""
+    root = _NAME.rsplit(".", 1)[0]
+    with caplog.at_level(logging.WARNING):
+        probe_logger.propagate = False
+        assert_capture_sees(caplog, root)  # the root still reaches the capture
+        with pytest.raises(AssertionError, match=_NAME):
+            assert_capture_sees_tree(caplog, root)
+        probe_logger.propagate = True
+        assert_capture_sees_tree(caplog, root)
+
+
+def test_no_records_probes_the_logger_it_checks(
+    caplog: pytest.LogCaptureFixture, probe_logger: logging.Logger
+) -> None:
+    """Vault BACKLOG #3766 item 36: the absence check and its probe name one logger, so a blind
+    capture fails the check rather than passing it, and a matching record fails it too."""
+    with caplog.at_level(logging.WARNING, logger=_NAME):
+        probe_logger.warning("unrelated")
+        assert_no_records(caplog, _NAME, lambda r: "secret" in r.getMessage())
+        probe_logger.warning("a secret line")
+        with pytest.raises(AssertionError, match="matched"):
+            assert_no_records(caplog, _NAME, lambda r: "secret" in r.getMessage())
+        probe_logger.propagate = False
+        with pytest.raises(AssertionError, match="would pass on nothing"):
+            assert_no_records(caplog, _NAME, lambda r: False)

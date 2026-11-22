@@ -74,6 +74,7 @@ import logging
 import os
 import pkgutil
 import re
+import sys
 import traceback
 import weakref
 from abc import ABCMeta
@@ -104,6 +105,7 @@ __all__ = [
     "log_timestamp",
     "prepare_log_record",
     "prints_a_codec_error",
+    "raised_by_a_driver",
     "redact",
     "redact_binary_carriage",
     "redact_untrusted",
@@ -3059,6 +3061,92 @@ def _unicode_error_detail(exc: UnicodeError) -> str:
 type ExcInfo = tuple[type[BaseException] | None, BaseException | None, TracebackType | None]
 
 
+#: Driver packages whose errors :func:`raised_by_a_driver` counts though the package has no DB-API
+#: ``apilevel``: asyncpg, the PostgreSQL store's driver.
+_NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
+
+
+def raised_by_a_driver(exc: BaseException) -> bool:
+    """Whether ``exc``'s class, or a class it inherits, is a database driver's: from a module, or
+    a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
+    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
+    builtin exception a driver raises does not count, though :func:`safe_traceback` withholds it
+    under a driver error that holds it (vault BACKLOG #1661). A class whose ``__module__`` is not
+    text is not a driver's. This runs on every link of a logged traceback, so it must not raise:
+    a class or module that raises when read answers ``True``, so its message is withheld rather
+    than printed on a guess that no driver raised it."""
+    try:
+        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+    except Exception:  # noqa: BLE001 - fail closed: see the docstring
+        return True
+
+
+def _a_driver_class(kind: type) -> bool:
+    """:func:`raised_by_a_driver` for one class of the MRO."""
+    name = kind.__module__
+    if not isinstance(name, str):
+        return False
+    parts = name.split(".")
+    if parts[0] in _NON_DBAPI_DRIVERS:
+        return True
+    return any(
+        getattr(sys.modules.get(".".join(parts[:depth])), "apilevel", None) == "2.0"
+        for depth in range(1, len(parts) + 1)
+    )
+
+
+#: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters.
+_DRIVER_SQLSTATE = re.compile(r"[0-9A-Z]{5}")
+#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``.
+_SQLITE_ERRORNAME = re.compile(r"SQLITE_[A-Z_]{1,40}")
+
+
+def _driver_line(exc: BaseException, *, under: bool) -> str | None:
+    """What a traceback prints after the class name for a database driver's error
+    (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
+    link (vault BACKLOG #1661, added item 3). A driver's message can quote a value the statement
+    carried, such as a duplicate key, so it is withheld. A driver error keeps its SQLSTATE,
+    asyncpg's ``sqlstate`` or else ``args[0]``, when that is five characters of SQL's alphabet; a
+    SQLite error keeps only its result-code name, since its ``args[0]`` is its message. A
+    link under a driver error is withheld whole, since a driver can raise its error from the
+    builtin one its codec raised, whose text can quote the value too. An attribute that raises
+    when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
+    driver = raised_by_a_driver(exc)
+    if not (driver or under):
+        return None
+    if driver:
+        try:
+            code = _driver_code(exc)
+        except Exception:  # noqa: BLE001 - the message stays withheld; only the code is lost
+            code = None
+        if code is not None:
+            return code
+    return "[driver message withheld]"
+
+
+def _driver_code(exc: BaseException) -> str | None:
+    """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code."""
+    # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
+    # and the CLI defers loading it (tests/test_startup_import_budget.py).
+    sqlite = sys.modules.get("sqlite3")
+    if sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning)):
+        # SQLite has no SQLSTATE, and its args[0] is the message itself, which can be a value as
+        # short as five characters; only its result-code name, a fixed word, is read.
+        name = getattr(exc, "sqlite_errorname", None)
+        if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
+            return f"[driver message withheld {name}]"
+        return None
+    state = getattr(exc, "sqlstate", None)
+    if state is None and exc.args:
+        state = exc.args[0]
+    if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state):
+        return f"[{state}] [driver message withheld]"
+    name = getattr(exc, "sqlite_errorname", None)
+    if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
+        return f"[driver message withheld {name}]"
+    return None
+
+
 def safe_traceback(ei: ExcInfo) -> str:
     """``logging.Formatter.formatException(ei)``, except that every ``UnicodeError`` in the chain
     prints the line :func:`safe_exc` would (vault BACKLOG #3185).
@@ -3079,27 +3167,37 @@ def safe_traceback(ei: ExcInfo) -> str:
     exception's ``__notes__`` after its line, so those are replaced or dropped on such a node; a
     ``UnicodeError`` keeps only the notes that read like a codec's own (:func:`_kept_notes`). One whose message was
     built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
-    third path, closed where the wrap is written."""
+    third path, closed where the wrap is written.
+
+    A database driver's error (:func:`raised_by_a_driver`) prints :func:`_driver_line`'s line in
+    place of its message, and so does every link printed under it, with their notes dropped (vault
+    BACKLOG #1661, added item 3). That bound is the class test's: a driver's error raised as a
+    builtin type, or wrapped in another library's, prints as any other link does."""
     value, tb = ei[1], ei[2]
     # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
     te = traceback.TracebackException(type(value), value, tb, compact=True)  # type: ignore[arg-type]
     # The stdlib builds one TracebackException per exception it will print, so the two trees walk in
     # step, and a link it chose not to print (a suppressed context, a repeat) is None on its side.
-    pending: list[tuple[Any, Any]] = [(te, value)]
+    pending: list[tuple[Any, Any, bool]] = [(te, value, False)]
     # Verdicts one link's scan reached for a later link, so a long chain is read about once, not
     # once per link (vault BACKLOG #3340): each link's own code may print the rest. Each link's
     # first pass has a whole budget; the added passes share one, which _ScanShare says leaves open.
     share = _ScanShare()
     while pending:
-        node, exc = pending.pop()
+        node, exc, under = pending.pop()
         if node is None or exc is None:  # exc is None at the root of an empty exc_info
             continue
-        line = _codec_line(exc, share)
+        driver = _driver_line(exc, under=under)
+        line = driver if driver is not None else _codec_line(exc, share)
+        below = driver is not None  # every link printed under a driver error is withheld too
         if line is not None:
             # The instance's own attribute, so a class-level default cannot pass; and getattr, so a
             # __slots__ class with no __dict__ fails closed rather than raising.
             if "_str" not in getattr(node, "__dict__", {}):  # renamed: fail closed, no traceback
-                return safe_exc(value) if value is not None else ""
+                if value is None:
+                    return ""
+                root = _driver_line(value, under=False)
+                return f"{type(value).__name__}: {root}" if root is not None else safe_exc(value)
             node._str = line  # the stdlib's private name: see docstring
             if isinstance(exc, SyntaxError):  # printed from these four, never from _str
                 node.msg, node.text, node.filename, node.lineno = line, None, None, None
@@ -3108,12 +3206,13 @@ def safe_traceback(ei: ExcInfo) -> str:
                 # A Unicode error's own keep only the codec's note (vault BACKLOG #3340, item 7).
                 # A caller's note can be built from the failing input, as add_note(f"{seg!r}"), so
                 # it goes with every other note, and a holder's go whole, as its message did.
-                keep = isinstance(exc, UnicodeError) and _own_notes(exc) is notes
+                keep = driver is None and isinstance(exc, UnicodeError) and _own_notes(exc) is notes
                 node.__notes__ = _kept_notes(notes) if keep else None
-        pending.append((node.__cause__, exc.__cause__))
-        pending.append((node.__context__, exc.__context__))
+        pending.append((node.__cause__, exc.__cause__, below))
+        pending.append((node.__context__, exc.__context__, below))
         if node.exceptions:  # set only for an exception group the stdlib will expand
-            pending.extend(zip(node.exceptions, exc.exceptions, strict=False))
+            members = zip(node.exceptions, exc.exceptions, strict=False)
+            pending.extend((member, raised, below) for member, raised in members)
     return "".join(te.format()).removesuffix("\n")
 
 

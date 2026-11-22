@@ -310,6 +310,38 @@ Restart-Service MessageFoundry
 Run them from an elevated prompt. Services.msc and `sc.exe` work too. NSSM's own start, stop and
 restart commands send the same request, so there is no reason to use them.
 
+**A stop holds some of its waits to a budget, to keep inside NSSM's stop window, and that can cut
+them short** (BACKLOG #3191; the owner ruled on 2026-11-22 that the budget wins over the work it
+cuts). The service's shutdown hands `engine.stop()` what is left of its budget after the floors of
+the steps after it, never less than 3 s. The budget covers at least these waits: a CRL reload pass
+in flight, the remote-debug refusal watch's two waits, for its last audit pass and then for that
+pass's cancel, and the drain of alert-instance writes. A budgeted wait is shortened only when what
+is left of the budget, less the time kept for the stop steps after it, is under that wait's fixed
+bound, and it still gets at least 0.1 s. The graph supervisor's exit is not budgeted: it waits up
+to its fixed 10 s, and then, once cancelled, for that cancel to land with no bound. It and the
+other stop steps are not held to the budget, so a slow one can still carry the stop past NSSM's
+window, and it spends budget the waits after it would have had. On a tight stop, at least these
+can be lost:
+
+- **The remote-debug watch's last pass** can be cut to about 0.1 s and cancelled. Every stop step
+  before it, the graph supervisor's wait and the stopping of the message graph included, shortens
+  its waits by what it took, so a slow graph stop alone can leave the pass only that floor. When
+  the budget cuts the pass, a WARNING says so, and a refusal seen since the pass before it may then
+  have no audit row and no alert. A cancel of the stop itself, in either wait, logs no WARNING.
+  A pass whose cancel has not landed when the second wait ends is left running and can outlive the
+  store's close, so its row may not be written; the WARNING then says it may still be running.
+- **The alert-instance drain** can be cut to about 0.1 s. A raise or clear write still running
+  then is not retried, and may fail when the store closes and go unrecorded. A clear still waiting
+  to retry is cancelled, and an ERROR counts it. An alert whose clear is lost can still read open
+  in the alert list. This drain covers alert records in the store, not the
+  sending of alert notifications, which a later shutdown step closes.
+- **A CRL reload pass in flight** gets at most about 1.8 s at the 3 s minimum, or about 0.8 s
+  while a config write is still running, and less when an earlier stop step was slow, down to the
+  same 0.1 s. When the budget cuts the pass, it is abandoned with a WARNING; a cancel of the stop
+  itself cancels it and logs none. Abandoning it does not end its read: the worker
+  thread running the pass cannot be cancelled and runs on, and it can hold the process's exit past
+  NSSM's window. The next start loads every CRL from the file again.
+
 The service's own `nssm.exe` is in `C:\Program Files\MessageFoundry\nssm` (the installer's
 `-NssmDir`). The installer checked that copy's hash, and keeps it where only administrators can
 write ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8). It never puts that
@@ -487,10 +519,12 @@ directory to the service account only, as the installer does.
 
 The engine resolves the account with `LookupAccountSid` each time it opens the store. It refuses
 the directory at least when the lookup fails, when the account resolves to anything but a user, such as a
-group, or when the directory names a second account. A refused directory gets a store restricted
-by `_secure_file` (see ADR 0163, *Note (2026-11-05)*), and the engine logs a WARNING naming the
-reason. Then the service and the operator who provisions the first Administrator can lock each
-other out of the store.
+group, or when the directory names a second account, and logs a WARNING naming the reason. In a
+refused directory the engine tries to remove each store file's inherited entries and grant the
+account that opened the store full control of it, and any other entry set on the file itself
+stays (see ADR 0163, *Note (2026-11-05)*). Where that fails, the file keeps the entries it
+inherited, and the engine logs a WARNING. With that fallback, the service and the operator who
+provisions the first Administrator can lock each other out of the store.
 
 At least these are unmeasured:
 
@@ -501,8 +535,8 @@ At least these are unmeasured:
 - **A start with no domain controller.** A gMSA resolves through a domain controller, or through
   the local lookup cache when no controller answers, and a slow or absent controller can delay
   the open or fail the lookup. A later start does not always repair what a failed lookup leaves.
-  Why a time-out can read as an account that does not exist, and what a store restricted by
-  `_secure_file` leaves on each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
+  Why a time-out can read as an account that does not exist, and what that restriction leaves on
+  each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 
@@ -561,7 +595,8 @@ What that changes for you:
 - **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
   leaves the user's site directory out. Install into a virtual environment.
 - **`messagefoundry serve` from a prompt has remote debugging on** unless its environment sets
-  `PYTHON_DISABLE_REMOTE_DEBUG`, so under `enforce` the start refusal for it stops the engine
+  `PYTHON_DISABLE_REMOTE_DEBUG`; give it a non-empty value, such as 1, since some shells delete a
+  variable set to an empty value. With remote debugging on, under `enforce` the start refusal for it stops the engine
   unless `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). The variable works
   there only because the console script passes neither `-I` nor `-E`: a start by hand that keeps
   `-I` and drops `-X disable-remote-debug` has the interface on whatever the variable says, as

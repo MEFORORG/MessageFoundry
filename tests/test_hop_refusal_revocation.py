@@ -33,6 +33,7 @@ import datetime
 import inspect
 import ssl
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography import x509
@@ -1616,10 +1617,10 @@ def _record_engine_start(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("engine.start")
         raise RuntimeError("PROBE: engine.start reached")
 
-    async def _stop(self: Engine) -> None:
+    async def _stop(self: Engine, **kwargs: Any) -> None:
         # Recorded, then the real stop, which closes the store (the #1257 teardown).
         calls.append("engine.stop")
-        await real_stop(self)
+        await real_stop(self, **kwargs)
 
     monkeypatch.setattr(Engine, "start", _probe)
     monkeypatch.setattr(Engine, "stop", _stop)

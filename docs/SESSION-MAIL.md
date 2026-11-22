@@ -176,8 +176,14 @@ already-shown counts separately.
 reached or a receipt that aged out. Read a receipt inside the window or not at all.
 
 **The OFF switch.** Creating the file `mefor-coord/mail/OFF` suppresses delivery repo-wide. Mail keeps
-being queued and is not lost; it is not shown. It reaches **already-running** sessions, which an
-environment variable cannot, and that is the point of it being a file. Delete it to resume.
+being queued; it is not shown or consumed. A message whose expiry passes meanwhile moves to `expired/`
+at the first drain of its box after the switch is removed. Its receipt then reads `expired-unshown` with an empty
+`observedUtc`, **even if a session was shown that message before OFF went up**, so that receipt does
+not prove the message was never seen. The drain says OFF is up as context at
+SessionStart. At Stop it says so on stderr, because output there would re-wake the session, and the
+model does not receive stderr from a hook that exits 0. The switch takes effect in **already-running**
+sessions, which an environment variable cannot, and that is the point of it being a file. Delete it
+to resume.
 
 ---
 

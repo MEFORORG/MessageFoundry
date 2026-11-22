@@ -105,6 +105,16 @@ function isCollection(v: unknown): v is TestCollection {
 }
 
 /**
+ * An empty collection map with no prototype. Collections are keyed by a name the user typed or the
+ * webview sent, so a name such as `__proto__` or `toString` must be an ordinary own key: on a plain
+ * object the first sets the prototype and is lost, and the second reads an Object.prototype method as
+ * a saved collection (BACKLOG #5846). JSON.stringify writes the map exactly as it did a plain one.
+ */
+function emptyCollections(): Record<string, TestCollection> {
+  return Object.create(null) as Record<string, TestCollection>;
+}
+
+/**
  * Keep only well-formed collections. One malformed entry must not block the list, or the user could
  * never reach Delete. A value that is not a map at all is unreadable as a whole.
  */
@@ -112,7 +122,7 @@ function validCollections(v: unknown): Record<string, TestCollection> {
   if (!isRecord(v)) {
     throw new CollectionStoreError("saved Test Bench collections are unreadable");
   }
-  const out: Record<string, TestCollection> = {};
+  const out = emptyCollections();
   for (const [name, coll] of Object.entries(v)) {
     if (isCollection(coll)) {
       out[name] = coll;
@@ -162,7 +172,7 @@ export class CollectionStore {
 
   private async readSecret(): Promise<Record<string, TestCollection>> {
     const raw = await this.secrets.get(this.key);
-    return raw === undefined ? {} : parseCollections(raw);
+    return raw === undefined ? emptyCollections() : parseCollections(raw);
   }
 
   /**
@@ -228,10 +238,10 @@ export class CollectionStore {
     const old = this.legacy.get<unknown>(LEGACY_COLLECTIONS_KEY);
     if (old !== undefined) {
       // Only this extension wrote the legacy key, but it is still checked the same way.
-      const moved = isRecord(old) ? validCollections(old) : {};
+      const moved = isRecord(old) ? validCollections(old) : emptyCollections();
       if (Object.keys(moved).length > 0) {
         const current = await this.readSecret();
-        await this.secrets.store(this.key, JSON.stringify({ ...moved, ...current }));
+        await this.secrets.store(this.key, JSON.stringify(Object.assign(moved, current)));
       }
       // update(key, undefined) removes the key from workspaceState.
       await this.legacy.update(LEGACY_COLLECTIONS_KEY, undefined);

@@ -1162,6 +1162,11 @@ IDE_SITES: dict[str, Site] = {
         " sweepStaleCaseDirs docblocks.",
         "ide/src/collectionCaseFiles.ts::st.uid !== uid",
     ),
+    "ide/src/configEditorModel.ts": Site(
+        4,
+        REVIEWED,
+        "The open document's path and the config-dir setting, resolved only to compare them.",
+    ),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/engineTrustModel.ts": Site(
@@ -1181,10 +1186,7 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/hl7schema.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/insertElement.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/liveDebug.ts": Site(
-        4,
-        OPERATOR,
-        "A sample the operator picked from a listing of the samples setting, and paths compared "
-        "for a breakpoint match.",
+        2, OPERATOR, "A sample the operator picked from a listing of the samples setting."
     ),
     "ide/src/newRoute.ts": Site(
         1,
@@ -1192,6 +1194,12 @@ IDE_SITES: dict[str, Site] = {
         "The wizard's inbound name is reduced to `[A-Za-z0-9_-]` before it names the new file, "
         "joined onto a config directory workspaceContainment.ts has held inside the workspace.",
         'ide/src/newRoute.ts::.replace(/[^A-Za-z0-9_-]/g, "_")}.py`',
+    ),
+    "ide/src/pathIdentity.ts": Site(
+        2,
+        OPERATOR,
+        "A file path resolved against a base folder, for an identity key to compare and for a "
+        "diagnostic's file.",
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/securityEditorModel.ts": Site(
@@ -1238,7 +1246,6 @@ IDE_SITES: dict[str, Site] = {
         "with the fixed name `program.py` inside it. The fifth only names that folder below the "
         "storage root for a log line and opens nothing (BACKLOG #5409).",
     ),
-    "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/workspaceContainment.ts": Site(
         8,
         GUARDED,

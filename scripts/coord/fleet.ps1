@@ -463,6 +463,10 @@ foreach ($r in $records) {
 # session's legacy record is still counted, because -ClearHandoff can still reach it.
 $frozenLegacy = @{}
 
+function Test-IsFrozenCopy($Copy, $Of) {
+    return ($Copy.Tree -cne $Copy.Box -and $Of.Box -ceq $Copy.Tree -and $Copy.SessionKey -and $Of.SessionKey -ceq $Copy.SessionKey)
+}
+
 $rows = @()
 # Seat lookups that threw. Each such seat reads POSSIBLY RUNNING, and the receipt says why.
 $lookupFailures = @()
@@ -486,6 +490,7 @@ foreach ($r in $records) {
     # The fence is this PC's session registry, so it is never asked about another PC's record.
     $isHere = Test-CoordRecordIsHere $rec
     $fence = if ($isHere) { 'UNKNOWN' } else { 'NOT-CHECKABLE-HERE' }
+    $holdsTree = $false
     if ($incomplete) {
         if ($isHere) { $fence = 'UNREADABLE' }
         $incompleteRecords += $r.File
@@ -504,28 +509,47 @@ foreach ($r in $records) {
             $fence = 'UNREADABLE'
             $lookupFailures += "$($r.File): $($_.Exception.GetType().Name) $($_.Exception.Message)"
         }
+        # The lookup matches an id by prefix and never reads the cwd, so LIVE alone can name a longer
+        # id or a session that moved to another tree. $liveInRepo holds each live session's exact id
+        # and innermost worktree. Any doubt answers no, which leaves a superseded record superseded.
+        $holdsTree = $fence -eq 'LIVE' -and @($liveInRepo | Where-Object { $_.SessionId -ieq $sid -and $_.Box -ceq $r.Tree }).Count -gt 0
     }
 
     $lifecycle = if ($null -ne (Get-RecordField $rec 'lifecycle')) { [string](Get-RecordField $rec 'lifecycle') } else { 'open' }
     $ageH = Get-AgeHours (Get-RecordField $rec 'asOf')
 
-    # SUPERSEDED: a newer record of the same tree (above), or a later record naming this one as
-    # predecessor. Without the tree, a session that crossed the box-key change reads as two seats.
+    # SUPERSEDED: a newer record of the same tree. Nothing here reads a predecessor link. Without the
+    # tree, a session that crossed the box-key change reads as two seats.
     # A legacy-box record whose own session also has a record in the new box is superseded outright:
     # the two can be minutes apart, inside Get-AgeHours's 0.1 h rounding, and the new box is the one
     # the writer keeps.
     $superseded = $false
+    # Another row already shows this session, so a RUNNING row here would be its second: this record
+    # is a frozen copy, or a newer record names the session. The session's own open frozen copy does
+    # not count, because that row reads SUPERSEDED and would leave the session no RUNNING row.
+    $shownElsewhere = $false
     foreach ($o in $records) {
         if ($o.File -eq $r.File) { continue }
         if ($o.Tree -cne $r.Tree) { continue }
-        if ($r.Tree -cne $r.Box -and $o.Box -ceq $r.Tree -and $r.SessionKey -and $o.SessionKey -ceq $r.SessionKey) {
+        if (Test-IsFrozenCopy $r $o) {
             $superseded = $true
+            $shownElsewhere = $true
             $frozenLegacy[$r.File] = $true
             continue
         }
         $oAge = Get-AgeHours (Get-RecordField $o.Rec 'asOf')
-        if ($null -ne $oAge -and $null -ne $ageH -and $oAge -lt $ageH) { $superseded = $true }
+        if ($null -ne $oAge -and $null -ne $ageH -and $oAge -lt $ageH) {
+            $superseded = $true
+            if ($holdsTree -and -not $shownElsewhere) {
+                $sameId = [string](Get-RecordField $o.Rec 'sessionId') -ieq $sid
+                $ownCopy = Test-IsFrozenCopy $o $r
+                $oLifecycle = Get-RecordField $o.Rec 'lifecycle'
+                $quietCopy = $ownCopy -and $sameId -and ($null -eq $oLifecycle -or [string]$oLifecycle -eq 'open')
+                if (($sameId -or $ownCopy) -and -not $quietCopy) { $shownElsewhere = $true }
+            }
+        }
     }
+    $staysSuperseded = $superseded -and ((-not $holdsTree) -or $shownElsewhere)
 
     $state = switch ($true) {
         { $lifecycle -eq 'closed' }                    { 'CLOSED'; break }
@@ -533,7 +557,7 @@ foreach ($r in $records) {
         # incomplete record names no checkout to brief.
         { $incomplete }                                { 'POSSIBLY RUNNING'; break }
         { $lifecycle -eq 'handed' }                    { 'HANDED'; break }
-        { $superseded }                                { 'SUPERSEDED'; break }
+        { $staysSuperseded }                           { 'SUPERSEDED'; break }
         { -not $isHere }                               { "ON $((Get-CoordRecordHost $rec).ToUpperInvariant())"; break }
         { $fence -eq 'LIVE' }                          { 'RUNNING'; break }
         { $fence -in @('UNVERIFIED', 'UNREADABLE') }   { 'POSSIBLY RUNNING'; break }
@@ -770,6 +794,14 @@ if ($Chip) {
         foreach ($u in ($untracked | Select-Object -First 40)) { $lines += "       $u" }
         if ($untracked.Count -gt 40) { $lines += "       ... and $($untracked.Count - 40) more" }
     }
+    # Present and not true: git status failed when the record was written, so its empty lists and
+    # null counts say nothing. A record with no such field predates it and reads as before.
+    $statusKnown = Get-RecordField (Get-RecordField $rec 'dirty') 'statusKnown'
+    if ($null -ne $statusKnown -and $statusKnown -ne $true) {
+        $lines += ""
+        $lines += "     *** TREE STATE UNKNOWN: git status failed when this record was written. ***"
+        $lines += "     This record does NOT say the checkout was clean. Run the status command above."
+    }
     $lines += "  2. git fetch origin FIRST, then decide whether the work already landed. Compare CONTENT, not"
     $lines += "     ancestry -- squash-merge makes 'commits ahead' and 'content ahead' disagree routinely:"
     if ($touchedPaths -and @($touchedPaths).Count -gt 0) {
@@ -783,21 +815,34 @@ if ($Chip) {
     $lines += "     time and you are reading it at click time; a hold may have been declared in between."
     $claims = @(Get-RecordField $rec 'claims' | Where-Object { $null -ne $_ })
     $ownClaims = @($claims | Where-Object { (Get-RecordField $_ 'attribution') -eq 'this-episode' })
-    $inhClaims = @($claims | Where-Object { (Get-RecordField $_ 'attribution') -ne 'this-episode' })
+    # `unknown` means the writer could not tell whose it is, so it gets neither firm answer.
+    $unkClaims = @($claims | Where-Object { (Get-RecordField $_ 'attribution') -eq 'unknown' })
+    $inhClaims = @($claims | Where-Object { (Get-RecordField $_ 'attribution') -notin @('this-episode', 'unknown') })
     if ($ownClaims.Count -gt 0) { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: " + (($ownClaims | ForEach-Object { Get-RecordField $_ 'key' }) -join ', ') }
+    elseif ($unkClaims.Count -gt 0) { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: none confirmed" }
     else { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: none" }
     if ($inhClaims.Count -gt 0) {
         $lines += "     ALSO PRESENT IN THAT WORKTREE BUT FROM EARLIER OCCUPANTS -- NOT YOURS, DO NOT REHOME:"
         $lines += "       " + (($inhClaims | ForEach-Object { Get-RecordField $_ 'key' }) -join ', ')
     }
+    if ($unkClaims.Count -gt 0) {
+        $lines += "     CLAIMS OF UNKNOWN ATTRIBUTION -- MAY BE THE PREDECESSOR'S. CHECK EACH HOLDER BEFORE ACTING:"
+        $lines += "       " + (($unkClaims | ForEach-Object { Get-RecordField $_ 'key' }) -join ', ')
+    }
     $allocs = @(Get-RecordField $rec 'allocations' | Where-Object { $null -ne $_ })
     $ownAlloc = @($allocs | Where-Object { (Get-RecordField $_ 'attribution') -eq 'this-episode' })
-    $inhAlloc = @($allocs | Where-Object { (Get-RecordField $_ 'attribution') -ne 'this-episode' })
+    $unkAlloc = @($allocs | Where-Object { (Get-RecordField $_ 'attribution') -eq 'unknown' })
+    $inhAlloc = @($allocs | Where-Object { (Get-RecordField $_ 'attribution') -notin @('this-episode', 'unknown') })
     if ($ownAlloc.Count -gt 0) { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: " + (($ownAlloc | ForEach-Object { "$(Get-RecordField $_ 'kind') #$(Get-RecordField $_ 'number')" }) -join ', ') }
+    elseif ($unkAlloc.Count -gt 0) { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: none confirmed" }
     else { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: none" }
     if ($inhAlloc.Count -gt 0) {
         $lines += "     $($inhAlloc.Count) MORE are allocated to that worktree PATH by earlier occupants."
         $lines += "     THEY ARE NOT YOURS. Do not rehome them and do not cite them."
+    }
+    if ($unkAlloc.Count -gt 0) {
+        $lines += "     LEDGER NUMBERS OF UNKNOWN ATTRIBUTION -- MAY BE THE PREDECESSOR'S. CHECK BEFORE CITING OR REHOMING:"
+        $lines += "       " + (($unkAlloc | ForEach-Object { "$(Get-RecordField $_ 'kind') #$(Get-RecordField $_ 'number')" }) -join ', ')
     }
     if ($hp) {
         $lines += ""

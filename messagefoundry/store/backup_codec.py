@@ -477,6 +477,42 @@ def archive_key_id(path: str | Path) -> str:
         return read_header(fh).key_id
 
 
+def _open_frame(
+    aes: AESGCM, nonce: bytes | bytearray, ct: bytes | bytearray, aad: bytes
+) -> bytes | None:
+    """One frame's plaintext, or ``None`` when its GCM tag does not authenticate under ``aad``."""
+    from cryptography.exceptions import InvalidTag
+
+    try:
+        return aes.decrypt(nonce, ct, aad)
+    except InvalidTag:
+        return None
+
+
+def _frame_refusal(
+    aes: AESGCM,
+    nonce: bytes | bytearray,
+    ct: bytes | bytearray,
+    header_digest: bytes,
+    frame_index: int,
+    read_as_final: bool,
+) -> str:
+    """Why frame ``frame_index`` failed its tag when read with ``final=read_as_final``. On this
+    failure path alone the other flag is tried, so the refusal can say what an operator needs: a
+    frame that authenticates as non-final where the stream ends is a truncated archive, and a final
+    frame with bytes after it has trailing bytes. Anything else is corrupt, tampered, or under the
+    wrong key."""
+    other = _aad(header_digest, frame_index, final=not read_as_final)
+    if _open_frame(aes, nonce, ct, other) is not None:
+        if read_as_final:
+            return "truncated .mfbak archive (no final frame)"
+        return "trailing bytes after the final .mfbak frame (tampered archive)"
+    return (
+        f"authentication failed on frame {frame_index} (corrupt/tampered/truncated archive, "
+        "or the wrong key)"
+    )
+
+
 def decrypt_stream(
     src: BinaryIO, dst: BinaryIO, key: bytes, *, max_plaintext_bytes: int | None = None
 ) -> ArchiveHeader:
@@ -489,8 +525,8 @@ def decrypt_stream(
     as a key mismatch when its ``key_id`` changed; by the frame-length bound when a lowered
     ``chunk_size`` is below a real frame; and at the tag, which covers the header bytes as read.
     Each frame's plaintext is written to ``dst`` once that frame authenticates, before the next
-    frame is read, so a refusal can leave earlier frames' plaintext in ``dst``: discard ``dst`` on
-    any error.
+    frame's length and ciphertext are read, so a refusal can leave earlier frames' plaintext in
+    ``dst``: discard ``dst`` on any error.
 
     Raises :class:`BackupKeyMismatch` when the header ``key_id`` does not match ``key`` — checked first,
     so a wrong key is a clean early error, not an opaque tag failure.
@@ -501,8 +537,6 @@ def decrypt_stream(
     ``store/`` may not import ``pipeline/`` — the dependency direction is one-way. Reaching upward for
     that constant would invert it; re-declaring the same number down here would fork it. The bound is
     checked BEFORE each write, so an over-cap archive never lands a byte past the ceiling."""
-    from cryptography.exceptions import InvalidTag
-
     _validate_key(key)
     header, header_bytes = _read_header(src)
     expected_kid = key_fingerprint(key)
@@ -524,9 +558,11 @@ def decrypt_stream(
     max_ctlen = min(header.chunk_size, MAX_CHUNK_SIZE) + _TAG_BYTES
     frame_index = 0
     written = 0
-    saw_final = False
+    # The byte read past each frame to see whether the stream ends there, which is the first byte
+    # of the next frame's nonce when it does not.
+    ahead: bytes | bytearray = b""
     while True:
-        nonce = _read_exact(src, _NONCE_BYTES, "frame nonce")
+        nonce = ahead + _read_exact(src, _NONCE_BYTES - len(ahead), "frame nonce")
         (ctlen,) = _U32.unpack(_read_exact(src, _U32.size, "frame length"))
         # Both halves BEFORE the read: a declared length is rejected rather than allocated, and this
         # is still pre-authentication -- ct has no tag checked against it until aes.decrypt below.
@@ -536,30 +572,18 @@ def decrypt_stream(
                 f"{_TAG_BYTES}..{max_ctlen} for a {header.chunk_size}-byte chunk)"
             )
         ct = _read_exact(src, ctlen, "frame ciphertext")
-        # We don't know up front whether this is the final frame, so try both the non-final AAD
-        # (every frame but the last) and the final-flag AAD. Exactly one matches for an authentic
-        # frame; if neither does, the frame is corrupt/tampered/wrong-key — fail closed.
-        #
-        # ASVS 11.2.4 (BACKLOG #1167): BOTH tries run on every frame, with no break on the first
-        # match, so the number of decrypt attempts does not depend on which AAD authenticated. The
-        # first match is kept. The cost is one extra AES-GCM decrypt pass per frame (the tag is
-        # checked after the whole frame is decrypted), on every decrypt of an archive: a restore and
-        # the post-backup verify alike.
-        plaintext: bytes | None = None
-        this_final = False
-        for final_try in (False, True):
-            try:
-                candidate = aes.decrypt(
-                    nonce, ct, _aad(header_digest, frame_index, final=final_try)
-                )
-            except InvalidTag:
-                continue
-            if plaintext is None:
-                plaintext, this_final = candidate, final_try
+        # A frame is read as the final one when the stream ends right after it, and as a non-final
+        # one otherwise, so an authentic frame takes ONE decrypt, under the AAD its position names
+        # (ASVS 11.2.4, BACKLOG #1167). The number of decrypts on success is then the number of
+        # frames, which the file's length already shows. Within one archive, a cut after a
+        # non-final frame reads that frame as final, and bytes appended after the final frame read
+        # it as non-final, so each fails the tag here.
+        ahead, _ = _read_up_to(src, 1, "frame boundary")
+        this_final = not ahead
+        plaintext = _open_frame(aes, nonce, ct, _aad(header_digest, frame_index, final=this_final))
         if plaintext is None:
             raise BackupCodecError(
-                f"authentication failed on frame {frame_index} (corrupt/tampered/truncated archive, "
-                "or the wrong key)"
+                _frame_refusal(aes, nonce, ct, header_digest, frame_index, this_final)
             )
         if max_plaintext_bytes is not None and written + len(plaintext) > max_plaintext_bytes:
             raise BackupCodecError(
@@ -568,17 +592,10 @@ def decrypt_stream(
             )
         dst.write(plaintext)
         written += len(plaintext)
-        # Not kept alive across the next frame's read. `candidate` is bound here: the loop above
-        # set `plaintext` from it, so at least one decrypt returned.
-        del ct, plaintext, candidate
+        # Not kept alive across the next frame's read.
+        del ct, plaintext
         if this_final:
-            saw_final = True
+            # The stream ended right after this frame, so nothing trails the terminator.
             break
         frame_index += 1
-    if not saw_final:  # defensive — the loop only exits on a final frame or a raise
-        raise BackupCodecError("truncated .mfbak archive (no final frame)")
-    # A trailing byte after the authenticated final frame is an append-tampering attempt — reject it.
-    trailing, _ = _read_up_to(src, 1, "trailing bytes")
-    if trailing:
-        raise BackupCodecError("trailing bytes after the final .mfbak frame (tampered archive)")
     return header

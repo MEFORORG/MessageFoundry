@@ -155,7 +155,7 @@ def test_ldaps_verifying_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch)
 def test_webhook_cleartext_is_refused_in_every_posture_even_with_escape(
     posture: HopPosture | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Vault BACKLOG #3533 item 5: every POST carries the webhook's path token, so http is refused
+    # Vault BACKLOG #3533 item 5: the URL can carry the webhook's path token, so http is refused
     # with no escape. Until then the escape released it at warn (#329); now no posture does.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with pytest.raises(ValueError, match="cleartext http") as info:

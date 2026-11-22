@@ -96,12 +96,11 @@ iterating whatever the file happens to contain cannot notice an omission.
 
 The third is partly closed, and not by this design. `scripts/coord/seat.ps1` resolves a declared
 label against `docs/roles/seats.json` and writes `seatCanonical` and `seatRosterVerdict` beside the
-raw seat. Measured 2026-09-18: 209 records carry the `seatCanonical` **key** and about half carry a
-**value**, the rest recording `seatRosterVerdict: none`. Only a `-Declare` pass resolves a label,
-and a later write assigns the field from that pass's own resolve with no carry-forward
-(`seat.ps1:763-764` against `:766`), so a `hook:Stop` write clears the grouping key while
-preserving the raw label -- six seated records already hold a null canonical. Grouping is available
-for a declaration, not for every record written since.
+raw seat. A pass that resolves no label, such as a `hook:Stop` write, carries both fields forward
+from the prior record (BACKLOG #5876), so the grouping key survives it. A record an older copy of
+the script already cleared stays cleared until that seat next declares with `-Seat`. A carried
+verdict is the roster's answer when the label was resolved, so it can go stale if the roster
+changes afterwards.
 
 ---
 

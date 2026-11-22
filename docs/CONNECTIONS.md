@@ -163,8 +163,10 @@ transport = "mllp"
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
   digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
-  #1650). That read sees what a `cast` left, so `cast = "int"` has already read `true` as 1 and cut
-  a fraction. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
+  #1650). That read sees what a `cast` left. `cast = "int"` is strict too: it refuses a bool and a
+  number that is not whole, where the builtin `int` read `true` as 1 and cut a fraction. A
+  `cast = "float"` is the builtin `float`, so it still reads `true` as 1.0, which the port read
+  takes as port 1. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin
   of `6661` (BACKLOG #5915). `allowed_db` also compares the SQL Server preset's `port` setting as
   a number when its check runs, but on `dialect="generic"` it refuses a `PORT` keyword with a
@@ -393,7 +395,10 @@ meets what any empty body meets. What each source does with a non-empty one, at 
   the input; it does not hold the file for the fix.
 - **A `DatabasePoll()` or `Timer()` source** fails to build on such a name, so it never starts.
 
-Bytes invalid in a usable charset are the body's own fault and final: `AR`, or `422`. Why:
+Bytes invalid in a usable charset are the body's own fault and final: `AR`, or `422`. So are
+bytes that decode to a UTF-16 surrogate code point, which at least `utf-7` decodes `+2D8-` to and
+which strict UTF-8 cannot encode, so at least the SQLite store could not write the text
+(BACKLOG #1619). Why:
 the [ADR 0154 amendment of 2026-11-04](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal)
 (BACKLOG #5102). At least the inbound `encoding` rows of the sources above point here.
 
@@ -2262,7 +2267,8 @@ name, counts only when every folder before it exists; a path that ends at a miss
 is left to the driver, as a missing file is. A `subst` drive onto a share counts as leading to
 another host.
 When the check cannot finish, or finds that the path leads to another host, a WARNING names the
-kind of cause, never the path; the path is logged at DEBUG only. The value is judged as the text
+kind of cause, never the path; the path is logged at DEBUG only. At least where the build or the
+lane check judges the value, the WARNING also names the connection and the keyword. The value is judged as the text
 the build sends, so `0` is checked as the path `0`. On Windows each entry of an `SSLCAPATH` folder
 takes the same check, since the driver opens a `<hash>.0` entry there by name: an entry that leads
 to another host, or one the check cannot finish, refuses the value, and so does a folder the engine
@@ -2401,8 +2407,10 @@ Two limits follow from this:
   file and a share Windows could not reach, saying the file must be a plain local path, not a
   share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
   file's own name can pass the walk, since Windows answers it from the folder's listing; the
-  read then refuses it as a file that could not be read. A missing name, other than such a share,
-  ends the walk and is left to libpq.
+  read then refuses it as a file that could not be read. A missing name, which Windows reports as
+  code 2 or 3, ends the walk and is left to libpq. Another code Windows raises as not found is not
+  read as a missing name: a share it could not reach is refused as above, and at least codes 161
+  and 206 stop the walk, and the build is refused.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder, which the engine asks the shell for as libpq does, through the ANSI

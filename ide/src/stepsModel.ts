@@ -113,14 +113,20 @@ export interface LensRow {
  * (a step after it is dead code); this keys that suppression on return-statement-ness, NOT on the `send`
  * kind — so an append (a real middle-of-body step) allows insert-after. Orthogonal to read-only-ness,
  * which keys on `scaffold`/`kind`. A row with neither flag (every estate return) reads as a return, so
- * behaviour is unchanged. Accepts a minimal shape so DOM-derived contexts (RowDropContext) can call it.
+ * behaviour is unchanged. A Router's `route` row is its return statement (the lens emits one only for a
+ * `return`), so it is a return too (BACKLOG #5838). Accepts a minimal shape so DOM-derived contexts
+ * (RowDropContext) can call it.
  */
 export function isReturnRow(row: {
   kind: RowKind;
   appended?: boolean;
   scaffold?: string;
 }): boolean {
-  return (row.kind === "send" && row.appended !== true) || row.scaffold === "return_collector";
+  return (
+    (row.kind === "send" && row.appended !== true) ||
+    row.kind === "route" ||
+    row.scaffold === "return_collector"
+  );
 }
 
 /** One `@handler`'s contract: its registered name, def line, and ordered rows. */
@@ -488,6 +494,15 @@ function rowParams(row: LensRow): ParamField[] {
       return [];
     }
     return [{ name: "handlers", value: names.length > 0 ? names.join(", ") : "(dynamic selection)" }];
+  }
+  if (row.kind === "note") {
+    // BACKLOG #5841. A one-line Comment shows and edits its text in a field. A pragma (read-only) and a
+    // multi-line run get none: one text box cannot hold a newline, and the engine refuses a text whose
+    // line count changed. Those show their raw lines in the row body instead (renderRowHtml).
+    const text = row.text;
+    return text !== undefined && row.pragma !== true && !text.includes("\n")
+      ? [{ name: "text", value: text }]
+      : [];
   }
   return paramsToFields(row.params);
 }
@@ -1581,6 +1596,39 @@ export function buildToolbarInsertRequest(
   return buildInsertRequest(anchor, action, params, pos);
 }
 
+/**
+ * The anchor row and position an insert relative to the row at `anchorLineStart` is requested at (pure;
+ * the webview mirrors it). An insert AFTER an `if`/`elif`/`else`/`for` header would land directly after
+ * the header line at the header's own indent, which the engine's re-parse refuses as an indentation
+ * failure (BACKLOG #5839). The Steps view draws the block's body right below its header, so "after the
+ * header" is requested as "before the block's first body row" (the body's suite id is the header's line
+ * number), which the engine indents into the body. Every other anchor and position comes back unchanged.
+ * A blank-only body row (an unformatted module's blank line after the header) is skipped: the engine
+ * takes an insert's indent from the anchor's first non-blank line, which for such a row is the header.
+ * Null when no row starts at `anchorLineStart`, or a header has no body row to anchor on. An `elif` /
+ * `else` clause insert must keep the `if` row as its anchor, so its callers do not route it through here.
+ */
+export function resolveInsertAnchor<
+  T extends { lineStart: number; kind: RowKind; suite: string; control?: string; expectSrc?: string },
+>(
+  rows: readonly T[],
+  anchorLineStart: number,
+  position: "before" | "after",
+): { anchor: T; position: "before" | "after" } | null {
+  const anchor = rows.find((r) => r.lineStart === anchorLineStart);
+  if (!anchor) {
+    return null;
+  }
+  const isHeader =
+    anchor.kind === "control" && anchor.control !== undefined && anchor.control !== "raise";
+  if (position !== "after" || !isHeader) {
+    return { anchor, position };
+  }
+  const bodySuite = String(anchor.lineStart);
+  const first = rows.find((r) => r.suite === bodySuite && (r.expectSrc ?? "x").trim() !== "");
+  return first ? { anchor: first, position: "before" } : null;
+}
+
 // ---- ADR 0106 grouped Add menu (the full palette) ----------------------------------------------------
 //
 // ADD_MENU_CATALOG is the SINGLE source of truth for the grouped <optgroup> select, the right-click
@@ -1975,12 +2023,13 @@ export function contextMenuEnablement(
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
   return {
+    // On an elif/else header the webview greys the items in it that would split the if-chain, all but
+    // Comment, which the engine writes above the clause; the submenu itself stays available.
     insertBefore: true,
     // Insert AFTER is suppressed on a terminal return (a returned send OR the `return sends` footer) — a
     // step after it is dead code — but ALLOWED on a mid-body `sends.append(...)` (ADR 0104), which is a
-    // normal step, not a return.
-    // A `route` row is a return too: a step after a routing return is dead code.
-    insertAfter: !isReturnRow(row) && row.kind !== "route",
+    // normal step, not a return. A Router's `route` row is a return ({@link isReturnRow}).
+    insertAfter: !isReturnRow(row),
     deleteRow: isRowMutable(row) && !isBindingRead(row),
     moveUp: ctx.canMoveUp && !isBindingRead(row),
     moveDown: ctx.canMoveDown && !isBindingRead(row),
@@ -2488,11 +2537,11 @@ export function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[
       childrenBySuite.set(r.suite, [r]);
     }
   }
-  const rootRow = rows.find((r) => r.nesting === 0);
+  // Every function's top-level suite, in document order. A module's Steps page holds one section per
+  // Handler or Router, and seeding from the first alone left every later function with no slots, so
+  // its arrows read as already at the end (BACKLOG #5840). {@link walkMove} scopes rows to one function.
+  const rootSuites = [...new Set(rows.filter((r) => r.nesting === 0).map((r) => r.suite))];
   const slots: DropResolution[] = [];
-  if (!rootRow) {
-    return slots;
-  }
   const isContinuation = (r: RowDropContext): boolean =>
     r.control === "elif" || r.control === "else";
   const emitSuite = (suiteId: string): void => {
@@ -2540,7 +2589,9 @@ export function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[
       }
     }
   };
-  emitSuite(rootRow.suite);
+  for (const suiteId of rootSuites) {
+    emitSuite(suiteId);
+  }
   return slots;
 }
 
@@ -2664,14 +2715,26 @@ export function blockLabel(
  * {@link DropResolution} — which maps 1:1 to a drag-to-target `move_row` ({@link buildMoveToRequest}),
  * reusing the verified cross-suite engine path. Returns null when there is no next slot (the block is
  * already at the very top/bottom of the handler) or when it is the SOLE primary child of its suite
- * (moving it would empty the suite — the engine refuses that, so the arrow is a no-op). `rows` must be
- * the full handler row list in document order.
+ * (moving it would empty the suite — the engine refuses that, so the arrow is a no-op). `allRows` is in
+ * document order and may hold several functions' rows (the webview passes the whole page): only the
+ * moving row's own function is walked, so a step never walks into another one (BACKLOG #5830/#5840).
+ * A function is told apart by its top-level suite id (its def line), never by name: a module may hold a
+ * `@router` and a `@handler` registered under the same name.
  */
 export function walkMove(
-  rows: readonly RowDropContext[],
+  allRows: readonly RowDropContext[],
   blockStartLine: number,
   direction: "up" | "down",
 ): DropResolution | null {
+  const at = allRows.findIndex((r) => r.lineStart === blockStartLine);
+  if (at < 0) {
+    return null;
+  }
+  // Each function's rows are contiguous and open with a nesting-0 row, so a row belongs to the root
+  // suite of the last nesting-0 row at or above it.
+  let root = "";
+  const roots = allRows.map((r) => (r.nesting === 0 ? (root = r.suite) : root));
+  const rows = allRows.filter((_r, i) => roots[i] === roots[at]);
   // The block's row span [mi..mj] — the SAME extent {@link captureBlock} joins, so an arrow move and a
   // copy/cut can never disagree about what "the block" is (both go through {@link blockExtent}).
   const extent = blockExtent(rows, blockStartLine);
@@ -2738,8 +2801,11 @@ export function buildInsertRequest(
 
 /**
  * Build a paste_block spec: insert the clipboard `clip.source` at the SELECTED anchor, re-indented to the
- * anchor's suite by the engine (pure; unit-testable). The POSITION follows the toolbar-Add rule — a `send`
- * anchor is the handler's return, so a paste must PRECEDE it (`before`); every other anchor pastes `after`.
+ * anchor's suite by the engine (pure; unit-testable). The POSITION follows the toolbar-Add rule: a
+ * terminal return or scaffold footer ({@link isReturnRow}) takes the paste BEFORE it, and every other
+ * anchor, a mid-body append send included, takes it `after`. An explicit `"before"` wins: the page sends
+ * it when {@link resolveInsertAnchor} moved a paste on a control header to "before the block's first
+ * body row" (BACKLOG #5839). There is no explicit `"after"`, so no caller can put a paste after a return.
  * The anchor's projection-time source rides as `expect_src` (the F7 stale guard); only `clip.source` is
  * used from the clipboard (the engine derives the indent from the block text, never from `clip.nesting`).
  */
@@ -2754,10 +2820,11 @@ export function buildPasteRequest(
     scaffold?: string;
   },
   clip: ClipboardBlock,
+  explicit?: "before",
 ): PasteRequest {
   // A terminal return / scaffold footer takes the block BEFORE it (no dead code); a mid-body append send
   // (ADR 0104) takes it after.
-  const position: "before" | "after" = isReturnRow(anchor) ? "before" : "after";
+  const position: "before" | "after" = explicit ?? (isReturnRow(anchor) ? "before" : "after");
   const req: PasteRequest = {
     handler: anchor.handler,
     line_start: anchor.lineStart,
@@ -3644,8 +3711,10 @@ export function renderRowHtml(
     : "";
   // A field is editable only when the handler name is known (the write path); read-only callers pass "".
   const editable = new Set(handlerName ? (row.editableParams ?? []) : []);
+  // A note with no text field (a pragma, or a multi-line run) shows its verbatim lines read-only, as a
+  // code row does, rather than a blank body (BACKLOG #5841).
   const body =
-    row.kind === "code"
+    row.kind === "code" || (row.kind === "note" && row.params.length === 0)
       ? `<pre class="code">${escapeHtml(row.code ?? "")}</pre>`
       : renderParamsHtml(row.params, editable, handlerName, row, schema);
   const lineLabel =
