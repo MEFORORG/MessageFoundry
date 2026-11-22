@@ -383,7 +383,7 @@ def test_a_bad_crl_file_is_not_reported_on_a_rest_ech_hop(pki: dict[str, str]) -
     _config_error("REST", r"crl_file", crl=pki["ca_and_crl"])
 
 
-def test_a_rest_ech_hop_still_loads_its_ca_file(tmp_path: Path) -> None:
+def test_a_rest_ech_hop_still_loads_its_ca_file(pki: dict[str, str], tmp_path: Path) -> None:
     """Only the CRL is dropped on the ECH hop (vault BACKLOG #2977 item 7). A ``tls_ca_file`` that
     cannot be read still fails the connection, as it did before."""
     with active_hop_posture(PROD_PHI), pytest.raises(CaFileUnreadable):
@@ -392,6 +392,9 @@ def test_a_rest_ech_hop_still_loads_its_ca_file(tmp_path: Path) -> None:
             revocation_attested=True,
             extra={**_ECH, "tls_ca_file": str(tmp_path / "missing-ca.pem")},
         )
+    # CONTROL: the same build with a readable CA file builds, so the refusal above is the file.
+    with active_hop_posture(PROD_PHI):
+        _build("REST", revocation_attested=True, extra={**_ECH, "tls_ca_file": pki["ca"]})
 
 
 def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[str, str]) -> None:
