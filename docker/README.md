@@ -172,10 +172,8 @@ against one case that matters, described under
   leader and watch the other promote; the default `docker compose up` stays single-node SQLite, unchanged).
   The local Postgres serves TLS from `./pg-tls`, and the engines pin its CA as
   `./config/pki/store-ca.pem`; `compose.yaml` says what each file must hold and how to own it. The
-  default `engine` has no profile, so it starts beside the pair and runs the same `/config` graph on
-  its own SQLite store; to run the pair alone, name its services:
-  `docker compose --profile ha up postgres schema-provision engine-ha engine-standby`. The pair's
-  MLLP is on host port 2578, and the default engine keeps 2575.
+  default `engine` has no profile, so it starts beside the pair; `compose.yaml` says how to run the
+  pair alone, and which host port publishes the pair's MLLP, and when.
 
 ## Exposure topologies (see the evaluation §1)
 

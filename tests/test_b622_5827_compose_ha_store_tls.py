@@ -120,7 +120,13 @@ def test_the_tls_check_sees_a_postgres_without_it(change: str) -> None:
 
 
 def test_every_ha_store_user_pins_the_store_ca_under_config() -> None:
-    for name in _HA_STORE_USERS:
+    users = {
+        n
+        for n, svc in _compose_doc()["services"].items()
+        if dict(svc.get("environment") or {}).get("MEFOR_STORE_BACKEND") == "postgres"
+    }
+    assert set(_HA_STORE_USERS) <= users, f"positive control: the Postgres store users: {users}"
+    for name in sorted(users):
         env = _literal_env(name)
         assert env.get("MEFOR_STORE_SERVER") == "postgres", name
         pin = env.get("MEFOR_STORE_SSL_ROOT_CERT", "")

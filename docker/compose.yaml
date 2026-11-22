@@ -78,7 +78,8 @@ x-ha-engine-env: &ha-engine-env
   # encrypt=false or trust_server_certificate=true, and no escape lifts that (vault BACKLOG #3533
   # item 2), so this file sets no MEFOR_ALLOW_INSECURE_TLS. The local Postgres below serves the
   # certificate in ./pg-tls (its comment says what it must hold), and the engines pin the CA that
-  # issued it, or that certificate itself when it is self-signed. Put the pin under ./config/pki/,
+  # issued it. The store CRL an enforcing start needs (below) must come from that CA, so a CA
+  # whose key usage includes cRLSign, not the server certificate itself. Put the pin under ./config/pki/,
   # owned as ./config is, so no other account can replace it: the store login trusts the file
   # before serve's preflight checks its owner, and `store provision-schema` never checks it. A
   # managed Postgres whose certificate the system trust store already verifies needs no pin:
@@ -310,6 +311,9 @@ services:
   # (docs/CLUSTERING.md, ADR 0047) on one host before deploying the k8s/ha-postgres.yaml manifest against a
   # managed Postgres. It is gated behind the `ha` PROFILE, so the DEFAULT `docker compose up` is UNCHANGED
   # (single-node SQLite engine, no Postgres, no cluster). Bring HA up with:  docker compose --profile ha up
+  # The default `engine` has no profile, so that command starts it too, running the same /config graph
+  # on its own store. To run the pair alone, name the services:
+  #   docker compose --profile ha up postgres schema-provision engine-ha engine-standby
   #
   # IMPORTANT — the failover demo is the PAIR `engine-ha` + `engine-standby`, NOT the default `engine`.
   # The default `engine` service stays single-node SQLite (no cluster env) so `docker compose up` is
@@ -328,14 +332,17 @@ services:
     # the certificate must name the host `postgres`. Postgres refuses a key file with group or
     # other bits wider than it allows, and a bind mount keeps the host's owner and mode: own the
     # key by the image's postgres account, uid 999, at 0600, or by root with group 999 at 0640.
+    # The key must be UNENCRYPTED: this command sets no ssl_passphrase_command.
     # Either way the host account or group with that number can read it. On Linux:
     #   sudo chown -R 999:999 ./pg-tls && sudo chmod 0600 ./pg-tls/server.key
     # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 999
     # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and is refused.
     # Without them Postgres does not start, so no ha engine does. A first start without them
     # still initializes the mefor-pg volume but never creates the messagefoundry database, and a
-    # later start skips initialization; so after fixing them, remove that volume once
-    # (docker compose --profile ha down -v, which also removes the other named volumes).
+    # later start skips initialization (the health check still passes; schema-provision then
+    # fails). So after fixing them, remove that one volume, never `down -v`, which also removes
+    # the default engine's store: docker compose --profile ha down, then
+    #   docker volume rm <project>_mefor-pg
     # This server still accepts a plaintext session from another client on the compose network;
     # the engines never open one.
     command:
