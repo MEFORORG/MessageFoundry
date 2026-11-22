@@ -1067,7 +1067,8 @@ class QueueStore(StoreLifecycle, Protocol):
         a permanent partner reject (``AR``), an internal/code error under the error-and-continue
         policy, or an undecryptable payload. Replayable via the dead-letter API like any dead row.
         Contrast :meth:`mark_failed`, which reschedules with backoff (and only dead-letters once a
-        finite ``max_attempts`` is exhausted)."""
+        finite ``max_attempts`` is exhausted). A row already ``done``, ``dead`` or ``cancelled`` is
+        left as it is (ADR 0157 Amendment D), and the call returns as it does for a vanished row."""
         ...
 
     async def mark_batch_failed(
@@ -1088,7 +1089,9 @@ class QueueStore(StoreLifecycle, Protocol):
         retry branch a terminal member (neither ``inflight`` nor ``pending``) is skipped, event and
         all, as in
         :meth:`mark_failed`, and the shared retry time is returned even when every member was
-        skipped."""
+        skipped. On the DEAD branch a member already ``done``, ``dead`` or ``cancelled`` is skipped
+        the same way and is not counted in ``dead`` (ADR 0157 Amendment D). A resolved head still
+        decides the disposition and is still the one named."""
         ...
 
     async def dead_letter_batch(
@@ -1096,7 +1099,8 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> None:
         """Force N outbound rows terminal (``DEAD``) in one transaction — the batch counterpart of
         :meth:`dead_letter_now` (ADR 0082 ratified decision #1). A **permanent** envelope reject
-        dead-letters all N together (atomic, no retry consumed); the operator replays the batch."""
+        dead-letters all N together (atomic, no retry consumed); the operator replays the batch. A
+        member already ``done``, ``dead`` or ``cancelled`` keeps its state (ADR 0157 Amendment D)."""
         ...
 
     # --- recovery / replay ---------------------------------------------------

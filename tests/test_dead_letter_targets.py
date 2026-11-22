@@ -149,6 +149,30 @@ async def test_the_targets_honour_the_channel_scope(store: Any) -> None:
     ]
 
 
+@pytest.mark.parametrize("write", ["now", "batch", "batch_failed"])
+async def test_a_late_dead_letter_leaves_a_delivered_row_done(store: Any, write: str) -> None:
+    """BACKLOG #5724, on the real SQL of all three backends. A worker's late dead-letter of a row
+    that was already delivered must not turn it DEAD or its PROCESSED message ERROR."""
+    mid: str = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=10.0
+    )
+    item = (await store.claim_ready(now=10.0, destination_name="OB"))[0]
+    await store.mark_done(item.id, now=11.0)
+
+    if write == "now":
+        await store.dead_letter_now(item.id, "late", now=12.0)
+    elif write == "batch":
+        await store.dead_letter_batch([item.id], "late", now=12.0)
+    else:
+        failed = await store.mark_batch_failed(
+            [item.id], "late", RetryPolicy(max_attempts=1), now=12.0
+        )
+        assert failed.dead == 0
+
+    assert [r["status"] for r in await store.outbox_for(mid)] == ["done"]
+    assert (await store.get_message(mid))["status"] == "processed"
+
+
 async def test_with_bodies_intact_the_targets_match_the_listed_rows(store: Any) -> None:
     """Every row the full listing returns maps to a target, and every target has a row."""
     await _seed(store)

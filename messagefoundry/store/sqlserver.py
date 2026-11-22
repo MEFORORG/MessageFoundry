@@ -10006,6 +10006,55 @@ class SqlServerStore:
         rows = await self._fetchall("SELECT namespace, [key], value FROM state")
         self._state_cache = await asyncio.to_thread(self._decode_state_rows, rows)
 
+    async def _dead_letter_orphans(
+        self,
+        conn: Any,
+        cur: Any,
+        orphans: list[Any],
+        error: str,
+        now: float,
+        *,
+        event_names_lane: bool,
+    ) -> list[Any]:
+        """Dead-letter a startup sweep's orphans, commit, and return the lane names of the rows
+        changed. Each orphan is positional: ``(id, message_id, lane)``.
+
+        BACKLOG #5729, in the canonical lock order: row locks through the UPDATEs in sorted id order,
+        then the finalize applocks, then the finalize. The candidate SELECT takes no lock under RCSI,
+        so each UPDATE carries a status term and a row settled since is skipped, event and finalize
+        included. The match is the OUTPUT rowset, never ``cursor.rowcount``. These sweeps have no
+        epoch fence, so that term cannot hide a fence miss (ADR 0157 Amendment D). One UPDATE per
+        row, because each ``last_error`` is sealed to its own row id."""
+        killed: list[tuple[str, Any]] = []
+        for row in sorted(orphans, key=lambda r: r[0]):
+            await cur.execute(
+                "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
+                " owner=NULL, lease_expires_at=NULL OUTPUT inserted.id"
+                " WHERE id=? AND status IN (?, ?)",
+                (
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", row[0])),  # H4
+                    now,
+                    row[0],
+                    OutboxStatus.PENDING.value,
+                    OutboxStatus.INFLIGHT.value,
+                ),
+            )
+            if not await cur.fetchall():
+                continue
+            await self._event(cur, row[1], "dead", row[2] if event_names_lane else None, error, now)
+            killed.append((row[1], row[2]))
+        if not killed:
+            await self._commit_read(conn)  # every candidate settled: nothing was written
+            return []
+        message_ids = sorted({message_id for message_id, _name in killed})
+        await self._lock_finalize_batch(cur, message_ids)
+        for message_id in message_ids:
+            await self._maybe_finalize(cur, message_id, now)
+        await self._commit(conn)
+        return [name for _message_id, name in killed]
+
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None
     ) -> int:
@@ -10028,31 +10077,20 @@ class SqlServerStore:
                     await self._commit(conn)
                     return 0
                 error = "handler removed from registry"
-                await self._lock_finalize_batch(cur, {r[1] for r in orphans})
-                for row in orphans:
-                    await cur.execute(
-                        "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (
-                            OutboxStatus.DEAD.value,
-                            now,
-                            self._enc(error, aad=cell_aad("queue", "last_error", row[0])),  # H4
-                            now,
-                            row[0],
-                        ),
-                    )
-                    await self._event(cur, row[1], "dead", None, error, now)
-                    await self._maybe_finalize(cur, row[1], now)
-                await self._commit(conn)
+                killed = await self._dead_letter_orphans(
+                    conn, cur, orphans, error, now, event_names_lane=False
+                )
             except Exception:
                 await conn.rollback()
                 raise
+        if not killed:
+            return 0
         log.warning(
             "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
-            len(orphans),
-            ", ".join(sorted({r[2] for r in orphans})),
+            len(killed),
+            ", ".join(sorted({str(name) for name in killed})),
         )
-        return len(orphans)
+        return len(killed)
 
     async def dead_letter_missing_inbounds(
         self, valid_names: set[str], now: float | None = None
@@ -10085,32 +10123,21 @@ class SqlServerStore:
                     await self._commit(conn)
                     return 0
                 error = "inbound removed from registry"
-                await self._lock_finalize_batch(cur, {r[1] for r in orphans})
-                for row in orphans:
-                    await cur.execute(
-                        "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (
-                            OutboxStatus.DEAD.value,
-                            now,
-                            self._enc(error, aad=cell_aad("queue", "last_error", row[0])),  # H4
-                            now,
-                            row[0],
-                        ),
-                    )
-                    await self._event(cur, row[1], "dead", None, error, now)
-                    await self._maybe_finalize(cur, row[1], now)
-                await self._commit(conn)
+                killed = await self._dead_letter_orphans(
+                    conn, cur, orphans, error, now, event_names_lane=False
+                )
             except Exception:
                 await conn.rollback()
                 raise
+        if not killed:
+            return 0
         log.warning(
             "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
             " inbound(s): %s",
-            len(orphans),
-            ", ".join(sorted({r[2] for r in orphans})),
+            len(killed),
+            ", ".join(sorted({str(name) for name in killed})),
         )
-        return len(orphans)
+        return len(killed)
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
     # The RetentionRunner drives these once the staged pipeline is enabled. Bodies are blanked to ''
@@ -12387,15 +12414,21 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                present: list[tuple[str, Any, Any, Any]] = []
-                for outbox_id in outbox_ids:
+                # ADR 0157 Amendment D (BACKLOG #5724): lock in sorted id order, one keyed read each
+                # (a set read's lock order is the plan's), and keep the caller's order for the head
+                # and the writes.
+                handed = tuple(outbox_ids)  # walked twice: the lock order, then the caller's order
+                locked: dict[str, Any] = {}
+                for outbox_id in sorted(set(handed)):
                     await cur.execute(
-                        "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
+                        "SELECT message_id, destination_name, attempts, status"
+                        " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                         (outbox_id,),
                     )
-                    row = await cur.fetchone()
-                    if row is not None:
-                        present.append((outbox_id, row[0], row[1], row[2]))
+                    locked[outbox_id] = await cur.fetchone()
+                present: list[tuple[str, Any, Any, Any, Any]] = [
+                    (oid, *locked[oid]) for oid in handed if locked[oid] is not None
+                ]
                 if not present:
                     await self._commit(conn)
                     return FailOutcome()
@@ -12431,7 +12464,11 @@ class SqlServerStore:
                 )
                 finalize: dict[str, None] = {}
                 changed = 0
-                for outbox_id, message_id, destination_name, attempts in present:
+                for outbox_id, message_id, destination_name, attempts, row_status in present:
+                    # Amendment D: the DEAD branch declines a resolved member before its UPDATE. A
+                    # resolved head still decided the disposition above.
+                    if not retrying and row_status in _RESOLVED_STATUSES:
+                        continue
                     params = (
                         status,
                         next_at,
@@ -12492,14 +12529,19 @@ class SqlServerStore:
         all_ids = tuple(outbox_ids)  # a rejection re-pends ALL N, as in mark_batch_done
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                finalize: dict[str, None] = {}
-                for outbox_id in all_ids:
+                # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed.
+                locked: dict[str, Any] = {}
+                for outbox_id in sorted(set(all_ids)):
                     await cur.execute(
-                        "SELECT message_id, destination_name FROM queue WHERE id=?",
+                        "SELECT message_id, destination_name, status"
+                        " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                         (outbox_id,),
                     )
-                    row = await cur.fetchone()
-                    if row is None:
+                    locked[outbox_id] = await cur.fetchone()
+                finalize: dict[str, None] = {}
+                for outbox_id in all_ids:
+                    row = locked[outbox_id]
+                    if row is None or row[2] in _RESOLVED_STATUSES:
                         continue
                     message_id, destination_name = row[0], row[1]
                     await self._exec_terminal(
@@ -12938,11 +12980,16 @@ class SqlServerStore:
         output, guard, guard_params = self._resolve_guard()
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # ADR 0157 Amendment D (BACKLOG #5724), as mark_failed: UPDLOCK, because a plain read
+                # takes no lock under RCSI, and a resolved row is declined here so that an empty
+                # OUTPUT rowset on the UPDATE is still the fence alone.
                 await cur.execute(
-                    "SELECT message_id, destination_name FROM queue WHERE id=?", (outbox_id,)
+                    "SELECT message_id, destination_name, status"
+                    " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                    (outbox_id,),
                 )
                 row = await cur.fetchone()
-                if row is None:
+                if row is None or row[2] in _RESOLVED_STATUSES:
                     await self._commit(conn)
                     return
                 message_id, destination_name = row[0], row[1]
@@ -13098,31 +13145,20 @@ class SqlServerStore:
                     await self._commit_read(conn)  # read-only release (M-6), uncounted (A1)
                     return 0
                 error = "destination removed from outbound registry"
-                await self._lock_finalize_batch(cur, {r[1] for r in orphans})
-                for row in orphans:
-                    await cur.execute(
-                        "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (
-                            OutboxStatus.DEAD.value,
-                            now,
-                            self._enc(error, aad=cell_aad("queue", "last_error", row[0])),  # H4
-                            now,
-                            row[0],
-                        ),
-                    )
-                    await self._event(cur, row[1], "dead", row[2], error, now)
-                    await self._maybe_finalize(cur, row[1], now)
-                await self._commit(conn)
+                killed = await self._dead_letter_orphans(
+                    conn, cur, orphans, error, now, event_names_lane=True
+                )
             except Exception:
                 await conn.rollback()
                 raise
+        if not killed:
+            return 0
         log.warning(
             "dead-lettered %d orphaned outbound row(s) at startup for missing destination(s): %s",
-            len(orphans),
-            ", ".join(sorted({r[2] for r in orphans})),
+            len(killed),
+            ", ".join(sorted({str(name) for name in killed})),
         )
-        return len(orphans)
+        return len(killed)
 
     async def replay(
         self,

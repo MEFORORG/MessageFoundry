@@ -6020,8 +6020,10 @@ class PostgresStore:
                 self._timed_acquire() as conn,
                 conn.transaction(isolation=_FINALIZE_ISOLATION),
             ):
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                if row is None:
+                # ADR 0157 Amendment D (BACKLOG #5724), as mark_failed: read under the row lock and
+                # decline a resolved row here, so a miss on the UPDATE is still the fence alone.
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id)
+                if row is None or row["status"] in _RESOLVED_STATUSES:
                     return
                 await self._exec_terminal(
                     conn,
@@ -7656,11 +7658,14 @@ class PostgresStore:
                 self._timed_acquire() as conn,
                 conn.transaction(isolation=_FINALIZE_ISOLATION),
             ):
-                present = []
-                for outbox_id in outbox_ids:
-                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                    if row is not None:
-                        present.append((outbox_id, row))
+                # ADR 0157 Amendment D (BACKLOG #5724): lock in sorted id order, one keyed read each,
+                # and keep the caller's order for the head and the writes.
+                handed = tuple(outbox_ids)  # walked twice: the lock order, then the caller's order
+                locked = {
+                    oid: await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", oid)
+                    for oid in sorted(set(handed))
+                }
+                present = [(oid, locked[oid]) for oid in handed if locked[oid] is not None]
                 if not present:
                     return FailOutcome()
                 head_attempts = present[0][1]["attempts"]
@@ -7692,6 +7697,10 @@ class PostgresStore:
                 finalize: dict[str, None] = {}
                 changed = 0
                 for outbox_id, row in present:
+                    # Amendment D: the DEAD branch declines a resolved member before its UPDATE. A
+                    # resolved head still decided the disposition above.
+                    if not retrying and row["status"] in _RESOLVED_STATUSES:
+                        continue
                     args = (
                         status,
                         next_at,
@@ -7746,20 +7755,26 @@ class PostgresStore:
         guard, guard_args = self._resolve_guard(
             6
         )  # ADR 0157 C1 — TERMINAL, once for the whole loop
+        all_ids = tuple(outbox_ids)  # walked three times below, and a fence re-pends all N
         try:
             async with (
                 self._timed_acquire() as conn,
                 conn.transaction(isolation=_FINALIZE_ISOLATION),
             ):
+                # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed.
+                locked = {
+                    oid: await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", oid)
+                    for oid in sorted(set(all_ids))
+                }
                 finalize: dict[str, None] = {}
-                for outbox_id in outbox_ids:
-                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                    if row is None:
+                for outbox_id in all_ids:
+                    row = locked[outbox_id]
+                    if row is None or row["status"] in _RESOLVED_STATUSES:
                         continue
                     await self._exec_terminal(
                         conn,
                         "dead_letter_batch",
-                        tuple(outbox_ids),
+                        all_ids,
                         "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
                         " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
                         OutboxStatus.DEAD.value,
@@ -8295,6 +8310,49 @@ class PostgresStore:
             )
         return _rowcount(result)
 
+    async def _dead_letter_orphans(
+        self,
+        conn: Any,
+        orphans: list[Any],
+        error: str,
+        now: float,
+        *,
+        lane: str,
+        event_names_lane: bool,
+    ) -> list[Any]:
+        """Dead-letter a startup sweep's orphans and return the lane names of the rows changed.
+
+        BACKLOG #5729, in the canonical lock order: row locks through the UPDATEs in sorted id order,
+        then the finalize locks, then the finalize. The candidate SELECT is unlocked, so each UPDATE
+        carries a status term and a row settled since is skipped, event and finalize included. These
+        sweeps have no epoch fence, so that term cannot hide a fence miss (ADR 0157 Amendment D).
+        One UPDATE per row, because each ``last_error`` is sealed to its own row id."""
+        killed: list[tuple[str, Any]] = []
+        for row in sorted(orphans, key=lambda r: r["id"]):
+            hit = await conn.fetchval(
+                "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status = ANY($6::text[])"
+                " RETURNING id",
+                OutboxStatus.DEAD.value,
+                now,
+                self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                now,
+                row["id"],
+                [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+            )
+            if hit is None:
+                continue
+            await self._event(
+                conn, row["message_id"], "dead", row[lane] if event_names_lane else None, error, now
+            )
+            killed.append((row["message_id"], row[lane]))
+        if killed:
+            message_ids = sorted({message_id for message_id, _name in killed})
+            await self._lock_finalize_batch(conn, message_ids)
+            for message_id in message_ids:
+                await self._maybe_finalize_message(conn, message_id, now)
+        return [name for _message_id, name in killed]
+
     async def dead_letter_missing_destinations(
         self, valid_names: set[str], now: float | None = None
     ) -> int:
@@ -8312,34 +8370,17 @@ class PostgresStore:
             if not orphans:
                 return 0
             error = "destination removed from outbound registry"
-            # Pre-lock all affected messages' finalize locks in canonical order before the loop
-            # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
-            await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
-            for row in orphans:
-                await conn.execute(
-                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                    OutboxStatus.DEAD.value,
-                    now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                    now,
-                    row["id"],
-                )
-                await self._event(
-                    conn,
-                    row["message_id"],
-                    "dead",
-                    row["destination_name"],
-                    error,
-                    now,
-                )
-                await self._maybe_finalize_message(conn, row["message_id"], now)
+            killed = await self._dead_letter_orphans(
+                conn, orphans, error, now, lane="destination_name", event_names_lane=True
+            )
+        if not killed:
+            return 0
         log.warning(
             "dead-lettered %d orphaned outbox row(s) at startup for missing destination(s): %s",
-            len(orphans),
-            ", ".join(sorted({r["destination_name"] for r in orphans})),
+            len(killed),
+            ", ".join(sorted({str(name) for name in killed})),
         )
-        return len(orphans)
+        return len(killed)
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None
@@ -8358,27 +8399,17 @@ class PostgresStore:
             if not orphans:
                 return 0
             error = "handler removed from registry"
-            # Pre-lock all affected messages' finalize locks in canonical order before the loop
-            # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
-            await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
-            for row in orphans:
-                await conn.execute(
-                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                    OutboxStatus.DEAD.value,
-                    now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                    now,
-                    row["id"],
-                )
-                await self._event(conn, row["message_id"], "dead", None, error, now)
-                await self._maybe_finalize_message(conn, row["message_id"], now)
+            killed = await self._dead_letter_orphans(
+                conn, orphans, error, now, lane="handler_name", event_names_lane=False
+            )
+        if not killed:
+            return 0
         log.warning(
             "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
-            len(orphans),
-            ", ".join(sorted({r["handler_name"] for r in orphans})),
+            len(killed),
+            ", ".join(sorted({str(name) for name in killed})),
         )
-        return len(orphans)
+        return len(killed)
 
     async def dead_letter_missing_inbounds(
         self, valid_names: set[str], now: float | None = None
@@ -8400,28 +8431,18 @@ class PostgresStore:
             if not orphans:
                 return 0
             error = "inbound removed from registry"
-            # Pre-lock all affected messages' finalize locks in canonical order before the loop
-            # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
-            await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
-            for row in orphans:
-                await conn.execute(
-                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                    OutboxStatus.DEAD.value,
-                    now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                    now,
-                    row["id"],
-                )
-                await self._event(conn, row["message_id"], "dead", None, error, now)
-                await self._maybe_finalize_message(conn, row["message_id"], now)
+            killed = await self._dead_letter_orphans(
+                conn, orphans, error, now, lane="channel_id", event_names_lane=False
+            )
+        if not killed:
+            return 0
         log.warning(
             "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
             " inbound(s): %s",
-            len(orphans),
-            ", ".join(sorted({r["channel_id"] for r in orphans})),
+            len(killed),
+            ", ".join(sorted({str(name) for name in killed})),
         )
-        return len(orphans)
+        return len(killed)
 
     async def replay(
         self,

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -319,3 +320,121 @@ async def test_a_batch_retry_with_every_member_terminal_writes_nothing(store: Me
     assert {r["status"] for r in await store.outbox_for(mid)} == {OutboxStatus.DONE.value}
     assert await _failed_events(store, mid) == 0
     assert next_at == 107.0
+
+
+# --- the DEAD siblings of mark_failed (BACKLOG #5724, ADR 0157 Amendment D) ---------------------
+
+_AT_CAP = RetryPolicy(max_attempts=1, backoff_seconds=5, backoff_multiplier=1)
+
+
+async def _dead_now(store: MessageStore, oid: str) -> None:
+    await store.dead_letter_now(oid, "late", now=102.0)
+
+
+async def _dead_batch(store: MessageStore, oid: str) -> None:
+    await store.dead_letter_batch([oid], "late", now=102.0)
+
+
+async def _batch_failed(store: MessageStore, oid: str) -> None:
+    assert (await store.mark_batch_failed([oid], "late", _AT_CAP, now=102.0)).dead == 0
+
+
+async def _resolve(store: MessageStore, oid: str, status: str) -> None:
+    if status == OutboxStatus.DONE.value:
+        await store.mark_done(oid, now=101.0)
+        return
+    await store._db.execute("UPDATE queue SET status=? WHERE id=?", (status, oid))
+    await store._db.commit()
+
+
+@pytest.mark.parametrize("status", [OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value])
+@pytest.mark.parametrize(
+    "write", [_dead_now, _dead_batch, _batch_failed], ids=["now", "batch", "batch-failed"]
+)
+async def test_a_dead_sibling_leaves_a_resolved_row_as_it_is(
+    store: MessageStore, write: Any, status: str
+) -> None:
+    mid, (oid,) = await _claimed(store, "OB1")
+    await _resolve(store, oid, status)
+    before = await _message_status(store, mid)
+
+    await write(store, oid)
+
+    row = (await store.outbox_for(mid))[0]
+    assert row["status"] == status
+    assert row["last_error"] is None
+    assert await _message_status(store, mid) == before
+    assert not [e for e in await store.events_for(mid) if e["event"] == "dead"]
+
+
+@pytest.mark.parametrize(
+    "write", [_dead_now, _dead_batch, _batch_failed], ids=["now", "batch", "batch-failed"]
+)
+async def test_a_dead_sibling_leaves_a_dead_row_with_its_first_reason(
+    store: MessageStore, write: Any
+) -> None:
+    """The first dead-letter's reason and its one event survive a late second one."""
+    mid, (oid,) = await _claimed(store, "OB1")
+    await store.dead_letter_now(oid, "first reason", now=101.0)
+
+    await write(store, oid)
+
+    assert (await store.outbox_for(mid))[0]["last_error"] == "first reason"
+    assert len([e for e in await store.events_for(mid) if e["event"] == "dead"]) == 1
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        _dead_now,
+        _dead_batch,
+        lambda s, oid: s.mark_batch_failed([oid], "late", _AT_CAP, now=102.0),
+    ],
+    ids=["now", "batch", "batch-failed"],
+)
+async def test_a_dead_sibling_still_lands_on_an_open_row(store: MessageStore, write: Any) -> None:
+    """The positive control. Amendment C declines only a resolved row, and C2 needs the write to
+    land on a row a lease sweep re-pended, so both open states are run."""
+    for swept in (False, True):
+        mid, (oid,) = await _claimed(store, "OB1")
+        if swept:
+            await _sweep(store, oid, now=101.0)
+
+        await write(store, oid)
+
+        assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DEAD.value
+        assert await _message_status(store, mid) == MessageStatus.ERROR.value
+
+
+async def test_a_resolved_head_still_decides_and_only_the_open_member_goes_dead(
+    store: MessageStore,
+) -> None:
+    """The choice for a resolved head member. The disposition still comes from the first member
+    present, as it does on the retry branch, and ``head_id`` still names it. Only the write is
+    declined, so the delivered head stays DONE and the open member is what the outcome counts."""
+    mid, (head, other) = await _claimed(store, "OB1", "OB2")
+    await store.mark_done(head, now=101.0)
+
+    failed = await store.mark_batch_failed([head, other], "late", _AT_CAP, now=102.0)
+
+    rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
+    assert rows["OB1"]["status"] == OutboxStatus.DONE.value
+    assert rows["OB2"]["status"] == OutboxStatus.DEAD.value
+    assert (failed.dead, failed.head_id, failed.dead_messages) == (1, head, (mid,))
+    assert failed.retry_at is None
+    assert await _message_status(store, mid) == MessageStatus.ERROR.value
+
+
+async def test_a_batch_dead_letter_with_every_member_resolved_reports_nothing_dead(
+    store: MessageStore,
+) -> None:
+    mid, (a, b) = await _claimed(store, "OB1", "OB2")
+    await store.mark_done(a, now=101.0)
+    await store.mark_done(b, now=101.0)
+
+    failed = await store.mark_batch_failed([a, b], "late", _AT_CAP, now=102.0)
+    await store.dead_letter_batch([a, b], "late", now=103.0)
+
+    assert (failed.dead, failed.dead_messages, failed.retry_at) == (0, (), None)
+    assert {r["status"] for r in await store.outbox_for(mid)} == {OutboxStatus.DONE.value}
+    assert await _message_status(store, mid) == MessageStatus.PROCESSED.value

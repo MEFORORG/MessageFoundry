@@ -1468,3 +1468,33 @@ dead-letter rolls it back with the rest of the transaction and re-pends a row st
 (C3). The count loses that death and nothing raises it again, though the runner's ERROR line and
 the store's fence WARNING and counter still record it. So a row whose dead-letter is fenced needs
 more deaths than the cap before a dead-letter lands.
+
+## Amendment D (2026-11-22): the DEAD siblings decline a resolved row, and the startup sweeps take a status term (BACKLOG #5724, #5729)
+
+**What changed for the fenced writes (#5724).** `dead_letter_now`, `dead_letter_batch` and
+`mark_batch_failed`'s DEAD branch now follow `mark_failed` on all three backends. Each reads its
+row under a lock (`FOR UPDATE`, or `UPDLOCK, ROWLOCK`; SQLite's single writer) and declines a row
+already DONE, DEAD or CANCELLED before its UPDATE. None of those UPDATEs gained a status term, so
+on Postgres and SQL Server a miss is still the fence alone (C3), and C2 is not contradicted: an
+INFLIGHT or PENDING row is still written.
+
+**Batch members.** The server backends lock members one keyed read at a time in sorted id order,
+because a set read's lock order on SQL Server is the plan's and not its `ORDER BY`. The writes keep
+the caller's order. **A resolved head still decides the batch's disposition**, from its attempts,
+and `head_id` still names it, as on the retry branch; only its write is declined. So a batch whose
+delivered head is at the cap dead-letters its open members. A batch with every member resolved
+writes nothing and reports `dead=0` with no retry time. `dead_letter_now` keeps its `None` return,
+so a caller cannot tell a decline from a landed write, as it already cannot for a vanished or
+fenced row; it re-reads nothing from it.
+
+**What changed for the startup sweeps (#5729).** On Postgres and SQL Server the
+`dead_letter_missing_destinations`, `_handlers` and `_inbounds` sweeps select candidates unlocked,
+then run one UPDATE per row in sorted id order with `status IN (pending, inflight)`, reading the
+match from `RETURNING` or `OUTPUT`. One statement per row rather than one set UPDATE, because each
+row's `last_error` is sealed to its own id. Events, finalize locks and the finalize run after the
+UPDATEs and only for rows actually changed, and the count returned and logged is those rows.
+
+**Why a status term is right here and wrong above.** C2 and C3 keep a status term off a *fenced*
+write, because its empty result must mean the fence fired. These sweeps carry no epoch fence
+(D11), so an empty result has only one possible meaning, and C2 and C3 are not contradicted.
+Whether the sweeps should carry a fence is a separate question this amendment does not answer.

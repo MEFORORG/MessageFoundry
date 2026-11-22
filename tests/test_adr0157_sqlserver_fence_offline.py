@@ -102,9 +102,8 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     # Its dead-letter at the cap (vault BACKLOG #4607 step 6). Its increment sets no status.
     "record_worker_death": (1, 1),
     # --- Bring-up sweeps + operator paths: unguarded, allowlisted. ---
-    "dead_letter_missing_destinations": (1, 0),
-    "dead_letter_missing_handlers": (1, 0),
-    "dead_letter_missing_inbounds": (1, 0),
+    # The three missing-lane sweeps share this one write (BACKLOG #5729).
+    "_dead_letter_orphans": (1, 0),
     "replay": (1, 0),
     "replay_dead": (1, 0),
     "cancel_queued": (1, 0),
@@ -134,13 +133,10 @@ _UNGUARDED_REASONS: dict[str, str] = {
         "Startup and promotion recovery. On promotion it runs on the successor, by definition unfenced,"
         " and it is the backstop when D1's re-pend fails."
     ),
-    "dead_letter_missing_destinations": (
-        "ADR 0157 D11: writes over PENDING rows, where D1's re-pend is meaningless. Runs only from"
-        " _start_graph, and the successor re-runs the identical sweep."
-    ),
-    "dead_letter_missing_handlers": "ADR 0157 D11: the twin of dead_letter_missing_destinations.",
-    "dead_letter_missing_inbounds": (
-        "ADR 0157 D11: the third lane key, same standing as its two siblings, same _start_graph caller."
+    "_dead_letter_orphans": (
+        "ADR 0157 D11, for all three missing-lane sweeps: writes over PENDING rows, where D1's re-pend"
+        " is meaningless. Runs only from _start_graph, and the successor re-runs the identical sweep."
+        " Amendment D: it carries a status term, safe because it has no fence to be confused with."
     ),
     "replay": "Operator action. Guarding it would leave an operator on a standby unable to act.",
     "replay_dead": "Operator action: revives a DEAD row to PENDING, which is re-pend direction.",
@@ -255,6 +251,8 @@ _SELECT_ROW: dict[str, tuple[Any, ...]] = {
         "inflight",
     ),
     "SELECT message_id, destination_name FROM queue WHERE id=?": ("m1", "OB1"),
+    # dead_letter_now's and dead_letter_batch's locked read (BACKLOG #5724).
+    "SELECT message_id, destination_name, status FROM queue": ("m1", "OB1", "inflight"),
     # ingress_handoff's guard read: a payload that is not a three-part ref takes the corrupt-ref
     # DEAD branch, which is one of the two fenced writes there.
     # It selects the queue tag's columns first (BACKLOG #2593), then the payload.
@@ -617,3 +615,155 @@ async def test_claim_ready_is_unchanged_unfenced_and_fenced_when_armed() -> None
         + " WHERE (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=?) <= ?"
     )
     assert params == (5, "outbound", "pending", 2.0, "inflight", 2.0, _LEASE_KEY, 7)
+
+
+# --- BACKLOG #5724 and #5729 (ADR 0157 Amendment D) -------------------------------------------
+
+
+class _RowCursor(_Cursor):
+    """Answers each locked read from ``status`` and each sweep from ``status`` too. A sweep UPDATE's
+    OUTPUT rowset is empty for an id in ``misses``, which is a row settled after the unlocked read."""
+
+    def __init__(self, status: dict[str, str], *, misses: frozenset[str] = frozenset()) -> None:
+        super().__init__()
+        self.status = status
+        self.misses = misses
+        self._params: tuple[Any, ...] = ()
+
+    async def execute(self, sql: str, params: Any = ()) -> None:
+        await super().execute(sql, params)
+        self._params = tuple(params)
+
+    async def fetchone(self) -> Any:
+        oid = self._params[0] if self._params else None
+        if oid not in self.status:
+            return None
+        if self._last.startswith("SELECT message_id, destination_name, attempts, status"):
+            return (f"m-{oid}", "OB1", 3, self.status[oid])
+        if self._last.startswith("SELECT message_id, destination_name, status"):
+            return (f"m-{oid}", "OB1", self.status[oid])
+        return None
+
+    async def fetchall(self) -> list[Any]:
+        if self._last.startswith("SELECT id, message_id"):
+            return [(oid, f"m-{oid}", None if oid == "n" else "GONE") for oid in self.status]
+        if self._last.startswith("UPDATE queue SET status"):
+            oid = next((p for p in self._params if p in self.status), None)
+            return [] if oid in self.misses else [(oid,)]
+        return []
+
+
+def _recording(store: SqlServerStore) -> list[str]:
+    order: list[str] = []
+
+    async def event(_c: Any, mid: str, kind: str, *_a: Any, **_k: Any) -> None:
+        order.append(f"event:{kind}:{mid}")
+
+    async def lock_finalize(_c: Any, mids: Any) -> None:
+        order.append(f"finalize-lock:{','.join(sorted(set(mids)))}")
+
+    async def finalize(_c: Any, mid: str, _now: float) -> None:
+        order.append(f"finalize:{mid}")
+
+    async def commit_read(_conn: Any) -> None:
+        order.append("commit-read")
+
+    store._event = event  # type: ignore[method-assign,assignment]
+    store._lock_finalize_batch = lock_finalize  # type: ignore[method-assign,assignment]
+    store._maybe_finalize = finalize  # type: ignore[method-assign,assignment]
+    store._commit_read = commit_read  # type: ignore[method-assign,assignment]
+    return order
+
+
+async def test_dead_now_reads_under_updlock_and_declines_a_resolved_row() -> None:
+    """Amendment C's shape. The decline happens before the UPDATE, so with an epoch armed an empty
+    OUTPUT rowset still means the fence alone: no UPDATE runs, nothing is counted or re-pended."""
+    for epoch in (None, 5):
+        cur, conn = _RowCursor({"a": "done"}), _Conn()
+        store, released = _store(cur, conn, epoch=epoch)
+        order = _recording(store)
+
+        await store.dead_letter_now("a", "late", now=1.0)
+
+        assert "WITH (UPDLOCK, ROWLOCK)" in cur.calls[0][0], epoch
+        assert _updates(cur) == [] and order == [], epoch
+        assert released == [] and store.fenced_writes == 0 and conn.commits == 1, epoch
+
+
+async def test_a_fence_miss_on_an_open_row_still_fires_after_the_lock() -> None:
+    """The negative twin: a row that is still open reaches the fenced UPDATE, so an empty OUTPUT
+    rowset there is the fence, and D1 re-pends it."""
+    cur, conn = _RowCursor({"a": "inflight"}, misses=frozenset({"a"})), _Conn()
+    store, released = _store(cur, conn, epoch=5)
+    _recording(store)
+
+    await store.dead_letter_now("a", "late", now=1.0)
+
+    assert released == [["a"]] and store.fenced_writes == 1 and conn.commits == 0
+
+
+async def test_a_batch_locks_sorted_keeps_the_callers_head_and_declines() -> None:
+    for write in ("dead_letter_batch", "mark_batch_failed"):
+        cur, conn = _RowCursor({"c": "inflight", "a": "done", "b": "pending"}), _Conn()
+        store, released = _store(cur, conn, epoch=None)
+        order = _recording(store)
+        args: tuple[Any, ...] = (
+            ("late", RetryPolicy(max_attempts=1)) if write == "mark_batch_failed" else ("late",)
+        )
+
+        outcome = await getattr(store, write)(["c", "a", "b"], *args, now=1.0)
+
+        reads = [(s, p) for s, p in cur.calls if s.startswith("SELECT")]
+        assert [p[0] for _s, p in reads] == ["a", "b", "c"], write
+        assert all("WITH (UPDLOCK, ROWLOCK)" in s for s, _p in reads), write
+        assert [p[4] for _s, p in _updates(cur)] == ["c", "b"], write
+        assert order == ["event:dead:m-c", "event:dead:m-b", "finalize:m-b", "finalize:m-c"], write
+        assert released == [], write
+        if write == "mark_batch_failed":
+            assert (outcome.head_id, outcome.dead) == ("c", 2)
+
+
+async def test_a_sweep_writes_before_the_finalize_lock_and_counts_only_its_changes() -> None:
+    """BACKLOG #5729. Updates in sorted id order, each with a status term and an OUTPUT clause; the
+    finalize lock after them, naming only rows changed; a NULL lane cannot raise in the log line."""
+    cur, conn = (
+        _RowCursor(
+            {"c": "pending", "a": "inflight", "b": "pending", "n": "pending"},
+            misses=frozenset({"b"}),
+        ),
+        _Conn(),
+    )
+    store, _ = _store(cur, conn, epoch=None)
+    order = _recording(store)
+
+    assert await store.dead_letter_missing_destinations({"OB1"}, now=1.0) == 3
+
+    updates = _updates(cur)
+    assert [p[4] for _s, p in updates] == ["a", "b", "c", "n"]
+    assert all(
+        s.endswith(" OUTPUT inserted.id WHERE id=? AND status IN (?, ?)") for s, _p in updates
+    )
+    assert all(p[5:] == ("pending", "inflight") for _s, p in updates)
+    assert order == [
+        "event:dead:m-a",
+        "event:dead:m-c",
+        "event:dead:m-n",
+        "finalize-lock:m-a,m-c,m-n",
+        "finalize:m-a",
+        "finalize:m-c",
+        "finalize:m-n",
+    ]
+    assert conn.commits == 1
+
+
+async def test_a_sweep_whose_every_row_settled_takes_no_finalize_lock() -> None:
+    for sweep in (
+        "dead_letter_missing_destinations",
+        "dead_letter_missing_handlers",
+        "dead_letter_missing_inbounds",
+    ):
+        cur, conn = _RowCursor({"a": "pending"}, misses=frozenset({"a"})), _Conn()
+        store, _ = _store(cur, conn, epoch=None)
+        order = _recording(store)
+        assert await getattr(store, sweep)({"OB1"}, now=1.0) == 0, sweep
+        assert order == ["commit-read"] and conn.commits == 0, sweep

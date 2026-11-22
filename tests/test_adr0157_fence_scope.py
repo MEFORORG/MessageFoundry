@@ -30,8 +30,13 @@ from __future__ import annotations
 import ast
 import pathlib
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
 
-from messagefoundry.store.postgres import _EPOCH_GUARD_CLAIM, _EPOCH_GUARD_RESOLVE
+from messagefoundry.config.models import RetryPolicy
+from messagefoundry.store.crypto import IdentityCipher
+from messagefoundry.store.postgres import _EPOCH_GUARD_CLAIM, _EPOCH_GUARD_RESOLVE, PostgresStore
 
 _SOURCE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "store" / "postgres.py"
 
@@ -155,9 +160,8 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     # Its dead-letter at the cap (vault BACKLOG #4607 step 6). Its increment sets no status.
     "record_worker_death": (1, 1),
     # --- Bring-up sweeps + operator paths: unguarded, allowlisted. ---
-    "dead_letter_missing_destinations": (1, 0),
-    "dead_letter_missing_handlers": (1, 0),
-    "dead_letter_missing_inbounds": (1, 0),
+    # The three missing-lane sweeps share this one write (BACKLOG #5729).
+    "_dead_letter_orphans": (1, 0),
     "replay": (1, 0),
     "replay_dead": (1, 0),
     "cancel_queued": (1, 0),
@@ -197,15 +201,11 @@ _UNGUARDED_REASONS: dict[str, str] = {
         "Owner-BLIND periodic recovery, by its own docstring. Bounded to already-expired row leases."
     ),
     "recover_inflight_on_promotion": "Runs on the successor, at promotion, by definition un-fenced.",
-    "dead_letter_missing_destinations": (
-        "ADR 0157 D11: also writes over PENDING rows, where D1's re-pend fallback is meaningless. Runs"
-        " only from _start_graph, and the successor re-runs the identical sweep. Flagged for the owner,"
-        " not silently skipped."
-    ),
-    "dead_letter_missing_handlers": "ADR 0157 D11: the twin of dead_letter_missing_destinations.",
-    "dead_letter_missing_inbounds": (
-        "ADR 0157 D11: the third lane key, same standing as its two siblings — also writes over"
-        " PENDING rows, runs only from _start_graph, and the successor re-runs the identical sweep."
+    "_dead_letter_orphans": (
+        "ADR 0157 D11, for all three missing-lane sweeps: also writes over PENDING rows, where D1's"
+        " re-pend fallback is meaningless. Runs only from _start_graph, and the successor re-runs the"
+        " identical sweep. Flagged for the owner, not silently skipped. Amendment D: it carries a"
+        " status term instead, which is safe because it has no fence for a miss to be confused with."
     ),
     "replay": "Operator action. Guarding it would leave an operator on a standby unable to act.",
     "replay_dead": (
@@ -353,3 +353,164 @@ def test_the_split_literal_claim_site_is_still_split() -> None:
     """
     source = _SOURCE.read_text(encoding="utf-8")
     assert re.search(r'" UPDATE queue q"\s*#[^\n]*\n\s*" SET status=\$6', source) is not None
+
+
+# --- BACKLOG #5724 and #5729 on Postgres, against a fake connection (ADR 0157 Amendment D) ------
+# The fake proves the statement order and the branch taken. That a real FOR UPDATE and a real
+# status term hold under concurrency is for the hosted Postgres leg.
+
+
+class _PgConn:
+    """Answers each row read from ``status``, records every statement in order, and reports a sweep
+    UPDATE's match from ``sweep_misses``."""
+
+    def __init__(self, status: dict[str, str], *, sweep_misses: frozenset[str] = frozenset()):
+        self.status = status
+        self.sweep_misses = sweep_misses
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    @asynccontextmanager
+    async def transaction(self, **_kw: Any) -> AsyncIterator[None]:
+        yield
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        self.calls.append((sql, args))
+        oid = args[0]
+        if oid not in self.status:
+            return None
+        return {
+            "id": oid,
+            "message_id": f"m-{oid}",
+            "destination_name": "OB1",
+            "attempts": 3,
+            "status": self.status[oid],
+        }
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.calls.append((sql, args))
+        return [
+            {
+                "id": oid,
+                "message_id": f"m-{oid}",
+                "destination_name": None if oid == "n" else "GONE",
+                "handler_name": "GONE",
+                "channel_id": "GONE",
+            }
+            for oid in self.status
+        ]
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        self.calls.append((sql, args))
+        return None if args[4] in self.sweep_misses else args[4]
+
+    async def execute(self, sql: str, *args: Any, **_kw: Any) -> str:
+        self.calls.append((sql, args))
+        return "UPDATE 1"
+
+
+def _pg_store(conn: _PgConn) -> tuple[PostgresStore, list[str]]:
+    store = object.__new__(PostgresStore)
+    store._cipher = IdentityCipher()
+    store._leader_epoch = None
+    store._lease_key = None
+    store.fenced_writes = 0
+    order: list[str] = []
+
+    @asynccontextmanager
+    async def acquire(**_kw: Any) -> AsyncIterator[_PgConn]:
+        yield conn
+
+    async def event(_c: Any, mid: str, kind: str, *_a: Any, **_k: Any) -> None:
+        order.append(f"event:{kind}:{mid}")
+
+    async def lock_finalize(_c: Any, mids: Any) -> None:
+        order.append(f"finalize-lock:{','.join(sorted(set(mids)))}")
+
+    async def finalize(_c: Any, mid: str, _now: float) -> None:
+        order.append(f"finalize:{mid}")
+
+    store._timed_acquire = acquire  # type: ignore[method-assign]
+    store._event = event  # type: ignore[method-assign,assignment]
+    store._lock_finalize_batch = lock_finalize  # type: ignore[method-assign,assignment]
+    store._maybe_finalize_message = finalize  # type: ignore[method-assign,assignment]
+    return store, order
+
+
+def _pg_updates(conn: _PgConn) -> list[tuple[str, tuple[Any, ...]]]:
+    return [(s, a) for s, a in conn.calls if s.startswith("UPDATE queue SET status")]
+
+
+async def test_postgres_dead_now_reads_under_a_lock_and_declines_a_resolved_row() -> None:
+    conn = _PgConn({"a": "done"})
+    store, order = _pg_store(conn)
+
+    await store.dead_letter_now("a", "late", now=1.0)
+
+    assert conn.calls[0][0].endswith("FOR UPDATE")
+    assert _pg_updates(conn) == [] and order == []
+
+
+async def test_postgres_batch_locks_sorted_keeps_the_callers_head_and_declines() -> None:
+    """Locks go in sorted id order whatever the caller passed, the head stays the caller's first
+    member, and the resolved member gets no UPDATE, event or finalize."""
+    for write in ("dead_letter_batch", "mark_batch_failed"):
+        conn = _PgConn({"c": "inflight", "a": "done", "b": "pending"})
+        store, order = _pg_store(conn)
+        args: tuple[Any, ...] = (
+            ("late", RetryPolicy(max_attempts=1)) if write == "mark_batch_failed" else ("late",)
+        )
+
+        outcome = await getattr(store, write)(["c", "a", "b"], *args, now=1.0)
+
+        reads = [a[0] for s, a in conn.calls if s.startswith("SELECT")]
+        assert reads == ["a", "b", "c"], write
+        assert all(s.endswith("FOR UPDATE") for s, _a in conn.calls if s.startswith("SELECT"))
+        assert [a[4] for _s, a in _pg_updates(conn)] == ["c", "b"], write
+        assert order == [
+            "event:dead:m-c",
+            "event:dead:m-b",
+            "finalize:m-b",
+            "finalize:m-c",
+        ], write
+        if write == "mark_batch_failed":
+            assert (outcome.head_id, outcome.dead) == ("c", 2)
+
+
+async def test_postgres_sweep_writes_before_the_finalize_lock_and_counts_only_its_changes() -> None:
+    """BACKLOG #5729. The UPDATEs run in sorted id order with a status term, the finalize lock comes
+    after them and names only the changed rows, a row settled meanwhile gets nothing, and a NULL lane
+    cannot raise in the log line after the commit."""
+    conn = _PgConn(
+        {"c": "pending", "a": "inflight", "b": "pending", "n": "pending"},
+        sweep_misses=frozenset({"b"}),
+    )
+    store, order = _pg_store(conn)
+
+    assert await store.dead_letter_missing_destinations({"OB1"}, now=1.0) == 3
+
+    assert [s.split()[0] for s, _a in conn.calls][:1] == ["SELECT"]
+    updates = [(s, a) for s, a in conn.calls if s.startswith("UPDATE")]
+    assert [a[4] for _s, a in updates] == ["a", "b", "c", "n"]
+    assert all("AND status = ANY($6::text[])" in s for s, _a in updates)
+    assert all(a[5] == ["pending", "inflight"] for _s, a in updates)
+    assert order == [
+        "event:dead:m-a",
+        "event:dead:m-c",
+        "event:dead:m-n",
+        "finalize-lock:m-a,m-c,m-n",
+        "finalize:m-a",
+        "finalize:m-c",
+        "finalize:m-n",
+    ]
+
+
+async def test_postgres_a_sweep_whose_every_row_settled_takes_no_finalize_lock() -> None:
+    for sweep in (
+        "dead_letter_missing_destinations",
+        "dead_letter_missing_handlers",
+        "dead_letter_missing_inbounds",
+    ):
+        conn = _PgConn({"a": "pending"}, sweep_misses=frozenset({"a"}))
+        store, order = _pg_store(conn)
+        assert await getattr(store, sweep)({"OB1"}, now=1.0) == 0, sweep
+        assert order == [], sweep

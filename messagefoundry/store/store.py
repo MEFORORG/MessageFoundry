@@ -15690,7 +15690,9 @@ class MessageStore:
 
         async def _body() -> None:
             row = await self._row(outbox_id)
-            if row is None:
+            # ADR 0157 Amendment D (BACKLOG #5724), as mark_failed's DEAD branch: a row already DONE,
+            # DEAD or CANCELLED is left as it is. Read under the writer lock.
+            if row is None or row["status"] in _RESOLVED_STATUSES:
                 raise _AbortMember(None)
             await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
@@ -16828,6 +16830,10 @@ class MessageStore:
             changed = 0
             finalize: dict[str, None] = {}
             for outbox_id, row in present:
+                # ADR 0157 Amendment D (BACKLOG #5724): the DEAD branch declines a resolved member,
+                # read under the writer lock. A resolved head still decides the disposition above.
+                if not retrying and row["status"] in _RESOLVED_STATUSES:
+                    continue
                 cur = await self._db.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                     " WHERE id=?" + (" AND status IN (?, ?)" if retrying else ""),
@@ -16886,7 +16892,8 @@ class MessageStore:
             finalize: dict[str, None] = {}
             for outbox_id in outbox_ids:
                 row = await self._row(outbox_id)
-                if row is None:
+                # ADR 0157 Amendment D (BACKLOG #5724): a resolved member keeps its state.
+                if row is None or row["status"] in _RESOLVED_STATUSES:
                     continue
                 await self._db.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
