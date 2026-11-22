@@ -8,7 +8,7 @@ import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
 import { mustChangeProblem } from "./engineStatusModel";
 import { assertBrowsableUrl, assertTargetAllowed, targetRefusalNotice } from "./engineTarget";
-import { SIGN_IN_TIMEOUT_MS, signInSettled, signInSuperseding } from "./signInSession";
+import { SIGN_IN_TIMEOUT_MS, reproveTracked, signInSettled, signInSuperseding } from "./signInSession";
 import { type StepUpHost, withStepUp } from "./stepUp";
 
 const SECRET_PREFIX = "messagefoundry.token:";
@@ -371,11 +371,14 @@ export async function withStepUpAuth<T>(
       // It rotates the token and queues behind the account's re-proof lock, as the sign-in does,
       // so it gets the sign-in's timeout (vault BACKLOG #2950), named here rather than left to
       // postJson's default so the two cannot drift apart.
-      // Unlike a sign-in it is not tracked in signInSession.ts, so peekToken does not wait for it.
+      // Tracked in signInSession.ts as a sign-in is, and it stores the rotated token there, so
+      // peekToken and a later sign-in wait for it and its store cannot overwrite a newer sign-in's.
       // A timeout after the engine finished leaves the cached token dead, as a lost sign-in reply
       // does: the next call gets a 401 and signs in again.
-      const reply = await postJson<{ token?: unknown }>(url, "/me/reauth", body, token, SIGN_IN_TIMEOUT_MS);
-      return typeof reply.token === "string" ? reply.token : undefined;
+      return await reproveTracked(ctx.secrets, secretKey(url), async () => {
+        const reply = await postJson<{ token?: unknown }>(url, "/me/reauth", body, token, SIGN_IN_TIMEOUT_MS);
+        return typeof reply.token === "string" ? reply.token : undefined;
+      });
     },
   };
   return await withAuthAdopting(ctx, url, (token, adopt) =>
@@ -384,9 +387,9 @@ export async function withStepUpAuth<T>(
       // The re-proof ended the token withAuthAdopting handed in, so it is told which one this call
       // now holds: a 401 on it is then not mistaken for a sign-in elsewhere merely because the
       // cache holds the rotated token (BACKLOG #5960).
+      // reauth above already stored it, inside the tracked span.
       storeToken: async (rotated) => {
         adopt(rotated);
-        await ctx.secrets.store(secretKey(url), rotated);
       },
     }),
   );

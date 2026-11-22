@@ -14,8 +14,9 @@
 //
 // THE COST IS THE ORDER ON THIS SIDE. The old token now dies inside the request, before the new one is
 // in the cache. Four things follow.
-//   1. A reader of the cache could pick up the dead token in that span. Each sign-in is therefore
-//      tracked from before its request leaves until the new token is stored, and `peekToken` in
+//   1. A reader of the cache could pick up the dead token in that span. Each sign-in, and each step-up
+//      re-proof (`reproveTracked`), is therefore tracked from before its request leaves until the new
+//      token is stored, and `peekToken` in
 //      auth.ts awaits `signInSettled` before it reads. A call already sent on the old token can still
 //      get a 401, and `withAuth` then reads the cache again through `peekToken`.
 //   2. Two sign-ins for one engine run one after the other. The second reads the cache only once the
@@ -95,15 +96,49 @@ export function signInSuperseding<R extends { token: string }>(
   post: (body: Record<string, string>) => Promise<R>,
   waitMs: number = SIGN_IN_WAIT_MS,
 ): Promise<R> {
-  const earlier = inFlight.get(key);
-  const attempt = (async () => {
-    await bounded(earlier, waitMs);
+  return tracked(key, waitMs, async () => {
     const prior = await cache.get(key);
     const reply = await post(prior ? { ...credentials, supersedes: prior } : credentials);
     await cache.store(key, reply.token);
     return reply;
+  });
+}
+
+/**
+ * Send one step-up re-proof for the engine cached under `key`, and store the token it returns.
+ *
+ * `post` sends `POST /me/reauth` on the token the call holds and resolves to the rotated token, or to
+ * `undefined` or `""` when the engine sent none (an older engine), which leaves the cache as it was.
+ * The engine ends the old token when it rotates, as a sign-in does, so the re-proof is tracked the same
+ * way: it waits up to `waitMs` for a sign-in or re-proof already in flight for `key`, and a later one,
+ * and `peekToken`, wait for it in turn. So in this window its store does not land on top of a token a
+ * newer sign-in stored, unless a wait runs out (point 3 above) or the sign-in was in another window
+ * (point 4).
+ */
+export function reproveTracked(
+  cache: TokenCache,
+  key: string,
+  post: () => Promise<string | undefined>,
+  waitMs: number = SIGN_IN_WAIT_MS,
+): Promise<string | undefined> {
+  return tracked(key, waitMs, async () => {
+    const rotated = await post();
+    if (rotated !== undefined && rotated !== "") {
+      await cache.store(key, rotated);
+    }
+    return rotated;
+  });
+}
+
+/** Run `run` once any attempt already tracked for `key` settles or `waitMs` passes, tracked itself
+ *  from before it starts until it settles. */
+function tracked<T>(key: string, waitMs: number, run: () => Promise<T>): Promise<T> {
+  const earlier = inFlight.get(key);
+  const attempt = (async () => {
+    await bounded(earlier, waitMs);
+    return await run();
   })();
-  // The attempt waits for the earlier sign-in first, so one await covers them all. Set in the same
+  // The attempt waits for the earlier attempt first, so one await covers them all. Set in the same
   // tick the attempt starts, which is before its request can leave.
   const settled = attempt.then(
     () => undefined,
