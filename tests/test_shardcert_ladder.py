@@ -11,8 +11,10 @@ stop-at-ceiling (the throughput-SUSTAIN signal — non-drain/loss or an intake s
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,6 +29,7 @@ from harness.load.shardcert import (
 )
 from harness.load.shardcert_ladder import (
     ClaimTiming,
+    ConsolidatedLadderReport,
     LadderRung,
     RungOutcome,
     aggregate_claim_timing,
@@ -1299,6 +1302,74 @@ def test_two_box_zero_offered_soak_is_setup_degraded() -> None:
 def test_two_box_zero_offered_rung_does_not_hide_a_real_break() -> None:
     lad = _consolidated([_sustained(0, 16.0), _two_box_zero(lane_inversions=1)])
     assert (lad.exit_code, lad.result_label) == (1, "FAIL")
+
+
+def _serialized_ceiling(lad: ConsolidatedLadderReport) -> dict[str, Any]:
+    ceiling = json.loads(json.dumps(lad.to_json_dict()))["ceiling"]
+    assert isinstance(ceiling, dict)
+    return ceiling
+
+
+@pytest.mark.parametrize("zero_on", ["climb", "soak"])
+def test_two_box_zero_offered_run_publishes_no_ceiling(zero_on: str) -> None:
+    # BACKLOG #5861: the RESULT line disowned this run while the JSON still read admissible=true with a
+    # pinned rate from the healthy rung beside it. Every quotable figure must be withheld.
+    held = _sustained(0, 16.0)
+    lad = (
+        _consolidated([held, _two_box_zero()])
+        if zero_on == "climb"
+        else _consolidated([held], soak=_two_box_zero(is_soak=True))
+    )
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+    ceiling = _serialized_ceiling(lad)
+    assert ceiling["admissible"] is False
+    for key in (
+        "pinned_ingress_rate",
+        "pinned_accepted_ingress_rate",
+        "pinned_outbound_rate",
+        "pinned_measured_delivered_rate_per_s",
+        "accepted_events_per_s",
+        "accepted_vs_offered_ratio",
+        "sustained_events_per_s",
+        "publishable_events_per_s",
+        "publishable_accepted_events_per_s",
+    ):
+        assert ceiling[key] is None, key
+    for key in (
+        "bracketed",
+        "clears_target_events",
+        "clears_target_events_accepted",
+        "clears_target_events_publishable",
+        "clears_target_events_accepted_publishable",
+    ):
+        assert ceiling[key] is False, key
+    rendered = lad.render()
+    assert "pinned sustainable ceiling" not in rendered
+    assert "no rung sustained" not in rendered  # one did; its figure is withheld, not absent
+    assert "withheld" in rendered
+
+
+def test_two_box_withheld_ceiling_keeps_the_held_rungs_pool() -> None:
+    # Withholding the figure must not move the pool diagnostic onto the rung that carried no load.
+    base = _sustained(0, 16.0)
+    zero = replace(_two_box_zero(), pool=base.pool)
+    held = replace(base, pool=replace(base.pool, requested=base.pool.requested + 1))
+    assert zero.pool.measured and held.pool != zero.pool
+    lad = _consolidated([zero, held])
+    assert lad.pinned_rung is None
+    assert lad.store_pool == held.pool
+
+
+def test_two_box_run_with_no_zero_offered_rung_keeps_its_ceiling() -> None:
+    held = _sustained(0, 16.0)
+    assert held.sustainable_ingress_rate is not None
+    lad = _consolidated([held])
+    assert (lad.exit_code, lad.result_label) == (0, "PASS")
+    ceiling = _serialized_ceiling(lad)
+    assert ceiling["admissible"] is True
+    assert ceiling["pinned_ingress_rate"] == round(held.sustainable_ingress_rate, 3)
+    assert ceiling["sustained_events_per_s"] is not None
+    assert "pinned sustainable ceiling" in lad.render()
 
 
 def test_colocated_control_rung_still_passes(monkeypatch: pytest.MonkeyPatch) -> None:

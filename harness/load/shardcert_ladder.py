@@ -1995,7 +1995,7 @@ class ConsolidatedLadderReport:
     def store_pool(self) -> PoolStats:
         """The pool the ladder ran on. Taken from the PINNED rung when there is one (the rung the headline is
         quoted from — its pool is the one that matters), else the first rung that measured a pool at all."""
-        pinned = self.pinned_rung
+        pinned = self._held_rung
         if pinned is not None and pinned.pool.measured:
             return pinned.pool
         for r in self.all_records:
@@ -2108,12 +2108,8 @@ class ConsolidatedLadderReport:
         what the engine ACTUALLY ACCEPTED. The fidelity gate now bounds the gap (an admissible rung accepted
         >= 95% of its offer), but it does not close it — and it closes it LEAST at the ceiling, which is
         exactly where offered and accepted diverge."""
-        honest = [
-            r.sustainable_ingress_rate
-            for r in self.admissible_climb
-            if r.verdict is RungVerdict.SUSTAINED and r.sustainable_ingress_rate is not None
-        ]
-        return max(honest) if honest else None
+        pinned = self.pinned_rung
+        return None if pinned is None else pinned.sustainable_ingress_rate
 
     @property
     def pinned_outbound_rate(self) -> float | None:
@@ -2126,7 +2122,14 @@ class ConsolidatedLadderReport:
     def pinned_rung(self) -> RungOutcome | None:
         """The SUSTAINED, FIDELITY-ADMISSIBLE climb rung whose HONEST ``sustainable_ingress_rate`` IS the
         pinned ceiling — the rung ``pinned_ingress_rate`` reports. ``None`` if nothing sustained with a
-        measured drain and an admissible fidelity."""
+        measured drain and an admissible fidelity, or if any rung planned zero messages (BACKLOG #5861):
+        that run is not a bench result, so every figure derived from the pin is withheld with it."""
+        return None if self.zero_offered_rates else self._held_rung
+
+    @property
+    def _held_rung(self) -> RungOutcome | None:
+        """The rung :attr:`pinned_rung` would publish, before the zero-offered withhold. The pool roll-up
+        reads this, so a withheld ceiling does not move its diagnostic onto a rung that carried no load."""
         candidates = [
             r
             for r in self.admissible_climb
@@ -2752,7 +2755,9 @@ class ConsolidatedLadderReport:
         if self.void_collapse_notes:
             lines.append("")
         pin = self.pinned_ingress_rate
-        if pin is None:
+        if pin is None and self.zero_offered_rates:
+            lines.append("  pinned ceiling: NONE — withheld, a rung planned zero messages")
+        elif pin is None:
             lines.append(
                 "  pinned ceiling: NONE — no rung sustained (lower the start rate / check setup)"
             )
