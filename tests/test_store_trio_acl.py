@@ -224,6 +224,23 @@ def test_a_named_run_as_may_not_own_the_directory(
     assert _grants(_installer_dir_for(_TI, owner=_TI)) == (_SY, _BA, _TI)
 
 
+@pytest.mark.parametrize("run_as", [_LOCAL_USER, _GMSA], ids=["a local user", "a gMSA"])
+def test_a_virtual_account_owner_is_refused_beside_a_named_run_as(
+    monkeypatch: pytest.MonkeyPatch, run_as: str
+) -> None:
+    # BACKLOG #3760 added item 9: a virtual account may own its directory only as the run-as the
+    # directory grants. Here the directory grants a named user and is owned by a virtual account it
+    # does not grant, so the owner keeps WRITE_DAC over a store it cannot open: refused, before any
+    # lookup.
+    lookup = _install_lookup(monkeypatch, _Lookup(default=store_mod._SID_TYPE_USER))
+    dacl = store_mod._parse_sddl_dacl(_installer_dir_for(run_as, owner=_TI))
+    assert dacl is not None
+    assert store_mod._hardening_refusal(dacl) == (
+        f"it is owned by {_TI}, which keeps WRITE_DAC over it"
+    )
+    assert lookup.asked == []
+
+
 @pytest.mark.parametrize(
     ("label", "kind"),
     [

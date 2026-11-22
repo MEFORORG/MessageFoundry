@@ -60,6 +60,7 @@ import sys
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -120,7 +121,12 @@ from messagefoundry.odbc_call_gate import (
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.redaction import prints_a_codec_error, safe_exc, safe_text
+from messagefoundry.redaction import (
+    prints_a_codec_error,
+    raised_by_a_driver,
+    safe_exc,
+    safe_text,
+)
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
@@ -986,9 +992,15 @@ def _windows_path_verdict(
         try:
             kind, target = probe(part)
         except (FileNotFoundError, NotADirectoryError) as exc:
-            if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+            winerror = getattr(exc, "winerror", None)
+            if winerror in _WINDOWS_UNREACHABLE:
                 raise _LeavesHost("the path is on a share Windows could not reach") from None
-            raise _PathEnds from None
+            if isinstance(exc, NotADirectoryError) or winerror in _MISSING_WINERRORS:
+                raise _PathEnds from None
+            # Another not-found code, at least 161 or 206, may come from a name that is there,
+            # so the walk stops on it with a cause, as on any read it could not make.
+            stopped_unread = True
+            raise
         except OSError as exc:
             # windows_chain ends the walk here with a cause the verdict below reads as None. Only
             # a failure the system reported counts as unread, not _win_probe's own refusal of a
@@ -1029,15 +1041,36 @@ def _windows_path_verdict(
     return False
 
 
+#: The setting whose path a walk is judging, naming the connection and the keyword in its
+#: caller's spelling (:func:`judging_file_keyword`), or ``None`` outside such a judgement.
+_JUDGED_SETTING: ContextVar[str | None] = ContextVar("database_judged_setting", default=None)
+
+
+@contextlib.contextmanager
+def judging_file_keyword(setting: str) -> Iterator[None]:
+    """Name ``setting`` on every line :func:`_not_cleared` logs inside the block, so the WARNING
+    says which connection and keyword it is about (vault BACKLOG #5197, engine PR 2738 finding 3).
+    ``setting`` names no path."""
+    token = _JUDGED_SETTING.set(setting)
+    try:
+        yield
+    finally:
+        _JUDGED_SETTING.reset(token)
+
+
 def _not_cleared(kind: str, detail: object) -> None:
     """Log why the walk did not clear a file keyword path, or what it found leads off the host:
     ``kind``, which names no path, at WARNING, so the operator who meets the refusal sees a reason,
     and ``detail``, which can name the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197
-    item 22)."""
+    item 22). Inside :func:`judging_file_keyword`, both lines name the setting it was given."""
+    setting = _JUDGED_SETTING.get()
+    about = f" for {setting}" if setting else ""
     logger.warning(
-        "DATABASE file keyword path not cleared: %s (the path, if any, is logged at DEBUG)", kind
+        "DATABASE file keyword path not cleared%s: %s (the path, if any, is logged at DEBUG)",
+        about,
+        kind,
     )
-    logger.debug("DATABASE file keyword path not cleared: %s", detail)
+    logger.debug("DATABASE file keyword path not cleared%s: %s", about, detail)
 
 
 #: A link target :func:`is_remote_spelling` matches that :func:`_windows_path_verdict` does not
@@ -1160,8 +1193,9 @@ def _refuse_remote_paths(
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
-        verdicts[name] = file_keyword_verdicts(value)
-        _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
+        with judging_file_keyword(f"{hop_name_prefix(connection)}odbc_params {name}"):
+            verdicts[name] = file_keyword_verdicts(value)
+            _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
     return verdicts
 
 
@@ -1250,7 +1284,7 @@ def _capath_folder_clear(folder: str) -> bool:
                 # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
                 _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
                 return False
-            if isinstance(exc, FileNotFoundError) and winerror not in _CAPATH_MISSING_WINERRORS:
+            if isinstance(exc, FileNotFoundError) and winerror not in _MISSING_WINERRORS:
                 # CPython raises other Windows codes as not found too, at least 161
                 # ERROR_BAD_PATHNAME and 206 ERROR_FILENAME_EXCED_RANGE, where a folder may be
                 # there. Nothing in it was judged, so it is refused as an unlistable folder is.
@@ -1401,10 +1435,18 @@ _WINDOWS_INVALID_NAME = 123
 #: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
 #: CPython raises as ``FileNotFoundError`` though a file may be there.
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
-#: The not-found answers at an ``sslcapath`` folder's open that mean no folder is there
-#: (:func:`_capath_folder_clear`): 2 ``ERROR_FILE_NOT_FOUND`` and 3 ``ERROR_PATH_NOT_FOUND``, and
-#: ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT is off Windows.
-_CAPATH_MISSING_WINERRORS = frozenset({None, 2, 3})
+#: The not-found answers that mean no file or folder is there: 2 ``ERROR_FILE_NOT_FOUND`` and 3
+#: ``ERROR_PATH_NOT_FOUND``, and ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT
+#: is off Windows. Read at an ``sslcapath`` folder's open (:func:`_capath_folder_clear`), by the
+#: walk's probe (:func:`_windows_path_verdict`) and at a driver file's read
+#: (:func:`_names_no_file`). CPython raises other Win32 codes as ``FileNotFoundError`` too, at
+#: least 15, 18, 161 and 206, and none of those is read as a missing name where CPython sets the
+#: code. A failure it raises with no ``winerror`` counts as ``None`` whatever caused it, at least
+#: an ``os.open`` on Windows, which reports through the C runtime's errno. Measured on Windows 11
+#: with CPython 3.14 (vault BACKLOG #5197): ``lstat`` and ``scandir`` gave only 2 or 3 for at least a
+#: missing file, a missing folder, a path through a file, a drive letter with no volume, a missing
+#: volume GUID and a missing ``\\?\GLOBALROOT`` device.
+_MISSING_WINERRORS = frozenset({None, 2, 3})
 #: The ``stat`` failures of libpq's root certificate that leave it to libpq, by ``errno`` off
 #: Windows: no file is there, or libpq, running as the same identity, cannot ``stat`` it either and
 #: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
@@ -1434,6 +1476,9 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: on a directory too. This set judges the file's own ``stat``. Before it, the
 #: :func:`names_another_host` walk has refused at least a code other than a missing name met on a
 #: folder in the path, 5, 123 and 1921 among them, so on a folder those are refused, not left.
+#: The walk's probe also reads the file's own name, and refuses there a not-found code other than
+#: 2 and 3 (:data:`_MISSING_WINERRORS`, vault BACKLOG #5197), so 15, 161 and 206 are left here only
+#: when the ``stat`` meets one the walk's probe did not.
 _LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921})
 
 
@@ -1699,7 +1744,8 @@ def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
     """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load."""
     what = "root certificate file"
     unread: dict[str, str] = {}
-    verdicts = file_keyword_verdicts(path, unread)
+    with judging_file_keyword(setting):
+        verdicts = file_keyword_verdicts(path, unread)
     if names_another_host(path, verdicts):
         cause = unread.get(path.strip())
         if cause is not None and True not in verdicts.values():
@@ -1753,7 +1799,11 @@ def _driver_file_spellings(
     value = named.get(keyword)
     if not _sent_text(value):
         return
-    given = file_keyword_verdicts(value) if verdicts is None else verdicts[keyword]
+    if verdicts is None:
+        with judging_file_keyword(setting):
+            given = file_keyword_verdicts(value)
+    else:
+        given = verdicts[keyword]
     if names_another_host(value, given):
         raise error(
             f"{setting}: the {what} is not a plain local path on this host, so it was not read "
@@ -1878,16 +1928,20 @@ def _names_no_file(exc: OSError) -> bool:
     """Whether a failure to read one spelling of a driver file says no file is there, so the
     driver cannot load it either, rather than that a file is there the engine cannot check.
 
-    A missing name counts, unless Windows reports it for a share it could not reach (53 and 67,
-    as :mod:`messagefoundry.config.key_file_access` reads them): the driver may reach that file
-    at a later connect. So does Windows' ``ERROR_INVALID_NAME``, a padded path for one, and only
+    A missing name counts: :data:`_MISSING_WINERRORS`, or ENOENT off Windows. Another code
+    Windows raises as not found does not (vault BACKLOG #5197): 53 and 67, a share it could not
+    reach (as :mod:`messagefoundry.config.key_file_access` reads them), where the driver may reach
+    that file at a later connect, and at least 161 and 206, which may come from a file that is
+    there. That holds only where the failure carries its ``winerror``: an ``os.open`` failure
+    carries none on Windows, so any not-found it raises counts as a missing name, as on main.
+    Windows' ``ERROR_INVALID_NAME`` counts too, a padded path for one, and only
     by that Win32 code: CPython maps every Win32 error it has no errno for to EINVAL, so testing
     errno would leave a real read failure unchecked. On POSIX an EINVAL is refused too, even from
     a filesystem that rejects a padded spelling with it, because errno cannot tell that from a
     failed read; that refuses the build rather than check the trimmed spelling."""
     winerror = getattr(exc, "winerror", None)
     if isinstance(exc, FileNotFoundError):
-        return winerror not in _WINDOWS_UNREACHABLE
+        return winerror in _MISSING_WINERRORS
     return winerror == _WINDOWS_INVALID_NAME
 
 
@@ -2668,6 +2722,22 @@ def _driver_code(message: str) -> str | None:
     return str(found[-1]) if found else None
 
 
+def _send_refusal(sqlstate: str | None, exc: BaseException) -> DeliveryError:
+    """A destination send's error for ``exc``: :func:`_classify_db_error` for a SQLSTATE, and for
+    a ``UnicodeEncodeError`` with none a permanent rejection naming its type alone. A parameter
+    the driver's codec cannot encode fails on this message's data, not on the code, so it is
+    dead-lettered rather than raised as an internal error, as it was on main for a codec whose name
+    read as a SQLSTATE (vault BACKLOG #1661, added item 2). A ``UnicodeDecodeError``, text the
+    driver returned, is not this message's, and the caller raises it as an internal error."""
+    if sqlstate is not None:
+        return _classify_db_error(sqlstate, str(exc))
+    return NegativeAckError(
+        f"database driver could not encode the message's text ({type(exc).__name__})",
+        code="db",
+        permanent=True,
+    )
+
+
 def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False) -> DeliveryError:
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
@@ -2715,12 +2785,25 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     )
 
 
+#: A SQLSTATE as SQL defines one: five characters, each a digit or an uppercase Latin letter.
+#: Lowercase is refused, so a word such as ``OSError('reset')``'s or a codec name such as
+#: ``ascii`` does not read as one (vault BACKLOG #1661, added items 1 and 2).
+_SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
+
+
 def _sqlstate(exc: BaseException) -> str | None:
     """The 5-character SQLSTATE a DB driver error carries in ``args[0]`` (pyodbc/aioodbc), or ``None``
     if ``exc`` isn't shaped like a DB error — letting a genuine bug propagate as an internal error
-    rather than being misread as a transport failure."""
+    rather than being misread as a transport failure.
+
+    Never for a ``UnicodeError``, whose first argument is the codec name. Only text of the SQLSTATE
+    alphabet (:data:`_SQLSTATE_RE`) counts. That is a bound on the misread, not a test of who
+    raised ``exc``: a non-driver error whose ``args[0]`` is five uppercase letters or digits still
+    reads as one."""
+    if isinstance(exc, UnicodeError):
+        return None
     args = getattr(exc, "args", ())
-    if args and isinstance(args[0], str) and len(args[0]) == 5 and args[0].isalnum():
+    if args and isinstance(args[0], str) and _SQLSTATE_RE.fullmatch(args[0]):
         return args[0]
     return None
 
@@ -2730,11 +2813,11 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     error: asyncpg's ``sqlstate`` attribute, else :func:`_sqlstate`'s ``args[0]``.
 
     Never for a ``UnicodeError`` or an exception that holds one. ``UnicodeEncodeError``'s first
-    argument is the codec name, and ``ascii`` is five alphanumerics, so it would read as one."""
+    argument is the codec name, which is not a SQLSTATE however it is spelled."""
     if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
         return None
     state = getattr(exc, "sqlstate", None)
-    if isinstance(state, str) and len(state) == 5 and state.isalnum():
+    if isinstance(state, str) and _SQLSTATE_RE.fullmatch(state):
         return state
     return _sqlstate(exc)
 
@@ -2763,26 +2846,11 @@ def _connection_lost(exc: BaseException | None) -> bool:
     return False
 
 
-#: Driver packages whose errors :func:`_raised_by_a_driver` counts though the package has no DB-API
-#: ``apilevel``: asyncpg, the PostgreSQL store's driver, whose handler-failure arm meets it.
-_NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
-
-
-def _raised_by_a_driver(exc: BaseException) -> bool:
-    """Whether ``exc``'s class, or a class it inherits, is a database driver's: from a module, or
-    a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
-    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
-    builtin exception a driver raises does not count, though its cause chain is withheld under a
-    driver error that holds it (:func:`_redacted_copy`)."""
-    for kind in type(exc).__mro__:
-        parts = kind.__module__.split(".")
-        if parts[0] in _NON_DBAPI_DRIVERS:
-            return True
-        for depth in range(1, len(parts) + 1):
-            module = sys.modules.get(".".join(parts[:depth]))
-            if getattr(module, "apilevel", None) == "2.0":
-                return True
-    return False
+#: :func:`~messagefoundry.redaction.raised_by_a_driver`, the one test of a driver's error that
+#: this module and the log chain's traceback both read (vault BACKLOG #1661, added item 3). A
+#: builtin exception a driver raises does not count, though its cause chain is withheld under a
+#: driver error that holds it (:func:`_redacted_copy`).
+_raised_by_a_driver = raised_by_a_driver
 
 
 #: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
@@ -2912,8 +2980,7 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     bug's message included; the frames still locate it, and their source lines still print. An
     error with no arguments has no text to
     withhold and is named by its type alone. It never raises: a link whose classification raises
-    is named by its type and a fixed note. A failure in :func:`_redacted_copy`'s own driver test
-    on that link still falls to :func:`_safe_db_exc_info`'s whole-chain fallback."""
+    is named by its type and a fixed note."""
     try:
         if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)
@@ -4531,17 +4598,17 @@ class DatabaseDestination(DestinationConnector):
                         "discarded rather than returned to its pool: %s",
                         _safe_db_error(rollback_exc),
                     )
-                    if state is None:
+                    if state is None and not isinstance(exc, UnicodeEncodeError):
                         raise  # the send's failure is no driver error: the rollback's propagates
                     # Classified by the send's own error, as it would be had the rollback passed,
                     # never by the rollback's: the send's error is the best evidence of the
                     # message's fate, and a transient rollback state overriding a permanent one
                     # would retry a poison message for as long as the retry budget lasts. A
                     # dead-letter can be replayed. The rollback's error stays the context.
-                    raise _classify_db_error(state, str(exc)) from exc
-                if state is None:
+                    raise _send_refusal(state, exc) from exc
+                if state is None and not isinstance(exc, UnicodeEncodeError):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
-                raise _classify_db_error(state, str(exc)) from exc
+                raise _send_refusal(state, exc) from exc
         finally:
             await _close_and_release(pool, conn, cur, discard=discard)
         return captured

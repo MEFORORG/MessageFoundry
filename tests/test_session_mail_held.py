@@ -860,8 +860,9 @@ def test_the_off_switch_neither_shows_nor_consumes_held_mail(repo: Path, tmp_pat
     )
     (mail_root(repo) / "OFF").write_text("", encoding="ascii")
 
-    suppressed = injection(run_drain(repo, event="Stop", session_id=SESSION_A))
-    assert "SUPPRESSED" in suppressed
+    # Stderr at Stop, because stdout there would re-wake the session (BACKLOG #5863).
+    run_drain(repo, event="Stop", session_id=SESSION_A, expect_stderr="SUPPRESSED")
+    assert "SUPPRESSED" in injection(run_drain(repo, event="SessionStart", session_id=SESSION_A))
     assert len(box_files(repo, key, "inbox")) == 1, "OFF did not stop the consume"
     assert box_files(repo, key, "seen") == []
     assert marker_name(stem, SESSION_A) in markers(repo, key)

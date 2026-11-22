@@ -350,8 +350,9 @@ suite("startup banners: every builder that sets a webview's HTML is wired", () =
    * clear. Named, with the reason, so that a third is a decision and not an oversight.
    */
   const STATIC_NOTICES: Record<string, string> = {
-    // Set before `enableScripts`; a one-line text notice shown while the file reopens as text.
-    "configEditors.ts": "",
+    // Set before `enableScripts`, `default-src 'none'` with no `script-src`: a one-line notice shown
+    // while the file reopens as text, or a non-file document's own read-only text (BACKLOG #5834).
+    "configEditors.ts": "configNoticeHtml",
     // `default-src 'none'` with no `script-src`; shown while the resource reopens as text.
     "stepsView.ts": "noticeHtml",
   };

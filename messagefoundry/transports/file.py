@@ -1289,8 +1289,9 @@ class FileSource(SourceConnector):
                     logger.warning(
                         "file source %s: the poll task did not stop within %.1fs, most likely a share "
                         "call blocked on an unreachable directory; cancelled it. The blocked call "
-                        "finishes on its own thread, and any file it was working on is left in place "
-                        "and re-read on the next start.",
+                        "finishes on its own thread. When it is the move or delete that disposes of "
+                        "a file, it may still complete there; otherwise the file it was working on "
+                        "is left in place and re-read on the next start.",
                         self.directory,
                         _STOP_GRACE_S,
                     )

@@ -92,7 +92,6 @@ import {
   type LensParseResult,
   type LiveInlineValue,
   type OpSchema,
-  type RowKind,
   type StructuralRequest,
 } from "./stepsModel";
 import {
@@ -106,6 +105,7 @@ import { buildSegmentScope, sampleSegments } from "./hl7scope";
 import { pickHl7Path, type PickScope } from "./hl7Picker";
 import { nonce } from "./cspNonce";
 import { STARTUP_BANNERS } from "./webviewMessaging";
+import { StepsPanelProjection, type AnchorMessage, type HandlerType } from "./stepsPanel";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
 const RERENDER_DEBOUNCE_MS = 250;
@@ -183,16 +183,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   // undefined if the fetch fails (an older/unavailable engine) -> every param falls back to a text input.
   private opSchema: OpSchema | undefined;
   private opSchemaFetched = false;
-  // ADR 0104 §2.3 P2: handler name -> its recognized message type, stashed by render() from the lens parse
-  // (a projection of the current parse, never persisted state). Read by scopeFor to rank the picker.
-  private handlerTypes = new Map<
-    string,
-    { acceptsTypes?: string[]; inferredType?: { code?: string; trigger?: string } }
-  >();
-  // ADR 0076 Amendment D: each projected element's ROLE, stashed by render() from the same parse (a
-  // projection of THIS parse, never persisted state). The webview greys the out-of-role Add items; this
-  // is the provider-side half of the same rule, because inbound webview data is untrusted.
-  private handlerRoles = new Map<string, "handler" | "router">();
+  // A panel's handler message types and roles live on that panel's StepsPanelProjection, never here:
+  // this one provider serves every open Steps editor (BACKLOG #5843).
 
   constructor(
     private readonly version: string,
@@ -205,11 +197,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   /** The segment ranking/scope for a handler's recognized message type (ADR 0104 §2.3 P2). Undefined when
    *  there is no schema bundle or the type is unresolvable → the picker offers the generic, unscoped
    *  segment list. Reads the (synthetic, PHI-safe) sample so its Z-segments / segments union in. */
-  private scopeFor(handler: string): PickScope | undefined {
+  private scopeFor(t: HandlerType | undefined): PickScope | undefined {
     if (!this.schema) {
       return undefined;
     }
-    const t = this.handlerTypes.get(handler);
     let sample: string[] = [];
     if (this.samplePath) {
       try {
@@ -248,7 +239,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       );
       // Reveal OFF, always — the lens never un-redacts and the argv never carried `--show-phi`, so every
       // captured value came back as the CLI's "REDACTED" sentinel and folds to the `▸ ⋯` placeholder.
-      return traceRowValues(invocationsForFile(entries, fsPath), false);
+      // Resolve the trace's relative file paths against `ws`, the cwd the trace ran in.
+      return traceRowValues(invocationsForFile(entries, fsPath, ws), false);
     } catch {
       return []; // a live-value failure is never an error — the redacted placeholder stands
     }
@@ -310,6 +302,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     let sawAlive = false;
     // One edit at a time + the webview↔document update-loop guard (ADR 0076 §5).
     const guard = new EditLoopGuard();
+    // What THIS panel's last render projected (BACKLOG #5843): read by the picker scope and the Router
+    // role check, so a second open Steps editor can never answer for this one.
+    const panelState = new StepsPanelProjection();
     // The typed rewrites applied since the webview was last projected, so an edit on one of their rows
     // is sent with the row's current source rather than refused as stale (BACKLOG #5943). render()
     // tells it which buffer each new webview was projected from.
@@ -411,17 +406,6 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       // parse is non-null here (shouldFallBackToText returned fallback:false only for a real handler set).
       const handlers = buildHandlerViewModels(parse as LensParseResult, source);
-      // ADR 0104 §2.3 P2: stash each handler's recognized message type for the field picker's scope (a
-      // projection of THIS parse — not persisted state).
-      this.handlerTypes = new Map(
-        (parse as LensParseResult).handlers.map((h) => [
-          h.handler,
-          { acceptsTypes: h.accepts_types, inferredType: h.inferred_type },
-        ]),
-      );
-      this.handlerRoles = new Map(
-        (parse as LensParseResult).handlers.map((h) => [h.handler, h.role ?? "handler"]),
-      );
       // Live values come from a SECOND `dryrun --trace` that reads the module FROM DISK, but the rows
       // above are projected from the LIVE buffer. While the buffer is dirty (an unsaved structural edit
       // shifted rows relative to disk — or any unsaved change made buffer != disk) the disk trace's line
@@ -443,6 +427,13 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       );
       // Each projection gets a new id, which the page echoes in every edit it posts (#5943).
       const projection = ++projectionId;
+      // ADR 0104 §2.3 P2 and ADR 0076 Amendment D: stash each element's message type (the field picker's
+      // scope) and role (the Router purity check), and each row's kind and fan-out flags (the structural
+      // insert anchor, BACKLOG #5844), for THIS panel. Updated beside the HTML it describes, after the
+      // last await, so an interleaved render cannot leave it describing a page it did not set. A message
+      // the old page posts while the new HTML loads is still answered by the new projection; the
+      // anchor's expectSrc match is what keeps that from taking another row's flags.
+      panelState.update(parse as LensParseResult, handlers);
       panel.webview.html = pageHtml(
         panel.webview,
         handlers,
@@ -626,6 +617,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       await render(); // reflect the picked value (no optimistic DOM value) + any drained edits
     };
 
+    // A structural message whose anchor anchorFor refused (BACKLOG #5844): say so rather than drop it,
+    // and never run the op without the stale check.
+    const refuseAnchor = (): void => {
+      void vscode.window.showErrorMessage(
+        "MessageFoundry: could not apply the change — the selected row's coordinates are malformed. Reopen the Steps view and retry.",
+      );
+    };
+
     // Run the native cascading field picker (ADR 0104 §2.3), then write what `build` makes of the picked
     // path through applyPickedEdit's set_params splice. The picker runs OUTSIDE the edit guard (a modal
     // must not hold the single edit slot — mirrors pickSample). No schema bundle → nothing to pick, so
@@ -648,7 +647,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       const picked = await pickHl7Path(this.schema, {
         mode,
-        scope: this.scopeFor(coords.handler),
+        scope: this.scopeFor(panelState.typeOf(coords.handler)),
         verified: this.structures?.verified,
         seed,
       });
@@ -819,15 +818,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         ) {
           // ADR 0104 fan-out "＋ dest": pick a destination, then add_destination via the SAME byte-stable
           // applyStructural path. The anchor's fan-out flags drive the insert position (isReturnRow).
-          const anchor = {
-            handler: m.handler,
-            lineStart: m.lineStart,
-            lineEnd: m.lineEnd,
-            expectSrc: typeof m.expectSrc === "string" ? m.expectSrc : undefined,
-            kind: (typeof m.kind === "string" ? m.kind : "send") as RowKind,
-            appended: m.appended === true,
-            scaffold: typeof m.scaffold === "string" ? m.scaffold : undefined,
-          };
+          const anchor = panelState.anchorFor(m as AnchorMessage);
+          if (anchor === undefined) {
+            refuseAnchor();
+            return;
+          }
           void pickDestination("Add destination", "Destination (fan out)").then((dest) => {
             if (dest !== undefined && dest !== "" && !disposed) {
               void applyStructural(buildAddDestinationRequest(anchor, dest));
@@ -893,19 +888,15 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // Insert a DEFAULT-param template at the currently SELECTED row (no InputBox prompts). The
           // position is either the explicit context-menu choice or derived from the anchor's kind (send →
           // before the return, else after) inside buildToolbarInsertRequest, which reuses the byte-stable
-          // `lens rewrite` path via applyStructural.
+          // `lens rewrite` path via applyStructural. The anchor carries the row's fan-out flags, so a
+          // derived position puts a mid-body append send before the new step and a footer after it (#5844).
+          const anchor = panelState.anchorFor(m as AnchorMessage);
+          if (anchor === undefined) {
+            refuseAnchor();
+            return;
+          }
           void applyStructural(
-            buildToolbarInsertRequest(
-              {
-                handler: m.handler,
-                lineStart: m.lineStart,
-                lineEnd: m.lineEnd,
-                expectSrc: m.expectSrc,
-                kind: m.kind as RowKind,
-              },
-              m.action,
-              m.position as "before" | "after" | undefined,
-            ),
+            buildToolbarInsertRequest(anchor, m.action, m.position as "before" | "after" | undefined),
           );
         } else if (
           m?.command === "insertItem" &&
@@ -924,19 +915,18 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // A router stays pure destination-selection (ADR 0076 D.6): refuse an item that authors a
           // transform verb, a lookup, a diagnostic or an outbound send inside one. The engine refuses it
           // too; this stops the request before it becomes an error toast the user has to read.
-          if (!itemAllowedInRole(item, this.handlerRoles.get(m.handler) ?? "handler")) {
+          if (!itemAllowedInRole(item, panelState.roleOf(m.handler))) {
             void vscode.window.showWarningMessage(
               `MessageFoundry: "${item.label}" is not available in a Router — a Router selects destinations, it does not transform the message.`,
             );
             return;
           }
-          const anchor = {
-            handler: m.handler,
-            lineStart: m.lineStart,
-            lineEnd: m.lineEnd,
-            expectSrc: typeof m.expectSrc === "string" ? m.expectSrc : undefined,
-            kind: m.kind as RowKind,
-          };
+          // The anchor carries the row's fan-out flags, for a request that derives its position (#5844).
+          const anchor = panelState.anchorFor(m as AnchorMessage);
+          if (anchor === undefined) {
+            refuseAnchor();
+            return;
+          }
           const position = m.position as "before" | "after" | undefined;
           if (item.prompts.length === 0) {
             void applyStructural(buildAddMenuRequest(item, anchor, {}, position));
@@ -975,23 +965,29 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.lineEnd === "number" &&
           typeof m.kind === "string" &&
           typeof m.block === "string" &&
-          m.block !== ""
+          m.block !== "" &&
+          // The page sends a position only when it moved a paste off a control header, and then only
+          // "before" (BACKLOG #5839). Accept that value alone: an "after" would override the derived
+          // position and could put the block after a return (inbound webview data is untrusted).
+          (m.position === undefined || m.position === "before")
         ) {
           // Paste the captured block at the selected anchor via the byte-stable `lens rewrite` path
           // (applyStructural). A refusal surfaces the engine LensRewriteError as an error toast with ZERO
           // change; on a real change we show the "Pasted …" toast the webview supplied.
           const pasteText =
             typeof m.text === "string" ? m.text : "MessageFoundry: pasted the steps.";
+          // The page posts no fan-out flags with a paste, so the anchor takes them from this panel's
+          // projection: a block pasted at a mid-body append send lands after it, at a footer before (#5844).
+          const anchor = panelState.anchorFor(m as AnchorMessage);
+          if (anchor === undefined) {
+            refuseAnchor();
+            return;
+          }
           void applyStructural(
             buildPasteRequest(
-              {
-                handler: m.handler,
-                lineStart: m.lineStart,
-                lineEnd: m.lineEnd,
-                expectSrc: m.expectSrc,
-                kind: m.kind as RowKind,
-              },
-              { source: m.block, nesting: 0, kind: m.kind as RowKind, lineCount: 0, label: "" },
+              anchor,
+              { source: m.block, nesting: 0, kind: anchor.kind, lineCount: 0, label: "" },
+              m.position,
             ),
           ).then((ok) => {
             if (ok && !disposed) {
@@ -1049,6 +1045,12 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     //
     // The update-loop guard is unchanged and still runs first: our own `lens rewrite` WorkspaceEdit
     // must not re-trigger a projection.
+    //
+    // BACKLOG #5845: running the panel.active check first would stop the re-render that follows a
+    // param edit typed in the focused webview, and that re-render is load-bearing today. The page
+    // never refreshes a row's data-expect-src itself, so without it a later structural op on the
+    // edited row is refused as stale, Copy/Cut capture the pre-edit source, and the rebaser chain is
+    // never pruned. Dropping the re-render needs a row-source refresh the page can apply in place.
     const changeSub = vscode.workspace.onDidChangeTextDocument((e) => {
       if (e.document.uri.toString() !== document.uri.toString()) {
         return;

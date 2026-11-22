@@ -23,9 +23,12 @@ constraint the tool was built under gets an arm here that goes RED if the constr
 
 from __future__ import annotations
 
+import errno
+import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -421,6 +424,295 @@ def test_an_unresolvable_range_says_so_in_the_report(
     # failure. Only the narrowing is unavailable, and it must say so rather than print a zero.
     assert code == EXIT_OK, out
     assert "GIT WOULD NOT ANSWER" in out, out
+
+
+def _assert_instrument_refusal(code: int, out: str, exc_name: str) -> None:
+    """A failure after the record loaded: exit 2, the class named, its message and any total absent."""
+    assert code == EXIT_INSTRUMENT, f"exited {code}, not {EXIT_INSTRUMENT}:\n{out}"
+    assert "REFUSING" in out, out
+    assert exc_name in out, f"the refusal did not name {exc_name}:\n{out}"
+    assert SENTINEL_ID not in out, f"the refusal quoted the exception's message:\n{out}"
+    assert "anchors examined" not in out, f"a total was printed off a failed run:\n{out}"
+    for banned in BANNED_CONTENT:
+        assert banned not in out.lower(), f"the refusal leaked {banned!r}:\n{out}"
+
+
+@pytest.mark.parametrize(
+    ("raised", "exc_name"),
+    [
+        (FileNotFoundError(SENTINEL_ID), "FileNotFoundError"),
+        (subprocess.TimeoutExpired(cmd=SENTINEL_ID, timeout=120), "TimeoutExpired"),
+    ],
+)
+@pytest.mark.parametrize("narrowed", [True, False])
+def test_a_git_call_that_raises_is_an_instrument_failure(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    raised: Exception,
+    exc_name: str,
+    narrowed: bool,
+) -> None:
+    """RED when: git being absent or hung exits 1. Both call sites, because the provenance header
+    runs git on every report, with or without ``--changed-since``."""
+    root, record = tree
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise raised
+
+    monkeypatch.setattr("anchor_report.subprocess.run", _raise)
+    argv = ["--scorecard", str(record), "--root", str(root)]
+    if narrowed:
+        argv += ["--changed-since", "main"]
+
+    code, out = _run(argv, capsys)
+
+    _assert_instrument_refusal(code, out, exc_name)
+
+
+def test_an_anchored_file_that_cannot_be_read_is_an_instrument_failure(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a cited file that exists but will not open exits 1, which reads as a broken anchor."""
+    root, record = tree
+    real_read_text = Path.read_text
+
+    def _deny(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.name == "engine_module.py":
+            raise PermissionError(SENTINEL_ID)
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _deny)
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root)], capsys)
+
+    _assert_instrument_refusal(code, out, "PermissionError")
+
+
+def test_a_cited_file_that_cannot_be_examined_is_not_reported_missing(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a stat failure reads as "file missing", because ``is_file`` answers False on it."""
+    root, record = tree
+    _stat_raises(monkeypatch, PermissionError(SENTINEL_ID))
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    _assert_instrument_refusal(code, out, "PermissionError")
+
+
+def test_a_directory_at_a_cited_path_is_still_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the arm above: not a regular file stays PATH_MISSING, not a refusal."""
+    root = tmp_path / "engine"
+    (root / "engine_module.py").mkdir(parents=True)
+    record = _scorecard(tmp_path / "record.toml")
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    assert code == EXIT_FINDINGS, out
+    assert "file missing     : 1" in out, out
+
+
+def test_a_refusal_with_no_usable_stderr_still_exits_2(
+    tree: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """RED when: the refusal's own write raises and the run exits 1, the findings code."""
+    root, _ = tree
+    monkeypatch.setattr(sys, "stderr", None)
+
+    assert main(["--scorecard", str(tmp_path / "absent.toml"), "--root", str(root)]) == 2
+
+
+def test_a_closed_stdout_pipe_exits_2_not_120(tree: tuple[Path, Path], tmp_path: Path) -> None:
+    """RED when: the failed flush fails again at interpreter exit, which CPython reports as 120."""
+    root, record = tree
+    # The read end closes BEFORE the child starts, so its first write cannot win a race against it.
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "asvs" / "anchor_report.py"),
+                "--scorecard",
+                str(record),
+                "--root",
+                str(root),
+            ],
+            cwd=tmp_path,
+            stdout=write_end,
+            stderr=subprocess.DEVNULL,
+        )
+    finally:
+        os.close(write_end)
+
+    assert proc.wait(timeout=120) == EXIT_INSTRUMENT
+
+
+def _stat_raises(monkeypatch: pytest.MonkeyPatch, exc: OSError) -> None:
+    """Make the cited file's stat fail with ``exc``, leaving every other path alone."""
+    real_stat = Path.stat
+
+    def _fail(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == "engine_module.py":
+            raise exc
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _fail)
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="winerror is Windows-only")
+
+
+def _winerror(code: int) -> Any:
+    return pytest.param(
+        OSError(None, SENTINEL_ID, None, code), id=f"winerror-{code}", marks=_WINDOWS_ONLY
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(OSError(errno.EINVAL, SENTINEL_ID), id="bare-einval"),
+        *(_winerror(code) for code in (64, 1117, 1920, 362)),
+    ],
+)
+def test_an_einval_that_says_nothing_about_the_name_is_refused(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    exc: OSError,
+) -> None:
+    """RED when: EINVAL, which CPython gives every unmapped winerror, reads as "file missing"."""
+    root, record = tree
+    assert exc.errno == errno.EINVAL, "the premise: this error carries EINVAL"
+    _stat_raises(monkeypatch, exc)
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    _assert_instrument_refusal(code, out, "OSError")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(OSError(errno.ELOOP, SENTINEL_ID), id="eloop"),
+        *(_winerror(code) for code in (123, 1921)),
+    ],
+)
+def test_a_bad_name_or_link_loop_is_one_missing_file(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    exc: OSError,
+) -> None:
+    """RED when: one such cited path aborts the report for every anchor."""
+    root, record = tree
+    _stat_raises(monkeypatch, exc)
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    assert code == EXIT_FINDINGS, out
+    assert "file missing     : 1" in out, out
+
+
+def test_a_real_symlink_loop_is_one_missing_file(
+    tree: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same answer from the real filesystem, on whichever platform runs this."""
+    root, record = tree
+    cited = root / "engine_module.py"
+    cited.unlink()
+    try:
+        cited.symlink_to(cited)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"this account cannot create a symlink: {type(exc).__name__}")
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    assert code == EXIT_FINDINGS, out
+    assert "file missing     : 1" in out, out
+
+
+def test_a_name_the_filesystem_cannot_hold_is_a_missing_file(
+    tree: tuple[Path, Path], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """RED when: one stale citation with an impossible name aborts the report for every anchor."""
+    root, _ = tree
+    record = tmp_path / "long.toml"
+    text = _scorecard(record).read_text(encoding="utf-8")
+    record.write_text(text.replace("engine_module.py", "x" * 300 + ".py"), encoding="utf-8")
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    assert code == EXIT_FINDINGS, out
+    assert "file missing     : 1" in out, out
+
+
+def test_a_closed_stderr_pipe_still_exits_2(tmp_path: Path) -> None:
+    """RED when: a refusal buffered for a closed stderr fails at interpreter exit, as 120."""
+    record = _scorecard(tmp_path / "record.toml")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "asvs" / "anchor_report.py"),
+            "--scorecard",
+            str(record),
+            "--root",
+            str(tmp_path / "absent"),
+        ],
+        cwd=tmp_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stderr is not None
+    proc.stderr.close()
+
+    assert proc.wait(timeout=120) == EXIT_INSTRUMENT
+
+
+def test_a_stripped_docstring_does_not_become_a_findings_exit(tmp_path: Path) -> None:
+    """RED when: ``-OO`` removes ``__doc__`` and argument parsing dies with exit 1."""
+    proc = subprocess.run(
+        [sys.executable, "-OO", str(ROOT / "scripts" / "asvs" / "anchor_report.py"), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        timeout=120,
+    )
+    assert proc.returncode == EXIT_OK, proc.stderr
+
+
+def test_a_console_that_cannot_encode_the_report_is_an_instrument_failure(tmp_path: Path) -> None:
+    """RED when: a cp1252 stdout exits 1. A real interpreter, because the codec is the fault, and
+    no ``-I``, which would make it ignore PYTHONIOENCODING. The root's name is what cp1252 lacks."""
+    root = tmp_path / f"engine-{chr(0x4E2D)}"
+    root.mkdir()
+    (root / "engine_module.py").write_text(SOURCE, encoding="utf-8")
+    record = _scorecard(tmp_path / "record.toml")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "asvs" / "anchor_report.py"),
+            "--scorecard",
+            str(record),
+            "--root",
+            str(root),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        timeout=120,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252:strict", "PYTHONUTF8": "0"},
+    )
+    out = (proc.stdout + proc.stderr).decode("cp1252", errors="replace")
+
+    _assert_instrument_refusal(proc.returncode, out, "UnicodeEncodeError")
 
 
 # --------------------------------------------------------------------------------------------

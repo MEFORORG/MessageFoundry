@@ -1996,7 +1996,7 @@ class ConsolidatedLadderReport:
     def store_pool(self) -> PoolStats:
         """The pool the ladder ran on. Taken from the PINNED rung when there is one (the rung the headline is
         quoted from — its pool is the one that matters), else the first rung that measured a pool at all."""
-        pinned = self.pinned_rung
+        pinned = self._held_rung
         if pinned is not None and pinned.pool.measured:
             return pinned.pool
         for r in self.all_records:
@@ -2109,12 +2109,8 @@ class ConsolidatedLadderReport:
         what the engine ACTUALLY ACCEPTED. The fidelity gate now bounds the gap (an admissible rung accepted
         >= 95% of its offer), but it does not close it — and it closes it LEAST at the ceiling, which is
         exactly where offered and accepted diverge."""
-        honest = [
-            r.sustainable_ingress_rate
-            for r in self.admissible_climb
-            if r.verdict is RungVerdict.SUSTAINED and r.sustainable_ingress_rate is not None
-        ]
-        return max(honest) if honest else None
+        pinned = self.pinned_rung
+        return None if pinned is None else pinned.sustainable_ingress_rate
 
     @property
     def pinned_outbound_rate(self) -> float | None:
@@ -2127,7 +2123,14 @@ class ConsolidatedLadderReport:
     def pinned_rung(self) -> RungOutcome | None:
         """The SUSTAINED, FIDELITY-ADMISSIBLE climb rung whose HONEST ``sustainable_ingress_rate`` IS the
         pinned ceiling — the rung ``pinned_ingress_rate`` reports. ``None`` if nothing sustained with a
-        measured drain and an admissible fidelity."""
+        measured drain and an admissible fidelity, or if any rung planned zero messages (BACKLOG #5861):
+        that run is not a bench result, so every figure derived from the pin is withheld with it."""
+        return None if self.zero_offered_rates else self._held_rung
+
+    @property
+    def _held_rung(self) -> RungOutcome | None:
+        """The rung :attr:`pinned_rung` would publish, before the zero-offered withhold. The pool roll-up
+        reads this, so a withheld ceiling does not move its diagnostic onto a rung that carried no load."""
         candidates = [
             r
             for r in self.admissible_climb
@@ -2486,7 +2489,12 @@ class ConsolidatedLadderReport:
             return False
         if any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in recs):
             return False
-        return all(r.lanes_observed >= 2 for r in recs if r.verdict is RungVerdict.SUSTAINED)
+        # BACKLOG #5861: a zero-offered rung paces one first-tick message, so one lane is its normal shape.
+        return all(
+            r.lanes_observed >= 2
+            for r in recs
+            if r.verdict is RungVerdict.SUSTAINED and r.offered != 0
+        )
 
     @property
     def store_truth_unconfirmed(self) -> bool:
@@ -2499,6 +2507,14 @@ class ConsolidatedLadderReport:
         cause counts too: the engine marked the rung's store-truth INVALID (``engine.invalidated``). The JSON
         key name is kept for schema_version 3 back-compat even though it now covers all three causes."""
         return any(r.verdict is RungVerdict.INCONCLUSIVE for r in self.climb)
+
+    @property
+    def zero_offered_rates(self) -> list[float]:
+        """The rates of the climb or soak rungs that planned zero messages (BACKLOG #5861). Only these, and
+        not every UNKNOWN rung: an unrecorded ``sent`` on a rung that did offer load keeps its existing
+        reading, because the verdict's other authorities still measured that rung. A zero-offered soak is
+        therefore SETUP_DEGRADED (exit 2), not the SOAK_UNCONFIRMED an unrecorded soak reads as."""
+        return [r.ingress_rate for r in self.all_records if r.offered == 0]
 
     @property
     def setup_degraded(self) -> bool:
@@ -2514,13 +2530,17 @@ class ConsolidatedLadderReport:
         tripwire is a RESOURCE bind, not an engine ceiling. It is a real number, so it is not voided — but it
         must not exit 0 as a clean PASS either, or the tripwire is decorative. :attr:`result_label` names it
         POOL_BOUND rather than folding it into the generic SETUP_DEGRADED token, because "the pool was the
-        wall" is a specific and actionable finding (raise ``--store-pool-size`` and re-run)."""
+        wall" is a specific and actionable finding (raise ``--store-pool-size`` and re-run).
+
+        A rung that planned zero messages (:attr:`zero_offered_rates`) belongs here too: its verdict is
+        scale-free and can read as a benign FROZEN_TAIL, so without this term the run exits 0."""
         return (
             self.climb_aborted
             or self.soak_aborted
             or self.store_truth_unconfirmed
             or self.soak_drive_shortfall
             or self.ceiling_pool_bound
+            or bool(self.zero_offered_rates)
         )
 
     @property
@@ -2627,7 +2647,9 @@ class ConsolidatedLadderReport:
         """A CLIMB rung broke correctness: the same terms :attr:`correctness_ok` applies, read on the climb
         alone, so the soak's state cannot touch it."""
         return any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in self.climb) or any(
-            r.lanes_observed < 2 for r in self.climb if r.verdict is RungVerdict.SUSTAINED
+            r.lanes_observed < 2
+            for r in self.climb
+            if r.verdict is RungVerdict.SUSTAINED and r.offered != 0
         )
 
     @property
@@ -2676,6 +2698,7 @@ class ConsolidatedLadderReport:
                 or self.soak_aborted
                 or self.store_truth_unconfirmed
                 or self.soak_drive_shortfall
+                or bool(self.zero_offered_rates)
             )
             return "SETUP_DEGRADED" if nothing_measured else "POOL_BOUND"
         if not self.ok:
@@ -2733,7 +2756,9 @@ class ConsolidatedLadderReport:
         if self.void_collapse_notes:
             lines.append("")
         pin = self.pinned_ingress_rate
-        if pin is None:
+        if pin is None and self.zero_offered_rates:
+            lines.append("  pinned ceiling: NONE — withheld, a rung planned zero messages")
+        elif pin is None:
             lines.append(
                 "  pinned ceiling: NONE — no rung sustained (lower the start rate / check setup)"
             )
@@ -2895,6 +2920,12 @@ class ConsolidatedLadderReport:
                     f"{self.soak.offered} offered at {self.soak.ingress_rate:g}/s. 'The operating point "
                     "held' would be a readback of the plan, and 'it collapsed' would be a fabrication — "
                     "so this run certifies NOTHING. Add sender workers / drive boxes and re-run"
+                )
+            elif self.zero_offered_rates and not self.store_truth_unconfirmed:
+                rates = ", ".join(f"{rate:g}" for rate in self.zero_offered_rates)
+                reason = (
+                    f"the rung(s) at {rates} ingress/s planned zero messages, so they establish no "
+                    "rate. Raise the rate or the hold and re-run"
                 )
             else:
                 reason = (
