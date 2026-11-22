@@ -14737,6 +14737,9 @@ class MessageStore:
         commit — a rolled-back write never leaks into :meth:`reference_view`. Replaces the whole set
         (build-new-then-flip), so it is idempotent on a re-run with the same rows."""
         encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
+        # BACKLOG #5688: one encrypt per row, reserved before the first, so the persisted total leads
+        # the burst. Outside the transaction: on SQLite a reservation commits the writer connection.
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, len(encoded))
         encrypted = [
             (
                 name,

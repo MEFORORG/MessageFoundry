@@ -5217,6 +5217,9 @@ class PostgresStore:
         encrypted), and upsert the ``reference_version`` pointer. The read cache swaps only after
         commit, so a failed sync leaves the last-good snapshot live. Ported, not stubbed."""
         encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
+        # BACKLOG #5688: one encrypt per row, reserved before the first, so the persisted total leads
+        # the burst.
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, len(encoded))
         encrypted = [
             (
                 name,

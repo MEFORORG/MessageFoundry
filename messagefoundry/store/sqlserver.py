@@ -9929,6 +9929,9 @@ class SqlServerStore:
         is idempotent on a re-run with the same rows."""
         self._guard_reference_widths(name, rows)
         encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
+        # BACKLOG #5688: one encrypt per row, reserved before the first, so the persisted total leads
+        # the burst. After the width guard, so a refused snapshot charges nothing.
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, len(encoded))
         encrypted = [
             (
                 name,

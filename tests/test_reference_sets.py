@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -35,7 +37,10 @@ from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dryrun import route_message
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
-from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
+from messagefoundry.store.crypto import AesGcmCipher, IdentityCipher, generate_key, make_cipher
+from messagefoundry.store.gcm_bound import reserve_invocations_ahead
+from messagefoundry.store.postgres import PostgresStore
+from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
 
 REF = ReferenceSettings()  # defaults
@@ -1210,5 +1215,181 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
             await store._db.execute("SELECT key FROM reference WHERE name = 'orphan'")
         ).fetchall()
         assert [r["key"] for r in rows] == ["OLD"], "the freshly-eligible rows were destroyed"
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #5688: a keyed snapshot reserves its whole burst before its first encrypt -----------
+
+_BURST_ROWS: dict[str, Any] = {"A": "alpha", "B": {"n": 2}, "C": None}
+_BURST_BACKENDS = ("sqlite", "postgres", "sqlserver")
+
+
+class _BurstConn:
+    """One recording fake for a Postgres connection and a SQL Server connection and cursor."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        yield
+
+    async def execute(self, sql: str, *args: Any) -> None:
+        self.events.append(f"write:{sql.split()[0]}")
+
+    async def commit(self) -> None:
+        return None
+
+
+async def _burst_store(backend: str, tmp_path: Path, cipher: Any, events: list[str]) -> Any:
+    """A store on ``cipher``: the real SQLite one, or a server class over a recording fake."""
+    if backend == "sqlite":
+        return await MessageStore.open(tmp_path / "burst.db", cipher=cipher)
+    cls = PostgresStore if backend == "postgres" else SqlServerStore
+    store: Any = cls.__new__(cls)
+    conn = _BurstConn(events)
+
+    @asynccontextmanager
+    async def acquire(*_: Any, **__: Any) -> AsyncIterator[_BurstConn]:
+        yield conn
+
+    async def add(_key_id: str, count: int) -> int:
+        return count
+
+    async def close() -> None:
+        return None
+
+    store._timed_acquire = store._acquire = store._cursor = acquire
+    store.committed_txns = 0
+    store._cipher = cipher
+    store._reference_cache = {}
+    store._reference_versions = {}
+    store.add_cipher_invocations = add
+    store.close = close
+    return store
+
+
+def _record_burst(
+    store: Any,
+    cipher: Any,
+    events: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    add_error: Exception | None = None,
+) -> None:
+    """Record the reservation, the persisted add and each encrypt, in order, into ``events``."""
+    real_add = store.add_cipher_invocations
+    real_encrypt = cipher.encrypt
+
+    async def reserve(c: Any, add_fn: Any, count: int) -> None:
+        events.append(f"reserve:{count}")
+        await reserve_invocations_ahead(c, add_fn, count)
+
+    async def add(key_id: str, count: int) -> int:
+        events.append("add")
+        if add_error is not None:
+            raise add_error
+        return int(await real_add(key_id, count))
+
+    def encrypt(plaintext: str, *, aad: bytes | None = None) -> str:
+        events.append("encrypt")
+        return str(real_encrypt(plaintext, aad=aad))
+
+    monkeypatch.setattr(f"{type(store).__module__}.reserve_invocations_ahead", reserve)
+    store.add_cipher_invocations = add
+    monkeypatch.setattr(cipher, "encrypt", encrypt)
+
+
+def _empty_reserve(cipher: AesGcmCipher) -> None:
+    """Leave the cipher hydrated with no reserve, so the next burst has to reserve."""
+    cipher.enable_invocation_bound()
+    cipher.grant_invocations(cipher.invocation_settlement(), cipher.cumulative_invocations())
+
+
+@pytest.mark.parametrize("backend", _BURST_BACKENDS)
+async def test_5688_keyed_write_reserves_the_burst_before_its_first_encrypt(
+    backend: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    events: list[str] = []
+    store = await _burst_store(backend, tmp_path, cipher, events)
+    try:
+        _empty_reserve(cipher)
+        _record_burst(store, cipher, events, monkeypatch)
+        await store.write_reference_snapshot(name="codes", version="v1", rows=_BURST_ROWS)
+        # The whole burst is counted, and the persisted add lands before the first encrypt.
+        assert events[:5] == ["reserve:3", "add", "encrypt", "encrypt", "encrypt"]
+        assert cipher.invocation_settlement() < 0, "the persisted total must lead the spend"
+        assert dict(store.reference_view()["codes"]) == _BURST_ROWS
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("backend", _BURST_BACKENDS)
+async def test_5688_refused_reservation_encrypts_nothing_and_keeps_the_snapshot(
+    backend: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    events: list[str] = []
+    store = await _burst_store(backend, tmp_path, cipher, events)
+    try:
+        await store.write_reference_snapshot(name="codes", version="v1", rows={"OLD": "kept"})
+        _empty_reserve(cipher)
+        # An add that fails before the cipher has read its persisted total is the refusal.
+        cipher._bound_hydrated = False
+        events.clear()
+        refusal = sqlite3.OperationalError("synthetic: the bound is unreachable")
+        _record_burst(store, cipher, events, monkeypatch, add_error=refusal)
+        with pytest.raises(sqlite3.OperationalError, match="synthetic"):
+            await store.write_reference_snapshot(name="codes", version="v2", rows=_BURST_ROWS)
+        assert events == ["reserve:3", "add"], "nothing may be encrypted or written"
+        assert dict(store.reference_view()["codes"]) == {"OLD": "kept"}
+        if backend == "sqlite":
+            cur = await store._db.execute("SELECT version, key FROM reference WHERE name='codes'")
+            assert [(r["version"], r["key"]) for r in await cur.fetchall()] == [("v1", "OLD")]
+            cur = await store._db.execute("SELECT version FROM reference_version")
+            assert [r["version"] for r in await cur.fetchall()] == ["v1"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("backend", _BURST_BACKENDS)
+async def test_5688_failed_add_on_a_hydrated_cipher_keeps_the_shared_contract(
+    backend: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # reserve_invocations_ahead logs this case and the burst proceeds under the in-process ceiling.
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    events: list[str] = []
+    store = await _burst_store(backend, tmp_path, cipher, events)
+    try:
+        await store.write_reference_snapshot(name="codes", version="v1", rows={"OLD": "x"})
+        _empty_reserve(cipher)
+        events.clear()
+        blip = sqlite3.OperationalError("synthetic: a transient blip")
+        _record_burst(store, cipher, events, monkeypatch, add_error=blip)
+        await store.write_reference_snapshot(name="codes", version="v2", rows=_BURST_ROWS)
+        assert events[:2] == ["reserve:3", "add"] and events.count("encrypt") == 3
+        assert dict(store.reference_view()["codes"]) == _BURST_ROWS
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("backend", _BURST_BACKENDS)
+async def test_5688_keyless_write_charges_nothing(
+    backend: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cipher = IdentityCipher()
+    events: list[str] = []
+    store = await _burst_store(backend, tmp_path, cipher, events)
+    try:
+        _record_burst(store, cipher, events, monkeypatch)
+        await store.write_reference_snapshot(name="codes", version="v1", rows=_BURST_ROWS)
+        assert "add" not in events
+        assert events.count("encrypt") == 3
+        assert dict(store.reference_view()["codes"]) == _BURST_ROWS
     finally:
         await store.close()
