@@ -2,7 +2,7 @@
   The revocation refusal on those three destinations offered `[tls].crl_file`, which cannot admit a
   hop that sets `tls_allow_expired`, and did not name that setting as the cause. It now names it and
   offers the per-connection attestation, or removing the setting, as MLLP, the DICOM SCU and FTPS
-  already did. On a REST hop with an ECH sidecar the ECH remedy stands. The refusal, the WARNING and
+  already did. A REST hop with an ECH sidecar now refuses `tls_allow_expired` at build. The refusal, the WARNING and
   the attested-crossing audit line on such a hop now use the expiry-relaxed record's words, so a log
   search for "verified TLS hop that skips validity-period checks crossed" finds these crossings
   (it read "with tls_allow_expired" until vault BACKLOG #4912), and one for

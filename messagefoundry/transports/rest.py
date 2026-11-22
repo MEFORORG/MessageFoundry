@@ -3306,8 +3306,9 @@ class RestDestination(DestinationConnector):
             # sidecar owns destination TLS + ECH + cert verification), so a plain no-redirect opener
             # carries it. No opener for the direct destination hop is built: none would be used, and
             # building one loaded the [tls] CRL and internal CA for a hop that never consults them, so
-            # a fault in either failed the connection (vault BACKLOG #2977 item 7). verify_tls=false,
-            # tls_allow_expired, tls_ca_file and Digest are refused above on this connection.
+            # a fault in either failed the connection (vault BACKLOG #2977 item 7). At least
+            # verify_tls=false, tls_allow_expired, tls_ca_file and Digest are refused above on this
+            # connection.
             # The empty proxy map keeps any proxy handler off this opener (vault BACKLOG #2579). The
             # loopback rule alone already dials every accepted sidecar direct, so this adds no
             # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
