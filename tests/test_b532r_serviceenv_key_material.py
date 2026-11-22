@@ -3,8 +3,7 @@
 """Key material below an empty secret is that secret's value (vault BACKLOG #5394, added items 6
 and 12).
 
-Synthetic values only: each stand-in is ASCII text, never a real key. Each shape below, in the
-next item and on the next line, makes the empty secret above it read as set, so the start refuses.
+Synthetic values only: each stand-in is ASCII text, never a real key.
 """
 
 from __future__ import annotations
