@@ -32,7 +32,8 @@ type or strength off the floor (``_require_key_strength``), a recipient cert the
 cleartext-credential misconfiguration **raises here**, so it fails at ``check``/dry-run/start.
 
 **One certificate property is NOT refused here: the validity window** (BACKLOG #5631). Construction
-only logs a WARNING for a recipient cert or issuing anchor outside it, and each send refuses it,
+only logs a WARNING, once per process for the same connection and certificates, for a recipient
+cert, issuing anchor or signing cert outside it, and each send refuses it,
 expired or not yet valid, as a permanent configuration fault whose code starts
 ``direct-cert-validity``. ``DirectDestination._send`` says why. The
 blocking crypto + SMTP exchange runs off the event loop via ``asyncio.to_thread``.
@@ -337,11 +338,26 @@ def _same_name_and_key(a: x509.Certificate, b: x509.Certificate) -> bool:
     ) == b.public_key().public_bytes(serialization.Encoding.DER, spki)
 
 
+#: How far ahead of this host's clock a certificate's notBefore may lie and still count as valid
+#: (BACKLOG #5631). A partner's CA stamps notBefore from its own clock, so a certificate issued
+#: moments ago would otherwise read as not yet valid on a host whose clock is a little behind. Only
+#: notBefore takes it: an allowance on notAfter would extend trust in a certificate past its expiry.
+#: The signing cert takes none (Manager decision, batch 224, the stricter reading): its partner
+#: verifies it on the partner's own clock, so an allowance here could let out a signature the
+#: partner then refuses. The cost is that a host a little behind the CA stops the lane on a freshly
+#: renewed signing cert until notBefore passes and an operator starts the lane again.
+_NOT_BEFORE_SKEW = datetime.timedelta(minutes=5)
+
+
 def _window_problem(
-    cert: x509.Certificate, setting: str, now: datetime.datetime
+    cert: x509.Certificate,
+    setting: str,
+    now: datetime.datetime,
+    skew: datetime.timedelta = _NOT_BEFORE_SKEW,
 ) -> _WindowProblem | None:
-    """Why ``cert`` is outside its validity window at ``now``, or None."""
-    if now < cert.not_valid_before_utc:
+    """Why ``cert`` is outside its validity window at ``now``, or None. A notBefore up to ``skew``
+    ahead of ``now`` is allowed."""
+    if now + skew < cert.not_valid_before_utc:
         return _WindowProblem(setting, expired=False)
     if now > cert.not_valid_after_utc:
         return _WindowProblem(setting, expired=True)
@@ -349,15 +365,20 @@ def _window_problem(
 
 
 def _validity_refusal(
-    recipient: x509.Certificate, anchors: Sequence[x509.Certificate]
+    recipient: x509.Certificate,
+    anchors: Sequence[x509.Certificate],
+    signer: x509.Certificate,
 ) -> _WindowProblem | None:
-    """Why ``recipient``, or every one of its issuing ``anchors``, is outside its validity window
-    now, or None. Any one issuing anchor in its window will do, so a CA renewed under the same name
-    and key carries on when the bundle's older copy expires; where none is, a not-yet-valid copy
-    is the anchors' answer, because time alone cures it. Between the recipient's answer and the
-    anchors', an expiry wins, because time cannot cure it, so the refusal names the fix an operator
-    needs: a not-yet-valid recipient issued by an expired anchor reports the anchor. An empty ``anchors``, which the trust check
-    never leaves, reads as an expired anchor rather than as none failing."""
+    """Why ``recipient``, every one of its issuing ``anchors``, or the ``signer`` cert is outside
+    its validity window now, or None. Any one issuing anchor in its window will do, so a CA renewed
+    under the same name and key carries on when the bundle's older copy expires; where none is, a
+    not-yet-valid copy is the anchors' answer, because time alone cures it. Between the three
+    answers an expiry wins, because time cannot cure it, so the refusal names the fix an operator
+    needs: a not-yet-valid recipient issued by an expired anchor reports the anchor. Among equals
+    the recipient leads, then the anchors, then the signer. The signer is checked because a
+    partner's verifier refuses a signature made under an out-of-window cert (BACKLOG #5631), so
+    the message would be refused after the relay had accepted it. An empty ``anchors``, which the
+    trust check never leaves, reads as an expired anchor rather than as none failing."""
     now = _utcnow()
     anchor_problem: _WindowProblem | None = _WindowProblem("trust_anchor", True)
     found: list[_WindowProblem] = []
@@ -370,9 +391,37 @@ def _validity_refusal(
     else:
         if found:
             anchor_problem = min(found, key=lambda p: p.expired)
-    problems = [p for p in (_window_problem(recipient, "recipient_cert", now), anchor_problem) if p]
+    problems = [
+        p
+        for p in (
+            _window_problem(recipient, "recipient_cert", now),
+            anchor_problem,
+            _window_problem(signer, "signing_cert", now, skew=datetime.timedelta(0)),
+        )
+        if p
+    ]
     # max on a bool key keeps the first of equals, so the recipient leads a tie.
     return max(problems, key=lambda p: p.expired, default=None)
+
+
+#: The construction validity warnings this process has logged, by connection (its name and the
+#: relay the line names), refusal code and the certificates read. A connector is built again by
+#: every reload, test build and probe build of the same config, and each build repeated the same
+#: line (BACKLOG #5631). The send-time refusal is not deduplicated: the delivery worker logs it once
+#: per lane stop. Never pruned: an entry is a few fingerprints, one per distinct configuration.
+_WARNED_WINDOWS: set[tuple[str, str, tuple[bytes, ...]]] = set()
+
+
+def _first_window_warning(
+    connection: str, window: _WindowProblem, certs: Sequence[x509.Certificate]
+) -> bool:
+    """Whether this process has not yet logged ``window`` for ``connection`` built from ``certs``,
+    recording it when not. A renewed certificate, a change of bound or of relay warns again."""
+    key = (connection, window.code, tuple(c.fingerprint(hashes.SHA256()) for c in certs))
+    if key in _WARNED_WINDOWS:
+        return False
+    _WARNED_WINDOWS.add(key)
+    return True
 
 
 #: What reading a certificate's extensions raises, at least, when ``cryptography`` cannot read them
@@ -729,8 +778,14 @@ class DirectDestination(DestinationConnector):
         # that was not built. The validity window warns here and refuses at send (Manager decision,
         # batch 224): a build refusal would record the lane failed at start (ADR 0031) rather than
         # stopped with its queue kept. The send-time refusal is what _send describes.
-        window = _validity_refusal(self._recipient_cert, self._recipient_anchors)
-        if window is not None:
+        window = _validity_refusal(
+            self._recipient_cert, self._recipient_anchors, self._signing_cert
+        )
+        if window is not None and _first_window_warning(
+            f"{config.name} {self.host}:{self.port}",
+            window,
+            (self._recipient_cert, self._signing_cert, *self._recipient_anchors),
+        ):
             logger.warning(
                 "Direct %s:%s: %s. %s",
                 self.host,
@@ -1069,7 +1124,9 @@ class DirectDestination(DestinationConnector):
         # the delivery worker stops the lane, keeps the queue, and logs one ERROR line and alert
         # carrying that code, so this arm adds no log line of its own. Under dead_letter the row's
         # last_error holds the text below.
-        window = _validity_refusal(self._recipient_cert, self._recipient_anchors)
+        window = _validity_refusal(
+            self._recipient_cert, self._recipient_anchors, self._signing_cert
+        )
         if window is not None:
             raise NegativeAckError(
                 f"Direct {self.host}:{self.port} refused: {window.text}",

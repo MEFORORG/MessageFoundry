@@ -1111,7 +1111,8 @@ class AlertSink(Protocol):
         """A ``[sandbox].mode = "subprocess"`` worker for inbound ``name`` was refused, because the
         graph it loaded differs from the one the engine serves (vault BACKLOG #2724, owner ruling
         2026-10-16: alert, keep dead-letter). ``content_only`` is True when only the config
-        modules' bytes differ: a config file was edited on disk with no reload.
+        modules' bytes differ: the worker ran other bytes than the engine loaded. Since vault BACKLOG
+        #2596 a worker runs the snapshot the engine sends it, so an edit on disk is not a cause.
 
         Raised once per refusal, on the event loop, by the runner: not again for each later
         message the session refuses from its cached refusal, and not for a refusal computed

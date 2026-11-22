@@ -91,6 +91,7 @@ from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
+    ATTACHMENT_CONTENT_TYPE_MAX,
     CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
@@ -121,6 +122,7 @@ from messagefoundry.store.cell_tag import (
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
+    require_preset_criteria,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
@@ -514,6 +516,12 @@ _RESET_LANE_CHUNK = 500
 # handed to that statement's own call and not waited for at all. A close can still queue behind a
 # call the cancellation did not cancel, such as a shielded one, and this bound caps that wait.
 _DIRTY_CLOSE_TIMEOUT = 5.0
+
+# BACKLOG #5720: how long the one-connection store's error path waits for its pool to finish
+# closing when the store's own close failed before its pool step. Past it the pool is left
+# closing. Its own value, not FAILED_OPEN_CANCEL_BOUND_S: it bounds one fallback wait, cancel or
+# not, where that bounds a whole cleanup once a cancel lands.
+_ONE_CONNECTION_POOL_CLOSE_BOUND_S = 5.0
 
 # BACKLOG #3023: how many `[store].acquire_timeout`s a session write that follows a committed auth
 # change may wait for a pooled connection (SqlServerStore._acquire_after_commit). Longer than an
@@ -1104,6 +1112,32 @@ def _rcsi_remedy(database: str | None) -> str:
     )
 
 
+def _options_error(exc: BaseException) -> str:
+    """How the database-options check renders an error into its refusals and logs (BACKLOG #5666):
+    its text through ``redact_log_line``, since ODBC text can echo connection parameters. The
+    redacted text keeps a driver's diagnosis, such as an untrusted certificate or a query timeout,
+    readable. The CLI's ``_engine_refusal_text`` matches this rendering as well as the error's own
+    text, so it prints its own rendering of the error in place of either: the class, SQLSTATE and
+    native number where the error carries a SQLSTATE."""
+    return redact_log_line(str(exc))
+
+
+def _bound_one_shot(conn: Any, seconds: int) -> None:
+    """Set the statement limit, in seconds, of the cursors a one-shot options connection opens
+    from now on (BACKLOG #5666); pyodbc applies a connection's ``timeout`` to each cursor as it is
+    created. 0 means no limit. Where the raw pyodbc connection is unreachable and a limit was
+    asked for, it warns, as the claim connection does (STORE-3), rather than run unbounded in
+    silence."""
+    raw = getattr(conn, "_conn", None)
+    if raw is not None:
+        raw.timeout = seconds
+    elif seconds:
+        log.warning(
+            "sqlserver: cannot reach the raw pyodbc connection to apply command_timeout on the"
+            " database-options check; its statements run with no statement limit (STORE-3)"
+        )
+
+
 def _upload_quota_lock(uploader_id: str) -> str:
     """The applock the reserve and the release of one uploader's reservations both take (vault
     BACKLOG #3180). One spelling, because the release's lock order holds only while the names
@@ -1543,30 +1577,40 @@ class _SyncHandoffPool:
     def acquire(self, timeout: float | None = None) -> Iterator[Any]:
         conn = self._free.get(timeout=timeout)
         if conn is None:  # a slot discarded by an earlier fault — reconnect lazily on demand
-            conn = self._factory()
+            try:
+                conn = self._factory()
+            except BaseException:
+                # BACKLOG #5663: the slot goes back as a placeholder, or a failed reconnect would
+                # shrink the pool by one for every acquire that met the fault.
+                self._free.put(None)
+                raise
         broken = False
         try:
             yield conn
-        except Exception:
+        except BaseException:
             # A raised handoff may have left the connection mid-transaction or dead. Mark it broken so
             # the finally discards it instead of returning a possibly-poisoned connection to the pool.
+            # BaseException, so a cancellation or interrupt discards it too (BACKLOG #5663).
             broken = True
             raise
         finally:
             if broken:
+                fresh: Any = None
                 try:
-                    conn.close()
-                except Exception:  # noqa: BLE001 - best-effort discard
-                    log.debug("sync handoff connection close on discard failed", exc_info=True)
-                try:
-                    self._free.put(self._factory())  # refill the slot with a fresh connection
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001 - best-effort discard
+                        log.debug("sync handoff connection close on discard failed", exc_info=True)
+                    fresh = self._factory()  # refill the slot with a fresh connection
                 except Exception:  # noqa: BLE001 - reconnect may itself fail (server down)
-                    # Keep the slot count stable with a None placeholder; the next acquire retries the
-                    # factory. Never re-circulate the poisoned connection or silently shrink the pool.
                     log.debug(
                         "sync handoff reconnect failed; slot will lazily reconnect", exc_info=True
                     )
-                    self._free.put(None)
+                finally:
+                    # Keep the slot count stable, with a None placeholder when the reconnect failed;
+                    # the next acquire retries the factory. Never re-circulate the poisoned
+                    # connection or silently shrink the pool.
+                    self._free.put(fresh)
             else:
                 self._free.put(conn)
 
@@ -2292,8 +2336,8 @@ _SCHEMA: list[str] = [
     # which DISTINCT attachments a message holds (Phase 3a linkage) so retention decrefs exactly those on
     # purge. Logical refs — no FK (mirrors queue.body_ref → shared_body.hash), so a future incremental
     # writer can insert chunks then finalize the header, and the startup sweep reclaims header-less orphans.
-    """IF OBJECT_ID('attachment','U') IS NULL CREATE TABLE attachment (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, content_type NVARCHAR(256) NOT NULL,
+    f"""IF OBJECT_ID('attachment','U') IS NULL CREATE TABLE attachment (
+        id NVARCHAR(64) NOT NULL PRIMARY KEY, content_type NVARCHAR({ATTACHMENT_CONTENT_TYPE_MAX}) NOT NULL,
         total_bytes BIGINT NOT NULL, refcount INT NOT NULL, created_at FLOAT NOT NULL)""",
     """IF OBJECT_ID('attachment_chunk','U') IS NULL CREATE TABLE attachment_chunk (
         attachment_id NVARCHAR(64) NOT NULL, seq INT NOT NULL, ciphertext NVARCHAR(MAX) NOT NULL,
@@ -4280,17 +4324,19 @@ class SqlServerStore:
             # A read-only open issues no ALTER either (#1780).
             await cls._ensure_database_options(settings)
         pool, executor = await cls._create_pool(settings, maxsize=settings.pool_size)
-        store = cls(
-            pool,
-            settings,
-            cipher=cipher,
-            audit_mac_key=audit_mac_key,
-            audit_mac_fn=audit_mac_fn,
-            message_events=message_events,
-        )
-        store._pool_executor = executor
-        store._read_only = read_only
         try:
+            # Inside the try, so a constructor that raises does not leak the pool or the
+            # executor (BACKLOG #5720).
+            store = cls(
+                pool,
+                settings,
+                cipher=cipher,
+                audit_mac_key=audit_mac_key,
+                audit_mac_fn=audit_mac_fn,
+                message_events=message_events,
+            )
+            store._pool_executor = executor
+            store._read_only = read_only
             await store._ensure_schema(create=create, read_only=read_only)
             # Right after the schema, so a later open step that fails still leaves the report
             # logged; read-only included, since it reads metadata only (BACKLOG #4917).
@@ -4871,6 +4917,8 @@ class SqlServerStore:
                     abandoned = False
                     try:
                         _require_call_gate(probe)  # BACKLOG #2394, as on `conn` below
+                        if fail_closed:
+                            _bound_one_shot(probe, settings.command_timeout)
                         pcur = await probe.cursor()
                         await pcur.execute(
                             "SELECT is_read_committed_snapshot_on FROM sys.databases"
@@ -4886,8 +4934,9 @@ class SqlServerStore:
                             await _close_one_shot(probe, pcur)
                 except UngatedConnectionError:
                     raise  # a refusal, not an unreadable state: the open must say why it failed
-                except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
-                    log.debug("RCSI re-read on %r failed", db, exc_info=True)
+                except Exception as exc:  # noqa: BLE001 - an unreadable state is an unverified one
+                    # No traceback: its text is the driver's, unredacted (BACKLOG #5666).
+                    log.debug("RCSI re-read on %r failed: %s", db, _options_error(exc))
                     continue
                 if prow is not None and prow[0]:
                     return True
@@ -4901,7 +4950,8 @@ class SqlServerStore:
             )
         except Exception as exc:
             raise RuntimeError(
-                f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
+                f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}:"
+                f" {_options_error(exc)}"
             ) from exc
         cur: Any = None
         abandoned = False
@@ -4911,6 +4961,12 @@ class SqlServerStore:
             # `_rcsi_on_after_a_peer` exit the same way. One the gate cannot wrap is refused before
             # its first call, and the `finally` closes it while nothing runs on it.
             _require_call_gate(conn)
+            if fail_closed:
+                # BACKLOG #5666: at an open, the state read and the re-read probes run under
+                # [store].command_timeout. The ALTERs below do not, at an open or under
+                # provision-schema: a cancel that lands after ROLLBACK IMMEDIATE has rolled back
+                # the peers leaves RCSI off, and the retry at every restart rolls them back again.
+                _bound_one_shot(conn, settings.command_timeout)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
             # guards against cannot arise; `_close_one_shot` still closes the cursor first.
@@ -4933,9 +4989,35 @@ class SqlServerStore:
                 log.warning("%s", message)
                 return
             off = _options_off(row)
+            swap = bool(off) and fail_closed and bool(settings.command_timeout)
+
+            async def alter(sql: str) -> None:
+                """Run one ALTER inside its caller's try, so a failure to open its cursor reaches
+                the same handler as the ALTER's own failure: the peer re-read and the remedy."""
+                nonlocal cur, swap
+                if swap or cur is None:
+                    # The ALTERs run with no statement limit, as on a provision-schema run, so
+                    # they get a cursor opened after the limit is lifted (see the comment at the
+                    # state read). `cur` is cleared before the close, so a cancellation landing in
+                    # it does not hand the same cursor to the gate a second time.
+                    swap = False
+                    old, cur = cur, None
+                    if old is not None:
+                        try:
+                            await old.close()
+                        except Exception as exc:  # noqa: BLE001 - the ALTER meets a dead session
+                            # A peer's ROLLBACK IMMEDIATE may have killed the session; the cursor
+                            # open or the ALTER then fails in the caller's handler.
+                            log.debug(
+                                "options state-read cursor close failed: %s", _options_error(exc)
+                            )
+                    _bound_one_shot(conn, 0)
+                    cur = await conn.cursor()
+                await cur.execute(sql)
+
             if "READ_COMMITTED_SNAPSHOT" in off:
                 try:
-                    await cur.execute(
+                    await alter(
                         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
@@ -4944,7 +5026,7 @@ class SqlServerStore:
                         log.info(
                             "READ_COMMITTED_SNAPSHOT on %r was enabled by a concurrent opener (%s)",
                             db,
-                            exc,
+                            _options_error(exc),
                         )
                         # Our connection may be dead, and the peer's open runs the same snapshot
                         # step, so a warning from a doomed ALTER here would only mislead.
@@ -4952,7 +5034,8 @@ class SqlServerStore:
                     elif fail_closed:
                         raise RuntimeError(
                             f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
-                            f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
+                            f" not enable it ({_options_error(exc)}); {remedy} -- refusing to open"
+                            " the store, because"
                             " under locking read committed concurrent finalizers deadlock (fail closed)"
                         ) from exc
                     else:
@@ -4962,18 +5045,18 @@ class SqlServerStore:
                             "READ_COMMITTED_SNAPSHOT is OFF on database %r and this login could"
                             " not enable it (%s); %s",
                             db,
-                            exc,
+                            _options_error(exc),
                             remedy,
                         )
             if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
-                    await cur.execute("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
+                    await alter("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning(
                         "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",
                         db,
-                        exc,
+                        _options_error(exc),
                         _options_remedy(db, ["ALLOW_SNAPSHOT_ISOLATION"]),
                     )
         except BaseException as exc:
@@ -5661,16 +5744,117 @@ class SqlServerStore:
     ) -> AsyncIterator[SqlServerStore]:
         """A one-connection store with the identity cipher, closed on exit: what
         :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`. It hands
-        the executor to the store, so :meth:`close` releases it."""
+        the executor to the store, so :meth:`close` releases it.
+
+        On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
+        cancel cannot cut it short and a close failure is logged by class rather than replacing
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
+        ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
+        async generator may await there; only if it fails or a cancel interrupts it does the
+        forced release run. A ``SystemExit`` or ``KeyboardInterrupt`` raised there propagates, as
+        it did before."""
+        cancels_before = cancels_at_entry()
         # Vault BACKLOG #2223: the pin's own checks, as :meth:`open` runs them.
         await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         pool, executor = await cls._create_pool(settings, maxsize=1)
-        store = cls(pool, settings)
-        store._pool_executor = executor
+        store: SqlServerStore | None = None
         try:
+            store = cls(pool, settings)
+            store._pool_executor = executor
             yield store
-        finally:
-            await store.close()
+        except BaseException as exc:
+            built = store
+
+            async def _graceful() -> None:
+                if built is not None:
+                    await built.close()
+                    return
+                try:
+                    pool.close()
+                    await pool.wait_closed()
+                finally:
+                    executor.shutdown(wait=False)
+
+            def _force_release() -> None:
+                # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
+                try:
+                    pool.close()
+                finally:
+                    executor.shutdown(wait=False)
+
+            if isinstance(exc, GeneratorExit):
+                try:
+                    await _graceful()
+                except asyncio.CancelledError:
+                    # A cancel during the close is raised, as main's unshielded close raised it,
+                    # once what the close left is released.
+                    try:
+                        _force_release()
+                    except Exception as forced:  # noqa: BLE001 — keep the cancel
+                        log.warning(
+                            "releasing a one-connection store without waiting also failed (%s)",
+                            type(forced).__name__,
+                        )
+                    raise
+                except Exception as cleanup:  # noqa: BLE001 — fall back, keep the exit
+                    log.warning(
+                        "closing a one-connection store at its close failed (%s); it is released "
+                        "without waiting",
+                        type(cleanup).__name__,
+                    )
+                    try:
+                        _force_release()
+                    except Exception as forced:  # noqa: BLE001 — keep the exit
+                        log.warning(
+                            "releasing a one-connection store without waiting also failed (%s)",
+                            type(forced).__name__,
+                        )
+                raise
+
+            async def _release() -> None:
+                try:
+                    await _graceful()
+                except Exception as cleanup:  # noqa: BLE001 — never mask the error
+                    log.warning(
+                        "closing a one-connection store after an error also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+                    log.debug("the one-connection store's close failure", exc_info=cleanup)
+                    # A close that raised before its own pool step leaves the pool and the
+                    # executor open, so release both here (BACKLOG #5720). A close that reached
+                    # that step shut the executor down in its own finally, and closes nothing more
+                    # here. The wait is bounded, so this fallback cannot hang the error path.
+                    if built is None or built._pool_executor is None:
+                        return
+                    bound = asyncio.timeout(_ONE_CONNECTION_POOL_CLOSE_BOUND_S)
+                    try:
+                        pool.close()
+                        async with bound:
+                            await pool.wait_closed()
+                    except Exception as released:  # noqa: BLE001 — keep the error
+                        if bound.expired():
+                            log.warning(
+                                "the pool did not finish closing within %s s; it is left closing",
+                                _ONE_CONNECTION_POOL_CLOSE_BOUND_S,
+                            )
+                        else:
+                            log.warning(
+                                "closing the pool after that also failed (%s)",
+                                type(released).__name__,
+                            )
+                            log.debug("the pool's close failure", exc_info=released)
+                    finally:
+                        executor.shutdown(wait=False)
+
+            await cleanup_failed_open(
+                exc,
+                _release,
+                _force_release,
+                cancels_before=cancels_before,
+                what="a one-connection store's cleanup",
+            )
+            raise
+        await store.close()
 
     @classmethod
     async def schema_meta_anywhere(
@@ -5823,8 +6007,14 @@ class SqlServerStore:
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+            # By class at WARNING, the traceback at DEBUG only: a driver's message may carry a
+            # path or a value, and the one-connection store's error path and open_store's keyless
+            # refusal run this close too (BACKLOG #5720).
+            log.warning(
+                "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
+            )
+            log.debug("the settle's failure at close", exc_info=exc)
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
         # opened, so it never affects the async path). ADR 0071 B5.
         self.close_sync_handoff_pool()
@@ -6437,22 +6627,30 @@ class SqlServerStore:
             return committed
         return rows
 
-    async def _execute_output(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-        """Run one write that carries an ``OUTPUT`` clause, commit it as a durable write, and return
-        the rows it output (BACKLOG #2283).
+    async def _execute_output(
+        self, sql: str, params: tuple[Any, ...] = (), *, empty_is_read: bool = False
+    ) -> list[dict[str, Any]]:
+        """Run one write that carries an ``OUTPUT`` clause, commit it, and return the rows it output
+        (BACKLOG #2283). The commit counts as a durable write, except that ``empty_is_read`` makes
+        one that output no row an uncounted read commit.
 
         For a write whose caller needs to know what it changed. The rowset holds whatever
         ``cursor.rowcount`` would, and a session-wide ``SET NOCOUNT ON`` cannot hide it, while the
         count can come back ``-1`` for a zero-match UPDATE. ``_fetchall`` would not do: it commits
         as a READ. The rows are drained before the commit, and ``_cursor`` frees the statement
-        handle the ``OUTPUT`` clause leaves open."""
+        handle the ``OUTPUT`` clause leaves open. ``empty_is_read`` commits a write that output no
+        row through :meth:`_commit_read`, so ``committed_txns`` does not count a change that never
+        happened (BACKLOG #5675)."""
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
                     await cur.execute(sql, params)
                     columns = [c[0] for c in cur.description]
                     rows = await cur.fetchall()
-                    await self._commit(conn)
+                    if rows or not empty_is_read:
+                        await self._commit(conn)
+                    else:
+                        await self._commit_read(conn)
             except Exception:
                 # As in _execute: a failed rollback discards rather than recycles the connection,
                 # and it runs after the cursor block.
@@ -8528,6 +8726,7 @@ class SqlServerStore:
         criteria: str,
         now: float | None = None,
     ) -> tuple[str, bool]:
+        require_preset_criteria(criteria)  # BACKLOG #5523: a read refuses a blank cell
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -8596,18 +8795,14 @@ class SqlServerStore:
         return row
 
     async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "DELETE FROM search_presets WHERE id=? AND owner_user_id=?",
-                    (preset_id, owner_user_id),
-                )
-                deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-                await self._commit(conn)
-                return deleted > 0
-            except Exception:
-                await conn.rollback()
-                raise
+        # Counted from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide (BACKLOG #5672, as
+        # #2283). _execute_output drains the rowset before its commit.
+        return bool(
+            await self._execute_output(
+                "DELETE FROM search_presets OUTPUT deleted.id WHERE id=? AND owner_user_id=?",
+                (preset_id, owner_user_id),
+            )
+        )
 
     async def list_connection_events(
         self,
@@ -8688,8 +8883,13 @@ class SqlServerStore:
         raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
-        # (event_type, connection) key. UPDATE-then-conditional-INSERT in one serializable transaction
-        # (matching the SQLite path): the filtered unique index keeps it to one LIVE instance per key. The
+        # (event_type, connection) key. UPDATE-then-conditional-INSERT in one transaction (matching the
+        # SQLite path): the filtered unique index keeps it to one LIVE instance per key. A per-key
+        # applock, held to the commit, makes two concurrent first fires queue rather than both INSERT
+        # and collide on that index (BACKLOG #5692). A named lock, not HOLDLOCK, as put_attachment's
+        # (#5753): a key-range lock taken on the unique index before the row would invert the order a
+        # resolve or ack of the same instance takes them in, and the two could deadlock. The UPDATE
+        # reports through OUTPUT, which a session-wide SET NOCOUNT ON cannot hide (as #2283). The
         # caller wraps it fail-soft. reason rides safe_text + the cipher. escalation_tier (#81, ADR 0133) is
         # kept monotonic within an open instance via a CASE (SQL Server has no 2-arg MAX scalar).
         now = time.time() if now is None else now
@@ -8703,44 +8903,57 @@ class SqlServerStore:
             if reason
             else None
         )
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        key = hashlib.sha256(f"{event_type}\x00{connection}".encode()).hexdigest()
+        async with self._acquire() as conn:
             try:
-                await cur.execute(
-                    "UPDATE alert_instance SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
-                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END,"
-                    " raised_by=?"
-                    " WHERE event_type=? AND connection=? AND status<>'resolved'",
-                    (
-                        now,
-                        severity,
-                        reason_enc,
-                        escalation_tier,
-                        escalation_tier,
-                        raised_by,
-                        event_type,
-                        connection,
-                    ),
-                )
-                if cur.rowcount == 0:
+                async with self._cursor(conn) as cur:
+                    # The SELECT opens the transaction the applock needs, as in put_attachment.
                     await cur.execute(
-                        "INSERT INTO alert_instance"
-                        " (event_type, connection, severity, status, first_seen, last_seen,"
-                        " [count], reason, escalation_tier, raised_by)"
-                        " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                        "SELECT TOP (1) id FROM alert_instance WHERE event_type=? AND connection=?",
+                        (event_type, connection),
+                    )
+                    await cur.fetchall()
+                    await self._applock(cur, f"mefor:alert_instance:{key}")
+                    await cur.execute(
+                        "UPDATE alert_instance"
+                        " SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
+                        " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier"
+                        " END, raised_by=?"
+                        " OUTPUT inserted.id"
+                        " WHERE event_type=? AND connection=? AND status<>'resolved'",
                         (
-                            event_type,
-                            connection,
+                            now,
                             severity,
-                            now,
-                            now,
                             reason_enc,
                             escalation_tier,
+                            escalation_tier,
                             raised_by,
+                            event_type,
+                            connection,
                         ),
                     )
-                await self._commit(conn)
+                    if not await cur.fetchall():
+                        await cur.execute(
+                            "INSERT INTO alert_instance"
+                            " (event_type, connection, severity, status, first_seen, last_seen,"
+                            " [count], reason, escalation_tier, raised_by)"
+                            " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                            (
+                                event_type,
+                                connection,
+                                severity,
+                                now,
+                                now,
+                                reason_enc,
+                                escalation_tier,
+                                raised_by,
+                            ),
+                        )
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # As in _execute_output: a failed rollback discards rather than recycles the
+                # connection, so no open transaction keeps this key's applock (BACKLOG #1940).
+                await self._rollback_or_discard(conn)
                 raise
 
     async def list_active_alert_instances(
@@ -12542,18 +12755,11 @@ class SqlServerStore:
     async def attachment_incref(self, ref: str) -> None:
         """Add one live reference to an attachment (store-once refcount). Raises :class:`KeyError` if the
         attachment does not exist — an incref must name a real stored document."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
-                )
-                if not cur.rowcount:
-                    await conn.rollback()
-                    raise KeyError(f"attachment {ref!r} not found")
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
+        # Read from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide: there cur.rowcount is
+        # -1, which is truthy (BACKLOG #5675, as #2283). A missing ref matches nothing, so its
+        # commit is a read and is not counted in committed_txns, as on main.
+        if not await self._execute_output(_SQL_INCREF_ATTACHMENT, (1, ref), empty_is_read=True):
+            raise KeyError(f"attachment {ref!r} not found")
 
     async def _decref_attachment(self, cur: Any, ref: str, count: int = 1) -> None:
         """Drop ``count`` references to an attachment and **GC the attachment + all its chunks at

@@ -347,6 +347,7 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     resolve_effective_policy,
 )
+from messagefoundry.config.anchor import explicit_root_value_file_guard
 from messagefoundry.config.fingerprint import (
     ConfigDirMissing,
     DigestCoverage,
@@ -532,12 +533,18 @@ from messagefoundry.serviceenv import (
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import (
+    ATTACHMENT_CONTENT_TYPE_MAX,
     ResendError,
     Store,
     audit_write_errors,
     build_store_cipher,
 )
-from messagefoundry.store.cell_tag import BlankCellError, CellTagError, NonTextCellError
+from messagefoundry.store.cell_tag import (
+    BlankCellError,
+    CellTagError,
+    NonTextCellError,
+    SealedBlankCellError,
+)
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -577,13 +584,17 @@ from messagefoundry.uploads import (
     UploadAccessError,
     UploadContentError,
     UploadDamagedError,
+    UploadDeleteIncompleteError,
+    UploadDeleteUnconfirmedError,
     UploadedFileMeta,
     UploadError,
     UploadNotFoundError,
     UploadNotTextError,
     UploadPathError,
     UploadQuotaError,
+    UploadRemoval,
     UploadRetentionRunner,
+    UploadStorageUnreachableError,
     UploadStore,
     UploadTooLargeError,
     UploadUnavailableError,
@@ -2104,6 +2115,18 @@ def _build_approval_gate(
         # BACKLOG #3157 item 4, which says when the row can still be lost).
         return await outliving.run(_apply(), "released config reload")
 
+    async def _config_reload_before_claim(_p: Mapping[str, Any]) -> None:
+        # BACKLOG #5906: a node that RegistryRunner.lease_lost reads as lease-lost refuses the
+        # reload. Asked here, before the gate's claim, so the request is not spent and can be
+        # released on the leader; the gate writes approval.node_refused against the approver.
+        # Past the claim the same refusal is compensated to 'failed' and that approval is spent.
+        # A point in time read: leadership lost after it and before the runner's second read is
+        # refused by the reload itself, and the approval is then marked failed; leadership lost
+        # after that second read is not refused (RegistryRunner.reload).
+        rr = engine.registry_runner
+        if rr is not None and rr.lease_lost:
+            raise ApprovalError(503, _LEASE_LOST_RELEASE_DETAIL)
+
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
         channel_id = p.get("channel_id")
         return _replay_in_scope(identity, channel_id if isinstance(channel_id, str) else None)
@@ -2131,6 +2154,7 @@ def _build_approval_gate(
         in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
         requires_fingerprint=True,
+        before_claim=_config_reload_before_claim,
     )
     return gate
 
@@ -2865,8 +2889,22 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigDirUnreadable,
     ConfigDirMissing,
     WiringError,
+    RunnerLeaseLostError,
 )
 
+
+#: The answer to a reload a cluster node refused because it lost its lease (BACKLOG #5906).
+_LEASE_LOST_RELOAD_DETAIL: Final = (
+    "this node no longer holds the cluster lease, so it applies no config reload; reload on the "
+    "leader instead"
+)
+
+#: The approve route's answer to a release on such a node, refused before the gate claims the
+#: request, so the request is not spent (BACKLOG #5906).
+_LEASE_LOST_RELEASE_DETAIL: Final = (
+    "this node no longer holds the cluster lease, so it releases no config reload and did not "
+    "claim the request; approve it on the leader"
+)
 
 #: The answer to a reload whose config directory the engine could not resolve or list: at the
 #: target check, or in the load after it (vault BACKLOG #5248).
@@ -2933,11 +2971,12 @@ async def _audit_refused_reload(
     an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
     filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
-    #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
-    one its approval named writes ``config_reload_failed`` with ``approved_fingerprint`` and
-    ``current_fingerprint`` and reason ``digest_mismatch``, or ``no_approved_digest`` when the hold
-    carries no usable digest (:func:`held_fingerprint`), whose ``approved_fingerprint`` is then
-    null, and answers 422 (vault BACKLOG #2596); only the
+    #3091); it is neither a refused anchor nor a bad graph. A cluster node that lost its lease while
+    its graph still runs writes reason ``lease_lost`` and answers 503 (BACKLOG #5906). A released
+    reload whose config is not the one its approval named writes ``config_reload_failed`` with
+    ``approved_fingerprint`` and ``current_fingerprint`` and reason ``digest_mismatch``, or
+    ``no_approved_digest`` when the hold carries no usable digest (:func:`held_fingerprint`),
+    whose ``approved_fingerprint`` is then null, and answers 422 (vault BACKLOG #2596); only the
     executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
@@ -2966,8 +3005,9 @@ async def _audit_refused_reload(
     BACKLOG #3109). ``reported``, when passed, holds :func:`_failure_row_key` of each row already
     written: a row already in it is not written again, and a row that lands is added. That reload
     retries every interval, and this keeps it to one row of each kind per version. Its refusal is
-    then logged at DEBUG, not WARNING: the convergence runner already logs each failure at ERROR,
-    and a WARNING per retry would repeat it every interval.
+    then logged at DEBUG, not WARNING, since a WARNING per retry would repeat every interval: the
+    convergence runner already logs each failure at ERROR, except a refusal it is told is designed,
+    such as ``lease_lost``, which it logs at INFO once per run of refused passes (BACKLOG #5906).
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
@@ -3048,6 +3088,12 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
+    elif isinstance(exc, RunnerLeaseLostError):
+        # BACKLOG #5906: this cluster node lost its lease while its graph still runs, so the
+        # runner refused the reload before it changed any lane. Nothing is wrong with the config.
+        warn("config reload refused: this node no longer holds the cluster lease")
+        action, detail["reason"] = "config_reload_failed", "lease_lost"
+        status, answer = 503, _LEASE_LOST_RELOAD_DETAIL
     elif isinstance(exc, WiringError) and explicit_cause(exc, AnchorStoreUnavailable) is not None:
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.
@@ -3808,10 +3854,6 @@ def _export_ndjson_line(row: Row) -> bytes:
 #: shape screen ONLY — it admits ``image/svg+xml``/``text/html``/``application/hta``; the allow-list
 #: below is what makes the served type inert (ASVS 1.3.4).
 _SAFE_MIME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$")
-#: Length bound on the served ``Content-Type``. The token grammar above is unbounded and the stored
-#: label has no column check, so an arbitrarily long attacker string would otherwise be echoed into a
-#: response header; no registered media type comes close to this.
-_MAX_ATTACHMENT_MIME_LEN = 255
 _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 
 #: The **inert** media types an attachment download may DECLARE, each mapped to the extension its download
@@ -3959,7 +4001,12 @@ def _safe_attachment_content_type(content_type: str | None) -> str:
     nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document. An SVG's SERVED
     copy is sanitized in the download route as well, beside this downgrade (see the comment there)."""
     ct = (content_type or "").strip()
-    if len(ct) > _MAX_ATTACHMENT_MIME_LEN or not _SAFE_MIME_RE.match(ct):
+    # The length bound is the store's column width (BACKLOG #1619), so the served type and the stored
+    # one share one limit. SQLite and PostgreSQL store a label of any length, and the bound keeps the
+    # shape screen and the lookup from working over an arbitrarily long attacker string; no type on
+    # the allow-list comes close to it. The screen admits ASCII only, where a character is one UTF-16
+    # unit.
+    if len(ct) > ATTACHMENT_CONTENT_TYPE_MAX or not _SAFE_MIME_RE.match(ct):
         return _DEFAULT_ATTACHMENT_MIME
     # The shape screen has already excluded parameters (``; charset=…``) and inner whitespace, so the
     # case-fold is the only normalization an exact lookup still needs.
@@ -4879,8 +4926,8 @@ def create_app(
     # [service] service-status reporting (L6a): default-off; the managed lifespan sets the live value,
     # here it backs the direct-construction (test) path.
     app.state.service_settings = service_settings
-    # Configured [logging].log_dir for the GET /status app-log metering (#50). None = stdout-only (no
-    # metering). The managed-app lifespan sets the live value; here it backs the direct-construction path.
+    # Configured [logging].log_dir for the GET /status app-log metering (#50) and GET /logs/tail.
+    # None = stdout-only (no metering). The managed-app lifespan sets the live value; here it backs the direct-construction path.
     app.state.log_dir = log_dir
     # BACKLOG #171 (ADR 0130): the startup [logging].level baseline GET /logging/level reports next to the
     # (possibly runtime-overridden, ephemeral) effective level. None when unknown (embedding/test path).
@@ -9168,6 +9215,19 @@ def create_app(
         "known to be damaged, so do not delete it for this. An operator fixes the cause on the "
         "server, then tries again"
     )
+    # BACKLOG #5388 added item 3: a delete the store could not finish. 409, which no other answer of
+    # the delete route spends, so the web console names it apart from a refusal. Neither text says
+    # the file is damaged or that access was refused: a retry may finish it.
+    _UPLOAD_DELETE_INCOMPLETE_STATUS = 409
+    _UPLOAD_DELETE_IN_USE = (
+        "this uploaded file is in use on the server, so nothing was deleted. Try the delete again "
+        "shortly. If it keeps failing, an administrator checks what holds the file open"
+    )
+    _UPLOAD_PARTLY_DELETED = (
+        "this uploaded file was not fully deleted: its record on the server could not be removed, "
+        "and its content may already be gone. Try the delete again to finish it. If it keeps "
+        "failing, an administrator removes the record on the server"
+    )
     _UPLOAD_REFUSED_TEXT: dict[str, str] = {
         "locked": _UPLOAD_UNREADABLE,
         "damaged": _UPLOAD_DAMAGED,
@@ -9178,6 +9238,26 @@ def create_app(
         "the store's key service could not complete the request, so nothing was read, stored or "
         "removed. Try again shortly"
     )
+    # BACKLOG #5388 added item 3: the uploads directory, or the share it is on, could not be
+    # reached. The same 503 and Retry-After as the key-service outage, with its own text, and
+    # ``storage_unreachable`` set so the web console names it apart.
+    _UPLOAD_STORAGE_UNREACHABLE = (
+        "the uploads storage on the server could not be reached, so nothing was read, stored or "
+        "removed. Try again shortly. If it keeps happening, an administrator should check the "
+        "uploads directory and the share it is on"
+    )
+    # BACKLOG #5388 added item 3: a delete whose body unlink met the share going away. Its row
+    # records the outcome as unknown, and this text claims neither a removal nor its absence.
+    _UPLOAD_DELETE_UNCONFIRMED = (
+        "the uploads storage on the server could not be reached during the delete, so whether the "
+        "file's content was removed could not be confirmed. Try the delete again once the storage "
+        "is back; an administrator should check the uploads directory and the share it is on"
+    )
+    _UPLOAD_OUTAGE_TEXT: dict[str, str] = {
+        "key": _UPLOAD_UNAVAILABLE,
+        "storage": _UPLOAD_STORAGE_UNREACHABLE,
+        "unconfirmed": _UPLOAD_DELETE_UNCONFIRMED,
+    }
 
     class _UploadUnavailable(HTTPException):
         """BACKLOG #3734: the store cipher's key service (Vault Transit) gave no verdict on the
@@ -9192,20 +9272,39 @@ def create_app(
         ``(503, detail)`` here, because Starlette's ``__init__`` leaves it as the call's own
         arguments; a copy rebuilds it through ``cls(*args)``, which logs nothing."""
 
-        def __init__(self, *_rebuilt: object) -> None:
+        def __init__(self, *_rebuilt: object, kind: str = "key") -> None:
+            # A copy rebuilds through cls(*args), whose detail says which outage it was.
+            for known, text in _UPLOAD_OUTAGE_TEXT.items():
+                if text in _rebuilt:
+                    kind = known
+            detail = _UPLOAD_OUTAGE_TEXT[kind]
             super().__init__(
                 503,
-                _UPLOAD_UNAVAILABLE,
+                detail,
                 headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
             )
-            self.args = (503, _UPLOAD_UNAVAILABLE)
+            self.args = (503, detail)
+            # Typed signals for the web console (BACKLOG #5388 added item 3), as upload_refusal is.
+            self.storage_unreachable = kind != "key"
+            self.outcome_unconfirmed = kind == "unconfirmed"
 
-    def _upload_unavailable(cause: str, op: str) -> _UploadUnavailable:
+    def _outage_of(exc: UploadUnavailableError) -> tuple[str, str]:
+        """The text of outage ``exc`` and its kind: ``"key"`` for the key service, ``"storage"``
+        for uploads storage that could not be reached, and ``"unconfirmed"`` for a delete whose
+        outcome that left unknown (BACKLOG #5388 added item 3). Only these are kept past the
+        handler."""
+        if isinstance(exc, UploadDeleteUnconfirmedError):
+            return str(exc), "unconfirmed"
+        return str(exc), "storage" if isinstance(exc, UploadStorageUnreachableError) else "key"
+
+    def _upload_unavailable(outage: tuple[str, str], op: str) -> _UploadUnavailable:
         """The outage 503, logged once at WARNING with the operation, so an outage that blocks
-        every upload is on the record. ``cause`` is the cipher's outage text, the key id and an
-        exception type name (``crypto_transit._transit_failure``); it goes to the log only."""
+        every upload is on the record. ``outage`` is :func:`_outage_of`'s: the cipher's outage text,
+        the key id and an exception type name (``crypto_transit._transit_failure``), or the
+        storage's, which go to the log only, and the outage's kind."""
+        cause, kind = outage
         _log.warning("upload %s answered 503: %s", op, cause)
-        return _UploadUnavailable()
+        return _UploadUnavailable(kind=kind)
 
     def _upload_refusal_kind(exc: UploadUnreadableError) -> str:
         """``"denied"``, ``"damaged"`` or ``"locked"``: which refusal ``exc`` is (BACKLOG #5388,
@@ -9257,13 +9356,20 @@ def create_app(
         gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322). An override holder whose read
         met a key-service outage gets the 503 instead, which DELETE does not catch (BACKLOG #3734)."""
         override_answer: Callable[[], HTTPException] | None = None
+        everyone = False
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
-            override_answer = partial(_upload_unavailable, str(exc), op)
+            override_answer = partial(_upload_unavailable, _outage_of(exc), op)
+            # BACKLOG #5388 added item 3: storage that could not be reached answers every caller
+            # 503, since an absent id meets the same outage and a 404 would tell an owner their
+            # file is gone. Only while the uploads root itself cannot be reached: an outage on one
+            # upload alone, such as a stale NFS handle, is one an absent id never meets, so for a
+            # caller who may not see the upload it keeps the 404 below (ASVS 8.2.2).
+            everyone = isinstance(exc, UploadStorageUnreachableError)
         except UploadUnreadableError as exc:
             override_answer = partial(_UploadSidecarRefused, _upload_refusal_kind(exc))
         if override_answer is not None:
@@ -9273,6 +9379,8 @@ def create_app(
             # anyone else. Both raises sit after the handler ends, so neither chain carries the
             # cipher's error.
             if identity.has(Permission.FILES_ACCESS_ANY):
+                raise override_answer()
+            if everyone and not await us.storage_reachable():
                 raise override_answer()
             raise HTTPException(404, "no such uploaded file")
         if not _may_access_upload(identity, meta):
@@ -9348,7 +9456,7 @@ def create_app(
             raise HTTPException(413, str(exc)) from None
         except MultipartError as exc:
             raise HTTPException(400, str(exc)) from None
-        outage: str | None = None
+        outage: tuple[str, str] | None = None
         try:
             # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
             # username) rides along as the display/audit label. See uploads.UploadedFileMeta.
@@ -9396,7 +9504,7 @@ def create_app(
             )
             raise HTTPException(409, str(exc)) from None
         except UploadUnavailableError as exc:
-            outage = str(exc)
+            outage = _outage_of(exc)
         if outage is not None:
             # BACKLOG #3734: nothing was written, so a retry stores the file once. Not audited as a
             # reject, because the file was not refused. Raised after the handler, from the text
@@ -9554,13 +9662,13 @@ def create_app(
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
         meta = await _authorized_upload_meta(request, engine, us, identity, file_id, "browse")
-        outage: str | None = None
+        outage: tuple[str, str] | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
-            outage = str(exc)
+            outage = _outage_of(exc)
         except UploadUnreadableError as exc:
             raise _UploadRefused(_upload_refusal_kind(exc)) from None
         if outage is not None:
@@ -9713,13 +9821,13 @@ def create_app(
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
         # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
         await _authorized_upload_meta(request, engine, us, identity, file_id, "resend")
-        outage: str | None = None
+        outage: tuple[str, str] | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
-            outage = str(exc)
+            outage = _outage_of(exc)
         except UploadUnreadableError as exc:
             raise _UploadRefused(_upload_refusal_kind(exc)) from None
         if outage is not None:
@@ -9792,9 +9900,19 @@ def create_app(
         owner-only object check (ASVS 8.2.2 — another operator's file answers 404, and is never
         unlinked), and an ``upload.delete`` audit row.
 
-        The check reads the metadata FIRST, because ``UploadStore.delete`` returns the metadata only
-        after it has already unlinked both sidecars — a check bolted onto that call would fire too
-        late. The age-based retention sweep is deliberately owner-blind and unaffected.
+        The check reads the metadata FIRST, because ``UploadStore.delete`` returns only after it
+        has already unlinked the body and the sidecar — a check bolted onto that call would fire
+        too late. The age-based retention sweep is deliberately owner-blind and unaffected.
+
+        The ``upload.delete`` row records what this call removed (``UploadRemoval``), and none is
+        written when it removed nothing (BACKLOG #5388 added item 3). A delete the store could not
+        finish answers 409: a body another handle held open, with nothing removed, or a sidecar it
+        could not remove. The latter's row is marked ``sidecar_kept``, and a retry that then
+        removes only the sidecar is marked ``body_removed: false``; a sidecar already gone is
+        marked ``sidecar_absent``. Storage that could not be reached answers 503: before any
+        unlink, with no row; at the body unlink, with a row whose ``body_removed`` is
+        ``"unknown"``, since a network filesystem may have applied it; and at the sidecar unlink,
+        after the body went, as the 409 above, with the body's row.
 
         An override holder goes on to ``UploadStore.delete`` when the sidecar is refused. That call
         removes the kind it classes as never sealable, and refuses the rest (BACKLOG #2322)."""
@@ -9815,22 +9933,58 @@ def create_app(
 
             async def _unlink_then_row() -> UploadedFileMeta | UploadError:
                 nonlocal detail
+                unfinished_exc: UploadError | None = None
+                removal: UploadRemoval
                 try:
-                    removed = await us.delete(file_id, sidecar_refused=refused)
+                    removal = await us.delete(file_id, sidecar_refused=refused)
+                except UploadDeleteUnconfirmedError as exc:
+                    if exc.meta is None:
+                        return exc
+                    # Whether the body went is not known, so the row says so; it never claims
+                    # nothing was removed.
+                    detail = json.dumps(
+                        {
+                            "file_id": exc.meta.file_id,
+                            "size": exc.meta.size,
+                            "body_removed": "unknown",
+                            "sidecar_kept": True,
+                        }
+                    )
+                    await engine.store.record_audit(
+                        "upload.delete", actor=actor, detail=detail, client=client
+                    )
+                    return exc
+                except UploadDeleteIncompleteError as exc:
+                    if exc.removed is None or not exc.removed.removed_any:
+                        # This call removed nothing, so no row is owed.
+                        return exc
+                    # This call removed the body, so the row is owed for it, though the delete
+                    # is answered as unfinished.
+                    removal, unfinished_exc = exc.removed, exc
                 except (
                     UploadPathError,
                     UploadNotFoundError,
                     UploadUnavailableError,
                     UploadUnreadableError,
                 ) as exc:
-                    # Each is raised before any unlink, so no row is owed, and a cancel landing
-                    # meanwhile must not log one as lost. Returned, so the route still answers it.
+                    # Each is raised before anything is removed, so no row is owed, and a cancel
+                    # landing meanwhile must not log one as lost. That includes the refusal of a
+                    # body unlink that failed, which keeps the sidecar (BACKLOG #5388 added item
+                    # 3). Returned, so the route still answers it.
                     return exc
-                detail = json.dumps({"file_id": removed.file_id, "size": removed.size})
+                removed = removal.meta
+                fields: dict[str, object] = {"file_id": removed.file_id, "size": removed.size}
+                if not removal.sidecar_was_there:
+                    fields["sidecar_absent"] = True
+                elif not removal.sidecar_removed:
+                    fields["sidecar_kept"] = True
+                if not removal.body_removed:
+                    fields["body_removed"] = False
+                detail = json.dumps(fields)
                 await engine.store.record_audit(
                     "upload.delete", actor=actor, detail=detail, client=client
                 )
-                return removed
+                return removed if unfinished_exc is None else unfinished_exc
 
             def _lost() -> str:
                 if detail is not None:
@@ -9848,15 +10002,21 @@ def create_app(
         # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
         # request, so a deadline can no longer land between them and leave a removed file with no
         # row.
-        outage: str | None = None
+        outage: tuple[str, str] | None = None
+        unfinished: str | None = None
         try:
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadDeleteIncompleteError as exc:
+            unfinished = _UPLOAD_DELETE_IN_USE if exc.removed is None else _UPLOAD_PARTLY_DELETED
         except UploadUnavailableError as exc:
-            outage = str(exc)
+            outage = _outage_of(exc)
         except UploadUnreadableError as exc:
             raise _UploadRefused(_upload_refusal_kind(exc)) from None
+        if unfinished is not None:
+            # After the handler, so the store's error is on no chain.
+            raise HTTPException(_UPLOAD_DELETE_INCOMPLETE_STATUS, unfinished)
         if outage is not None:
             raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
@@ -10028,10 +10188,14 @@ def create_app(
                     ),
                     client=client_ip(request),
                 )
+            except AUDIT_WRITE_DEFECTS as exc:
+                # Inside the refusal set below, so caught first: they still mean a defect, and
+                # the record says so (BACKLOG #5523). Not re-raised: a raise would replace the
+                # refusal owed with a 500, the case write_audit_soft's docstring says to pass
+                # defects=() for.
+                failed = f"defect {type(exc).__name__}"
             except audit_write_errors() as exc:
-                # The store-refusal set the other fail-soft audit writes catch. Defects
-                # (AUDIT_WRITE_DEFECTS) are not re-raised: a raise would replace the refusal owed
-                # with a 500, the case write_audit_soft's docstring says to pass defects=() for.
+                # The store-refusal set the other fail-soft audit writes catch.
                 # write_audit_soft itself is not used: it logs the traceback, whose frames reach
                 # the route frame's decrypted `criterias`. Names the refusal's own status and
                 # cause, which the row would have held, at most once per preset, cause and failure
@@ -10064,16 +10228,21 @@ def create_app(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
             except (BlankCellError, NonTextCellError) as exc:
-                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, which
-                # it never writes (audited and logged there, and alerted on a keyed store), so it
-                # never reads as an empty filter that would widen the search. Its own text: a
-                # keyless store has no integrity tag for such a cell to fail.
+                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, or a
+                # sealed one that opens to an empty value, which it never writes (audited and
+                # logged there, and alerted on a keyed store), so it never reads as an empty filter
+                # that would widen the search. Its own text: a keyless store has no integrity tag
+                # for such a cell to fail.
                 cause = type(exc).__name__
-                shape = "blank" if isinstance(exc, BlankCellError) else "non-text"
+                if isinstance(exc, SealedBlankCellError):
+                    shape = "criteria that open to an empty value"
+                elif isinstance(exc, BlankCellError):
+                    shape = "blank criteria"
+                else:
+                    shape = "non-text criteria"
                 refusal = HTTPException(
                     423,
-                    f"preset {preset_id} has {shape} criteria, written outside the store, and"
-                    " cannot be used",
+                    f"preset {preset_id} has {shape}, written outside the store, and cannot be used",
                 )
             except CellTagError as exc:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
@@ -10088,8 +10257,13 @@ def create_app(
                 # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
                 # so a later try may succeed. Its text goes to the log only, as in uploads, and as
                 # a str: the exception's traceback would reach this frame's decrypted `criterias`.
-                _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
+                # Once per preset and reason per interval, as the other arms log: an outage fails
+                # every recall, and a changed reason is logged again (BACKLOG #5523).
                 cause = type(exc).__name__
+                if _first_layered_refusal(preset_id, f"{cause}:{exc}"):
+                    _log.warning(
+                        "layered search answered 503 on preset %s: %s", preset_id, str(exc)
+                    )
                 refusal = HTTPException(
                     503,
                     f"the store's key service could not open preset {preset_id}. Try again shortly",
@@ -10125,7 +10299,12 @@ def create_app(
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
             # arm is gone: get_search_preset returns the criteria through the cipher as a
             # non-blank str, and refuses a NULL, blank or non-text cell itself (BACKLOG #5523).
-            criteria, refused = json_loads_or_refusal(row["criteria"])
+            # A store that broke that contract, a test double say, gets this 400, not a TypeError's
+            # 500 (BACKLOG #5523).
+            stored = row["criteria"]
+            criteria, refused = (
+                json_loads_or_refusal(stored) if isinstance(stored, str) else (None, "not text")
+            )
             if refused is not None or not isinstance(criteria, dict):
                 # BACKLOG #5523: the store writes criteria as a JSON object, so this was written
                 # outside it. Logged, once per preset per interval, and audited each time.
@@ -10174,15 +10353,18 @@ def create_app(
         )
         # BACKLOG #5523: coalesced into summary_access after the route's own row, as
         # /messages/search does, so a layered recall is no way round the harvest signal (review
-        # M-5). Counted post-redaction; note() writes nothing when both counts are zero.
-        await request.app.state.summary_auditor.note(
-            engine.store,
-            identity.username,
-            meta["channel_id"],
-            count_exposed(messages),
-            time.time(),
-            masked=count_masked(messages),
-        )
+        # M-5). Counted post-redaction; note() writes nothing when both counts are zero, and is
+        # skipped then, as the other call sites skip it.
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
+            await request.app.state.summary_auditor.note(
+                engine.store,
+                identity.username,
+                meta["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
+            )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,
@@ -10811,7 +10993,8 @@ def create_app(
         offset: int = Query(0, ge=0),
     ) -> LogTailPage:
         """A paginated, **redacted** page of the newest application-log file's tail (#171, ADR 0130) — the
-        in-console viewer over the same redacted tail the support bundle produces. ``offset`` counts lines
+        in-console viewer. It picks and reads its file on its own terms, not the support bundle's
+        (docs/DANGEROUS-FUNCTIONALITY.md section 7 has both rows). ``offset`` counts lines
         back from the END (``offset=0`` = the most recent ``limit`` lines).
 
         This is a genuine **new PHI read surface**: the app log is best-effort-redacted (a residual
@@ -12604,6 +12787,23 @@ async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink
         await asyncio.sleep(interval)
 
 
+def _chain_registry_guards(
+    *guards: Callable[[Registry], None] | None,
+) -> Callable[[Registry], None] | None:
+    """One registry guard that runs each given guard in order; ``None`` entries are skipped, a lone
+    survivor is returned as it is, and none gives ``None``. The engine takes a single guard, and
+    the first refusal wins (BACKLOG #5775)."""
+    live = [guard for guard in guards if guard is not None]
+    if len(live) <= 1:
+        return live[0] if live else None
+
+    def chained(registry: Registry) -> None:
+        for guard in live:
+            guard(registry)
+
+    return chained
+
+
 def _chain_registry_preflights(
     *preflights: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None,
 ) -> Callable[[Registry, Mapping[str, Any]], Awaitable[None]]:
@@ -12746,7 +12946,11 @@ def create_managed_app(
     so it is refused beside an enabled ``cluster_settings``, and ``serve`` passes it only on a
     single node. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
-    inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
+    inventory's settings half from; ``None`` makes that route say it could not read it. Its
+    ``[environments].base_dir``, with an ``env_values_provider`` that is a
+    ``SnapshotEnvValuesProvider`` naming a value file, also turns on the ADR 0050 AC-3 value-file
+    guard, run before ``registry_guard`` (BACKLOG #5775,
+    :func:`~messagefoundry.config.anchor.explicit_root_value_file_guard`). The Vault
     privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
     Vault token is probed.
     ``prestore_anchor_refusals`` holds trust-anchor refusals a caller made before the store opened
@@ -13136,7 +13340,14 @@ def create_managed_app(
                 coordinator=coordinator,
                 cluster_settings=cluster_settings,
                 registry_filter=registry_filter,
-                registry_guard=registry_guard,
+                # BACKLOG #5775: the ADR 0050 AC-3 value-file check, so a reload that turns on a
+                # connection whose env() a start did not count is refused as that start would have
+                # been. First, so a guard that reads env() values never judges the ones a missing
+                # value file leaves. None, no check, without an explicit root.
+                registry_guard=_chain_registry_guards(
+                    explicit_root_value_file_guard(static_credential_settings, env_values_provider),
+                    registry_guard,
+                ),
                 # BACKLOG #1188: the settings the engine is not otherwise handed, read only for the
                 # directories they name (key files, CA files, spool dirs), which the `.processed`
                 # archive sweep must never reach.
@@ -13538,7 +13749,7 @@ def create_managed_app(
             # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
             app.state.tls_settings = tls_settings
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
-            app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
+            app.state.log_dir = log_dir  # back GET /status app-log metering (#50) + GET /logs/tail
             app.state.approval_gate = _build_approval_gate(
                 engine,
                 approvals_settings or ApprovalsSettings(),

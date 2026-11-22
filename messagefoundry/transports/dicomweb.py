@@ -54,7 +54,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
-    float_setting,
+    positive_seconds,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -315,6 +315,33 @@ def _sequence_items(datasets: list[dict[str, Any]], tag: str) -> list[Any] | Non
     return items
 
 
+def _failed_sop_state(datasets: list[dict[str, Any]]) -> tuple[bool, bool]:
+    """``(proven, malformed)`` for the FailedSOPSequence (``00081198``) across the datasets.
+
+    ``proven``: some dataset's sequence is well formed and holds an item, a rejection the reply
+    proves. ``malformed``: some dataset's sequence is in a shape dicom+json does not allow, so it
+    proves nothing: one :func:`_element_values` refuses, or one that holds an item while its own
+    ``vr`` is absent or not ``SQ``, or whose items are not all dataset objects (BACKLOG #5914). Each dataset is judged
+    alone, so a malformed sequence in one does not hide a proven rejection in another. An absent
+    element, or one :func:`_element_values` passes with no item, is neither, whatever its ``vr``.
+    Only the shape is read, never an item's contents (PHI-safe)."""
+    proven = malformed = False
+    for ds in datasets:
+        if _FAILED_SOP_SEQUENCE not in ds:
+            continue
+        element = ds[_FAILED_SOP_SEQUENCE]
+        items = _element_values(element)
+        if items is None:
+            malformed = True
+        elif items:
+            well_formed = element.get("vr") == "SQ" and all(
+                isinstance(item, dict) for item in items
+            )
+            proven = proven or well_formed
+            malformed = malformed or not well_formed
+    return proven, malformed
+
+
 def _names_an_instance(item: Any) -> bool:
     """True when a ReferencedSOPSequence item is a dataset whose ReferencedSOPInstanceUID element
     has ``vr`` ``UI``, passes :func:`_element_values`, and holds exactly one value (the attribute's
@@ -341,10 +368,13 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
 
     - ``unparseable-reply``: the body is not JSON, repeats a key at any depth (``json.loads`` keeps
       the last of two, so a FailedSOPSequence could be read two ways), is nested past json's
-      recursion limit (a ``RecursionError``, which a ``ValueError`` arm does not reach), or is not
-      a dataset object or a non-empty array of them.
-    - ``failed-sop``: a FailedSOPSequence (``00081198``) with any item, or in a shape dicom+json
-      does not allow -- that direction fails closed.
+      recursion limit (a ``RecursionError``, which a ``ValueError`` arm does not reach), is not
+      a dataset object or a non-empty array of them, or carries a FailedSOPSequence in a shape
+      dicom+json does not allow (:func:`_failed_sop_state`) and none that proves a rejection --
+      that direction fails closed, under this code and not ``failed-sop``, since such a sequence
+      proves no rejection (BACKLOG #5914).
+    - ``failed-sop``: a well-formed FailedSOPSequence (``00081198``) with an item, in any of the
+      datasets, a proven rejection.
     - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
       no stored instance: no ReferencedSOPSequence (``00081199``) item that names one by its
       ReferencedSOPInstanceUID (``00081155``; :func:`_names_an_instance`). An empty 202 is one.
@@ -366,15 +396,16 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
         datasets = obj
     else:
         return "unparseable-reply", f"a reply that is not parseable dicom+json; {_NOT_SENT}"
-    failed = _sequence_items(datasets, _FAILED_SOP_SEQUENCE)
-    if failed is None:
-        # A malformed sequence proves no rejection, so it carries the replay advice.
+    proven, malformed = _failed_sop_state(datasets)
+    if proven:
+        return "failed-sop", "a FailedSOPSequence (instance rejected)"
+    if malformed:
+        # A malformed sequence proves no rejection, so it is not failed-sop, and it carries the
+        # replay advice.
         return (
-            "failed-sop",
+            "unparseable-reply",
             f"a FailedSOPSequence in a shape dicom+json does not allow; {_NOT_SENT}",
         )
-    if failed:
-        return "failed-sop", "a FailedSOPSequence (instance rejected)"
     if status == 202:
         referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []
         if not any(_names_an_instance(i) for i in referenced):
@@ -424,7 +455,8 @@ class DicomWebDestination(DestinationConnector):
             # BACKLOG #1241: and the control-char screen alone is not enough for a value that becomes a
             # path SEGMENT — refuse at construction, where the operator sees it, not at the URL layer.
             _reject_non_uid(self.study_uid, "study_uid")
-        self.timeout: float = float_setting(
+        # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
+        self.timeout: float = positive_seconds(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOMweb destination"
         )
         self.encoding: str = s.get("encoding", "utf-8")

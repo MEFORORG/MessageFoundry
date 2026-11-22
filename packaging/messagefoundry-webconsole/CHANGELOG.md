@@ -76,6 +76,14 @@ this line.**
 
 ### Security
 
+- **A step-up request refused for a new client address spends no budget.** The step-up gates
+  (`require_ui_step_up` and its action, re-auth-only and own-sessions variants) asked the
+  new-address question after their `require_ui` base had already charged the admin-write budget,
+  so a cookie replayed from another address and refused could still throttle the real operator's
+  writes. The base now asks it, before either charge. The preset save's refusal now continues to
+  the search form, where it used to continue to its own POST path, which `/ui/reauth` refuses. The
+  layered search's refusal now keeps its `?presets=` query, without which the run answers 400.
+  The supported engine seam moved with it. (`BACKLOG #5646`)
 - **The user pages read an account through the engine's seal-checked read.** The detail page, the
   federated identity screen and its unlink confirmation, the channel-scope save and the
   notification-address form read the account through `AdminHandlers.checked_user` rather than the

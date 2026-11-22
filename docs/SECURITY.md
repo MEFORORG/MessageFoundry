@@ -1736,13 +1736,27 @@ are still answered as a failing record and reported**, a false alarm the reads c
 tampering, because the role rows are read apart from the account's row. Where
 `[auth].require_action_step_up` is on, the default, `PATCH /users/{user_id}` reads the account
 after its gate has spent the single-use `admin_user_update` grant, so its 423 and its 404 cost that
-proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. Where it is
-off, the gate checks the step-up session window instead and spends nothing, so neither answer
-costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
+proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. So does its 422
+for a changed display name the name rule refuses (BACKLOG #5784), which the route checks against
+the stored name after that read. Where it is
+off, the gate checks the step-up session window instead and spends nothing, so none of these
+answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
 answered the same way, a 423 or listed as failed, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
 lists nothing, pages `authority-seal-transit` and writes no audit row.
+
+A custom role save checks the role name (BACKLOG #5785) after its gate. Where
+`[auth].require_action_step_up` is on, the default, and the save would end the caller's own
+sessions, that gate has spent the single-use `save_ends_own_sessions` proof, so a refused name
+costs it: on `PUT /roles/custom/{role_id}` the answer is a 422, and on the console's
+`POST /ui/roles/custom/{role_id}/update` it is a 400 page re-rendering the form. The console's
+proof is also spent on a form the request model refuses, such as a malformed permission id. Where
+the setting is off, or the save ends none of the caller's own sessions, the gate checks the
+step-up session window and spends nothing. The save reads the stored name only for a name the
+rule refuses, to tell a re-sent stored name, which is exempt, from a new one. That read checks
+no seal, so it calls no Vault transit and reports nothing; a name written outside the store is
+exempt like any other, and the save re-seals the row as it always has.
 
 #### Audit
 
@@ -2709,7 +2723,10 @@ with a note saying why. A release refused for unreadable parameters writes an
 `approval.params_unreadable` row against the approver, which carries no parameters, and one refused
 as `params_no_requester` or `params_no_fingerprint` writes an `approval.params_no_requester` or
 `approval.params_no_fingerprint` row against the approver. A
-release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
+release refused on the requester's standing writes `approval.stale_requester`, above. One an
+operation refuses on this node's state before the claim, at least a config reload on a cluster
+node that lost its lease (BACKLOG #5906), writes `approval.node_refused` against the approver and
+leaves the request unclaimed. A refusal for
 a request with no requester id, or for an operation no longer registered, still writes no row.
 
 **A listing that shows `requester_not_authorized` writes one audit row (vault BACKLOG #3747).** Each
@@ -2780,7 +2797,7 @@ row may have committed after all.
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
 `no_approved_digest` (reached only past the gate's own check, below), `digest_unavailable`,
-`store_unavailable` and `reload_fault`. **An operator
+`store_unavailable`, `lease_lost` and `reload_fault`. **An operator
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
@@ -2808,7 +2825,31 @@ reason is written only for an anchor that passed them. An anchor they refuse is 
 `trust_anchor` when its audit row then fails, and so is an anchor file that cannot be read.
 Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine log is the record
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
-every refused release does. The engine log carries the store's error.
+every refused release does. The engine log carries the store's error. An applied reload on a
+cluster node whose coordinator no longer reads it as leader, while its graph still runs, is
+refused as `lease_lost` (BACKLOG #5906). "The lease" here is the coordinator's cached
+`is_leader()` flag, not a read of the lease row, so it can lag that row. On such a node an inline
+reload answers **503**. A request that dual control gates files its hold as usual, since the hold
+reads no lease. A release approved on that node is refused with **503** before the gate claims
+it, so the request is not spent and can be approved on the leader; the refusal writes an
+`approval.node_refused` row against the approver. If the flag goes false after that check and
+before the runner's second read, below, the reload itself refuses, and the approval is then
+marked failed and answers 422, as every refused release does. If it goes false after that second
+read, the release is not refused and runs on this node, as an inline reload would. A release on
+the leader, or on this node once its graph has stopped, is not refused for the lease. A dry run
+there is not refused for the lease: it swaps nothing and never asks for it. The runner reads the
+flag twice: once it holds the reload lock, which is after `Engine.reload_detail` has loaded the
+config and run its preflights, and again before the reload stops any listener. Each read is point
+in time, so what they guarantee is at least this: a reload is refused when the flag reads false
+at either read, and a flag that goes false after the second read is not refused. That reload then
+binds listeners and resumes lanes on the node, and `Engine._stop_graph` takes them down only once
+the reload ends, since it waits on the same lock. A cluster convergence pass on such a node is
+refused the same way, before it loads the config, and retried each interval; the first pass of
+such a run logs at INFO with no traceback, the rest at DEBUG. A DR activation's reload would be
+refused too, and its `dr_activation_aborted` row names the lease. Only an embedder that skips the
+settings check reaches that, since the service settings refuse `[dr]` together with `[cluster]`;
+there the refusal comes at the activation's profile step, after its store recovery, its seed
+marker and any takeover hook have run.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer
@@ -3080,7 +3121,9 @@ in the local audit log for a `dead_letter_replay` or `connection_purge` row writ
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
 `approval.no_longer_gated`, `approval.params_unreadable`, `approval.params_no_requester` and
-`approval.params_no_fingerprint`. A claim, a rejection or a resolution that the store cannot write with
+`approval.params_no_fingerprint`. An `approval.node_refused` refusal answers the status its
+operation raised, at least **503** for a config reload approved on a cluster node that lost its
+lease, whether or not its row is written. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
 error, as stated for the claim above.
 
@@ -4788,11 +4831,12 @@ unconditional dedicated rows (`message_view`, `message_search`) regardless, and 
 `GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
 `GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
 `GET /search/layered` also tries to write its `preset.layered_search` row when it refuses a
-stored preset while loading it, naming the preset id, the status and the refusal cause, an error
-class name or `malformed` (BACKLOG #5523). The write is best effort: a failed write does not change
-the answer, and it is logged at ERROR. A refusal of the composed layers writes no such row. A
-refusal row has `refused` in its detail, which tells it from a search that ran. A NULL, empty or
-non-text criteria cell is refused by the store itself, which logs a WARNING and writes the
+stored preset while loading it, naming at least the number of presets layered, the preset id, the
+status and the refusal cause, an error class name or `malformed` (BACKLOG #5523). The write is
+best effort: a failed write does not change the answer, and it is logged at ERROR. A refusal of
+the composed layers writes no such row. A refusal row has `refused` in its detail, which tells it
+from a search that ran. A NULL, empty or non-text criteria cell, and a sealed one that opens to an
+empty string, are refused by the store itself, which logs a WARNING and writes the
 `integrity.preset_tag_failed` row on every store, and on a keyed store raises the
 `integrity_drift` alert, as for a moved preset. The store rate-limits its WARNING, alert and
 `integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its
@@ -5009,7 +5053,7 @@ slack.
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited` on the sign-in start, or a **429** that re-renders the step-up page on `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages into the same cache; WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
 | `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped, because that GET then runs the POST leg | header **present** and not `navigate` (absent = allowed by this check. On `POST /ui/oidc/start` the `Sec-Fetch-Site` row below runs first and refuses a POST with neither `Sec-Fetch-Site` nor `Origin`, with a 403 and no audit row, BACKLOG #1116, #1124. The skipped-interstitial GET runs that row too, but as a GET: a request with neither header is **not** refused there, under owner rulings R4 and R4b of 2026-09-28). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site, or same-site when the identity provider is on the console's site, where the `/ui` fetch-metadata row's `Sec-Fetch-User: ?1` demand applies to it (`docs/BROWSER-SUPPORT.md`, *Federated sign-in and form-action*) | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** each leg's limiter, so the audit write is itself rate-bounded: the login limiter, or on a step-up return to the callback the per-user ceremony key (BACKLOG #3374) and, for the row alone, the step-up return audit budget, kept per user with a backstop across all sources that pages when it stops a row (control 11 of the 6.1.1 protection set, BACKLOG #3965) | on | (no knob) |
 | Instance environment posture × claimed AI data scope | `[ai].derived_posture()` (from `[ai].environment` and `[security].production_instance`; an unresolved posture defaults to the **strictest** ceiling) re-resolved server-side through `resolve_effective_policy` on every `POST /ai/chat` | the effective mode is not `managed_endpoint`, or the request's `data_scope` exceeds the server-enforced ceiling (the engine-broker MVP enforces `code_only` regardless of what the caller claims) | **DENY** — **409** on the mode mismatch, **403** on scope excess; each audited `ai.assist` with PHI-safe metadata only | `mode = byo`, `data_scope = code_only` | `[ai].mode`, `[ai].data_scope`, `[ai].environment`, `[security].production_instance` |
-| Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours`; the hold is younger than `min_dwell_seconds` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; the same **202** and id + `approval.request_repeated` audit for the same requester's repeat of an open hold; **403** on self-approval; **409** once expired or already decided; **409** + `approval.too_early` audit while younger than the floor (the hold stays pending); **409** + `approval.no_longer_gated` audit once dual control no longer gates the operation (the hold stays pending) | off; `['connection_purge','dead_letter_replay']`; 72 h; 2 s | `[approvals].enabled`, `operations`, `expiry_hours`, `min_dwell_seconds` |
+| Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours`; the hold is younger than `min_dwell_seconds` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; the same **202** and id + `approval.request_repeated` audit for the same requester's repeat of an open hold; **403** on self-approval; **409** once expired or already decided; **409** + `approval.too_early` audit while younger than the floor (the hold stays pending); **409** + `approval.no_longer_gated` audit once dual control no longer gates the operation (the hold stays pending); **503** + `approval.node_refused` audit for a config reload approved on a cluster node that lost its lease (the hold stays pending, for the leader) | off; `['connection_purge','dead_letter_replay']`; 72 h; 2 s | `[approvals].enabled`, `operations`, `expiry_hours`, `min_dwell_seconds` |
 | mTLS client-certificate subject | the subject DN of the loaded CA certificate whose key directly signed the peer certificate, and the peer's qualified subject-RDN / SAN names | exact match of the name under the map entry for that verifying CA's DN (BACKLOG #2237), in a deny-by-default map (empty map = feature off). The same subject from another CA matches nothing. A client-sent intermediate, and two loaded CAs sharing one DN with different keys, name no issuer | **ALLOW** — resolve the mapped account **id** (BACKLOG #2238; never a username, which a rename can hand to another account) to its Identity (RBAC then authorizes); an unknown or disabled account grants none. A directory account is also asked about in the directory on every request and fails closed: anything short of a present, enabled account grants none, and the Identity keeps only the stored roles and channels its current groups still map to. One exception: when none of its groups is in the scope map, a scope an administrator set stays as stored (BACKLOG #2316) | `{}` = off | `[api].tls_client_cert_identities` (requires `tls_client_ca_file`) |
 | Operator-listener peer client certificate | the TLS peer certificate presented at the API / `/ui` handshake | `[api].tls_client_ca_file` set (requires `tls_cert_file`) → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags (`build_api_ssl_context` in `api/tls.py`); no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails, so the request never reaches the ASGI stack at all: no middleware runs, no route matches, no identity is resolved, and no 403 body is produced. The failure is logged as a throttled WARNING that names no peer, as [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states (vault BACKLOG #3302) | unset = off (server-only TLS, no peer-certificate decision on the control plane) | `[api].tls_client_ca_file` |
 | Declared token class of a federated assertion | the `typ` JOSE header, and the presence of an `events` claim, on a **signature-verified** JWS | `typ` present and — normalised `.strip().lower()` then `application/`-stripped — not `jwt`, so `at+jwt` (RFC 9068 access token), `logout+jwt` and `secevent+jwt` are refused while an **absent** `typ` is allowed (RFC 7519 §5.1 makes the header advisory); or the claim set carries `events`, i.e. an RFC 8417 security event token. Every such token is minted by the **same issuer under the same key**, so no signature or key rung distinguishes it | **DENY** the sign-in — `ClaimsError("wrong_token_type")` at the key-selection rung, `ClaimsError("unexpected_events_claim")` ahead of the nonce compare (a logout token carries no nonce, so a later check would misreport it as a browser-binding failure) | on | (no knob) |
@@ -8322,7 +8366,7 @@ are covered:
 
 | Hop | When its CA is checked | What a refusal does |
 |---|---|---|
-| The `serve` syslog forwarder | Before the forwarder is built | Builds no forwarder and logs that forwarding is off. The audited check then refuses the start before any listener binds. It writes its rows when it can read the file |
+| The `serve` syslog forwarder | Before the forwarder is built | Builds no forwarder and logs that forwarding is off. The audited check then refuses the start before any listener binds. It writes its rows when it can read the file. A start refused before the API lifespan writes no audit row for it. For at least this CA, such a start logs a WARNING with the refusal's reason; at least the exits `messagefoundry/auth/trust_anchors.py` module item 10 lists may log nothing |
 | The `supervise` syslog forwarder | Before the forwarder is built | Refuses the start on stderr before any engine shard spawns, with no audit row: that process has no audited check |
 | The `serve` alert notifier, when it sends email | Before the notifier is built, for the email CA or the internal CA it falls back to | Builds no email transport, and no alert is suppressed for it (module item 10 says how). The audited check then refuses the start. It writes its rows when it can read the file |
 | The offline recovery commands' security notices | Before the SMTP hop is built | Drops the notice with a WARNING. The recovery goes on |

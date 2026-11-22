@@ -1180,3 +1180,32 @@ async def test_a_reject_under_leave_costs_no_tracking_stat(
     await rig.scan()
     assert await rig.scan() == ["a.hl7"]
     assert calls == []
+
+
+async def test_a_remembered_reject_costs_no_stat_hop_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Step 9 of BACKLOG #5717: the fresh pass judges an unchanged remembered reject by the stat the
+    listing already took, so it costs no ``_file_mark`` hop, which under a share credential is a
+    logon of its own. A changed one is still stat'd and examined.
+
+    Mutation: ignore ``_listed_marks`` in ``_examine``. Red: one call per scan."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    path = rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    calls: list[Path] = []
+    real_mark = file_mod._file_mark
+
+    def mark(p: Path) -> Any:
+        calls.append(p)
+        return real_mark(p)
+
+    monkeypatch.setattr(file_mod, "_file_mark", mark)
+    for _ in range(3):
+        assert await rig.scan() == []
+    assert calls == []
+
+    path.write_bytes(_PDF + b" and more")
+    await rig.scan()
+    assert calls == [path], "a changed reject is stat'd and examined afresh"

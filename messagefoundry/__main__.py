@@ -47,6 +47,7 @@ __lazy_modules__ = ["sqlite3", "tomllib", "messagefoundry.exception_origin"]
 
 # E402 on each import below: they follow the install call above on purpose.
 import argparse  # noqa: E402
+import contextvars  # noqa: E402  # a builtin module; serve's exit hook (#5391)
 import functools  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
@@ -96,6 +97,7 @@ if TYPE_CHECKING:
     # call must not pay for it (see the module docstring on deferred heavy imports).
     import asyncio
 
+    from messagefoundry.api.tls import GeneratedPairReplaced
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.environments import EnvironmentValuesReader
@@ -392,12 +394,25 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
 
     validate = sub.add_parser("validate", help="check a config dir and report all problems")
     validate.add_argument("--config", default="samples/config", help="config modules directory")
-    _add_anchor_flags(validate)
+    _add_anchor_flags(
+        validate,
+        env_help=_offline_env_help(
+            "A reference that does not resolve is reported as a problem, naming its key."
+        ),
+    )
     validate.add_argument("--json", action="store_true", help="emit JSON")
 
     graph = sub.add_parser("graph", help="print the wired Connection/Router/Handler graph")
     graph.add_argument("--config", default="samples/config", help="config modules directory")
-    _add_anchor_flags(graph)
+    _add_anchor_flags(
+        graph,
+        env_help=_offline_env_help(
+            "A reference that does not resolve is listed under env_problems beside the graph, "
+            "naming its key, as are settings or a value file that cannot be read; graph reports "
+            "them and does not fail on them.",
+            root_scope="Under an explicit --project-root",
+        ),
+    )
     graph.add_argument("--json", action="store_true", help="emit JSON")
 
     dryrun = sub.add_parser(
@@ -410,7 +425,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "silent OFF (#230).",
     )
     dryrun.add_argument("--config", default="samples/config", help="config modules directory")
-    _add_anchor_flags(dryrun)
+    _add_anchor_flags(
+        dryrun,
+        env_help=_offline_env_help(
+            "A reference that does not resolve stops the run, which names its key."
+        ),
+    )
     dryrun.add_argument(
         "--messages", required=True, nargs="+", help="HL7 file(s) or directories of *.hl7"
     )
@@ -569,20 +589,25 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     security.add_argument("--json", action="store_true", help="emit JSON")
 
-    # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
-    # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
-    # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
-    # operator username is exactly that shape while this engine's own settings classifier calls a
-    # username a credential. A blanket claim resting on a member that does not meet it is the
+    # The old wording read "a SECRET-FREE / PHI-free support zip". The config summary holds no
+    # secret and the status snapshot is metadata-only, the phi_contract's own terms, but the log
+    # tail meets neither, because its redaction is best-effort: a single-token identifier
+    # survives it (messagefoundry/redaction.py states that residual), and an operator username
+    # is exactly that shape while this engine's own settings classifier calls a username a
+    # credential. A blanket claim resting on a member that does not meet it is the
     # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
     # control -- see BACKLOG #1475 and the exclusion table in
     # tests/test_log_redaction_secret_domain.py for why the username class stays out. The help
     # repeats the manifest phi_contract's log-tail residual because an operator reads it before the
-    # zip exists; tests/test_support_bundle.py holds the two to the same terms (BACKLOG #5385).
+    # zip exists; tests/test_support_bundle.py and tests/test_b532w3_redaction_bundle_members.py
+    # hold the two to the same terms (BACKLOG #5385).
     # Both the command list and `support-bundle --help` print it.
     support_bundle_help = (
-        "write a support zip to hand to support (#49): a secret-free config summary "
-        "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
+        "write a support zip to hand to support (#49). Its members: version.txt (the engine "
+        "version); manifest.json (at least a list of the other members, the engine version, a generation "
+        "time and the phi_contract); config-summary.json (counts/names only, holding no "
+        "secret); status.json (from the metadata-only status models); and, when written, app-log.txt, "
+        "a REDACTED app-log tail or an MF-BUNDLE-LOG-* code in its place. The tail's "
         "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
         "as an operator username and, on a non-production instance logging at DEBUG, a message "
         "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "
@@ -597,7 +622,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     support_bundle.add_argument(
         "--config",
         default=None,
-        help="config modules directory — drives the secret-free graph summary (counts/names only)",
+        help="config modules directory — drives the graph summary (counts/names only, no secret)",
     )
     support_bundle.add_argument(
         "--service-config",
@@ -609,8 +634,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--log-tail-lines",
         type=_non_negative_int,
         default=None,
-        help="number of trailing app-log lines to include (redacted); default 500; 0 omits the "
-        "app log",
+        help="at most this many trailing app-log lines are included (redacted), from at most the "
+        "last 4 MiB of the file; default 500; 0 omits the app log",
     )
 
     sub.add_parser(
@@ -1407,16 +1432,33 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     return parser, _DISPATCH
 
 
-def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None) -> None:
+def _offline_env_help(outcome: str, *, root_scope: str = "Where a project root is set") -> str:
+    """The ``--env`` help of ``validate``/``graph``/``dryrun``; ``outcome`` says what the command
+    does with a reference that does not resolve, and ``root_scope`` where its missing-value-file
+    refusal applies (vault BACKLOG #5554)."""
+    return (
+        "active environment NAME. The command resolves every env() reference of each deployed "
+        "connection and lookup against that environment's values. It finds them through the "
+        "settings load serve runs, with --env as [ai].environment and --project-root as "
+        "[environments].base_dir (default: the working directory). It reads them with serve's "
+        f"value reader, so overrides such as MEFOR_VALUE_* apply. {outcome} A resolved value is "
+        f"never printed. {root_scope}, a graph that references env() fails when its value file is "
+        "missing. No connector is built: at least the build and posture checks are "
+        "left to check --env. ADR 0050 lists where this still differs from serve."
+    )
+
+
+def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str) -> None:
     """Add the project-root / active-env / service-config trio to an OFFLINE subcommand (ADR 0050 §3).
 
     ``validate``/``graph``/``dryrun``/``check`` carried only ``--config`` before, so the commit/CI gate
     could resolve a DIFFERENT environment view than ``serve`` (review C3). These flags let the gate
     anchor the same bundle root, WITHOUT adopting serve's required-active-env / explicit-posture
-    refusal (AC-6). On ``validate``/``graph``/``dryrun``, ``--env`` feeds only the value-file check in
-    :func:`_resolve_offline_anchor`, as the default help says (vault BACKLOG #5554). ``check`` is the
-    exception, by ADR 0050's amended AC-6: its settings legs read it as ``serve --env`` does (vault
-    BACKLOG #2355). ``env_help`` replaces the ``--env`` help for it.
+    refusal (AC-6). On ``validate``/``graph``/``dryrun``, ``--env`` feeds the value-file check and
+    the ``env()`` resolution of :func:`_offline_env_values`, as :func:`_offline_env_help` says
+    (vault BACKLOG #5554). ``check`` is the exception, by ADR 0050's amended AC-6: its settings legs
+    read it as ``serve --env`` does (vault BACKLOG #2355). ``env_help`` is each command's ``--env``
+    help.
     """
     p.add_argument(
         "--project-root",
@@ -1426,15 +1468,7 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
         "Default = the working directory (unchanged). Pass serve's own value so relative paths "
         "resolve under the same root.",
     )
-    p.add_argument(
-        "--env",
-        default=None,
-        help=env_help
-        or "active environment NAME. Here it feeds ADR 0050's value-file check under --project-root, "
-        "which can fail the command when that environment's value file is missing, and without "
-        "--project-root it does nothing. It selects no values: at least loading env() values, "
-        "resolving env() references and the posture check are left to check --env.",
-    )
+    p.add_argument("--env", default=None, help=env_help)
     p.add_argument(
         "--service-config",
         default=None,
@@ -1444,7 +1478,10 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
 
 
 def _resolve_offline_anchor(
-    args: argparse.Namespace, *, defer_missing_service_config: bool = False
+    args: argparse.Namespace,
+    *,
+    defer_missing_service_config: bool = False,
+    env_file_check: bool = True,
 ) -> tuple[str, str | None] | int:
     """Apply the ADR 0050 project-root anchor to an offline subcommand's paths, and fail loud on the
     one scoped missing-value-file case. Returns ``(config_dir, service_config)`` resolved under the
@@ -1457,13 +1494,20 @@ def _resolve_offline_anchor(
     selected ``<env>.toml`` is absent — a zero-``env()`` deployment, or a no-root launch, never trips it.
     Under the same two conditions it also fails when ``[environments].dir`` or ``--env`` is one
     :func:`~messagefoundry.config.environments.values_file_path` refuses (BACKLOG #5322).
+
+    ``env_file_check=False`` leaves that check out, for ``validate`` and ``dryrun``:
+    :func:`_offline_env_values` runs it from the settings it loads, so the check and the value read
+    name one file, and falls back to this settings-free check when those settings do not load (vault
+    BACKLOG #5554). ``check`` and ``graph`` keep it here, so ``graph`` exits 2 in every case it did
+    before ``--env`` read values, a settings file that does not load included.
     """
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
 
     cwd = Path.cwd()
     # --project-root is the explicit anchor; absent it, an explicit --service-config may still carry a
-    # [environments].base_dir, but for the OFFLINE gate we only anchor against the explicit flag (no
-    # settings load here — load_config below stays settings-free, like validate/graph/dryrun today).
+    # [environments].base_dir, but the paths here anchor only against the explicit flag, with no
+    # settings load (check's settings legs load settings later; the other three commands load them
+    # in _offline_env_values when given --env).
     root = resolve_project_root(args.project_root, cwd=cwd)
     config_dir = anchor_under_root(args.config, root, cwd=cwd)
     assert config_dir is not None  # args.config always has a string default
@@ -1491,7 +1535,13 @@ def _resolve_offline_anchor(
         and service_config is not None
         and not Path(service_config).exists()
     )
-    if args.project_root is not None and args.env is not None and root is not None and not deferred:
+    if (
+        env_file_check
+        and args.project_root is not None
+        and args.env is not None
+        and root is not None
+        and not deferred
+    ):
         env_dir = _env_dir_name(service_config)
         rc = _check_env_file_present(config_dir, root, args.env, env_dir)
         if rc is not None:
@@ -1499,13 +1549,131 @@ def _resolve_offline_anchor(
     return config_dir, service_config
 
 
+def _offline_env_values(
+    args: argparse.Namespace,
+    config_dir: str,
+    service_config: str | None,
+    *,
+    value_file_check: bool = True,
+) -> dict[str, Any] | int | None:
+    """The ``env()`` values ``validate``/``graph``/``dryrun`` resolve against: ``None`` with no
+    ``--env``, or an exit code, already reported, for the AC-3 missing-value-file refusal (vault
+    BACKLOG #5554, ADR 0050 §3).
+
+    Where the settings load, one load locates the value file for both the AC-3 check and the read.
+    It is the load serve runs, with ``--env`` as the ``[ai].environment`` override and
+    ``--project-root`` as the ``[environments].base_dir`` override serve applies. ``service_config``
+    is the file :func:`_resolve_offline_anchor` chose. The AC-3 check fires wherever that load names
+    a project root, as serve's does, including a ``base_dir`` from the file or the environment.
+    Where the settings do not load, the settings-free AC-3 check of :func:`_resolve_offline_anchor`
+    runs instead, under an explicit ``--project-root`` only, before the failure is raised, so its
+    exit 2 comes first as it did before ``--env`` read values.
+    ``value_file_check=False`` (``graph``) runs no AC-3 check here, because ``graph`` keeps the
+    pre-check in :func:`_resolve_offline_anchor` that it ran before ``--env`` read values. The values
+    are read by :func:`_read_environment_values`, serve's own reader, so overrides such as
+    ``MEFOR_VALUE_*`` apply. A value file that is absent reads as no values, as serve's read does,
+    so each reference it would have supplied is reported missing; a note on stderr names the file
+    looked for. Raises :class:`~messagefoundry.config.wiring.WiringError` in at least these cases:
+    for settings that do not load, as the fixed line ADR 0050's 2026-11-20 note describes, which
+    holds no text from the failure; for a ``--service-config`` that does not exist, in place of
+    the fixed line, as a line naming the path the load looked for, which the same note quotes;
+    and for a value file that cannot be read, naming that file. The callers never print a
+    resolved ``env()`` value."""
+    from messagefoundry.config.anchor import resolve_project_root
+    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+    from messagefoundry.config.settings import settings_file_path
+    from messagefoundry.config.wiring import WiringError
+
+    if args.env is None:
+        return None
+    cli: dict[str, dict[str, object]] = {"ai": {"environment": args.env}}  # as serve --env
+    if args.project_root is not None:
+        cli["environments"] = {"base_dir": args.project_root}  # as serve applies the flag
+    # The detail is not printed here: see the refusal below.
+    settings, _ = _load_service_settings(service_config, cli=cli)
+    if settings is None:
+        # Settings that do not load name no value dir, so under an explicit --project-root the
+        # settings-free pre-check runs first: a graph with env() and no value file still exits 2,
+        # as it did before --env read values, rather than 1 for the settings.
+        explicit_root = resolve_project_root(args.project_root, cwd=Path.cwd())
+        if value_file_check and explicit_root is not None:
+            rc = _check_env_file_present(
+                config_dir, explicit_root, args.env, _env_dir_name(service_config)
+            )
+            if rc is not None:
+                return rc
+        settings_file = settings_file_path(service_config)
+        if service_config is not None and not settings_file.exists():
+            # The loader's wording; it names the path the load looked for, nothing configured.
+            raise WiringError(
+                f"could not load the service settings: service config not found: {settings_file}"
+            )
+        # NO VALIDATOR TEXT (vault BACKLOG #5554): a validator message can quote the value it
+        # refused into output CI logs keep. No source is named either: the cause can be in any
+        # layer the load read, not only the file.
+        raise WiringError(
+            "could not load the service settings; this command does not print the reason, "
+            "because the error text can quote a configured value"
+        )
+    cwd = Path.cwd()
+    base_dir = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
+    dir_name = settings.environments.dir
+    # serve's AC-3 root is the merged base_dir, so a file- or environment-set one counts too.
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
+    if root is not None and value_file_check:
+        rc = _check_env_file_present(
+            config_dir,
+            root,
+            args.env,
+            dir_name,
+            anchor=(
+                "the explicit --project-root"
+                if args.project_root is not None
+                else "the [environments].base_dir project root"
+            ),
+            remedy=(
+                "--project-root"
+                if args.project_root is not None
+                else "[environments].base_dir, set in the settings file or the environment,"
+            ),
+        )
+        if rc is not None:
+            return rc
+    values = _read_environment_values(base_dir=base_dir, dir_name=dir_name, environment=args.env)
+    # The read above refused a path values_file_path refuses, so this call does not raise.
+    env_file = values_file_path(base_dir, dir_name, args.env)
+    if not env_file.is_file():
+        print(
+            f"note: no value file at {env_file} for --env {args.env!r}; an env() reference "
+            "resolves only from an override such as a MEFOR_VALUE_* variable, or its default",
+            file=sys.stderr,
+        )
+    return values
+
+
+def _offline_env_or_exit(
+    args: argparse.Namespace, config_dir: str, service_config: str | None
+) -> dict[str, Any] | int | None:
+    """:func:`_offline_env_values` for ``dryrun``: a settings or value-file failure is reported
+    and returned as an exit code, as the AC-3 refusal already is. ``graph`` lists such a failure
+    instead, so it does not call this."""
+    from messagefoundry.config.wiring import WiringError
+
+    try:
+        return _offline_env_values(args, config_dir, service_config)
+    except WiringError as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+
 def _env_dir_name(service_config: str | None) -> str:
     """The ``[environments].dir`` value-dir name (default ``"environments"``).
 
     Read from the resolved ``service_config`` TOML (a tiny, settings-free tomllib read) so the offline
     AC-3 check honors a CUSTOM ``dir = "envs"`` instead of false-positive-failing on the hardcoded
-    literal. Best-effort: no/unreadable/malformed file -> the default. The full ``load_settings`` is
-    deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun).
+    literal. Best-effort: no/unreadable/malformed file -> the default. The settings-free AC-3
+    pre-check reads it: ``check``'s and ``graph``'s in :func:`_resolve_offline_anchor`, and
+    ``validate``'s and ``dryrun``'s in :func:`_offline_env_values` only when their settings do not
+    load; otherwise those two take the dir from that settings load (vault BACKLOG #5554).
 
     ``MEFOR_ENVIRONMENTS_DIR`` beats the file, as it does in ``serve``'s ``load_settings`` (vault
     BACKLOG #2355). The file read is ``service_config`` alone: under ``--project-root`` with no root
@@ -1520,7 +1688,11 @@ def _env_dir_name(service_config: str | None) -> str:
     try:
         with Path(service_config).open("rb") as fh:
             data = tomllib.load(fh)
-    except (tomllib.TOMLDecodeError, OSError):
+    except (ValueError, RecursionError, OSError):
+        # ValueError covers tomllib.TOMLDecodeError and a file that is not UTF-8 (a
+        # UnicodeDecodeError); RecursionError a deeply nested document. Each is left to the full
+        # settings load: validate's, graph's and dryrun's report it, while check's settings legs
+        # still raise the RecursionError.
         return "environments"
     env_section = data.get("environments")
     if isinstance(env_section, dict):
@@ -1531,10 +1703,19 @@ def _env_dir_name(service_config: str | None) -> str:
     return "environments"
 
 
-def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir: str) -> int | None:
+def _check_env_file_present(
+    config_dir: str,
+    root: Path,
+    env_name: str,
+    env_dir: str,
+    *,
+    anchor: str = "the explicit --project-root",
+    remedy: str = "--project-root",
+) -> int | None:
     """Hard-fail (return exit 2) if the graph references ``env()`` but ``<root>/<env_dir>/<env>.toml``
     is absent; otherwise ``None``. ``env_dir`` is ``[environments].dir`` (default ``environments``),
-    read from the resolved service config so a custom value-dir name is honored, not false-failed."""
+    read from the resolved service config so a custom value-dir name is honored, not false-failed.
+    ``anchor`` names where ``root`` came from, and ``remedy`` what to drop, in the message."""
     from messagefoundry.config.anchor import graph_references_env
     from messagefoundry.config.wiring import WiringError, load_config
 
@@ -1555,9 +1736,9 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
         return 2
     if not env_file.is_file():
         print(
-            f"error: the graph references env() but no value file was found at {env_file} under the "
-            f"explicit --project-root {str(root)!r} for --env {env_name!r}. Create that file (or drop "
-            "--project-root to use the working directory).",
+            f"error: the graph references env() but no value file was found at {env_file} under "
+            f"{anchor} {str(root)!r} for --env {env_name!r}. Create that file (or drop "
+            f"{remedy} to use the working directory).",
             file=sys.stderr,
         )
         return 2
@@ -1944,7 +2125,9 @@ def _load_service_settings(
 
     try:
         return load_settings(config_path=config_path, cli=cli), None
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+    except (FileNotFoundError, ValueError, ValidationError, OSError, RecursionError) as exc:
+        # RecursionError: a deeply nested TOML document recurses past the limit in tomllib, as
+        # _read_environment_values measures for a value file (vault BACKLOG #5554).
         return None, settings_error_detail(exc)
 
 
@@ -2326,8 +2509,10 @@ def _start_logging(
     ``spool_dir`` is this process's own spool directory (:func:`_forward_spool_dir`); the spool
     locks it. The last gate checks the collector's CA as a trust anchor (BACKLOG #3470). A caller
     that passes ``deferred_ca_refusals`` takes that refusal itself: it is appended there, and
-    logging is configured without the forwarder. ``serve`` does, so its audited preflight refuses
-    the start, with a row when it can read the file.
+    logging is configured without the forwarder. ``serve`` does: its API lifespan's audited
+    preflight refuses the start. On a way out before uvicorn runs the lifespan, a start already
+    refused for another reason, its exit hook logs that no row records the refusal (BACKLOG
+    #5391). trust_anchors module item 10 says when a row is written.
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2613,9 +2798,8 @@ def _start_logging_gates(
             logging.getLogger(__name__).warning("%s", _ca_note)
     if _ca_refusal is not None:
         logging.getLogger(__name__).warning(
-            "off-box log forwarding is off: the collector's CA was refused (%s). The start check "
-            "refuses the start once the store is open. trust_anchors module item 10 says when "
-            "that refusal has an audit row.",
+            "off-box log forwarding is off: the collector's CA was refused (%s), and this start "
+            "is refused. trust_anchors module item 10 says when that refusal has an audit row.",
             _ca_refusal,
         )
     if forwarder_live and log_forward is not None:
@@ -2904,6 +3088,91 @@ def _remote_debug_refused(
 _UVICORN_DRAIN_SECONDS = 3.0
 
 
+class _PreLifespanAnchorAudit:
+    """The trust anchors ``serve`` refused before uvicorn ran its lifespan, for its exit hook
+    (BACKLOG #5391 added item 2).
+
+    The lifespan's audited preflight writes a refused anchor's ``auth.trust_anchor`` row. At least
+    two anchors are refused before it runs: ``[logging].forward_tls_ca_file``, which
+    ``_start_logging`` refuses and defers, and ``[api].tls_client_ca_file``, which the API TLS
+    context build refuses. ``serve`` arms this just before ``_start_logging`` and disarms it just
+    before ``uvicorn.run``. Any way out in between, a return or an ``Exception``, is an exit the
+    lifespan never ran for, so :func:`_audits_anchors_refused_before_the_lifespan` reports then
+    that no row records each such anchor (:func:`_report_anchors_refused_before_the_lifespan`
+    says why none is written). An interrupt, or any other ``BaseException`` that is not an
+    ``Exception``, reports nothing. Nor does an exit uvicorn takes before the lifespan starts, or
+    one inside the lifespan before its preflight runs."""
+
+    def __init__(self) -> None:
+        self.armed = False
+        self.forward_ca_refusals: list[TrustAnchorError] = []
+        self.api_ca_refusal: Exception | None = None  # a TrustAnchorError, or the CA's OSError
+
+    def arm(self, forward_ca_refusals: list[TrustAnchorError]) -> None:
+        """Start the span. ``forward_ca_refusals`` is the list ``_start_logging`` appends to, read
+        at the exit, so a refusal it adds after this call is still reported."""
+        self.armed = True
+        self.forward_ca_refusals = forward_ca_refusals
+
+    def disarm(self) -> None:
+        """End the span: uvicorn runs the lifespan next, and its preflight writes the rows."""
+        self.armed = False
+        self.forward_ca_refusals = []  # holds nothing once disarmed
+        self.api_ca_refusal = None
+
+    def run(self) -> None:
+        """Report what was refused, once, if the span was armed and not disarmed."""
+        armed, self.armed = self.armed, False
+        if armed and (self.forward_ca_refusals or self.api_ca_refusal is not None):
+            _report_anchors_refused_before_the_lifespan(
+                forward_ca_refusals=self.forward_ca_refusals,
+                api_ca_refusal=self.api_ca_refusal,
+            )
+
+
+_PRE_LIFESPAN_ANCHOR_AUDIT: contextvars.ContextVar[_PreLifespanAnchorAudit | None] = (
+    contextvars.ContextVar("_PRE_LIFESPAN_ANCHOR_AUDIT", default=None)
+)
+
+
+def _pre_lifespan_anchor_audit() -> _PreLifespanAnchorAudit:
+    """The exit hook's record for this ``serve`` call. Raises when the body runs without the
+    hook, so a refactor that drops the decorator fails loudly rather than auditing nothing."""
+    audit = _PRE_LIFESPAN_ANCHOR_AUDIT.get()
+    if audit is None:
+        raise RuntimeError("serve ran without its pre-lifespan anchor audit hook (BACKLOG #5391)")
+    return audit
+
+
+def _audits_anchors_refused_before_the_lifespan(
+    serve: Callable[[argparse.Namespace], int],
+) -> Callable[[argparse.Namespace], int]:
+    """``serve``'s one exit hook over the span :class:`_PreLifespanAnchorAudit` names. The report
+    runs once the body has returned, after every refusal is printed, and before an ``Exception``
+    propagates. It only logs, and opens no store."""
+
+    @functools.wraps(serve)
+    def hooked(args: argparse.Namespace) -> int:
+        audit = _PreLifespanAnchorAudit()
+        token = _PRE_LIFESPAN_ANCHOR_AUDIT.set(audit)
+        failure: Exception | None = None
+        try:
+            try:
+                rc = serve(args)
+            except Exception as exc:
+                failure = exc
+            # Outside the except block, so what the report logs is not chained to the failure.
+            audit.run()
+        finally:
+            _PRE_LIFESPAN_ANCHOR_AUDIT.reset(token)
+        if failure is not None:
+            raise failure
+        return rc
+
+    return hooked
+
+
+@_audits_anchors_refused_before_the_lifespan
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config. The
     # module-level call (vault BACKLOG #2742) has normally put the hook in place already, before
@@ -3326,9 +3595,13 @@ def _serve(args: argparse.Namespace) -> int:
         _write_start_audit(_start_audit)
         raise
     # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
-    # built, and the API lifespan's audited preflight refuses the start. It writes its audit row
-    # when it can read the file.
+    # built, and the API lifespan's audited preflight refuses the start. A way out before uvicorn
+    # runs the lifespan is a start already refused for another reason, and this function's exit
+    # hook, armed here, logs then that no row records the CA's refusal (BACKLOG #5391).
+    # trust_anchors module item 10 says when the CA's audit row is written.
     _forward_ca_refusals: list[TrustAnchorError] = []
+    _anchor_audit = _pre_lifespan_anchor_audit()
+    _anchor_audit.arm(_forward_ca_refusals)
     _logging_refused = _start_logging(
         settings,
         env_name=env_name,
@@ -4822,7 +5095,7 @@ def _serve(args: argparse.Namespace) -> int:
     # security notifications — must surface first. An operator who is missing three declarations
     # should be told about the concrete misconfiguration before the platform-property one, and a
     # gate that jumped the queue would silently change which error every existing exposed-PHI test
-    # (and every existing exposed-PHI deployment) reports.
+    # reports, and which one a deploying site would meet first.
     # ASVS 3.7.3: the "you are leaving this site" interstitial. Two knobs can weaken it, and BOTH are
     # announced at start rather than discovered in a later assessment. Warn-only by design: neither is
     # a PHI-safety property and refusing on an operator's deliberate UX decision would be a
@@ -5127,7 +5400,6 @@ def _serve(args: argparse.Namespace) -> int:
     # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
     # DAST target each decide it their own way, which is the defect this item exists to remove.
     from messagefoundry.api.tls import (
-        GeneratedPairReplaced,
         ensure_api_tls_material,
         generated_state_dir,
     )
@@ -5373,6 +5645,13 @@ def _serve(args: argparse.Namespace) -> int:
                 _tls_refusal,
                 exc_info=exc,
             )
+            # BACKLOG #5391 added item 2: the exit hook reports a refused client CA after this
+            # return. verified_anchor_cadata passes the CA file's own read failure through as a
+            # bare OSError, so that one is told apart by the file it names.
+            if isinstance(exc, TrustAnchorError) or _names_the_file(
+                exc, settings.api.tls_client_ca_file
+            ):
+                _anchor_audit.api_ca_refusal = exc
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # Vault BACKLOG #3302: the loop runs every API handshake, so a failed one left no record.
@@ -5399,6 +5678,7 @@ def _serve(args: argparse.Namespace) -> int:
     logging.getLogger(__name__).info(
         "HTTP request parser in force on the API: %s", http_parser_in_force(run_kwargs["http"])
     )
+    _anchor_audit.disarm()  # the lifespan's preflight audits the anchors from here (#5391)
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -5408,6 +5688,60 @@ def _serve(args: argparse.Namespace) -> int:
         if api_handshakes is not None:
             api_handshakes.close()
     return 0
+
+
+def _names_the_file(exc: BaseException, path: str | None) -> bool:
+    """Whether ``exc`` is an ``OSError`` raised for the file at ``path``, as a failed open or read
+    of it reports in its ``filename``."""
+    if path is None or not isinstance(exc, OSError) or not isinstance(exc.filename, str):
+        return False
+    try:
+        return Path(exc.filename).resolve() == Path(path).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _report_anchors_refused_before_the_lifespan(
+    *,
+    forward_ca_refusals: Sequence[TrustAnchorError],
+    api_ca_refusal: Exception | None,
+) -> None:
+    """Log, for each trust anchor a ``serve`` start refused before uvicorn ran its lifespan, that no
+    ``auth.trust_anchor`` row records this refusal, and why it was refused (BACKLOG #5391 added
+    item 2). ``serve``'s exit hook calls this on a way out between ``_start_logging`` and
+    ``uvicorn.run``: a return or an ``Exception``, and not an interrupt or other
+    ``BaseException`` (:class:`_PreLifespanAnchorAudit` names the exits it does not cover).
+
+    **No row is written, and no store is opened** (Manager decision, BACKLOG #5391: a refused
+    start writes nothing to the store). Writing a row here would take a writable store open, which
+    writes more than the row: :func:`~messagefoundry.store.open_store` says what an open does. At
+    least the AES-GCM invocation reserve is written by every keyed writable open.
+
+    The anchors it names: ``[logging].forward_tls_ca_file`` for each refusal in
+    ``forward_ca_refusals``, and for ``api_ca_refusal`` the setting a ``TrustAnchorError`` names,
+    or ``[api].tls_client_ca_file`` for one that names none and for the CA file's own
+    ``OSError``. Each line says first that no row records the refusal, then carries the
+    refusal's own reason, cut to :func:`~messagefoundry.redaction.safe_exc`'s length, because
+    ``serve`` prints none for a collector CA when ``_start_logging`` then refuses at
+    ``configure_logging``. The lines go through :func:`_write_start_audit`, so ``[logging].level``
+    does not filter them out."""
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
+    from messagefoundry.controlchars import scrub_log_argument
+    from messagefoundry.redaction import safe_exc
+
+    refused: list[tuple[str, Exception]] = [
+        ("[logging].forward_tls_ca_file", refusal) for refusal in forward_ca_refusals
+    ]
+    if api_ca_refusal is not None:
+        named = api_ca_refusal.setting if isinstance(api_ca_refusal, TrustAnchorError) else None
+        refused.append((named or "[api].tls_client_ca_file", api_ca_refusal))
+    _write_start_audit(
+        [
+            f"no audit row records the refused {setting} (BACKLOG #5391); the refusal was: "
+            f"{scrub_log_argument(safe_exc(refusal))}"
+            for setting, refusal in refused
+        ]
+    )
 
 
 def _floor_or_refusal[T](refusing_to: str, build: Callable[[], T]) -> T | None:
@@ -5489,7 +5823,6 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     would in serve: the WARNING the renewal logged, with both fingerprints, is then its record.
     """
     from messagefoundry.api.tls import (
-        GeneratedPairReplaced,
         ensure_api_tls_material,
         generated_state_dir,
         record_generated_pair_replacements,
@@ -5962,13 +6295,23 @@ def _fleet_connection_key_file_refusal(
 
 
 def _validate(args: argparse.Namespace) -> int:
-    from messagefoundry.config.wiring import validate_config
+    from messagefoundry.config.wiring import Diagnostic, WiringError, validate_config
 
-    resolved = _resolve_offline_anchor(args)
+    resolved = _resolve_offline_anchor(args, env_file_check=False)
     if isinstance(resolved, int):
         return resolved
-    config_dir, _ = resolved
-    diags = validate_config(config_dir)
+    config_dir, service_config = resolved
+    unreadable: list[Diagnostic] = []
+    try:
+        env = _offline_env_values(args, config_dir, service_config)
+    except WiringError as exc:
+        # Reported beside the other problems; the graph is still validated, with no values.
+        unreadable.append(Diagnostic(message=str(exc)))
+        env = None
+    if isinstance(env, int):
+        return env  # the AC-3 refusal, already reported
+    env_values = env
+    diags = [*unreadable, *validate_config(config_dir, env_values=env_values)]
     if args.json:
         print(
             json.dumps(
@@ -5987,10 +6330,24 @@ def _graph(args: argparse.Namespace) -> int:
     from messagefoundry.config.graph import build_wiring_graph
     from messagefoundry.config.wiring import WiringError, display_settings, load_config
 
+    # The missing-value-file refusal (exit 2) is the pre-check graph ran before --env read values:
+    # under an explicit --project-root, from the settings-free dir read, so it still fires when the
+    # settings do not load (vault BACKLOG #5554).
     resolved = _resolve_offline_anchor(args)
     if isinstance(resolved, int):
         return resolved
-    config_dir, _ = resolved
+    config_dir, service_config = resolved
+    # Past that refusal, graph reports a graph and does not gate one (BACKLOG #1648, and a Manager
+    # decision for vault BACKLOG #5554): a settings or value-file failure under --env, and each
+    # env() reference that does not resolve, is listed under env_problems beside the graph.
+    env_read_problems: list[str] = []
+    try:
+        env = _offline_env_values(args, config_dir, service_config, value_file_check=False)
+    except WiringError as exc:
+        env_read_problems.append(str(exc))
+        env = None
+    assert not isinstance(env, int)  # value_file_check=False returns no exit code
+    env_values = env
     try:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
@@ -5998,6 +6355,14 @@ def _graph(args: argparse.Namespace) -> int:
         reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
+    # For the same reason an env() reference that does not resolve is reported beside the graph,
+    # never instead of it. Keys only, never values.
+    env_problems: list[str] | None = None
+    if args.env is not None:
+        env_problems = [
+            *env_read_problems,
+            *([] if env_values is None else reg.env_resolution_problems(env_values)),
+        ]
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
     # legacy string-constant scan as a fallback tier, provenance-tagged, plus reverse adjacency.
     # v1 fields ("handlers"/"sends" name lists, per-element file/line) are preserved unchanged;
@@ -6079,6 +6444,9 @@ def _graph(args: argparse.Namespace) -> int:
             for n, fn in sorted(reg.handlers.items())
         ],
     }
+    if env_problems is not None:
+        # Present only under --env, so a graph read without one keeps its shape.
+        data["env_problems"] = env_problems
     _print_json(data, compact=args.json)
     return 0
 
@@ -6146,14 +6514,23 @@ def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
     from messagefoundry.redaction import safe_error
 
-    resolved = _resolve_offline_anchor(args)
+    resolved = _resolve_offline_anchor(args, env_file_check=False)
     if isinstance(resolved, int):
         return resolved
     config_dir, service_config = resolved
+    env_values = _offline_env_or_exit(args, config_dir, service_config)
+    if isinstance(env_values, int):
+        return env_values
     try:
         reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
+    if env_values is not None and (problems := reg.env_resolution_problems(env_values)):
+        # A preview in an environment the graph does not resolve in is refused. Keys only.
+        return _emit_error(
+            f"env() does not resolve for --env {args.env!r}: " + "; ".join(problems),
+            as_json=args.json,
+        )
     try:
         messages = read_messages(args.messages, cap=fixture_cap(reg))
     except (FileNotFoundError, ValueError) as exc:
@@ -13895,16 +14272,10 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a support zip (#49): engine version + a config summary (registry COUNTS/names only — never
-    settings values or secrets) + a ``/status`` snapshot built from the real status models + a REDACTED
-    app-log tail. **The blanket "secret-free / PHI-free" this docstring used to open with covered the
-    first two members and not the tail**, whose redaction is best-effort with a single-token residual
-    that includes an operator username (BACKLOG #1475; the argparse help above carries the reasoning,
-    and ``docs/PHI.md`` stream 14 is the record). Offline: touches no network, starts no server. The
-    status
-    snapshot + log tail come from the service settings (the configured store + ``[logging].log_dir``);
-    the config summary comes from ``--config``. A missing service config or store is tolerated — the
-    bundle is still produced (support is most wanted when something is already broken)."""
+    """Write a support zip (#49) with :func:`messagefoundry.support.build_bundle`. The argparse
+    help above names the members, the manifest's ``phi_contract`` states the log-tail residual, and
+    ``docs/PHI.md`` stream 14 is the record (BACKLOG #1475, #5385). The status
+    snapshot + log tail come from the service settings, the config summary from ``--config``."""
     from pydantic import ValidationError
 
     from messagefoundry.config.anchor import anchor_settings_store_path
@@ -14611,10 +14982,14 @@ def _engine_refusal_text(exc: BaseException) -> str:
     A refusal such as the SQL Server open's READ_COMMITTED_SNAPSHOT check embeds the driver error
     it was raised from, and a server's text can quote a stored value. The chain is followed through
     ``__cause__``, or ``__context__`` where no cause was set. Each link that is not itself an engine
-    refusal has its ``repr``, its ``str`` and each of its string arguments replaced wherever the
-    refusal quotes them. Every occurrence is replaced: a short cause text that also appears in the
-    refusal's own prose costs that prose, which is the cheaper failure. A quotation in any other
-    shape is not caught; the refusal sites themselves are unchanged."""
+    refusal has its ``repr``, its ``str``, that ``str`` as :func:`redact_log_line` renders it, and
+    each of its string arguments replaced wherever the refusal quotes them. The redacted form is
+    there because the SQL Server options check quotes its driver errors that way (BACKLOG #5666).
+    Every occurrence is replaced: a short cause text that also appears in the refusal's own prose
+    costs that prose, which is the cheaper failure. A quotation in any other shape is not caught;
+    the refusal sites themselves are unchanged."""
+    from messagefoundry.support.redact import redact_log_line
+
     text = str(exc)
     renderings: list[str] = []
     link = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
@@ -14624,7 +14999,12 @@ def _engine_refusal_text(exc: BaseException) -> str:
         if not _is_engine_refusal(link):
             # Longest first, so a repr is replaced before the str inside it; a placeholder keeps a
             # rendering from being matched again by a later, shorter quotation.
-            quotations = {repr(link), str(link), *(a for a in link.args if isinstance(a, str))}
+            quotations = {
+                repr(link),
+                str(link),
+                redact_log_line(str(link)),
+                *(a for a in link.args if isinstance(a, str)),
+            }
             for quoted in sorted((q for q in quotations if len(q) > 5), key=len, reverse=True):
                 if quoted in text:
                     text = text.replace(quoted, f"\x00{len(renderings)}\x00")

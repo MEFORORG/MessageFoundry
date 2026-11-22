@@ -61,7 +61,6 @@ from pydantic import (
     PrivateAttr,
     ValidationError,
     ValidationInfo,
-    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
@@ -73,6 +72,7 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     SecurityEnforcement,
 )
+from messagefoundry.config.bool_numbers import NumbersRefuseBool
 from messagefoundry.config.input_hiding import HIDDEN_INPUT as HIDDEN_INPUT
 from messagefoundry.config.input_hiding import _InputHidingModel as _InputHidingModel
 from messagefoundry.config.models import (
@@ -371,76 +371,7 @@ def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
     return value
 
 
-#: pydantic error types a number's own bound raises. One raised where a bool was given means the
-#: bool was read as a number first, so the bool refusal names it instead (BACKLOG #5509).
-_NUMBER_BOUND_ERRORS: Final = frozenset(
-    {"greater_than", "greater_than_equal", "less_than", "less_than_equal", "multiple_of"}
-)
-
-
-def _bool_on_a_number_refusal(where: str) -> str:
-    """The refusal of a bool on a number at ``where``. It quotes no value (BACKLOG #5509)."""
-    return f"{where} expects a number, not a boolean (true or false); write a number in its place"
-
-
-def _bool_at(given: Any, loc: tuple[int | str, ...], where: str) -> str | None:
-    """The path of ``loc`` inside ``given`` when a bool sits there, or ``None`` (#5509).
-
-    ``loc`` cannot tell a model field from a dict key, so a key that is not a plain identifier is
-    left out of the path rather than echoed."""
-    for part in loc:
-        if isinstance(given, Mapping) and part in given:
-            given = given[part]
-            where = f"{where}.{part}" if isinstance(part, str) and part.isidentifier() else where
-        elif isinstance(given, list | tuple) and isinstance(part, int) and part < len(given):
-            given = given[part]
-            where = f"{where}[{part}]"
-        else:
-            return None
-    return where if isinstance(given, bool) else None
-
-
-def _bool_read_as_number(given: Any, got: Any, where: str) -> str | None:
-    """Where a bool in ``given`` came out of validation as a number in ``got``, or ``None`` (#5509).
-
-    Read off the validated value rather than the annotation, so it holds for at least a constrained
-    or optional int, an int subclass, a list, tuple, set or dict of numbers, and the fields of a
-    nested model such as ``[[alerts.rules]]``. It misses at least a dict whose keys validation
-    rewrites, a list an inner validator shortens, and a bool read as a ``timedelta`` or an enum
-    member. A field that deliberately keeps a bool keeps it, since its validated value is still a
-    bool. The path names model fields and list positions only, never a dict key the operator
-    wrote."""
-    if isinstance(given, bool):
-        return where if isinstance(got, int | float) and not isinstance(got, bool) else None
-    if isinstance(given, Mapping):
-        if isinstance(got, BaseModel):
-            fields = type(got).model_fields
-            pairs = [(f"{where}.{k}", v, getattr(got, k)) for k, v in given.items() if k in fields]
-        elif isinstance(got, Mapping):
-            pairs = [(f"{where}[a key]", v, got[k]) for k, v in given.items() if k in got]
-        else:
-            return None
-        for path, inner_given, inner_got in pairs:
-            if found := _bool_read_as_number(inner_given, inner_got, path):
-                return found
-        return None
-    if isinstance(given, list | tuple):
-        if isinstance(got, list | tuple) and len(got) == len(given):
-            for index, (inner_given, inner_got) in enumerate(zip(given, got, strict=True)):
-                if found := _bool_read_as_number(inner_given, inner_got, f"{where}[{index}]"):
-                    return found
-        # A set reorders and merges, so no element pairs with its input: a bool given where none
-        # survived was read as a number.
-        elif (
-            isinstance(got, set | frozenset)
-            and any(isinstance(item, bool) for item in given)
-            and not any(isinstance(item, bool) for item in got)
-        ):
-            return where
-    return None
-
-
-class _Section(_InputHidingModel):
+class _Section(_InputHidingModel, NumbersRefuseBool):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
     # (_reject_unknown_file_keys for the file, _reject_unknown_env_keys for the environment). A model-level extra="forbid" would refuse the engine's OWN writes:
     # _env_overrides scrapes every MEFOR_<section>_<key> into its section dict, and a dozen documented
@@ -477,43 +408,6 @@ class _Section(_InputHidingModel):
                 if key in data:
                     raise ValueError(refusal)
         return data
-
-    @field_validator("*", mode="wrap")
-    @classmethod
-    def _refuse_a_bool_on_a_number(
-        cls, value: Any, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
-    ) -> Any:
-        """Refuse ``true``/``false`` on a numeric key rather than read it as 1 or 0 (BACKLOG #5509).
-
-        pydantic's lax mode coerces a bool to an int or float, so
-        ``delete_message_bodies_after_days = false`` would read as 0, "keep indefinitely", and a
-        byte cap set to ``true`` as one byte. Lax mode stays on for everything else, because the
-        environment layer hands every value over as a string. A subclass ``before`` validator
-        that turns a bool into a number itself runs ahead of this one and is not seen."""
-        where = str(info.field_name)
-        try:
-            validated = handler(value)
-        except ValidationError as exc:
-            # A bool read as 0 can then fail the number's own bound (``gt=0``), and that message
-            # would hide the coercion: name the bool instead.
-            found = next(
-                (
-                    path
-                    for err in exc.errors(include_url=False)
-                    if err["type"] in _NUMBER_BOUND_ERRORS
-                    and (path := _bool_at(value, err["loc"], where))
-                ),
-                None,
-            )
-            if found is None:
-                raise
-        else:
-            found = _bool_read_as_number(value, validated, where)
-            if found is None:
-                return validated
-        # Raised outside the handler, so the bound error, whose input a nested plain model does not
-        # hide, is not chained onto the refusal (BACKLOG #1796).
-        raise ValueError(_bool_on_a_number_refusal(found))
 
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
@@ -1497,7 +1391,11 @@ class StoreSettings(_Section):
 #: Defined here rather than beside its ADR 0118 use because at least two security decisions in this
 #: module key on it and must not disagree: :attr:`ApiSettings.is_loopback`, which used to inline the
 #: same three hosts as a tuple, and ``_desugar_security``'s refusal of a non-loopback ``listen_address``
-#: under ``local_access_only = true``. This unifies THIS module only. Other packages carry same-named
+#: under ``local_access_only = true``. ``messagefoundry.api.tls`` also reads it as the names a
+#: generated API certificate carries for a loopback bind (BACKLOG #5790), so a name added here is
+#: added to that certificate too, must be one hostname verification can match, and makes every
+#: existing generated pair for a loopback bind re-mint at its next start. Within this module it
+#: is the one definition. Other packages carry same-named
 #: frozensets for their own transports, with different contents (``::ffff:127.0.0.1`` in
 #: ``pipeline.wiring_runner`` and ``transports.dicom``, ``[::1]`` in the harness poller); reconciling
 #: those is a separate question, recorded in ADR 0154.
@@ -2991,7 +2889,8 @@ class LoggingSettings(_Section):
     # The engine writes no log FILE of its own unless `file` below is set (opt-in, #122), but if an
     # operator tells us where the supervisor parks them, GET /status meters that directory's total bytes
     # + filesystem free space alongside the DB metrics (#50). None (the default) = stdout-only, no
-    # metering. Metadata only — the contents are never read.
+    # metering. Other code reads the files' contents; docs/CONFIGURATION.md, the [logging] log_dir
+    # row, says which.
     log_dir: str | None = None
 
     # --- Engine-managed application log file + fail-closed write guard (#122, ADR 0162) ----------
@@ -5084,7 +4983,8 @@ class AiSettings(_Section):
     # _FILE_SECRET_KEYS (warns if placed in the file) and _SECRET_SETTING_KEYS (redacted). Never logged.
     api_key: str | None = None
     # SSRF fail-closed allowlist (ADR 0135): each entry is "host" or "[v6]" (any port), or
-    # "host:port" or "[v6]:port"; an entry no host can match is refused at load. The broker
+    # "host:port" or "[v6]:port"; an entry `hostlist.allow_entry_problem` refuses is refused at
+    # load, at least one in no such form, a URL, a pattern or a bad port. The broker
     # validates its configured `endpoint` against THIS list ITSELF — an un-listed host (or an empty list)
     # is REFUSED. Deliberately independent of [egress].allowed_http, which, when empty, allows any
     # host under the audited `[security].block_unlisted_outbound = false` opt-out (see
@@ -5123,7 +5023,8 @@ class AiSettings(_Section):
     @field_validator("allowed_endpoints", mode="after")
     @classmethod
     def _endpoint_entries_are_read(cls, value: list[str]) -> list[str]:
-        """Refuse at load an entry the broker's host match cannot read (BACKLOG #5915)."""
+        """Refuse at load an entry :func:`~messagefoundry.hostlist.allow_entry_problem` refuses,
+        every one the broker's host match cannot read among them (BACKLOG #5915)."""
         return _host_list_entries(value, "[ai].allowed_endpoints")
 
     @field_validator("provider")
@@ -5659,8 +5560,8 @@ class EgressSettings(_Section):
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" or "[v6]" (any port), or "host:port"
-    # or "[v6]:port". `_host_entries_are_read` names the lists that refuse at load an entry no host
-    # can match.
+    # or "[v6]:port". `_host_entries_are_read` names the lists that refuse at load an entry
+    # `hostlist.allow_entry_problem` refuses.
     allowed_mllp: list[str] = []
     # Allowed raw-TCP outbound destinations: each entry is an MLLP-style host entry.
     allowed_tcp: list[str] = []
@@ -5813,7 +5714,8 @@ class EgressSettings(_Section):
     )
     @classmethod
     def _host_entries_are_read(cls, value: list[str], info: ValidationInfo) -> list[str]:
-        """Refuse at load an entry the host matcher cannot read (BACKLOG #5915). An ``allowed_db``
+        """Refuse at load an entry :func:`~messagefoundry.hostlist.allow_entry_problem` refuses,
+        every one the host matcher cannot read among them (BACKLOG #5915). An ``allowed_db``
         entry naming an IPv6 address is refused too: while the list is set the DATABASE check
         refuses every server holding a ``:``, so such an entry could never admit one."""
         setting = f"[egress].{info.field_name}"

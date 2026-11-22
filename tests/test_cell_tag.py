@@ -784,6 +784,39 @@ async def test_a_planted_unmarked_cell_is_audited_and_dead_lettered(
     assert sink.dead == ["r-um2"] and sink.audits == [MESSAGE_TAG_FAILED_ACTION]
 
 
+@pytest.mark.parametrize("keyed", [True, False])
+async def test_a_planted_blob_in_a_message_cell_is_contained(
+    monkeypatch: pytest.MonkeyPatch, keyed: bool
+) -> None:
+    """BACKLOG #5650 added item 2: a BLOB planted in a ``messages`` cell raised ``TypeError`` out of
+    a keyed cipher, so a list read failed with a 500 and a handoff re-pended the row forever; a
+    keyless cipher returned the bytes unchanged. Both now raise :class:`NonTextCellError`, so a list
+    withholds the row's cells and a handoff dead-letters it with one tag-failed audit row."""
+    for memo in ("_reported", "_reported_audit"):  # leave no entry for a later test
+        monkeypatch.setattr(cell_tag, memo, {})
+    cipher = make_cipher(generate_key() if keyed else None, write_v2=True)
+    with pytest.raises(NonTextCellError) as planted:
+        open_message_cell(cipher, "raw", b"PLANTED-BLOB", message_id="nt1", channel_id="A")
+    assert planted.value.drift and planted.value.table == "messages"
+    assert "PLANTED" not in str(planted.value)
+
+    failures: list[CellTagError] = []
+    record: dict[str, Any] = {"raw": b"PLANTED-BLOB", "summary": "kept?"}
+    withhold_message_cells(
+        cipher, record, ("raw", "summary"), message_id="nt2", channel_id="A", failures=failures
+    )
+    assert record == {"raw": None, "summary": None}
+    assert [type(f) for f in failures] == [NonTextCellError]
+
+    async def handoff(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        open_message_cell(cipher, "raw", b"PLANTED-BLOB", message_id="nt3", channel_id="A")
+        return True
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(handoff)(sink, routed_id="r-nt3") is False
+    assert sink.dead == ["r-nt3"] and sink.audits == [MESSAGE_TAG_FAILED_ACTION]
+
+
 def test_transit_names_only_its_aead_refusal_unauthenticated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

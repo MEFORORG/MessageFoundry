@@ -2,7 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A sandbox worker whose graph differs from the engine's does not come up (vault BACKLOG #2587).
 
-The worker loads the config directory again, in its own process, under an allowlisted environment.
+The worker runs the engine's config again, from the snapshot the engine sends it (vault BACKLOG
+#2596), in its own process, under an allowlisted environment.
 A config module that reads the environment can therefore build a different graph there. These tests
 pin that the difference is loud and fails closed, and that the documented way to hand the worker a
 variable, ``[sandbox].pass_environment``, is real and refuses the engine's own secrets.

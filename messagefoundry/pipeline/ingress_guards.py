@@ -85,6 +85,7 @@ from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import (
     DEFAULT_MAX_MESSAGE_BYTES,
+    PEEK_READ_FAULTS,
     HL7PeekError,
     Peek,
     enforce_size_limits,
@@ -635,7 +636,8 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
       :func:`peek_max_bytes`, so a connection's own lower ``max_message_bytes`` holds, but never above
       the engine ceiling (see below); the engine ceiling for any other type, in the listener's units.
     * **type** -- the declared-type magic-byte sniff the listener applies to a non-HL7 body.
-    * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check.
+    * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check,
+      and then :func:`doc_ref_marker_refusal`, as both listeners run it after the parse.
 
     Strict ``hl7apy`` validation is NOT run here, because the listener times it and a synchronous
     function cannot time itself without a thread of its own. :func:`admit_resubmission` runs this and
@@ -653,7 +655,9 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
 
     **Not mirrored, and a resubmission can therefore still differ from a sender's body:** document
     detach. A streaming inbound raises ``max_message_bytes`` to pay for a detach this path does not do,
-    so its HL7 ceiling here stays at the engine default rather than the raised value.
+    so its HL7 ceiling here stays at the engine default rather than the raised value. The detach's
+    own refusal of a received handle or marker in a body over the threshold is not run either
+    (BACKLOG #5099).
 
     The reason never carries a byte of the body, so a caller may return it to the operator and audit it."""
     if ic is None:
@@ -697,10 +701,18 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             refused = str(exc)
         if refused is not None:
             raise IngressGuardError(refused, phase="size")
+        # The listeners' marker refusal runs at the same point after the parse, so a resend does
+        # not rest on delivery's refusal alone (BACKLOG #5099). A fault in the parse or in the
+        # marker's header read is a parse refusal naming its type alone, in the listeners'
+        # wording, rather than an error the caller cannot audit. Unlike the listeners it logs no
+        # WARNING of its own, and the listeners' own field reads in that block are not run here.
         try:
-            Peek.parse(text, max_bytes=ceiling)
-        except HL7PeekError as exc:
+            peek = Peek.parse(text, max_bytes=ceiling)
+            refused = doc_ref_marker_refusal(peek, text)
+        except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
             refused = f"parse error: {safe_exc(exc)}"
+        except PEEK_READ_FAULTS as exc:
+            refused = f"parse error: peek read failed ({type(exc).__name__})"
         if refused is not None:
             raise IngressGuardError(refused, phase="parse")
     else:

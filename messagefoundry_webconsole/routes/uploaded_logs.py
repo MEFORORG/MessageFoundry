@@ -156,11 +156,14 @@ DELETE_DAMAGED_CODE = "delete_damaged"
 BROWSE_DAMAGED_CODE = "browse_damaged"
 RESEND_ACCESS_CODE = "resend_access_refused"
 DELETE_ACCESS_CODE = "delete_access_refused"
+DELETE_INCOMPLETE_CODE = "delete_incomplete"
 BROWSE_ACCESS_CODE = "browse_access_refused"
 BROWSE_HOP_REFUSED_CODE = "browse_hop_refused"
 BROWSE_THROTTLED_CODE = "browse_throttled"
 UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
 KEY_SERVICE_BUSY_CODE = "key_service_busy"
+STORAGE_UNREACHABLE_CODE = "storage_unreachable"
+DELETE_UNCONFIRMED_CODE = "delete_unconfirmed"
 
 #: The status the engine answers when the store cipher refuses an uploaded file (BACKLOG #1169).
 _LOCKED_STATUS = status.HTTP_423_LOCKED
@@ -257,6 +260,16 @@ BROWSE_ACCESS_NOTICE = f"{_BROWSE_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
 RESEND_ACCESS_NOTICE = f"{_RESEND_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
 DELETE_ACCESS_NOTICE = f"{_DELETE_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
 
+#: 409 on a delete is one the engine could not finish (BACKLOG #5388 added item 3): the file was in
+#: use on the server, with nothing removed, or its content went and its record stayed, so it is
+#: still listed. One text serves both, so it claims neither, and it invites the retry that
+#: finishes either.
+DELETE_INCOMPLETE_NOTICE = (
+    "That delete did not finish. The file was in use on the server, or part of it could not be "
+    "removed, so some of it may already be gone and it may still be listed. Try deleting it "
+    "again. If that keeps failing, an administrator should check the file on the server."
+)
+
 #: Three more engine answers the routes used to let escape as JSON (BACKLOG #1169, PR 1506
 #: follow-up A). Each is this module's own text. The engine's detail for each names config keys and
 #: posture internals, and none of it is reflected here, for the same reason as every notice above.
@@ -294,6 +307,25 @@ KEY_SERVICE_BUSY_NOTICE = (
     "happening, an administrator should check that service."
 )
 
+#: 503 with ``Retry-After`` and ``storage_unreachable`` set: the uploads directory, or the share it
+#: is on, could not be reached, so nothing was opened, injected or removed (BACKLOG #5388 added item
+#: 3). One text serves browse, resend and delete, so it names no single action.
+STORAGE_UNREACHABLE_NOTICE = (
+    "That request did not complete, and nothing was opened, injected or removed. The engine could "
+    "not reach the storage that holds uploaded files. Try again in a moment. If it keeps "
+    "happening, an administrator should check the uploads folder on the server."
+)
+
+#: 503 with ``outcome_unconfirmed`` set: a delete met the storage going away at the body's unlink,
+#: so whether the content was removed is not known (BACKLOG #5388 added item 3). It claims
+#: neither a removal nor its absence.
+DELETE_UNCONFIRMED_NOTICE = (
+    "That delete could not be confirmed. The engine lost the storage that holds uploaded files "
+    "while it was deleting, so the file's content may or may not be gone. Try the delete again "
+    "once the storage is back. If it keeps happening, an administrator should check the uploads "
+    "folder on the server."
+)
+
 #: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never
 #: rendered — an unrecognized value maps to no banner at all rather than being echoed.
 _LIST_NOTICES: dict[str, str] = {
@@ -310,10 +342,13 @@ _LIST_NOTICES: dict[str, str] = {
     BROWSE_DAMAGED_CODE: BROWSE_DAMAGED_NOTICE,
     RESEND_ACCESS_CODE: RESEND_ACCESS_NOTICE,
     DELETE_ACCESS_CODE: DELETE_ACCESS_NOTICE,
+    DELETE_INCOMPLETE_CODE: DELETE_INCOMPLETE_NOTICE,
     BROWSE_ACCESS_CODE: BROWSE_ACCESS_NOTICE,
     BROWSE_HOP_REFUSED_CODE: BROWSE_HOP_REFUSED_NOTICE,
     BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
     KEY_SERVICE_BUSY_CODE: KEY_SERVICE_BUSY_NOTICE,
+    STORAGE_UNREACHABLE_CODE: STORAGE_UNREACHABLE_NOTICE,
+    DELETE_UNCONFIRMED_CODE: DELETE_UNCONFIRMED_NOTICE,
     # UPLOADS_UNAVAILABLE_CODE is deliberately absent. With no uploads store the list page answers
     # 503 and renders UPLOADS_UNAVAILABLE_NOTICE without reading ``e``. A listing that loads proves
     # the store is back, so a banner saying it is missing would be false there.
@@ -347,6 +382,7 @@ _DELETE_CODES: dict[int, str] = {
     404: DELETE_FAILED_CODE,
     _LOCKED_STATUS: DELETE_LOCKED_CODE,
     _UNAVAILABLE_STATUS: UPLOADS_UNAVAILABLE_CODE,
+    status.HTTP_409_CONFLICT: DELETE_INCOMPLETE_CODE,
 }
 
 #: The same for a browse the engine refused. 404 is NOT here: an absent file, a traversal id and an
@@ -404,6 +440,12 @@ def _refusal_code(exc: HTTPException, codes: dict[int, str]) -> str | None:
     import; the cost is that a later 503 with ``Retry-After`` from these handlers would read as an
     outage too. At least today, the handlers raise no other."""
     if exc.status_code == _UNAVAILABLE_STATUS and "Retry-After" in (exc.headers or {}):
+        # BACKLOG #5388 added item 3: the engine marks a storage it could not reach, a typed
+        # signal like ``upload_refusal``, so its notice does not blame the key service.
+        if getattr(exc, "outcome_unconfirmed", False) is True:
+            return DELETE_UNCONFIRMED_CODE
+        if getattr(exc, "storage_unreachable", False) is True:
+            return STORAGE_UNREACHABLE_CODE
         return KEY_SERVICE_BUSY_CODE
     code = codes.get(exc.status_code)
     kind = getattr(exc, _REFUSAL_ATTR, None)

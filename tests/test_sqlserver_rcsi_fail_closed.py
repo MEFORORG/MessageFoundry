@@ -64,6 +64,11 @@ class _ProbeCursor:
     async def fetchone(self) -> tuple[int, int] | None:
         return self._row
 
+    async def close(self) -> None:
+        # BACKLOG #5666: an open closes its bounded state-read cursor before the ALTERs. The
+        # stand-in hands the same cursor back, so its recorded statements stay in one list.
+        pass
+
 
 class _ProbeConn:
     def __init__(self, cursor: _ProbeCursor) -> None:

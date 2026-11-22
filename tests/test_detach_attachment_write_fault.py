@@ -5,8 +5,13 @@
 A streaming inbound detaches its large documents with ``put_attachment`` before the ingress commit.
 No fault from that write is classed as the document's (Manager decision d20261104T042552411-c23337,
 as amended): every one that is not already one of the detach's own refusals (at least
-``StreamingAttachmentsUnsupported`` is) propagates to the transport with no message row, so the
-input is kept for a resend, and the tests below pin what each source then does with it. A fault answered as a refusal
+``StreamingAttachmentsUnsupported`` is) propagates to the transport with no message row, so nothing
+records the body as finished. Whether the input survives for a resend is the source's to decide. The
+file and database sources leave it where it was read, and a TCP or MLLP inbound that sends no reply
+holds the frame and retries it until it is recorded or the inbound stops (BACKLOG #5022); the tests
+below pin those. A source that answers its sender keeps no copy: MLLP with replies NAKs or closes,
+and HTTP and DICOM receipt answer a failure, so the input survives only if the sender resends it
+(BACKLOG #1619 keeps the HTTP answer as an open item). A fault answered as a refusal
 would charge the refused-body allowance, and a body whose text no backend can encode would then fail
 the ``ERROR`` write as well, so each resend of it would drain the allowance for every other refused
 body on that inbound.
@@ -37,6 +42,7 @@ from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, RefusedBodyPolicy
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, StreamingAttachmentsUnsupported
+from messagefoundry.store.base import ATTACHMENT_CONTENT_TYPE_MAX
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.receipt import RefusalKind
@@ -398,17 +404,72 @@ async def test_a_lone_surrogate_label_propagates_and_stores_nothing(store: Messa
 
 
 def test_the_content_type_bound_is_the_narrowest_backend_column() -> None:
-    # The bound copies the stores' DDL, so a change to any backend's column must move it too.
+    # SQL Server's column is built from the bound; the other backends' columns are unbounded TEXT,
+    # so a change to either of them must move the bound too.
     from messagefoundry.store import postgres, sqlserver
     from messagefoundry.store import store as sqlite_store
 
     def ddl(path: str) -> str:
         return Path(path).read_text(encoding="utf-8")
 
-    width = wiring_runner._ATTACHMENT_CONTENT_TYPE_MAX
-    assert f"content_type NVARCHAR({width}) NOT NULL" in ddl(sqlserver.__file__)
+    width = ATTACHMENT_CONTENT_TYPE_MAX
+    assert width == 256
+    assert any(f"content_type NVARCHAR({width}) NOT NULL" in stmt for stmt in sqlserver._SCHEMA)
     assert "content_type TEXT NOT NULL" in ddl(postgres.__file__)
     assert "content_type TEXT NOT NULL" in ddl(sqlite_store.__file__)
+
+
+def test_the_detach_and_the_download_route_share_the_store_bound() -> None:
+    # One width, owned by the store (BACKLOG #1619): the API once kept its own 255 beside it.
+    from messagefoundry.api import app as api_app
+
+    # Each module imports the store's own name and keeps no copy of the number. Read in the source,
+    # since an identity test cannot tell a copy of a small int from the original.
+    for module in (wiring_runner, api_app):
+        source = Path(module.__file__ or "").read_text(encoding="utf-8")
+        assert "    ATTACHMENT_CONTENT_TYPE_MAX,\n" in source  # in the store.base import
+        assert "ATTACHMENT_CONTENT_TYPE_MAX =" not in source
+        assert "_MAX_ATTACHMENT_MIME_LEN" not in source
+    widest = "application/" + "x" * (ATTACHMENT_CONTENT_TYPE_MAX - len("application/"))
+    assert wiring_runner._label_fits_every_backend(widest)
+    assert not wiring_runner._label_fits_every_backend(widest + "x")
+
+
+async def test_the_magic_byte_head_is_read_off_the_event_loop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The head's work grows with sender-controlled whitespace, so it runs in a thread, as the rest
+    # of the detach's body-scaled work does, and in the scan's own hop rather than one of its own,
+    # so a document costs no extra hop for it (BACKLOG #1619).
+    import asyncio
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+    real = vars(wiring_runner)["b64_head"]
+
+    def recording(b64: str, max_bytes: int = 32) -> bytes:
+        seen.append(threading.get_ident())
+        return real(b64, max_bytes)
+
+    hops: list[object] = []
+    real_to_thread = asyncio.to_thread
+
+    async def counting(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        hops.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "b64_head", recording)
+    monkeypatch.setattr(asyncio, "to_thread", counting)
+    runner, ic = _runner(store, ConnectorType.MLLP)
+
+    ack = await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
+
+    assert _ack_code(ack) == "AA"
+    assert seen, "the head was never read"
+    assert loop_thread not in seen
+    assert hops, "no thread hop was counted, so this measured nothing"
+    assert recording not in hops
 
 
 # --- what each retrying source does with the propagated fault ------------------------------------

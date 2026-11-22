@@ -5,10 +5,11 @@
 Both manifests read ``MEFOR_TLS_REVOCATION_ATTESTED`` from a required, non-optional Secret key
 reference, exactly once per container. A deployer following docs that never mention it would hit
 ``CreateContainerConfigError`` on the first apply, so each deploy doc a k8s deployer reads must name
-the key the manifests read and say that a false value still crash-loops there. The compose one-shot
+the key the manifests read and say that a false value passes the kubelet and is refused by the
+``revocation-attestation-check`` initContainer (BACKLOG #5400 items 4 and 6). The compose one-shot
 check must also not inherit the image HEALTHCHECK, which probes an API it never serves. No doc may
-claim, unqualified, that a false value is refused before any engine starts: at least two compose
-commands skip the check, and no k8s manifest checks the value."""
+claim, unqualified, that a false value is refused before any compose engine starts: at least two
+compose commands skip the check."""
 
 from __future__ import annotations
 
@@ -94,7 +95,9 @@ def test_each_deploy_doc_names_the_required_secret_key(doc: Path) -> None:
     section = _k8s_section(doc)
     assert _SECRET[1] in section, f"{doc.name} never names the Secret key {_SECRET[1]}"
     assert "CreateContainerConfigError" in section, doc.name
-    assert "crash-loop" in section, f"{doc.name} does not say a false value still crash-loops"
+    assert "revocation-attestation-check" in section, (
+        f"{doc.name} does not name the initContainer that refuses a false value"
+    )
     # The caveat itself, beside the key: a value such as 0 passes the kubelet.
     assert re.search(r"such as `?0`?,? passes the kubelet", section), (
         f"{doc.name} does not say a value such as 0 passes the kubelet"
@@ -189,10 +192,14 @@ def test_no_deploy_doc_carries_the_unqualified_refusal_claim(doc: Path) -> None:
         assert stale not in text, f"{doc.name} still carries the unqualified claim: {stale}"
 
 
-@pytest.mark.parametrize("doc", (_CLOUD, _README), ids=lambda p: p.name)
-def test_each_k8s_section_says_no_manifest_checks_the_value(doc: Path) -> None:
+@pytest.mark.parametrize("doc", _DOCS, ids=lambda p: p.name)
+def test_each_k8s_section_says_the_init_check_stops_the_engine(doc: Path) -> None:
+    # BACKLOG #5400 items 4 and 6 added the initContainer, so the claim this pinned until then,
+    # that no manifest checks the value before the engine starts, became false; it must not return.
     section = _k8s_section(doc)
-    assert "anifest checks the value before the engine starts." in section, section
+    assert "anifest checks the value before the engine starts" not in section, doc.name
+    assert "the engine never starts" in section, section
+    assert "Init:CrashLoopBackOff" in section, section
 
 
 def test_the_readme_topology_a_bullet_names_the_skips() -> None:

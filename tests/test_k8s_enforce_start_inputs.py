@@ -5,8 +5,9 @@
 ``[security].enforcement`` defaults to ``enforce``, and neither ``--env prod`` nor either manifest
 lowers it, so ``serve`` refuses to start until at least these hold: the API revocation attestation,
 a security-notice channel with a recipient, verified-TLS log forwarding to an allowlisted
-collector with a writable spool, bounded retention, and, on the Postgres hop, a store CRL. Before
-these rows neither manifest named any of them.
+collector, bounded retention, and, on the Postgres hop, a store CRL. Before these rows neither
+manifest named any of them. A spool it cannot write does not refuse the start: ``serve`` warns and
+forwards without one, so the writable spool mount is pinned separately.
 
 Each manifest now carries a block of COMMENTED env entries for the inputs only a site can supply.
 They are commented because a placeholder value would pass these gates and start an engine whose

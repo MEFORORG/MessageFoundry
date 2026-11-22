@@ -788,7 +788,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     it cannot read. The refusal names the path and the Win32 error where there is one. The cure is
     to fix what made the read fail. Where it is honoured (see *Dev/test escape* below),
     `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
-    WARNING for a dev/CI checkout only, as it does every refusal here. A `*.py` deleted while the
+    WARNING for a dev/CI checkout only, as it does every refusal of this owner and access-list
+    read. It does not downgrade the refusal of a trust-list link that cannot be resolved or leads
+    to nothing at check time, on either platform. A `*.py` deleted while the
     load runs is skipped, as on POSIX (ADR 0036 Amendment B).
   - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
     `WRITE_DAC` implicitly, so it can rewrite the DACL and the executed `.py` whatever the ACEs
@@ -851,9 +853,21 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
     is the safest layout, because the engine's own account cannot rewrite it, provided the engine
-    can still read every file. The loader checks the same paths as on Windows, following links, so
-    the layout also depends on at least these, which it does not check: every directory above the
-    config directory is writable only by root; a file that is a link points into such a directory;
+    can still read every file. The loader checks the same paths as on Windows, following links.
+    For each of them that is a symbolic link or a junction, the
+    config directory included, it also checks what Python's path resolution says the link leads
+    to and, for a file, the folder holding that file, on both platforms, and it refuses the load
+    where a link it lists, a module, `__pycache__` entry, `connections.toml`, `codesets` or
+    code-set table link among them, leads to nothing it can read at check time or cannot be
+    resolved (vault BACKLOG #2596), and the dev/test escape does not downgrade that refusal. For
+    a linked folder the folder holding its target is not
+    checked. That
+    resolution is not checked against what the load's open then reaches. It does not check the
+    links in between, for a link to a link, a folder outside the config directory that holds a
+    link, from which a writer could re-point it, or on Windows a reparse point other than a
+    symbolic link or a junction, which it does not follow. So the layout also depends on at least these, which it
+    does not check: every directory above the config directory, and above each folder a link
+    leads to, is writable only by root; no link leads through a folder another account can write;
     and the file system reports real owners and modes (a network mount may synthesize them).
     - **Why the loader does not walk the directories above it (vault BACKLOG #3106).** The trust
       anchor check, `anchor_path.posix_path_verdict`, does walk them: it reads every directory from
@@ -873,15 +887,18 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       take this walk either, but it does walk the links an open of each file passes through, as
       it models the open, and vets the folders holding them, as the value-file paragraph in
       [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
-      states. The config load's trust list still vets each module by its own path, not the links
-      it passes through, so the two checks answer a linked file differently.
+      states. The config load's trust list does not take that walk: it checks what each link
+      resolves to, as the bullet above says, so the two checks still answer a linked file
+      differently.
     - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
       any directory above the config directory can rename that directory and put a link or another
       directory in its place. A substitute put there after the check runs unchecked, and one put
       there before it passes when it is a link to any directory owned by root or by the engine's
       own account that is not group- or world-writable, such as the engine's data directory.
-      Nothing here detects either. An account that can write the directory a link points into can
-      replace the file the check passed. Before you deploy, run `namei -l <config dir>` to list
+      Nothing here detects either. An account that can write the directory a link points into
+      can replace the file the check passed, after the check, and an account that can write a
+      directory above that one, or a folder holding a link in between, can put another in its
+      place, after the check or, with the same limit as above, before it. Before you deploy, run `namei -l <config dir>` to list
       every directory on the path. It does not look inside the directory, so also run `ls -lR` on
       the config directory, which lists at least its `codesets` and `environments` folders, and
       run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own
@@ -1081,7 +1098,7 @@ holds claimed rows whose return to the queue never landed. Under the pooled clai
 restart leaves STOPPED a lane that still holds claimed rows whose return to the queue never landed;
 under per_lane the restart respawns such a worker, and it can claim past rows left in flight.
 Any later notify_work broadcast re-arms such a lane, at least a reload, a replay, a resend, an
-inject or a dead-letter replay, and it then claims past the unlanded rows; until one arrives it
+inject or a dead-letter replay, and it can then claim past the unlanded rows; until one arrives it
 stays STOPPED. At least a service restart returns them to the queue first, because the engine does that as it starts, so restart the service
 to recover it.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
@@ -1139,6 +1156,24 @@ log as `api.tls_generated_pair_replaced`, with the old and new SHA-256 fingerpri
 renewal, import the new `api-generated-cert.pem` into the browser trust store again, and replace
 any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews once, before it
 starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
+The same replacement runs at startup, whatever the expiry, when the certificate does not name the
+address a client on this box dials for the current bind: the family's loopback for a wildcard
+`--host` (`127.0.0.1` for `0.0.0.0`, `::1` for `::`), else the host without IPv6 brackets (`[::1]`
+is the address `::1`), matched without regard to case or an IPv6 zone. For a bind the engine treats
+as loopback (`127.0.0.1`, `::1`, `localhost`), whose certificate names all three, it also runs when
+the certificate lacks any of them (BACKLOG #5790). A move from `0.0.0.0` to `::` replaces a pair a
+first run minted for `0.0.0.0`; a move from `127.0.0.1` to `0.0.0.0` or `::` does not, and nor does
+the move back. The new certificate names what a first-run mint for the current bind would. When a
+client on this box dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a
+renewal included, also keeps each of those three the old certificate named, and always `127.0.0.1`,
+which the CLI, the IDE and the harness dial by default. A replacement for a missing name is audited
+with reason `bind_changed`, unless the pair is also due for renewal, which is audited with reason
+`renewal`. An engine shard makes neither. The audit row may be missing, at least if its write fails,
+which logs an ERROR, or if the start fails after the replacement and before the row is written,
+which leaves the WARNING line as the only record (ADR 0172 decision 6). Import the certificate from
+either replacement as after a renewal (BACKLOG #5973). At least an engine shard, a bind the
+certificate builder refuses (a WARNING names it), and a file or lock failure (a WARNING, and the
+next start tries again) keep serving the old certificate, which lacks a name the current bind needs.
 See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)

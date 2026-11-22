@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
@@ -139,14 +140,138 @@ def test_a_rest_a_pass_could_read_differently_stays_as_main_left_it(text: str) -
     assert redaction._redact_xml_elements(text) == main
 
 
-def test_a_field_run_that_takes_the_end_tag_prints_the_rest_as_main_did() -> None:
-    """A STATED RESIDUAL (code review round 3): the flat passes run before the XML pass, so a field
-    run that takes the end tag's name leaves a rest no end tag owns, and it prints, as on main."""
-    for text in ("a|b|<family>Smith</family Zqxdoe>", "<given>A^B^C</given Zqxdoe>"):
-        with _main():
-            main = redact(text)
-        assert redact(text) == main
-        assert "Zqxdoe" in main  # the residual, named so a fix to it is seen here
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("a|b|<family>Smith</family Zqxdoe>", "[redacted] Xxxxxx>"),
+        ("<given>A^B^C</given Zqxdoe>", "[redacted] Xxxxxx>"),
+        ("a|b|</family Zqxdoe>", "[redacted] Xxxxxx>"),
+        ("a|b|<ns:family>Smith</ns:family Zqxdoe", "[redacted] Xxxxxx"),
+        # Code review round 1: a short last word, which the walk masks too.
+        ("a|b|</family Li>", "[redacted] Xx>"),
+        ("<given>A^B^C</given Zqxdoe 1>", "[redacted] Xxxxxx 0>"),
+        # Code review round 2: through the pass a declared delimiter set runs.
+        ("MSH*^~\\&*X\nx*y*</family Zqxdoe>", "[redacted]\n[redacted] Xxxxxx>"),
+    ],
+)
+def test_a_field_run_that_takes_the_end_tag_has_the_rest_masked(text: str, want: str) -> None:
+    """BACKLOG #5925 item 1: the flat passes run before the XML pass, so a field run that took the
+    end tag's name left a rest no end tag owned, and it printed on main. The run now masks it under
+    the end tag's rules (:func:`redaction._glued_end_tag_rest`)."""
+    with _main():
+        main = redact(text)
+    assert main != want and _is_main_masked(want, main)  # the premise: main printed it
+    assert redact(text) == want
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a|b|<family>Smith</family ZqMSH>",  # a head of a word read with no boundary
+        "a|b|<family>Smith</family Kim",  # an end-of-text refusal, as in the walk
+        "a|b|<family>Smith</family userPwd>",  # a camel credential label
+        "a|b|<other>Smith</other Zqxdoe>",  # no vocabulary end tag
+        "<name>a|b|<b>c</b Zqxdoe></name>",  # a stated residual: the run hides the element
+        # A stated residual (code review round 1): the field-run pass reads the backstop's opener,
+        # which the JSON pass scrubs only later, so the arm keeps every rest in that text.
+        """{"name": "nonnumeric port: 'x"} a|b|</family Zqxdoe>""",
+        # Code review round 1: the last word opens the next run's token, so a mask would split it.
+        "a|b|</family Zqxdoe>|x|y",
+        # Code review round 2: the same, where the next run is the declared delimiter set's, so the
+        # arm must read the run it is handed, not the default one.
+        "MSH*^~\\&*X\nx*y*</family Zqxdoe>*a*b",
+    ],
+)
+def test_a_field_run_rest_the_end_tag_rules_refuse_stays_as_main_left_it(text: str) -> None:
+    with _main():
+        main = redact(text)
+    assert redact(text) == main
+
+
+def _clamped_at(shape: str) -> str:
+    """``shape`` as :func:`redaction.clamp_untrusted` leaves it when the cut lands right after it:
+    the shape, then the bound note. The window is searched, since the cut lands only on whitespace."""
+    text = shape + " 12" * 200
+    for window in range(len(shape), len(shape) + 200):
+        clamped = redaction.clamp_untrusted(text, window=window)
+        if clamped.startswith(shape + "\n"):
+            return clamped
+    raise AssertionError(f"no window cuts right after {shape!r}")
+
+
+@pytest.mark.parametrize(
+    "shape", ["a|b|</family zqxP", "a|b|</family Zqx 4455", "a|b|</family Kim"]
+)
+def test_a_clamped_field_run_rest_is_judged_as_the_xml_pass_judges_it(shape: str) -> None:
+    """Code review round 3 (Manager repair): the bound note a clamp appends is stripped before the
+    XML pass reads the text, so the field-run arm judges the rest without it too. With the note left
+    on, a rest that ends the text read as followed by a line break and lost the end-of-text
+    refusals, so it was masked where main kept it. The answer is main's, with no new masking.
+
+    The clamp's name walk drops a trailing capitalized word such as ``Kim`` whole, so for that
+    shape the clamped text is built from the note directly."""
+    if shape.endswith("Kim"):
+        clamped = f"{shape}\n{redaction._clamp_marker(500)}"
+    else:
+        clamped = _clamped_at(shape)
+    assert redaction._TRAILING_NOTES.search(clamped) is not None  # the premise: the note is on
+    with _main():
+        main = redact(clamped)
+    assert redact(clamped) == main
+
+
+@pytest.mark.parametrize("joiner", [" ", "\n"])
+@pytest.mark.parametrize(
+    "rest", [" Zqxdoe", " Li", " Zqxdoe>", " zqxP", " Zqx 4455", " Kim", " Zqxdoe Vandt"]
+)
+def test_a_field_run_rest_before_a_bound_note_is_judged_as_the_walk_judges_it(
+    rest: str, joiner: str
+) -> None:
+    """Regression pin for the reverted attempt in engine PR 3093: the field-run arm found where the
+    rest ended BEFORE it set the bound note aside, so a note joined by a space (as
+    :func:`redaction.safe_text_bound` writes it) ran into the rest, and the rest was refused where
+    the XML walk masked the same words. The arm's answer for a run that took the end tag now equals
+    the walk's answer for the same rest, with either joiner."""
+    note = joiner + redaction._clamp_marker(500)
+    walked = redact(f"<family>Smith</family{rest}{note}")
+    prefix = "<family>[redacted]</family"
+    assert walked.startswith(prefix) and walked.endswith(note)  # the premise: the walk read it
+    assert redact(f"a|b|</family{rest}{note}") == f"{redaction._REDACTED}{walked[len(prefix) :]}"
+
+
+class _CountingPattern:
+    """A stand-in for a compiled pattern that counts its ``search`` calls."""
+
+    def __init__(self, pattern: re.Pattern[str]) -> None:
+        self.pattern = pattern
+        self.searches = 0
+
+    def search(self, text: str, *args: int) -> re.Match[str] | None:
+        self.searches += 1
+        return self.pattern.search(text, *args)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.pattern, name)
+
+
+def _note_searches(tokens: int) -> int:
+    """How many times one :func:`redact` searches for the bound note, over a clamped text holding
+    ``tokens`` field runs that each take a vocabulary end tag's name."""
+    text = " ".join(["a|b|</family Zqxdoe>"] * tokens) + "\n" + redaction._clamp_marker(9)
+    counting = _CountingPattern(redaction._TRAILING_NOTES)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redaction, "_TRAILING_NOTES", counting)
+        out = redact(text)
+    assert "Zqxdoe" not in out  # the premise: the arm masked every rest
+    return counting.searches
+
+
+def test_the_bound_note_is_found_once_per_pass_not_once_per_token() -> None:
+    """Regression pin for the reverted attempt in engine PR 3093: the field-run arm searched the
+    whole text for the bound note once per token it read, so a 64 KiB record took 0.74 s against
+    0.02 s. The search now runs once per field-run pass, so the count does not grow with the
+    tokens."""
+    assert _note_searches(400) == _note_searches(4)
 
 
 @pytest.mark.parametrize(

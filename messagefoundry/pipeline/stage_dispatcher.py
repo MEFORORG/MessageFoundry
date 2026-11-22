@@ -47,7 +47,7 @@ import functools
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Protocol
@@ -105,7 +105,8 @@ class HoldResult(Enum):
     INFLIGHT, and lets the caller go on as it did before step 2 after its one failed write: a
     per-lane worker loops, a pooled serializer runs its terminal transition, after at most one
     tail release (``_run_lane`` says when). ``RegistryRunner._repend_claimed_on_fault`` names
-    at least one caller that differs."""
+    at least one caller that differs. A pooled lane records the rows an ``ABANDONED`` or
+    ``EXHAUSTED`` end left, and re-pends them before it next claims (:class:`_Stranded`)."""
 
     LANDED = auto()  # the write landed
     STOPPED = auto()  # the engine is stopping: the rows stay INFLIGHT for the next start
@@ -263,6 +264,33 @@ class _LanePhase(Enum):
     PAUSED = auto()
 
 
+@dataclass(frozen=True)
+class _Stranded:
+    """Claimed rows a pooled serializer's hold left INFLIGHT at a pause (``ABANDONED``) or the
+    stop policy's bound (``EXHAUSTED``), with the lane still running (BACKLOG #5744). The claim
+    reads PENDING rows only, so a later claim of this lane would take the next row past them; the
+    lane's next chunk assembly re-pends them first (:meth:`StageDispatcher._repend_stranded`).
+
+    ``head`` is the T17 head and the date its re-pend was sent with; ``tail`` the rows to release.
+    ``fence`` is the lease they were claimed under. A hold that ended on a moved lease
+    (``SUPERSEDED``) makes no record. A tail the fence skipped beside a recorded head is recorded,
+    whatever the lease, so the write fence is the episode's own check: a record's writes are sent
+    only while this node leads under ``fence`` (:class:`RependFence` names the window that leaves),
+    kept unwritten while it does not lead, and dropped
+    unwritten once it leads under another lease, because another node may hold those rows. It is
+    dropped unwritten too once this engine no longer owns the lane (a reload moved it to another
+    engine shard or removed it), and a stop, a demotion's included, drops every record with the
+    rest of the lane state; each drop logs a WARNING."""
+
+    head: tuple[str, float] | None
+    tail: tuple[str, ...]
+    fence: RependFence
+
+
+# The hold ends that leave this node's own rows in flight with the lane still running.
+_RECORDED_ENDS = frozenset({HoldResult.ABANDONED, HoldResult.EXHAUSTED})
+
+
 @dataclass
 class _LaneState:
     phase: _LanePhase = _LanePhase.IDLE
@@ -316,10 +344,16 @@ class _LaneState:
     claimer_deaths: int = 0
     # BACKLOG #5704: while the lane is STOPPED, whether the STOP that set it left claimed rows whose
     # re-pend did not land, so they are still in flight. _to_stopped writes it on every STOP, and
-    # _run_lane's RETRY branch also writes it before _apply_retry, which passes it to a T17 STOP;
+    # _run_lane's RETRY branch and _repend_stranded's bound also write it before _apply_retry,
+    # which passes it to a T17 STOP;
     # so on a lane that is not STOPPED it can hold a stale value. Read by _apply_retry, for that
     # T17 STOP, and by StageDispatcher.stopped_holding_rows, which checks the phase.
     unlanded: bool = False
+    # BACKLOG #5744: rows a hold left in flight that this lane re-pends before its next claim.
+    stranded: _Stranded | None = None
+    # Consecutive re-pend episodes of that record that sent nothing and parked, for their backoff
+    # and to log a lease-read fault once. Reset when the record clears.
+    stranded_waits: int = 0
 
 
 @dataclass
@@ -879,7 +913,10 @@ class StageDispatcher:
                 # A dead claimer's rows that its replacement had not yet released are INFLIGHT too, so
                 # the contract is not met. They are NOT released here: this path runs because the
                 # lease may be lost, and an unfenced release could re-pend a row a successor holds.
-                return not any(claimer.orphan_ids for claimer in self._claimers)
+                # A lane's stranded record (BACKLOG #5744) is rows in flight too.
+                return not any(claimer.orphan_ids for claimer in self._claimers) and not any(
+                    st.stranded is not None for st in self._states.values()
+                )
             remaining = deadline - loop.time()
             if remaining <= 0:
                 self._reap(watched)
@@ -928,6 +965,16 @@ class StageDispatcher:
         await asyncio.gather(*tasks, return_exceptions=True)
         # Rows a dead claimer left claimed and its replacement had not yet released stay INFLIGHT
         # for reset_stale_inflight, exactly like a cancelled serializer's (the rule above).
+        # BACKLOG #5744: a stop, a demotion's included, ends this node's hold on every lane, so a
+        # stranded record is dropped with the state; say so, since its rows stay in flight.
+        if dropped := sum(st.stranded is not None for st in self._states.values()):
+            log.warning(
+                "StageDispatcher %s: stopping with %d lane(s) holding stranded claimed rows; the "
+                "records are dropped and the rows stay in flight for reset_stale_inflight or a "
+                "successor's recovery",
+                self._stage.value,
+                dropped,
+            )
         # POST-gather clear — safe now that every task is done (mirrors _teardown_unsafe:1187-1204).
         self._states.clear()
         self._timers.clear()
@@ -1212,7 +1259,9 @@ class StageDispatcher:
     def _assemble_chunk(self, claimer: _Claimer) -> list[str]:
         """Pop READY lanes into a claim chunk, reserving one processing slot per lane as it is added
         (T8). Skips stale ready entries (a lane already advanced past READY). Slots reserved here are
-        released for any lane the claim does not turn into PROCESSING (§4.3 exact-reservation)."""
+        released for any lane the claim does not turn into PROCESSING (§4.3 exact-reservation).
+        A lane with a stranded record (BACKLOG #5744) is not returned: it takes a slot and starts
+        a :meth:`_repend_stranded` episode in place of a claim."""
         budget = min(self._slots_free, self._claim_lane_chunk)
         lanes: list[str] = []
         # S_lane (ARM 1): ONE clock read for the whole chunk, hoisted out of the loop. The whole
@@ -1221,7 +1270,8 @@ class StageDispatcher:
         # claimer path for stamps that are semantically identical. Hoisting makes the "reserved together"
         # invariant literal AND costs one read instead of N. Zero when the lever is off.
         now_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
-        while claimer.ready and len(lanes) < budget:
+        repending = 0
+        while claimer.ready and len(lanes) + repending < budget:
             lane = claimer.ready.popleft()
             claimer.ready_set.discard(lane)
             st = self._states.get(lane)
@@ -1233,6 +1283,17 @@ class StageDispatcher:
                 continue
             if not may:  # BACKLOG #5704: gated, so park, no claim, no slot
                 self._park_gated(lane, st)
+                continue
+            if st.stranded is not None:
+                # BACKLOG #5744: re-pend what a hold left in flight before any claim of this lane,
+                # which would take the next row past it. The episode holds the lane as a
+                # serializer does (PROCESSING, one slot) and readies it again once it lands.
+                st.phase = _LanePhase.PROCESSING
+                st.dirty = False
+                st.episode_start_ns = now_ns  # occupancy, booked as a drop at its release
+                self._reserve_lane_slot(st)
+                repending += 1
+                self._track_lane_task(lane, self._repend_stranded(lane, st.stranded))
                 continue
             st.phase = _LanePhase.CLAIMING  # T8
             st.dirty = False
@@ -1453,9 +1514,12 @@ class StageDispatcher:
     # --- lane serializer (T9, T13-T17) --------------------------------------
 
     def _spawn_serializer(self, lane: str, items: list[OutboxItem]) -> None:
+        self._track_lane_task(lane, self._run_lane(lane, items))
+
+    def _track_lane_task(self, lane: str, work: Coroutine[object, object, None]) -> None:
         if lane in self._lane_tasks:
             self._busy_violations += 1  # a live serializer already owns this lane — invariant break
-        task = asyncio.create_task(self._run_lane(lane, items), name=f"lane:{lane}")
+        task = asyncio.create_task(work, name=f"lane:{lane}")
         task.add_done_callback(functools.partial(self._on_lane_task_done, lane))
         self._lane_tasks[lane] = task
 
@@ -1497,7 +1561,8 @@ class StageDispatcher:
         # reset_stale_inflight at the next start, as a cancelled serializer's are, and this returns
         # with no terminal transition. Any other end (a pause, an epoch change, the stop policy's
         # bound) sends no further retry and runs the terminal transition below, as before step 2
-        # after one failed write; the rows stay in flight and the in-flight watch pages them.
+        # after one failed write; the rows stay in flight and the in-flight watch pages them. A
+        # pause or the bound records them (_Stranded), and the lane re-pends them before it claims.
         #
         # After a head re-pend the tail's first write is no longer at fault time, and a successor
         # may hold those rows. When the head landed, it is skipped only if another node's lease is
@@ -1551,15 +1616,26 @@ class StageDispatcher:
                 unlanded,
             )
             return
+        ended = head if head is not HoldResult.LANDED else tail
+        stranded = None
+        if unlanded and ended in _RECORDED_ENDS:
+            kept_head = None
+            if head_reschedule is not None and head in _RECORDED_ENDS:
+                kept_head = (head_reschedule[0], dated)
+            # A tail the fence skipped is kept too: _repend_stranded reads the fence again.
+            kept_tail = tuple(tail_ids) if tail is not HoldResult.LANDED else ()
+            stranded = _Stranded(kept_head, kept_tail, fence)
         if unlanded:
             log.warning(
                 "StageDispatcher %s lane %s: stopped holding %d claimed row(s) whose re-pend had "
-                "not landed (%s); they stay in flight until a store recovery path re-pends them, "
-                "at least the next start",
+                "not landed (%s); they stay in flight until %s",
                 self._stage.value,
                 lane,
                 unlanded,
-                (head if head is not HoldResult.LANDED else tail).name.lower(),
+                ended.name.lower(),
+                "this lane re-pends them before its next claim, or a store recovery path does"
+                if stranded is not None
+                else "a store recovery path re-pends them, at least the next start",
             )
         # The stop policy's bound on a hold: _apply_retry STOPs a lane only for a zero-progress infra
         # fault at the bound, which a re-pend failing that often is. The streak is raised to the
@@ -1579,6 +1655,7 @@ class StageDispatcher:
         if st is None:  # torn down under us: stop() already returned every slot, nothing to book
             return
         self._release_lane_slot(st)
+        st.stranded = stranded
         # Consume the stamp UNCONDITIONALLY: whichever branch runs below, this episode is over, and a
         # stamp that survived it could be mis-booked onto the lane's NEXT episode.
         _episode_start_ns = st.episode_start_ns
@@ -1632,14 +1709,128 @@ class StageDispatcher:
             # and on EXHAUSTED, the stop policy's bound that also STOPs a T17 lane (BACKLOG #5708). The
             # rows stay INFLIGHT, so the lane stays STOPPED even when a reload restored its inbound:
             # re-arming it here would claim past them at once. This does not keep it down. A later
-            # notify_work or resume_lane re-arms a STOPPED lane without checking for rows in flight,
-            # as it does after any STOP or T17 bound that left rows unlanded.
+            # notify_work or resume_lane re-arms a STOPPED lane without checking for rows in flight.
+            # On EXHAUSTED the lane then re-pends them before its next claim (_Stranded); on
+            # SUPERSEDED nothing does, and that claim can pass them.
             if not unlanded and self._stop_voided(lane):
                 self._to_ready(lane, woken=True)  # as the reload's notify_work would have
             else:
                 self._to_stopped(
                     lane, st, f"{self._stage.value} lane stopped", unlanded=bool(unlanded)
                 )
+
+    async def _repend_stranded(self, lane: str, stranded: _Stranded) -> None:
+        """Re-pend the rows a hold left in flight, then ready the lane to claim (BACKLOG #5744).
+        Started by :meth:`_assemble_chunk` in place of a claim; it holds the lane as a serializer
+        does, so no claim passes the rows while it runs.
+
+        Each write is held by :meth:`_land_while_holding` and sent only under the lease the rows
+        were claimed under. A record whose lease moved is dropped unwritten, and the lane claims as
+        it did before this fix: another node may hold the rows, and re-pending them could send them
+        twice. Not the leader under that lease, nothing is sent and the lane parks for a backoff
+        with the record kept. A pause or the stop policy's bound ends the episode as it ends a
+        serializer's hold, keeping what did not land; a stop is the teardown, which clears it."""
+        fence = stranded.fence
+        left = stranded
+        ended = HoldResult.LANDED
+        due: float | None = None  # the date a landed head was re-pended with
+        # A lane this engine no longer owns (a reload moved it to another engine shard, or removed
+        # it) is not this node's to write: the new owner may hold the rows. Not the leader, nothing
+        # is sent (the lane parks below); leading, the fence decides.
+        disowned = False
+        try:
+            disowned = lane not in self._lane_provider()
+            leading = not disowned and fence.is_leader()
+            moved = leading and fence.superseded()
+        except Exception:  # noqa: BLE001 — a lease read fault must not wedge the held lane
+            st0 = self._states.get(lane)
+            # Once per record, then quiet: the park below backs off, and its next pass reads again.
+            log.log(
+                logging.WARNING if st0 is None or st0.stranded_waits == 0 else logging.DEBUG,
+                "StageDispatcher %s lane %s: reading ownership or leadership for its stranded rows "
+                "failed; sending nothing and asking again after a backoff",
+                self._stage.value,
+                lane,
+                exc_info=True,
+            )
+            leading = moved = False
+        if disowned or moved:
+            ended = HoldResult.SUPERSEDED
+        elif leading:
+            if left.head is not None:
+                head_id, dated = left.head
+                ended = await self._land_while_holding(
+                    lane,
+                    "reschedule_claimed of a stranded head",
+                    functools.partial(self._store.reschedule_claimed, [head_id], dated),
+                    fence,
+                )
+                if ended is HoldResult.LANDED:
+                    left, due = replace(left, head=None), dated
+                    if left.tail and fence.moved():
+                        # As in _run_lane: a lease another node took while the head's write ran
+                        # may cover the tail now, so its release is not sent.
+                        ended = HoldResult.SUPERSEDED
+            if ended is HoldResult.LANDED and left.tail:
+                ended = await self._land_while_holding(
+                    lane,
+                    f"release_claimed of {len(left.tail)} stranded row(s)",
+                    functools.partial(self._store.release_claimed, list(left.tail)),
+                    fence,
+                )
+                if ended is HoldResult.LANDED:
+                    left = replace(left, tail=())
+        if ended is HoldResult.STOPPED:
+            return  # the teardown: stop() clears the lane state, record included
+        # --- synchronous terminal transition (NO await below) -------------------------------------
+        self._lane_tasks.pop(lane, None)
+        st = self._states.get(lane)
+        if st is None:
+            return
+        self._release_lane_slot(st)
+        self._drop_lane_episode(st, time.perf_counter_ns() if self._lane_episode_timing else 0)
+        if ended is HoldResult.SUPERSEDED:
+            log.warning(
+                "StageDispatcher %s lane %s: %s since %d stranded row(s) were claimed, so they are "
+                "not re-pended here; they stay in flight for a store recovery path, and this "
+                "lane's claims may pass them",
+                self._stage.value,
+                lane,
+                "this engine no longer owns the lane" if disowned else "another node may have led",
+                (left.head is not None) + len(left.tail),
+            )
+            st.stranded = None
+        else:
+            st.stranded = left if left.head is not None or left.tail else None
+        if st.stranded is None:
+            st.stranded_waits = 0
+        if st.pause_pending:
+            self._to_paused(lane, st)
+        elif ended is HoldResult.EXHAUSTED:
+            # The bound STOPs this lane through _apply_retry, as an EXHAUSTED serializer hold does.
+            st.infra_error_streak = max(st.infra_error_streak, self._infra_fault_stop_after - 1)
+            st.unlanded = True
+            self._apply_retry(
+                lane,
+                st,
+                _LaneOutcome(
+                    LaneResultKind.RETRY,
+                    self._clock() + _LANE_ERROR_BACKOFF_SECONDS,
+                    is_infra_fault=True,
+                ),
+            )
+        elif st.stranded is not None:
+            # Not the leader, a lease-read fault, or a hold that ended unlanded: ask again on a
+            # capped backoff. _sweep_ready_due leaves this park to its own timer.
+            wait = _capped_backoff(
+                _LANE_ERROR_BACKOFF_SECONDS, st.stranded_waits, _REPEND_RETRY_CAP_SECONDS
+            )
+            st.stranded_waits += 1
+            self._park(lane, st, self._clock() + wait)
+        elif due is not None and due > self._clock():
+            self._park(lane, st, due)  # the head is not due yet, as _run_lane parks a T17 head
+        else:  # a wake during the episode makes it wake-sourced, as T14 does
+            self._to_ready(lane, woken=st.dirty_woken if st.dirty else st.ready_woken)
 
     def _apply_retry(self, lane: str, st: _LaneState, outcome: _LaneOutcome) -> None:
         """Apply a RETRY outcome under the ADR 0070 infra-fault bound (fix B). A T17 zero-progress
@@ -2364,6 +2555,15 @@ class StageDispatcher:
             self.mark_ready(lane, woken=False)  # T20
         elif phase is _LanePhase.PARKED and st.gated:
             st.dirty = True  # BACKLOG #5704: a gated park waits for release_gated, not a due head
+        elif (
+            phase is _LanePhase.PARKED
+            and st.stranded is not None
+            and st.park_until is not None
+            and st.park_until > self._clock()
+        ):
+            # BACKLOG #5744: the due row is the one behind the stranded rows, so it says nothing
+            # about this backoff; the park's own timer ends it.
+            st.dirty = True
         elif phase is _LanePhase.PARKED:
             self._unpark(lane, woken=False)  # T18 — backoff elapsed; the backstop
         elif phase in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):

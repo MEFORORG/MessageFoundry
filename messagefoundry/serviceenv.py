@@ -166,7 +166,7 @@ class ServiceEnvPosture:
     value_runs_on: bool = False
     #: Whether a string read as part of a value that runs on sets ``MEFOR_SECRETS_DIRECTORY`` on
     #: its first line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether
-    #: or not :func:`_names` keeps the variable it was joined to, such as a path-form OIDC key.
+    #: or not :func:`_names` keeps the variable it was joined to.
     #: NSSM may read that string as its own variable, so the refusal must not say to remove every
     #: such string, nor that the lists set no secrets directory.
     directory_joined: bool = False
@@ -333,11 +333,13 @@ _LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 #: A later line that sets an ordinary variable: a name Windows allows in an environment block,
 #: which is any non-blank text without an equals sign (``ProgramFiles(x86)`` among them), then an
 #: equals sign, then a value holding something other than equals signs and blanks. Such a line
-#: ends the variable above it. A line of base64 does not match, since its only equals signs are
-#: the padding at its end, and neither does a line of PEM armour, which holds no equals sign. So
-#: ``OTHER=`` with an empty value does not match either, nor does one whose value is only equals
-#: signs and blanks in any order, and each is read as part of the value above it: a store key
-#: left empty above it then reads as set, an error toward refusing.
+#: ends the variable above it, except below an empty secret-class value, where
+#: :func:`_ends_blank_class` decides instead. A line of base64 does
+#: not match, since its only equals signs are the padding at its end, and neither does a line of
+#: PEM armour, which holds no equals sign. So ``OTHER=`` with an empty value does not match
+#: either, nor does one whose value is only equals signs and blanks in any order, and each is
+#: read as part of the value above it: a store key left empty above it then reads as set, an
+#: error toward refusing.
 _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 
 #: A run of 43 standard base64 characters: a store key, 32 bytes, less its one padding character.
@@ -352,6 +354,78 @@ _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
 
 #: Text of the standard base64 alphabet alone, as the body of a padded secret is.
 _BASE64_TEXT = re.compile(r"[A-Za-z0-9+/]+")
+
+#: The names Windows itself sets in a service's environment, each spelled exactly as Windows
+#: spells it, at least these. Matched with case, unlike the comparison Windows makes, so mixed-case
+#: secret text such as ``Public=Summer!`` is not taken for ``PUBLIC`` (:func:`_ends_blank_class`).
+#: A name missing from it only refuses more.
+_WINDOWS_NAMES = frozenset(
+    (
+        "ALLUSERSPROFILE",
+        "APPDATA",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
+        "COMPUTERNAME",
+        "ComSpec",
+        "DriverData",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "LOGONSERVER",
+        "NUMBER_OF_PROCESSORS",
+        "OS",
+        "Path",
+        "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "PSModulePath",
+        "PUBLIC",
+        "SystemDrive",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "USERDOMAIN",
+        "USERDOMAIN_ROAMINGPROFILE",
+        "USERNAME",
+        "USERPROFILE",
+        "windir",
+    )
+)
+
+
+def _ends_blank_class(line: str) -> bool:
+    """Whether ``line``, below a secret-class value (:data:`_REFUSED_CLASS_NAMES`) that is empty
+    or blank so far, is a variable of its own that ends that value. This is the one statement of
+    the fail-closed rule (vault BACKLOG #5394, added items 6 and 12); the readers that apply it
+    point here.
+
+    The reader cannot tell such a line or item from the secret ``nssm set`` split from its name,
+    so it is read as the secret's value, and refuses, unless it is exactly one of:
+
+    * an ordinary line (:func:`_is_ordinary_line`) under a name Windows itself sets, spelled as
+      Windows spells it (:data:`_WINDOWS_NAMES`), such as ``Path=C:\\x``;
+    * an ordinary line under ``MEFOR_SECRETS_DIRECTORY`` in upper case, so an item that sets the
+      directory is still read as setting it (a later line of one string never is, under the
+      line rule :func:`_variables` states).
+
+    No other name ends the value, however conventional: ``HTTP_PROXY=x``, ``TZ=UTC``,
+    ``MEFOR_AI_ENVIRONMENT=prod``, ``Public=Summer!``, ``PATH=,C:\\x`` and ``=orphan`` all refuse,
+    and the refusal names the secret-class variable. A line led by blanks is not exact either.
+    Nor does any equals-led line, Windows' own nameless entries such as ``=C:=C:\\x`` and
+    ``=ExitCode=0`` among them: the plain line rule reads such a later line of one string as the
+    value above it, and so refuses, and this rule refuses no less
+    (``tests/test_b532w3_serviceenv_split_shapes.py`` pins it). What
+    this misses, at least: a secret whose own text is exactly such a line, such as
+    ``OS=Summer!``."""
+    name = line.partition("=")[0]
+    return (name in _WINDOWS_NAMES or name == _DIRECTORY_VARIABLE) and _is_ordinary_line(line)
 
 
 def _holds_key_run(text: str) -> bool:
@@ -379,18 +453,93 @@ def _refused_name(name: str) -> bool:
     return name in _REFUSED_CLASS_NAMES or name.startswith(_VALUE_PREFIX)
 
 
-def _line_start(line: str) -> Literal["kept", "ends"] | None:
+def _starts_refused(written: str, *, below_empty_class: bool) -> bool:
+    """Whether the text before a line's first equals sign, ``written``, names a variable the
+    refusal is about (:func:`_refused_name`), so the line starts a variable of its own. Below an
+    empty secret-class value a name that takes either a key or its path
+    (:data:`_INLINE_PEM_NAMES`) must be in upper case, as the engine spells it: mixed-case text
+    such as ``Mefor_Auth_Oidc_Client_Private_Key=Summer!`` may be the secret split from its name,
+    and read as that key it would be dropped as a path, and the empty value above it with it, so
+    it is read as the value instead, which refuses. Any other refused name is kept in any case,
+    as Windows compares names, since it refuses on its own."""
+    name = written.strip()
+    upper = name.upper()
+    if below_empty_class and upper in _INLINE_PEM_NAMES and name != upper:
+        return False
+    return _refused_name(upper)
+
+
+def _line_start(line: str, *, below_empty_class: bool = False) -> Literal["kept", "ends"] | None:
     """How a line below a registry string's first is read: ``"kept"`` when it sets a name the
     refusal is about, so it is a variable of its own; ``"ends"`` when it sets an ordinary
     variable (:func:`_is_ordinary_line`), which ends the value above and is not kept; ``None``
     when it starts no variable and so belongs to the value above. :func:`_continues_string`
-    applies it to a string's first line, narrowed as it says."""
+    applies it to a string's first line, narrowed as it says.
+
+    ``below_empty_class`` is for a line whose value above is a secret-class name set so far to
+    nothing but blanks (:func:`_blank_class`), or a refused name written alone
+    (:func:`_name_alone`): the line then ends that value only under :func:`_ends_blank_class`.
+    Below any other value the plain rule applies. An empty ``MEFOR_VALUE_*`` name, with its
+    equals sign, refuses whatever it holds, so reading the next line into it would only change
+    the remedy, to removing that line and no longer naming the empty entry. The secrets
+    directory's name is no secret, and reading the next line into it would take the directory as
+    set. Below such a value a refused name starts a variable of its own only in upper case
+    (:func:`_starts_refused`)."""
     written, equals, _rest = line.partition("=")
     if not equals:
         return None
-    if _refused_name(written.strip().upper()):
+    if _starts_refused(written, below_empty_class=below_empty_class):
         return "kept"
-    return "ends" if _is_ordinary_line(line) else None
+    ends = _ends_blank_class(line) if below_empty_class else _is_ordinary_line(line)
+    return "ends" if ends else None
+
+
+def _blank_class(written: str, rest: str) -> bool:
+    """Whether a line split at its first equals sign into ``written`` and ``rest`` sets a
+    secret-class name (:data:`_REFUSED_CLASS_NAMES`) to nothing but blanks so far, so the line
+    below it is read under :func:`_ends_blank_class`. A line with no equals sign is all
+    ``written``, so a secret-class name alone on its line, as ``nssm set ... NAME =value``
+    writes it, counts as one set to nothing."""
+    return written.strip().upper() in _REFUSED_CLASS_NAMES and _still_blank(rest)
+
+
+def _still_blank(text: str) -> bool:
+    """Whether ``text`` holds only blanks and equals signs, as ``nssm set ... NAME = value``
+    leaves between a name and its value, so a secret-class value is still empty after it.
+
+    A value of equals signs alone is read on the side that refuses, wherever it is read: still
+    empty where it takes a path-form key as no path (:func:`_path_form`), and set where an empty
+    value would not be kept (:func:`_names`), so ``MEFOR_STORE_PASSWORD==`` refuses alone. On a
+    later line, as ``NAME<LF>=`` writes it, it keeps a secret-class value open to the strings
+    after it (:func:`_value_still_open`); on the name's own line it is set, so the value does not
+    run on into the next item."""
+    return not text.replace("=", "").strip()
+
+
+def _name_alone(line: str) -> bool:
+    """Whether ``line`` is a name the refusal is about (:func:`_refused_name`) alone, with no
+    equals sign, as ``nssm set ... NAME =value`` writes the name as an item of its own. It is
+    read as that name set to nothing so far, so the value below it is read into it."""
+    return "=" not in line and _refused_name(line.strip().upper())
+
+
+def _value_still_open(variable: _Variable) -> bool:
+    """Whether ``variable``, the one a string ends on, may take the strings after it as its
+    value (:func:`_variables`): a secret-class value or a refused name written alone that is
+    blank on its own line and still blank after it (:func:`_still_blank`), as ``NAME<LF>=``
+    leaves it, or a ``MEFOR_VALUE_*`` value that is empty or blank. ``NAME==`` sets ``=`` in its
+    own string, so it does not run on, and it refuses as set (:func:`_names`)."""
+    if _below_open_class(variable):
+        own_line = _LINE_BREAK.split(variable.value, 1)[0]
+        return not own_line.strip() and _still_blank(variable.value)
+    return variable.written.upper().startswith(_VALUE_PREFIX) and not variable.value.strip()
+
+
+def _below_open_class(variable: _Variable) -> bool:
+    """Whether the strings a still-open ``variable`` takes (:func:`_value_still_open`) are read
+    under the fail-closed rule (:func:`_ends_blank_class`): it is a secret-class name's, or a
+    refused name written alone."""
+    return variable.alone or variable.written.upper() in _REFUSED_CLASS_NAMES
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +567,9 @@ class _Variable:
     #: Whether it runs on, and the string its value takes first sets ``MEFOR_SECRETS_DIRECTORY``
     #: on its first line (:func:`_sets_directory_first`).
     holds_directory: bool = False
+    #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
+    #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
+    alone: bool = False
 
 
 def _read_string(
@@ -437,32 +589,66 @@ def _read_string(
     first, *rest_lines = lines[skip:]
     first_written, first_equals, first_rest = first.partition("=")
     first_written = first_written.strip()
+    # The whole-string reading, below: the name is everything before the first equals sign.
+    whole_written, whole_equals, whole_value = entry.partition("=")
+    whole_written = whole_written.strip()
+    whole_kept = bool(whole_equals) and _refused_name(whole_written.upper())
+    # A refused name alone in a string the whole-string reading names nothing in, such as a
+    # ``MEFOR_VALUE_*`` name as ``nssm set ... MEFOR_VALUE_X =value`` writes it.
+    first_alone = not first_equals and not whole_kept and _name_alone(first_written)
+    empty_class = _blank_class(first_written, first_rest) or first_alone
+    # Whether the first line starts a variable: it sets a name, or is a refused name alone.
+    first_sets = bool(first_equals) or empty_class
     first_line = skip + 1 if skip else None
     first_parts = [first_rest]
     # A later line kept as a variable: its line number, name as written and value parts.
-    later: list[tuple[int, str, list[str]]] = []
+    later: list[tuple[int, str, list[str], bool]] = []
     starts_seen = False  # whether any later line starts a variable, kept or ordinary
     parts = first_parts  # the value the current line belongs to
     for number, line in enumerate(rest_lines, skip + 2):
-        start = _line_start(line)
+        start = _line_start(line, below_empty_class=empty_class)
+        # A refused name alone below another variable, or below lines that start none, starts a
+        # variable of its own. Not below an empty secret-class value, which takes it, nor inside
+        # a name the whole-string reading keeps, such as ``MEFOR_VALUE_A<LF>`` on the first
+        # line, which names the variable instead, unless the line is in a later string of a
+        # joined group, which NSSM reads as its own variable.
+        alone = (
+            start is None
+            and not empty_class
+            and (
+                first_sets
+                or starts_seen
+                or not whole_kept
+                or (own_lines is not None and number > own_lines)
+            )
+            and _name_alone(line)
+        )
+        if alone:
+            start = "kept"
         if start is None:
             parts.append(line)
+            empty_class = empty_class and _still_blank(line)
             continue
         written, _equals, rest = line.partition("=")
         parts = [rest]
         starts_seen = True
+        empty_class = start == "kept" and (alone or _blank_class(written, rest))
         if start == "kept":
-            later.append((number, written.strip(), parts))
+            later.append((number, written.strip(), parts, alone))
         # an ordinary line ends the value above, and is not kept
     read: list[_Variable] = []
     ending: _Variable | None = None  # the kept variable the last line belongs to
-    if first_equals:
-        read.append(_Variable(where, first_written, "\n".join(first_parts), line=first_line))
+    if first_sets:
+        read.append(
+            _Variable(
+                where, first_written, "\n".join(first_parts), line=first_line, alone=first_alone
+            )
+        )
         if parts is first_parts:
             ending = read[-1]
     later_variables = [
-        _Variable(where, written, "\n".join(value_parts), line=number)
-        for number, written, value_parts in later
+        _Variable(where, written, "\n".join(value_parts), line=number, alone=alone)
+        for number, written, value_parts, alone in later
     ]
     # The whole-string reading: the name is everything before the first equals sign, stripped,
     # and the value everything after it. Kept when that name is one the refusal is about, so a
@@ -470,10 +656,8 @@ def _read_string(
     # not in its string refuses under that reading. A name that still holds a line break is
     # counted only when no later line sets a name :func:`_names` keeps, since both readings then
     # describe the same variable.
-    whole_written, whole_equals, whole_value = entry.partition("=")
-    whole_written = whole_written.strip()
     broken = _LINE_BREAK.search(whole_written) is not None
-    if whole_equals and _refused_name(whole_written.upper()):
+    if whole_kept:
         # A broken name is kept under its first line, as the line reading names it.
         name = _LINE_BREAK.split(whole_written, 1)[0].rstrip() if broken else whole_written
         same_string = [
@@ -484,56 +668,61 @@ def _read_string(
             _Variable(where, name, whole_value, line=first_line, broken=broken, counted=counted)
         )
         # Its value ends with the string, so it is the one the string ends on when no line of
-        # the line reading starts a variable, as with ``KEY<LF>=``, or ``MEFOR_VALUE_A<LF>X=``,
-        # whose name holds a line break.
-        if not first_equals and not starts_seen:
+        # the line reading starts a variable, as with ``MEFOR_VALUE_A<LF>=``, or
+        # ``MEFOR_VALUE_A<LF>X=``, whose name holds a line break.
+        if not first_sets and not starts_seen:
             ending = read[-1]
     read.extend(later_variables)
     if later and parts is later[-1][2]:
         ending = later_variables[-1]
-    if ending is None or not _refused_name(ending.written.upper()) or ending.value.strip():
+    if ending is None or not _value_still_open(ending):
         ending = None
     return read, ending
 
 
-def _continues_string(entry: str) -> bool:
+def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
     """Whether the registry string ``entry`` may continue an empty value the string above it
-    ends on (:func:`_variables`).
+    ends on (:func:`_variables`). ``below_empty_class`` says that value is a secret-class
+    name's (:data:`_REFUSED_CLASS_NAMES`) or a refused name's written alone
+    (:func:`_below_open_class`), not one a ``MEFOR_VALUE_*`` name sets with its equals sign.
 
     It may not when it holds no non-blank line. It may not when a name the refusal is about
     starts it under the whole-string reading, as one starts ``MEFOR_VALUE_A<LF>X=1``. Otherwise
     its first non-blank line decides. A first line with no equals sign continues the value.
 
-    NSSM reads each item as its own variable. So a first line with an equals sign continues the
-    value in three cases only. Its name is the text before its first equals sign, stripped, and
-    its value the text after it:
+    Below an empty secret-class value, a first line continues the value unless
+    :func:`_ends_blank_class` says it ends it, the same rule a later line of one string is read
+    under, so the two readings of one shape agree on whether the secret-class value refuses.
+
+    Below any other value, NSSM reading each item as its own variable, a first line with an
+    equals sign continues the value only in the cases below. Its name is the text before its
+    first equals sign, stripped, and its value the text after it:
 
     * the name holds a store-key-sized run (:data:`_KEY_SHAPED_RUN`), whatever the value;
     * the name is standard base64 text, and the value holds only whitespace and equals signs;
     * the name is not blank, and the value holds an equals sign and nothing but equals signs
       and whitespace.
 
-    So ``abc==`` continues it in any alphabet. ``abc=`` continues it only under the first two
-    cases, so ``ab-c_dE=`` ends it. ``PATH=`` continues it too. ``HTTP_PROXY=`` and Windows'
-    own empty-named ``=C:=C:\\x`` entries end it. ``MEFOR_SECRETS_DIRECTORY=`` ends it, as it
-    fits no case, but ``MEFOR_SECRETS_DIRECTORY==`` fits the third and continues it. In the
-    three cases :func:`_line_start` reads the first line as starting no variable. So when the
-    strings are joined, the line and the item's later lines are read as later lines of one
-    string."""
+    So there ``abc==`` continues it in any alphabet, ``abc=`` continues it under the second
+    case, and ``PATH=`` continues it too. ``HTTP_PROXY=`` and ``PATH=C:\\x`` end it, as they fit
+    no case, but ``MEFOR_SECRETS_DIRECTORY==`` fits the third and continues it. In each case
+    :func:`_line_start` reads the first line as starting no variable. So when the strings are
+    joined, the line and the item's later lines are read as later lines of one string."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), None)
     if first is None:
         return False
     whole, whole_equals, _value = entry.partition("=")
-    if whole_equals and _refused_name(whole.strip().upper()):
+    if whole_equals and _starts_refused(whole, below_empty_class=below_empty_class):
         return False
+    if below_empty_class:
+        return not _ends_blank_class(first)
     written, equals, rest = first.partition("=")
     if not equals:
         return True
     name = written.strip()
     could_be_key = _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name)
     # A secret outside the standard alphabet padded with ``==``, such as base64url, reads as a
-    # name set to ``=``. The rule of 3085e1d5c55 continued on that, so this case keeps it. One
-    # ``=`` of padding leaves the value empty, so this case does not take such a secret.
+    # name set to ``=``. The rule of 3085e1d5c55 continued on that, so this case keeps it.
     # ``_line_start`` holds the value to equals signs and whitespace, as on a later line.
     padded = bool(name) and "=" in rest
     return (could_be_key or padded) and _line_start(first) is None
@@ -552,14 +741,17 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
 
     The reader cannot tell whether NSSM takes a line or the whole string as a variable, so it
     keeps what either reading would refuse. Each string's first non-blank line is a variable when
-    it holds an equals sign: blank lines above it are skipped, as the whole-string reading's strip
-    of the name skips them, so a secrets directory set below a blank first line is still read as
-    set. A later line is one when it sets a name the refusal is about, so a store key on a later
+    it holds an equals sign, or is a refused name alone (:func:`_name_alone`), a
+    ``MEFOR_VALUE_*`` one only in a string with no equals sign: blank lines above it are skipped,
+    as the whole-string reading's strip of the name skips them, so a secrets directory set below
+    a blank first line is still read as set. A later line is one when it sets a name the refusal
+    is about, or is a refused name alone below another variable, so a store key on a later
     line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`)
     ends the value above it under the line reading, and is not kept: under the whole-string
     reading it sets nothing, so the secrets directory's name is never taken as set by a later
-    line. Any other line, such as one of key material, belongs to the value above it, so a key
-    whose value starts on the next line is not empty.
+    line. Below an empty secret-class value :func:`_ends_blank_class` decides instead whether a
+    later line ends it. Any other line, such as one of key material, belongs to the value above it,
+    so a key whose value starts on the next line is not empty.
 
     Each string is also read whole: the name before its first equals sign, stripped, and
     everything after it as the value. That variable is kept when its name is one the refusal is
@@ -576,10 +768,11 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     continue it (:func:`_continues_string`), the two are joined and read as one string, so
     ``MEFOR_STORE_ENCRYPTION_KEY=`` as one item and the key as the next refuses, as ``nssm set``
     writes a key split from its name. An empty store key above an item whose first line ends it
-    under :func:`_continues_string`, such as one that sets an ordinary variable to a value, does
-    not, and a value that is not empty in its own string does not run on, so a path-form OIDC
-    key above an item of PEM armour is still a path. Each string is read alone
-    first to decide this, and a joined group is read once more, so the work stays linear."""
+    under :func:`_continues_string`, such as one that sets a variable under a name Windows itself
+    sets (:func:`_ends_blank_class`), does not, and a value that is not empty in its own string
+    does not run on, so a path-form OIDC key above an item of PEM armour is still a path. Each
+    string is read alone first to decide this, and a joined group is read once more, so the work
+    stays linear."""
     # Each group: its registry value, its strings, its first string read alone, and for each
     # string but the last the variable it ends on, whose empty value the next string continues.
     groups: list[tuple[str, list[str], list[_Variable], list[_Variable]]] = []
@@ -588,9 +781,18 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         alone, ends = _read_string(where, entry)
         if not entry.strip():
             continue  # a blank string sets nothing, and ends no value above it
-        if groups and ending is not None and groups[-1][0] == where and _continues_string(entry):
+        if (
+            groups
+            and ending is not None
+            and groups[-1][0] == where
+            and _continues_string(entry, below_empty_class=_below_open_class(ending))
+        ):
             groups[-1][1].append(entry)
             groups[-1][3].append(ending)
+            if _still_blank(entry):
+                # Only equals signs, as ``nssm set ... NAME = value`` writes between the name and
+                # its value, so the value still runs on into the item after it.
+                continue
         else:
             groups.append((where, [entry], alone, []))
         ending = ends
@@ -608,6 +810,11 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         # the same name, line and spelling and was as empty. Only these make the refusal say to
         # remove the strings after them.
         ran = {(i, v.written, v.line, v.broken) for i, v in enumerate(endings)}
+        # A name written alone has no line variable once joined, only the whole-string one,
+        # whose name holds a line break when the next string's first line has an equals sign
+        # after other text, as ``Winter=2026!`` does. That break is the join's: NSSM reads the
+        # name's own string alone, so the twin is not taken as broken.
+        joined_breaks = {(i, v.written, v.line, True) for i, v in enumerate(endings) if v.alone}
         # ``\r\n`` between strings: a string ending in a lone ``\r`` then still ends a line of
         # its own, so each line keeps the number ``starts`` gives it.
         joined, _ends = _read_string(where, "\r\n".join(strings), own_lines=starts[1] - 1)
@@ -616,25 +823,62 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             local = (variable.line or 1) - starts[index] + 1
             line_on_string = None if local == 1 else local
             key = (index, variable.written, line_on_string, variable.broken)
-            ran_on = key in ran and bool(variable.value.strip())
-            # Its value takes the next string's first line, which may set the directory.
-            holds = ran_on and _sets_directory_first(strings[index + 1])
+            joined_break = key in joined_breaks
+            ran_on = (key in ran or joined_break) and bool(variable.value.strip())
+            # Its value takes the next string's first line, which may set the directory, past any
+            # string of equals signs alone, which keeps the value running on (_still_blank).
+            holds = False
+            if ran_on:
+                taken = next(
+                    (
+                        strings[i]
+                        for i in range(index + 1, len(strings))
+                        if not _still_blank(strings[i])
+                    ),
+                    "",
+                )
+                holds = _sets_directory_first(taken)
             read.append(
-                replace(variable, line=line_on_string, runs_on=ran_on, holds_directory=holds)
+                replace(
+                    variable,
+                    line=line_on_string,
+                    broken=variable.broken and not joined_break,
+                    runs_on=ran_on,
+                    holds_directory=holds,
+                )
             )
     return read
+
+
+def _kept_empty(variable: _Variable) -> bool:
+    """Whether :func:`_names` keeps ``variable`` even when its value is empty: a
+    ``MEFOR_VALUE_*`` name, unless it is written alone with nothing read into it, which sets no
+    variable."""
+    return variable.written.upper().startswith(_VALUE_PREFIX) and not (
+        variable.alone and not variable.value.strip()
+    )
+
+
+def _path_form(value: str) -> bool:
+    """Whether the value of a name that takes either a key or its path (:data:`_INLINE_PEM_NAMES`)
+    is a path, which is no secret: it holds no PEM armour, and its own line, the text after the
+    name's equals sign up to the first line break, is not blank (:func:`_still_blank`). Only that
+    line is judged, never the lines or strings a blank one took below it, since those may be
+    another secret split from its name: ``[KEY=, MEFOR_STORE_PASSWORD, =hunter2]`` refuses."""
+    return "-----BEGIN" not in value and not _still_blank(_LINE_BREAK.split(value, 1)[0])
 
 
 def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str, int | None], ...]:
     """The upper-cased names of the variables set to a secret that the refusal reads. The value
     is dropped here and never kept. An empty value carries no secret, so its name is not kept,
     except a ``MEFOR_VALUE_*`` name, which the owner's ruling refuses whatever it holds and whose
-    empty value the engine still overlays on the value file. A path in a name that takes either a
-    key or its path is not a secret, so that name is not kept either. Only a secret-class name, a
-    ``MEFOR_VALUE_*`` name and ``MEFOR_SECRETS_DIRECTORY`` are kept: the text before any other
-    line's equals sign may be key material (vault BACKLOG #5394). Windows compares environment
-    names without case, so this does too. Each name is returned with the first registry value,
-    and the line, that sets it."""
+    empty value the engine still overlays on the value file, unless it is written alone with
+    nothing read into it (:func:`_kept_empty`). A path in a name that takes either a key or its
+    path is not a secret, so that name is not kept either (:func:`_path_form`). Only a
+    secret-class name, a ``MEFOR_VALUE_*`` name and ``MEFOR_SECRETS_DIRECTORY`` are kept: the
+    text before any other line's equals sign may be key material (vault BACKLOG #5394). Windows
+    compares environment names without case, so this does too. Each name is returned with the
+    first registry value, and the line, that sets it."""
     names: dict[str, tuple[str, int | None]] = {}
     for variable in variables:
         name = variable.written.upper()
@@ -643,9 +887,9 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str, int | None],
             continue
         # An ``env()`` value is kept even when empty: the engine overlays an empty one on the
         # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
-        if not ((value and not value.isspace()) or name.startswith(_VALUE_PREFIX)):
+        if not ((value and not value.isspace()) or _kept_empty(variable)):
             continue
-        if name in _INLINE_PEM_NAMES and "-----BEGIN" not in value:
+        if name in _INLINE_PEM_NAMES and _path_form(value):
             continue
         names.setdefault(name, (variable.where, variable.line))
     return tuple((name, where, line) for name, (where, line) in names.items())
@@ -667,6 +911,8 @@ def _value_entry_shapes(
         name = written.upper()
         if not name.startswith(_VALUE_PREFIX) or name == _VALUE_PREFIX:
             continue
+        if not _kept_empty(variable):
+            continue  # a name alone with nothing read into it sets no variable
         if variable.counted and (not variable.value or variable.value.isspace()):
             empty[name] = None
         if variable.broken or not (written.isascii() and _setting_names.is_value_name(name)):
@@ -724,7 +970,7 @@ def read_service_env_posture(
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
         # Not filtered through ``_names``: the directory string is in the lists whichever
-        # variable it was joined to, so a dropped one, such as a path-form OIDC key, counts too.
+        # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
     )
 

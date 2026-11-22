@@ -556,7 +556,7 @@ def test_verify_written_catches_changed_bytes_and_a_misplaced_file() -> None:
     # A link is recorded unread, so it has no control id to match; it fails the check anyway.
     link = Record(b"", {"relpath": "L.hl7", "inside": "false", "symlink": "true"})
     result = verify_written(scenario, [good, link], sent, "p")
-    assert not result.ok and "non-file entry appeared in the outbox (L.hl7)" in result.detail
+    assert not result.ok and "a link appeared in the sink ('L.hl7')" in result.detail
     fifo = Record(b"", {"relpath": "F.hl7", "inside": "true", "refused": NOT_REGULAR})
     assert not verify_written(scenario, [good, fifo], sent, "p").ok
     # A listed name the sink refused before the join is unread too, so it fails the same way.
@@ -564,4 +564,4 @@ def test_verify_written_catches_changed_bytes_and_a_misplaced_file() -> None:
         b"", {"name": "nul", "folder": ".", "inside": "false", "refused": file_sink.UNSAFE_NAME}
     )
     result = verify_written(scenario, [good, unsafe], sent, "p")
-    assert not result.ok and "non-file entry appeared in the outbox (nul)" in result.detail
+    assert not result.ok and "a non-file entry appeared in the sink ('nul')" in result.detail
