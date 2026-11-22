@@ -141,6 +141,7 @@ __all__ = [
     "refuse_unsendable_static_request",
     "refuse_url_credentials",
     "refuse_verify_off",
+    "digest_password_unmatched",
     "request_target_as_sent",
     "unsendable_request_target",
     "url_host_label",
@@ -1874,6 +1875,15 @@ def request_target_as_sent(url: str) -> str:
     return url.rpartition("#")[0] if "#" in url else url
 
 
+def digest_password_unmatched(url: str) -> bool:
+    """Whether a Digest password stored under ``url`` as written would be found for the url
+    urllib requests (BACKLOG #5911). Asked of ``urllib.request.HTTPPasswordMgr.reduce_uri``, the
+    key the lookup itself compares, so a ``#`` and leading whitespace, which its split drops on
+    both sides, are not a mismatch; trailing whitespace it keeps is."""
+    reduce = urllib.request.HTTPPasswordMgr().reduce_uri
+    return reduce(url) != reduce(request_target_as_sent(url))
+
+
 def unsendable_request_target(url: str, *, sent_as_is: bool = False) -> bool:
     """Whether ``http.client`` could never send ``url`` as a request target (BACKLOG #5911).
 
@@ -3178,12 +3188,12 @@ class RestDestination(DestinationConnector):
             sent_as_is=True,
             leave_proxy_credential_names=True,
         )
-        if digest_selected and request_target_as_sent(url) != url:
-            # The Digest password manager is keyed on the url as written, so a challenge for the
-            # url urllib requests would find no password and every send would end in a 401.
+        if digest_selected and digest_password_unmatched(url):
+            # Every send would otherwise end in a 401 the Digest handler cannot answer.
             raise ValueError(
-                "REST destination 'url' must hold no whitespace around it and no '#' with HTTP "
-                "Digest (its password is keyed on the url as written)"
+                "REST destination 'url' must not end in whitespace with HTTP Digest (the Digest "
+                "password is stored under the url as written, and the request goes to the url "
+                "without it, so no challenge would find the password)"
             )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.

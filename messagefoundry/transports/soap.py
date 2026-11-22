@@ -120,6 +120,7 @@ from messagefoundry.transports.rest import (
     assert_probe_hop,
     auth_challenge_refused,
     capture_response_headers,
+    digest_password_unmatched,
     egress_route_from_settings,
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
@@ -774,14 +775,20 @@ class SoapDestination(DestinationConnector):
             sent_as_is=True,
             leave_proxy_credential_names=True,
         )
-        if (self.ws_addressing or digest_selected) and request_target_as_sent(url) != url:
+        if self.ws_addressing and request_target_as_sent(url) != url:
             # The POST drops both, but wsa:To carries the url as written, so a server that matches
-            # To against its own address would fault every message, and the Digest password is
-            # keyed on the url as written, so every challenge would find none.
+            # To against its own address would fault every message.
             raise ValueError(
                 "SOAP destination 'url' must hold no whitespace around it and no '#' when "
-                "ws_addressing or HTTP Digest is on (each reads the url as written, while the POST "
-                "drops both)"
+                "ws_addressing is on (wsa:To carries the url as written, while the POST drops "
+                "both)"
+            )
+        if digest_selected and digest_password_unmatched(url):
+            # Every send would otherwise end in a 401 the Digest handler cannot answer.
+            raise ValueError(
+                "SOAP destination 'url' must not end in whitespace with HTTP Digest (the Digest "
+                "password is stored under the url as written, and the request goes to the url "
+                "without it, so no challenge would find the password)"
             )
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).

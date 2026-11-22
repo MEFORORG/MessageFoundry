@@ -9,9 +9,10 @@
   other than HTAB. Where a URL is sent with no path appended (REST, SOAP, DICOMweb's target and
   the token URLs), whitespace around it is not refused, since urllib strips it. On REST, SOAP and
   the token URLs a fragment is not refused either, since urllib drops it before sending to the
-  peer. Both are refused where a setting reads the URL as written: on a REST or SOAP destination
-  with HTTP Digest, whose password is keyed on it; on a SOAP destination with `ws_addressing` on,
-  whose `wsa:To` carries it; and in a `smart_token_url` with no `smart_audience`, whose default
-  `aud` is it. On REST, SOAP and DICOMweb a header name that
+  peer. Both are refused where a setting reads the URL as written: on a SOAP destination with
+  `ws_addressing` on, whose `wsa:To` carries it, and in a `smart_token_url` with no
+  `smart_audience`, whose default `aud` is it. On a REST or SOAP destination with HTTP Digest, a
+  URL ending in whitespace that the Digest password lookup keeps, such as a space, is refused,
+  since the password would be stored under it and never found. On REST, SOAP and DICOMweb a header name that
   reads as `Proxy-Authorization` is left to the proxy-header rule, as before. A refusal names the
   setting and, for a header, its key, never a value. (`BACKLOG #5911`)

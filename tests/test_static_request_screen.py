@@ -236,8 +236,9 @@ def test_a_soap_url_with_surrounding_controls_is_refused_with_ws_addressing() ->
 
 @pytest.mark.parametrize("kind", [ConnectorType.REST, ConnectorType.SOAP])
 def test_a_url_with_trailing_whitespace_is_refused_with_digest(kind: ConnectorType) -> None:
-    """The Digest password is keyed on the url as written (round-4104477e09 finding 5)."""
-    with pytest.raises(ValueError, match="no whitespace around it"):
+    """The Digest password is stored under the url as written, and the lookup keeps a trailing
+    space the request drops (round-4104477e09 finding 5)."""
+    with pytest.raises(ValueError, match="must not end in whitespace with HTTP Digest"):
         _build(
             kind,
             url=_URLS[kind] + " ",
@@ -245,6 +246,22 @@ def test_a_url_with_trailing_whitespace_is_refused_with_digest(kind: ConnectorTy
             http_auth_user="u",
             http_auth_password="synthetic",
         )
+
+
+@pytest.mark.parametrize("kind", [ConnectorType.REST, ConnectorType.SOAP])
+@pytest.mark.parametrize("wrapped", ["{}#frag", " {}"], ids=["fragment", "leading-space"])
+def test_a_url_the_digest_lookup_still_matches_builds_with_digest(
+    kind: ConnectorType, wrapped: str
+) -> None:
+    """The lookup's own split drops a fragment and leading whitespace on both sides, so these
+    authenticate as on main and must build (round-4656d6176e finding 4)."""
+    assert _build(
+        kind,
+        url=wrapped.format(_URLS[kind]),
+        http_auth="digest",
+        http_auth_user="u",
+        http_auth_password="synthetic",
+    )
 
 
 def test_a_proxy_named_name_http_client_refuses_names_that_rule() -> None:
