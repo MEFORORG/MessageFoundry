@@ -32,13 +32,13 @@ function pasteOn(lineStart: number): Record<string, unknown> | undefined {
 }
 
 suite("b622 #5839 — Paste on a control header lands as the block's first statement", () => {
-  test("model: an explicit position wins over the derived one", () => {
+  test("model: an explicit 'before' wins over the derived position", () => {
     const anchor = { handler: "h", lineStart: 3, lineEnd: 3, kind: "action" as const };
     assert.strictEqual(buildPasteRequest(anchor, CLIP).position, "after");
     assert.strictEqual(buildPasteRequest(anchor, CLIP, "before").position, "before");
     const send = { handler: "h", lineStart: 8, lineEnd: 8, kind: "send" as const };
     assert.strictEqual(buildPasteRequest(send, CLIP).position, "before");
-    assert.strictEqual(buildPasteRequest(send, CLIP, "after").position, "after");
+    assert.strictEqual(buildPasteRequest(send, CLIP, "before").position, "before");
   });
 
   for (const [header, body, name] of [
@@ -60,17 +60,18 @@ suite("b622 #5839 — Paste on a control header lands as the block's first state
     const src = fs.readFileSync(STEPS_VIEW_TS, "utf8");
     const at = src.indexOf('m?.command === "paste"');
     assert.ok(at >= 0, "stepsView.ts has a paste handler");
-    const next = src.indexOf("m?.command ===", at + 1);
-    const body = src.slice(at, next < 0 ? undefined : next);
-    assert.ok(
-      /\(m\.position === undefined \|\| m\.position === "before"\)\s*\)/.test(body),
-      "the paste guard admits an absent position or 'before', nothing else",
-    );
+    // The paste branch is the last one, so bound it at the save subscription that follows the switch.
+    const end = src.indexOf("vscode.workspace.onDidSaveTextDocument", at);
+    assert.ok(end > at, "the save subscription follows the paste handler");
+    const body = src.slice(at, end);
+    const guard = /\(m\.position === undefined \|\| m\.position === "before"\)\s*\)/;
+    const forwards = /buildPasteRequest\(\s*anchor,[^;]*?,\s*m\.position,\s*\)/;
+    // Negative controls: the pre-fix guard and a call that drops the position do not match.
+    assert.ok(!guard.test('(m.position === undefined || m.position === "before" || m.position === "after")\n)'));
+    assert.ok(!forwards.test('buildPasteRequest(\n anchor,\n { source: m.block },\n),'));
+    assert.ok(guard.test(body), "the paste guard admits an absent position or 'before', nothing else");
     assert.ok(!/m\.position === "after"/.test(body), "the paste guard does not admit 'after'");
-    assert.ok(
-      /buildPasteRequest\(\s*anchor,[\s\S]*?,\s*m\.position,\s*\)/.test(body),
-      "the validated position reaches buildPasteRequest",
-    );
+    assert.ok(forwards.test(body), "the validated position reaches buildPasteRequest");
   });
 
   test("webview: Ctrl+V on a leaf row posts that row and no position, as before", () => {
