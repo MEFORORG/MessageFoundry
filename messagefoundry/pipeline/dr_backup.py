@@ -671,7 +671,8 @@ class BackupRunner:
         self._ensure_destination(dest_dir)
 
         # The key SOURCE is the existing store DEK (ADR 0019). Resolve it the same way open_store does.
-        key = self._resolve_key()
+        # Off the loop: the provider can dial a Vault that does not answer (BACKLOG #5888).
+        key = await asyncio.to_thread(self._resolve_key)
         if key is None and not s.allow_unencrypted:
             # Fail-closed: a no-key instance refuses to write a cleartext archive unless the explicit,
             # audited [backup].allow_unencrypted escape is set (parallel to [store].allow_unencrypted_phi).
@@ -4508,6 +4509,19 @@ def _decode_store_key(key_b64: str) -> bytes:
     raise StoreCipherConfigError(reason)
 
 
+def _resolve_decrypt_keyring(store_settings: object, posture: HopPosture | None) -> list[bytes]:
+    """The decrypt-capable keyring, decoded. Blocking: the provider can dial a Vault, so the callers
+    run this in its own thread hop, ahead of the verify or restore hop (BACKLOG #5888). A caller's
+    timeout cannot stop the thread; one left behind finishes resolving and its value is dropped."""
+    return [
+        _decode_store_key(k)
+        for k in resolve_decrypt_keys(
+            store_settings,  # type: ignore[arg-type]
+            posture=posture,
+        )
+    ]
+
+
 async def run_restore_verify(
     archive_path: str,
     *,
@@ -4531,13 +4545,7 @@ async def run_restore_verify(
     # `posture` is the caller's, for the Vault hop the key resolve and a full verify can dial
     # (vault BACKLOG #2983). The engine's DR activation passes its own; the `restore-verify`
     # command holds none, and `None` counts as enforcing on that hop.
-    keys = [
-        _decode_store_key(k)
-        for k in resolve_decrypt_keys(
-            store_settings,  # type: ignore[arg-type]
-            posture=posture,
-        )
-    ]
+    keys = await asyncio.to_thread(_resolve_decrypt_keyring, store_settings, posture)
     # `staging_root=None` is a standalone verify: a private directory under the OS temp dir, never
     # where the backup runner stages. See the staging-location block above `_Staging` (BACKLOG #1174).
     return await asyncio.to_thread(
@@ -5311,13 +5319,7 @@ async def run_restore(
     ``posture`` is the caller's, for the Vault hop the key resolve can dial, as on
     :func:`run_restore_verify`. ``None`` counts as enforcing on that hop; the ``restore`` command
     passes none."""
-    keys = [
-        _decode_store_key(k)
-        for k in resolve_decrypt_keys(
-            store_settings,  # type: ignore[arg-type]
-            posture=posture,
-        )
-    ]
+    keys = await asyncio.to_thread(_resolve_decrypt_keyring, store_settings, posture)
     return await asyncio.to_thread(
         _restore_blocking,
         archive_path=archive_path,
