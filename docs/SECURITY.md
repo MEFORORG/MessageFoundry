@@ -2388,17 +2388,18 @@ the same permission set on the same method reds CI until it is listed here.
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
 > scope, and `control_target` is unset or in it. Each name a rule carries must also be an inbound
 > in `Registry.inbound_names()`, the set the flag route's scope test reads, even when the scope
-> lists it (BACKLOG #3378). The owner ruled on 2026-11-04 that a scoped caller sees no outbound
-> rule; this allowlist is the batch Manager's 2026-11-22 reading of that ruling. So a rule
+> lists it (BACKLOG #3378). The owner ruled on 2026-11-04 that this part "stays strict", which the
+> batch 606 Manager recorded as a scoped caller seeing no outbound rules; this allowlist is the
+> batch Manager's 2026-11-22 reading of that ruling. So a rule
 > naming an outbound, or a name that
 > exists nowhere, is withheld from a scoped caller, and with no graph loaded every rule that
-> names a connection is. A name the running graph also knows as an outbound, a name declared on
-> both sides included, is withheld too, since a rule on it can match the outbound's events. Every
+> names a connection is. A name the runner also knows as an outbound
+> (`RegistryRunner.knows_outbound`, which counts a reload-dropped outbound still draining), a
+> name declared on both sides included, is withheld too, since a rule on it can match the outbound's events. Every
 > `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
-> its action names the outbound side. Other routes were left as they were, on purpose, at least
-> the alert-instance routes and `GET /connections/{name}/events`. The batch Manager decided this
-> on 2026-11-22. It read the owner's ruling as covering rules and flagging, not instances or
-> events. What the ack, resolve, suspend and resume routes admit is in their bullet under
+> its action names the outbound side. The alert-instance routes were left as they were, on
+> purpose. The batch Manager decided this on 2026-11-22. It read the owner's ruling as covering
+> rules and flagging, not instances. What the ack, resolve, suspend and resume routes admit is in their bullet under
 > *Single-route data rules*, below. Each rule it shows has a null `id`
 > (BACKLOG #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
 > connection name in it, and nothing here reliably tells a label that names one from one that

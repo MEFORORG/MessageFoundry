@@ -4924,8 +4924,8 @@ def create_app(
     # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set. ON by default
     # since BACKLOG #1277; `serve` passes the resolved [diagnostics].audit_all_authz over the top.
     app.state.audit_all_authz = audit_all_authz
-    # Loaded [alerts] config for the read-only /alerts/rules view (independent of engine; may be None,
-    # in which case the route falls back to all-off defaults). The lifespan path sets the live value.
+    # Loaded [alerts] config for the read-only /alerts/rules view (may be None, in which case the
+    # route falls back to all-off defaults; a scoped caller's view also reads the engine's graph). The lifespan path sets the live value.
     app.state.alerts_settings = alerts_settings
     # [service] service-status reporting (L6a): default-off; the managed lifespan sets the live value,
     # here it backs the direct-construction (test) path.
@@ -6310,9 +6310,10 @@ def create_app(
         give the same refusal for an outbound and for a name outside the scope, and so does the web
         console's flag route for a direction that names neither side. A change to that refusal has
         to be made in at least those three places. :func:`alerts_rules` reads the same
-        ``inbound_names()`` set for a scoped caller in its own code. The two differ with no graph
-        loaded: this route lets an in-scope name reach the engine, and that one withholds every
-        rule naming a connection."""
+        ``inbound_names()`` set for a scoped caller in its own code. The two differ at least with no
+        graph loaded, where this route lets an in-scope name reach the engine and that one
+        withholds every rule naming a connection, and on a name the runner also knows as an
+        outbound, which that one withholds and this one admits for ``direction=inbound``."""
         rr = engine.registry_runner
         wrong_direction = req.direction != "inbound"
         if identity.allowed_channels is not None and (
@@ -10605,10 +10606,9 @@ def create_app(
 
         Which further rules such a caller is denied, and what it reads of each rule's ``id``, are
         stated once in ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG
-        #3378). Other routes were left as they were on purpose, at least the alert-instance reads
-        and acts and ``GET /connections/{name}/events``, so a scoped operator keeps handling its
-        listed outbound's alerts. The same paragraph says who decided that and on what reading of
-        the owner's ruling.
+        #3378). The alert-instance reads and acts were left as they were on purpose, so a scoped
+        operator keeps handling its listed outbound's alerts. The same paragraph says who decided
+        that and on what reading of the owner's ruling.
 
         A read that withholds at least one rule writes an audit row; see
         :func:`_audit_alert_rules_withheld`."""

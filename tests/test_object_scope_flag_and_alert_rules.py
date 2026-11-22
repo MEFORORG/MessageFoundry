@@ -8,7 +8,8 @@
   refusal the per-name routes give (BACKLOG #2551, #2640) to every target outside the caller's scope.
 * ``GET /alerts/rules`` returned every rule's ``connection`` and ``control_target``. It now withholds
   any rule that names a connection outside the caller's scope and, since BACKLOG #3378, any rule
-  naming a name not in the loaded config's inbound_names(), and every ``restart_outbound`` rule.
+  naming a name not in the loaded config's inbound_names() or that the runner also knows as an
+  outbound, and every ``restart_outbound`` rule.
 
 NOT-DEPLOYED beta: each gap was one a first deployment would have carried, not a live exposure.
 """
@@ -404,8 +405,8 @@ async def test_alert_rules_with_no_graph_show_a_scoped_caller_no_named_rule(
 async def test_alert_rules_withhold_an_in_scope_name_the_graph_lacks(
     toml_engine: Engine,  # noqa: F811
 ) -> None:
-    """BACKLOG #3378 item 4: a name the scope lists but the loaded graph does not declare, such as
-    one a reload removed or a draining outbound dropped from the graph, is withheld as
+    """BACKLOG #3378 item 4: a name the scope lists but the loaded graph does not declare, here one
+    that exists nowhere, is withheld as
     ``connection`` and as ``control_target``, as the flag route refuses it. The control: the
     in-scope inbound's own rule shows."""
     rules = AlertsSettings(
