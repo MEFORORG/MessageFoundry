@@ -245,6 +245,8 @@ def test_the_output_is_plain_text_and_not_a_rejected_envelope(repo: Worktree) ->
     out = run_hook(repo, _COMPACT_RESTART)
 
     assert out.strip(), "the hook said nothing on a compaction restart; that is the whole defect"
+    # The catch now prints what it gathered, so non-empty alone no longer detects a throw.
+    assert "RESTORE INCOMPLETE" not in out, f"the normal path threw: {out}"
     event = _hook_envelope_event(out)
     assert event is None, (
         f"the hook emitted a hook-output envelope naming {event!r}. Exit-0 stdout is added to "
@@ -625,6 +627,21 @@ def test_a_newer_goal_with_no_seat_is_restored(repo: Worktree) -> None:
     assert "GOAL: a goal with no seat" in out, out
     assert "SEAT: (none recorded)" in out, out
     assert "an older goal" not in out, out
+
+
+def test_a_throwing_ledger_helper_does_not_empty_the_catch(repo: Worktree, tmp_path: Path) -> None:
+    """The helper the catch itself calls can be the one that threw on the main path."""
+    marker = "function Get-LedgerLines {\n"
+    source = HOOK.read_text(encoding="utf-8")
+    assert source.count(marker) == 1
+    planted = _planted_hook(tmp_path, source.replace(marker, f"{marker}    throw 'planted'\n"))
+    _declaration(repo, goal="survive a helper throw")
+
+    out = run_hook(repo, _COMPACT_RESTART, script=planted)
+
+    assert "GOAL: survive a helper throw" in out, out
+    assert "RESTORE INCOMPLETE" in out, out
+    assert f"BRANCH: {_BRANCH}" in out, out
 
 
 @pytest.mark.parametrize(

@@ -394,8 +394,10 @@ try {
     # This hook never fails a turn, but a throw must not discard what was already gathered: that
     # total loss is BACKLOG #5865. The inner try keeps a failed write from failing the turn.
     try {
-        $why = ConvertTo-OneLine $_.Exception.Message
-        $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir)
+        # Each step is guarded alone, so a helper that threw on the main path cannot empty this one.
+        $why = [string]$_.Exception.Message
+        try { $why = ConvertTo-OneLine $why } catch { $why = 'unreadable error' }
+        try { $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir) } catch { }
         try { $lines += @(Get-WorkLines $branchNow) } catch { }
         $lines += ''
         $lines += "RESTORE INCOMPLETE: this hook stopped early ($why)."
