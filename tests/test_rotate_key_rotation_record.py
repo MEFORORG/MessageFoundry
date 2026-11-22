@@ -947,13 +947,16 @@ async def test_engine_start_passes_the_chain_answer_and_holds_the_key(tmp_path: 
 async def test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_stamps(
     tmp_path: Path, enforcement: SecurityEnforcement
 ) -> None:
-    """BACKLOG #4942's remainder. A ``serve`` start on a new key before any ``rotate-key`` run, on
-    a store with no keyed audit chain: the store is opened through ``open_store`` with no
+    """BACKLOG #4942's remainder. An engine start on a new key before any ``rotate-key`` run, on a
+    store with no keyed audit chain: the store is opened through ``open_store`` with no
     ``before_first_write`` hook, as ``serve`` passes none (only ``rotate-key`` passes one, BACKLOG
     #4936), and a real ``Engine.start`` runs the reconcile. Nothing tells this start from a key
     changed by hand after a run, so it stamps the new key and opens no record. The row's decision
     of 2026-11-22 keeps that, with PHI.md's warning against the order as the remedy (pinned in the
-    test after this one): the start is not refused or held, under either enforcement setting."""
+    test after this one): ``Engine.start`` neither refuses nor holds it, under either enforcement
+    setting. The seed's stamp is long overdue, so under ``ENFORCE`` a hold that kept the prior
+    stamp would refuse this start. This covers ``Engine.start`` only, not the gates ``serve`` runs
+    before it."""
     from messagefoundry.config.settings import EgressSettings, StoreSettings
     from messagefoundry.pipeline.engine import Engine
     from messagefoundry.store.base import open_store
@@ -991,7 +994,10 @@ def test_phi_md_warns_against_a_start_before_the_first_run_on_a_store_with_no_ke
     alone, so the warning must stay. Whitespace is normalized, so a re-wrap does not break it."""
     phi = Path(__file__).resolve().parents[1] / "docs" / "PHI.md"
     text = " ".join(phi.read_text(encoding="utf-8").split())
+    # Both sentences, together: the warning's "such a store" means the one the first names.
     assert (
-        "On such a store, do not start `serve` between setting a new key and running "
-        "`rotate-key`: that stamp stands however the run ends." in text
+        "A key changed with no record still stamps on a store with no keyed chain to ask, such as "
+        "one whose audit rows open with no genesis row naming its key, so there a stamp proves "
+        "only a changed key. On such a store, do not start `serve` between setting a new key and "
+        "running `rotate-key`: that stamp stands however the run ends." in text
     )
