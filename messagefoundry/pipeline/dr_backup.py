@@ -4861,10 +4861,11 @@ def _full_open_check(
                     if walked[0] == "FAIL" and not walked[1].startswith(_OUTAGE_LEAD)
                     else ""
                 )
-                # Redacted, but not cut to safe_text's default, so its tail survives.
+                # Redacted by `_incompatible_snapshot`, which does not cut it to safe_text's
+                # default, so its tail survives in this reason.
                 walk = (
                     f"Before the open, the walk of the cells this build knows reported {walked[0]}"
-                    f"{why}: {safe_text(walked[1], limit=_WALK_REASON_LIMIT)}"
+                    f"{why}: {walked[1]}"
                 )
             elif walked[2]:
                 walk = (
@@ -4901,8 +4902,8 @@ def _full_open_check(
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
 _INCOMPATIBLE_REASON_LIMIT = 600
 
-#: The most characters of a walk's reason the incompatible-snapshot refusal quotes. Its parts are
-#: already bounded where they are made, so this only keeps a defect from making it unbounded.
+#: The most characters of the walk's sentence the incompatible-snapshot refusal quotes. Its parts
+#: are bounded where they are made, so this only keeps a defect from making it unbounded.
 _WALK_REASON_LIMIT = 2000
 
 #: How :func:`_decrypt_check` opens the reason for a decrypt the key service gave no verdict on.
@@ -4942,9 +4943,9 @@ def _incompatible_snapshot(
         f" {tail}",
         limit=_INCOMPATIBLE_REASON_LIMIT,
     )
-    # Appended after the cut, so a long differences list cannot cut it away. The caller redacts
-    # it (`safe_text`) before it comes here.
-    return f"{head} {walk}" if walk else head
+    # Redacted here, and appended after the head's cut, so a long differences list cannot cut it
+    # away.
+    return f"{head} {safe_text(walk, limit=_WALK_REASON_LIMIT)}" if walk else head
 
 
 def _sqlite_error_reason(exc: sqlite3.Error) -> str:

@@ -1984,7 +1984,7 @@ def test_a_key_service_outage_in_the_verify_walk_is_not_called_a_damaged_cell(
     monkeypatch.setattr(cipher_cells_module, "decrypt_or_error", down)
     status, reason, cells = dr_backup._decrypt_check(db, settings)
     assert (status, cells) == ("FAIL", 0), reason
-    assert f"{dr_backup._OUTAGE_LEAD} (CipherUnavailableError)" in reason, reason
+    assert reason.startswith(f"{dr_backup._OUTAGE_LEAD} (CipherUnavailableError)"), reason
     assert "did not decrypt" not in reason, reason
     assert len(calls) == 1, "the walk sent a value to the key service after its outage"
     assert _SYNTH not in reason
@@ -2092,6 +2092,8 @@ def test_the_walks_finding_survives_a_long_differences_list(
         conn.close()
     assert f"messages.raw id={message_id} carries no at-rest marker" in reason, reason
     assert reason.endswith("or a planted row"), reason
+    # Control: the differences were cut, so the walk line survived a cut.
+    assert "ix_synthetic_39" not in reason, reason
 
 
 @pytest.mark.parametrize(
@@ -2103,7 +2105,7 @@ def test_the_walks_finding_survives_a_long_differences_list(
         (("FAIL", "OperationalError: no such column: synthetic", 0), True),
     ],
 )
-def test_the_misread_rationale_rides_only_on_a_cell_finding(
+def test_the_misread_rationale_is_withheld_from_a_key_mismatch_and_an_outage(
     tmp_path: Path,
     _template: tuple[Path, StoreSettings],
     monkeypatch: pytest.MonkeyPatch,
