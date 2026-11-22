@@ -18,7 +18,8 @@ script's temporary directory, and leftover mf-dashboard-build-* directories olde
 run that was killed, are swept first.
 
 Exit status: 0 when every metric was read; 3 when the page was written but a metric or part could
-not be read (the collector's own 3), or the temporary directory could not be removed; any other
+not be read (the collector's own 3), or the temporary directory, or a stale one from a killed run,
+could not be removed; any other
 non-zero when no page was written. A failed render
 leaves the previous index.html in place, because render_html.py replaces it atomically.
 
@@ -57,16 +58,20 @@ function Resolve-Python([string[]]$Given) {
 
 function Remove-StaleTemp([string]$Base, [string]$Prefix) {
     # A run killed by the task's time limit skips its finally, so its private snapshot outlives
-    # it. Two hours is past any live run.
+    # it. Two hours is past any live run. $false when one that should have gone is still there:
+    # it holds a private snapshot and vault files, so the caller fails the run, as the collector
+    # does for its own sweep.
     $cutoff = [DateTime]::UtcNow.AddHours(-2)
-    Get-ChildItem -LiteralPath $Base -Directory -Filter "$Prefix*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTimeUtc -lt $cutoff -and -not $_.LinkType } |
-        ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            if (Test-Path -LiteralPath $_.FullName) {
-                [Console]::Error.WriteLine("ERROR: could not sweep stale $($_.FullName)")
-            }
+    $ok = $true
+    foreach ($old in @(Get-ChildItem -LiteralPath $Base -Directory -Filter "$Prefix*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTimeUtc -lt $cutoff -and -not $_.LinkType })) {
+        Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $old.FullName) {
+            [Console]::Error.WriteLine("ERROR: could not sweep stale $($old.FullName)")
+            $ok = $false
         }
+    }
+    return $ok
 }
 
 $py = Resolve-Python $Python
@@ -85,7 +90,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $base = [IO.Path]::GetTempPath()
-Remove-StaleTemp $base 'mf-dashboard-build-'
+$swept = Remove-StaleTemp $base 'mf-dashboard-build-'
 $tmp = Join-Path $base ('mf-dashboard-build-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $snapshot = Join-Path $tmp 'metrics.json'
@@ -123,4 +128,6 @@ try {
         if ($code -eq 0) { $code = 3 }
     }
 }
+# A stale directory that would not go fails a run that was otherwise clean, as above.
+if (-not $swept -and $code -eq 0) { $code = 3 }
 exit $code

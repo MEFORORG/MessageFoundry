@@ -6,8 +6,10 @@ CLAUDE.md section 5 host circuit breaker as its first statement. Nothing here re
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,74 @@ def test_installer_splits_and_validates_times() -> None:
     assert got["ok"] == ["07:00", "19:00"]
     assert got["ok2"] == ["07:05", "19:30"]
     assert "'noon' is not a 24-hour time" in got["bad"]
+
+
+_SWEEP = r"""
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-StaleTemp' }, $true)
+Invoke-Expression $fn.Extent.Text
+$r = @(Remove-StaleTemp $base 'mf-dashboard-build-')
+[pscustomobject]@{ result = $r } | ConvertTo-Json -Compress
+"""
+
+
+def _sweep(tmp_path: Path) -> list[object]:
+    # Only the sweep function is evaluated, lifted from build.ps1's AST, against tmp_path.
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("pwsh is not installed")
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, a checked-in script path
+        [
+            pwsh,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"$path = {_ps_literal(_DIR / 'build.ps1')}; $base = {_ps_literal(tmp_path)}" + _SWEEP,
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+        check=True,
+    )
+    # A list, so stray pipeline output from the function would show as a second element.
+    result: list[object] = json.loads(proc.stdout)["result"]
+    return result
+
+
+def _stale_dir(tmp_path: Path, name: str) -> Path:
+    old = tmp_path / name
+    old.mkdir()
+    (old / "metrics.json").write_text("{}", encoding="utf-8")
+    os.utime(old, (1_000_000.0, 1_000_000.0))
+    return old
+
+
+def test_build_sweep_removes_a_stale_directory(tmp_path: Path) -> None:
+    old = _stale_dir(tmp_path, "mf-dashboard-build-old")
+    fresh = tmp_path / "mf-dashboard-build-new"
+    fresh.mkdir()
+    assert _sweep(tmp_path) == [True]
+    assert not old.exists()
+    assert fresh.exists()  # a live run's directory is never swept
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="an open file blocks deletion only on Windows")
+def test_build_sweep_failure_is_reported(tmp_path: Path) -> None:
+    old = _stale_dir(tmp_path, "mf-dashboard-build-old")
+    # An open handle without FILE_SHARE_DELETE: Remove-Item cannot delete the file.
+    with (old / "metrics.json").open(encoding="utf-8"):
+        assert _sweep(tmp_path) == [False]
+    assert old.exists()
+
+
+def test_build_sweep_failure_fails_the_run() -> None:
+    text = (_DIR / "build.ps1").read_text(encoding="utf-8")
+    assert "$swept = Remove-StaleTemp $base 'mf-dashboard-build-'" in text
+    assert "if (-not $swept -and $code -eq 0) { $code = 3 }" in text
+    # The gate sits after the finally, right before the only exit that follows it.
+    assert text.rindex("if (-not $swept") < text.rindex("exit $code")
 
 
 def test_installer_keeps_the_runner_out_of_appdata() -> None:
