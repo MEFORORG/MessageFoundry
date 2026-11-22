@@ -128,7 +128,8 @@ async def test_an_enforce_refusal_refuses_new_store_connects(
     store connecting. Holding it logs an ERROR, since the reload's refusal does not say so."""
     caplog.set_level("ERROR", logger=ta.__name__)
     settings = await _refuse_at(store, _pin(tmp_path), enforcing=True)
-    assert any("now refuses new connections" in r.getMessage() for r in caplog.records)
+    (held,) = [r.getMessage() for r in caplog.records if "now refuses new" in r.getMessage()]
+    assert "The refusal: " in held and "PRIVATE KEY" in held  # it names what was refused
     with pytest.raises(StorePinConnectRefused, match="a new store connection was refused"):
         refuse_connect_after_pin_refusal(settings)
 
@@ -245,17 +246,26 @@ async def test_a_pipe_or_device_at_the_pin_path_sets_the_hold(
         refuse_connect_after_pin_refusal(settings)
 
 
-async def test_an_acl_that_could_not_be_read_sets_no_hold(
+async def test_an_acl_that_could_not_be_read_sets_the_hold(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An ACL read that came back indeterminate, such as an ``icacls`` timeout, still refuses at
-    ``enforce``, but it is a read fault, not a verdict, so no hold. Red under: the hold set for
-    every refusal at enforce."""
+    """An ACL read that came back indeterminate holds new connects shut, since the owner of a
+    swapped file can make its ACL unreadable on purpose. Red under: an indeterminate ACL exempted
+    from the hold (head 48166601156)."""
     settings = _settings(_pin(tmp_path))
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
     with pytest.raises(TrustAnchorError):
         await run_anchor_preflight(_specs(settings), store, enforcing=True)
-    refuse_connect_after_pin_refusal(settings)
+    with pytest.raises(StorePinConnectRefused):
+        refuse_connect_after_pin_refusal(settings)
+
+
+def test_the_connect_refusal_is_a_refused_store_call() -> None:
+    """Callers that degrade on a refused store call catch :func:`store_call_errors`; the refusal
+    must be in it. Red under: the class derived from ``Exception`` (head 48166601156)."""
+    from messagefoundry.store.base import store_call_errors
+
+    assert issubclass(StorePinConnectRefused, store_call_errors())
 
 
 async def test_in_serve_order_a_corrected_acl_lifts_the_hold(

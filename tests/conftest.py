@@ -514,7 +514,8 @@ def _quiesce_background_loggers_at_teardown(
 
 @pytest.fixture(autouse=True)
 def _no_held_store_pin_refusal() -> None:
-    """Start each test with no SQL Server store pin refusal held (vault BACKLOG #3714 step 11).
+    """Start each test with no SQL Server store pin refusal held and no pin baseline (vault
+    BACKLOG #3714 step 11).
     The hold is process-global, so one a test sets would otherwise refuse the store connects of
     a later test on the same worker that names the same pin path. Read only when the module is
     already imported, so this fixture imports nothing."""
@@ -522,6 +523,7 @@ def _no_held_store_pin_refusal() -> None:
     if anchors is not None:
         anchors._STORE_PIN_REFUSED.clear()
         anchors._STORE_PIN_RELEASE_REFUSED.clear()
+        anchors._STORE_PIN_FIRST_CHECKED.clear()  # a release compares with it
 
 
 @pytest.fixture(scope="session", autouse=True)

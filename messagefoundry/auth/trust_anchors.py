@@ -249,10 +249,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). **This paragraph is
     where the hold is stated; the code and messages that act on it point here.** What sets it: a
     refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
-    device at the path among them. A read the next check may not repeat sets nothing
-    (:func:`_transient_read_fault`): a file not there, as between the steps of some renewals, one
-    the engine may not open, or one a scanner holds. Nor does an ACL or path that could not be
-    read, such as when ``icacls`` times out. What it refuses: at least the new connects the
+    device at the path among them, or an ACL or path that could not be read, since whoever
+    swapped the file can make its ACL unreadable. A file read the next check may not repeat sets
+    nothing (:func:`_transient_read_fault`): a file not there, as between the steps of some
+    renewals, or one the engine may not open, as while a scanner holds it. What it refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -1802,9 +1802,10 @@ def hold_store_pin_refused(spec: AnchorSpec, refusal: str) -> None:
             "%s: a settings check at enforce refused the SQL Server pin %r, so this engine "
             "process's store now refuses new connections; the ones already open stay open. "
             "Fix what the refusal names; item 11 of the messagefoundry.auth.trust_anchors module docstring "
-            "says which checks then let it connect again, and a restart does",
+            "says which checks then let it connect again, and a restart does. The refusal: %s",
             spec.setting,
             spec.path,
+            refusal,
         )
     _STORE_PIN_REFUSED[key] = refusal
 
@@ -2905,21 +2906,13 @@ async def _preflight_one(
         raise
 
 
-#: The Windows errors a scanner or backup holding the file returns: a sharing violation and a
-#: lock violation. Read with the POSIX ones in :func:`_transient_read_fault`.
-_WINDOWS_TRANSIENT_READ_ERRORS = frozenset({32, 33})
-
-
 def _transient_read_fault(exc: OSError | ValueError) -> bool:
     """Whether reading an anchor failed in a way the next check may not repeat, so the store pin
     sets no hold for it (module item 11): a file not there, as between the two steps of some
-    renewals, one the engine may not open, or one another process holds. Not a pipe or device
-    refused as not a regular file, and not a path the OS cannot take: those are verdicts."""
-    if isinstance(exc, (FileNotFoundError, PermissionError)):
-        return True
-    if isinstance(exc, OSError):
-        return getattr(exc, "winerror", None) in _WINDOWS_TRANSIENT_READ_ERRORS
-    return False
+    renewals, or one the engine may not open, which is also what a Windows sharing or lock
+    violation arrives as. Not a pipe or device refused as not a regular file, and not a path the
+    OS cannot take: those are verdicts."""
+    return isinstance(exc, (FileNotFoundError, PermissionError))
 
 
 async def _preflight_checks(
@@ -3007,10 +3000,9 @@ async def _preflight_checks(
             raise shape_error
     except TrustAnchorError as refusal:
         refusal.unaudited = store_fault is not None
-        # Step 11, module item 11: a verdict on the content, the ACL or the path holds new store
-        # connects shut; an ACL or path that could not be read alone does not.
-        verdict_refused = shape_error is not None or False in (verdict.acl_ok, verdict.path_ok)
-        if spec.server_pin and enforcing and verdict_refused:
+        # Step 11, module item 11. An ACL or path that could not be read holds too: the owner of
+        # a swapped file can make it unreadable on purpose.
+        if spec.server_pin and enforcing:
             hold_store_pin_refused(spec, str(refusal))
         raise
     if spec.server_pin:
