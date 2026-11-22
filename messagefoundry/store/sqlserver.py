@@ -3254,7 +3254,8 @@ def check_pinned_certificate(
       still counts as valid, as RFC 5280 reads it.
 
     The file is read once, and the certificate checks read the bytes the anchor checks read
-    (BACKLOG #3714). It writes no audit row. The audited check is the settings preflight
+    (BACKLOG #3714). It writes no audit row. A pin that passes becomes the process's in-process
+    baseline, unless an earlier one is held (:func:`~messagefoundry.auth.trust_anchors.note_store_pin_checked`). The audited check is the settings preflight
     (:mod:`messagefoundry.auth.trust_anchors`, module item 11, which says what a reload skips).
 
     Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
@@ -3264,6 +3265,7 @@ def check_pinned_certificate(
     from messagefoundry.auth.trust_anchors import (
         TrustAnchorError,
         enforced_anchor,
+        note_store_pin_checked,
         store_pin_anchor_spec,
     )
     from messagefoundry.pki import (
@@ -3285,7 +3287,8 @@ def check_pinned_certificate(
         enforcing = posture is None or posture.enforcing
         # remember_warning: serve's preflight checks this file again moments later, and need not
         # log the same warning twice (BACKLOG #3714).
-        checked = enforced_anchor(spec, enforcing=enforcing, remember_warning=True).data
+        verdict = enforced_anchor(spec, enforcing=enforcing, remember_warning=True)
+        checked = verdict.data
     except TrustAnchorError as exc:
         checked = str(exc)  # the anchor module's own message, which names the setting and the fix
     except (OSError, ValueError, TypeError) as exc:  # the last two: a path open() refuses
@@ -3313,6 +3316,9 @@ def check_pinned_certificate(
             f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The engine "
             "refuses a pin outside its validity period."
         )
+    # The pin this open checked becomes the in-process baseline the settings preflight compares
+    # the file with, off the store hop (vault BACKLOG #3714 step 9); the first one is kept.
+    note_store_pin_checked(spec, verdict.fingerprint)
 
 
 def connection_string(settings: StoreSettings) -> str:

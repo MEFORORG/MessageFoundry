@@ -72,6 +72,7 @@ def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
     # raising=False: the negative controls run this file against a head without the memo.
     monkeypatch.setattr(ta, "_STORE_CONTENT_RECORDED", {}, raising=False)
+    monkeypatch.setattr(ta, "_STORE_PIN_FIRST_CHECKED", {}, raising=False)
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
@@ -3696,6 +3697,84 @@ async def test_a_store_pin_swap_past_the_pin_cap_writes_changed(
     await run_anchor_preflight(specs, store, enforcing=True)
     events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
     assert "changed" in events, events
+
+
+def _another_sqlserver_pin(tmp_path: Path) -> bytes:
+    """A second server certificate's bytes, made apart from the pin file the test swaps."""
+    other = tmp_path / "other"
+    other.mkdir()
+    return _sqlserver_pin(other).read_bytes()
+
+
+def _off_hop_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if "differs from the pin this engine process first checked" in r.getMessage()
+    ]
+
+
+async def test_a_store_pin_swap_warns_off_hop_when_the_store_answers_with_the_new_fingerprint(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3714 step 9 (a): a server the swapped pin admits can answer the baseline read
+    with the new fingerprint, so the store-backed compare writes no ``changed`` row. The in-process
+    baseline still logs the swap, and keeps logging it at each check, since it does not move. Red
+    on origin/main 895925f2d3a, which has no in-process baseline and logs nothing here. The
+    control: the unchanged file logs no such warning."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    caplog.set_level("WARNING", logger=ta.__name__)
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    await run_anchor_preflight(specs, store, enforcing=True)
+    await run_anchor_preflight(specs, store, enforcing=True)
+    assert _off_hop_warnings(caplog) == []  # the control
+    pin.write_bytes(_another_sqlserver_pin(tmp_path))
+    swapped = ta.anchor_fingerprint(pin)
+
+    async def answers_with_the_new_fingerprint(_store: Any, _label: str) -> Any:
+        return ta._Baseline(ta.Fingerprint(ta.ANCHOR_DIGEST, swapped), False)
+
+    monkeypatch.setattr(ta, "_last_fingerprint", answers_with_the_new_fingerprint)
+    for _ in range(2):
+        await run_anchor_preflight(specs, store, enforcing=True)
+    events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    assert "changed" not in events, events  # the store-backed compare was answered away
+    warned = _off_hop_warnings(caplog)
+    assert len(warned) == 2, warned
+    assert swapped in warned[0] and "[store].ssl_root_cert" in warned[0]
+
+
+def test_the_store_open_sets_the_in_process_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3714 step 9 (a): the store open records the pin bytes it checked as the
+    baseline, and a later open of a swapped file does not move it. Red on origin/main
+    895925f2d3a, where the open records nothing."""
+    from messagefoundry.store.sqlserver import check_pinned_certificate
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    settings = StoreSettings.model_validate(
+        {
+            "backend": "sqlserver",
+            "server": "db.example",
+            "database": "mefor",
+            "username": "mefor",
+            "ssl_root_cert": str(pin),
+        }
+    )
+    first = ta.anchor_fingerprint(pin)
+    check_pinned_certificate(settings)
+    pin.write_bytes(_another_sqlserver_pin(tmp_path))
+    check_pinned_certificate(settings)
+    baseline = ta._STORE_PIN_FIRST_CHECKED
+    assert baseline == {("store_sqlserver_pin", str(pin)): first}
 
 
 async def test_an_oversized_postgres_store_ca_is_refused_with_its_row(
