@@ -513,6 +513,43 @@ def test_a_probe_answering_for_the_wrong_repository_reads_present_never_unoccupi
     assert "A DIRECTORY, NOT A SESSION" not in proc.stdout
 
 
+def test_an_answer_listing_the_holder_only_by_another_case_reads_present(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """On a case-sensitive filesystem that spelling is another repository's directory.
+
+    The stub stands in for that volume: the listing differs from the holder by case alone, which is
+    all the comparison sees.
+    """
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    append_to_probe(
+        repo_with_occupancy,
+        "function Get-WorktreeOccupancy { param([string]$Repo)\n"
+        "  [pscustomobject]@{ Available = $true; Sessions = @();\n"
+        "    Worktrees = @([pscustomobject]@{ Path = $Repo.ToUpperInvariant() }) } }",
+    )
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "DIRECTORY ONLY" not in out, out
+    assert "OCCUPANCY UNKNOWN" in out, out
+
+
+def test_a_drive_letter_in_another_case_is_still_the_same_path(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """The control for the test above: the exact comparison must not refuse every answer."""
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    append_to_probe(
+        repo_with_occupancy,
+        "function Get-WorktreeOccupancy { param([string]$Repo)\n"
+        "  $c = $Repo.Substring(0, 1)\n"
+        "  $flipped = if ($c -cmatch '[A-Z]') { $c.ToLowerInvariant() } else { $c.ToUpperInvariant() }\n"
+        "  [pscustomobject]@{ Available = $true; Sessions = @();\n"
+        "    Worktrees = @([pscustomobject]@{ Path = $flipped + $Repo.Substring(1) }) } }",
+    )
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "DIRECTORY ONLY" in out, out
+
+
 @pytest.mark.parametrize(
     ("failing", "other_state"),
     [("peer-wt", "LIVE SESSION in the holder"), ("other-repo", "DIRECTORY ONLY")],

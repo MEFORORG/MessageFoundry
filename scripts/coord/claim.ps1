@@ -398,8 +398,20 @@ function Add-HistoryLine([string]$Line) {
 # The common dir comes from the holder's own .git pointer, which costs no git process: -List can walk
 # hundreds of claims. A path alone is not a safe key, because a stale listing in one repository can
 # name a path that is now a worktree of another.
+#
+# THE CACHE KEY IS CASE-FOLDED AND THE LISTING CHECK IS NOT. Get-OwningGitCommonDir folds case, so on
+# a case-sensitive filesystem two repositories can share a key. The exact check below is what stops
+# one answering for the other: a holder spelled differently from the listing reads `present`. Nothing
+# here can tell whether a case-only difference is the same directory, so it never counts as a match.
+# Only the drive letter folds, because it is case-insensitive on every volume.
 $script:OccupancyProbes = @{}
 $script:OccupancyLoaded = $null   # $null = not looked up yet. Whether occupancy.ps1 loaded cannot change.
+
+function ConvertTo-ExactPathKey([string]$Path) {
+    $p = ($Path -replace '\\', '/').TrimEnd('/')
+    if ($p -match '^[A-Za-z]:') { $p = $p.Substring(0, 1).ToUpperInvariant() + $p.Substring(1) }
+    return $p
+}
 
 function Get-OccupancyForHolder([string]$HeldPath) {
     try {
@@ -418,14 +430,15 @@ function Get-OccupancyForHolder([string]$HeldPath) {
             # `Available` false means the fence could not be built -- an unplaceable record, no repo.
             # Treat that exactly like a failed probe.
             if ($occ -and $occ.Available) {
-                $listed = @{}
-                foreach ($w in @($occ.Worktrees)) { $listed[(ConvertTo-Norm $w.Path)] = $true }
+                # Ordinal, because a PowerShell @{} would fold case again.
+                $listed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                foreach ($w in @($occ.Worktrees)) { [void]$listed.Add((ConvertTo-ExactPathKey $w.Path)) }
                 $script:OccupancyProbes[$key] = [pscustomobject]@{ Answer = $occ; Listed = $listed }
             }
         }
         $probe = $script:OccupancyProbes[$key]
         # Zero occupants means something only for a worktree the answer actually lists.
-        if ($probe -and $probe.Listed.ContainsKey((ConvertTo-Norm $HeldPath))) { return $probe.Answer }
+        if ($probe -and $probe.Listed.Contains((ConvertTo-ExactPathKey $HeldPath))) { return $probe.Answer }
         return $false
     }
     catch { return $false }

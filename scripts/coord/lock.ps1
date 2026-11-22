@@ -53,17 +53,20 @@ function Enter-CoordLock {
         # every worktree AND the primary checkout resolve to the same lock.
         [string]$Repo
     )
-    # Load-bearing. Under a caller's SilentlyContinue, or with no enclosing try, a failed .NET call
-    # would not stop this function: it would run on into the block that owns and deletes the lock file.
-    $ErrorActionPreference = 'Stop'
-    # With Stop in force, a caller's $true here would turn a failed git call into a raw error ahead of
-    # the exit-code check below.
-    $PSNativeCommandUseErrorActionPreference = $false
+    # git is judged by its exit code alone. Continue, not a caller's Stop: under Windows PowerShell 5.1
+    # a redirected stderr line from a SUCCESSFUL git call is a terminating error under Stop. Under
+    # pwsh, Continue also keeps a caller's $PSNativeCommandUseErrorActionPreference from turning a
+    # failed git call into a raw error ahead of the check below.
+    $ErrorActionPreference = 'Continue'
     $gitArgs = @()
     if ($Repo) { $gitArgs = @("-C", $Repo) }
     $common = (& git @gitArgs rev-parse --path-format=absolute --git-common-dir 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $common) { throw "Enter-CoordLock: not inside a git repository." }
 
+    # Load-bearing from here on. Under a caller's SilentlyContinue, or with no enclosing try, a failed
+    # .NET call would not stop this function: it would run on into the block that owns and deletes the
+    # lock file.
+    $ErrorActionPreference = 'Stop'
     $dir = Join-Path $common.Trim() "mefor-coord/locks"
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $safe = ($Name.Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
@@ -91,12 +94,12 @@ function Enter-CoordLock {
             if ($null -eq $deniedAt) { $deniedAt = $now }
             $isDirectory = Test-Path -LiteralPath $lock -PathType Container
             $isFile = Test-Path -LiteralPath $lock -PathType Leaf
-            $inWindow = ($now - $deniedAt) -lt 5
+            $inWindow = ($now - $deniedAt) -lt 5 -and $now -le $TimeoutSeconds
             $retry = if ($isDirectory) { $false }
             elseif ($isFile) { $absentAt = $null; $inWindow }
             elseif ($null -eq $absentAt) { $absentAt = $now; $true }
             else { $inWindow -and ($now - $absentAt) -lt 1 }
-            if ($now -le $TimeoutSeconds -and $retry) {
+            if ($retry) {
                 Start-Sleep -Milliseconds 50
                 continue
             }
