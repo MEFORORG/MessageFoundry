@@ -170,6 +170,10 @@ against one case that matters, described under
   For a local taste of the HA shape: `docker compose --profile ha up` (adds a Postgres + a PAIR of
   clustered engines — `engine-ha` + `engine-standby` — that share one leader lease, so you can stop the
   leader and watch the other promote; the default `docker compose up` stays single-node SQLite, unchanged).
+  The local Postgres serves TLS from `./pg-tls`, and the engines pin its CA as
+  `./config/pki/store-ca.pem`; `compose.yaml` says what each file must hold and how to own it. The
+  default `engine` has no profile, so it starts beside the pair; `compose.yaml` says how to run the
+  pair alone, and which host port publishes the pair's MLLP, and when.
 
 ## Exposure topologies (see the evaluation §1)
 

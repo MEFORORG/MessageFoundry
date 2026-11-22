@@ -385,6 +385,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # guard would not run on the change that breaks it. It starts two child pytest processes,
         # each stopped before any worker spawns.
         "test_xdist_auto_worker_cap.py",
+        "test_b622_5828_compose_host_ports.py",  # docker/compose.yaml: no tooling=true path
     }
 )
 

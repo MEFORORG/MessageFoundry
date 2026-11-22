@@ -74,13 +74,17 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_STORE_USERNAME: "mefor"
   MEFOR_STORE_POOL_SIZE: "40"         # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"
-  # AS SHIPPED, THIS LINE CHANGES NOTHING: this file leaves [security].enforcement at enforce, where
-  # the escape has no effect, and the escape never lifts a weakened store hop (vault BACKLOG #3533
-  # item 2). The local Postgres below has no TLS set up, so as shipped the engines' verified store hop
-  # cannot succeed here. Give it a certificate the engines trust, or use a managed Postgres, and
-  # remove this line. What the escape means: docs/DEPLOYMENT.md, "The MEFOR_ALLOW_INSECURE_TLS
-  # escape hatch".
-  MEFOR_ALLOW_INSECURE_TLS: "1"
+  # The store hop is verified TLS at every posture: the engine refuses a store login over
+  # encrypt=false or trust_server_certificate=true, and no escape lifts that (vault BACKLOG #3533
+  # item 2), so this file sets no MEFOR_ALLOW_INSECURE_TLS. The local Postgres below serves the
+  # certificate in ./pg-tls (its comment says what it must hold), and the engines pin the CA that
+  # issued it. The store CRL an enforcing start needs (below) must come from that CA, so a CA
+  # whose key usage includes cRLSign, not the server certificate itself. Put the pin under ./config/pki/,
+  # owned as ./config is, so no other account can replace it: the store login trusts the file
+  # before serve's preflight checks its owner, and `store provision-schema` never checks it. A
+  # managed Postgres whose certificate the system trust store already verifies needs no pin:
+  # remove this line.
+  MEFOR_STORE_SSL_ROOT_CERT: "/config/pki/store-ca.pem"
   # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.
   # Under the shipped enforce dial an over-granted store login refuses to start (ADR 0199), so this
   # accepts it, audited. A real deployment gives the engines a row-only role (docs/DEPLOY-SERVER-DB.md
@@ -115,8 +119,8 @@ x-ha-engine-env: &ha-engine-env
   # MEFOR_RETENTION_SEARCH_PRESET_DAYS: "REPLACE-days"
   # MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
   # The store hop checks revocation: under enforce, a verified Postgres hop with no CRL
-  # refuses at store open. The local Postgres below has no TLS set up, so this applies once
-  # the engines reach a Postgres that has it. Postgres only: a SQL Server store refuses
+  # refuses at store open. That includes the local Postgres below, which serves TLS. The CRL
+  # must come from the CA the store pin names. Postgres only: a SQL Server store refuses
   # this setting at load.
   # MEFOR_STORE_SSL_CRL_FILE: "/config/pki/store-crl.pem"
   # The log spool (ADR 0200) defaults to log-spool beside the store path, /var/lib/mefor, and
@@ -307,6 +311,9 @@ services:
   # (docs/CLUSTERING.md, ADR 0047) on one host before deploying the k8s/ha-postgres.yaml manifest against a
   # managed Postgres. It is gated behind the `ha` PROFILE, so the DEFAULT `docker compose up` is UNCHANGED
   # (single-node SQLite engine, no Postgres, no cluster). Bring HA up with:  docker compose --profile ha up
+  # The default `engine` has no profile, so that command starts it too, running the same /config graph
+  # on its own store. To run the pair alone, name the services:
+  #   docker compose --profile ha up postgres schema-provision engine-ha engine-standby
   #
   # IMPORTANT — the failover demo is the PAIR `engine-ha` + `engine-standby`, NOT the default `engine`.
   # The default `engine` service stays single-node SQLite (no cluster env) so `docker compose up` is
@@ -315,11 +322,37 @@ services:
   # "stop one, watch the other promote" actually true.
   #
   # This is a LOCAL DEV convenience, not a production DB: a single Postgres container is itself a SPOF
-  # (no DB-tier HA) and its TLS is not set up here — for real HA point [store] at a managed/replicated
-  # Postgres (RDS / Cloud SQL / Azure DB) with a CA-trusted cert, per docs/CLOUD-DEPLOYMENT.md.
+  # (no DB-tier HA) — for real HA point [store] at a managed/replicated Postgres (RDS / Cloud SQL /
+  # Azure DB) with a CA-trusted cert, per docs/CLOUD-DEPLOYMENT.md.
   postgres:
     profiles: ["ha"]
     image: postgres:16
+    # TLS from your certificate and key in ./pg-tls (server.crt, server.key), mounted read-only.
+    # The engines verify it, host name included (x-ha-engine-env, MEFOR_STORE_SSL_ROOT_CERT), so
+    # the certificate must name the host `postgres`. Postgres refuses a key file with group or
+    # other bits wider than it allows, and a bind mount keeps the host's owner and mode: own the
+    # key by the image's postgres account, uid 999, at 0600, or by root with group 999 at 0640.
+    # The key must be UNENCRYPTED: this command sets no ssl_passphrase_command.
+    # Either way the host account or group with that number can read it. On Linux:
+    #   sudo chown -R 999:999 ./pg-tls && sudo chmod 0600 ./pg-tls/server.key
+    # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 999
+    # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and is refused.
+    # Without them Postgres does not start, so no ha engine does. A first start without them
+    # still initializes the mefor-pg volume but never creates the messagefoundry database, and a
+    # later start skips initialization (the health check still passes; schema-provision then
+    # fails). So after fixing them, remove that one volume, never `down -v`, which also removes
+    # the default engine's store: docker compose --profile ha down, then
+    #   docker volume rm <project>_mefor-pg
+    # This server still accepts a plaintext session from another client on the compose network;
+    # the engines never open one.
+    command:
+      - "postgres"
+      - "-c"
+      - "ssl=on"
+      - "-c"
+      - "ssl_cert_file=/etc/postgresql/tls/server.crt"
+      - "-c"
+      - "ssl_key_file=/etc/postgresql/tls/server.key"
     environment:
       POSTGRES_DB: messagefoundry
       POSTGRES_USER: mefor
@@ -331,6 +364,7 @@ services:
       POSTGRES_PASSWORD: "${MEFOR_STORE_PASSWORD:?required. Compose SUBSTITUTION reads at least the shell environment and the project .env, the .env beside compose.yaml unless --project-directory moves it; passing --env-file reads the named file INSTEAD of that .env -- an env_file: does NOT feed it}"
     volumes:
       - mefor-pg:/var/lib/postgresql/data
+      - ./pg-tls:/etc/postgresql/tls:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mefor -d messagefoundry"]
       interval: 5s
@@ -360,9 +394,11 @@ services:
   # standby is promoted within ≈ one heartbeat and binds the listeners — genuine failover, because they
   # share a store and a lease (the default `engine` service shares NEITHER, so it is not in this picture).
   #
-  # NOTE on ports: a single host cannot publish 2575 twice, so only `engine-ha` publishes the MLLP port.
-  # When `engine-ha` is the leader, MLLP works through the published port; when it is the standby its
-  # listener is closed (connection refused on 2575) and the leader is `engine-standby`, reachable on the
+  # NOTE on ports: a single host cannot publish one port twice, and the default `engine` has no profile,
+  # so it runs beside this pair under --profile ha and already owns host 8443 and 2575. So only
+  # `engine-ha` publishes the MLLP port, on host port 2578 (the container still listens on 2575).
+  # When `engine-ha` is the leader, MLLP works through host port 2578; when it is the standby its
+  # listener is closed (connection refused on 2578) and the leader is `engine-standby`, reachable on the
   # container network but not via the host-published port. That host-port asymmetry is a single-host
   # docker limitation only — in k8s the L4 LB's primary-only health check moves the VIP to whichever pod is
   # the leader (docs/CLOUD-DEPLOYMENT.md §3). For a clean local failover demo, hit `engine-ha` first, then
@@ -383,10 +419,10 @@ services:
       - mefor-spool-ha:/var/lib/mefor
     ports:
       - "8444:8443"     # API on a distinct host port (the default `engine` already owns 8443)
-      - "2575:2575"     # MLLP — published only here; works while this node is the leader
+      - "2578:2575"     # MLLP on a distinct host port (the default `engine` already owns 2575); leader only
 
   # Clustered engine #2 — same image + config + cluster; the warm standby (or leader after a failover).
-  # Publishes only its API on a distinct host port; it does NOT publish 2575 (one host can't bind it twice).
+  # Publishes only its API on a distinct host port; it publishes no MLLP port (engine-ha owns host 2578).
   engine-standby:
     <<: *ha-engine
     environment:
