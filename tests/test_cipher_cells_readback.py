@@ -1993,8 +1993,8 @@ def test_an_incompatible_snapshot_keeps_the_walks_finding(
     tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The remedy for a snapshot this build cannot open still leads, and the cell walk that ran
-    before the open is reported after it: what it found, or that it passed and how many cells it
-    decrypted (BACKLOG #1719 item 3)."""
+    before the open is reported after it: what it found, or that it passed and whether it held a
+    sealed value to decrypt (BACKLOG #1719 item 3)."""
     from messagefoundry.store.schema_verify import SchemaMismatchError
 
     def incompatible(coro: Any) -> Any:
@@ -2018,6 +2018,11 @@ def test_an_incompatible_snapshot_keeps_the_walks_finding(
     assert passed[0] == "PASS" and passed[2] > 0, passed
     _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
     assert "passed: every sealed value it read decrypted and authenticated" in reason, reason
+    # Nor does it claim a decrypt that a walk with nothing sealed to read never made.
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: ("PASS", "ok", 0))
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "holding no sealed value to decrypt" in reason and "authenticated" not in reason, reason
+    assert reason.index("The schema step failed") < reason.index("Before the open"), reason
 
 
 def test_the_second_walk_reads_the_cell_the_migration_made_readable(

@@ -788,7 +788,8 @@ def audit_cipher_cells(
 class CipherCellSource(Protocol):
     """What a server store offers :func:`read_server_cipher_cells`: four reads, implemented by
     ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes. A read may take
-    more than one statement: SQL Server's column inventory asks once per table."""
+    more than one statement: at least SQL Server's column inventory, which asks once per table,
+    and each backend's surface-sealed test."""
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]: ...
 

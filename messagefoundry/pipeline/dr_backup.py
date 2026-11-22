@@ -4783,7 +4783,7 @@ def _full_open_check(
         return "FAIL", "no live store settings were supplied for the full restore-verify", 0
     snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
 
-    # Whether the last `_walk` reached the cells, rather than failing to build its cipher or connect.
+    # Whether the last `_walk` returned `_decrypt_check`'s own verdict, rather than one for a raise.
     walk_read: list[bool] = [False]
 
     def _walk() -> tuple[str, str, int]:
@@ -4845,17 +4845,27 @@ def _full_open_check(
         ok, msg = run_guarded(_open())
     except SchemaMismatchError as exc:
         # The walk's finding rides along, so it is not lost behind the remedy (BACKLOG #1719 item
-        # 3). One whose cipher build or connect failed read no cell, so it says nothing here.
+        # 3). A walk that raised, whether in its cipher build, its connect or partway through,
+        # returned no finding of its own, so it says nothing here.
         walk = None
         if walked_cells:
             # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
-            walk = (
-                "Before the open, the walk of the cells this build knows passed: every sealed"
-                " value it read decrypted and authenticated."
-                if walked[0] == "PASS"
-                else f"Before the open, the walk of the cells this build knows reported "
-                f"{walked[0]}: {safe_text(walked[1]).rstrip('.')}."
-            )
+            if walked[0] != "PASS":
+                walk = (
+                    f"Before the open, the walk of the cells this build knows reported {walked[0]},"
+                    " which may be only this build reading another version's cells differently: "
+                    f"{safe_text(walked[1])}"
+                )
+            elif walked[2]:
+                walk = (
+                    "Before the open, the walk of the cells this build knows passed: every sealed"
+                    " value it read decrypted and authenticated."
+                )
+            else:
+                walk = (
+                    "Before the open, the walk of the cells this build knows passed, holding no"
+                    " sealed value to decrypt."
+                )
         return "FAIL", _incompatible_snapshot(exc, engine_version, walk=walk), 0
     except StoreKeylessError as exc:
         # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
@@ -4889,9 +4899,9 @@ def _incompatible_snapshot(
 
     The store's own message tells an operator to move the store aside and recreate it, and for an
     encrypted store to change its key first. Neither applies to an archive, so this names the
-    version to restore it with instead. The remedy leads, then ``walk``, the cell walk's sentence
-    when one read the cells before the open, and the differences follow, so a short display loses
-    only the detail."""
+    version to restore it with instead. The remedy leads, the differences follow, and ``walk``,
+    the cell walk's sentence when one read the cells before the open, comes last, so a short
+    display loses only the detail."""
     # The manifest is inside the authenticated archive, but it is still a string this build did not
     # write, so only a short, printable version label is quoted back.
     version = "".join(c for c in engine_version[:40] if c.isprintable())
@@ -4902,14 +4912,13 @@ def _incompatible_snapshot(
         tail = f"The schema step failed: {exc.cause or ''}."
     # Redacted and bounded like every other arm's reason (safe_exc there): the tail is driver text
     # and a difference list with no length of its own. The remedy leads, so a cut loses only detail.
-    middle = f"{walk} " if walk else ""
+    after = f" {walk}" if walk else ""
     return safe_text(
         "the archive's store is from an incompatible version, so this build cannot open it: restore"
         f" it with {wrote}. The archive opened and passed its integrity and row-count checks."
-        f" {middle}{tail}",
-        # The walk's sentence is bounded where it is made, and adds its own length so it does
-        # not push the first differences past the cut.
-        limit=_INCOMPATIBLE_REASON_LIMIT + len(middle),
+        f" {tail}{after}",
+        # The walk's sentence is bounded where it is made, and adds its own length to the cut.
+        limit=_INCOMPATIBLE_REASON_LIMIT + len(after),
     )
 
 
