@@ -54,13 +54,14 @@ from messagefoundry.transports.base import (
     wait_for_intake,
 )
 from messagefoundry.transports.framing import (
+    REPLY_REPLACED_REASON,
     FrameCodec,
     FrameError,
     check_frame_bytes,
     codec_for,
     declared_encoding,
     frame_for_delivery,
-    frame_reply,
+    frame_reply_reporting,
 )
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
@@ -730,14 +731,20 @@ class TcpSource(SourceConnector):
                                     break  # handler_error is recorded; close
                                 failed = False
                             if reply is not None:
-                                writer.write(
-                                    frame_reply(
-                                        self.codec,
-                                        reply,
-                                        self.encoding,
-                                        connection=self._pacing_name,
-                                    )
+                                wire, replaced = frame_reply_reporting(
+                                    self.codec,
+                                    reply,
+                                    self.encoding,
+                                    connection=self._pacing_name,
                                 )
+                                writer.write(wire)
+                                if replaced:
+                                    # BACKLOG #5799, as the MLLP listener records it.
+                                    await self._emit_event(
+                                        "reply_replaced",
+                                        peer_host=peer_host,
+                                        reason=REPLY_REPLACED_REASON,
+                                    )
                                 await self._drain_reply(writer)
                         if failed:
                             break

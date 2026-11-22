@@ -387,8 +387,9 @@ def test_split_keeps_the_whitespace_terminator_of_a_malformed_interchange_cut_at
 
 
 # Three trailers that close the frame at once, two of them not a clean IEA. Any segment opening with
-# IEA closes it (BACKLOG #5807 keeps that rule): the reader cannot see a connection end, so a frame
-# it held there would be dropped with no row.
+# IEA closes it: the reader cannot see a connection end, so a frame it held there would be dropped
+# with no row. BACKLOG #5807 asks for a separator check after IEA, which would break these; a build
+# of it was reverted in PR 3031, and the row is open.
 _TRAILERS_THAT_CLOSE = [
     pytest.param("IEA1*000000001~", id="dropped-separator"),
     pytest.param("IEAX*1~", id="longer-id"),
