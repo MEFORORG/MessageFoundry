@@ -391,9 +391,6 @@ _LOADERS: dict[str, frozenset[str]] = {
     "_username_held": frozenset({"get_user_by_username"}),
     "_directory_object_id_held": frozenset({"get_user_by_directory_object_id"}),
     "_user_id_held": frozenset({"get_user"}),
-    # An id question too: only the holder's id leaves it, to name an Unverifiable holder in a
-    # reconciler rename's seal report (vault BACKLOG #3069 item 1).
-    "_username_holder_id": frozenset({"get_user_by_username"}),
     # The bind's holder check, which must see a holder whose seal fails (BACKLOG #5625).
     "_federated_subject_held_elsewhere": frozenset({"get_user_by_federated_subject"}),
     # A count for the holder's notice after a code is spent; it decides nothing.

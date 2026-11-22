@@ -10959,8 +10959,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except FirstAdministratorGrantedSessionsLive as exc:
         # Vault BACKLOG #3023 residual (4): the role is granted, so it pages as any grant does,
         # then the command exits non-zero with the text naming the host command that ends the
-        # earlier holder's session. Whether the page was delivered is reported as a granted run
-        # reports it (vault BACKLOG #3023 items 11 and 30).
+        # earlier holder's session. Whether the page was delivered is reported too: the JSON's
+        # administrator_granted_alerted, and a WARNING when it was not. Unlike a granted run's,
+        # that WARNING names no other Administrator, since this refusal does not carry them
+        # (vault BACKLOG #3023 items 11 and 30).
         alerted = page_granted(exc.username)
         if not alerted and not args.json:
             print(

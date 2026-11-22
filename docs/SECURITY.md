@@ -1037,7 +1037,7 @@ to page its `administrator_granted` alert, and the command exits non-zero with t
 `messagefoundry admin-revoke-sessions`, since a re-run refuses an account that holds the role. A
 run refused after it wrote to the account may leave that account's sessions live;
 `messagefoundry admin-revoke-sessions`, run once the store answers, with the `--service-config` or
-`--db` the command used, ends the sessions it finds, of every account (vault BACKLOG #3023). The
+`--db` the command used, ends the sessions it finds, of any account (vault BACKLOG #3023). The
 directory reconciler's revoke counts its attempts the same way, but
 its first attempt carries its `auth.ad_session_revoked` row and its second, without the row,
 always runs, since the first one's error may be the row's; so there a SQL Server pool wait is
@@ -6713,7 +6713,7 @@ under running engines skips that moment, so stop every engine process and cluste
 store before the restore):
 
 - run `messagefoundry admin-revoke-sessions` against the restored store. It ends the sessions it
-  finds, of every account, and writes one `auth.session_revoked` audit row; *Limits of the session
+  finds, of any account, and writes one `auth.session_revoked` audit row; *Limits of the session
   sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says what it
   may miss;
 - re-apply the changes the restore undid. `messagefoundry restore --help` prints the statement of

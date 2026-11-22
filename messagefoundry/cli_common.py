@@ -355,7 +355,10 @@ def _emit_error(
 
     ``code`` adds a machine-readable ``"code"`` key beside ``"error"`` in the JSON form, for a consumer
     that must branch on the failure family without matching message text (``lens rewrite``, BACKLOG
-    #237). ``extra`` adds further keys to the JSON form only, after those two."""
+    #237). ``extra`` adds further keys to the JSON form only; it may not name either of those two
+    (``ValueError``)."""
+    if extra is not None and not extra.keys().isdisjoint({"error", "code"}):
+        raise ValueError("extra may not replace the error envelope's own keys")
     if as_json:
         payload: dict[str, object] = {"error": message}
         if code is not None:
