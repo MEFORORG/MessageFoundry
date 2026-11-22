@@ -6427,12 +6427,29 @@ class AlertsSettings(_Section):
 
         ``WebhookTransport`` refuses the same URL when the API lifespan builds the notifier, so a
         settings load, ``check`` and the serve pre-flight passed it before. An empty value stays
-        "not configured", as every consumer reads it. The message names neither the URL nor its
-        scheme, because the path can hold the webhook's token."""
-        if v and urlsplit(v).scheme.lower() != "https":
+        "not configured", as every consumer reads it. The path can hold the webhook's token, so the
+        message carries nothing of the value: urlsplit's own ``ValueError`` quotes the netloc, so it
+        is caught and not chained. A control character or surrounding space is refused too: urlsplit
+        drops leading spaces and controls and every tab, CR and LF, so the scheme it reports need
+        not be the one urllib dials. The uncached split keeps the URL out of urllib's cache (vault
+        BACKLOG #5287).
+        """
+        if not v:
+            return v
+        # Lazy, as at the proxy_url check: the transport owns the uncached split.
+        from messagefoundry.transports.proxy_address import _UNCACHED_URLSPLIT
+
+        scheme: str | None = None
+        if v == v.strip() and not has_control_char(v) and not has_lone_surrogate(v):
+            try:
+                scheme = _UNCACHED_URLSPLIT(v).scheme
+            except ValueError:
+                scheme = None
+        if scheme != "https":
             raise ValueError(
-                "[alerts].webhook_url must be an https URL; the value is not repeated here, since "
-                "its path can carry the webhook's token. Refused, with no escape"
+                "[alerts].webhook_url must be a well-formed https URL with no control characters "
+                "or surrounding spaces; the value is not repeated here, since its path can carry "
+                "the webhook's token. Refused, with no escape"
             )
         return v
 

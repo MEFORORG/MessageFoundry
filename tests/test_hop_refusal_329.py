@@ -188,14 +188,31 @@ _WEBHOOK_TOKEN = "T0KEN-in-the-path"
         f"HTTP://hooks.example/{_WEBHOOK_TOKEN}",
         f"ftp://hooks.example/{_WEBHOOK_TOKEN}",
         f"hooks.example/{_WEBHOOK_TOKEN}",
+        # urlsplit's own ValueError quotes the netloc; the refusal must not pass it on.
+        f"https://svc:{_WEBHOOK_TOKEN}\uff03x@hooks.example/x",
+        f"https://svc:pw@[{_WEBHOOK_TOKEN}]/x",
+        # urlsplit drops these, so it would read the scheme as https.
+        f"ht\ttps://hooks.example/{_WEBHOOK_TOKEN}",
+        f"https\n://hooks.example/{_WEBHOOK_TOKEN}",
+        f" https://hooks.example/{_WEBHOOK_TOKEN}",
     ],
-    ids=["http", "upper-http", "ftp", "no-scheme"],
+    ids=[
+        "http",
+        "upper-http",
+        "ftp",
+        "no-scheme",
+        "nfkc-netloc",
+        "bad-bracket",
+        "tab",
+        "lf",
+        "space",
+    ],
 )
 def test_a_non_https_webhook_is_refused_at_load_without_echoing_it(url: str) -> None:
     # Vault BACKLOG #3533 item 14: settings load refuses it, so check and the serve pre-flight do
     # too, not only the notifier build. The path can hold the webhook's token, so the message
     # repeats no part of the URL.
-    with pytest.raises(ValidationError, match="must be an https URL") as info:
+    with pytest.raises(ValidationError, match="must be a well-formed https URL") as info:
         AlertsSettings(webhook_url=url)
     text = str(info.value)
     assert _WEBHOOK_TOKEN not in text and "hooks.example" not in text
@@ -207,7 +224,7 @@ def test_a_non_https_webhook_is_refused_by_the_settings_loader(tmp_path: Path) -
     config.write_text(
         f'[alerts]\nwebhook_url = "http://hooks.example/{_WEBHOOK_TOKEN}"\n', encoding="utf-8"
     )
-    with pytest.raises(ValidationError, match="must be an https URL") as info:
+    with pytest.raises(ValidationError, match="must be a well-formed https URL") as info:
         load_settings(config_path=config, environ={})
     assert _WEBHOOK_TOKEN not in str(info.value)
 

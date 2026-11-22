@@ -2747,7 +2747,8 @@ the DSN or a credential.
 ASVS 13.2.1 asks that every backend hop authenticate with an individual service account, a short-term
 token or a certificate, not with an unchanging credential. The engine keeps one list of the hops it
 dials that do not (BACKLOG #1182). A hop is on the list when it presents a static credential (a
-password, API key, static bearer token or Vault token) or no credential at all. A hop that presents
+password, API key, static bearer token or Vault token; the alert webhook counts as one, since its
+URL path can carry a token) or no credential at all. A hop that presents
 only a compliant credential is never on it.
 
 Three surfaces read that one list, so they cannot disagree:
