@@ -23,6 +23,7 @@ import stat
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -256,3 +257,45 @@ def test_a_file_renamed_and_replaced_after_its_screen_is_reported_not_emptied(
     assert (staging / "a.tar").read_bytes() == b"synthetic replacement"
     # The control: the other file of the same directory is still emptied.
     assert (staging / "own.tar").read_bytes() == b""
+
+
+# --- the re-mark's exclusive create, when the name is taken -------------------------------------
+
+
+def test_the_re_mark_refuses_an_entry_at_a_mark_name_that_is_not_a_plain_file(
+    tmp_path: Path,
+) -> None:
+    """`.lock` is taken by a directory: the re-mark raises rather than accept it, on Windows at the
+    exclusive create and on POSIX at the check after it. The control: the other name is created."""
+    staging = tmp_path / "mefor-backup-kept"
+    staging.mkdir()
+    (staging / dr_backup._LOCK_NAME).mkdir()
+    with dr_backup._HeldStagingDir(staging) as held_dir:
+        with pytest.raises(OSError):  # Windows refuses the create itself, POSIX the check
+            held_dir.mark(dr_backup._LOCK_NAME)
+        held_dir.mark(dr_backup._HELD_MARKER_NAME)
+    assert (staging / dr_backup._HELD_MARKER_NAME).is_file()
+
+
+def test_the_re_mark_creates_a_name_that_went_after_its_create_was_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The entry is removed between the refused create and its check, as a concurrent teardown's
+    removal can do: it is created once more rather than leave the directory unmarked."""
+    staging = tmp_path / "mefor-backup-kept"
+    staging.mkdir()
+    lock = staging / dr_backup._LOCK_NAME
+    lock.write_bytes(b"")
+    real_open = os.open
+
+    def refused_then_gone(*args: Any, **kwargs: Any) -> int:
+        try:
+            return real_open(*args, **kwargs)
+        except FileExistsError:
+            lock.unlink()
+            raise
+
+    with dr_backup._HeldStagingDir(staging) as held_dir:
+        monkeypatch.setattr(os, "open", refused_then_gone)
+        held_dir.mark(dr_backup._LOCK_NAME)
+    assert lock.is_file()
