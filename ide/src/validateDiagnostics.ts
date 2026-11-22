@@ -19,10 +19,10 @@ export interface DiagnosticLocation {
 }
 
 // The engine writes a module's own load failure as "error loading config module <name>: <Type> at line
-// N (...)" (wiring.py, _load_failure_text and _failure_detail). Any other shape names a line somewhere
+// N (...)" (wiring.py, _module_failure and _failure_detail). Any other shape names a line somewhere
 // else: "<Type> in <helper>.py at line N" is a helper's line, and a helper-preload refusal quotes the
 // helper's own detail. So only that exact shape, naming this file, places the diagnostic.
-const OWN_LINE_RE = /^error loading config module (.+?): [\w.]+ at line (\d+)\b/;
+const OWN_LINE_RE = /^error loading config module (.+?): \S+ at line (\d+)\b/;
 
 /**
  * Locate `d` for the Problems panel. The CLI runs in `cwd` (the workspace), so a relative `file` is
@@ -36,7 +36,7 @@ export function diagnosticLocation(
   configDir: string,
   win32: boolean = IS_WIN32,
 ): DiagnosticLocation {
-  const file = resolveAgainst(cwd, d.file ?? configDir, win32);
+  const file = resolveAgainst(cwd, d.file || configDir, win32);
   const m = d.file ? OWN_LINE_RE.exec(d.message) : null;
   let line = 0;
   if (m) {

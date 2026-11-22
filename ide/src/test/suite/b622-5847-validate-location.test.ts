@@ -54,6 +54,15 @@ suite("b622 #5847 validate diagnostic location", () => {
     assert.strictEqual(diagnosticLocation(diag("d:\\ws\\config\\a.py", upper), "d:\\ws", "config", true).line, 2);
   });
 
+  test("a non-ASCII exception type name still places the line", () => {
+    const m = "error loading config module a.py: ÉchecConfig at line 12 (withheld)";
+    assert.strictEqual(diagnosticLocation(diag("/ws/config/a.py", m), "/ws", "config", false).line, 11);
+  });
+
+  test("an empty file falls back to the config directory, like a missing one", () => {
+    assert.strictEqual(diagnosticLocation(diag(""), "/ws", "config", false).file, "/ws/config");
+  });
+
   test("no line in the message, or no file, stays on the first line", () => {
     assert.strictEqual(diagnosticLocation(diag("/ws/config/a.py"), "/ws", "config", false).line, 0);
     assert.strictEqual(diagnosticLocation(diag(null, "x at line 9"), "/ws", "config", false).line, 0);

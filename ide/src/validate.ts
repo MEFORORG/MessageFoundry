@@ -3,6 +3,7 @@
 // Run `messagefoundry validate --json` and surface problems in the Problems panel.
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
+import { fileKey } from "./pathIdentity";
 import { diagnosticLocation, type ValidateDiagnostic } from "./validateDiagnostics";
 
 export interface Validator {
@@ -28,8 +29,8 @@ export function createValidator(context: vscode.ExtensionContext): Validator {
     }
 
     collection.clear();
-    // Keyed by the Uri's own string, which is how the collection tells files apart: two spellings of
-    // one file (a drive letter's case, say) would otherwise be two entries, and the second set() wins.
+    // Keyed by file identity (case-folded on Windows), as the collection compares resources: two
+    // spellings of one file would otherwise be two entries, and the second set() would replace the first.
     const byFile = new Map<string, { uri: vscode.Uri; list: vscode.Diagnostic[] }>();
     for (const d of diags) {
       const { file, line } = diagnosticLocation(d, cwd, dir);
@@ -40,7 +41,7 @@ export function createValidator(context: vscode.ExtensionContext): Validator {
           : vscode.DiagnosticSeverity.Error;
       const diag = new vscode.Diagnostic(new vscode.Range(line, 0, line, 0), d.message, severity);
       diag.source = "messagefoundry";
-      const key = uri.toString();
+      const key = fileKey(cwd, file);
       const entry = byFile.get(key) ?? { uri, list: [] };
       entry.list.push(diag);
       byFile.set(key, entry);
