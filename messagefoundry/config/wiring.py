@@ -412,8 +412,8 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
     made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
-    (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` the builtin's reading with a bool
-    refused (:func:`_cast_float`). Any other callable runs as given, a builtin such as ``abs`` or a
+    (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
+    (:func:`_cast_float`). Any other callable runs as given, a builtin such as ``abs`` or a
     type such as ``decimal.Decimal`` included, on the environment value as it arrives, a TOML bool
     included, so ``cast=lambda v: int(v)`` still reads ``true`` as 1; the connector's own check
     sees only what the cast returned. On a boolean
@@ -536,20 +536,13 @@ def _cast_float(raw: Any) -> float:
     it (vault BACKLOG #1650).
 
     The builtin turns ``True`` into 1.0, and a TOML ``true`` in ``environments/<env>.toml`` reaches
-    the cast typed, so a bool is refused, ``False`` as well as ``True``. Anything else is read by
-    ``float()``, as before.
+    the cast typed. It also takes ``"nan"`` and ``"inf"``, and rounds ``"1e-400"`` to 0.0, so a
+    float cap read through the cast could turn off from a value nobody wrote as zero. So the value
+    is read by the rule ``transports.base.float_setting`` holds, which refuses each of those with a
+    ``ValueError`` that withholds the value, by the rule :func:`_cast_bool` states."""
+    from messagefoundry.transports.base import float_setting
 
-    Raises ``ValueError`` with the value withheld, by the rule :func:`_cast_bool` states, outside the
-    handler, so ``float()``'s own message, which quotes the value, is not left on ``__context__``."""
-    reason: str
-    if isinstance(raw, bool):
-        reason = "a bool is not a number"
-    else:
-        try:
-            return float(raw)
-        except (TypeError, ValueError, OverflowError):
-            reason = "not a number"
-    raise ValueError(f"{reason} (value withheld)")
+    return float_setting(raw, knob="value", transport="env()")
 
 
 # Named "float" for the reason ``_cast_bool`` is named "bool".

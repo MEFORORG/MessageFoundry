@@ -9,6 +9,9 @@ bool cases are red there; the rest are controls the builtin already met."""
 
 from __future__ import annotations
 
+import math
+from decimal import Decimal
+
 import pytest
 
 from messagefoundry.config.wiring import (
@@ -28,6 +31,24 @@ def test_env_cast_float_refuses_a_bool_and_other_shapes(raw: object) -> None:
     assert "'rate'" in msg and "'acme_rate'" in msg
     assert "not a valid float" in msg and "value withheld" in msg
     assert "abc" not in msg
+
+
+@pytest.mark.parametrize(
+    "raw", ["nan", "inf", "-inf", math.nan, math.inf, "1e-400", Decimal("1e-400"), "1e400"]
+)
+def test_env_cast_float_refuses_a_non_finite_or_underflowing_value(raw: object) -> None:
+    """The builtin read each of these as nan, an infinity or 0.0, so a float cap read through the
+    cast could turn off from a value nobody wrote as zero. Red on branch head b0172e13bd8."""
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings({"rate": env("acme_rate", cast=float)}, {"acme_rate": raw})
+    msg = str(ei.value)
+    assert "not a valid float" in msg and "value withheld" in msg
+    assert "400" not in msg
+
+
+@pytest.mark.parametrize("raw", ["0", "0.0", "-0", 0, 0.0])
+def test_env_cast_float_still_reads_an_exact_zero(raw: object) -> None:
+    assert resolve_env_settings({"rate": env("r", cast=float)}, {"r": raw})["rate"] == 0.0
 
 
 @pytest.mark.parametrize("raw", [True, False])

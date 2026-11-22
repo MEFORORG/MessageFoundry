@@ -53,7 +53,10 @@ def test_the_probe_leaves_no_text_and_reaches_no_other_handler(
             self.messages: list[str] = []
 
         def emit(self, record: logging.LogRecord) -> None:
-            self.messages.append(record.getMessage())
+            # Only this logger's records: the root spy also sees every other logger's, and a stray
+            # line from one of them must not fail the comparison below.
+            if record.name == _NAME:
+                self.messages.append(record.getMessage())
 
     other, above = _Keep(), _Keep()
     probe_logger.addHandler(other)
@@ -62,6 +65,7 @@ def test_the_probe_leaves_no_text_and_reaches_no_other_handler(
         with caplog.at_level(logging.WARNING, logger=_NAME):
             probe_logger.warning("before the probe")
             assert_capture_sees(caplog, _NAME)
+            logging.getLogger(f"{_NAME}_other").warning("a stray line from another logger")
             probe_logger.warning("after the probe")
     finally:
         probe_logger.removeHandler(other)
