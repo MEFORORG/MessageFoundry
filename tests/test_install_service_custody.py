@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
+import messagefoundry.service as svc
 from tests.test_service_install_manifest import (
-    _SCRIPT,
     _extract,
     _ok,
     _preflight_facts,
@@ -26,6 +26,8 @@ from tests.test_service_install_manifest import (
     _script_text,
     _sole_call,
 )
+
+_SCRIPT = svc.install_script_path()
 
 pytestmark = pytest.mark.skipif(
     _SCRIPT is None,
