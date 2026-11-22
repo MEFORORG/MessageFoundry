@@ -34,15 +34,17 @@ import io
 import logging
 import tokenize
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
 from typing import cast
 
 from messagefoundry.config.code_sets import CodeSet
-from messagefoundry.config.wiring import _CONFIG_MODULE_PREFIX, Registry
+from messagefoundry.config.graph import DATA_FLOW_RELATIONS
+from messagefoundry.config.wiring import _CONFIG_MODULE_PREFIX, EnvRef, Registry
 
 __all__ = [
+    "SETTING_REFERENCES",
     "Reference",
     "ReferenceIndex",
     "SourceCache",
@@ -56,6 +58,13 @@ __all__ = [
 ]
 
 _log = logging.getLogger(__name__)
+
+#: The connection settings that name another connection: (referrer kind, setting, target kind).
+#: Each referrer's edge carries the setting as its relation.
+SETTING_REFERENCES: tuple[tuple[str, str, str], ...] = (
+    ("outbound", "reingress_to", "inbound"),
+    ("inbound", "reply_from", "outbound"),
+)
 
 #: The run-time call each table kind is read through, keyed by the simple name the call resolves to
 #: (``code_set(...)`` and ``mod.code_set(...)`` alike). Its first positional argument is the table name.
@@ -271,13 +280,36 @@ class SourceCache:
     def __init__(self) -> None:
         self._parsed: dict[str, tuple[ast.Module, list[str]] | None] = {}
         self._occurrences: dict[tuple[str, str], dict[tuple[int, int], str | None]] = {}
+        self._raw: dict[str, bytes | None] = {}
+
+    def raw(self, file: str) -> bytes | None:
+        """``file``'s bytes as first read through this cache, or ``None`` when unreadable. Every
+        later read of the file through the cache sees the same bytes, so a plan built from them
+        can be checked against the file as it was when the plan read it."""
+        if file not in self._raw:
+            try:
+                self._raw[file] = Path(file).read_bytes()
+            except OSError as exc:
+                _log.debug("reference analysis could not read %s: %s", file, type(exc).__name__)
+                self._raw[file] = None
+        return self._raw[file]
+
+    def text(self, file: str, encoding: str = "utf-8") -> str | None:
+        """``file``'s cached bytes decoded with universal newlines, as ``Path.read_text`` reads it;
+        ``None`` when unreadable. A decode error propagates."""
+        raw = self.raw(file)
+        if raw is None:
+            return None
+        return raw.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
 
     def parse(self, file: str) -> tuple[ast.Module, list[str]] | None:
         """``file``'s module tree and its lines, or ``None`` when unreadable or unparseable."""
         if file not in self._parsed:
             try:
                 # utf-8-sig: a BOM-encoded module (common from Windows editors) parses too.
-                text = Path(file).read_text(encoding="utf-8-sig")
+                text = self.text(file, "utf-8-sig")
+                if text is None:
+                    raise FileNotFoundError(file)
                 lines = source_lines(text)
                 self._parsed[file] = (ast.parse(text), lines)
             except (OSError, SyntaxError, ValueError, MemoryError, RecursionError) as exc:
@@ -382,12 +414,26 @@ def _source_kinds(func: FunctionType, literal: str, sources: SourceCache) -> set
 
 @dataclass(frozen=True)
 class Reference:
-    """One reverse edge — ``referrer`` (a ``referrer_kind``) names ``target`` (a ``target_kind``)."""
+    """One reverse edge — ``referrer`` (a ``referrer_kind``) names ``target`` (a ``target_kind``).
+
+    ``relation`` is what the naming means: a wiring edge's
+    :data:`~messagefoundry.config.graph.EdgeRelation` (``reply_from`` among them, which names an
+    outbound but sends it nothing), ``"reads"`` for a table a Router or Handler reads, or ``None``
+    when the constructor did not say. It is left out of equality, so a caller can still look an edge
+    up by its four names."""
 
     referrer_kind: str
     referrer: str
     target_kind: str
     target: str
+    relation: str | None = field(default=None, compare=False)
+
+    @property
+    def carries_data(self) -> bool:
+        """Whether the reachability walk follows this edge: a table read, and every wiring relation
+        but a name reference such as ``reply_from``. An untagged edge counts, so a missed tag can
+        only hide dead config, never report a live object dead."""
+        return self.relation in (None, "reads") or self.relation in DATA_FLOW_RELATIONS
 
 
 @dataclass(frozen=True)
@@ -402,12 +448,17 @@ class ReferenceIndex:
 
     def unreferenced(self, registry: Registry) -> list[tuple[str, str]]:
         """Registered objects unreachable from the inbound roots — dead config (#176), as sorted
-        ``(kind, name)`` pairs. Inbound connections are the roots and are never reported."""
+        ``(kind, name)`` pairs. Inbound connections are the roots and are never reported.
+
+        The walk follows data flow, so a wiring edge no message travels along (an inbound's
+        ``reply_from``) is skipped: an outbound only a ``reply_from`` names, that nothing sends to,
+        never produces the reply, and is reported (BACKLOG #5966)."""
+        flow = [e for e in self.edges if e.carries_data]
         adj: dict[tuple[str, str], set[tuple[str, str]]] = {}
-        for e in self.edges:
+        for e in flow:
             adj.setdefault((e.referrer_kind, e.referrer), set()).add((e.target_kind, e.target))
         reachable: set[tuple[str, str]] = {
-            (e.target_kind, e.target) for e in self.edges if e.referrer_kind == "inbound"
+            (e.target_kind, e.target) for e in flow if e.referrer_kind == "inbound"
         }
         stack = list(reachable)
         while stack:
@@ -440,7 +491,7 @@ def build_reference_index(registry: Registry, sources: SourceCache | None = None
     # Wiring edges (inbound -> router -> handler -> outbound/PT): the shared extractor. Reachability
     # wants MAXIMAL edges (a missed edge = a false "dead" report), so every provenance tier counts.
     edges: list[Reference] = [
-        Reference(e.source_kind, e.source, e.target_kind, e.target)
+        Reference(e.source_kind, e.source, e.target_kind, e.target, e.relation)
         for e in build_wiring_graph(registry).edges
     ]
     # Table edges. A referrer's callables are its own function and, for a handler, its accepts=
@@ -458,12 +509,28 @@ def build_reference_index(registry: Registry, sources: SourceCache | None = None
     # Helpers shared by many referrers are read once: targets are cached per reached object.
     targets_of: dict[int, list[tuple[str, str]]] = {}
     seen: set[Reference] = set(edges)
+    # A setting the wiring graph has no edge for still names its target: one written as an env()
+    # whose default names it, and a reingress_to naming an inbound that is no Loopback (dangling in
+    # the graph). Delete impact and rename must see both (BACKLOG #5966).
+    settings_of = {
+        "inbound": {n: c.spec.settings for n, c in registry.inbound.items()},
+        "outbound": {n: c.spec.settings for n, c in registry.outbound.items()},
+    }
+    for kind, setting, target_kind in SETTING_REFERENCES:
+        for name, settings in sorted(settings_of[kind].items()):
+            value = settings.get(setting)
+            named = value.default if isinstance(value, EnvRef) else value
+            if isinstance(named, str) and named in settings_of[target_kind]:
+                edge = Reference(kind, name, target_kind, named, setting)
+                if edge not in seen:
+                    seen.add(edge)
+                    edges.append(edge)
     for kind, name, fn in roots:
         for reached in _reached(fn):
             if id(reached) not in targets_of:
                 targets_of[id(reached)] = _table_targets(reached, kinds_by_name, sources)
             for target_kind, target in targets_of[id(reached)]:
-                edge = Reference(kind, name, target_kind, target)
+                edge = Reference(kind, name, target_kind, target, "reads")
                 if edge not in seen:
                     seen.add(edge)
                     edges.append(edge)

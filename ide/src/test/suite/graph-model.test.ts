@@ -206,3 +206,59 @@ suite("graphModel — v1 payload normalization (older CLI)", () => {
     assert.deepStrictEqual(chainOut.children.map((c) => c.label), ["OB_X"]);
   });
 });
+
+suite("graphModel — connection-to-connection references (BACKLOG #5966)", () => {
+  // A request/response loop: IB_REQ -> route_req -> to_partner -> OB_PARTNER, whose captured reply
+  // re-enters IB_LOOP (reingress_to).
+  const LOOP: Graph = {
+    version: 2,
+    inbound: [
+      { name: "IB_REQ", type: "file", router: "route_req", receives_from: [] },
+      { name: "IB_LOOP", type: "loopback", router: "route_loop", receives_from: [] },
+    ],
+    outbound: [
+      {
+        name: "OB_PARTNER",
+        type: "mllp",
+        receives_from: ["to_partner"],
+        edges: [{ target: "IB_LOOP", target_kind: "inbound", provenance: "declared" }],
+      },
+      { name: "OB_RESULT", type: "file", receives_from: [], edges: [] },
+    ],
+    routers: [
+      { name: "route_req", edges: [{ target: "to_partner", target_kind: "handler", provenance: "literal" }], fed_by: ["IB_REQ"] },
+      { name: "route_loop", edges: [], fed_by: ["IB_LOOP"] },
+    ],
+    handlers: [
+      {
+        name: "to_partner",
+        edges: [{ target: "OB_PARTNER", target_kind: "outbound", provenance: "literal" }],
+        fed_by: ["route_req"],
+      },
+    ],
+  };
+
+  test("the reingress_to back-edge shows on both ends in the elements perspective", () => {
+    const roots = buildElementsView(LOOP, "");
+    const ob = byLabel(byLabel(roots, "Outbound Connections").children, "OB_PARTNER");
+    const reenters = group(ob, "→ re-enters").children;
+    assert.deepStrictEqual(reenters.map((r) => [r.elementKind, r.elementName]), [["inbound", "IB_LOOP"]]);
+    const loop = byLabel(byLabel(roots, "Inbound Connections").children, "IB_LOOP");
+    assert.deepStrictEqual(group(loop, "⇦ re-entered from").children.map((r) => [r.elementKind, r.elementName]), [
+      ["outbound", "OB_PARTNER"],
+    ]);
+    const plain = byLabel(byLabel(roots, "Outbound Connections").children, "OB_RESULT");
+    assert.deepStrictEqual(plain.children, []);
+  });
+
+  test("the flow perspective draws the back-edge once, as a leaf ref, never a loop", () => {
+    const flow = buildFlowView(LOOP, "", "none");
+    const ob = byLabel(flow, "OB_PARTNER");
+    assert.strictEqual(ob.collapsible, "collapsed");
+    assert.deepStrictEqual(
+      ob.children.map((c) => [c.kind, c.elementKind, c.elementName, c.children.length]),
+      [["ref", "inbound", "IB_LOOP", 0]],
+    );
+    assert.strictEqual(byLabel(flow, "OB_RESULT").collapsible, "none");
+  });
+});
