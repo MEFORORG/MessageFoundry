@@ -113,6 +113,33 @@ function Get-RecordText {
     return ConvertTo-OneLine ([string]$property.Value)
 }
 
+function Test-SameWorktree {
+    # ORDINAL, because a culture-sensitive compare ignores zero-width and some control characters and
+    # would call a different path this tree. Case and separators still fold, as they always have.
+    param([string]$Left, [string]$Right)
+    return [string]::Equals(($Left -replace '/', '\').TrimEnd('\'), ($Right -replace '/', '\').TrimEnd('\'),
+        [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-GoalText {
+    # The goal as one line, '' when it is absent, blank or not text. ConvertFrom-Json turns a goal that
+    # looks like a date into a [datetime], and that is still the goal somebody stated, so the original
+    # text is read back. -DateKind needs PowerShell 7.5; without it the instant is kept in ISO form.
+    param($Record, [string]$Path)
+    $property = $Record.PSObject.Properties['goal']
+    if (-not $property) { return '' }
+    $value = $property.Value
+    if ($value -is [datetime] -or $value -is [datetimeoffset]) {
+        $reread = $null
+        try { $reread = (Read-CoordText $Path | ConvertFrom-Json -DateKind String -EA Stop).goal } catch { }
+        $value = if ($reread -is [string]) { $reread } else { $value.ToString('o', [cultureinfo]::InvariantCulture) }
+    }
+    if ($value -isnot [string]) { return '' }
+    $text = ConvertTo-OneLine $value
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    return $text
+}
+
 function Test-AllocTombstone {
     # EXACTLY the ownerless record the retired allocator left (BACKLOG #1829), the same test
     # remove.ps1's Read-RecordFile applies. Any near miss stays a record nobody can attribute.
@@ -140,7 +167,7 @@ function Get-LedgerLines {
         ''
         'UNREADABLE LEDGER RECORD -- names this worktree but its filename is no number, so it may'
         'be a held allocation. Read it before removing this tree:'
-        foreach ($u in $Unreadable) { "    $(ConvertTo-OneLine $u)" }
+        foreach ($u in $Unreadable) { "    $u" }
     }
     if ($Unattributed -gt 0) {
         ''
@@ -232,6 +259,7 @@ $ledgerScanned = $false
 $allocDir = ''
 $branchNow = ''
 $banner = "[precompact] Restoring what this compaction is about to drop.`n"
+$declareCmd = '    pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"'
 try {
     $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
@@ -241,7 +269,6 @@ try {
     $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
     if (-not $top) { exit 0 }
     $top = $top.Trim()
-    $topNorm = ($top -replace '/', '\').TrimEnd('\')
 
     # seats/ and alloc/ live on the SHARED root (docs/COORD-SHARED-ROOT.md). One probe answers both,
     # since the resolver puts every shared kind on one root. A root that does not answer drops only
@@ -276,6 +303,13 @@ try {
     # codex-seats/ is not a shared kind; it stays on the local root.
     if ($env:KORUS_AGENT -eq 'codex') { $seatsDir = Join-Path $coord 'codex-seats' }
     $declared = $null
+    $declaredGoal = ''
+    # Records for this tree that were rejected as damaged, so that "none usable" is not reported as
+    # "never declared". The newest goal among them is still shown, labelled as unverified.
+    $damagedCount = 0
+    $damagedFile = ''
+    $damagedGoal = ''
+    $damagedBranch = ''
     if ($seatsDir -and (Test-Path -LiteralPath $seatsDir)) {
         $cands = Get-ChildItem -LiteralPath $seatsDir -Recurse -Filter '*.json' -File -EA SilentlyContinue |
                  Sort-Object LastWriteTimeUtc -Descending
@@ -283,7 +317,7 @@ try {
             try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
             $wt = Get-RecordWorktree $j
             if (-not $wt) { continue }
-            if (($wt -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
+            if (-not (Test-SameWorktree $wt $top)) { continue }
             # Another PC can hold a worktree at the same path. Its record is that PC's seat, not this
             # one's. A record with no host predates the field and is this PC's.
             # Only codex-seats/ is read with no resolver loaded, and that registry is local by kind.
@@ -296,11 +330,19 @@ try {
             }
             # seat.ps1 always writes the `seat` key, so a record without it is damaged and must not
             # displace a good declaration. A PRESENT null is real: `-Declare -Goal` with no -Seat.
-            if (-not $j.PSObject.Properties['seat']) { continue }
+            $hasSeat = [bool]$j.PSObject.Properties['seat']
             # seat.ps1 writes a goal as text, so a blank or non-string one is damage too.
+            $goalText = Get-GoalText $j $f.FullName
+            if ($hasSeat -and $goalText) { $declared = $j; $declaredGoal = $goalText; break }
+            # A seat key with a null or absent goal is what seat.ps1 writes before any declaration.
             $goalField = $j.PSObject.Properties['goal']
-            if ($goalField -and $goalField.Value -is [string] -and
-                -not [string]::IsNullOrWhiteSpace((ConvertTo-OneLine $goalField.Value))) { $declared = $j; break }
+            if ($hasSeat -and (-not $goalField -or $null -eq $goalField.Value)) { continue }
+            $damagedCount++
+            if (-not $damagedFile) { $damagedFile = ConvertTo-OneLine $f.FullName }
+            if (-not $damagedGoal) {
+                $damagedGoal = if ($goalText) { $goalText } else { (Get-RecordText $j 'goal').Trim() }
+                if ($damagedGoal) { $damagedBranch = Get-RecordText $j 'branch' }
+            }
         }
     }
 
@@ -343,21 +385,30 @@ try {
             $lines += "Worktrees get re-used, so treat the following as a previous occupant's intent"
             $lines += "and re-declare rather than adopting it:"
             $lines += "    seat: $declSeat"
-            $lines += "    goal: $(Get-RecordText $declared 'goal')"
-            $lines += '    pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"'
+            $lines += "    goal: $declaredGoal"
+            $lines += $declareCmd
         } else {
             $lines += "SEAT: $declSeat"
-            $lines += "GOAL: $(Get-RecordText $declared 'goal')"
+            $lines += "GOAL: $declaredGoal"
             if ($declared.PSObject.Properties['done'] -and $declared.done) { $lines += "DONE WHEN: $(Get-RecordText $declared 'done')" }
             if ($declared.PSObject.Properties['outOfScope'] -and $declared.outOfScope) { $lines += "OUT OF SCOPE: $(Get-RecordText $declared 'outOfScope')" }
             if ($declaredDisplay) { $lines += "declared at $declaredDisplay$age" }
         }
+    } elseif ($damagedCount -gt 0) {
+        $lines += "SEAT: not restored. $damagedCount DAMAGED record(s) name this worktree, so a declaration may"
+        $lines += "have been lost. This is not known to be the never-declared case. Newest: $damagedFile"
+        if ($damagedGoal) {
+            $onBranch = if ($damagedBranch) { " (recorded on branch '$damagedBranch')" } else { '' }
+            $lines += "    goal in a damaged record, UNVERIFIED$onBranch`: $damagedGoal"
+        }
+        $lines += 'Check it, then declare again:'
+        $lines += $declareCmd
     } elseif ($sharedError -and -not $seatsDir) {
         $lines += "SEAT: not restored. The shared seat registry did not answer ($sharedError)."
     } else {
         $lines += "SEAT: not declared. Nothing on disk carries a goal for this worktree, so this is the"
         $lines += "'never asked or never answered' case, NOT a goal lost to compaction. Declare one:"
-        $lines += '    pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"'
+        $lines += $declareCmd
     }
 
     # ---- ledger numbers this worktree holds ------------------------------------------------
@@ -369,7 +420,10 @@ try {
         foreach ($f in (Get-ChildItem -LiteralPath $allocDir -Recurse -Filter '*.json' -File -EA SilentlyContinue)) {
             # A record that does not parse or names no worktree could be this tree's. They are counted
             # rather than listed, because the registry is shared and this text costs context.
-            try { $a = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { $unattributed++; continue }
+            # -NoEnumerate and the object test are how remove.ps1 reads this record: without them a
+            # one-element array unwraps and reads as a normal held number.
+            try { $a = Read-CoordText $f.FullName | ConvertFrom-Json -NoEnumerate -EA Stop } catch { $unattributed++; continue }
+            if ($a -isnot [System.Management.Automation.PSCustomObject]) { $unattributed++; continue }
             # Another machine's allocation names a path on that machine's disk, so the same path here
             # is a different tree and the number is not this one's to lose. No `host` is this machine.
             if (-not (Test-CoordRecordIsHere $a)) { continue }
@@ -381,17 +435,18 @@ try {
             # EXACT match, never a prefix. Sibling worktrees in this repo are named as extensions of
             # each other (...-cfbf59 and ...-cfbf59-connscale-ci-claim), so a prefix test claims another
             # tree's numbers as your own.
-            if (($aw -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
+            if (-not (Test-SameWorktree $aw $top)) { continue }
             # THE FILENAME IS THE NUMBER, as alloc.ps1 records, and the body's `number` field is not, so
             # a body that lost the field still names its number. A file naming this tree with no
             # number in its name may still be a held allocation, so it is reported, never skipped.
             # ASCII digits only: `\d` also matches other scripts' digits, as alloc.ps1 warns.
-            if ($f.BaseName -notmatch '\A[0-9]+\z') { $unreadable += $f.FullName; continue }
+            if ($f.BaseName -notmatch '\A[0-9]+\z') { $unreadable += ConvertTo-OneLine $f.FullName; continue }
             $held += "#$($f.BaseName) ($(ConvertTo-OneLine $f.Directory.Name)) $(Get-RecordText $a 'title')"
         }
     }
-    $ledgerScanned = $true
     $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir)
+    # Set only once the block is in $lines: a renderer throw must still earn the catch's caveat.
+    $ledgerScanned = $true
     # Emptied once printed, so the catch below cannot print them a second time.
     $held = @()
     $unreadable = @()
@@ -412,7 +467,15 @@ try {
         # Each step is guarded alone, so a helper that threw on the main path cannot empty this one.
         $why = [string]$_.Exception.Message
         try { $why = ConvertTo-OneLine $why } catch { $why = 'unreadable error' }
-        try { $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir) } catch { }
+        try {
+            $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir)
+        } catch {
+            # The renderer is what threw, so the gathered facts go out plain. They are already one line.
+            $lines += ''
+            $lines += 'LEDGER RECORDS GATHERED BEFORE THE STOP -- held numbers, then unreadable files:'
+            foreach ($entry in @($held) + @($unreadable)) { $lines += "    $entry" }
+            if ($unattributed -gt 0) { $lines += "LEDGER RECORDS NOT ATTRIBUTED: $unattributed could be this tree's." }
+        }
         # A missing ledger block must not read as "this tree holds no numbers".
         if (-not $ledgerScanned) { $lines += ''; $lines += 'LEDGER NUMBERS: not fully checked, so this tree may hold some.' }
         try { $lines += @(Get-WorkLines $branchNow) } catch { }
