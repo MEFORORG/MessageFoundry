@@ -421,8 +421,8 @@ def test_named_bool_cast_is_not_the_builtin(tmp_path: Path) -> None:
     assert ref.cast("false") is False and ref.cast("true") is True
     # `int` is not the builtin either: it is the strict whole-number cast (BACKLOG #1650).
     assert parse_env_setting({"env": "p", "cast": "int"}).cast is not int
-    # `float` and `str` are still the builtins.
-    assert parse_env_setting({"env": "p", "cast": "float"}).cast is float
+    # `float` refuses a bool (BACKLOG #1650); `str` is still the builtin.
+    assert parse_env_setting({"env": "p", "cast": "float"}).cast is not float
     assert parse_env_setting({"env": "p", "cast": "str"}).cast is str
 
 

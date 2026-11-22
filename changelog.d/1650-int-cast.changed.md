@@ -3,6 +3,7 @@
   connector's own port check saw the value, so an `env()` port could dial a port nobody named.
   Either value from the environment is now refused when the reference is resolved, naming the setting and the key and
   withholding the value. Text is still read by `int()`, and a whole float such as `2575.0` passes.
-  A `cast = "float"` is unchanged and still reads `true` as 1.0. An `env()` with `cast=int` on a
+  `cast = "float"` and `env(..., cast=float)` refuse a bool too, where the builtin read `true` as
+  1.0. A cast of the author's own still runs as given. An `env()` with `cast=int` on a
   boolean setting now refuses a TOML `true` or `false`, which used to read as on or off.
   (`BACKLOG #1650`)
