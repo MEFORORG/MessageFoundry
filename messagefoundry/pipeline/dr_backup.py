@@ -4907,8 +4907,8 @@ def _full_open_check(
 _INCOMPATIBLE_REASON_LIMIT = 600
 
 #: The most characters of the walk's sentence the incompatible-snapshot refusal quotes. Its parts
-#: are bounded where they are made: at least a cell's locator values, at 64 characters each after
-#: their escape (`cipher_cells._shown`), and error text at safe_exc's 200 plus its bound note. A
+#: are bounded where they are made: at least a cell's locator values, at 64 characters and an
+#: elision mark each (`cipher_cells._shown`), and error text at safe_exc's 200 plus its notes. A
 #: reading's line, the foreign-key note included, then stays well inside this, verdict and reason
 #: words included, so the cut only stops a defect from making the sentence unbounded.
 _WALK_REASON_LIMIT = 2000
@@ -4964,8 +4964,8 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
 
 
 #: What decided a :func:`_decrypt_check` verdict. ``cell`` is a sealed value that did not open or
-#: a value with no marker; ``damaged`` a BLOB or a TEXT value SQLite cannot decode, which no
-#: version reads; ``sqlite_schema`` a statement the snapshot's schema could not answer, by
+#: a value with no marker; ``damaged`` a BLOB or a TEXT value SQLite cannot decode, neither of
+#: which this build's writer stores; ``sqlite_schema`` a statement the snapshot's schema could not answer, by
 #: :func:`is_schema_step_error`, other than a virtual table's missing module; ``sqlite`` any other
 #: SQLite fault; ``interrupted`` a schema change mid-walk; ``outage`` a key service that gave no
 #: verdict; ``key_mismatch`` a keyed snapshot read with no key; ``pass`` none.
@@ -4982,7 +4982,7 @@ WalkKind = Literal[
 
 #: The kinds a walk under this build can reach by reading another version's cells or schema
 #: differently, as well as by real damage, so the incompatible-snapshot refusal offers that reading
-#: for them alone. It is a possible cause there, never a finding that the cells are sound.
+#: for these. It is a possible cause there, never a finding that the cells are sound.
 _MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
 
 
@@ -5022,7 +5022,8 @@ def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> WalkVerdict:
     """Decrypt AND authenticate every cipher-covered cell retained in the snapshot, under the store's own
-    cipher. Returns ``(status, message, cells)`` — a COUNT and a PHI-free reason, never a plaintext.
+    cipher. Returns a :class:`WalkVerdict`, ``(status, message, cells)`` with the :data:`WalkKind`
+    that decided it — a COUNT and a PHI-free reason, never a plaintext.
 
     Opening the store proves the file is a readable SQLite database. It does not prove the PHI inside it
     is readable, and those are the two different claims a disaster-recovery check gets confused about: a

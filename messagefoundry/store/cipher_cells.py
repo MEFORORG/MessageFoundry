@@ -137,7 +137,8 @@ class CipherCell:
         """The row's ``locator`` values as ``column=value`` pairs, for a PHI-free failure message.
 
         A value is read from the store, and a planted row is one thing a cipher read hunts for, so
-        each is cut to :data:`_LOCATOR_LIMIT` characters and a control character is escaped: a
+        each is shown at most :data:`_LOCATOR_LIMIT` characters and an elision mark, escaped
+        whole-escape by whole-escape where it holds a non-printable character (:func:`_shown`): a
         locator cannot forge a line of the report or carry a long value out whole."""
         return " ".join(f"{c}={_shown(v)}" for c, v in zip(self.locator, values, strict=True))
 
