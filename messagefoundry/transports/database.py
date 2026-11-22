@@ -125,6 +125,7 @@ from messagefoundry.redaction import (
     driver_sqlstate_of,
     prints_a_codec_error,
     raised_by_a_driver,
+    reads_as_a_sqlstate,
     safe_exc,
     safe_text,
     sqlite_errorname_of,
@@ -2802,9 +2803,16 @@ def _sqlstate(exc: BaseException) -> str | None:
 def _log_sqlstate(exc: BaseException) -> str | None:
     """:func:`_sqlstate` for a log line, and also ``None`` for an exception that holds a Unicode
     error, whose text a codec name can make read like a SQLSTATE."""
-    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
-        return None
-    return driver_sqlstate_of(exc)
+    return None if prints_a_codec_error(exc) else _sqlstate(exc)
+
+
+def _sqlstate_shaped(exc: BaseException) -> bool:
+    """Whether ``exc``'s first argument reads like a SQLSTATE although :func:`_sqlstate` reads
+    none from it, as pyodbc's error is shaped: ``KeyError('MRN42')``, or a driver's tuple re-raised
+    as a builtin type. Its arguments may carry a value, so its text is withheld (engine PR 3150,
+    finding 1). Never for a ``UnicodeError``, whose first argument is the codec name."""
+    args = exc.args
+    return not isinstance(exc, UnicodeError) and bool(args) and reads_as_a_sqlstate(args[0])
 
 
 def _connection_lost(exc: BaseException | None) -> bool:
@@ -2860,11 +2868,13 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     the argument it could not encode, renders as its type alone (engine PR 2658, finding 4). Anything
     else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful text for a bug or
     an unreachable host, unless ``withhold`` says it is held by a driver error, as a link of its
-    chain (:func:`_redacted_copy`). That is a bound, not a guarantee: an error a driver raises as a
-    builtin type, or wraps in another library's, is printed as ``safe_exc`` prints it.
+    chain (:func:`_redacted_copy`), or its first argument reads like a SQLSTATE
+    (:func:`_sqlstate_shaped`): either renders as its type alone. That is a bound, not a guarantee:
+    an error a driver raises as a builtin type with any other arguments, or wraps in another
+    library's, is printed as ``safe_exc`` prints it.
 
-    Under ``withhold``, only a driver's own error may name a SQLSTATE: any other link renders as
-    its type alone, since ``args[0]`` of five letters or digits may be a value.
+    Only a driver's own error names a SQLSTATE (:func:`_sqlstate`), since ``args[0]`` of five
+    letters or digits on any other error may be a value.
 
     A Unicode error, or a non-driver exception holding one, takes ``safe_exc`` or, under
     ``withhold``, its type alone, so this never prints a codec error's text;
@@ -2878,13 +2888,24 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
             return _withheld(exc)
         state = _log_sqlstate(exc)
         if state is None:
-            return _withheld(exc) if driver else safe_exc(exc)
+            if driver:
+                return _withheld(exc)
+            if _sqlstate_shaped(exc):
+                return f"{type(exc).__name__} [message withheld]"
+            return safe_exc(exc)
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring
         return (
             f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
         )
     return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
+
+
+class WithheldSendError(Exception):
+    """A send's failure that is no driver's error although its first argument reads like a SQLSTATE
+    (:func:`_sqlstate_shaped`), such as ``KeyError('MRN42')``: still an internal error, re-raised
+    from the original with its type alone, since the runner stores an internal error's text and its
+    arguments may carry a value (engine PR 3150, finding 1). Unprefixed because its name prints."""
 
 
 class RedactedDbError(Exception):
@@ -2979,7 +3000,7 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     withhold and is named by its type alone. It never raises: a link whose classification raises
     is named by its type and a fixed note."""
     try:
-        if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
+        if under or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)
         if isinstance(exc, _ENGINE_FIXED_TEXT):
             return safe_exc(exc, limit=_ENGINE_TEXT_LIMIT)  # the call-gate remedy is its tail
@@ -4584,7 +4605,8 @@ class DatabaseDestination(DestinationConnector):
                 captured = await self._capture(cur) if self.capture_response else None
                 await conn.commit()
             except Exception as exc:
-                state = _sqlstate(exc)
+                # The SQLSTATE is read only once the rollback has run or failed: a driver error
+                # whose ``sqlstate`` raises when read must not skip it (BACKLOG #5010).
                 try:
                     await conn.rollback()
                 except Exception as rollback_exc:
@@ -4597,6 +4619,7 @@ class DatabaseDestination(DestinationConnector):
                         "discarded rather than returned to its pool: %s",
                         _safe_db_error(rollback_exc),
                     )
+                    state = _sqlstate(exc)
                     if state is None and not isinstance(exc, UnicodeEncodeError):
                         raise  # the send's failure is no driver error: the rollback's propagates
                     # Classified by the send's own error, as it would be had the rollback passed,
@@ -4605,7 +4628,10 @@ class DatabaseDestination(DestinationConnector):
                     # would retry a poison message for as long as the retry budget lasts. A
                     # dead-letter can be replayed. The rollback's error stays the context.
                     raise _send_refusal(state, exc) from exc
+                state = _sqlstate(exc)
                 if state is None and not isinstance(exc, UnicodeEncodeError):
+                    if _sqlstate_shaped(exc):
+                        raise WithheldSendError(f"{type(exc).__name__} [message withheld]") from exc
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
                 raise _send_refusal(state, exc) from exc
         finally:

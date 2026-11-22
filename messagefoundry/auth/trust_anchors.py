@@ -2110,9 +2110,10 @@ def database_ca_anchor_spec(
     answers ``None``, left to the build's refusal, which names the keyword.
 
     The other driver file keywords, ``sslcapath``, ``sslcert`` and ``sslkey``, are judged here
-    again the same way first, and on Windows each entry of an ``sslcapath`` folder too, so a path the build
-    cleared that leads off the host later is refused at the lane check (item 18). None of them is
-    read as an anchor: no ACL, path or audit check covers them (module item 12)."""
+    again the same way first, and on Windows each entry of an ``sslcapath`` folder too, so on
+    Windows a path the build cleared that leads off the host later is refused at the lane check
+    (item 18). None of them is read as an anchor: no ACL, path or audit check covers them (module
+    item 12)."""
     files = _lane_driver_files(settings)
     if not files:
         return None

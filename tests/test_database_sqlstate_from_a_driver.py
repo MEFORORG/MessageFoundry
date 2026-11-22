@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.redaction import safe_traceback
+from messagefoundry.redaction import safe_exc, safe_traceback
 from messagefoundry.transports import database
 from messagefoundry.transports.base import NegativeAckError
 from tests._fake_dbapi_driver import DriverError
@@ -51,22 +51,55 @@ def test_a_non_driver_error_is_not_read_as_a_sqlstate(exc: BaseException) -> Non
 
 async def test_a_non_driver_error_in_a_send_is_never_dead_lettered_with_its_text() -> None:
     """Red on main: ``KeyError('MRN42')`` was dead-lettered as ``database rejected the statement
-    [MRN42]``, a value in ``last_error`` and the alert. It propagates unchanged now, an internal
-    error, so the connector writes no text from it."""
+    [MRN42]``, a value in ``last_error`` and the alert. It is an internal error now, re-raised from
+    the original naming its type alone, so the text the runner stores for it carries no value."""
     failure = KeyError(_VALUE)
     conn = _FakeConn(_FakeCursor(failure))
     dest = _dest()
     dest._pool = _FakePool(conn)
-    with pytest.raises(KeyError) as raised:
+    with pytest.raises(database.WithheldSendError) as raised:
         await dest.send('{"mrn": "1", "val": "x"}')
-    assert raised.value is failure
+    assert raised.value.__cause__ is failure
     assert not isinstance(raised.value, NegativeAckError)
+    assert _VALUE not in safe_exc(raised.value)  # what the runner's internal-error arm stores
     assert conn.rolledback
 
 
-def test_a_non_driver_error_names_no_sqlstate_on_a_log_line() -> None:
-    """Red on main: ``_safe_db_error`` printed ``KeyError [MRN42]``, the value as a SQLSTATE."""
-    assert f"[{_VALUE}]" not in database._safe_db_error(KeyError(_VALUE))
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(KeyError(_VALUE), id="KeyError"),
+        pytest.param(RuntimeError("23000", f"duplicate key ({_VALUE}2)"), id="driver tuple"),
+    ],
+)
+def test_a_non_driver_error_shaped_like_a_drivers_prints_no_value_on_a_log_line(
+    exc: BaseException,
+) -> None:
+    """Red on main for the KeyError: ``_safe_db_error`` printed ``KeyError [MRN42]``, the value as
+    a SQLSTATE. Neither reads as a SQLSTATE now, and neither falls to ``safe_exc``'s text."""
+    line = database._safe_db_error(exc)
+    assert _VALUE not in line
+    assert line == f"{type(exc).__name__} [message withheld]"
+
+
+class _UnreadableState(DriverError):
+    """A driver error whose ``sqlstate`` raises when read."""
+
+    @property
+    def sqlstate(self) -> str:
+        raise RuntimeError("unreadable")
+
+
+async def test_a_driver_error_whose_sqlstate_cannot_be_read_still_rolls_back() -> None:
+    """The send reads the SQLSTATE after the rollback, so a read that raises never leaves the
+    failed statement's transaction open on a returned connection (BACKLOG #5010). A regression
+    check: main read ``args`` alone there."""
+    conn = _FakeConn(_FakeCursor(_UnreadableState("23000", "synthetic")))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(RuntimeError, match="unreadable"):
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert conn.rolledback
 
 
 async def test_a_driver_error_in_a_send_is_still_rejected_by_its_sqlstate() -> None:

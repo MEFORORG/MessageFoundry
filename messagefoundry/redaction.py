@@ -107,6 +107,7 @@ __all__ = [
     "prepare_log_record",
     "prints_a_codec_error",
     "raised_by_a_driver",
+    "reads_as_a_sqlstate",
     "redact",
     "redact_binary_carriage",
     "redact_untrusted",
@@ -3113,18 +3114,24 @@ def _a_sqlite_error(exc: BaseException) -> bool:
     return sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning))
 
 
+def reads_as_a_sqlstate(value: object) -> bool:
+    """Whether ``value`` is text of a SQLSTATE's shape: five digits or uppercase Latin letters."""
+    return isinstance(value, str) and _DRIVER_SQLSTATE.fullmatch(value) is not None
+
+
 def driver_sqlstate_of(exc: BaseException) -> str | None:
     """The SQLSTATE a database driver's own error names (:func:`raised_by_a_driver`): asyncpg's
-    ``sqlstate`` attribute, else ``args[0]``, when it is five characters of SQL's alphabet
-    (:data:`_DRIVER_SQLSTATE`). None for any other exception, so a ``KeyError('MRN42')`` is never
-    read as one, and None for a SQLite error, whose ``args[0]`` is its message (vault BACKLOG
-    #1661). The one reading that the DATABASE connector and :func:`safe_traceback` share."""
+    ``sqlstate`` attribute, else ``args[0]``, when it :func:`reads_as_a_sqlstate`. None for any
+    other exception, so a ``KeyError('MRN42')`` is never read as one, and None for a SQLite error,
+    whose ``args[0]`` is its message (vault BACKLOG #1661). The one reading that the DATABASE
+    connector and :func:`safe_traceback` share. A ``sqlstate`` attribute that raises when read
+    propagates, so a caller in an error arm reads it only once its own cleanup is done."""
     if not raised_by_a_driver(exc) or _a_sqlite_error(exc):
         return None
     state = getattr(exc, "sqlstate", None)
     if state is None and exc.args:
         state = exc.args[0]
-    return state if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state) else None
+    return state if isinstance(state, str) and reads_as_a_sqlstate(state) else None
 
 
 def sqlite_errorname_of(exc: BaseException) -> str | None:
