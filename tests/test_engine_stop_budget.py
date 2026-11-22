@@ -256,50 +256,41 @@ async def _unwinds_slowly(release: asyncio.Event) -> None:
         raise
 
 
-async def _until_cancel_requested(task: asyncio.Task[None]) -> None:
-    loop = asyncio.get_running_loop()
-    give_up = loop.time() + 5.0
-    while not task.cancelling():
-        assert loop.time() < give_up, "the stop never cancelled the pass"
-        await asyncio.sleep(0.01)
-
-
-async def test_a_cancel_of_the_crl_runner_stop_caller_propagates(
+async def test_a_cancel_during_the_crl_runner_first_wait_propagates_as_on_main(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cancel of the caller while the stop waits for the pass's cancel to land is the caller's,
-    so it is raised. Before, ``suppress(CancelledError)`` around ``await task`` swallowed it. The
-    open alerts are still resolved first."""
-    release = asyncio.Event()
+    """The budget changes only the CRL runner's timeout, not its cancel handling, which stays
+    main's: a cancel of the caller during the wait for the pass cancels the pass and is raised,
+    and the stop-time resolve does not run (measured on main 72ac872c9cd)."""
     runner = CrlReloadRunner(stop_timeout_seconds=30.0)
     resolved: list[bool] = []
-    monkeypatch.setattr(runner, "_resolve_at_stop", lambda: resolved.append(True))
-    pass_task = asyncio.ensure_future(_unwinds_slowly(release))
+    monkeypatch.setattr(runner, "_resolve", lambda _keys, _why: resolved.append(True))
+    pass_task = asyncio.ensure_future(_hangs())
     runner._task = pass_task
-    stopping = asyncio.ensure_future(runner.stop(timeout=0.05))
+    stopping = asyncio.ensure_future(runner.stop(timeout=30.0))
     try:
-        await _until_cancel_requested(pass_task)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
         assert not stopping.done()
         stopping.cancel()
         with pytest.raises(asyncio.CancelledError):
             await stopping
-        assert stopping.cancelled()
-        assert resolved == [True]
+        await asyncio.sleep(0)
+        assert pass_task.cancelled()
+        assert resolved == []
     finally:
-        release.set()
+        pass_task.cancel()
         await asyncio.gather(pass_task, return_exceptions=True)
 
 
-async def test_a_cancel_of_engine_stop_during_the_crl_stop_still_closes_the_store(
+async def test_a_cancel_of_engine_stop_during_the_crl_first_wait_leaves_as_on_main(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The CRL runner now raises a cancel of its caller, and engine.stop() calls it before its
-    guarded teardown. The stop holds that cancel until the store has closed, then raises it."""
+    """As on main, the CRL stop comes before engine.stop()'s guarded teardown, so a cancel there
+    leaves engine.stop() at once and the store is not closed (measured on main 72ac872c9cd). This
+    pins main's behaviour, which this PR keeps; it is not a property to preserve."""
     eng = await _engine(tmp_path)
-    release = asyncio.Event()
     runner = CrlReloadRunner(stop_timeout_seconds=30.0)
-    pass_task = asyncio.ensure_future(_unwinds_slowly(release))
+    pass_task = asyncio.ensure_future(_hangs())
     runner._task = pass_task
     eng._crl_reload_runner = runner
     closed: list[bool] = []
@@ -310,17 +301,18 @@ async def test_a_cancel_of_engine_stop_during_the_crl_stop_still_closes_the_stor
         await real_close()
 
     monkeypatch.setattr(eng.store, "close", _close)
-    stopping = asyncio.ensure_future(eng.stop(budget_seconds=3.0))
+    stopping = asyncio.ensure_future(eng.stop(budget_seconds=60.0))
     try:
-        await _until_cancel_requested(pass_task)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
         assert not stopping.done()
         stopping.cancel()
         with pytest.raises(asyncio.CancelledError):
             await stopping
-        assert closed == [True]
+        await asyncio.sleep(0)
+        assert pass_task.cancelled()
+        assert closed == []
     finally:
-        release.set()
+        pass_task.cancel()
         await asyncio.gather(pass_task, return_exceptions=True)
         if not closed:
             await real_close()

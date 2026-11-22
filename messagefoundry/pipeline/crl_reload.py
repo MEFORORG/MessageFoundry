@@ -1316,9 +1316,8 @@ class CrlReloadRunner:
         task is cancelled, and its worker thread, which cannot be cancelled, finishes on its own. A
         pass lock keeps it from overlapping a runner started next.
 
-        Every ``crl_reload_refused`` alert this runner still has open is resolved on the way out,
-        a cancelled stop included: a cancel of the caller cancels the pass, resolves, and is then
-        raised without waiting for the pass's cancel to land. A stopped runner can no longer see a refusal clear, and the next start builds every
+        Every ``crl_reload_refused`` alert this runner still has open is resolved on the way out.
+        A stopped runner can no longer see a refusal clear, and the next start builds every
         context from the file as it is then, so an alert left open would say hops hold an old
         copy when none does. A runner started again raises it afresh if a refusal still stands."""
         wait = self._stop_timeout if timeout is None else timeout
@@ -1328,27 +1327,18 @@ class CrlReloadRunner:
         if task is not None:
             try:
                 done, _ = await asyncio.wait({task}, timeout=wait)
-                if not done:
-                    log.warning(
-                        "crl_reload: a reload pass did not finish within %gs of stop; abandoning it",
-                        wait,
-                    )
-                    task.cancel()
-                    # ``wait``, not ``await task``: awaiting the task would raise a cancel of this
-                    # caller as the task's own CancelledError, and suppressing that swallowed the
-                    # caller's cancel. So a cancel raised here is always the caller's (BACKLOG
-                    # #3191); the task's own, this stop's or one from elsewhere, is not raised.
-                    await asyncio.wait({task})
             except asyncio.CancelledError:
                 task.cancel()
-                self._resolve_at_stop()
                 raise
-            if not task.cancelled():
-                task.result()
+            if not done:
+                log.warning(
+                    "crl_reload: a reload pass did not finish within %gs of stop; abandoning it",
+                    wait,
+                )
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         # Also with no task: a clear the sink refused at an earlier stop is retried by this one.
-        self._resolve_at_stop()
-
-    def _resolve_at_stop(self) -> None:
         self._resolve(list(self._alerted), "the reload has stopped")
         if self._alerted:
             # Said here every time, whatever streak is open: no later pass will try again.

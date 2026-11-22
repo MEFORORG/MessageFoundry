@@ -4315,15 +4315,9 @@ class Engine:
             await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
             await self._cert_expiry_runner.stop()
-        crl_cancelled = False
         if self._crl_reload_runner is not None:
             crl = self._crl_reload_runner
-            try:
-                await crl.stop(timeout=budget.wait(crl.stop_timeout_seconds, kept=crl_kept))
-            except asyncio.CancelledError:
-                # The runner cancels its pass and raises a cancel of this stop. Held, as the
-                # monitor's is below, so the graph still stops and the store closes.
-                crl_cancelled = True
+            await crl.stop(timeout=budget.wait(crl.stop_timeout_seconds, kept=crl_kept))
             self._crl_reload_runner = None
         if self._log_forward_watch is not None:
             await self._log_forward_watch.stop()
@@ -4367,7 +4361,7 @@ class Engine:
         # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
         # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
         # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
-        cancelled = monitor_cancelled or crl_cancelled
+        cancelled = monitor_cancelled
         failure: BaseException | None = None
         try:
             # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is

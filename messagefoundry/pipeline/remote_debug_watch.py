@@ -199,14 +199,16 @@ class RemoteDebugRefusalWatch:
             if task.done():
                 log.warning(
                     "remote-debug refusal watch: the last pass did not finish in %.2f s and was "
-                    "cancelled, so a refusal since the pass before it may have no audit row",
+                    "cancelled, so a refusal since the pass before it may have no audit row and "
+                    "no alert",
                     wait,
                 )
             else:
                 log.warning(
                     "remote-debug refusal watch: the last pass did not finish in %.2f s and had not "
                     "ended %.2f s after its cancel, so it may still be running when the store "
-                    "closes, and a refusal since the pass before it may have no audit row",
+                    "closes, and a refusal since the pass before it may have no audit row and no "
+                    "alert",
                     wait,
                     cancel_wait,
                 )
