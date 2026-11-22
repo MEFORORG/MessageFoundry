@@ -24,7 +24,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import CREATE, REMOVE, RUNS_ON
+from tests._serviceenv_remedy import CREATE, KEEP, REMOVE, RUNS_ON
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
 _PLAIN = "Parameters\\AppEnvironment"
@@ -62,13 +62,11 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
     # Nothing here has a value of its own to move, so nothing says to put it in the directory or
-    # how one is created. An empty value is still told to go (the fifth hold on PR 3142, H3). A
-    # name written with a blank before its equals sign is not read as the directory's, so a value
-    # joined to it still has that text to move.
-    moves = refused.startswith("MEFOR_VALUE_") and " " in directory
-    assert (CREATE in refusal) is moves and ("Put " in refusal) is moves
+    # how one is created (the fifth hold on PR 3142, H3; the seventh hold). An empty value joined
+    # to the directory entry is still told to go (the fifth hold, H3).
+    assert CREATE not in refusal and "Put " not in refusal
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
-        refused.startswith("MEFOR_VALUE_") and not moves
+        refused.startswith("MEFOR_VALUE_") and " " not in directory
     )
 
 
@@ -105,6 +103,20 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
     assert "Put each MEFOR_VALUE_* variable in the secrets directory" in refusal
     assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
     assert "synthetic-a-value" not in refusal
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["MEFOR_VALUE_A=\nOTHER=1", "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d"],
+)
+def test_a_name_empty_on_its_own_line_is_only_deleted(entry: str) -> None:
+    """The Lander's seventh hold on PR 3142: content is a name's own value, up to its first
+    line break. The lines after it in the same item give the name none, so the refusal says only
+    to delete it, as at e6e600bb27e."""
+    refusal = service_env_refusal(_read([entry]))
+    assert refusal is not None
+    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    assert "Put " not in refusal and CREATE not in refusal and KEEP not in refusal
 
 
 def test_a_name_empty_in_one_entry_and_joined_to_a_directory_in_another_moves_nothing() -> None:

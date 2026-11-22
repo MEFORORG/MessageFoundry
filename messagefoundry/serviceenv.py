@@ -173,7 +173,8 @@ class ServiceEnvPosture:
     #: keep it. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
     #: The ``MEFOR_VALUE_<KEY>`` names no entry sets to content of its own: each variable
-    #: :func:`_names` keeps for one is empty or blank, or takes only a joined directory entry.
+    #: :func:`_names` keeps for one has an own value, up to its first line break, that is empty
+    #: or blank, or takes only a joined directory entry.
     #: A name with content in any entry is not here, so its Put step prints (the Lander's sixth
     #: hold on PR 3142, H2). The remedy alone reads this, never the refusal itself.
     contentless_value_names: tuple[str, ...] = field(default=(), repr=False)
@@ -359,11 +360,14 @@ _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
 
 #: For the remedy only (the Lander's sixth hold on PR 3142, H1): a whole value that is plainly
-#: an absolute path, from a drive letter, a UNC share or a POSIX root, in ASCII letters,
+#: an absolute path, from a drive letter or a UNC server and share, in ASCII letters,
 #: digits, spaces, ``.``, ``_``, ``-``, parentheses and separators only; and a key run in either
 #: base64 alphabet. A joined directory value is kept only when it is such a path and holds no
 #: such run; anything else may be key material, so the remedy treats it as one.
-_PLAIN_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\[A-Za-z0-9._-]+[\\/]|/)[A-Za-z0-9 ._()\\/-]*")
+_PLAIN_PATH = re.compile(
+    r"[A-Za-z]:[\\/][A-Za-z0-9 ._()\\/-]*"
+    r"|\\\\[A-Za-z0-9._-]+[\\/][A-Za-z0-9 ._()-]+(?:[\\/][A-Za-z0-9 ._()\\/-]*)?"
+)
 _EITHER_KEY_RUN = re.compile(r"[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43}")
 
 #: One 32-byte secret, whole (vault BACKLOG #5394 added items 6 and 12): 43 characters of the
@@ -924,9 +928,8 @@ def _directory_entry_value(entry: str) -> str | None:
     only blanks or line breaks after it and no blank around the name, the name is ASCII, and the
     value is blank or plainly a path (:data:`_PLAIN_PATH`) with no key run in it
     (:data:`_EITHER_KEY_RUN`); else None, as for key material. The engine strips the value it
-    reads, so what trails it does not matter. ``str.upper`` maps some non-ASCII letters onto
-    ASCII ones, so a name that is not ASCII is not taken as the directory's. The remedy alone
-    reads it, to tell a joined directory path from key material."""
+    reads, so what trails it does not matter. The remedy alone reads it, to tell a joined
+    directory path from key material."""
     line = entry.rstrip()
     if _LINE_BREAK.search(line):
         return None
@@ -1064,13 +1067,20 @@ def read_service_env_posture(
         contentless_value_names=_every_kept(
             variables,
             [f for f in found if f[0].startswith(_VALUE_PREFIX) and f[0] != _VALUE_PREFIX],
-            lambda v: v.directory_only or not v.value or v.value.isspace(),
+            lambda v: v.directory_only or not _own_value(v) or _own_value(v).isspace(),
         ),
         # Fail closed: one run-on value that takes anything but a blank or plain-path directory
         # entry may hold key material, so nothing says to keep any entry (sixth hold, H1).
         directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
         and all(v.directory_only for v in variables if v.runs_on and _names([v])),
     )
+
+
+def _own_value(variable: _Variable) -> str:
+    """``variable``'s value up to its first line break: what its own line sets, not what a
+    reading of the whole string, or of the strings joined to it, adds (the Lander's seventh hold
+    on PR 3142). Remedy only."""
+    return _LINE_BREAK.split(variable.value, 1)[0]
 
 
 def _every_kept(
