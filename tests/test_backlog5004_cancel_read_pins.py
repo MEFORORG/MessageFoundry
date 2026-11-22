@@ -14,10 +14,9 @@ tests pin that read, so a change to it fails here rather than passing unseen:
   ``finally``), at the predicate, beside the call-site arms in
   ``tests/test_backlog5010_database_gate_discard.py``;
 * the two cases the predicate's docstring names as not seen, so that text stays true;
-* a source census that no direct call site of ``_close_and_release``, in
-  ``transports/database.py`` or ``pipeline/reference_sync.py``, turns a cancel into something else
-  before the release reads it. The census is lexical: it reads the call site's own ``try``, not
-  what the functions that ``try`` awaits do inside them.
+* a lexical census of the direct call sites of ``_close_and_release`` across the engine packages,
+  for the forms it names that turn a cancel into something else before the release reads it. It
+  is narrower than "no path converts a cancel": its own section says what it does not see.
 
 Synthetic data only; no driver, no database.
 """
@@ -26,21 +25,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import contextlib
 from collections.abc import Iterator
-from pathlib import Path
 
 import pytest
 
 from messagefoundry.transports import database
 from messagefoundry.transports.base import DeliveryError
-from tests._ast_sites import call_sites, callee_name
+from tests._ast_sites import call_sites, callee_name, package_trees
+from tests.test_backlog5010_database_gate_discard import _absorb_a_cancel
 
-_ROOT = Path(__file__).resolve().parents[1]
-_SITES = (
-    _ROOT / "messagefoundry" / "transports" / "database.py",
-    _ROOT / "messagefoundry" / "pipeline" / "reference_sync.py",
-)
 _TARGET = "_close_and_release"
 
 
@@ -73,10 +66,9 @@ def test_nothing_in_flight_reads_as_no_cancel() -> None:
     ],
 )
 def test_a_base_exception_in_flight_reads_as_a_cancel(exc: BaseException) -> None:
-    """Every ``BaseException`` that is not an ``Exception`` takes the cancel path. That includes an
-    outer ``KeyboardInterrupt`` or ``SystemExit``: every caller's ``except Exception`` rollback was
-    skipped for it too, so the connection goes back only once the gate has settled it, and the
-    unwind does not wait on a statement that may still be running."""
+    """A ``BaseException`` that is not an ``Exception`` takes the cancel path, an outer
+    ``KeyboardInterrupt`` or ``SystemExit`` included: a caller's ``except Exception`` rollback was
+    skipped for it too, so the unwind does not wait on a statement that may still be running."""
     assert _read_while_unwinding(exc) is True
 
 
@@ -100,16 +92,6 @@ def test_a_handled_exception_no_longer_reads_as_in_flight() -> None:
     except asyncio.CancelledError:
         pass
     assert database._unwinding_a_cancel() is False
-
-
-async def _absorb_a_cancel() -> None:
-    """Take a cancel and swallow it without ``uncancel()``, leaving ``cancelling()`` at one."""
-    task = asyncio.current_task()
-    assert task is not None
-    asyncio.get_running_loop().call_soon(task.cancel)
-    with contextlib.suppress(asyncio.CancelledError):
-        await asyncio.sleep(1.0)
-    assert task.cancelling() == 1, "the arm is vacuous: no cancel was absorbed"
 
 
 async def test_an_absorbed_cancel_does_not_read_as_a_cancel_later() -> None:
@@ -150,16 +132,17 @@ async def test_a_cancel_still_reads_as_one_after_an_uncancel_before_the_finally(
 async def test_a_runner_teardown_cancel_reads_as_a_cancel() -> None:
     """A task cancelled as a runner tears down unwinds a ``CancelledError`` like any other."""
     seen: list[bool] = []
-    started = asyncio.Event()
-
-    async def body() -> None:
-        try:
-            started.set()
-            await asyncio.Event().wait()
-        finally:
-            seen.append(database._unwinding_a_cancel())
 
     def run() -> None:
+        started = asyncio.Event()
+
+        async def body() -> None:
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                seen.append(database._unwinding_a_cancel())
+
         async def main() -> None:
             asyncio.get_running_loop().create_task(body())
             await started.wait()  # main returns; asyncio.run cancels the task left running
@@ -175,7 +158,7 @@ async def test_a_runner_teardown_cancel_reads_as_a_cancel() -> None:
 
 async def test_a_cancel_asyncio_timeout_converts_reads_as_its_timeout() -> None:
     """``asyncio.timeout`` turns its cancel into ``TimeoutError`` before an outer ``finally``, which
-    then reads no cancel. That is why the census below finds no such conversion at a call site."""
+    then reads no cancel. It is one of the forms the census below looks for at a call site."""
     seen: list[bool] = []
     with pytest.raises(TimeoutError):
         try:
@@ -199,11 +182,38 @@ def test_a_borrow_inside_a_cancel_handler_reads_that_cancel_as_its_own() -> None
 
 
 # --- the call-site census ------------------------------------------------------------------------
+#
+# What it checks, for each direct call of ``_close_and_release`` (bare or as an attribute) in an
+# engine module: walking up from the call to its function, every ``try`` that holds the call in
+# a handler, ``else`` or ``finally`` runs nothing before it that is one of the forms below, and no
+# enclosing handler catches a cancel without re-raising it.
+#
+# What it does not see, at least: anything inside a function the ``try`` awaits; an exception a
+# cleanup step raises in place of the cancel (an inner ``finally`` that awaits, say); a cancel type
+# imported under another name, or a ``suppress`` whose types are not spelled in the call.
 
 # A handler naming one of these catches a cancel; a bare ``except:`` does too.
-_CANCEL_TYPES = frozenset({"CancelledError", "BaseException", "KeyboardInterrupt", "SystemExit"})
-# Calls that end a cancel or a timeout as a TimeoutError inside the code they wrap.
-_CONVERTING_CALLS = frozenset({"timeout", "timeout_at", "wait_for"})
+_CANCEL_TYPES = frozenset(
+    {
+        "CancelledError",
+        "BaseException",
+        "BaseExceptionGroup",
+        "KeyboardInterrupt",
+        "SystemExit",
+        "GeneratorExit",
+    }
+)
+# Context managers and calls that can end a cancel as something else inside the code they wrap: a
+# TimeoutError, or (a task group whose child fails during the cancel) an ExceptionGroup.
+_CONVERTING_CALLS = frozenset({"timeout", "timeout_at", "wait_for", "TaskGroup"})
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_TRIES = (ast.Try, ast.TryStar)
+# The floors are the direct call sites counted when this census was written; a site that moves out
+# of the census's reach lowers the count and fails here.
+_FLOORS = {
+    "messagefoundry/transports/database.py": 8,
+    "messagefoundry/pipeline/reference_sync.py": 1,
+}
 
 
 def _names(node: ast.expr | None) -> set[str]:
@@ -218,25 +228,30 @@ def _names(node: ast.expr | None) -> set[str]:
     return set()
 
 
-def _converting_handler(handler: ast.ExceptHandler) -> bool:
-    """A handler that catches a cancel and does not end by re-raising it as it is."""
-    catches = handler.type is None or bool(_names(handler.type) & _CANCEL_TYPES)
-    last = handler.body[-1]
-    reraises = isinstance(last, ast.Raise) and last.exc is None
-    return catches and not reraises
-
-
 def _walk_body(nodes: list[ast.stmt]) -> Iterator[ast.AST]:
-    """Every node under ``nodes``, not entering a nested ``def``, ``lambda`` or class."""
-    stack: list[ast.AST] = list(nodes)
+    """Every node under ``nodes``, not entering a ``def``, ``lambda`` or class at any depth."""
+    stack: list[ast.AST] = [n for n in nodes if not isinstance(n, _SCOPES)]
     while stack:
         node = stack.pop()
         yield node
-        for child in ast.iter_child_nodes(node):
-            if not isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-            ):
-                stack.append(child)
+        stack.extend(c for c in ast.iter_child_nodes(node) if not isinstance(c, _SCOPES))
+
+
+def _converting_handler(handler: ast.ExceptHandler) -> bool:
+    """A handler that catches a cancel and may end it: it raises something else, leaves by a
+    ``return``, ``break`` or ``continue`` anywhere in its body, or does not end with a bare
+    ``raise``."""
+    catches = handler.type is None or bool(_names(handler.type) & _CANCEL_TYPES)
+    if not catches:
+        return False
+    last = handler.body[-1]
+    if not (isinstance(last, ast.Raise) and last.exc is None):
+        return True
+    return any(
+        (isinstance(n, ast.Raise) and n.exc is not None)
+        or isinstance(n, (ast.Return, ast.Break, ast.Continue))
+        for n in _walk_body(handler.body)
+    )
 
 
 def _conversions(nodes: list[ast.stmt]) -> list[str]:
@@ -253,37 +268,60 @@ def _conversions(nodes: list[ast.stmt]) -> list[str]:
     return found
 
 
+def _before(try_node: ast.Try | ast.TryStar, child: ast.AST) -> list[ast.stmt]:
+    """The statements of ``try_node`` that may run before ``child``, one of its direct children."""
+    handlers: list[ast.stmt] = []
+    for handler in try_node.handlers:
+        handlers.extend(handler.body)
+    if child in try_node.finalbody:
+        return [*try_node.body, *handlers, *try_node.orelse]
+    # In a handler or the else: only the body ran first; a sibling handler never runs before it.
+    return list(try_node.body) if child not in try_node.body else []
+
+
 def _site_faults(tree: ast.Module) -> tuple[int, list[str]]:
     """How many direct call sites of ``_close_and_release`` ``tree`` holds, and each conversion
-    found on the path from the start of its ``try`` to the call."""
+    the census finds on the way to one."""
     parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
-    sites = call_sites(tree, _TARGET, bare_only=True)
+    sites = call_sites(tree, _TARGET)
     faults: list[str] = []
     for call in sites:
         node: ast.AST = call
-        while node in parents and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        while node in parents and not isinstance(node, _SCOPES):
             child, node = node, parents[node]
             if isinstance(node, ast.ExceptHandler) and _converting_handler(node):
                 faults.append(f"line {call.lineno}: inside a handler that ends a cancel")
-            if isinstance(node, ast.Try) and child not in node.body:
-                # The release is in this try's finally or handler: what the try runs before it
-                # is what could turn a cancel into something else on the way there.
-                for what in _conversions(node.body):
+            if isinstance(node, _TRIES):
+                for what in _conversions(_before(node, child)):
                     faults.append(f"line {call.lineno}: {what}")
-                for handler in node.handlers:
-                    if handler is not child and _converting_handler(handler):
-                        faults.append(f"line {call.lineno}: handler at line {handler.lineno}")
+                if child in node.finalbody:
+                    for handler in node.handlers:
+                        if _converting_handler(handler):
+                            faults.append(f"line {call.lineno}: handler at line {handler.lineno}")
+        if isinstance(node, _SCOPES) and not isinstance(
+            parents.get(node), (ast.Module, ast.ClassDef)
+        ):
+            # A release inside a closure is reached from wherever the closure is awaited, which
+            # this walk cannot follow; such a site is reported rather than passed unread.
+            faults.append(f"line {call.lineno}: inside a nested def the census cannot follow")
     return len(sites), faults
 
 
-@pytest.mark.parametrize("path", _SITES, ids=lambda p: p.name)
-def test_no_call_site_turns_a_cancel_into_something_else(path: Path) -> None:
+def test_no_call_site_turns_a_cancel_into_something_else() -> None:
     """The predicate reads the exception in flight, so a call site that turned the cancel into a
     ``TimeoutError``, swallowed it, or raised its own exception in its place would send a cancelled
     borrow down the ordinary path, which waits, through ``shield``, on a statement that may still be
-    running. The predicate's docstring states that no call site in these two modules does this."""
-    count, faults = _site_faults(ast.parse(path.read_text(encoding="utf-8")))
-    assert count >= 1, f"the census is vacuous: no {_TARGET} call found in {path.name}"
+    running. The census reads the forms named above; a green run is not proof that no other path
+    does this."""
+    counts: dict[str, int] = {}
+    faults: list[str] = []
+    for path, tree in package_trees().items():
+        count, found = _site_faults(tree)
+        if count:
+            counts[path] = count
+            faults.extend(f"{path} {fault}" for fault in found)
+    for path, floor in _FLOORS.items():
+        assert counts.get(path, 0) >= floor, f"the census reads fewer sites than {floor}: {counts}"
     assert faults == [], faults
 
 
@@ -303,11 +341,51 @@ async def f():
     finally:
         await _close_and_release(pool, conn, cur)
 """,
+    "TaskGroup": """
+async def f():
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(cur.execute(sql))
+    finally:
+        await _close_and_release(pool, conn, cur)
+""",
     "suppress": """
 async def f():
     try:
         with contextlib.suppress(asyncio.CancelledError):
             await cur.execute(sql)
+    finally:
+        await _close_and_release(pool, conn, cur)
+""",
+    "timeout in else": """
+async def f():
+    try:
+        cur = await conn.cursor()
+    except Exception:
+        raise
+    else:
+        async with asyncio.timeout(1):
+            await cur.execute(sql)
+    finally:
+        await _close_and_release(pool, conn, cur)
+""",
+    "timeout in a handler": """
+async def f():
+    try:
+        await cur.execute(sql)
+    except Exception:
+        await asyncio.wait_for(conn.rollback(), 1)
+        raise
+    finally:
+        await _close_and_release(pool, conn, cur)
+""",
+    "except*": """
+async def f():
+    try:
+        async with asyncio.timeout(1):
+            await cur.execute(sql)
+    except* ValueError:
+        raise
     finally:
         await _close_and_release(pool, conn, cur)
 """,
@@ -321,11 +399,33 @@ async def f():
     finally:
         await _close_and_release(pool, conn, cur)
 """,
-    "own handler": """
+    "conditional conversion": """
 async def f():
     try:
         await cur.execute(sql)
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            raise DeliveryError("stopped") from exc
+        raise
+    finally:
+        await _close_and_release(pool, conn, cur)
+""",
+    "conditional return": """
+async def f():
+    try:
+        await cur.execute(sql)
+    except asyncio.CancelledError:
+        if stopping:
+            return
+        raise
+    finally:
+        await _close_and_release(pool, conn, cur)
+""",
+    "bare except": """
+async def f():
+    try:
+        await cur.execute(sql)
+    except:
         pass
     finally:
         await _close_and_release(pool, conn, cur)
@@ -341,29 +441,79 @@ async def f():
         finally:
             await _close_and_release(pool, conn, None)
 """,
+    "attribute call": """
+async def f():
+    try:
+        await asyncio.wait_for(cur.execute(sql), 1)
+    finally:
+        await database._close_and_release(pool, conn, cur)
+""",
+    "closure": """
+async def f():
+    async def release():
+        await _close_and_release(pool, conn, cur)
+
+    try:
+        await cur.execute(sql)
+    finally:
+        await release()
+""",
 }
 
-_CLEAN = """
+# The shapes the live call sites use: an ordinary handler that converts an Exception, and a
+# BaseException handler that releases and re-raises.
+_CLEAN = {
+    "finally": """
+async def f():
+    try:
+        await cur.execute(sql)
+    except Exception as exc:
+        raise DeliveryError("failed") from exc
+    finally:
+        await _close_and_release(pool, conn, cur)
+""",
+    "handled then released": """
+async def f():
+    try:
+        await cur.execute(sql)
+    except Exception:
+        pass
+    except BaseException:
+        await _close_and_release(pool, conn, cur)
+        raise
+    await _close_and_release(pool, conn, cur)
+""",
+    "handler beside a converting sibling": """
+async def f():
+    try:
+        await cur.execute(sql)
+    except asyncio.CancelledError:
+        await _close_and_release(pool, conn, cur)
+        raise
+    except BaseException:
+        return None
+""",
+    "released in the else": """
 async def f():
     try:
         await cur.execute(sql)
     except Exception:
         raise
-    except BaseException:
+    else:
         await _close_and_release(pool, conn, cur)
-        raise
-    finally:
-        await _close_and_release(pool, conn, cur)
-"""
+""",
+}
 
 
 @pytest.mark.parametrize("source", list(_CONVERTED.values()), ids=list(_CONVERTED))
 def test_the_census_finds_each_conversion(source: str) -> None:
-    """Positive controls: each form the census forbids is found."""
+    """Positive controls: each form the census looks for is found."""
     count, faults = _site_faults(ast.parse(source))
     assert count == 1 and faults, faults
 
 
-def test_the_census_passes_a_release_that_re_raises_the_cancel() -> None:
-    """Negative control: the shapes the live call sites use pass."""
-    assert _site_faults(ast.parse(_CLEAN)) == (2, [])
+@pytest.mark.parametrize("source", list(_CLEAN.values()), ids=list(_CLEAN))
+def test_the_census_passes_a_release_that_keeps_the_cancel(source: str) -> None:
+    """Negative controls: shapes that keep the cancel in flight pass."""
+    count, faults = _site_faults(ast.parse(source))
+    assert count >= 1 and faults == [], faults
