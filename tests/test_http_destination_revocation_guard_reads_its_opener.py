@@ -274,15 +274,20 @@ def test_the_expiry_relaxed_refusal_with_no_crl_names_the_same_remedy(cell: str)
     assert EXPIRY_RELAXED_WAYS_ACROSS not in default
 
 
-def test_rest_with_an_ech_sidecar_and_expiry_relaxed_keeps_the_ech_remedy(
-    pki: dict[str, str],
-) -> None:
-    """On an ECH hop the sidecar dials the partner, so the engine's relaxed opener is never used and
-    the ECH remedy stands rather than the expiry-relaxed one."""
-    text = _refused("REST", crl=pki["crl"], extra={**_ECH, **_EXPIRED})
-    assert ECH_HOP_WAYS_ACROSS in text
-    assert EXPIRY_RELAXED_WAYS_ACROSS not in text
-    assert "[tls].crl_file" not in text
+def test_rest_with_an_ech_sidecar_refuses_expiry_relaxed(pki: dict[str, str]) -> None:
+    """On an ECH hop the sidecar verifies the partner, so no hop of the connection applies
+    ``tls_allow_expired``. It is refused at build, as ``verify_tls=false`` is (vault BACKLOG #2977),
+    and the refusal is a configuration error, not the revocation refusal."""
+    err = _config_error(
+        "REST", r"ech_egress and tls_allow_expired", crl=pki["crl"], extra={**_ECH, **_EXPIRED}
+    )
+    assert "mutually exclusive" in str(err)
+    # An attestation does not cross it either.
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="tls_allow_expired"):
+        _build("REST", revocation_attested=True, extra={**_ECH, **_EXPIRED})
+    # CONTROL: the same attested ECH build without the relaxation builds.
+    with active_hop_posture(PROD_PHI):
+        _build("REST", crl=pki["crl"], revocation_attested=True, extra=_ECH)
 
 
 def test_a_lapsed_crl_passes_a_context_that_skips_validity_checks(tmp_path: Path) -> None:
@@ -383,18 +388,33 @@ def test_a_bad_crl_file_is_not_reported_on_a_rest_ech_hop(pki: dict[str, str]) -
     _config_error("REST", r"crl_file", crl=pki["ca_and_crl"])
 
 
-def test_a_rest_ech_hop_still_loads_its_ca_file(pki: dict[str, str], tmp_path: Path) -> None:
-    """Only the CRL is dropped on the ECH hop (vault BACKLOG #2977 item 7). A ``tls_ca_file`` that
-    cannot be read still fails the connection, as it did before."""
-    with active_hop_posture(PROD_PHI), pytest.raises(CaFileUnreadable):
-        _build(
-            "REST",
-            revocation_attested=True,
-            extra={**_ECH, "tls_ca_file": str(tmp_path / "missing-ca.pem")},
-        )
-    # CONTROL: the same build with a readable CA file builds, so the refusal above is the file.
+@pytest.mark.parametrize("shape", ["missing", "readable", "pin"])
+def test_a_rest_ech_hop_refuses_a_ca_it_cannot_apply(
+    shape: str, pki: dict[str, str], tmp_path: Path
+) -> None:
+    """No hop of an ECH connection reads ``tls_ca_file``: the sidecar verifies the partner and the
+    engine verifies an https sidecar against the system trust store. A CA file, readable or not, and
+    a pin beside it are refused at build, and the refusal names the settings but not the path
+    (vault BACKLOG #2977)."""
+    ca = str(tmp_path / "missing-ca.pem") if shape == "missing" else pki["ca"]
+    extra: dict[str, object] = {**_ECH, "tls_ca_file": ca}
+    if shape == "pin":
+        extra["tls_ca_pin"] = "ab" * 32
+    with (
+        active_hop_posture(PROD_PHI),
+        pytest.raises(ValueError, match="ech_egress and tls_ca_file") as exc,
+    ):
+        _build("REST", revocation_attested=True, extra=extra)
+    assert not isinstance(exc.value, (InsecureHopRefused, CaFileUnreadable))
+    assert ca not in str(exc.value)
+    assert ("tls_ca_pin" in str(exc.value)) is (shape == "pin")
+    assert "ab" * 32 not in str(exc.value)
+    # CONTROL: the same attested ECH build with no CA builds, and the same readable CA without the
+    # sidecar builds, so the refusal is the pairing.
     with active_hop_posture(PROD_PHI):
-        _build("REST", revocation_attested=True, extra={**_ECH, "tls_ca_file": pki["ca"]})
+        _build("REST", revocation_attested=True, extra=_ECH)
+        if shape == "readable":
+            _build("REST", revocation_attested=True, extra={"tls_ca_file": ca})
 
 
 def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[str, str]) -> None:

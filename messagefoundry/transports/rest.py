@@ -3164,6 +3164,26 @@ class RestDestination(DestinationConnector):
                 "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
                 "engine, makes this connection's TLS connection to the destination (ADR 0139)"
             )
+        # Vault BACKLOG #2977 item 7, by the reasoning item 8 gives for verify_tls=false above: the
+        # sidecar verifies the destination's certificate, the engine verifies an https sidecar
+        # against the system trust store, and the token hop posts through the same plain opener.
+        # So no hop of this connection applies a tls_allow_expired relaxation, a tls_ca_file or a
+        # tls_ca_pin. Accepted, each would read as in force while nothing applies it. The message
+        # names the settings only, never their values.
+        if self._ech_sidecar is not None:
+            unapplied = [
+                key
+                for key in ("tls_allow_expired", "tls_ca_file", "tls_ca_pin")
+                if (bool(s.get(key, False)) if key == "tls_allow_expired" else s.get(key))
+            ]
+            if unapplied:
+                raise ValueError(
+                    f"ech_egress and {', '.join(unapplied)} are mutually exclusive -- no hop of "
+                    "this connection applies "
+                    + ("it" if len(unapplied) == 1 else "them")
+                    + ": the ECH sidecar verifies the destination's certificate, and the engine "
+                    "verifies an https sidecar against the system trust store (ADR 0139)"
+                )
         # BACKLOG #5529 limb 3 (#2707 closing step 1): the ECH branch below replaces the opener the
         # Digest handler is folded into, so the connection used to build and deliver with no Digest
         # auth. Keeping the handler on the ECH opener would not work: its password manager is keyed
@@ -3295,8 +3315,8 @@ class RestDestination(DestinationConnector):
                 # The opener built here is replaced by the sidecar opener below, and the sidecar
                 # makes the TLS connection to the partner, so no CRL loaded here is ever consulted.
                 # Loading it anyway reported a CRL fault on a hop that cannot use the CRL (vault
-                # BACKLOG #2977 item 7). The CA half is still loaded, so a CA file that cannot be
-                # read fails this connection as it did before.
+                # BACKLOG #2977 item 7). A tls_ca_file is refused above on this connection, so the
+                # CA half here can come only from the [tls] policy, and it still loads.
                 anchor = replace(anchor, crl_file=None)
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(

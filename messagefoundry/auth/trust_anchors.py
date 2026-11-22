@@ -1908,9 +1908,10 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     it or the settings cannot tell yet (vault BACKLOG #2371).
 
     The switches that build no verifying context: ``tls`` or ``use_tls`` off, a remote-file
-    ``protocol`` of plain ``ftp``, ``tls_verify`` off, ``ech_egress`` through an ``http://``
-    sidecar, and on the HTTP family ``verify_tls`` off or an ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
-    loopback and verifies the server itself (ADR 0139). An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
+    ``protocol`` of plain ``ftp``, ``tls_verify`` off, ``ech_egress``, and on the HTTP family
+    ``verify_tls`` off or an ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes
+    both hops and verifies the server itself (ADR 0139); an ``https://`` sidecar is verified against
+    the system trust store. An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
     check after resolution decides. Each caller refuses a pin beside an unread CA and checks no
     file there: a pin nothing checks reads as pinned while nothing is.
 
@@ -1931,8 +1932,11 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
         return "plain FTP (tls=False) builds no TLS context"
     if not bool_setting(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
-    if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
-        return "ech_egress sends both hops to an http:// sidecar, which does the TLS itself"
+    if settings.get("ech_egress"):
+        # Either sidecar scheme: an https:// sidecar is verified against the system trust store
+        # and the token hop posts through the same plain opener, so neither hop reads the CA, and
+        # the REST destination refuses one at build (vault BACKLOG #2977).
+        return "ech_egress sends both hops to the sidecar, and no hop reads tls_ca_file"
     if _token_hop_reads_ca(settings):
         return None
     if not bool_setting(settings, "verify_tls", default=True):
