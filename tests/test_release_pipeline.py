@@ -2089,12 +2089,50 @@ def _clone_venv(template: Path, root: Path) -> tuple[Path, Path]:
     return exe, Path(purelib)
 
 
+#: A heredoc fed to an interpreter on stdin, as every release smoke and tag guard is fed:
+#: ``<path>python <flags> - [args] <<'TAG'``, the body, then ``TAG`` alone at column 0 of the
+#: dedented ``run:`` block. ``flags`` stops at the first word that is not a dash flag, so a flag
+#: that takes a value (``-X utf8``) makes the invocation unreadable here rather than misread.
+_STDIN_HEREDOC = re.compile(
+    r"\S*python[0-9.]*(?P<flags>(?:[ \t]+-[A-Za-z]+)*)[ \t]+-(?=[ \t])[^\n]*<<'(?P<tag>[A-Z]+)'\n"
+    r"(?P<body>.*?)\n(?P=tag)\n",
+    re.S,
+)
+
+
+@functools.cache
+def _step_flags(script: str) -> tuple[str, ...]:
+    """The interpreter flags release.yml passes the interpreter that ``script`` is fed to.
+
+    Read from the workflow by the script's own text, so an execution test runs a smoke or a tag
+    guard under the flags the step really uses (BACKLOG #1583). Before this, ``_run_smoke``
+    hardcoded ``-I``, so the intact checkout the acceptance keeps present could never answer: a
+    step that dropped ``-I`` would have left every execution test here green. Two steps may carry
+    the same script, the engine's and the toolkit's tag guards for one, so the flags of every copy
+    must agree, or no single answer exists.
+    """
+    found = {
+        tuple(m.group("flags").split())
+        for job in _jobs().values()
+        for step in (job.get("steps") or [])
+        if isinstance(step, dict)
+        for m in _STDIN_HEREDOC.finditer(str(step.get("run") or ""))
+        if m.group("body") == script
+    }
+    assert len(found) == 1, (
+        f"expected the script to be fed to exactly one interpreter flag list in release.yml, found "
+        f"{sorted(found)}: either no step feeds it on stdin any more, or two copies are run "
+        f"under different flags"
+    )
+    return next(iter(found))
+
+
 def _run_smoke(
     exe: Path,
     script: str,
     workdir: Path,
     *,
-    isolated: bool = True,
+    flags: Sequence[str] | None = None,
     args: Sequence[str] = (),
 ) -> tuple[int, str, str]:
     """Run ``script`` the way the step does; return (rc, stdout, combined output).
@@ -2103,11 +2141,11 @@ def _run_smoke(
     ``built=$(...)`` and everything else the script says goes to stderr, so a diagnostic that leaked
     onto stdout would silently become the version the release compares against the tag.
 
-    ``-I`` matches the workflow. The one caller that drops it is the checkout-shadow control, which
-    exists to prove the in-venv assertion fires rather than that the flag is spelled right.
+    ``flags`` defaults to the step's own, read by :func:`_step_flags`. A caller passes other flags
+    only as a control, to show what the same run does without the step's isolation.
     ``args`` follow the ``-``, as ``python -I - "$built" "$want"`` passes them to a tag guard.
     """
-    argv = [str(exe), *(["-I"] if isolated else []), "-", *args]
+    argv = [str(exe), *(_step_flags(script) if flags is None else flags), "-", *args]
     proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
         argv,
         input=script.encode("utf-8"),
@@ -2174,6 +2212,16 @@ def test_a_wheel_smoke_accepts_a_correctly_built_wheel(
         f"{job}'s smoke passed without reporting how much of the package tree it found.\n{out}"
     )
     assert _SHADOW_VERSION not in out, f"the intact checkout answered {job}'s smoke.\n{out}"
+
+    # THE INTACT CHECKOUT IS LIVE (BACKLOG #1583's acceptance). The run above used the step's own
+    # flags, so its pass shows those flags keep the checkout out only if the checkout would
+    # otherwise get in. The same run without them must be refused for exactly that reason.
+    work = tmp_path / "checkout"
+    rc, _stdout, out = _run_smoke(exe, script, work, flags=())
+    assert rc != 0 and "OUTSIDE the smoke venv" in out, (
+        f"without the step's flags ({' '.join(_step_flags(script)) or 'none'}) the intact checkout "
+        f"did not reach {job}'s smoke, so the pass above does not show the flags keep it out.\n{out}"
+    )
 
 
 def _no_package_tree(purelib: Path, dist: str, pkg: str) -> None:
@@ -2288,7 +2336,7 @@ def test_a_wheel_smoke_refuses_a_module_resolved_outside_the_smoke_venv(
     for rel, text in _good_package(pkg, "9.9.9").items():
         (shadow / pkg / rel).write_text(text, encoding="utf-8")
 
-    rc, _stdout, out = _run_smoke(exe, script, shadow, isolated=False)
+    rc, _stdout, out = _run_smoke(exe, script, shadow, flags=())
     assert rc != 0, (
         f"{job}'s smoke accepted a module resolved from the CHECKOUT instead of the smoke venv — it "
         f"would report on the source tree and never open the wheel.\n{out}"
