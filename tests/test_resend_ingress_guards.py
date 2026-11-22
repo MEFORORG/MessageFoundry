@@ -425,6 +425,34 @@ def test_guard_direct_path_refuses_a_body_the_parser_faults_on(
     assert admit_resubmitted_body(EDITED, None) == EDITED
 
 
+@pytest.mark.parametrize("shape", ["batch", "over-segment-cap"])
+def test_guard_direct_path_judges_the_form_limit_on_the_reattach_parse(shape: str) -> None:
+    # BACKLOG #5972: Peek.parse refuses an FHS-led batch and a body past its segment cap, but the
+    # delivery re-attach parses both and refuses them for their form count, so the direct path
+    # judges the limit on that parse rather than admitting the body to dead-letter.
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT, DOC_REF_MARKER
+    from messagefoundry.parsing.peek import HL7PeekError, Peek
+    from messagefoundry.pipeline.ingress_guards import HEADER_FORMS_REFUSED_REASON
+
+    headers = "".join(
+        f"BHS|:~{chr(0x4E00 + index)}&|A\r" for index in range(_LATER_HEADER_FORMS_LIMIT + 1)
+    )
+    note = f"NTE|1||{DOC_REF_MARKER}x\r"
+    if shape == "batch":
+        body = "FHS|^~\\&|APP|FAC\r" + headers + EDITED + note
+    else:
+        body = EDITED + note + headers + "ZZZ|1\r" * 10_001
+    with pytest.raises(HL7PeekError):
+        Peek.parse(body)  # control: the listeners' parse refuses this shape
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(body, None)
+    assert exc.value.phase == "ingest"
+    assert exc.value.reason == HEADER_FORMS_REFUSED_REASON
+    # Control: within the limit the same shape is still left to the outbound.
+    within = body.replace(headers, "BHS|:~X&|A\r")
+    assert admit_resubmitted_body(within, None) == within
+
+
 def test_guard_sniffs_the_declared_type() -> None:
     admit_resubmitted_body('{"a": 1}', _ic(ContentType.JSON))
     with pytest.raises(IngressGuardError) as exc:

@@ -722,11 +722,29 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         # meets the listeners' document-marker refusal here, rather than being committed and then
         # dead-lettered (BACKLOG #5972). A body the parser refuses is left to the outbound, but a
         # fault in the parser refuses the body, as the re-attach re-raises one rather than admit
-        # what it could not read.
+        # what it could not read. The form limit is judged first on the re-attach's own parse,
+        # which admits an FHS- or BHS-led batch and has no segment cap, so a body Peek.parse
+        # refuses for either is not committed past the limit.
         if not may_hold_doc_ref(raw):
             return raw
         # Raised once its handler has ended, so the parser's error is on no chain.
         faulted: str | None = None
+        try:
+            message = Message.parse(raw)
+        except HL7PeekError as exc:
+            if not exc.parser_fault:
+                return raw
+            faulted = f"parse error: {safe_exc(exc)}"
+        if faulted is not None:
+            raise IngressGuardError(faulted, phase="parse")
+        try:
+            over_limit = later_header_forms_over_limit(message)
+        except PEEK_READ_FAULTS:
+            faulted = _MARKER_CHECK_FAULT_REASON
+        if faulted is not None:
+            raise IngressGuardError(faulted, phase="ingest")
+        if over_limit:
+            raise IngressGuardError(HEADER_FORMS_REFUSED_REASON, phase="ingest")
         try:
             peek = Peek.parse(raw, max_bytes=DEFAULT_MAX_MESSAGE_BYTES)
         except HL7PeekError as exc:

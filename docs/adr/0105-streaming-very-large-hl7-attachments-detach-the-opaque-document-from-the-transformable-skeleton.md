@@ -369,7 +369,8 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   detach does not change, so a skeleton the detach grew is not refused for a count the
   listeners admitted; a payload a Handler built can be. The upload resend and both edit-resend
   paths run the same listener check (`admit_resubmitted_body`), the direct path on a body that
-  parses as HL7. A
+  parses as HL7, with the form limit judged on the re-attach's own parse (`Message.parse`, which
+  also reads an `FHS`- or `BHS`-led batch and has no segment cap), and a parser fault refused. A
   body with no `MSH` never reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a
