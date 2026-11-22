@@ -1231,6 +1231,14 @@ def _sole_call(facts: dict, name: str) -> dict:
     return hits[0]
 
 
+def _sole_call_on(facts: dict, name: str, needle: str) -> dict:
+    """The one ``name`` call whose text holds ``needle``, for a command called on more than one
+    directory."""
+    hits = [c for c in facts["commands"] if c["name"] == name and needle in c["text"]]
+    assert len(hits) == 1, f"expected exactly one {name} call holding {needle}, found {len(hits)}"
+    return hits[0]
+
+
 def test_every_path_parameter_is_absolute_before_anything_consumes_it(tmp_path: Path) -> None:
     """Each of -DataDir, -AppExe, -Config, -DbPath is finalised BEFORE the Resolve-Nssm call.
 
@@ -4018,8 +4026,9 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     lock = _sole_call(facts, "Set-SecretsDirAcl")
     assert "-Account $ServiceAccount" in lock["text"], lock["text"]
     assert lock["start"] > data["start"], "the secrets directory is restricted before the data dir"
-    named = _sole_call(facts, "Set-ServiceEnvironmentValue")
-    assert "MEFOR_SECRETS_DIRECTORY" in named["text"] and "$SecretsDir" in named["text"]
+    # The custody directory (vault BACKLOG #3411) has calls of its own, on $CustodyDir.
+    named = _sole_call_on(facts, "Set-ServiceEnvironmentValue", "$SecretsDir")
+    assert "MEFOR_SECRETS_DIRECTORY" in named["text"], named["text"]
     assert "AppEnvironmentExtra" not in " ".join(
         c["text"] for c in facts["commands"] if c["name"] == "Invoke-Nssm"
     ), "an `nssm set AppEnvironmentExtra` would replace the operator's whole list"
@@ -4033,8 +4042,7 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     assert "-AllowMissing" in check["text"] and "-OnlyFolders @()" in check["text"], check["text"]
     # Made in one step with its owner and list (New-RestrictedDirectory), never New-Item then icacls,
     # which leaves a window where the folder inherits Users' create right.
-    creates = _sole_call(facts, "New-RestrictedDirectory")
-    assert "-Path $SecretsDir" in creates["text"], creates["text"]
+    creates = _sole_call_on(facts, "New-RestrictedDirectory", "-Path $SecretsDir")
     assert not [
         c
         for c in facts["commands"]
@@ -4045,7 +4053,7 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
         for c in facts["commands"]
         if c["name"] == "Get-ReparsePointAncestor" and "-Path $SecretsDir" in c["text"]
     )
-    sharers = _sole_call(facts, "Get-OtherServiceNamingPath")
+    sharers = _sole_call_on(facts, "Get-OtherServiceNamingPath", "-Path $SecretsDir")
     empty = _sole_call(facts, "Get-SecretsDirHeldProblem")
     registered = min(
         c["start"]

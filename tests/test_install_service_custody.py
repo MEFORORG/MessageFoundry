@@ -23,8 +23,11 @@ from tests.test_service_install_manifest import (
     _ok,
     _preflight_facts,
     _psq,
+    _run,
     _script_text,
     _sole_call,
+    _sole_call_on,
+    _windows_only,
 )
 
 _SCRIPT = svc.install_script_path()
@@ -156,3 +159,164 @@ def test_the_installer_refuses_before_anything_acts(tmp_path: Path) -> None:
         assert refusal < text.index(later), later
     # The settings file is known to exist before it is read.
     assert text.index("Service settings file not found at: $ServiceConfig") < refusal
+
+
+# --- the custody directory (ADR 0214's 2026-11-22 amendment) --------------------------------------
+
+#: (the service account's grant, as icacls spells it, whether Get-CustodyGrantProblem passes it)
+_GRANTS: list[tuple[str, bool]] = [
+    ("(RX,WD)", True),
+    ("(RX)", False),  # no add-file: the first start could not write master.key
+    ("(WD)", False),  # no read
+    ("(OI)(RX,WD)", False),  # inherited by the files in it
+    ("(RX,WD,DC)", False),  # may delete any file in it
+    ("(RX,WD,WDAC)", False),  # may change its list
+    ("M", False),
+    ("F", False),
+    ("(GR,WD)", False),  # a generic right is not read as the rights it maps to
+]
+
+
+@_windows_only
+def test_the_custody_grant_rule(tmp_path: Path) -> None:
+    """Get-CustodyGrantProblem on a real directory's list, one per grant. A deny entry is not a
+    grant, so it neither widens nor narrows the verdict."""
+    assert _SCRIPT is not None
+    dirs = []
+    for i, (grant, _) in enumerate(_GRANTS):
+        d = tmp_path / f"g{i}"
+        d.mkdir()
+        dirs.append((str(d), grant))
+    cases = "\n".join(
+        f'  & icacls {_psq(d)} /inheritance:r /grant:r "*${{mySid}}:{grant}" '
+        f"'*S-1-5-32-544:(OI)F' | Out-Null\n"
+        f"  & icacls {_psq(d)} /deny '*S-1-5-32-545:(WD)' | Out-Null\n"
+        f"  $out += [string](Get-CustodyGrantProblem -Acl (Get-Acl -LiteralPath {_psq(d)}) "
+        "-AccountSid $mySid)"
+        for d, grant in dirs
+    )
+    body = (
+        "  $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
+        f"  $out = @()\n{cases}\n  ConvertTo-Json -InputObject $out -Compress\n"
+    )
+    try:
+        got = json.loads(_ok(_extract(_SCRIPT, ["Get-CustodyGrantProblem"], body), tmp_path))
+    finally:
+        restore = "\n".join(
+            f'  & icacls {_psq(d)} /inheritance:e /grant "*$([Security.Principal.WindowsIdentity]'
+            '::GetCurrent().User.Value):(OI)(CI)F" | Out-Null'
+            for d, _ in dirs
+        )
+        _run(_extract(_SCRIPT, [], restore), tmp_path)
+    assert [not p for p in got] == [ok for _, ok in _GRANTS], list(zip(_GRANTS, got, strict=True))
+
+
+@_windows_only
+def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_path: Path) -> None:
+    """Set-CustodyDirAcl on a directory that inherits Users read and the account's Modify. The
+    account ends with read and add-file on the directory alone, nothing inherited, and the engine's
+    own check of a custody directory passes it, where it refused the directory before. Unelevated,
+    the owner change is refused, and the function refuses for that alone."""
+    from messagefoundry.store import custody_host
+
+    assert _SCRIPT is not None
+    parent = tmp_path / "cd"
+    custody = parent / "custody"
+    custody.mkdir(parents=True)
+    pre = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)RX' "${{me}}:(OI)(CI)M" | Out-Null
+"""
+    _ok(_extract(_SCRIPT, [], pre), tmp_path)
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody)}
+    assert custody_host._own_directory_refusal(environ) is not None, (
+        "CONTROL FAILED: the engine accepted the directory before the lockdown"
+    )
+    lock = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $dir = {_psq(str(custody))}
+  $refusal = ''
+  try {{ Set-CustodyDirAcl -Path $dir -Account $me }} catch {{ $refusal = $_.Exception.Message }}
+  $acl = Get-Acl -LiteralPath $dir
+  $mine = @($acl.Access | Where-Object {{
+    try {{ $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $mySid }}
+    catch {{ $false }} }})
+  [pscustomobject]@{{
+    refusal = $refusal
+    inherited = @($acl.Access | Where-Object {{ $_.IsInherited }}).Count
+    protected = $acl.AreAccessRulesProtected
+    mine = @($mine | ForEach-Object {{ [pscustomobject]@{{
+      type = "$($_.AccessControlType)"; rights = [int64]$_.FileSystemRights;
+      inherit = "$($_.InheritanceFlags)" }} }})
+    grant = (Get-CustodyGrantProblem -Acl $acl -AccountSid $mySid)
+    text = (& icacls $dir | Out-String)
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+    names = [
+        "Set-CustodyDirAcl",
+        "Get-CustodyGrantProblem",
+        "Get-WellKnownBroadSids",
+        "Get-BroadAclResidue",
+        "Get-ReparsePointAncestor",
+    ]
+    try:
+        got = json.loads(_ok(_extract(_SCRIPT, names, lock), tmp_path).strip().splitlines()[-1])
+        after = custody_host._own_directory_refusal(environ)
+    finally:
+        restore = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls {_psq(str(custody))} /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+"""
+        _run(_extract(_SCRIPT, [], restore), tmp_path)
+    assert after is None, f"the engine refuses the locked directory: {after}\n{got['text']}"
+    assert got["protected"] and got["inherited"] == 0, got["text"]
+    mine = got["mine"] if isinstance(got["mine"], list) else [got["mine"]]
+    # ReadAndExecute | CreateFiles | Synchronize, in one allow entry inherited by nothing.
+    assert mine == [{"type": "Allow", "rights": 0x1200AB, "inherit": "None"}], got["text"]
+    assert not got["grant"], got["grant"]
+    refusal = got["refusal"]
+    assert not refusal or (
+        "owner" in refusal
+        and "grants access" not in refusal
+        and "inherits" not in refusal
+        and "more than" not in refusal
+    ), f"a clean lockdown must find nothing but the owner; got {refusal}"
+
+
+def test_the_installer_makes_and_names_the_custody_directory_under_the_host_provider(
+    tmp_path: Path,
+) -> None:
+    """CALL-SITE guard: the custody directory is judged with the secrets directory's rules before
+    NSSM is resolved, made restricted before the service is registered, restricted after the
+    secrets directory once the account resolves, and named to the service. Each step sits under
+    the host provider's branch, and -CustodyDir is refused without it."""
+    facts = _preflight_facts(tmp_path)
+    # Read by line: the call offsets count the file's own line endings, which read_text folds.
+    text = _script_text()
+    check = _sole_call_on(facts, "Get-LockPathProblem", "-Path $CustodyDir")
+    assert "-AllowMissing" in check["text"] and "$SecretsDir" in check["text"], check["text"]
+    sharers = _sole_call_on(facts, "Get-OtherServiceNamingPath", "-Path $CustodyDir")
+    creates = _sole_call_on(facts, "New-RestrictedDirectory", "-Path $CustodyDir")
+    lock = _sole_call(facts, "Set-CustodyDirAcl")
+    assert "-Path $CustodyDir" in lock["text"] and "-Account $ServiceAccount" in lock["text"]
+    secrets_lock = _sole_call(facts, "Set-SecretsDirAcl")
+    named = _sole_call_on(facts, "Set-ServiceEnvironmentValue", "$CustodyDir")
+    assert "MEFOR_CUSTODY_DIRECTORY" in named["text"], named["text"]
+    nssm = min(c["start"] for c in facts["commands"] if c["name"] == "Resolve-Nssm")
+    registered = min(
+        c["start"]
+        for c in facts["commands"]
+        if c["name"] == "Invoke-Nssm" and "install" in c["text"]
+    )
+    host = _sole_call(facts, "Get-HostCustodyAccountProblem")
+    assert host["start"] < check["start"] < sharers["start"] < nssm
+    assert creates["start"] < registered < secrets_lock["start"] < lock["start"] < named["start"]
+    # Each act is inside an `if ($HostCustody)` block.
+    lines = text.splitlines()
+    for call in (creates, lock, named):
+        at = call["line"] - 1  # 1-based in the parser's extent
+        head = max(i for i in range(at) if lines[i].startswith("if ($HostCustody) {"))
+        end = next(i for i in range(head, len(lines)) if lines[i] == "}")
+        assert head < at < end, call["text"]
+    assert "-CustodyDir is used only under [store].key_provider = 'host'" in text

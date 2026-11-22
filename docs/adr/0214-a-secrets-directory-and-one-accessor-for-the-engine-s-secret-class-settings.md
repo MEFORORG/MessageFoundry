@@ -153,6 +153,25 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## Amendments
 
+- **2026-11-22, the host key provider's files get a custody directory of their own (vault
+  BACKLOG #3411).** Under `[store].key_provider = 'host'` the service's first start writes its own
+  key file, `master.key`, beside the `handoff.key` an administrator's `provision-admin
+  --service-account` left. Decision 5 and slice C keep this directory administrator-written, with
+  the service at read only, and a service right to add a file here would let it supply a
+  secret-class setting. So those two files move to a directory of their own when
+  `MEFOR_CUSTODY_DIRECTORY` names one, an absolute path, which wins over `MEFOR_SECRETS_DIRECTORY`
+  for them; unset, they stay where they were, in this directory or beside a SQLite store. Before
+  a read or a mint, the engine applies decision 4's check to the directory that variable names,
+  `broad_access_problem` with `directory`, at every enforcement setting; it does not refuse one
+  account's right to add a file there. A host file or handoff found only in this directory while
+  the variable is set refuses the read, so a mint made without the variable is not taken for no
+  key. `install-service.ps1` makes the directory only when it reads that provider: `-CustodyDir`,
+  else the one the service names, else `<DataDir>-custody`, judged by slice C's rules with this
+  directory added to the paths it must not be, hold or sit inside, made restricted in one step,
+  and restricted to Administrators as owner, SYSTEM and Administrators with full control, and the
+  service account with read and add-file on the directory alone, which it reads back. It names
+  the directory to the service as `MEFOR_CUSTODY_DIRECTORY`. docs/SERVICE.md, *The custody
+  directory under the host key provider*, is the operator's text.
 - **2026-11-17, the Windows holder is read where the path resolves to (vault BACKLOG #5657).**
   This replaces parts of the 2026-11-13 amendment below. `_windows_surroundings_problem` still
   walks `full.parent`, except for a drive root such as `S:\`, whose own path it walks, so a
