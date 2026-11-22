@@ -146,8 +146,53 @@ def _stub_gh(monkeypatch: pytest.MonkeyPatch, stdout: str) -> list[dict[str, obj
         calls.append({"cmd": cmd, **kwargs})
         return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
-    monkeypatch.setattr("scripts.ci.check_required_workflow_state.subprocess.run", fake_run)
+    monkeypatch.setattr("scripts.ci.required_contexts.subprocess.run", fake_run)
     return calls
+
+
+def test_a_conflicting_repeat_across_pages_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A later ``active`` must not overwrite a ``disabled_manually`` for the same file."""
+    entries = _active_entries()
+    disabled = {**entries[0], "state": "disabled_manually"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": [disabled]}, {"workflows": entries}]))
+    assert main(["--repo", "owner/name"]) == 2
+
+
+def test_an_identical_repeat_is_harmless(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control for the conflict case: a page shift that repeats an entry unchanged still passes."""
+    entries = _active_entries()
+    _stub_gh(monkeypatch, json.dumps([{"workflows": entries[:1]}, {"workflows": entries}]))
+    assert main(["--repo", "owner/name"]) == 0
+
+
+def test_a_same_named_file_elsewhere_cannot_stand_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``dynamic/`` entry with a required file's basename does not make that file present."""
+    entries = _active_entries()
+    name = Path(str(entries[0]["path"])).name
+    entries[0] = {**entries[0], "path": f"dynamic/other/{name}"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": entries}]))
+    assert main(["--repo", "owner/name"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"), [pytest.param(1, "", id="gh-fails"), pytest.param(0, "", id="empty")]
+)
+def test_a_failed_gh_read_exits_2(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str
+) -> None:
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="refused")
+
+    monkeypatch.setattr("scripts.ci.required_contexts.subprocess.run", fake_run)
+    assert main(["--repo", "owner/name"]) == 2
+
+
+def test_a_gh_timeout_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd, 120)
+
+    monkeypatch.setattr("scripts.ci.required_contexts.subprocess.run", fake_run)
+    assert main(["--repo", "owner/name"]) == 2
 
 
 def test_two_slurped_pages_are_both_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,6 +253,8 @@ _GOOD = {"path": ".github/workflows/ci.yml", "state": "active"}
         pytest.param({"workflows": [{"path": "ci.yml", "state": 1}]}, id="state-not-string"),
         pytest.param({"workflows": [{"path": "", "state": "active"}]}, id="path-empty"),
         pytest.param({"workflows": [{"path": "ci.yml", "state": ""}]}, id="state-empty"),
+        pytest.param({"workflows": [{"path": "   ", "state": "active"}]}, id="path-blank"),
+        pytest.param({"workflows": [{"path": "ci.yml", "state": "   "}]}, id="state-blank"),
         pytest.param([], id="empty-list"),
         pytest.param(["ci.yml"], id="list-of-strings"),
         pytest.param([None], id="list-of-null"),

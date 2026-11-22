@@ -37,7 +37,7 @@ import argparse
 import json
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,6 +52,8 @@ from tests._workflow_contexts import required_contexts, resolve  # noqa: E402
 #: ``disabled_inactivity`` (60 days idle on a fork/scheduled-only repo), ``disabled_fork`` -- means it
 #: will not dispatch, so a required context it owns can never report.
 _RUNNABLE = "active"
+
+_WORKFLOW_DIR = PurePosixPath(".github/workflows")
 
 
 def _workflow_entries(payload: object) -> list[object]:
@@ -81,7 +83,7 @@ def _workflow_entries(payload: object) -> list[object]:
 
 
 def _workflow_state(entry: object) -> tuple[str, str]:
-    """``(filename, state)`` of one entry, or ``RuntimeError``.
+    """``(path, state)`` of one entry, or ``RuntimeError``.
 
     A missing field must not default to ``""``: that would report a malformed payload as a disabled
     workflow, exit 1, which is the findings code.
@@ -89,10 +91,9 @@ def _workflow_state(entry: object) -> tuple[str, str]:
     if not isinstance(entry, dict):
         raise RuntimeError("a workflow entry is not an object")
     path, state = entry.get("path"), entry.get("state")
-    name = Path(path).name if isinstance(path, str) else ""
-    if not name or not isinstance(state, str) or not state:
+    if not (isinstance(path, str) and path.strip() and isinstance(state, str) and state.strip()):
         raise RuntimeError("a workflow entry lacks a usable `path` or `state`")
-    return name, state
+    return path, state
 
 
 def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, str]:
@@ -109,7 +110,17 @@ def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, st
         # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
         route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
         payload = gh_api(["--paginate", "--slurp", route])
-    return dict(_workflow_state(entry) for entry in _workflow_entries(payload))
+    # Only a file directly in .github/workflows can own a required context: the list also carries
+    # `dynamic/` entries, and matching on the basename alone would let one stand in for a real file.
+    # A repeat that disagrees is refused, because last-wins could overwrite a disabled state.
+    states: dict[str, str] = {}
+    for path, state in map(_workflow_state, _workflow_entries(payload)):
+        where = PurePosixPath(path)
+        if where.parent != _WORKFLOW_DIR:
+            continue
+        if states.setdefault(where.name, state) != state:
+            raise RuntimeError(f"workflow {where.name} is listed with conflicting states")
+    return states
 
 
 def main(argv: list[str] | None = None) -> int:
