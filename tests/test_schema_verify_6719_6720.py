@@ -30,6 +30,7 @@ from messagefoundry.store.schema_verify import (
     is_schema_step_error,
     live_schema_differences,
     read_schema_shape,
+    run_schema_step,
 )
 from messagefoundry.store.store import _SCHEMA, _await_connection_worker_exit
 
@@ -589,60 +590,88 @@ async def test_a_failure_building_the_expected_shape_keeps_its_own_error(
 async def test_the_foreign_object_is_matched_against_the_file(
     tmp_path: Path, view_name: str, cause: str, found: tuple[str, str] | None
 ) -> None:
-    from messagefoundry.store.schema_verify import _foreign_object
+    from messagefoundry.store.schema_verify import _foreign_objects
 
     path = tmp_path / "named.db"
     _sql(path, f'CREATE VIEW "{view_name}" AS SELECT 1 AS a')
     async with _connected(path) as db:
-        assert await _foreign_object(db, cause) == found
+        assert await _foreign_objects(db, cause) == ((found,) if found else ())
 
 
 @pytest.mark.parametrize(
-    ("cause_view", "reads", "statement", "expected_cause"),
+    ("views", "reads", "statement", "expected_cause", "found"),
     [
         pytest.param(
-            "vv",
+            ("vv", "vv after"),
             "c FROM t",
             "ALTER TABLE t DROP COLUMN c",
             "error in view vv after drop column: no such column: c",
+            ("vv",),
             id="vv-after-the-change",
         ),
         pytest.param(
-            "vv after",
+            ("vv after", "vv"),
             "c FROM t",
             "ALTER TABLE t DROP COLUMN c",
             "error in view vv after after drop column: no such column: c",
+            ("vv", "vv after"),
             id="vv-after-after-the-change",
         ),
         pytest.param(
-            "vv",
+            ("vv", "vv after"),
             "missing FROM t",
             "ALTER TABLE t RENAME TO t2",
             "error in view vv: no such column: missing",
+            ("vv",),
             id="vv-before-the-change",
         ),
         pytest.param(
-            "vv after",
+            ("vv after", "vv"),
             "missing FROM t",
             "ALTER TABLE t RENAME TO t2",
             "error in view vv after: no such column: missing",
+            ("vv after",),
             id="vv-after-before-the-change",
+        ),
+        pytest.param(
+            ("vv", "vv after drop column"),
+            "c FROM t",
+            "ALTER TABLE t DROP COLUMN c",
+            "error in view vv after drop column: no such column: c",
+            ("vv", "vv after drop column"),
+            id="broken-vv-beside-a-healthy-suffix-name",
+        ),
+        pytest.param(
+            ("vv", "vv: no such column"),
+            "missing FROM t",
+            "ALTER TABLE t RENAME TO t2",
+            "error in view vv: no such column: missing",
+            ("vv", "vv: no such column"),
+            id="broken-vv-beside-a-healthy-message-name",
         ),
     ],
 )
 async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
-    tmp_path: Path, cause_view: str, reads: str, statement: str, expected_cause: str
+    tmp_path: Path,
+    views: tuple[str, str],
+    reads: str,
+    statement: str,
+    expected_cause: str,
+    found: tuple[str, ...],
 ) -> None:
     # Views "vv" and "vv after" both fit "error in view vv after ...", so the longest name alone
     # would tell the operator to drop "vv after" when "vv" stopped the change. Each cause is
-    # SQLite's own text. A view already broken fails SQLite's first check, with no suffix; a view
-    # the change breaks fails its re-check after the change, with the "after drop column" suffix.
-    from messagefoundry.store.schema_verify import _foreign_object
+    # SQLite's own text, and views[0] is the broken view. A view already broken fails SQLite's
+    # first check, with no suffix; a view the change breaks fails its re-check after the change,
+    # with the "after drop column" suffix. The last two pairs are ones the text cannot settle: the
+    # healthy view's own name holds the suffix or the message, so both views are named.
+    from messagefoundry.store.schema_verify import _foreign_objects
 
     path = tmp_path / "prefix.db"
     _sql(path, "CREATE TABLE t (a, c)", "CREATE TABLE u (c)")
-    for view in ("vv", "vv after"):
-        _sql(path, f'CREATE VIEW "{view}" AS SELECT {reads if view == cause_view else "c FROM u"}')
+    broken, healthy = views
+    _sql(path, f'CREATE VIEW "{broken}" AS SELECT {reads}')
+    _sql(path, f'CREATE VIEW "{healthy}" AS SELECT c FROM u')
     conn = sqlite3.connect(path)
     try:
         with pytest.raises(sqlite3.OperationalError) as info:
@@ -651,7 +680,33 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
         conn.close()
     assert str(info.value) == expected_cause
     async with _connected(path) as db:
-        assert await _foreign_object(db, expected_cause) == ("view", cause_view)
+        assert await _foreign_objects(db, expected_cause) == tuple(("view", n) for n in found)
+
+
+async def test_names_the_text_cannot_tell_apart_are_all_named_in_the_remedy(
+    tmp_path: Path,
+) -> None:
+    # A broken "vv" beside a healthy "vv after drop column": the remedy must not tell the operator
+    # to drop the healthy view alone, so it names both, the instruction first.
+    path = tmp_path / "both.db"
+    _sql(
+        path,
+        "CREATE TABLE t (a, c)",
+        "CREATE TABLE u (c)",
+        "CREATE VIEW vv AS SELECT c FROM t",
+        'CREATE VIEW "vv after drop column" AS SELECT c FROM u',
+    )
+    async with _connected(path) as db:
+        with pytest.raises(SchemaMismatchError) as info:
+            await run_schema_step(
+                db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
+            )
+    text = str(info.value)
+    assert text.startswith(
+        f"store {path}: drop whichever of the view 'vv' and the view 'vv after drop column' stops"
+        " its upgrade, then restart."
+    ), text
+    assert "recreate" not in text, text
 
 
 @pytest.mark.parametrize(
@@ -661,60 +716,60 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
             "view",
             ("vv", "vv after"),
             "error in view vv after rename: no such module: m",
-            "vv",
+            ("vv",),
             id="vv-after-rename",
         ),
         pytest.param(
             "view",
             ("vv", "vv after"),
             "error in view vv after after rename: no such module: m",
-            "vv after",
+            ("vv", "vv after"),
             id="vv-after-after-rename",
         ),
         pytest.param(
             "view",
             ("vv", "vv: x"),
             "error in view vv: x after rename: no such module: m",
-            "vv: x",
+            ("vv", "vv: x"),
             id="colon-name-after-rename",
         ),
         pytest.param(
             "view",
             ("vv", "vv: x"),
             "error in view vv: no such module: m",
-            "vv",
+            ("vv",),
             id="colon-name-prefix",
         ),
         pytest.param(
             "view",
             ("vv", "vv after x"),
             "error in view vv after x: no such module: m",
-            "vv after x",
+            ("vv", "vv after x"),
             id="colon-outranks-a-shorter-after",
         ),
         pytest.param(
             "trigger",
             ("tr", "tr after"),
             "error in trigger tr after rename: no such module: m",
-            "tr",
+            ("tr",),
             id="trigger-after-rename",
         ),
         pytest.param(
             "trigger",
             ("tr", "tr after"),
             "error in trigger tr after after rename: no such module: m",
-            "tr after",
+            ("tr", "tr after"),
             id="trigger-after-after-rename",
         ),
     ],
 )
 async def test_a_prefix_name_is_told_apart_in_the_rename_recheck(
-    tmp_path: Path, kind: str, names: tuple[str, str], cause: str, found: str
+    tmp_path: Path, kind: str, names: tuple[str, str], cause: str, found: tuple[str, ...]
 ) -> None:
     # The RENAME COLUMN migration's re-check writes the " after rename" suffix. These causes are
     # written out in SQLite's form rather than raised, so one test can cover a colon name and a
     # trigger pair without a view or trigger built to break under each.
-    from messagefoundry.store.schema_verify import _foreign_object
+    from messagefoundry.store.schema_verify import _foreign_objects
 
     path = tmp_path / "prefix.db"
     _sql(path, "CREATE TABLE t (a)")
@@ -724,7 +779,7 @@ async def test_a_prefix_name_is_told_apart_in_the_rename_recheck(
         else:
             _sql(path, f'CREATE TRIGGER "{name}" AFTER INSERT ON t BEGIN SELECT 1; END')
     async with _connected(path) as db:
-        assert await _foreign_object(db, cause) == (kind, found)
+        assert await _foreign_objects(db, cause) == tuple((kind, n) for n in found)
 
 
 # --- BACKLOG #6720 item 1: a foreign view using an unloaded function or collation ----------------
