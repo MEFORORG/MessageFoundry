@@ -468,7 +468,7 @@ async def test_a_foreign_object_that_stops_a_migration_gets_the_drop_remedy(
     cause = info.value.cause
     assert cause is not None and cause.startswith(f"error in {kind} {name}: no such module"), cause
     text = str(info.value)
-    assert text.startswith(f"store {path} holds a {kind} '{name}' this build did not create"), text
+    assert text.startswith(f"store {path}: drop the {kind} '{name}', which this build"), text
     assert "recreate" not in text and "NEW store key" not in text, text
     # The remedy is true: with that object dropped, the same migration runs and the open succeeds.
     _sql(path, drop)
@@ -523,6 +523,10 @@ async def _verify_raising(
     """``verify_live_schema`` with ``target`` raising ``exc``; returns what the verify raised."""
     from messagefoundry.store import schema_verify
 
+    # Warm the expected shape first: its scratch build calls read_schema_shape too, and on a cold
+    # cache the patched error would come from there rather than from the live read.
+    await schema_verify._expected_shape(_SCHEMA, MessageStore._migrate)
+
     async def raising(*_args: object, **_kwargs: object) -> object:
         raise exc
 
@@ -546,6 +550,8 @@ async def test_a_read_error_that_is_not_a_shape_keeps_its_own_error(
     exc = _real_sqlite_error("SELEC 1")
     assert exc.sqlite_errorcode & 0xFF == sqlite3.SQLITE_ERROR
     assert await _verify_raising(monkeypatch, "read_schema_shape", exc) is exc
+    frames = {f.name for f in traceback.extract_tb(exc.__traceback__)}
+    assert "run_schema_step" in frames, frames
 
 
 async def test_a_failure_building_the_expected_shape_keeps_its_own_error(
@@ -558,15 +564,37 @@ async def test_a_failure_building_the_expected_shape_keeps_its_own_error(
     assert await _verify_raising(monkeypatch, "_expected_shape", exc) is exc
 
 
-async def test_a_view_under_a_name_this_build_creates_is_not_another_tools_object() -> None:
+@pytest.mark.parametrize(
+    ("view_name", "cause", "found"),
+    [
+        pytest.param("vv", "error in view vv: no such module: m", ("view", "vv"), id="plain"),
+        pytest.param(
+            "vv", "error in view vv after rename: no such column: c", ("view", "vv"), id="suffix"
+        ),
+        pytest.param("a:b", "error in view a:b: no such module: m", ("view", "a:b"), id="colon"),
+        pytest.param("users", "error in view users: no such module: m", None, id="expected-table"),
+        pytest.param(
+            "USERS", "error in view USERS after rename: no such column: c", None, id="expected-case"
+        ),
+        pytest.param(
+            "ix_queue_fifo_in_seq",
+            "error in view ix_queue_fifo_in_seq: no such module: m",
+            None,
+            id="expected-index",
+        ),
+        pytest.param("vv", "error in table vv: no such module: m", None, id="a-table"),
+        pytest.param("vv", "error in view other: no such module: m", None, id="not-in-the-file"),
+    ],
+)
+async def test_the_foreign_object_is_matched_against_the_file(
+    tmp_path: Path, view_name: str, cause: str, found: tuple[str, str] | None
+) -> None:
     from messagefoundry.store.schema_verify import _foreign_object
 
-    assert await _foreign_object("error in view vv: no such module: m") == ("view", "vv")
-    assert await _foreign_object("error in trigger tt: no such module: m") == ("trigger", "tt")
-    # A view that holds an expected table's or index's name is the incompatible store.
-    assert await _foreign_object("error in view users: no such module: m") is None
-    assert await _foreign_object("error in view IX_QUEUE_FIFO_IN_SEQ: no such module: m") is None
-    assert await _foreign_object("error in table users: no such module: m") is None
+    path = tmp_path / "named.db"
+    _sql(path, f'CREATE VIEW "{view_name}" AS SELECT 1 AS a')
+    async with _connected(path) as db:
+        assert await _foreign_object(db, cause) == found
 
 
 # --- BACKLOG #6720 item 1: a foreign view using an unloaded function or collation ----------------

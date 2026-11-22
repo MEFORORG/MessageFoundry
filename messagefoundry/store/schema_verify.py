@@ -80,12 +80,12 @@ _KEYED_DETAIL = (
     " so restarting under the old key would zero its AES-GCM use count, which lives in the store. If"
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
-# The kinds the ALTER re-check names, as "error in <kind> <name>: ...", when an object other than
-# the altered table fails to parse. Only views and triggers: this build creates neither (see
-# _ORDINARY_TABLE), so the object named is another tool's. SQLite uses the same form for a table or
-# an index, which may be this build's own. Dropping a view or a trigger removes no row, so that
-# remedy keeps the store and its key.
-_FOREIGN_KINDS = ("view", "trigger")
+# The ALTER re-check names an object other than the altered table that fails to parse as
+# "error in <kind> <name>", then ":" or a suffix such as " after rename". Only views and triggers
+# get the drop remedy (see _ORDINARY_TABLE for why they are another tool's); SQLite uses the same
+# form for a table or an index, which may be this build's own. Dropping a view or a trigger removes
+# no row, so that remedy keeps the store and its key.
+_FOREIGN_OBJECTS_SQL = "SELECT type, name FROM sqlite_master WHERE type IN ('view', 'trigger')"
 
 # The reads below skip a table whose stored SQL is LIKE 'CREATE VIRTUAL TABLE%', because a pragma
 # on a virtual table whose module is not loaded here can raise "no such module" (BACKLOG #6719).
@@ -432,23 +432,23 @@ async def run_schema_step[T](
     failure propagates unchanged.
 
     One shape failure gets another remedy: SQLite's re-check of the schema after an ``ALTER``
-    names the view or trigger it could not parse, as in "error in view V: no such module". This
-    build creates neither kind, so that object is another tool's, and dropping it lets the
-    migration run past it (BACKLOG #6719). A view under a name this build creates is not such an
-    object: it holds the place of a table or index, which is the incompatible store the plain
-    remedy names."""
+    names the view or trigger it could not parse, as in "error in view V: no such module". That
+    object is another tool's (see ``_ORDINARY_TABLE``), and dropping it lets the migration run past
+    it (BACKLOG #6719). A view under a name this build creates is not such an object: it holds the
+    place of a table or index, which is the incompatible store the plain remedy names."""
     try:
         return await step
     except Exception as exc:
         if not is_schema_step_error(exc):
             raise
         cause = str(exc)
-        foreign = await _foreign_object(cause)
+        foreign = await _foreign_object(db, cause)
         if foreign is not None:
             kind, name = foreign
+            # The instruction leads and the name follows it, so the 200-character cut keeps it.
             raise SchemaMismatchError(
-                f"store {path} holds a {kind} {name!r} this build did not create, which stops its"
-                f" upgrade: drop it, then restart. The schema step failed: {cause}.",
+                f"store {path}: drop the {kind} {name!r}, which this build did not create and which"
+                f" stops its upgrade, then restart. The schema step failed: {cause}.",
                 cause=cause,
             ) from exc
         if counts_under_dek is None:
@@ -459,16 +459,29 @@ async def run_schema_step[T](
         ) from exc
 
 
-async def _foreign_object(cause: str) -> tuple[str, str] | None:
-    """The kind and name of another tool's view or trigger that ``cause`` names, else ``None``."""
-    for kind in _FOREIGN_KINDS:
-        prefix = f"error in {kind} "
-        if cause.startswith(prefix):
-            name = cause[len(prefix) :].split(":", 1)[0]
-            if kind == "view" and name.lower() in await _names_this_build_creates():
-                return None
-            return kind, name
-    return None
+async def _foreign_object(db: aiosqlite.Connection, cause: str) -> tuple[str, str] | None:
+    """The kind and name of another tool's view or trigger that ``cause`` names, else ``None``.
+
+    The name is matched against the live file's views and triggers, never cut out of the text: the
+    text may add a suffix after the name, and a quoted name may hold a colon. A SQLite error while
+    telling falls back to ``None``, the plain remedy."""
+    try:
+        async with db.execute(_FOREIGN_OBJECTS_SQL) as cur:
+            objects = [(str(kind), str(name)) for kind, name in await cur.fetchall()]
+        named = []
+        for kind, name in objects:
+            rest = cause.removeprefix(f"error in {kind} {name}")
+            if rest != cause and rest[:1] in (":", " "):
+                named.append((kind, name))
+        if not named:
+            return None
+        kind, name = max(named, key=lambda o: len(o[1]))
+        if kind == "view" and name.lower() in await _names_this_build_creates():
+            return None
+    except sqlite3.Error as exc:
+        log.warning("could not read the views and triggers to pick the schema remedy: %s", exc)
+        return None
+    return kind, name
 
 
 async def _names_this_build_creates() -> frozenset[str]:
