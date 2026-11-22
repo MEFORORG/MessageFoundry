@@ -81,7 +81,7 @@ def test_an_env_ref_built_directly_with_the_builtin_bool_is_held_to_the_same_rea
     assert resolve_env_settings({"flag": ref}, {"flag": "off"})["flag"] is False
 
 
-def test_a_cast_other_than_the_builtin_bool_or_int_is_left_alone() -> None:
+def test_a_cast_of_the_authors_own_is_left_alone() -> None:
     # The builtin int is swapped too, for its own strict cast (vault BACKLOG #1650,
     # tests/test_env_cast_int_strict.py), and so is the builtin float
     # (tests/test_env_cast_float_strict.py); a callable of the author's own stays as given.

@@ -673,8 +673,10 @@ async def test_start_row_reads_an_env_url_query_credential_against_its_snapshot_
         runner.set_env_values({"q_start_url": url})
         loaded = app_module._LoadedConfig.read(engine)
         assert loaded is not None and loaded.env_values == {"q_start_url": url}
+        before = len(await engine.store.list_audit(action="config_loaded"))
         await app_module._record_start_audit(app, engine, loaded=loaded)
         rows = await engine.store.list_audit(action="config_loaded")
+        assert len(rows) == before + 1
         switches: list[str] = json.loads(rows[0]["detail"])["loosenings"]
         return switches
 

@@ -2543,7 +2543,7 @@ def _instance_env_values(settings: ServiceSettings) -> dict[str, Any]:
     if key not in memo:
         try:
             memo[key] = load()
-        except (ValueError, OSError) as exc:
+        except _SETTINGS_LOAD_ERRORS as exc:
             memo[key] = exc
             raise
     cached = memo[key]
@@ -3048,8 +3048,8 @@ def _check_url_query_credentials(
     An ``env()`` URL is read against the environment values ``build-check`` loads, resolved as
     ``serve`` resolves them (:func:`_instance_env_values`, vault BACKLOG #3766 item 24), when a
     settings file or an environment declaration resolves and its values load. Otherwise it is read
-    by its literal ``default=``, including where the settings are refused or the values do not
-    load, which the detail names. Either way one that neither the values nor a default gives, or
+    by its literal ``default=``, including where the settings file cannot be read, the settings
+    are refused or the values do not load, which the detail names. Either way one that neither the values nor a default gives, or
     whose value does not resolve (a failed cast, say), is not read, and the detail says which
     reading ran, on a hit as on a clean graph (item 23). SKIPs when the graph will not load, like
     its siblings."""
@@ -3085,7 +3085,7 @@ def _check_url_query_credentials(
         except _SETTINGS_LOAD_ERRORS as exc:
             if loaded:
                 what = "the environment values did not load"
-            elif isinstance(exc, OSError):
+            elif isinstance(exc, OSError) and toml is not None:
                 # A missing or unreadable --service-config is not a refusal of its content (PR
                 # 3150 finding 10, vault BACKLOG #3766).
                 what = "the settings file could not be read"

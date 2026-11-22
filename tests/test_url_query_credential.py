@@ -800,8 +800,9 @@ def test_one_check_run_loads_the_environment_values_once(
     monkeypatch.setattr(environments, "load_environment_values", counting)
     cfg = _env_url_config(tmp_path, value="https://p.example.invalid/x?key=SYNTHETIC-14")
     report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
-    names = {x.name for x in report.results}
-    assert {"build-check", "url-query-credential"} <= names
+    build = next(x for x in report.results if x.name == "build-check")
+    # build-check got past its own load, so a memo that failed would show a second call.
+    assert not build.skipped and "did not load" not in build.detail, build.detail
     detail = next(x for x in report.results if x.name == "url-query-credential").detail
     assert "OB_PLAIN (key)" in detail
     assert calls == ["dev"]

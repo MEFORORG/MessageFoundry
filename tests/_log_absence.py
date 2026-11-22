@@ -15,6 +15,7 @@ through that logger, or that it reached the line that would have logged.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Callable
 
@@ -30,9 +31,10 @@ def assert_capture_sees(
     """Fail unless ``caplog`` captures a ``level`` record sent through ``logger``, then take it out
     of ``caplog.records`` and ``caplog.text`` so the absence check after this call is unchanged.
 
-    Every other handler the record would reach on its way up, pytest's report handler among them,
-    drops it, so the probe line is not written anywhere but the capture it tests (vault BACKLOG
-    #3766 item 35)."""
+    Each other handler on the record's way up, pytest's report handler among them, drops it while
+    the probe runs, so at least those handlers do not write the probe line (vault BACKLOG #3766
+    item 35). A capture that cannot see the logger fails here, and then the probe may still reach
+    ``logging.lastResort``, which writes to stderr."""
     log = logger if isinstance(logger, logging.Logger) else logging.getLogger(logger)
     others = [h for h in _handlers_reached(log) if h is not caplog.handler]
     for handler in others:
@@ -48,12 +50,15 @@ def assert_capture_sees(
         f"{log.name!r}, so an absence check over that logger would pass on nothing"
     )
     caplog.records.remove(probes[0])
-    # The capture's text stream holds the formatted line too; take that one line back out.
-    stream = caplog.handler.stream
-    line = caplog.handler.format(probes[0]) + caplog.handler.terminator
-    text = stream.getvalue()
-    at = text.rfind(line)
-    if at >= 0:
+    # The capture's text stream holds the formatted line too; take that one line back out, under
+    # the handler's lock so a record another thread writes meanwhile is not lost.
+    handler = caplog.handler
+    with handler.lock or contextlib.nullcontext():
+        stream = handler.stream
+        line = handler.format(probes[0]) + handler.terminator
+        text = stream.getvalue()
+        at = text.rfind(line)
+        assert at >= 0, "the probe's formatted line is not in caplog.text, so it cannot be removed"
         stream.seek(0)
         stream.truncate()
         stream.write(text[:at] + text[at + len(line) :])

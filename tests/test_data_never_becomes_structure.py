@@ -859,8 +859,9 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
             # wait would stall the shared loop for the whole bound; fail at once instead. That
             # failure is raised inside the hand-off, which _poll_once catches and logs, so an inline
             # split turns this test red through the WARNING assertion below rather than here (vault
-            # BACKLOG #3766 item 22). Wrapping asyncio.to_thread itself would also order the stop;
-            # patching the split keeps the handshake on the batch's own job (item 6).
+            # BACKLOG #3766 item 22). Ordering the stop in a wrapper of asyncio.to_thread would also
+            # work; patching the split keeps the handshake on the batch's own job (item 6). The
+            # to_thread wrapper below only records which threads ran this poll's jobs.
             assert threading.get_ident() != loop_thread, "the split ran on the loop thread"
             asyncio.run_coroutine_threadsafe(_set_stop(), loop).result(timeout=30)
             holds_at_split.append(holds)
@@ -914,9 +915,10 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     # Every RemoteFileSource logs through the one module logger, so its name alone would also take a
     # line another source logged meanwhile, from its own poller task, and fail this test for it. A
     # record logged on another task is not this poll's (vault BACKLOG #3766 item 9). One with no
-    # task is kept only from a thread that ran one of this poll's asyncio.to_thread jobs, since its
-    # worker threads log with none; any other source's worker line is dropped (item 30). A pooled
-    # thread can serve both, so a line another source logged on one of ours is still kept.
+    # task is kept from the loop thread, where a callback logs with none, and from a thread that
+    # ran one of this poll's asyncio.to_thread jobs, since its worker threads log with none; a
+    # line from any other thread is dropped (item 30). A pooled thread can serve both, so a line
+    # another source logged on one of ours is still kept.
     poll_task = asyncio.current_task()
     assert poll_task is not None
     our_threads: set[int] = set()
@@ -939,7 +941,7 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
         if r.name != connector_log.name:
             return False
         if r.taskName is None:
-            return r.thread in our_threads
+            return r.thread == loop_thread or r.thread in our_threads
         return r.taskName == poll_task.get_name()
 
     connector_log.warning(markers[0])
