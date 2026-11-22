@@ -631,6 +631,65 @@ def test_cli_json_reports_every_family_and_no_secret(
     assert by_hop["smtp"]["state"] == "not_probed"
 
 
+#: ESC, DEL, a C1 control (CSI), RIGHT-TO-LEFT OVERRIDE and LINE SEPARATOR. ``json.dumps`` always
+#: escapes ESC; it escapes the other four only under ``ensure_ascii``, so ``--json`` output must
+#: carry each as a ``\uXXXX`` escape (BACKLOG #2891, PR 2390 note 3).
+_HOSTILE = "a\x1b[31mb\x7fc\x9bd\u202ee\u2028f"
+
+
+def _assert_escaped(out: str) -> None:
+    """``out`` is ASCII, and every character in it but a newline is printable. ``str.splitlines``
+    would drop U+2028 as a line break, so the check splits on nothing. With the caller's check
+    that ``out`` decodes back to :data:`_HOSTILE`, that proves each of its characters was written
+    as an escape."""
+    raw = [ch for ch in out if ch != chr(10) and not (ch.isascii() and ch.isprintable())]
+    assert not raw, f"--json output carries a raw character: {out!r}"
+
+
+def test_the_escape_assertion_fails_on_unescaped_json() -> None:
+    """The control for :func:`_assert_escaped`: output written without ``ensure_ascii`` fails it,
+    and so does output that leaves only U+2028 raw, which ``json.loads`` accepts."""
+    with pytest.raises(AssertionError, match="carries a raw character"):
+        _assert_escaped(json.dumps({"error": _HOSTILE}, ensure_ascii=False))
+    escaped_ls, raw_ls = chr(92) + "u2028", chr(0x2028)
+    only_line_separator_raw = json.dumps({"error": _HOSTILE}).replace(escaped_ls, raw_ls)
+    assert json.loads(only_line_separator_raw) == {"error": _HOSTILE}
+    with pytest.raises(AssertionError, match="carries a raw character"):
+        _assert_escaped(only_line_separator_raw)
+    _assert_escaped(json.dumps({"error": _HOSTILE}, indent=2))
+
+
+def test_cli_json_result_escapes_controls_and_bidi_in_a_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _clear_env(monkeypatch)
+    report = dataclasses.replace(
+        _unobservable_report(), backend=StoreBackend.POSTGRES, detail=_HOSTILE
+    )
+    _stub_probe(monkeypatch, report)
+    argv = ["check-privileges", "--service-config", str(_server_toml(tmp_path)), "--json"]
+    code = main(argv)
+    out = capsys.readouterr().out  # read first, so a failing assert never echoes it raw
+    _assert_escaped(out)
+    assert code == EXIT_UNOBSERVABLE
+    store = next(h for h in json.loads(out)["hops"] if h["hop"] == "store")
+    assert _HOSTILE in store["detail"]
+
+
+def test_cli_json_error_escapes_controls_and_bidi_in_the_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._load_service_settings", lambda *a, **k: (None, _HOSTILE)
+    )
+    code = main(["check-privileges", "--service-config", "unused.toml", "--json"])
+    out = capsys.readouterr().out
+    _assert_escaped(out)
+    assert code == EXIT_SETTINGS
+    assert json.loads(out) == {"error": _HOSTILE}
+
+
 def test_cli_says_serve_would_refuse_an_over_grant_under_enforce(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
