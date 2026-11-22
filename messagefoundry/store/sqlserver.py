@@ -138,6 +138,7 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    StoreKeylessError,
     allows_unmarked,
     cell_aad,
     cipher_info,
@@ -1398,7 +1399,7 @@ def _finalize_from_message_status(mrows: Sequence[Any]) -> tuple[str, str | None
 
 
 def _parent_meta_from_row(
-    pmeta_json: str | None, *, message_id: str, channel_id: str
+    pmeta_json: str | None, *, message_id: str, channel_id: str, encrypts: bool
 ) -> dict[str, Any]:
     """Decode a PT parent's ``metadata`` (already decrypted) into a dict for depth computation —
     absent -> ``{}`` (depth 0). A cell the depth read cannot use raises
@@ -1410,13 +1411,21 @@ def _parent_meta_from_row(
     try:
         loaded = json.loads(pmeta_json)
         if isinstance(loaded, dict):
-            int(loaded.get("correlation_depth", 0) or 0)
+            # str(): the child formats depth + 1, past int's digit limit a ValueError.
+            str(int(loaded.get("correlation_depth", 0) or 0) + 1)
             # The child re-encodes this root, and a nested one can overflow that.
             if not isinstance(loaded.get("correlation_root_id") or "", str):
                 loaded = None
     except (ValueError, TypeError, OverflowError, RecursionError):
         loaded = None
     if not isinstance(loaded, dict):
+        # A keyless open hands an mfenc: cell back unchanged: the engine's fault, so the row stays
+        # in flight until the key returns.
+        if pmeta_json.startswith(_ENC_MARKER_PREFIX) and not encrypts:
+            raise StoreKeylessError(
+                "store table 'messages' carries encrypted metadata (mfenc: markers) but no store"
+                " encryption key is configured (fail-closed)"
+            )
         # Raised outside the except: json's error holds the whole cell.
         err = UnreadableParentMetadataError("messages", "metadata", message_id, channel_id)
         log.warning("%s; the handoff was refused", str(err))
@@ -8019,7 +8028,10 @@ class SqlServerStore:
                         )
                 if pt_deliveries:
                     parent_meta = _parent_meta_from_row(
-                        pmeta_dec, message_id=message_id, channel_id=msg_channel
+                        pmeta_dec,
+                        message_id=message_id,
+                        channel_id=msg_channel,
+                        encrypts=self._cipher.encrypts,
                     )
                     inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
@@ -8232,7 +8244,10 @@ class SqlServerStore:
                     )
             if pt_deliveries:
                 parent_meta = _parent_meta_from_row(
-                    pmeta_dec, message_id=message_id, channel_id=msg_channel
+                    pmeta_dec,
+                    message_id=message_id,
+                    channel_id=msg_channel,
+                    encrypts=self._cipher.encrypts,
                 )
                 inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:

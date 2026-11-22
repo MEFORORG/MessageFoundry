@@ -22,7 +22,11 @@ from messagefoundry.store import postgres as pg
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store import store as sqlite_module
 from messagefoundry.store.cell_tag import CellTagError
-from messagefoundry.store.crypto import CipherUnavailableError, IdentityCipher
+from messagefoundry.store.crypto import (
+    CipherUnavailableError,
+    IdentityCipher,
+    StoreKeylessError,
+)
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
@@ -40,10 +44,13 @@ BAD_CELLS = {
     "infinity-depth": '{"correlation_depth": Infinity}',
     "nan-depth": '{"correlation_depth": NaN}',
     "deep-nesting": "[" * 200_000,
-    # Decodes, but the child's json.dumps of the root would overflow the encoder.
+    # A nested root: at this depth the child's json.dumps can overflow, depending on the stack.
     "deep-root": '{"correlation_root_id": ' + "[" * 15_600 + "]" * 15_600 + "}",
     "non-string-root": '{"correlation_root_id": {"k": 1}}',
+    # depth + 1 has 4301 digits, past int's string limit, so the child could not format it.
+    "over-digit-limit-depth": '{"correlation_depth": ' + "9" * 4300 + "}",
 }
+_KEYLESS_CELL = "mfenc:v1:SYNTHCIPHERTEXT"
 _BAD = pytest.mark.parametrize("cell", list(BAD_CELLS.values()), ids=list(BAD_CELLS))
 _GOOD_CELL = '{"correlation_depth": 3, "correlation_id": "root"}'
 
@@ -138,6 +145,37 @@ async def test_sqlite_key_outage_still_holds_the_lane(
     assert await _queue_rows(sqlite_store, mid) == [
         (Stage.ROUTED.value, OutboxStatus.INFLIGHT.value)
     ]
+
+
+async def test_sqlite_keyless_open_of_a_sealed_cell_holds_the_lane(
+    sqlite_store: MessageStore,
+) -> None:
+    """The identity cipher hands an mfenc: cell back unchanged: a missing key, not a bad row."""
+    mid, rtd = await _to_routed(sqlite_store)
+    await _set_cell(sqlite_store, mid, _KEYLESS_CELL)
+    with pytest.raises(StoreKeylessError):
+        await _handoff(sqlite_store, mid, rtd.id)
+    assert await _queue_rows(sqlite_store, mid) == [
+        (Stage.ROUTED.value, OutboxStatus.INFLIGHT.value)
+    ]
+
+
+async def test_postgres_keyless_open_of_a_sealed_cell_does_not_dead_letter() -> None:
+    store, seen = _pg_store(_KEYLESS_CELL)
+    with pytest.raises(StoreKeylessError):
+        await store.transform_handoff(**_PG_KWARGS)
+    assert seen["dead"] == []
+
+
+async def test_sqlserver_keyless_open_of_a_sealed_cell_does_not_dead_letter() -> None:
+    store, dead = _ss_store(_KEYLESS_CELL)
+    with pytest.raises(StoreKeylessError):
+        await store.transform_handoff(**_PG_KWARGS)
+    assert dead == []
+    conn = _SsSyncConn(_SsSyncCursor(_KEYLESS_CELL))
+    with pytest.raises(StoreKeylessError):
+        store.transform_handoff_sync(conn, **_PG_KWARGS)
+    assert conn.rollbacks == 1 and conn.commits == 0
 
 
 # --- Postgres, offline ---------------------------------------------------------------------------
@@ -370,12 +408,13 @@ def test_sqlserver_sync_raises_the_contained_family_and_rolls_back(cell: str) ->
 
 
 def test_sqlserver_valid_parent_decodes_unchanged() -> None:
-    assert ss._parent_meta_from_row(_GOOD_CELL, message_id="m", channel_id="IB") == {
+    where: dict[str, Any] = {"message_id": "m", "channel_id": "IB", "encrypts": False}
+    assert ss._parent_meta_from_row(_GOOD_CELL, **where) == {
         "correlation_depth": 3,
         "correlation_id": "root",
     }
-    assert ss._parent_meta_from_row(None, message_id="m", channel_id="IB") == {}
-    assert ss._parent_meta_from_row("", message_id="m", channel_id="IB") == {}
+    assert ss._parent_meta_from_row(None, **where) == {}
+    assert ss._parent_meta_from_row("", **where) == {}
 
 
 def test_sqlserver_sync_key_outage_is_not_the_contained_family(

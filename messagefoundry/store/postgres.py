@@ -149,6 +149,7 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    StoreKeylessError,
     allows_unmarked,
     cell_aad,
     cipher_info,
@@ -5129,13 +5130,26 @@ class PostgresStore:
                         try:
                             loaded = json.loads(pmeta_json)
                             if isinstance(loaded, dict):
-                                int(loaded.get("correlation_depth", 0) or 0)
+                                # str(): the child formats depth + 1; past int's digit limit that
+                                # is a ValueError.
+                                str(int(loaded.get("correlation_depth", 0) or 0) + 1)
                                 # The child re-encodes this root; a nested one can overflow that.
                                 if not isinstance(loaded.get("correlation_root_id") or "", str):
                                     loaded = None
                         except (ValueError, TypeError, OverflowError, RecursionError):
                             loaded = None
                         if not isinstance(loaded, dict):
+                            # A keyless open hands an mfenc: cell back unchanged: the engine's
+                            # fault, so the row stays in flight until the key returns.
+                            if (
+                                pmeta_json.startswith(_ENC_MARKER_PREFIX)
+                                and not self._cipher.encrypts
+                            ):
+                                raise StoreKeylessError(
+                                    "store table 'messages' carries encrypted metadata (mfenc:"
+                                    " markers) but no store encryption key is configured"
+                                    " (fail-closed)"
+                                )
                             err = UnreadableParentMetadataError(
                                 "messages", "metadata", message_id, msg_channel
                             )
