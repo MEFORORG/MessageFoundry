@@ -503,8 +503,9 @@ _PR_PLAIN_STATE_VERB = rf"(?:{_PR_STRONG_VERB}|is(?: now| still)?|was|are|reads|
 #: (_PR_QUALIFIER). Lists kept apart drifted, so a word one place took unbound another (BACKLOG #8175
 #: item 6): "<id> has likely been met", "<id> is only partial", "<id> never stays partial".
 _PR_HEDGE = r"(?:likely|probably|still|now|also|only|then|already|so|never|yet|honestly|since)"
-#: "has been" with an optional negation and any hedges between ("has since been", "hasn't yet been").
-_PR_HAS_BEEN = rf"(?:has|have|had)(?: not|n['\u2019]t)?(?: {_PR_HEDGE})* been"
+#: "has been" with any negations and hedges between, in any order and any markup ("has since been",
+#: "hasn't yet been", "has still not been", "has _never_ been").
+_PR_HAS_BEEN = rf"(?:has|have|had)(?:n['\u2019]t)?(?:{_PR_SEP}(?:not|{_PR_HEDGE}))*{_PR_SEP}been"
 #: The passive and negated forms ("were", "has been", "isn't", "has not been", "is no longer") bind an
 #: unmarked identifier only with a state verdict ending its clause (_pr_verdict_bound).
 _PR_STATE_VERB = (
@@ -557,8 +558,8 @@ _PR_MODAL_STRONG = re.compile(r"(?i)(?:stay|remain)$")
 #: preposition is not one: "<version> will fail on the strict validator" is a verb and its phrase.
 _PR_VERDICT_END = re.compile(
     rf"(?i){_PR_FMT}(?:\s*(?:$|[.,;:!?)\]|])"
-    # Underscore emphasis on the word ("_yet_") does not hide it, as "\b" did.
-    rf"|\s+_{{0,2}}(?:yet|today|now|either|again|until|unless|because){_PR_EA})"
+    # Emphasis on the word ("_yet_", "*yet*", "`yet`") does not hide it, as "\b" hid "_yet_".
+    rf"|\s+{_PR_FMT}(?:yet|today|now|either|again|until|unless|because){_PR_EA})"
 )
 #: A verb that states the verdict BEFORE the identifier: "does not meet <id>", "satisfies ASVS <id>",
 #: and the record's idiom for a requirement that does not pass yet, "an honest pass for <id>". "pass"
@@ -612,9 +613,9 @@ _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`
 #: one deleted, inside a word or a cell as well as around one, and keeps the hits of both readings.
 #: The deletion reaches the text the verdict, gap and map patterns read, not the line's kind:
 #: _pr_units decides a row, heading, list item or empty line from the line as written, so an
-#: invisible character before a row's first pipe makes it a paragraph in both readings. A third
-#: reading deletes them before the kinds are read (_pr_scan_reading). A fixed table, so an import
-#: pays nothing for it.
+#: invisible character before a row's first pipe makes it a paragraph in both passes. A further
+#: pass of each reading deletes them before the kinds are read (_pr_scan_reading). A fixed table,
+#: so an import pays nothing for it.
 _PR_DEFAULT_IGNORABLE = (
     (0x00AD, 0x00AD),
     (0x034F, 0x034F),
@@ -1410,7 +1411,7 @@ def _pr_scan_reading(
             if unit[1] != plain[1] or unit_asvs != plain_asvs or unit_loose != plain_loose:
                 _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
         # The passes above read each line's kind as written, so an invisible character before a
-        # row's first pipe makes it a paragraph there. A third pass deletes every one before the
+        # row's first pipe makes it a paragraph there. A further pass deletes every one before the
         # kinds are read, so such a line is read as a row, with its own runs of rows. It only adds
         # hits; where it builds the units the second pass built, it would add none.
         regrouped = _pr_units([_PR_INVISIBLE.sub("", line) for line in lines], False, reading)

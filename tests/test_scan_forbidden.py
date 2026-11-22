@@ -1337,6 +1337,16 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # Step 11: underscore emphasis on the word that ends a modal's clause.
     ("11", "verdict", f"{_REQ} cannot {_PASS} _yet_."),
     ("11", "verdict", f"{_REQ} will {_FAIL} _today_."),
+    ("11", "verdict", f"{_REQ} cannot {_PASS} *yet*."),
+    ("11", "verdict", f"{_REQ} will {_FAIL} **today**."),
+    ("11", "verdict", f"{_REQ} cannot {_PASS} `yet`."),
+    # Step 11: a hedge before the negation, and markup or extra space inside "has ... been".
+    ("11", "verdict", f"ASVS {_REQ} has still not been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has likely not been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has *likely* been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has _never_ been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has **not** been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has  likely been {_MET}."),
     # Step 11: underscore emphasis on a cell's connective and on a list's "and". Main flags each
     # through the markup-deleted reading of the cell; these pin it.
     ("11", "verdict", f"| ASVS {_REQ} | the limb | {_PASS.title()} _until_ the fix |"),
