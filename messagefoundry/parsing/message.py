@@ -500,7 +500,8 @@ class Message:
         _builtin_hl7.add_segment_line(self._m, segment_id, tokens, index)
 
     def delete_segments(self, segment_id: str, *, occurrence: int | None = None) -> int:
-        """Remove every segment with ``segment_id`` and return how many were removed.
+        """Remove every segment with ``segment_id``, or only its ``occurrence``-th, and return how
+        many were removed.
 
         Deleting ``MSH`` is refused — the message must keep its header. Common for clearing a
         repeating block (e.g. ``delete_segments("ODS")``) before rebuilding it with
@@ -518,7 +519,10 @@ class Message:
             position = _builtin_hl7.segment_index(self._m, segment_id, occurrence)
             if position is None:
                 return 0
-            self._delete_segment_at(position)
+            self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
+            # The raw delete, not _delete_segment_at: that one refuses index 0, which here is an
+            # FHS or BHS the delete-all form removes too.
+            _builtin_hl7.delete_segment_at(self._m, position)
             return 1
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         removed = 0

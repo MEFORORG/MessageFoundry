@@ -50,7 +50,7 @@ outbound(
 )
 
 # Local lab test code (OBX-3.1) -> the EHR's code. Edit codesets/test_codes.csv + reload; no code
-# change. A code not in the table blanks through unchanged (.get(code, code)).
+# change. A code not in the table passes through unchanged.
 TEST_CODES = code_set("test_codes")
 
 
@@ -82,12 +82,12 @@ def relay_results(msg):  # type: ignore[no-untyped-def]
     #    component, the message's own escaping, and each OBX under the OBR it arrived with.
     for i in range(msg.count_segments("OBX"), 0, -1):
         if msg.field("OBX-11", occurrence=i) == "X":  # cancelled / not done -> drop
-            msg.delete_segments("OBX", occurrence=i)
+            _drop_result(msg, i)
             continue
         local_code = msg.field("OBX-3.1", occurrence=i)
-        if local_code:
+        if local_code in TEST_CODES:  # an unmapped code is left exactly as it arrived
             # A component write escapes the new code and leaves OBX-3.2 onward as they were.
-            msg.set("OBX-3.1", TEST_CODES.get(local_code, local_code), occurrence=i)
+            msg.set("OBX-3.1", TEST_CODES[local_code], occurrence=i)
     if not msg.count_segments("OBX"):
         return None  # every result cancelled -> nothing to relay (logged FILTERED)
 
@@ -98,3 +98,16 @@ def relay_results(msg):  # type: ignore[no-untyped-def]
 
     # 4) Fan out: relay to the EHR and archive a copy to file.
     return [Send(OB_EHR, msg), Send(FILE_ARCHIVE, msg)]
+
+
+def _drop_result(msg, i):  # type: ignore[no-untyped-def]
+    # Delete the i-th OBX and the NTE comments directly after it, so a cancelled result's comment
+    # never ends up annotating the result before it.
+    ids = msg.segments()
+    at = [pos for pos, seg in enumerate(ids) if seg == "OBX"][i - 1]
+    first_note = ids[:at].count("NTE") + 1  # the NTE occurrence right after this OBX
+    after = at + 1
+    while after < len(ids) and ids[after] == "NTE":
+        msg.delete_segments("NTE", occurrence=first_note)  # the next note takes its number
+        after += 1
+    msg.delete_segments("OBX", occurrence=i)

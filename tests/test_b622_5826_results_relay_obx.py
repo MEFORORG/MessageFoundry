@@ -20,11 +20,15 @@ from messagefoundry.pipeline.dryrun import dry_run
 
 RESULTS_RELAY = Path(__file__).resolve().parents[1] / "samples" / "results_relay"
 
+_HEAD = "MSH|^~\\&|LABCO|LAB|EHR|HOSP|20260613130000||ORU^R01|MSG3|P|2.5.1\rOBR|1|ORD1\r"
+
 
 def _relay(fixture: str) -> list[str]:
-    registry = load_config(RESULTS_RELAY)
-    raw = (RESULTS_RELAY / "messages" / fixture).read_text(encoding="utf-8")
-    result = dry_run(registry, raw)
+    return _relay_raw((RESULTS_RELAY / "messages" / fixture).read_text(encoding="utf-8"))
+
+
+def _relay_raw(raw: str) -> list[str]:
+    result = dry_run(load_config(RESULTS_RELAY), raw)
     assert [d.to for d in result.deliveries] == ["OB_EHR_ORU", "FILE-OUT_LABCO_ORU"]
     payload = result.deliveries[0].payload
     assert isinstance(payload, str)
@@ -44,6 +48,25 @@ def test_two_orders_keep_every_obx_field_escape_and_order() -> None:
         # The second order keeps its own OBX, renumbered from 1 within that order.
         r"OBX|1|NM|HGB^Hemoglobin^L^718-7^Hemoglobin^LN|2|13.5|g/dL|12.0-16.0|N|||F|||20260613122000",
     ]
+
+
+def test_a_cancelled_results_comments_go_with_it() -> None:
+    segments = _relay_raw(
+        _HEAD + "OBX|1|NM|GLU^Glucose^L||95||||||F\rNTE|1||glucose ok\r"
+        "OBX|2|NM|K^Potassium^L||4.1||||||X\rNTE|1||hemolyzed\rNTE|2||recollect\r"
+        "OBX|3|NM|NA^Sodium^L||140||||||F\rNTE|1||sodium ok"
+    )
+    assert segments[2:] == [
+        "OBX|1|NM|GLUC^Glucose^L||95||||||F",
+        "NTE|1||glucose ok",
+        "OBX|2|NM|SOD^Sodium^L||140||||||F",
+        "NTE|1||sodium ok",
+    ]
+
+
+def test_an_unmapped_code_is_left_exactly_as_it_arrived() -> None:
+    obx = r"OBX|1|ST|ZZ\H\Q&SUB^Other^L||x||||||F"
+    assert _relay_raw(_HEAD + obx)[2:] == [obx]
 
 
 def _msg() -> Message:
@@ -89,3 +112,10 @@ def test_delete_segments_occurrence_skips_a_fieldless_line_like_count_segments()
     assert msg.delete_segments("OBX", occurrence=1) == 1
     assert msg.segments() == ["MSH", "OBX"]
     assert msg.count_segments("OBX") == 0
+
+
+def test_delete_segments_occurrence_reaches_a_leading_batch_header() -> None:
+    # Index 0 is an FHS here, not MSH; the delete-all form removes it, so this form must too.
+    msg = Message.parse("FHS|^~\\&|A\rBHS|^~\\&|A\rMSH|^~\\&|A|B|C|D|20260101||ORU^R01|1|P|2.5.1")
+    assert msg.delete_segments("FHS", occurrence=1) == 1
+    assert msg.segments()[0] == "BHS"
