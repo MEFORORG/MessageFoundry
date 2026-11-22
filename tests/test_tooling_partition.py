@@ -63,16 +63,19 @@ _ENGINE_IMPORT = re.compile(
     r"^\s*(from|import)\s+(messagefoundry(?:_webconsole|_toolkit)?|harness|tee)\b", re.M
 )
 
-# Tests that do NOT import the engine and nonetheless belong on the engine legs, because their
-# SUBJECT is engine source: they read messagefoundry/** off disk and assert something about it. A
-# scanner is still a guard on the thing it scans.
+# Tests that do NOT import the engine and nonetheless belong on the engine legs. The criterion,
+# stated here once: a change to the test's SUBJECT sets ci.yml's `code` output but not its
+# `tooling` output, so only the engine legs would meet that change (vault BACKLOG #3766 item 43).
+# Most entries read messagefoundry/** off disk; at least some read other files the tooling path
+# gate does not match, and each comment names what it reads. A scanner is still a guard on the
+# thing it scans.
 _STAYS_WITHOUT_IMPORTING = frozenset(
     {
         # Reads messagefoundry/config/models.py (the ActiveWindow/Schedule window evaluator, as its
         # positive control) and rglobs messagefoundry/auth/**.py (the absence assertion). The absence
         # arm is exactly why this cannot be tooling: what it guards against is a time-window read
         # appearing inside auth/, which arrives as an ENGINE diff and does not trip the tooling job's
-        # path gate (scripts/**, .github/**, the ledger). Listed as tooling it would face nothing on
+        # path gate (ci.yml's `changes` job). Listed as tooling it would face nothing on
         # the change that breaks it. Its other half reads docs/SECURITY.md, which is what makes it a
         # doc-drift guard, but the doc half is not the reason it stays.
         "test_adaptive_attributes_doc_drift.py",
@@ -274,8 +277,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # and the reason is the one arm that does not use tmp_path: the screen's DEFAULT SCOPE is
         # messagefoundry/api/app.py and auth_routes.py, so test_the_live_api_scope_still_surfaces_the
         # _unjudged_candidate parses real engine source. A username re-appearing as an access key
-        # arrives in an API route -- an engine diff -- and the tooling job's path gate (scripts/**,
-        # .github/**, the ledger) is not tripped by one, so gating this behind scripts/** would
+        # arrives in an API route -- an engine diff -- and the tooling job's path gate (ci.yml's
+        # `changes` job) is not tripped by one, so gating this behind scripts/** would
         # leave exactly the change that reintroduces the defect facing nothing.
         "test_username_access_key_screen.py",
         # NOT engine source, so this entry widens the list's stated rule, as
@@ -309,7 +312,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # The four below were WRONGLY LISTED as tooling in the first cut of the manifest and were
         # caught by adversarial review, not by any guard here. Each reads real engine source without
         # importing it, so the marker took them off every engine leg while the tooling job's path gate
-        # (scripts/**, .github/**, the ledger) is not tripped by an engine diff -- they ran on ZERO
+        # (ci.yml's `changes` job) is not tripped by an engine diff -- they ran on ZERO
         # legs for the change that would break them. Named individually, with what each reads, because
         # the whole point of this list is that a reviewer can check the claim:
         #   sqlserver_encrypt_pass_tables -> messagefoundry/store/sqlserver.py. Its own docstring is
@@ -407,16 +410,17 @@ def _unclassified_remedy(names: list[str]) -> str:
         f"_STAYS_WITHOUT_IMPORTING in {here}: {names}\n"
         "They import no engine module, so nothing decides which CI legs run them. Choose one, per "
         "file, in the SAME pull request:\n"
-        f"  (a) HARNESS subject (scripts/**, .github/**, the ledger) -> append `tests/{example}` "
+        "  (a) HARNESS subject (a path ci.yml's `changes` job gates the tooling tier on, at "
+        f"least scripts/**, .github/** and docs/**) -> append `tests/{example}` "
         f"to {manifest}, keeping the `tests/` prefix (ci.yml matches whole changed paths against "
         "these lines).\n"
         f'  (b) ENGINE subject it READS off disk without importing -> add `"{example}"` to '
-        f"_STAYS_WITHOUT_IMPORTING in {here}, with a comment naming the messagefoundry/** file it "
-        "reads.\n"
+        f"_STAYS_WITHOUT_IMPORTING in {here}, with a comment naming the file it reads, when a "
+        "change to that file runs the engine legs but not the tooling tier.\n"
         "  A test that IMPORTS the engine needs neither entry -- which is why most files here sit "
         "in no list at all.\n"
         "WHEN AMBIGUOUS CHOOSE (b). (a) is the answer that loses coverage silently: a wrongly "
-        "listed engine test leaves the engine legs, and the tooling job's scripts/** path gate is "
+        "listed engine test leaves the engine legs, and the tooling job's path gate is "
         "not tripped by an engine diff, so it runs on NO leg for the change that would break it."
     )
 
