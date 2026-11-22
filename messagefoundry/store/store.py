@@ -5354,6 +5354,22 @@ def rotation_reseal(
     return apply
 
 
+def marker_test_sql(column: str, *, present: bool) -> str:
+    """SQLite's test of ``column`` against the marker pattern bound as ``?1`` (``<prefix>%``).
+
+    Text compares byte-exact, because ``LIKE`` folds ASCII case and ``MFENC:`` is not a marker to
+    the cipher (BACKLOG #5506, #5611). A BLOB keeps ``LIKE`` and so reads as it did before: ``substr``
+    of a BLOB is a BLOB, which never equals text, so an exact test would call every BLOB unmarked.
+    What ``LIKE`` does with a BLOB depends on the SQLite build (``cipher_cells._sealed_test`` says
+    how), and on a build where it matches none, every BLOB is unmarked here too. ``column`` is a
+    code constant. NULL matches neither form."""
+    compare, like = ("=", "LIKE") if present else ("<>", "NOT LIKE")
+    return (
+        f"CASE WHEN typeof({column}) = 'blob' THEN {column} {like} ?1"
+        f" ELSE substr({column}, 1, length(?1) - 1) {compare} substr(?1, 1, length(?1) - 1) END"
+    )
+
+
 def report_refused_role_holder() -> None:
     """Log a holder of a custom role being deleted whose record fails its integrity seal (BACKLOG
     #2592). Its role row is deleted with the role, which needs no key, and nothing is re-sealed; the
@@ -12825,7 +12841,10 @@ class MessageStore:
         pending, never as a false plant beside its own new ciphertext.
         """
         keys = key_cols if key_cols is not None else aad_cols
-        pending_where = f"{column} NOT LIKE ? AND {column} <> ''"
+        pending_where = f"{marker_test_sql(column, present=False)} AND {column} <> ''"
+        # What this column's LIKE calls unmarked. On a sealed surface the opt-out seals only these,
+        # as it did before the exact test, so where LIKE folds case an `MFENC:` value is left alone.
+        folded_where = f"{column} NOT LIKE ?1 AND {column} <> ''"
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(table, pending_where, like)
@@ -12833,13 +12852,15 @@ class MessageStore:
         if blank_where is not None and not keyed:
             blanks = await self._count_unmarked(table, blank_where)
         is_sealed = keyed
-        if (blanks or (pending and strict)) and not keyed:
+        if (blanks or pending) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # A peer may have sealed the rows between the count and the probe; count again so
                 # its legitimate seal is not reported as a plant. A blank here stays refused.
                 blanks = 0
                 pending = await self._count_unmarked(table, pending_where, like)
+        if pending and is_sealed and not strict:
+            pending = await self._count_unmarked(table, folded_where, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
@@ -12865,12 +12886,13 @@ class MessageStore:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
             # The opt-out reseals plaintext, never a blank on a surface another process keyed.
+            unmarked_where = pending_where if claimed and not is_sealed else folded_where
             seal_where = (
-                f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+                f"({unmarked_where}) OR ({blank_where})" if blanks and claimed else unmarked_where
             )
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
-                # matching NOT LIKE and the loop terminates inside the one transaction.
+                # matching and the loop terminates inside the one transaction.
                 cur = await self._db.execute(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
                     f" WHERE {seal_where} LIMIT {int(batch)}",
@@ -12892,12 +12914,14 @@ class MessageStore:
                         for r in rows
                     ],
                 )
-                await self._db.executemany(
+                await self._update_every_row(
                     f"UPDATE {table} SET {column}=? WHERE {where_keys}",
                     [
                         (value, *(r[c] for c in keys))
                         for value, r in zip(sealed_values, rows, strict=True)
                     ],
+                    f"{table}.{column}",
+                    exact=True,
                 )
                 sealed += len(rows)
             await self._commit()
@@ -12908,6 +12932,26 @@ class MessageStore:
         # Top the reserve back up for whatever follows; the burst itself was reserved in step 2.
         await self._charge_bound_batch()
         return sealed
+
+    async def _update_every_row(
+        self, sql: str, params: Sequence[Sequence[object]], cell: str, *, exact: bool = False
+    ) -> None:
+        """Run a seal or rotation UPDATE, refusing when a row it had to write stayed unwritten.
+
+        SQLite allows NULL in a non-INTEGER primary key, and ``key = NULL`` matches nothing, so such
+        a row would stay selected and its pass would encrypt it again forever (BACKLOG #5506). The
+        caller's guard or unwind rolls the uncommitted batch back. Names the cell, never a value.
+        ``exact`` is the seal's, whose read and write share one transaction, so any shortfall is a
+        fault. A rotation reads outside its write, so there only a NULL key refuses: a row another
+        process deleted in between has nothing left to rotate."""
+        cur = await self._db.executemany(sql, params)
+        missed = cur.rowcount != len(params)
+        if missed and (exact or any(v is None for p in params for v in p[1:])):
+            raise CipherError(
+                f"cipher column {cell}: an update wrote {cur.rowcount} of {len(params)} row(s), so"
+                " a row's key is NULL or changed. Nothing in this batch was kept; repair or remove"
+                " that row and retry"
+            )
 
     async def _surface_keyed(self, table: str, column: str) -> bool:
         """Whether ``table.column`` has its persisted ``keyed_surface`` marker (BACKLOG #3383)."""
@@ -12920,7 +12964,7 @@ class MessageStore:
     async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
         """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
         cur = await self._db.execute(
-            f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (like,)
+            f"SELECT 1 FROM {table} WHERE {marker_test_sql(column, present=True)} LIMIT 1", (like,)
         )
         return await cur.fetchone() is not None
 
@@ -13017,7 +13061,7 @@ class MessageStore:
                     # excluding NULL/blank. Rewritten rows match active_like next round, so this ends.
                     cur = await self._db.execute(
                         f"SELECT id, {column} FROM {table}"
-                        f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT ?",
+                        f" WHERE {self._rotation_scan(column)} LIMIT ?",
                         (active_like, batch),
                     )
                     rows = list(await cur.fetchall())
@@ -13035,7 +13079,9 @@ class MessageStore:
                         )
                         for r in rows
                     ]
-                    await self._db.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", updates)
+                    await self._update_every_row(
+                        f"UPDATE {table} SET {column}=? WHERE id=?", updates, f"{table}.{column}"
+                    )
                     await self._commit()
                     await self._charge_bound_batch()
                     total += len(rows)
@@ -13084,6 +13130,17 @@ class MessageStore:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
+    def _rotation_scan(self, column: str) -> str:
+        """The rotation's "not under the active key" filter, whose pattern binds as ``?1``.
+
+        Byte-exact, so a value in another case is selected and the decrypt refuses it (BACKLOG
+        #5611). Under the opt-out that decrypt passes an unmarked value through, so the filter
+        stays the ``LIKE`` it was: this fix widens nothing there. It does not protect such a value
+        either: one that does not fold to the active prefix is selected and re-sealed."""
+        if allows_unmarked(self._cipher):
+            return f"{column} NOT LIKE ?1 AND {column} <> ''"
+        return f"{marker_test_sql(column, present=False)} AND {column} <> ''"
+
     @staticmethod
     def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any configured key) then re-encrypt under the active key, rebinding the
@@ -13118,10 +13175,22 @@ class MessageStore:
         matches the marker filter."""
         total = skipped = 0
         after = ""
+        # The page filter below never selects a NULL or empty id, so such a cell would stay under a
+        # prior key while the rotation reports success (BACKLOG #5506).
+        cur = await self._db.execute(
+            f"SELECT 1 FROM {table} WHERE (id IS NULL OR id = '')"
+            f" AND {self._rotation_scan(column)} LIMIT 1",
+            (active_like,),
+        )
+        if await cur.fetchone() is not None:
+            raise CipherError(
+                f"cipher column {table}.{column}: a row with a NULL or empty id cannot be rotated;"
+                " repair or remove that row and retry"
+            )
         while True:
             cur = await self._db.execute(
                 f"SELECT {select}, {column} AS v FROM {table}"
-                f" WHERE {column} NOT LIKE ? AND {column} <> '' AND id > ? ORDER BY id LIMIT ?",
+                f" WHERE {self._rotation_scan(column)} AND id > ? ORDER BY id LIMIT ?",
                 (active_like, after, batch),
             )
             rows = list(await cur.fetchall())
@@ -13162,7 +13231,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT attachment_id, seq, ciphertext FROM attachment_chunk"
-                " WHERE ciphertext NOT LIKE ? AND ciphertext <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('ciphertext')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13180,8 +13249,10 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?", updates
+            await self._update_every_row(
+                "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?",
+                updates,
+                "attachment_chunk.ciphertext",
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13199,7 +13270,7 @@ class MessageStore:
         rotated = 0
         while True:
             cur = await self._db.execute(
-                "SELECT hash, body FROM shared_body WHERE body NOT LIKE ? AND body <> '' LIMIT ?",
+                f"SELECT hash, body FROM shared_body WHERE {self._rotation_scan('body')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13214,7 +13285,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE shared_body SET body=? WHERE hash=?", updates)
+            await self._update_every_row(
+                "UPDATE shared_body SET body=? WHERE hash=?", updates, "shared_body.body"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13254,7 +13327,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT namespace, key, value FROM state"
-                " WHERE value NOT LIKE ? AND value <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('value')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13270,8 +13343,8 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE state SET value=? WHERE namespace=? AND key=?", updates
+            await self._update_every_row(
+                "UPDATE state SET value=? WHERE namespace=? AND key=?", updates, "state.value"
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13288,7 +13361,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT name, version, key, value FROM reference"
-                " WHERE value NOT LIKE ? AND value <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('value')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13307,8 +13380,10 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?", updates
+            await self._update_every_row(
+                "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?",
+                updates,
+                "reference.value",
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13329,7 +13404,7 @@ class MessageStore:
             while True:
                 cur = await self._db.execute(
                     f"SELECT message_id, destination_name, response_seq, {column} FROM response"
-                    f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT ?",
+                    f" WHERE {self._rotation_scan(column)} LIMIT ?",
                     (active_like, batch),
                 )
                 rows = list(await cur.fetchall())
@@ -13354,10 +13429,11 @@ class MessageStore:
                     )
                     for r in rows
                 ]
-                await self._db.executemany(
+                await self._update_every_row(
                     f"UPDATE response SET {column}=?"
                     " WHERE message_id=? AND destination_name=? AND response_seq=?",
                     updates,
+                    f"response.{column}",
                 )
                 await self._commit()
                 await self._charge_bound_batch()
@@ -13374,7 +13450,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, message_id, ts, event, detail FROM message_events"
-                " WHERE detail NOT LIKE ? AND detail <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('detail')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13391,7 +13467,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE message_events SET detail=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE message_events SET detail=? WHERE id=?", updates, "message_events.detail"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13406,7 +13484,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, connection, ts, kind, reason FROM connection_event"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('reason')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13423,7 +13501,11 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE connection_event SET reason=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE connection_event SET reason=? WHERE id=?",
+                updates,
+                "connection_event.reason",
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13439,7 +13521,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, event_type, connection, reason FROM alert_instance"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('reason')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13456,7 +13538,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE alert_instance SET reason=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE alert_instance SET reason=? WHERE id=?", updates, "alert_instance.reason"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)

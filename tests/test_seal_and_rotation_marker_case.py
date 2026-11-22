@@ -1,0 +1,209 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""BACKLOG #5506 and #5611: the at-open seal and ``rotate-key`` read the cipher marker byte-exact.
+
+SQLite's ``LIKE`` folds ASCII case, so ``MFENC:...`` used to count as ciphertext. On a surface with
+no ciphertext that would have left the value in plaintext and written the keyed marker. In a
+rotation it would have skipped the value as already under the active key. Every synthetic value
+here is made up. The SQL Server statements are pinned by source only; its live leg runs them.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS, _surface_sealed
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    CipherError,
+    cell_aad,
+    generate_key,
+    make_cipher,
+)
+from messagefoundry.store.sqlserver import SqlServerStore
+from messagefoundry.store.store import MessageStore
+
+_BIN2 = "COLLATE Latin1_General_100_BIN2"
+
+
+def _reason(path: Path, connection: str) -> str:
+    with sqlite3.connect(path) as db:
+        row = db.execute(
+            "SELECT reason FROM connection_event WHERE connection=?", (connection,)
+        ).fetchone()
+    return str(row[0])
+
+
+def _plant_reasons(path: Path, *rows: tuple[str, str]) -> None:
+    """``connection_event.reason`` is read by nothing at open, so a plant reaches the sweep alone."""
+    with sqlite3.connect(path) as db:
+        db.executemany(
+            "INSERT INTO connection_event (ts, connection, transport, direction, kind, reason)"
+            " VALUES (1.0, ?, 'mllp', 'inbound', 'k', ?)",
+            rows,
+        )
+
+
+def _keyed_marker(path: Path, table: str, column: str) -> bool:
+    with sqlite3.connect(path) as db:
+        return (
+            db.execute(
+                "SELECT 1 FROM keyed_surface WHERE surface_table=? AND surface_column=?",
+                (table, column),
+            ).fetchone()
+            is not None
+        )
+
+
+async def test_an_uppercase_marker_on_an_unsealed_surface_is_sealed(tmp_path: Path) -> None:
+    path = tmp_path / "s.db"
+    await (await MessageStore.open(path)).close()
+    _plant_reasons(path, ("plant", "MFENC:synthetic-plant"), ("plain", "synthetic-plain"))
+    cipher = make_cipher(generate_key())
+    await (await MessageStore.open(path, cipher=cipher)).close()
+    for name, value in (("plant", "MFENC:synthetic-plant"), ("plain", "synthetic-plain")):
+        stored = _reason(path, name)
+        assert stored.startswith("mfenc:"), name
+        aad = cell_aad("connection_event", "reason", name, 1.0, "k")
+        assert cipher.decrypt(stored, aad=aad) == value
+    assert _keyed_marker(path, "connection_event", "reason")
+
+
+async def test_an_uppercase_marker_on_a_keyed_surface_stays_refused_and_is_reported(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "s.db"
+    key = generate_key()
+    await (await MessageStore.open(path, cipher=make_cipher(key))).close()
+    assert _keyed_marker(path, "connection_event", "reason")
+    _plant_reasons(path, ("plant", "MFENC:synthetic-plant"))
+    with caplog.at_level(logging.WARNING):
+        await (await MessageStore.open(path, cipher=make_cipher(key))).close()
+    assert _reason(path, "plant") == "MFENC:synthetic-plant"
+    assert any("connection_event.reason is sealed" in r.getMessage() for r in caplog.records)
+    with pytest.raises(CipherError):
+        make_cipher(key).decrypt(
+            "MFENC:synthetic-plant", aad=cell_aad("connection_event", "reason", "plant", 1.0, "k")
+        )
+
+
+async def test_the_opt_out_never_seals_an_uppercase_marker_on_a_sealed_surface(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "s.db"
+    key = generate_key()
+    await (await MessageStore.open(path, cipher=make_cipher(key))).close()
+    _plant_reasons(path, ("plant", "MFENC:synthetic-plant"), ("plain", "synthetic-plain"))
+    await (await MessageStore.open(path, cipher=make_cipher(key, allow_unmarked=True))).close()
+    assert _reason(path, "plant") == "MFENC:synthetic-plant"
+    assert _reason(path, "plain").startswith("mfenc:")  # control: the opt-out still seals plaintext
+
+
+async def test_a_null_key_row_fails_the_keyed_open_instead_of_spinning(tmp_path: Path) -> None:
+    path = tmp_path / "s.db"
+    await (await MessageStore.open(path)).close()
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO shared_body (hash, body, refcount, created_at)"
+            " VALUES (NULL, 'synthetic-plain', 1, 0)"
+        )
+    with pytest.raises(CipherError, match=r"shared_body\.body"):
+        await asyncio.wait_for(MessageStore.open(path, cipher=make_cipher(generate_key())), 10)
+    # The surface rolled back whole: no marker, and the value as it was.
+    assert not _keyed_marker(path, "shared_body", "body")
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT body FROM shared_body").fetchone()[0] == "synthetic-plain"
+
+
+def test_the_walk_reads_an_uppercase_marker_as_the_store_now_does(tmp_path: Path) -> None:
+    spec = next(c for c in SQLITE_CIPHER_CELLS if (c.table, c.column) == ("state", "value"))
+    conn = sqlite3.connect(tmp_path / "w.db")
+    conn.execute("CREATE TABLE state (namespace TEXT, key TEXT, value)")
+    conn.execute("INSERT INTO state VALUES ('n', 'k', 'MFENC:synthetic-plant')")
+    assert not _surface_sealed(conn, spec, {"state"})
+    conn.execute("INSERT INTO state VALUES ('n', 'j', 'mfenc:v1:x')")
+    assert _surface_sealed(conn, spec, {"state"})  # control: a real marker still counts
+    conn.close()
+
+
+def test_the_sql_server_scans_compare_the_marker_in_binary() -> None:
+    for fn in (SqlServerStore._seal_surface, SqlServerStore._surface_holds_ciphertext):
+        assert _BIN2 in inspect.getsource(fn), fn.__name__
+    rotation = inspect.getsource(SqlServerStore._rotation_scan)
+    assert _BIN2 in rotation and "DATALENGTH" in rotation
+    body = inspect.getsource(SqlServerStore.reencrypt_to_active)
+    assert " NOT LIKE ?" not in body  # every scan goes through _rotation_scan
+
+
+async def test_rotation_aborts_on_the_uppercase_of_the_active_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "r.db"
+    key = generate_key()
+    cipher = make_cipher(key)
+    assert isinstance(cipher, AesGcmCipher)
+    await (await MessageStore.open(path, cipher=cipher)).close()
+    plant = f"{cipher.active_marker_prefix.upper()}synthetic"
+    _plant_reasons(path, ("plant", plant))
+    store = await MessageStore.open(path, cipher=make_cipher(key))
+    try:
+        with pytest.raises(CipherError):
+            await store.reencrypt_to_active()
+    finally:
+        await store.close()
+    assert _reason(path, "plant") == plant
+
+
+@pytest.mark.parametrize("row_id", [None, ""])
+async def test_a_tagged_cell_with_a_null_or_empty_id_aborts_the_rotation(
+    tmp_path: Path, row_id: str | None
+) -> None:
+    path = tmp_path / "r.db"
+    key = generate_key()
+    await (await MessageStore.open(path, cipher=make_cipher(key))).close()
+    with sqlite3.connect(path) as db:
+        columns = db.execute("PRAGMA table_info(search_presets)").fetchall()
+        required: dict[str, str | int | None] = {
+            c[1]: ("x" if "TEXT" in c[2] else 0) for c in columns if c[3] and not c[5]
+        }
+        required["criteria"] = "synthetic-unrotated"
+        required["id"] = row_id
+        names = ", ".join(required)
+        marks = ", ".join("?" for _ in required)
+        db.execute(
+            f"INSERT INTO search_presets ({names}) VALUES ({marks})", tuple(required.values())
+        )
+    store = await MessageStore.open(path, cipher=make_cipher(key))
+    try:
+        with pytest.raises(CipherError, match=r"search_presets\.criteria"):
+            await store.reencrypt_to_active()
+    finally:
+        await store.close()
+
+
+async def test_a_row_deleted_between_the_read_and_the_write_does_not_abort_a_rotation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "r.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key()))
+    try:
+        await store._update_every_row(
+            "UPDATE connection_event SET reason=? WHERE id=?",
+            [("x", 999)],
+            "connection_event.reason",
+        )
+        await store._db.rollback()
+        with pytest.raises(CipherError):  # control: a seal's own transaction allows no shortfall
+            await store._update_every_row(
+                "UPDATE connection_event SET reason=? WHERE id=?",
+                [("x", 999)],
+                "connection_event.reason",
+                exact=True,
+            )
+        await store._db.rollback()
+    finally:
+        await store.close()
