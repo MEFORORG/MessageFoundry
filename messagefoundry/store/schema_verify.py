@@ -466,23 +466,24 @@ async def _foreign_object(db: aiosqlite.Connection, cause: str) -> tuple[str, st
     text may add a suffix after the name, and a quoted name may hold a colon. A SQLite error while
     telling falls back to ``None``, the plain remedy.
 
-    SQLite writes "error in view V: ..." or, on its re-check after the change, "error in view V
-    after drop column: ...". So when several names fit, as ``vv`` and ``vv after`` both fit "error
-    in view vv after drop column: ...", one whose remainder starts with the colon wins, then one
-    whose remainder starts with " after ", then any other; among names of one rank the longest wins.
-    The longest alone would name ``vv after`` there, which is not the cause."""
+    Several names can fit one text (the forms are in the note above ``_FOREIGN_OBJECTS_SQL``):
+    ``vv`` and ``vv after`` both fit "error in view vv after rename: ...". So a name whose remainder
+    starts with the colon or with " after " ranks first, any other name last, and the longest name
+    of the first rank present wins. The longest alone named ``vv after`` there, which is not the
+    cause. The colon and " after " share a rank because a quoted name may hold either: with ``vv``
+    and ``vv: x``, "error in view vv: x after rename: ..." names ``vv: x``."""
     try:
         async with db.execute(_FOREIGN_OBJECTS_SQL) as cur:
             objects = [(str(kind), str(name)) for kind, name in await cur.fetchall()]
-        named: list[tuple[int, str, str]] = []
+        named: list[tuple[bool, str, str]] = []
         for kind, name in objects:
             rest = cause.removeprefix(f"error in {kind} {name}")
             if rest != cause and rest[:1] in (":", " "):
-                rank = 0 if rest.startswith(":") else 1 if rest.startswith(" after ") else 2
-                named.append((rank, kind, name))
+                exact = rest.startswith((":", " after "))
+                named.append((exact, kind, name))
         if not named:
             return None
-        _, kind, name = min(named, key=lambda o: (o[0], -len(o[2])))
+        _, kind, name = max(named, key=lambda o: (o[0], len(o[2])))
         if kind == "view" and name.lower() in await _names_this_build_creates():
             return None
     except sqlite3.Error as exc:

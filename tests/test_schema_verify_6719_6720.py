@@ -654,6 +654,72 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
         assert await _foreign_object(db, expected_cause) == ("view", cause_view)
 
 
+@pytest.mark.parametrize(
+    ("kind", "names", "cause", "found"),
+    [
+        pytest.param(
+            "view",
+            ("vv", "vv after"),
+            "error in view vv after rename: no such module: m",
+            "vv",
+            id="vv-after-rename",
+        ),
+        pytest.param(
+            "view",
+            ("vv", "vv after"),
+            "error in view vv after after rename: no such module: m",
+            "vv after",
+            id="vv-after-after-rename",
+        ),
+        pytest.param(
+            "view",
+            ("vv", "vv: x"),
+            "error in view vv: x after rename: no such module: m",
+            "vv: x",
+            id="colon-name-after-rename",
+        ),
+        pytest.param(
+            "view",
+            ("vv", "vv: x"),
+            "error in view vv: no such module: m",
+            "vv",
+            id="colon-name-prefix",
+        ),
+        pytest.param(
+            "trigger",
+            ("tr", "tr after"),
+            "error in trigger tr after rename: no such module: m",
+            "tr",
+            id="trigger-after-rename",
+        ),
+        pytest.param(
+            "trigger",
+            ("tr", "tr after"),
+            "error in trigger tr after after rename: no such module: m",
+            "tr after",
+            id="trigger-after-after-rename",
+        ),
+    ],
+)
+async def test_a_prefix_name_is_told_apart_in_the_rename_recheck(
+    tmp_path: Path, kind: str, names: tuple[str, str], cause: str, found: str
+) -> None:
+    # The RENAME COLUMN migration's re-check writes the " after rename" suffix. The causes are
+    # SQLite's form written out, as in the test above, because no healthy view this test can plant
+    # breaks under RENAME COLUMN: SQLite rewrites its reference instead.
+    from messagefoundry.store.schema_verify import _foreign_object
+
+    path = tmp_path / "prefix.db"
+    _sql(path, "CREATE TABLE t (a)")
+    for name in names:
+        if kind == "view":
+            _sql(path, f'CREATE VIEW "{name}" AS SELECT a FROM t')
+        else:
+            _sql(path, f'CREATE TRIGGER "{name}" AFTER INSERT ON t BEGIN SELECT 1; END')
+    async with _connected(path) as db:
+        assert await _foreign_object(db, cause) == (kind, found)
+
+
 # --- BACKLOG #6720 item 1: a foreign view using an unloaded function or collation ----------------
 
 
