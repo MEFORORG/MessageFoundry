@@ -1325,7 +1325,7 @@ grade*, under the ruling above, and its note of 2026-11-11.
 
 - **Where it ran.** Two runs with results. The first run's legs ran from 02:22 to 02:25 UTC and
   the second's from 05:18 to 05:19 UTC, both on 2026-10-17. The records are dated in Central
-  time, where the first run fell on the evening of 2026-10-16. The first run's record says it ran
+  time: the first 2026-10-16, the second 2026-10-17. The first run's record says it ran
   on a disposable virtual machine built for the test, not on the SQL Server test box, and that the
   runbook puts the next run there. The second
   run's record says it ran inside a virtual machine, after a revert to checkpoint

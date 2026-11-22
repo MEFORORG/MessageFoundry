@@ -665,10 +665,11 @@ lifetime is Vault's to version. The bound is a no-op there and for the identity 
 > `Engine.start` checks for an operator's recorded attestation to the precondition through
 > `enforce_transit_bound_attestation`, so "documented" now undersells it. The R3 ruling above
 > judged the precondition before that record existed. ADR 0138's 2026-10-07 amendment says how the
-> attestation is recorded, what the check does under each enforcement level, what it does not
-> change, and how the record stands against R3. *(Corrected 2026-11-21, vault BACKLOG #1173: this
-> note also named the CLI command that records the attestation, and said that whether the record
-> meets R3 is a scorecard call. The 2026-10-07 amendment states both.)*
+> attestation is recorded and what the check does under each enforcement level. It also says what
+> the check does not change, and who judges the record against R3. *(Corrected 2026-11-21, vault
+> BACKLOG #1173: this note read "an operator attests to the precondition with `messagefoundry
+> store attest-transit-bound`, and `Engine.start` reads that record" and "whether the record meets
+> R3 is a scorecard call". The 2026-10-07 amendment states both.)*
 
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
@@ -802,9 +803,9 @@ above.
 4. **Volume wears out a key, not the generator.** The one value whose safety falls with volume is the
    96-bit random AES-GCM nonce, and that is a limit on the key, not on the generator. The default path
    counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path
-   counts nothing. `Engine.start` calls `enforce_transit_bound_attestation` in
-   `store/transit_attestation.py` (BACKLOG #2337), and an attestation is still weaker than the
-   counted bound. [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+   counts nothing. `Engine.start` instead checks for an operator's recorded attestation to the
+   bound, through `enforce_transit_bound_attestation` in `store/transit_attestation.py` (BACKLOG
+   #2337). An attestation is still weaker than the counted bound. [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
    2026-10-07 amendment records what that gate checks, what it does under each enforcement level,
    and what it does not catch. Its 2026-09-28 amendment states the rotation precondition the
    operator attests to. *(Corrected 2026-11-21, vault BACKLOG #1173: this point read "In its
