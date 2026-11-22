@@ -8877,9 +8877,7 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
         remedy=(
             "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
             "the key again with `messagefoundry protect-key` to a new path in a folder no broad "
-            "group may delete a file in, with no junction or link on its path that an account "
-            "other than SYSTEM, Administrators or the engine's own can change, a LOCAL SERVICE or "
-            "NETWORK SERVICE engine's own not counting"
+            "group may delete a file in, with no junction or link on its path, or folder holding or above one, that an account the check does not trust can change (it trusts at least SYSTEM and Administrators, and the engine's own account unless it is Local service or Network service)"
         ),
         enforcing=enforcing,
     )
@@ -8907,9 +8905,9 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
     import shlex
 
     remedy = (
-        'Where the refusal says the key itself is owned by another account ("is not restricted: '
-        'it is owned by"), delete it and its certificate so the next start mints a pair the '
-        "engine owns: restricting it does not change its owner. Otherwise "
+        "Where the refusal is about who owns the key itself, rather than the directory that "
+        "holds it, delete it and its certificate so the next start mints a pair the engine "
+        "owns: restricting it does not change its owner. Otherwise "
         "restrict it to the account the engine runs as, or delete it and its certificate so "
         "the next start mints a new pair. "
     )
@@ -8920,8 +8918,9 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             f"Where it names the directory's mode, remove the write bits: chmod go-w {directory}. "
             "Where it names the directory's owner, give it to the account the engine runs as: "
             f"chown {shlex.quote(_engine_account_name())} {directory}. "
-            "Where it names a link on its path, keep the store where no link above it can be "
-            "changed by an account other than root or the engine's own, since a new pair would be "
+            "Where it names a link on its path, keep the store where no link above it, or folder "
+            "holding or above one, can be changed by an account other than root or the engine's "
+            "own, since a new pair would be "
             "minted in the same place. "
         )
     else:
@@ -8929,9 +8928,10 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             "Where the refusal names the directory that holds it, that is the store's directory: "
             "remove a broad group's right to delete files in it or change its access list, and "
             "give it an owner that is not such a group. Where it names a folder on its path, keep "
-            "the store where no junction or link above it can be changed by an account other "
-            "than SYSTEM, Administrators or the engine's own, a LOCAL SERVICE or NETWORK SERVICE "
-            "engine's own not counting. A new pair would be minted in the same place again. "
+            "the store where no junction or link above it, or folder holding or above one, can be "
+            "changed by an account the check does not trust (it trusts at least SYSTEM and "
+            "Administrators, and the engine's own account unless it is Local service or Network "
+            "service). A new pair would be minted in the same place again. "
         )
     return remedy + (
         "If the volume itself widens the file on every mount, "

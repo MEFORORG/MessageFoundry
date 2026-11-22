@@ -111,7 +111,9 @@ def test_the_posix_owner_rule_names_root_as_allowed() -> None:
 
 # --- the refusal and remedy text, for an engine that runs as a shared service account -------------
 
-_SHARED_TEXT = "a LOCAL SERVICE or NETWORK SERVICE engine's own not counting"
+#: Spelled as ``describe_sid`` spells the accounts: two capitalised words in a row are a name run the
+#: log redaction scrubs.
+_SHARED_TEXT = "the engine's own account unless it is Local service or Network service"
 
 
 def _joined(source: str) -> str:
@@ -133,24 +135,37 @@ def test_a_link_refusal_does_not_say_the_engine_account_is_another(shared: str) 
     problem = _windows_link_problem(chain, read, WinTrust(shared, lambda _sid: False))
     assert problem is not None
     assert "other than the engine's own" not in problem
-    assert "does not trust" in problem and "even when the engine runs as one" in problem
+    assert "an account this check does not trust" in problem
 
 
-def test_the_remedies_do_not_say_another_account_for_a_shared_service_engine() -> None:
+def _remedies() -> dict[str, str]:
     import messagefoundry.__main__ as cli
     from messagefoundry import engine_secrets, secrets_dpapi
     from messagefoundry.config.key_file_access import KEY_FILE_REMEDY
 
-    texts = {
+    return {
         "KEY_FILE_REMEDY": KEY_FILE_REMEDY,
         "engine_secrets._REMEDY": engine_secrets._REMEDY,
         # Both run only where DPAPI is, so their text is read from the source.
         "load_protected_key": _joined(inspect.getsource(secrets_dpapi.load_protected_key)),
         "_store_key_file_gate": _joined(inspect.getsource(cli._store_key_file_gate)),
     }
-    for name, text in texts.items():
+
+
+def test_the_remedies_do_not_say_another_account_for_a_shared_service_engine() -> None:
+    for name, text in _remedies().items():
         assert "that another account can change" not in text, name
         assert _SHARED_TEXT in text, name
+        # TrustedInstaller and others are trusted too, so the list is a floor, not the whole set.
+        assert "it trusts at least SYSTEM and Administrators" in text, name
+        assert "folder holding or above one" in text, name
+
+
+def test_the_shared_service_clause_survives_log_redaction() -> None:
+    from messagefoundry.redaction import redact_untrusted
+
+    for name, text in _remedies().items():
+        assert _SHARED_TEXT in redact_untrusted(text), name
 
 
 @pytest.mark.parametrize("platform", ["linux", "win32"])
@@ -158,16 +173,17 @@ def test_the_generated_key_remedy_names_the_trusted_accounts(
     monkeypatch: pytest.MonkeyPatch, platform: str
 ) -> None:
     import messagefoundry.__main__ as cli
+    from messagefoundry.redaction import redact_untrusted
 
     monkeypatch.setattr(cli, "_engine_account_name", lambda: "mefor")
     monkeypatch.setattr(sys, "platform", platform)
     remedy = cli._generated_tls_key_remedy(Path("/srv/mefor"))
     assert "another account can change" not in remedy
     if platform == "win32":
-        assert _SHARED_TEXT in remedy
+        assert _SHARED_TEXT in redact_untrusted(remedy)
     else:
         assert "an account other than root or the engine's own" in remedy
-    # Step 11 (g): the delete-and-mint advice names the key's own owner refusal, which a refusal
-    # about the directory's owner ("the directory that holds it is owned by") does not match.
+    # Step 11 (g): the delete-and-mint advice is for a refusal about the key's own owner, which
+    # covers a broad-group owner too, and not for one about the directory's owner.
     assert "names who owns it" not in remedy
-    assert '"is not restricted: it is owned by"' in remedy
+    assert "is about who owns the key itself, rather than the directory that holds it" in remedy
