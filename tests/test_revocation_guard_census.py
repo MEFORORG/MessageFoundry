@@ -24,7 +24,7 @@ to a guard call. It does not prove that every branch reaches the call, or that t
 or that a guard checks a CRL: the behaviour tests (at least
 ``tests/test_revocation_guard_remaining_hops.py``, ``tests/test_hop_refusal_revocation.py`` and
 ``tests/test_vault_revocation_hop_guard.py``) prove that. A second hop added inside a function that
-is already guarded passes here too, so read the function in review.
+is already listed, Guarded or Exempt, passes here too, so read the function in review.
 
 **It goes red.** Delete the guard call from one guarded site and
 :func:`test_every_guarded_site_calls_a_guard` fails naming that site; measured when this file was
@@ -330,7 +330,9 @@ _CENSUS: dict[str, Guarded | Exempt] = {
 #: The sites :data:`_CENSUS` lists as Exempt, pinned exactly (vault BACKLOG #3512). A Guarded hop
 #: moved to Exempt, with its guard call deleted, can pass every other check here (a relaxed hop
 #: fails its own census below), so this list is the second edit such a change needs. A diff that
-#: edits both still passes, so review stays the check on what is added here.
+#: edits both still passes, so review stays the check on what is added here. Nor is a Guarded
+#: entry caught whose ``by`` is re-pointed at another function that calls a guard, in any module,
+#: after its own guard call is deleted: that is one census edit, and only review sees it.
 _EXEMPT_SITES = frozenset(
     {
         "messagefoundry/apiclient/client.py::_build_verify_context",
@@ -492,8 +494,8 @@ def test_every_guarded_site_calls_a_guard() -> None:
     guarded = {site: entry for site, entry in _CENSUS.items() if isinstance(entry, Guarded)}
     # 15 sites were Guarded when this floor was set, so 10 lets up to five retire with no edit here.
     # It is a floor against a census emptied or turned all Exempt, over which the check below would
-    # pass on nothing. A single hop moved from Guarded to Exempt fails the test below, unless
-    # _EXEMPT_SITES moves too; review is the check on that.
+    # pass on nothing. A single hop moved from Guarded to Exempt fails the test below; what that
+    # test does not catch is on _EXEMPT_SITES.
     assert len(guarded) >= 10, f"only {len(guarded)} Guarded census entries, floor 10"
     unguarded = [
         f"{site} (guard expected in {entry.by or 'the site itself'}; {entry.note or 'no note'})"
@@ -506,12 +508,11 @@ def test_every_guarded_site_calls_a_guard() -> None:
 def test_the_exempt_sites_are_the_pinned_list() -> None:
     """A Guarded hop moved to Exempt fails here, named, unless :data:`_EXEMPT_SITES` moves too."""
     exempt = {site for site, entry in _CENSUS.items() if isinstance(entry, Exempt)}
-    assert sorted(exempt - _EXEMPT_SITES) == [], (
-        "census sites Exempt but not in _EXEMPT_SITES. Add a site to it only once review has read "
-        "the exemption's reason; a hop moved here from Guarded loses its revocation guard"
-    )
-    assert sorted(_EXEMPT_SITES - exempt) == [], (
-        "_EXEMPT_SITES names sites the census does not exempt"
+    assert exempt == _EXEMPT_SITES, (
+        f"Exempt in the census, not in _EXEMPT_SITES: {sorted(exempt - _EXEMPT_SITES)}; in "
+        f"_EXEMPT_SITES, not Exempt in the census: {sorted(_EXEMPT_SITES - exempt)}. Add a site to "
+        f"_EXEMPT_SITES only once review has read the exemption's reason; a hop moved there from "
+        f"Guarded loses its revocation guard"
     )
 
 
