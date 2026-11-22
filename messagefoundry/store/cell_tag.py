@@ -697,7 +697,7 @@ def withhold_refused_cell(cipher: Cipher, table: str, exc: CipherError, stored: 
             return
         _remember(_withheld, key, now)
     _log.warning(
-        "a %s cell is sealed under a key the store does not hold (%s), so a list read withheld it",
+        "a %s cell is sealed under a key the store does not hold (%s), so a read withheld it",
         table,
         type(exc).__name__,
     )

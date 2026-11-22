@@ -47,9 +47,10 @@ __all__ = [
     "restore_eol",
 ]
 
-#: Shown for a delivery error or event detail sealed under a key the store does not hold, which the
-#: engine sends as null with a flag, so the cell does not read as "no error" (BACKLOG #5693).
-_WITHHELD_CELL = el("span", "Withheld: sealed under a key this store does not hold", class_="muted")
+#: Shown for a delivery error or event detail whose marker names a key the store does not hold,
+#: which the engine sends as null with a flag, so the cell does not read as "no error" (BACKLOG
+#: #5693). It says what the marker names: a rewritten marker reads the same.
+_WITHHELD_CELL = el("span", "Withheld: names a key this store does not hold", class_="muted")
 
 #: The tail-placement caution ADR 0090 §3 requires the console affordance to carry, worded to the two
 #: things that ADR actually establishes and no further. It rules that a resend lands at the

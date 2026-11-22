@@ -1307,16 +1307,18 @@ def test_the_withheld_flag_follows_the_cells_own_permission() -> None:
 
     from messagefoundry.api.field_authz import withheld_flag
     from messagefoundry.api.models import EventInfo, OutboxInfo, ReplayResult
+    from messagefoundry.auth import Permission
 
-    holder: Any = SimpleNamespace(has=lambda _p: True)
-    other: Any = SimpleNamespace(has=lambda _p: False)
+    holder: Any = SimpleNamespace(has=lambda p: p is Permission.MESSAGES_VIEW_SUMMARY)
+    raw_only: Any = SimpleNamespace(has=lambda p: p is Permission.MESSAGES_VIEW_RAW)
     assert withheld_flag(OutboxInfo, "last_error", holder, withheld=True) is True
     assert withheld_flag(EventInfo, "detail", holder, withheld=True) is True
     assert withheld_flag(OutboxInfo, "last_error", holder, withheld=False) is False
-    assert withheld_flag(OutboxInfo, "last_error", other, withheld=True) is False
-    assert withheld_flag(EventInfo, "detail", other, withheld=True) is False
-    with pytest.raises(KeyError):
-        withheld_flag(ReplayResult, "last_error", holder, withheld=True)
+    assert withheld_flag(OutboxInfo, "last_error", raw_only, withheld=True) is False
+    assert withheld_flag(EventInfo, "detail", raw_only, withheld=True) is False
+    for withheld in (True, False):  # an unmapped property raises on a healthy read too
+        with pytest.raises(KeyError):
+            withheld_flag(ReplayResult, "last_error", holder, withheld=withheld)
 
 
 async def test_the_message_detail_route_and_page_say_a_cell_was_withheld(

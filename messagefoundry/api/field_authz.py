@@ -253,10 +253,12 @@ def gated_properties(model_cls: type[BaseModel]) -> dict[str, Permission]:
 def withheld_flag(
     model_cls: type[BaseModel], prop: str, identity: Identity, *, withheld: bool
 ) -> bool:
-    """Whether to tell this caller that ``prop`` was withheld for a key the store does not hold
-    (BACKLOG #5693). The flag says a value exists, so it follows the permission that unlocks the
+    """Whether to tell this caller that ``prop`` was withheld because its marker names a key the
+    store does not hold (BACKLOG #5693). The flag says a value exists, so it follows the permission that unlocks the
     property; an unmapped property raises ``KeyError`` rather than answering."""
-    return withheld and identity.has(gated_properties(model_cls)[prop])
+    # Resolved first, so an unmapped property raises on a healthy read and not only on a withheld one.
+    permission = gated_properties(model_cls)[prop]
+    return withheld and identity.has(permission)
 
 
 def redact_unauthorized(  # noqa: UP047
