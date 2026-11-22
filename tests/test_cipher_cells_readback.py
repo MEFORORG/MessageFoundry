@@ -1969,7 +1969,7 @@ def test_a_keyless_open_after_a_failed_walk_is_still_a_key_mismatch(
 def test_a_key_service_outage_in_the_verify_walk_is_not_called_a_damaged_cell(
     tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A decrypt the key service gave no answer to stops the walk as an outage, as cipher-audit
+    """A decrypt the key service gave no usable answer to stops the walk as an outage, as cipher-audit
     stops, and its FAIL says so rather than that the cell did not decrypt (BACKLOG #1719 item 12).
     It is still no PASS."""
     from messagefoundry.store.crypto import CipherUnavailableError
@@ -1984,7 +1984,8 @@ def test_a_key_service_outage_in_the_verify_walk_is_not_called_a_damaged_cell(
     monkeypatch.setattr(cipher_cells_module, "decrypt_or_error", down)
     status, reason, cells = dr_backup._decrypt_check(db, settings)
     assert (status, cells) == ("FAIL", 0), reason
-    assert "key service gave no answer" in reason and "did not decrypt" not in reason, reason
+    assert "did not return a usable answer (CipherUnavailableError)" in reason, reason
+    assert "did not decrypt" not in reason, reason
     assert len(calls) == 1, "the walk sent a value to the key service after its outage"
     assert _SYNTH not in reason
 
@@ -2009,7 +2010,7 @@ def test_an_incompatible_snapshot_keeps_the_walks_finding(
     assert (status, cells) == ("FAIL", 0), reason
     remedy, _, walk = reason.partition("Before the open")
     assert "0.0.1" in remedy and "messages.raw" not in remedy, reason
-    assert "messages.raw" in walk and "reported FAIL" in walk, reason
+    assert "messages.raw" in walk and "reported FAIL (the remedy leads" in walk, reason
     assert _SYNTH not in reason
 
     (tmp_path / "intact").mkdir()
@@ -2063,3 +2064,62 @@ def test_the_absence_predicates_the_live_server_tests_use_can_fire() -> None:
             for column in needed:
                 partial = {spec.table: frozenset(needed - {column})}
                 assert not server_cell_present(spec, partial), (spec, column)
+
+
+def test_the_walks_finding_survives_a_long_differences_list(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive many schema versions old lists many differences; the walk's finding is appended
+    after their cut, so the damaged cell's locator is still named (BACKLOG #1719 item 3)."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    differences = tuple(f"index ix_synthetic_{n:02d} lacks column c{n:02d}" for n in range(12))
+
+    def incompatible(coro: Any) -> Any:
+        coro.close()
+        raise SchemaMismatchError("synthetic: old schema", differences=differences)
+
+    monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "raw", rowid, "x" + value[1:])
+    status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert status == "FAIL" and "0.0.1" in reason and "ix_synthetic_00" in reason, reason
+    conn = sqlite3.connect(db)
+    try:
+        (message_id,) = conn.execute("SELECT id FROM messages WHERE rowid = ?", (rowid,)).fetchone()
+    finally:
+        conn.close()
+    assert f"messages.raw id={message_id} carries no at-rest marker" in reason, reason
+
+
+@pytest.mark.parametrize(
+    ("walked", "misread"),
+    [
+        (("FAIL", "messages.raw id=1 did not decrypt: synthetic", 0), True),
+        (("FAIL", "the key service did not return a usable answer (X) while ...", 0), False),
+        (("KEY_MISMATCH", "messages.raw is encrypted at rest but ...", 0), False),
+        (("FAIL", "OperationalError: synthetic", 0), False),
+    ],
+)
+def test_the_misread_rationale_rides_only_on_a_cell_finding(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    walked: tuple[str, str, int],
+    misread: bool,
+) -> None:
+    """Only a finding about a cell's content can be this build misreading another version's
+    cells; a key mismatch, an outage or a SQLite fault is not offered that reading."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    def incompatible(coro: Any) -> Any:
+        coro.close()
+        raise SchemaMismatchError("synthetic: schema written by another build")
+
+    monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: walked)
+    db, settings = _copy(_template, tmp_path)
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert walked[1] in reason, reason
+    assert ("misread another version" in reason) is misread, reason
