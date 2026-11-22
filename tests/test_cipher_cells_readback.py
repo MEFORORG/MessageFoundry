@@ -2096,24 +2096,7 @@ def test_the_walks_finding_survives_a_long_differences_list(
     assert "ix_synthetic_39" not in reason, reason
 
 
-@pytest.mark.parametrize(
-    ("walked", "misread"),
-    [
-        (("FAIL", "messages.raw id=1 did not decrypt: synthetic", 0), True),
-        (("FAIL", f"{dr_backup._OUTAGE_LEAD} (X) while ...", 0), False),
-        (("KEY_MISMATCH", "messages.raw is encrypted at rest but ...", 0), False),
-        (("FAIL", "OperationalError: no such column: synthetic", 0), True),
-    ],
-)
-def test_the_misread_rationale_is_withheld_from_a_key_mismatch_and_an_outage(
-    tmp_path: Path,
-    _template: tuple[Path, StoreSettings],
-    monkeypatch: pytest.MonkeyPatch,
-    walked: tuple[str, str, int],
-    misread: bool,
-) -> None:
-    """A key mismatch or a key-service outage is not this build reading the cells, so it is not
-    offered the misread rationale; a FAIL from reading them, a SQLite fault included, is."""
+def _incompatible_open(monkeypatch: pytest.MonkeyPatch) -> None:
     from messagefoundry.store.schema_verify import SchemaMismatchError
 
     def incompatible(coro: Any) -> Any:
@@ -2121,8 +2104,156 @@ def test_the_misread_rationale_is_withheld_from_a_key_mismatch_and_an_outage(
         raise SchemaMismatchError("synthetic: schema written by another build")
 
     monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
+
+
+@pytest.mark.parametrize(
+    ("walked", "misread"),
+    [
+        (dr_backup.WalkVerdict("FAIL", "messages.raw id=1 did not decrypt: x", 0, "cell"), True),
+        (dr_backup.WalkVerdict("FAIL", "no such column: c", 0, "sqlite_schema"), True),
+        (dr_backup.WalkVerdict("FAIL", "the key service ... while", 0, "outage"), False),
+        (
+            dr_backup.WalkVerdict("KEY_MISMATCH", "messages.raw is encrypted", 0, "key_mismatch"),
+            False,
+        ),
+        (dr_backup.WalkVerdict("FAIL", "the store's schema changed", 0, "interrupted"), False),
+        (dr_backup.WalkVerdict("FAIL", "DatabaseError: malformed", 0, "sqlite"), False),
+        (dr_backup.WalkVerdict("FAIL", "messages.raw id=1 holds a BLOB", 0, "damaged"), False),
+    ],
+)
+def test_the_misread_rationale_follows_the_walks_kind(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    walked: dr_backup.WalkVerdict,
+    misread: bool,
+) -> None:
+    """Only a cell finding, or a statement the snapshot's schema could not answer, is offered the
+    misread rationale; the kind decides, never the reason's wording."""
+    _incompatible_open(monkeypatch)
     monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: walked)
     db, settings = _copy(_template, tmp_path)
     _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
     assert walked[1] in reason, reason
     assert ("misread another version" in reason) is misread, reason
+
+
+def test_a_sqlite_fault_is_a_schema_kind_only_when_the_schema_could_not_answer() -> None:
+    """A fault the store's schema classifier calls a wrong shape is ``sqlite_schema``; a TEXT value
+    SQLite cannot decode is the cell's own content; a malformed image or a lock is neither."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE t (a TEXT)")
+        conn.execute("INSERT INTO t VALUES (CAST(x'ff' AS TEXT))")
+        faults: dict[str, sqlite3.Error] = {}
+        for name, sql in (("column", "SELECT nope FROM t"), ("table", "SELECT 1 FROM nope")):
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError as exc:
+                faults[name] = exc
+        try:
+            conn.execute("SELECT a FROM t").fetchall()
+        except sqlite3.OperationalError as exc:
+            faults["decode"] = exc
+    finally:
+        conn.close()
+    assert set(faults) == {"column", "table", "decode"}, faults
+    assert dr_backup._sqlite_kind(faults["column"]) == "sqlite_schema"
+    assert dr_backup._sqlite_kind(faults["table"]) == "sqlite_schema"
+    assert dr_backup._sqlite_kind(faults["decode"]) == "damaged"
+    malformed = sqlite3.DatabaseError("database disk image is malformed")
+    assert dr_backup._sqlite_kind(malformed) == "sqlite"
+    assert dr_backup._sqlite_kind(sqlite3.OperationalError("database is locked")) == "sqlite"
+
+
+def test_a_walk_verdict_keeps_its_kind_through_copy_and_pickle() -> None:
+    import copy
+    import pickle
+
+    verdict = dr_backup.WalkVerdict("FAIL", "messages.raw id=1 did not decrypt", 3, "cell")
+    for clone in (copy.copy(verdict), copy.deepcopy(verdict), pickle.loads(pickle.dumps(verdict))):
+        assert tuple(clone) == ("FAIL", "messages.raw id=1 did not decrypt", 3)
+        assert clone.kind == "cell"
+
+
+def test_a_shown_locator_is_bounded_and_cut_on_a_whole_escape() -> None:
+    """A locator value is shown at most 64 characters and the elision mark, escaped character by
+    character, so no escape is split and a huge value is never escaped whole."""
+    from messagefoundry.store.cipher_cells import _LOCATOR_LIMIT, _shown
+
+    for value in (chr(0xE0001) * 70, "\\" * 40 + "\x00", "a" * 65, chr(0xE0001) * 10**6):
+        shown = _shown(value)
+        assert len(shown) <= _LOCATOR_LIMIT + 3, (len(shown), shown[:80])
+        if not value[:_LOCATOR_LIMIT].isprintable():
+            # Whole escapes only, so the shown text decodes back without an error.
+            shown.removesuffix("...").encode("ascii").decode("unicode_escape")
+    assert _shown("short id") == "short id"
+    assert _shown("a" * 64) == "a" * 64
+    assert _shown(chr(0xE0001)) == "\\U000e0001"
+
+
+def test_a_real_outage_and_a_real_cell_finding_carry_their_kind(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the real walk: an outage gets no misread framing under an incompatible
+    open, and a damaged cell does."""
+    from messagefoundry.store.crypto import CipherUnavailableError
+
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "raw", rowid, "x" + value[1:])
+    assert dr_backup._decrypt_check(db, settings).kind == "cell"
+    _incompatible_open(monkeypatch)
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "misread another version" in reason, reason
+
+    (tmp_path / "down").mkdir()
+    db, settings = _copy(_template, tmp_path / "down")
+
+    def down(_cipher: Any, _stored: str, _aad: bytes) -> CipherError:
+        return CipherUnavailableError("synthetic: the key service did not answer")
+
+    monkeypatch.setattr(cipher_cells_module, "decrypt_or_error", down)
+    assert dr_backup._decrypt_check(db, settings).kind == "outage"
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "did not return a usable answer" in reason and "misread another" not in reason, reason
+
+
+def test_the_incompatible_refusal_redacts_the_walk_line(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk's reason is redacted inside the refusal builder: an HL7-shaped run in it never
+    reaches the reason, whatever the walk handed back."""
+    _incompatible_open(monkeypatch)
+    phi = "PID|1||MRN123456^^^HOSP^MR||DOE^JOHN^Q||19700101|M"
+    walked = dr_backup.WalkVerdict("FAIL", f"messages.raw id=1 did not decrypt: {phi}", 0, "cell")
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: walked)
+    db, settings = _copy(_template, tmp_path)
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "messages.raw id=1 did not decrypt" in reason, reason
+    assert "DOE^JOHN" not in reason and "MRN123456" not in reason, reason
+
+
+def test_a_long_escaped_locator_leaves_the_walk_lines_verdict_words(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A response row whose three locator values each hold 70 non-printable astral characters is
+    shown at most 64 escaped characters a value, so the refusal still says the cell did not
+    decrypt (BACKLOG #1719 item 3)."""
+    db, settings = _copy(_template, tmp_path)
+    tag = chr(0xE0001) * 70  # a format character: not printable, escaped as ten characters
+    conn = sqlite3.connect(db)
+    try:
+        (rowid,) = conn.execute("SELECT rowid FROM response ORDER BY rowid LIMIT 1").fetchone()
+        conn.execute(
+            "UPDATE response SET message_id = ?, destination_name = ?, response_seq = ?"
+            " WHERE rowid = ?",
+            (tag, tag, tag, rowid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _incompatible_open(monkeypatch)
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "response.body" in reason and "did not decrypt" in reason, reason
+    assert tag not in reason

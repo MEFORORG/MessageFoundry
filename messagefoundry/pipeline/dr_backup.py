@@ -56,7 +56,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, NamedTuple, cast
+from typing import Any, BinaryIO, Literal, NamedTuple, cast
 
 from messagefoundry import file_lock
 from messagefoundry.config import atomic_edit
@@ -101,7 +101,7 @@ from messagefoundry.store.crypto import (
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
-from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.store.schema_verify import SchemaMismatchError, is_schema_step_error
 from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.transports.file import (
     _FLAG_BACKUP_SEMANTICS,
@@ -4785,9 +4785,12 @@ def _full_open_check(
 
     # Whether the last `_walk` returned `_decrypt_check`'s own verdict, rather than one for a raise.
     walk_read: list[bool] = [False]
+    # The last walk's `WalkVerdict.kind`, or None for one that raised or carries no kind.
+    walk_kind: list[WalkKind | None] = [None]
 
     def _walk() -> tuple[str, str, int]:
         walk_read[0] = False
+        walk_kind[0] = None
         try:
             result = _decrypt_check(snap, snap_settings, posture=posture)
         except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
@@ -4798,6 +4801,7 @@ def _full_open_check(
             # order below decides; after the open it is the verdict.
             return "FAIL", safe_exc(exc), 0
         walk_read[0] = True
+        walk_kind[0] = getattr(result, "kind", None)
         return result
 
     # The cells are read FIRST, from the snapshot as the archive holds it (BACKLOG #1719). The open
@@ -4853,16 +4857,16 @@ def _full_open_check(
         if walked_cells:
             # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
             if walked[0] != "PASS":
-                # A key mismatch or a key-service outage is not this build reading the cells, so
-                # it is not offered that reading; a FAIL that read them, a SQLite fault included,
-                # may be.
+                # Only a finding this build could reach by reading another version's cells or
+                # schema differently is offered that reading (`_MISREADABLE_KINDS`).
                 why = (
-                    " (the remedy leads because this build can misread another version's cells)"
-                    if walked[0] == "FAIL" and not walked[1].startswith(_OUTAGE_LEAD)
+                    " (the remedy leads because this build can misread another version's cells"
+                    " or schema)"
+                    if walk_kind[0] in _MISREADABLE_KINDS
                     else ""
                 )
-                # Redacted by `_incompatible_snapshot`, which does not cut it to safe_text's
-                # default, so its tail survives in this reason.
+                # Redacted by `_incompatible_snapshot` under `_WALK_REASON_LIMIT`, not safe_text's
+                # 200-character default, which the prefix and a reading's line together can pass.
                 walk = (
                     f"Before the open, the walk of the cells this build knows reported {walked[0]}"
                     f"{why}: {walked[1]}"
@@ -4903,7 +4907,10 @@ def _full_open_check(
 _INCOMPATIBLE_REASON_LIMIT = 600
 
 #: The most characters of the walk's sentence the incompatible-snapshot refusal quotes. Its parts
-#: are bounded where they are made, so this only keeps a defect from making it unbounded.
+#: are bounded where they are made: at least a cell's locator values, at 64 characters and an
+#: elision mark each (`cipher_cells._shown`), and error text at safe_exc's 200 plus its notes. A
+#: reading's line, the foreign-key note included, then stays well inside this, verdict and reason
+#: words included, so the cut only stops a defect from making the sentence unbounded.
 _WALK_REASON_LIMIT = 2000
 
 #: How :func:`_decrypt_check` opens the reason for a decrypt the key service gave no verdict on.
@@ -4956,11 +4963,67 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
+#: What decided a :func:`_decrypt_check` verdict. ``cell`` is a sealed value that did not open or
+#: a value with no marker; ``damaged`` a BLOB or a TEXT value SQLite cannot decode, neither of
+#: which this build's writer stores; ``sqlite_schema`` a statement the snapshot's schema could not answer, by
+#: :func:`is_schema_step_error`, other than a virtual table's missing module; ``sqlite`` any other
+#: SQLite fault; ``interrupted`` a schema change mid-walk; ``outage`` a key service that gave no
+#: verdict; ``key_mismatch`` a keyed snapshot read with no key; ``pass`` none.
+WalkKind = Literal[
+    "pass",
+    "cell",
+    "damaged",
+    "sqlite_schema",
+    "sqlite",
+    "interrupted",
+    "outage",
+    "key_mismatch",
+]
+
+#: The kinds a walk under this build can reach by reading another version's cells or schema
+#: differently, as well as by real damage, so the incompatible-snapshot refusal offers that reading
+#: for these. It is a possible cause there, never a finding that the cells are sound.
+_MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
+
+
+class WalkVerdict(tuple[str, str, int]):
+    """A :func:`_decrypt_check` verdict: ``(status, reason, cells)``, as every caller unpacks it,
+    with the :data:`WalkKind` that decided it on ``kind``."""
+
+    kind: WalkKind
+
+    def __new__(cls, status: str, reason: str, cells: int, kind: WalkKind) -> WalkVerdict:
+        verdict = super().__new__(cls, (status, reason, cells))
+        verdict.kind = kind
+        return verdict
+
+    def __getnewargs__(self) -> tuple[str, str, int, WalkKind]:
+        # So copy and pickle rebuild it with its kind; tuple's own supplies only the three items.
+        return (self[0], self[1], self[2], self.kind)
+
+    def __repr__(self) -> str:
+        return f"WalkVerdict({self[0]!r}, {self[1]!r}, {self[2]!r}, kind={self.kind!r})"
+
+
+def _sqlite_kind(exc: sqlite3.Error) -> WalkKind:
+    """``sqlite_schema`` where the store's own schema classifier (:func:`is_schema_step_error`)
+    calls the fault a wrong shape, except a virtual table's missing module, which is an object
+    another tool left rather than another version's schema; ``damaged`` for a TEXT value SQLite
+    could not decode; else ``sqlite``."""
+    text = str(exc)
+    if is_schema_step_error(exc) and "no such module" not in text:
+        return "sqlite_schema"
+    if isinstance(exc, sqlite3.OperationalError) and text.startswith(_DECODE_ERROR_PREFIX):
+        return "damaged"
+    return "sqlite"
+
+
 def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
-) -> tuple[str, str, int]:
+) -> WalkVerdict:
     """Decrypt AND authenticate every cipher-covered cell retained in the snapshot, under the store's own
-    cipher. Returns ``(status, message, cells)`` — a COUNT and a PHI-free reason, never a plaintext.
+    cipher. Returns a :class:`WalkVerdict`, ``(status, message, cells)`` with the :data:`WalkKind`
+    that decided it — a COUNT and a PHI-free reason, never a plaintext.
 
     Opening the store proves the file is a readable SQLite database. It does not prove the PHI inside it
     is readable, and those are the two different claims a disaster-recovery check gets confused about: a
@@ -4997,7 +5060,7 @@ def _decrypt_check(
     try:
         mismatch = keyed_store_mismatch(conn, cipher, store_tables(conn), source="snapshot")
         if mismatch is not None:
-            return "KEY_MISMATCH", mismatch, cells
+            return WalkVerdict("KEY_MISMATCH", mismatch, cells, "key_mismatch")
         for reading in read_cipher_cells(conn, cipher, unmarked=True):
             if reading.kind == "unmarked":
                 # A non-blank value with no marker on a surface the keyed store sealed: the store
@@ -5006,12 +5069,13 @@ def _decrypt_check(
                 # plaintext, and so does this. Only a keyed walk yields one.
                 if settings.allow_unmarked_ciphertext:
                     continue
-                return (
+                return WalkVerdict(
                     "FAIL",
                     f"{reading.cell.table}.{reading.cell.column} {reading.where} carries no "
                     "at-rest marker on a surface this keyed store has sealed, so the store "
                     "refuses it at read: a damaged or stripped marker, or a planted row",
                     cells,
+                    "cell",
                 )
             if reading.kind == "legacy":
                 # Plaintext on a surface no keyed open recorded, which the next keyed open seals.
@@ -5022,40 +5086,41 @@ def _decrypt_check(
                 # unambiguously the cause. Keylessness is the CIPHER's, never a plaintext's: a
                 # decrypted value may itself begin with the marker. A BLOB never comes here.
                 mismatch = with_first_failure(reading.failure(source="snapshot"), first_blob)
-                return "KEY_MISMATCH", mismatch, cells
+                return WalkVerdict("KEY_MISMATCH", mismatch, cells, "key_mismatch")
             elif reading.kind == "blob":
                 # FAIL under any cipher, and never the keyring's: no key makes a BLOB readable.
                 if cipher.encrypts:
-                    return "FAIL", reading.failure(source="snapshot"), cells
+                    return WalkVerdict("FAIL", reading.failure(source="snapshot"), cells, "damaged")
                 first_blob = first_blob or reading.failure(source="snapshot")
             elif reading.kind == "failed":
                 if reading.error is not None and gave_no_verdict(reading.error):
                     # The key service failed, not the value: the walk stops here, as
                     # `cipher-audit` stops on an outage, and the reason says so rather than
                     # calling the cell undecryptable (BACKLOG #1719 item 12). Still no PASS.
-                    return (
+                    return WalkVerdict(
                         "FAIL",
                         f"{_OUTAGE_LEAD} ({_error_classes(reading.error)}) while "
                         f"{reading.cell.table}.{reading.cell.column} {reading.where} was read, so "
                         f"the walk stopped without a verdict on it: {safe_exc(reading.error)}",
                         cells,
+                        "outage",
                     )
                 # Only under a key: a keyless walk never decrypts. FAIL, not KEY_MISMATCH:
                 # CipherError cannot separate a corrupted ciphertext from a key that was never
                 # supplied, so the softer verdict on a bit-flipped PHI cell is the reading that
                 # must not be talked down.
-                return "FAIL", reading.failure(source="snapshot"), cells
+                return WalkVerdict("FAIL", reading.failure(source="snapshot"), cells, "cell")
             elif reading.kind == "opened":
                 cells += 1
         if first_blob is not None:
-            return "FAIL", first_blob, cells
+            return WalkVerdict("FAIL", first_blob, cells, "damaged")
     except sqlite3.Error as exc:
-        return "FAIL", _sqlite_error_reason(exc), cells
+        return WalkVerdict("FAIL", _sqlite_error_reason(exc), cells, _sqlite_kind(exc))
     except CipherWalkInterrupted as exc:  # nothing else writes a snapshot, but never PASS a part
-        return "FAIL", str(exc), cells
+        return WalkVerdict("FAIL", str(exc), cells, "interrupted")
     finally:
         conn.close()
-    return "PASS", "ok", cells
+    return WalkVerdict("PASS", "ok", cells, "pass")
 
 
 def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
