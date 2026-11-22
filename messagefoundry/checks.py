@@ -125,11 +125,6 @@ _SETTINGS_LOAD_ERRORS: tuple[type[Exception], ...] = (ValueError, OSError)
 #: The settings resolutions and loads of one :func:`run_checks` call, so each runs once per run
 #: rather than once per settings leg (vault BACKLOG #2950 added items 6 and 13). ``None`` outside a
 #: run: a leg called on its own resolves and loads afresh, as it always did.
-#:
-#: The key is the arguments alone, not the working directory or the environment, on purpose: the
-#: memo is a snapshot of the run. :func:`run_checks` resolves the source once, before the config
-#: modules are imported, and tags each leg's line with it, so a leg that resolved again after a
-#: module changed either would grade settings that tag does not name.
 _RUN_MEMO: ContextVar[dict[tuple[object, ...], object] | None] = ContextVar(
     "_RUN_MEMO", default=None
 )

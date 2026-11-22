@@ -230,8 +230,10 @@ def test_the_census_of_queued_calls_matches_the_client() -> None:
 def test_no_method_builds_its_own_read_keyword_timeout() -> None:
     """RED when: an ``EngineClient`` method builds its own ``httpx.Timeout(..., read=...)`` rather
     than calling ``_sign_in_timeout``, so a longer reply wait escapes the census above. Control:
-    the scan finds the one method that does build one, ``_sign_in_timeout`` itself. A positional
-    ``httpx.Timeout(n)`` or a scalar ``timeout=`` is not scanned."""
+    the scan finds the one method that does build one, ``_sign_in_timeout`` itself. It reads only
+    a ``read=`` keyword in a call inside a method body, so at least these escape it: a positional
+    ``httpx.Timeout(n)``, a scalar ``timeout=``, a module-level ``httpx.Timeout`` constant or helper
+    passed in, and ``httpx.Timeout(**kw)``."""
     assert _methods_setting_a_read_timeout() == {"_sign_in_timeout"}
 
 
