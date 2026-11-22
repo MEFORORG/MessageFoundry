@@ -312,10 +312,12 @@ _B64_WHITESPACE = " \t\n\r\f\v"
 
 def _plaintext(value: object) -> str | None:
     """Transit's base64 ``plaintext`` as text, with :data:`_B64_WHITESPACE` removed first, so a
-    reply that a hop rewrapped opens as it does unwrapped (BACKLOG #5964). ``None`` for at least a
-    value that is not a ``str``, a non-empty reply of whitespace alone, any other character outside
-    the alphabet, bad padding, or bytes that are not UTF-8. The empty string opens as itself, and
-    non-zero trailing bits in the last character are still accepted. A decode failure returns
+    reply that a hop rewrapped opens as it does unwrapped, with one exception (BACKLOG #5964): a
+    reply of whitespace alone is refused even if the sealed value was empty, which differs from
+    the earlier non-strict decode. ``None`` for at least that reply, a value that is not a
+    ``str``, any other character outside the alphabet, bad padding, or bytes that are not UTF-8.
+    The empty string opens as itself, and non-zero trailing bits in the last character are still
+    accepted. A decode failure returns
     ``None`` rather than raising, so its error cannot carry the decrypted bytes (BACKLOG #2085);
     only ``ValueError`` is caught, so a ``MemoryError`` still propagates."""
     if not isinstance(value, str):
