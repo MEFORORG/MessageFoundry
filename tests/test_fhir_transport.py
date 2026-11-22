@@ -436,7 +436,7 @@ def test_a_static_header_value_with_a_line_break_is_refused_at_construction() ->
 
 @pytest.mark.parametrize("name", ["X-Caf\u00e9", "X:A", " X-A", "X\r\nA"])
 def test_an_unsendable_static_header_name_is_refused_at_construction(name: str) -> None:
-    with pytest.raises(ValueError, match="not a header name http.client can send"):
+    with pytest.raises(ValueError, match="not a header name the engine sends"):
         _dest(headers={name: "1"})
 
 

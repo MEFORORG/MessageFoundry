@@ -142,6 +142,7 @@ from messagefoundry.transports.rest import (
     refuse_url_credentials,
     refuse_verify_off,
     revocation_attestation_from_settings,
+    unsendable_request_target,
     url_scheme,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -878,10 +879,10 @@ def _refuse_unsendable_conditional_query(query: str, conditional: str | None, ba
     """
     setting = "FHIR destination 'conditional_query'"
     if conditional == "conditional-update":
-        # isascii and the control-character screen leave the space as the only whitespace.
-        if not query.isascii() or " " in query or "#" in query:
+        # The request-line rule the static base url is judged by (BACKLOG #5911).
+        if unsendable_request_target(query):
             raise ValueError(
-                f"{setting} must be ASCII with no space or '#' for "
+                f"{setting} must be ASCII with no space, control character, DEL or '#' for "
                 "conditional='conditional-update' (it is sent unencoded in the request URL); "
                 "percent-encode the search parameters"
             )
@@ -1194,6 +1195,22 @@ class FhirDestination(DestinationConnector):
         # (http.header.* entries). Default False → the delivery worker skips the metadata read and send
         # is byte-identical. When True, consumes_metadata tells the worker to pass this message's bag.
         self.consumes_metadata: bool = bool(s.get("dynamic_headers", False))
+        self._headers = self._build_headers(s)
+        # vault BACKLOG #1965: on an update sent as a transaction entry, a static conditional header,
+        # which qualified every PUT, moves into the entry with the rest; on the outer POST it would
+        # qualify the Bundle. The path form (#2550) is a plain PUT, so its headers stay where they are.
+        wraps_update = self._is_update and not self._path_form
+        self._static_conditionals = {
+            name: self._headers.pop(name)
+            for name in list(self._headers)
+            if wraps_update and name.lower() in _ENTRY_CONDITIONAL_FIELDS
+        }
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
+        # bad conditional_query does, rather than every message at send time. Before any hop gate,
+        # so none audits a crossing for a connection that never builds (#5529). A static
+        # conditional moved into the Bundle entry above is JSON there, never an HTTP header, so it
+        # is not judged by the header rules.
+        refuse_unsendable_static_request(url, self._headers, setting="FHIR destination")
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
         # ADR 0153 decision 2: the OPPOSITE per-connection declaration — this hop is cleartext, is not
@@ -1202,21 +1219,6 @@ class FhirDestination(DestinationConnector):
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
-        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
-        # bad conditional_query does, rather than every message at send time. Before any hop gate,
-        # so none audits a crossing for a connection that never builds (#5529). A static
-        # conditional that a wrapped update moves into the Bundle entry (#1965, below) is JSON
-        # there, never an HTTP header, so it is not judged by the header rules.
-        wrapped = self._is_update and not self._path_form
-        refuse_unsendable_static_request(
-            url,
-            {
-                name: value
-                for name, value in self._build_headers(s).items()
-                if not (wrapped and name.lower() in _ENTRY_CONDITIONAL_FIELDS)
-            },
-            setting="FHIR destination",
-        )
         self._proxy: ProxyConfig | None = egress_route_from_settings(
             s,
             dest_scheme=scheme,
@@ -1228,16 +1230,6 @@ class FhirDestination(DestinationConnector):
         proxy_dest = self._proxy.for_host(self.base_url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
-        self._headers = self._build_headers(s)
-        # vault BACKLOG #1965: on an update sent as a transaction entry, a static conditional header,
-        # which qualified every PUT, moves into the entry with the rest; on the outer POST it would
-        # qualify the Bundle. The path form (#2550) is a plain PUT, so its headers stay where they are.
-        wraps_update = self._is_update and not self._path_form
-        self._static_conditionals = {
-            name: self._headers.pop(name)
-            for name in list(self._headers)
-            if wraps_update and name.lower() in _ENTRY_CONDITIONAL_FIELDS
-        }
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
             self._headers.update(proxy_dest.auth_headers())
@@ -1973,7 +1965,8 @@ def _mint_bearer(token: Any, prefix: str) -> str:
 
     The mint runs before the GET's own ``try``. The provider raises ``DeliveryError`` for a failed
     mint: a refused or unreachable endpoint, an unparseable reply, or a refused reply body (an
-    ``EgressReplyError``, which is a subclass). It raises ``ValueError`` when a configured value is
+    ``EgressReplyError``, or, for a 2xx reply in a content coding, the ``token-reply-coded``
+    ``NegativeAckError`` of BACKLOG #5910; both are subclasses). It raises ``ValueError`` when a configured value is
     over the length limit. Neither is a lookup error, so a Handler that caught ``FhirLookupError``
     missed it (BACKLOG #1980). The ``DeliveryError`` text names the redacted token URL and a status
     or reason, or, for a refused reply body, only the fixed hop label (BACKLOG #2060). It never
@@ -2038,6 +2031,12 @@ class FhirLookupExecutor:
         # all. `None` (a direct test build) = the OS trust store, byte-identical.
         from messagefoundry.transports.smart import token_provider_from_settings
 
+        # BACKLOG #5911: every lookup's static url and headers are screened before any lookup is
+        # built, so a refused build leaves no hop-gate crossing record from a lookup the loop below
+        # built before it (#5529).
+        screened = {
+            cname: self._screened_static_request(cname, raw) for cname, raw in connections.items()
+        }
         self._base: dict[str, str] = {}
         self._headers: dict[str, dict[str, str]] = {}
         self._timeout: dict[str, float] = {}
@@ -2057,20 +2056,7 @@ class FhirLookupExecutor:
             # are their own namespace: an outbound and a lookup may share a name, and the records must
             # still tell them apart. The same prefix the loosening reports use (accepted_cleartext_hops).
             label = fhir_lookup_record_name(cname)
-            url = s.get("url")
-            if not isinstance(url, str) or not url:
-                raise ValueError(
-                    f"FhirLookup {cname!r} requires a 'url' setting (the FHIR base URL)"
-                )
-            # #1241: the SECOND url construction site in this module. The destination screens its
-            # own; screening one and not its sibling reproduces the asymmetry the item reports.
-            _reject_config_control_chars(url, "url", f"lookup {cname!r}")
-            scheme = url_scheme(url, f"FhirLookup {cname!r} 'url'")
-            if scheme not in ("http", "https"):
-                raise ValueError(
-                    f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"
-                )
-            refuse_url_credentials(url, f"FhirLookup {cname!r} 'url'")
+            url, scheme, headers = screened[cname]
             self._base[cname] = url
             # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
             self._timeout[cname] = positive_seconds(
@@ -2085,10 +2071,6 @@ class FhirLookupExecutor:
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
             # arrives in these settings, mirrored from the spec's typed fields by
             # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
-            # BACKLOG #5911: the destination's static-settings screen, at this sibling too (#1241).
-            refuse_unsendable_static_request(
-                url, self._build_headers(s), setting=f"FhirLookup {cname!r}"
-            )
             # Vault BACKLOG #3139: a refusal from either reader names the lookup, as the url checks do.
             try:
                 attested = hop_attestation_from_settings(s)
@@ -2112,7 +2094,6 @@ class FhirLookupExecutor:
             )
             proxy_dest = proxy.for_host(url) if proxy is not None else None
             proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
-            headers = self._build_headers(s)
             if proxy_dest is not None:
                 headers.update(proxy_dest.auth_headers())  # pre-emptive Proxy-Authorization (0126)
             # The read sends Authorization (static or SMART) — refuse it over cleartext http.
@@ -2203,6 +2184,29 @@ class FhirLookupExecutor:
                     _redact_url(url),
                 )
                 self._opener[cname] = _insecure_opener(*proxy_handlers)
+
+    @classmethod
+    def _screened_static_request(
+        cls, cname: str, s: Mapping[str, Any]
+    ) -> tuple[str, str, dict[str, str]]:
+        """The lookup's base url, its scheme and its static headers, once they pass the screens.
+
+        #1241: the SECOND url construction site in this module. The destination screens its own;
+        screening one and not its sibling reproduces the asymmetry the item reports. BACKLOG #5911:
+        the destination's static-settings screen runs here too."""
+        url = s.get("url")
+        if not isinstance(url, str) or not url:
+            raise ValueError(f"FhirLookup {cname!r} requires a 'url' setting (the FHIR base URL)")
+        _reject_config_control_chars(url, "url", f"lookup {cname!r}")
+        scheme = url_scheme(url, f"FhirLookup {cname!r} 'url'")
+        if scheme not in ("http", "https"):
+            raise ValueError(
+                f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"
+            )
+        refuse_url_credentials(url, f"FhirLookup {cname!r} 'url'")
+        headers = cls._build_headers(s)
+        refuse_unsendable_static_request(url, headers, setting=f"FhirLookup {cname!r}")
+        return url, scheme, headers
 
     @staticmethod
     def _build_headers(s: Mapping[str, Any]) -> dict[str, str]:

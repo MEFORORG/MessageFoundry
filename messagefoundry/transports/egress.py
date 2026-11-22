@@ -352,8 +352,8 @@ def _check_ech_sidecar_egress(
     :func:`~messagefoundry.transports.rest.ech_sidecar_url_from_settings`, the resolver the
     connector dials from, so a value the build refuses is refused here first, in that resolver's
     words, which name no credential. That includes a URL credential, which urllib would dial as
-    part of the host rather than the host this gate reads. A port that cannot be read, or port 0,
-    which no entry can list, is refused next in fixed words. The port is the URL's, or 80 for
+    part of the host rather than the host this gate reads, a port that cannot be read, and port 0,
+    which no entry can list. The port is the URL's, or 80 for
     ``http`` and 443 for ``https`` where it names none, as urllib dials. That host and port, and
     each entry, are read by :func:`~messagefoundry.config.settings.pinned_host_port`, the parse the
     list is validated with at load, so an IP literal compares in one spelling and an entry it
@@ -371,26 +371,10 @@ def _check_ech_sidecar_egress(
         raise WiringError(f"{label}: {refusal}")
     if sidecar is None:
         return
-    # Uncached, as the resolver's own split is (vault BACKLOG #5287).
+    # Uncached, as the resolver's own split is (vault BACKLOG #5287). The resolver has refused a
+    # port that cannot be read, so this read does not raise.
     parts = _UNCACHED_URLSPLIT(sidecar)
-    try:
-        url_port = parts.port
-        unreadable = False
-    except ValueError:
-        # A port of more than 4300 digits, leading zeros and all, passes the resolver's credential
-        # screen and breaks int(). urlsplit's own text is not let out.
-        url_port, unreadable = None, True
-    if unreadable:
-        log.warning("egress denied: %s ECH sidecar port cannot be read", label)
-        raise WiringError(f"{label}: ech_sidecar names a port that cannot be read as a number")
-    if url_port == 0:
-        # Not "not in the allowlist": no entry can list port 0, so that would send the operator
-        # looking for an entry to add.
-        log.warning("egress denied: %s ECH sidecar names port 0", label)
-        raise WiringError(
-            f"{label}: ech_sidecar names port 0, which is not a port a sidecar can listen on and "
-            "no [egress].allowed_ech_sidecar entry can list; name the sidecar's own port"
-        )
+    url_port = parts.port
     if not allowed_ech_sidecar:
         log.warning(
             "egress denied: %s ECH sidecar set with an empty [egress].allowed_ech_sidecar", label
