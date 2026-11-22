@@ -3678,8 +3678,12 @@ _PROVISION_REVOKE_RETRY: Final = _RevokeRetry(
 )
 
 
-#: How long ``provision-admin``'s revoke re-ran before it was given up on, for its texts.
-_PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes"
+#: How ``provision-admin``'s revoke was re-run before it was given up on, for its texts. It names
+#: the budget, not a duration: an attempt itself is unbounded, and a re-run may start up to one
+#: pause past the budget (vault BACKLOG #3023 items 16, 31 and 39).
+_PROVISION_REVOKE_GAVE_UP: Final = (
+    f"on every attempt, re-run on a {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g}-minute budget"
+)
 
 
 #: What ``provision-admin`` tells the operator to do when a revoke after a grant that may have
@@ -3688,8 +3692,8 @@ _PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PR
 _PROVISION_REVOKE_RECOVERY: Final = (
     "Running provision-admin again does not help: it refuses an account that holds the role. Once "
     "the store answers again, run 'messagefoundry admin-revoke-sessions' on this host, with the "
-    "--service-config or --db this command used: it ends every account's sessions, that one's "
-    "included"
+    "--service-config or --db this command used: it ends the sessions it finds, of any account, "
+    "that one's included"
 )
 #: Said after :data:`_PROVISION_REVOKE_RECOVERY` where the give-up wrote its miss row.
 _PROVISION_REVOKE_MISS_ROW: Final = (
