@@ -80,15 +80,12 @@ _KEYED_DETAIL = (
     " so restarting under the old key would zero its AES-GCM use count, which lives in the store. If"
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
-# The ALTER re-check's prefix when an object other than the altered table fails to parse. Only the
-# view and trigger forms: this build creates neither (see _ORDINARY_TABLE), so the object named is
-# another tool's. SQLite uses the same form for a table or an index, which may be this build's own.
-_FOREIGN_OBJECT_PREFIXES = ("error in view ", "error in trigger ")
-# Dropping a view or a trigger removes no row, so this remedy keeps the store and its key.
-_REMEDY_FOREIGN = (
-    "holds a view or trigger this build did not create, which stops its upgrade: drop that object,"
-    " then restart."
-)
+# The kinds the ALTER re-check names, as "error in <kind> <name>: ...", when an object other than
+# the altered table fails to parse. Only views and triggers: this build creates neither (see
+# _ORDINARY_TABLE), so the object named is another tool's. SQLite uses the same form for a table or
+# an index, which may be this build's own. Dropping a view or a trigger removes no row, so that
+# remedy keeps the store and its key.
+_FOREIGN_KINDS = ("view", "trigger")
 
 # The reads below skip a table whose stored SQL is LIKE 'CREATE VIRTUAL TABLE%', because a pragma
 # on a virtual table whose module is not loaded here can raise "no such module" (BACKLOG #6719).
@@ -350,17 +347,20 @@ async def verify_live_schema(
     service's key still gets the new-key remedy. A process that HAS a key is never overruled by the
     file, because a restored cell-bound store also has counts and no salt row until its first open.
 
-    A read that fails on the store's shape is refused the same way, through
+    A read of the live store that fails on its shape is refused the same way, through
     :func:`run_schema_step` (BACKLOG #6720): a virtual table whose stored SQL the
     ``_ORDINARY_TABLE`` predicate does not recognise, held under an expected name, raises "no such
-    module" from the column read rather than reading as a difference.
+    module" from the column read rather than reading as a difference. The expected shape is built
+    outside that, so a failure of this build's own script or migrations keeps its own error.
     """
-    problems = await run_schema_step(
+    expected = await _expected_shape(schema, migrate)
+    live = await run_schema_step(
         db,
-        live_schema_differences(db, schema=schema, migrate=migrate),
+        read_schema_shape(db, sorted(expected.columns)),
         path=path,
         counts_under_dek=counts_under_dek,
     )
+    problems = schema_differences(expected, live)
     if problems:
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
@@ -396,7 +396,8 @@ _SHAPE_MESSAGES = (
 
 
 def is_schema_step_error(exc: BaseException) -> bool:
-    """Whether ``exc``, raised by the schema script or a migration, says the store's shape is wrong.
+    """Whether ``exc``, raised by the schema script, a migration or the verify's read of the live
+    store, says the store's shape is wrong.
 
     Two tests, both needed. The code must be SQLite's generic ``SQLITE_ERROR``: a busy or locked
     file, a read-only file, an I/O error, a full disk and a corrupt file each carry their own primary
@@ -421,8 +422,8 @@ async def run_schema_step[T](
     path: object,
     counts_under_dek: bool | None,
 ) -> T:
-    """Await the schema script, the migrations or the verify's read, turning a shape failure into a
-    refusal, and return what the step returned.
+    """Await the schema script, the migrations or the verify's read of the live store, turning a
+    shape failure into a refusal, and return what the step returned.
 
     A failure :func:`is_schema_step_error` accepts is raised as :class:`SchemaMismatchError`, from
     the original so the driver's text stays in the chain (BACKLOG #2101). It carries the remedy a
@@ -433,16 +434,22 @@ async def run_schema_step[T](
     One shape failure gets another remedy: SQLite's re-check of the schema after an ``ALTER``
     names the view or trigger it could not parse, as in "error in view V: no such module". This
     build creates neither kind, so that object is another tool's, and dropping it lets the
-    migration run past it (BACKLOG #6719)."""
+    migration run past it (BACKLOG #6719). A view under a name this build creates is not such an
+    object: it holds the place of a table or index, which is the incompatible store the plain
+    remedy names."""
     try:
         return await step
     except Exception as exc:
         if not is_schema_step_error(exc):
             raise
         cause = str(exc)
-        if cause.startswith(_FOREIGN_OBJECT_PREFIXES):
+        foreign = await _foreign_object(cause)
+        if foreign is not None:
+            kind, name = foreign
             raise SchemaMismatchError(
-                f"store {path} {_REMEDY_FOREIGN} The schema step failed: {cause}.", cause=cause
+                f"store {path} holds a {kind} {name!r} this build did not create, which stops its"
+                f" upgrade: drop it, then restart. The schema step failed: {cause}.",
+                cause=cause,
             ) from exc
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
@@ -450,6 +457,27 @@ async def run_schema_step[T](
             f"store {path} {_remedy(counts_under_dek)} The schema step failed: {cause}.",
             cause=cause,
         ) from exc
+
+
+async def _foreign_object(cause: str) -> tuple[str, str] | None:
+    """The kind and name of another tool's view or trigger that ``cause`` names, else ``None``."""
+    for kind in _FOREIGN_KINDS:
+        prefix = f"error in {kind} "
+        if cause.startswith(prefix):
+            name = cause[len(prefix) :].split(":", 1)[0]
+            if kind == "view" and name.lower() in await _names_this_build_creates():
+                return None
+            return kind, name
+    return None
+
+
+async def _names_this_build_creates() -> frozenset[str]:
+    """Every table and named index this build's SQLite schema and migrations create."""
+    # Imported here, as _expected_shape imports from store.py: store.py imports this module.
+    from messagefoundry.store.store import _SCHEMA, MessageStore
+
+    shape = await _expected_shape(_SCHEMA, MessageStore._migrate)
+    return frozenset(shape.columns) | frozenset(shape.named_indexes)
 
 
 async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:

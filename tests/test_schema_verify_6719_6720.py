@@ -15,6 +15,7 @@ measured from the local SQLite, not copied from the row.
 from __future__ import annotations
 
 import sqlite3
+import traceback
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -203,7 +204,7 @@ _TABLES_FLAGGED_VIRTUAL = (
 #: Every schema object with a flag saying whether it is a view or a trigger, so one walk both counts
 #: what it saw and finds those (a query for them alone returns nothing on the built schema, so it
 #: cannot show it ran). The flag is in the SQL, so the negative control below pins the same predicate.
-_OBJECTS_FLAGGED_VIEW = "SELECT name, type IN ('view', 'trigger') FROM sqlite_master"
+_OBJECTS_FLAGGED_VIEW_OR_TRIGGER = "SELECT name, type IN ('view', 'trigger') FROM sqlite_master"
 
 
 async def test_the_expected_shape_holds_no_virtual_table() -> None:
@@ -215,7 +216,7 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
         await MessageStore._migrate(db)
         async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
             tables = [tuple(r) for r in await cur.fetchall()]
-        async with db.execute(_OBJECTS_FLAGGED_VIEW) as cur:
+        async with db.execute(_OBJECTS_FLAGGED_VIEW_OR_TRIGGER) as cur:
             objects = [tuple(r) for r in await cur.fetchall()]
     # Positive control: the walk saw the built schema (40 tables when this floor was set), so the
     # absence below cannot pass on an empty walk.
@@ -229,8 +230,8 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
     # The reads skip views too, so a view this build created would never be verified either
     # (BACKLOG #6719 item 10). And the foreign-object remedy tells the operator to drop a view or a
     # trigger that stops an upgrade, which is safe only while this build creates neither.
-    views = [name for name, is_view in objects if is_view]
-    assert views == []
+    views_or_triggers = [name for name, flagged in objects if flagged]
+    assert views_or_triggers == []
 
 
 async def test_the_virtual_table_probe_finds_one_without_fts5(tmp_path: Path) -> None:
@@ -247,10 +248,10 @@ async def test_the_virtual_table_probe_finds_one_without_fts5(tmp_path: Path) ->
     async with _connected(path) as db:
         async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
             rows = {r[0]: bool(r[1]) for r in await cur.fetchall()}
-        async with db.execute(_OBJECTS_FLAGGED_VIEW) as cur:
-            views = [name for name, is_view in await cur.fetchall() if is_view]
+        async with db.execute(_OBJECTS_FLAGGED_VIEW_OR_TRIGGER) as cur:
+            flagged = {name for name, is_one in await cur.fetchall() if is_one}
     assert rows == {"plain": False, "planted": True}
-    assert views == ["v", "tr"]
+    assert flagged == {"v", "tr"}
 
 
 async def test_a_planted_ordinary_table_with_rootpage_zero_is_not_skipped(tmp_path: Path) -> None:
@@ -467,7 +468,7 @@ async def test_a_foreign_object_that_stops_a_migration_gets_the_drop_remedy(
     cause = info.value.cause
     assert cause is not None and cause.startswith(f"error in {kind} {name}: no such module"), cause
     text = str(info.value)
-    assert text.startswith(f"store {path} holds a view or trigger this build did not create"), text
+    assert text.startswith(f"store {path} holds a {kind} '{name}' this build did not create"), text
     assert "recreate" not in text and "NEW store key" not in text, text
     # The remedy is true: with that object dropped, the same migration runs and the open succeeds.
     _sql(path, drop)
@@ -499,30 +500,73 @@ async def test_a_shape_error_from_the_verify_read_is_refused_with_the_remedy(
     text = str(info.value)
     assert text.startswith(f"store {path} is from an incompatible version; recreate it:"), text
     assert "The schema step failed: no such module" in text, text
-    assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+    cause = info.value.__cause__
+    assert isinstance(cause, sqlite3.OperationalError)
+    # The verify's read raised it, not the script or a migration.
+    frames = {f.name for f in traceback.extract_tb(cause.__traceback__)}
+    assert {"run_schema_step", "read_schema_shape"} <= frames, frames
 
 
-async def test_a_read_error_that_is_not_a_shape_keeps_its_own_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Control: a read failure that recreating the store would not fix is not given the remedy.
+def _real_sqlite_error(statement: str) -> sqlite3.OperationalError:
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(sqlite3.OperationalError) as info:
+            conn.execute(statement)
+    finally:
+        conn.close()
+    return info.value
+
+
+async def _verify_raising(
+    monkeypatch: pytest.MonkeyPatch, target: str, exc: sqlite3.OperationalError
+) -> BaseException:
+    """``verify_live_schema`` with ``target`` raising ``exc``; returns what the verify raised."""
     from messagefoundry.store import schema_verify
 
-    async def locked(*_args: object, **_kwargs: object) -> list[str]:
-        raise sqlite3.OperationalError("database is locked")
+    async def raising(*_args: object, **_kwargs: object) -> object:
+        raise exc
 
-    monkeypatch.setattr(schema_verify, "live_schema_differences", locked)
+    monkeypatch.setattr(schema_verify, target, raising)
     async with _connected(":memory:") as db:
         with pytest.raises(sqlite3.OperationalError) as info:
             await schema_verify.verify_live_schema(
                 db,
                 schema=_SCHEMA,
                 migrate=MessageStore._migrate,
-                path="locked.db",
+                path="x.db",
                 counts_under_dek=False,
             )
-    assert not isinstance(info.value, SchemaMismatchError)
-    assert str(info.value) == "database is locked"
+    return info.value
+
+
+async def test_a_read_error_that_is_not_a_shape_keeps_its_own_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Control: a real SQLITE_ERROR whose message names no shape is not given the remedy.
+    exc = _real_sqlite_error("SELEC 1")
+    assert exc.sqlite_errorcode & 0xFF == sqlite3.SQLITE_ERROR
+    assert await _verify_raising(monkeypatch, "read_schema_shape", exc) is exc
+
+
+async def test_a_failure_building_the_expected_shape_keeps_its_own_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A shape message from this build's own scratch build is this build's defect, which recreating
+    # the store would not fix, so only the live read is classified.
+    exc = _real_sqlite_error("SELECT missing FROM sqlite_master")
+    assert is_schema_step_error(exc), str(exc)
+    assert await _verify_raising(monkeypatch, "_expected_shape", exc) is exc
+
+
+async def test_a_view_under_a_name_this_build_creates_is_not_another_tools_object() -> None:
+    from messagefoundry.store.schema_verify import _foreign_object
+
+    assert await _foreign_object("error in view vv: no such module: m") == ("view", "vv")
+    assert await _foreign_object("error in trigger tt: no such module: m") == ("trigger", "tt")
+    # A view that holds an expected table's or index's name is the incompatible store.
+    assert await _foreign_object("error in view users: no such module: m") is None
+    assert await _foreign_object("error in view IX_QUEUE_FIFO_IN_SEQ: no such module: m") is None
+    assert await _foreign_object("error in table users: no such module: m") is None
 
 
 # --- BACKLOG #6720 item 1: a foreign view using an unloaded function or collation ----------------
