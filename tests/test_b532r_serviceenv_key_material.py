@@ -53,7 +53,9 @@ def test_the_stand_ins_have_a_secrets_shape() -> None:
     assert not _URL_ONE_PAD.endswith("==") and "-" in _URL_ONE_PAD and "_" in _URL_ONE_PAD
 
 
-#: Each as the line or the item below an empty store key.
+#: Each as the line or the item below an empty store key. The ``x`` cases refused before BACKLOG
+#: #5394 items 6 and 12 too; the Windows-name cases below them did not, on a later line or in
+#: the next item, so only they show the change (Lander hold on PR 3142, finding 2).
 _SHAPES = (
     pytest.param(f"x={_KEY_B64}", id="ordinary-name-set-to-a-key"),
     pytest.param(_URL_ONE_PAD, id="base64url-one-pad"),
@@ -62,6 +64,11 @@ _SHAPES = (
     # Review round 2: a retired-keys list and a quoted key as an ordinary variable's value.
     pytest.param(f"x={_KEY_B64},{_KEY_B64}", id="ordinary-name-set-to-a-key-list"),
     pytest.param(f'x="{_KEY_B64}"', id="ordinary-name-set-to-a-quoted-key"),
+    # Names that may end an empty secret-class value (``serviceenv._ends_blank_class``), each
+    # set to a key, so only the value's key shape makes the empty key read as set.
+    pytest.param(f"Path={_KEY_B64}", id="windows-name-set-to-a-key"),
+    pytest.param(f"TEMP={_URL_ONE_PAD}", id="windows-name-set-to-a-base64url-key"),
+    pytest.param(f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}", id="directory-name-set-to-a-key"),
 )
 
 
@@ -77,6 +84,58 @@ def test_key_material_in_the_next_item_makes_the_empty_key_read_as_set(shape: st
     posture = _read([f"{_KEY}=", shape])
     assert posture.listed_keys == (_KEY,), posture.listed
     assert service_env_refusal(posture) is not None
+
+
+@pytest.mark.parametrize("shape", _SHAPES)
+def test_key_material_in_the_next_item_below_a_later_empty_line_reads_as_set(shape: str) -> None:
+    """The empty key on a later line of its own item, not the item's first."""
+    posture = _read([f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=", shape])
+    assert posture.listed_keys == (_KEY,), posture.listed
+    assert service_env_refusal(posture) is not None
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        (_KEY, base64.b64encode(b"synthetic-store-key-abcdefghij01").decode()),
+        ("MEFOR_STORE_PASSWORD", "hunter2"),
+    ],
+    ids=["store-key", "store-password"],
+)
+def test_a_secret_alone_below_an_ordinary_name_set_to_a_key_is_named(name: str, value: str) -> None:
+    """A line of an ordinary variable's shape whose value is a key, ``x=<key>``, still starts a
+    variable, so a secret's name alone below it, with its value on the next line, is read as that
+    secret and the refusal names it, with that secret's remedy, rather than the ``MEFOR_VALUE_*``
+    name the string opens with (Lander hold on PR 3142, finding 1)."""
+    posture = _read([f"MEFOR_VALUE_A\nx={_KEY_B64}\n{name}\n={value}"])
+    assert posture.listed == (name,), posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and refusal.startswith(name), refusal
+    if name == _KEY:
+        assert "DPAPI-protected key file" in refusal
+
+
+def test_an_ordinary_name_set_to_a_key_does_not_join_an_empty_value_item() -> None:
+    """An item with its own ``NAME=`` prefix is a variable of its own, so below an empty
+    ``MEFOR_VALUE_*`` item the empty entry is named, and the remedy does not say to remove the
+    item below it (Lander hold on PR 3142, finding 3)."""
+    posture = _read(["MEFOR_VALUE_A=", f"x={_KEY_B64}"])
+    assert posture.empty_value_names == ("MEFOR_VALUE_A",)
+    assert not posture.value_runs_on
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    assert "remove those strings with it" not in refusal
+
+
+def test_a_nameless_key_item_still_joins_an_empty_value_item() -> None:
+    """Control: an item with no name before its equals sign, ``=<key>``, is still read as the
+    empty ``MEFOR_VALUE_*`` item's value split from it, so the remedy says to remove it too."""
+    posture = _read(["MEFOR_VALUE_A=", f"={_KEY_B64}"])
+    assert posture.value_runs_on
+    assert posture.empty_value_names == ()
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and "remove those strings with it" in refusal
 
 
 @pytest.mark.parametrize(
