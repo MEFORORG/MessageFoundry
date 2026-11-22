@@ -2919,7 +2919,8 @@ secret. Each file in that directory holds one setting and is named exactly as it
   and one held in a directory that such an account owns or that a group or other may write
   without the sticky bit, since any account that may write it may replace what it holds. On
   Windows it also reads the folder that holds the directory, as [PHI.md](PHI.md)
-  section 2, *The folders above a key file*, states for a key file. It also
+  section 2, *The folders above a key file*, states for a key file, except where ADR 0214's
+  amendments say no such folder is read, such as at some drive roots. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
   whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
@@ -2958,9 +2959,9 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
 - **A container.** Mount a host directory read-only, as `docker/compose.yaml` shows for
   `/run/mefor/secrets`, and own it as the TLS directory there is owned: uid 10001, the directory
   `0700` and each file `0600`. The engine refuses a directory or file whose mode has a group or
-  other read or write bit, or that another account owns, and a bind mount keeps the host's modes
-  and owners, so a mode the runtime sets on a path it creates for you passes only when it has no
-  such bit. A Kubernetes Secret volume serves each file as a link, so it is refused here.
+  other read or write bit, or that an account other than the engine's own or root owns, and a
+  bind mount keeps the host's modes and owners, so a mode the runtime sets on a path it creates
+  for you passes only when it has no such bit. A Kubernetes Secret volume serves each file as a link, so it is refused here.
 - **systemd credentials.** A unit can point the variable at its credentials directory with
   `Environment=MEFOR_SECRETS_DIRECTORY=%d` and one `LoadCredential=` per setting, the credential
   named as the variable. That is not measured here; Linux is not a supported v1 deployment target
