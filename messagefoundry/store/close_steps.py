@@ -19,8 +19,9 @@ from typing import Any, Final
 
 log = logging.getLogger(__name__)
 
-#: How long the steps of a close may keep running, in all, once a cancellation has arrived. The
-#: caller asked to stop, so a step that cannot finish (a wedged driver call) must not hold it forever.
+#: How long the later steps of a close are given, in all, once a cancellation has arrived: at this
+#: bound the running step is cancelled. A step may overrun by its own unwind, such as the group
+#: committer's bounded rollback, so this is not a hard limit on the close.
 CANCELLED_CLOSE_GRACE_SECONDS: Final[float] = 5.0
 
 #: The least any step is given past that bound, so that it still starts.
@@ -55,25 +56,36 @@ class CloseSteps:
 
     async def run(self, step: Coroutine[Any, Any, None], what: str) -> None:
         """Await ``step``, holding a cancellation; once one is held, only up to the bound."""
-        try:
-            if self._cancelled is None:
-                await step
-                return
+        if self._cancelled is None:
             try:
-                async with asyncio.timeout(self.remaining()):
-                    await step
-            except TimeoutError:
-                log.warning("store close gave up waiting on %s after a cancellation", what)
+                await step
+            except asyncio.CancelledError as exc:
+                self.hold(exc)
+            return
+        bound = asyncio.timeout(self.remaining())
+        try:
+            async with bound:
+                await step
         except asyncio.CancelledError as exc:
             self.hold(exc)
+        except TimeoutError as exc:
+            if bound.expired():
+                log.warning("store close gave up waiting on %s after a cancellation", what)
+            else:
+                self.absorb(exc)  # the step's own TimeoutError, not the bound
+        except Exception as exc:  # noqa: BLE001 — a held cancel wins; absorb logs this by class
+            self.absorb(exc)
 
-    def reraise(self, failure: Exception | None = None) -> None:
-        """Raise the held cancellation, if any. It wins over ``failure``, which is logged by class
-        here because nothing else would report it (the traceback at DEBUG: a driver's message may
-        carry a path or a value, CLAUDE.md section 9)."""
+    def absorb(self, failure: Exception) -> None:
+        """With no cancellation held, raise ``failure``. With one held, log it by class, since the
+        cancellation will replace it (the traceback at DEBUG: a driver's message may carry a path
+        or a value, CLAUDE.md section 9)."""
         if self._cancelled is None:
-            return
-        if failure is not None:
-            log.warning("store close step failed after a cancellation (%s)", type(failure).__name__)
-            log.debug("the close step's failure", exc_info=failure)
-        raise self._cancelled
+            raise failure
+        log.warning("store close step failed after a cancellation (%s)", type(failure).__name__)
+        log.debug("the close step's failure", exc_info=failure)
+
+    def reraise(self) -> None:
+        """Raise the held cancellation, if one arrived."""
+        if self._cancelled is not None:
+            raise self._cancelled

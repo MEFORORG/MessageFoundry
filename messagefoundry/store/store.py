@@ -13774,26 +13774,22 @@ class MessageStore:
         # of the connections after it stay alive and interpreter exit hangs on them. CloseSteps
         # holds it until every step has run.
         steps = CloseSteps()
-        try:
-            await steps.run(self._settle_at_close(), "the AES-GCM settlement")
-            # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members
-            # and resolves their futures before the write connection is closed — otherwise an
-            # in-flight handoff would hang forever on a future no committer will ever complete.
-            if self._group_commit is not None:
-                await steps.run(self._close_group_commit(self._group_commit), "the group committer")
-            # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
-            # state), then the writer. Best-effort: one failing close must not strand the rest.
-            for conn in self._read_conns:
-                try:
-                    await self._close_connection(conn, steps)
-                except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
-                    _log_close_failure("error closing read-pool connection", exc)
-            self._read_conns = []
-            self._read_pool = None
-            await self._close_connection(self._db, steps)
-        except Exception as exc:
-            steps.reraise(exc)
-            raise
+        await steps.run(self._settle_at_close(), "the AES-GCM settlement")
+        # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members
+        # and resolves their futures before the write connection is closed — otherwise an
+        # in-flight handoff would hang forever on a future no committer will ever complete.
+        if self._group_commit is not None:
+            await steps.run(self._close_group_commit(self._group_commit), "the group committer")
+        # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
+        # state), then the writer. Best-effort: one failing close must not strand the rest.
+        for conn in self._read_conns:
+            try:
+                await self._close_connection(conn, steps)
+            except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+                _log_close_failure("error closing read-pool connection", exc)
+        self._read_conns = []
+        self._read_pool = None
+        await self._close_connection(self._db, steps)
         steps.reraise()
 
     async def _settle_at_close(self) -> None:
@@ -13819,30 +13815,38 @@ class MessageStore:
     async def _close_connection(conn: aiosqlite.Connection, steps: CloseSteps) -> None:
         """Close ``conn`` and wait out its non-daemon worker, whatever cancellation arrives.
 
-        Once a cancellation is held, ``stop()`` replaces ``await close()``: it queues the close and
-        the worker's exit without awaiting, and ``close()`` could park on a wedged worker past any
-        single cancel. The wait re-enters on a further cancel, against one deadline, so "the store
-        is closed" still means every thread it owned is gone unless that bound was hit and logged.
+        Once a cancellation is held, the forced release replaces ``await close()``, which could park
+        on a busy worker past any single cancel: ``interrupt()`` aborts a running statement so the
+        close ``stop()`` queues behind it is reached. The wait re-enters on a further cancel, against
+        one deadline, so the worker is gone on return unless that bound was hit and logged. No
+        ``finally``: this must not await while a closed coroutine unwinds on ``GeneratorExit``.
         """
+        failure: Exception | None = None
         try:
             if steps.cancelled:
-                conn.stop()
+                raw = getattr(conn, "_connection", None)
+                if raw is not None:
+                    _force_failed_open_release(raw.interrupt)
+                _force_failed_open_release(functools.partial(_stop_unawaited, conn))
             else:
                 await conn.close()
         except asyncio.CancelledError as exc:
             steps.hold(exc)
-        finally:
-            loop = asyncio.get_running_loop()
-            bound = steps.remaining() if steps.cancelled else _CONNECTION_WORKER_EXIT_TIMEOUT
-            deadline = loop.time() + bound
-            while True:
-                try:
-                    await _await_connection_worker_exit(
-                        conn, timeout=max(deadline - loop.time(), 0.0)
-                    )
-                    break
-                except asyncio.CancelledError as exc:
-                    steps.hold(exc)
+        except Exception as exc:  # noqa: BLE001 — raised below, once the worker is waited out
+            failure = exc
+        loop = asyncio.get_running_loop()
+        # At least a second even with the shared bound spent: a stopped worker exits in milliseconds
+        # but may need scheduling on a loaded box, and returning early would leave it listed.
+        bound = max(steps.remaining(), 1.0) if steps.cancelled else _CONNECTION_WORKER_EXIT_TIMEOUT
+        deadline = loop.time() + bound
+        while True:
+            try:
+                await _await_connection_worker_exit(conn, timeout=max(deadline - loop.time(), 0.0))
+                break
+            except asyncio.CancelledError as exc:
+                steps.hold(exc)
+        if failure is not None:
+            steps.absorb(failure)
 
     # --- write path ----------------------------------------------------------
 

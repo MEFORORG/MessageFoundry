@@ -3016,12 +3016,8 @@ class PostgresStore:
     async def _close_handles(self) -> None:
         # BACKLOG #5668: a cancellation during the settlement must not skip the pool's close.
         steps = CloseSteps()
-        try:
-            await steps.run(self._settle_at_close(), "the AES-GCM settlement")
-            await steps.run(self._pool.close(), "the connection pool")
-        except Exception as exc:
-            steps.reraise(exc)
-            raise
+        await steps.run(self._settle_at_close(), "the AES-GCM settlement")
+        await steps.run(self._pool.close(), "the connection pool")
         steps.reraise()
 
     async def _settle_at_close(self) -> None:

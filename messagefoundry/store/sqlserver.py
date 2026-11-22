@@ -6001,32 +6001,35 @@ class SqlServerStore:
                 release()
 
     async def _close_handles(self) -> None:
-        # BACKLOG #5668: a cancellation must not skip a later step. A step's own failure still leaves
-        # here before the pool step: _one_connection_store's fallback bounds that wait.
+        # BACKLOG #5668: a cancellation must not skip a later step. With none held, a step's own
+        # failure still leaves before the pool step: _one_connection_store's fallback bounds that
+        # wait. With one held, the failure is logged and the pool wait is under the cancel's bound.
         steps = CloseSteps()
+        await steps.run(self._settle_at_close(), "the AES-GCM settlement")
+        # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
+        # opened, so it never affects the async path). ADR 0071 B5.
         try:
-            await steps.run(self._settle_at_close(), "the AES-GCM settlement")
-            # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none
-            # were opened, so it never affects the async path). ADR 0071 B5.
             self.close_sync_handoff_pool()
-            # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op when the
-            # prepared path never opened one).
-            await steps.run(self._close_claim_holders(), "the claim holders")
-            # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point. wait_closed()
-            # cannot complete while the pool is wedged -- which is precisely the state these threads
-            # are stuck in -- so releasing them only on the success path would leak the whole pool's
-            # worth of threads in the one case that matters. shutdown(wait=False) does not join: a
-            # wedged ODBC call is not interruptible, and the process is going away regardless.
+        except Exception as exc:  # noqa: BLE001 — absorb re-raises it unless a cancel is held
+            steps.absorb(exc)
+        # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op when the
+        # prepared path never opened one).
+        await steps.run(self._close_claim_holders(), "the claim holders")
+        # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point. wait_closed()
+        # cannot complete while the pool is wedged -- which is precisely the state these threads
+        # are stuck in -- so releasing them only on the success path would leak the whole pool's
+        # worth of threads in the one case that matters. shutdown(wait=False) does not join: a
+        # wedged ODBC call is not interruptible, and the process is going away regardless.
+        try:
             try:
                 self._pool.close()
-                await steps.run(self._pool.wait_closed(), "the connection pool")
-            finally:
-                if self._pool_executor is not None:
-                    self._pool_executor.shutdown(wait=False)
-                    self._pool_executor = None
-        except Exception as exc:
-            steps.reraise(exc)
-            raise
+            except Exception as exc:  # noqa: BLE001 — absorb re-raises it unless a cancel is held
+                steps.absorb(exc)
+            await steps.run(self._pool.wait_closed(), "the connection pool")
+        finally:
+            if self._pool_executor is not None:
+                self._pool_executor.shutdown(wait=False)
+                self._pool_executor = None
         steps.reraise()
 
     async def _settle_at_close(self) -> None:

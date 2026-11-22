@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.store.close_steps import CloseSteps
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
@@ -147,6 +148,57 @@ async def test_a_step_wedged_after_the_cancel_is_cut_at_the_bound(
         await asyncio.wait_for(asyncio.shield(task), 5)
     assert task.cancelled()
     assert [w.name for w in workers if w.is_alive()] == []
+
+
+async def test_a_statement_running_on_a_reader_does_not_outlive_a_cancelled_close(
+    tmp_path: Path,
+) -> None:
+    """The held-cancel path interrupts it. Without that the stop queues behind the statement."""
+    store = await MessageStore.open(tmp_path / "busy.db")
+    workers = _workers(store)
+    entered = _inject(store, "settle")
+    reader: Any = store._read_conns[0]
+    endless = asyncio.ensure_future(
+        reader.execute(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT MAX(x) FROM c"
+        )
+    )
+    await asyncio.sleep(0.05)
+    task = asyncio.ensure_future(store.close())
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.gather(endless, return_exceptions=True)
+    assert [w.name for w in workers if w.is_alive()] == []
+
+
+async def test_a_closed_coroutine_does_not_await_while_unwinding(tmp_path: Path) -> None:
+    """GeneratorExit in a suspended connection close must not raise RuntimeError."""
+    store = await MessageStore.open(tmp_path / "gen.db")
+    conn: Any = store._read_conns[0]
+    real_close = conn.close
+    parked = asyncio.Event()
+
+    async def close() -> None:
+        parked.set()
+        await asyncio.Event().wait()
+
+    conn.close = close
+    steps = CloseSteps()
+    coro = MessageStore._close_connection(conn, steps)
+    runner = asyncio.ensure_future(_drive_until_parked(coro, parked))
+    await runner
+    coro.close()  # must not raise
+    conn.close = real_close
+    await store.close()
+
+
+async def _drive_until_parked(coro: Any, parked: asyncio.Event) -> None:
+    future = coro.send(None)
+    assert parked.is_set()
+    assert future is not None
+    future.cancel = lambda *_: False  # the coroutine stays suspended; nothing resumes it
 
 
 async def test_a_step_failure_after_a_cancel_is_logged_and_the_cancel_wins(
