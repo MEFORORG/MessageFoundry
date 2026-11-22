@@ -147,12 +147,14 @@ def _positive_seconds(value: str) -> float:
 
 def _positive_int(value: str) -> int:
     """A positive integer (refuses 0, negatives and non-integers)."""
+    # The message names the rule, not the raw input, so a value pasted into the wrong flag is not
+    # echoed to stderr or a captured log.
     try:
         number = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}") from None
+        raise argparse.ArgumentTypeError("expected a positive integer") from None
     if number < 1:
-        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+        raise argparse.ArgumentTypeError("expected a positive integer")
     return number
 
 
@@ -239,7 +241,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="quick retries on the Corepoint leg before tripping fail-closed",
     )
     run.add_argument("--corepoint-retry-delay", type=float, default=1.0)
-    run.add_argument("--mefor-queue-max", type=_positive_int, default=1000)
+    run.add_argument(
+        "--mefor-queue-max",
+        type=_positive_int,
+        default=1000,
+        help="bound on the shadow MEFOR queue (a positive integer); the oldest copy is dropped when full",
+    )
     run.add_argument(
         "--stop-grace",
         type=_positive_seconds,
