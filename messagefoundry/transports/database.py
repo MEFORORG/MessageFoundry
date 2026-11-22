@@ -4376,6 +4376,20 @@ def _json_default(value: Any) -> Any:
     )
 
 
+def _rows_json(rows: Any) -> str:
+    """``rows`` as standard JSON text, with :func:`_json_default` for the column types ``json``
+    has no encoding for. A float NaN or Infinity raises ``ValueError`` rather than being written as
+    the bare ``NaN`` or ``Infinity`` token, which is not JSON and which a strict reader refuses
+    (vault BACKLOG #6711, added item 1). The message is fixed text: ``json``'s own names the value.
+    Every caller already turns a ``ValueError`` here into its refusal of the row or the capture."""
+    try:
+        return json.dumps(rows, default=_json_default, allow_nan=False)
+    except ValueError:
+        pass
+    # Raised outside the handler, so json's error is on neither __cause__ nor __context__.
+    raise ValueError("a column value JSON cannot carry, such as a float NaN or Infinity")
+
+
 async def _fetch_result_set(cur: Any) -> list[Any] | None:
     """The rows of ``cur``'s current result set, or ``None`` when the statement produced none.
 
@@ -4623,7 +4637,7 @@ class DatabaseDestination(DestinationConnector):
         try:
             cols = [d[0] for d in cur.description]
             data = [dict(zip(cols, tuple(row))) for row in rows]  # noqa: B905
-            body = json.dumps(data, default=_json_default)
+            body = _rows_json(data)
         except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
             # _json_default raises TypeError on a column type it can't encode; serializing must never
             # propagate (it runs pre-commit and would roll back an otherwise-successful write).
@@ -4685,7 +4699,7 @@ class DatabaseDestination(DestinationConnector):
                 body="", outcome="no_reply", detail="no OUT params / return value"
             )
         try:
-            body = json.dumps(merged, default=_json_default)
+            body = _rows_json(merged)
         except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
             return DeliveryResponse(
                 body="",
@@ -5428,7 +5442,7 @@ class DatabaseSource(SourceConnector):
             else:
                 text = value if isinstance(value, str) else str(value)
         else:
-            text = json.dumps(record, default=_json_default)
+            text = _rows_json(record)
         return self._through_codec(text.encode)
 
     def _through_codec[T](self, call: Callable[[str], T]) -> T:

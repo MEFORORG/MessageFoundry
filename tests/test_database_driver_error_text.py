@@ -10,10 +10,12 @@ pin. All values are synthetic.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import types
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -25,6 +27,8 @@ from tests.test_database_transport import (
     _FakeConn,
     _FakeCursor,
     _FakePool,
+    _RecordingHandler,
+    _run_poll,
     _src,
 )
 
@@ -257,3 +261,34 @@ async def test_finish_stop_logs_no_driver_value(caplog: pytest.LogCaptureFixture
     assert "poll task failed" in caplog.text
     assert "pool close failed" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
+
+
+# --- #6711 added item 1: JSON that is JSON -------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_float_is_refused_with_fixed_text(value: float) -> None:
+    """Red on main: ``json.dumps`` wrote the bare ``NaN`` or ``Infinity`` token, which is not JSON."""
+    with pytest.raises(ValueError, match="JSON cannot carry") as refused:
+        database._rows_json([{"x": value}])
+    assert refused.value.__cause__ is None and refused.value.__context__ is None
+
+
+def test_a_finite_row_still_encodes() -> None:
+    """Control: an ordinary row encodes as before, and the text is strict JSON."""
+    text = database._rows_json({"x": 1.5, "y": None})
+    assert json.loads(text, parse_constant=_refuse_constant) == {"x": 1.5, "y": None}
+
+
+def _refuse_constant(token: str) -> Any:
+    raise AssertionError(f"non-standard JSON token {token}")
+
+
+async def test_the_poller_skips_a_row_holding_nan() -> None:
+    """The poller's record-to-JSON body: the row is skipped as undecodable, as a row holding a
+    column type JSON has no encoding for is, and the next row still goes. Red on main: the
+    handler got a body holding a bare ``NaN``."""
+    src = _src(body_column=None, mark_statement=None)
+    handler = _RecordingHandler()
+    await _run_poll(src, ["id", "v"], [(1, float("nan")), (2, 2.5)], handler)
+    assert handler.bodies == [b'{"id": 2, "v": 2.5}']
