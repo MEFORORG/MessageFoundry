@@ -6,13 +6,11 @@ Before this, the generic :data:`~messagefoundry.transports.base.InboundHandler` 
 nothing else, so a stored message could not name the peer that sent it. The MLLP and raw-TCP
 listeners and the File source now build an :class:`IntakeContext` and hand it over with the body
 through :func:`deliver`; other sources still pass the body alone. The
-runner's handler, marked with :func:`intake_handler`, takes both, and writes the context into the
+runner's handler, wrapped by :func:`intake_handler`, takes both, and writes the context into the
 message's metadata in the ingress transaction.
 
-The mark keeps the plain one-argument handler working: :func:`deliver` passes the context only to a
-handler that declared it takes one, as :func:`~messagefoundry.transports.receipt.receipt_handler`
-declares a receipt handler, because a return or parameter annotation cannot be read reliably at run
-time.
+:func:`deliver` keeps the plain one-argument handler working: it passes the context only to an
+:class:`IntakeHandler`, which it recognises by class.
 
 Everything here is socket or path metadata, never a byte of the body. A certificate subject can name
 a person; the runner writes the context into the message's metadata cell, which the store encrypts
@@ -22,14 +20,16 @@ at rest when it has a key, as it does ``connection_event.reason``.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any
 
 __all__ = [
     "IntakeAuth",
     "IntakeContext",
+    "IntakeHandler",
     "deliver",
     "intake_handler",
 ]
@@ -84,27 +84,46 @@ class IntakeContext:
         }
 
 
-#: The attribute :func:`intake_handler` sets, which :func:`deliver` reads.
-_INTAKE_MARK = "__messagefoundry_intake_handler__"
+class IntakeHandler[R]:
+    """A handler that takes ``(body, intake=...)``: the runner's, wrapped by :func:`intake_handler`.
+
+    :func:`deliver` recognises it by its class, not by an attribute, so a ``functools.wraps``
+    wrapper around it, which copies attributes but not the class, is not mistaken for one and is
+    called with the body alone. Building one checks the wrapped function takes an optional
+    ``intake`` keyword, so a handler that cannot take the context fails when it is wrapped, not on
+    the first message."""
+
+    __slots__ = ("_handler",)
+
+    def __init__(self, handler: Callable[..., Awaitable[R]]) -> None:
+        param = inspect.signature(handler).parameters.get("intake")
+        if (
+            param is None
+            or param.kind not in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+            or param.default is param.empty
+        ):
+            raise TypeError(
+                "an intake handler must take an optional intake= keyword beside the body"
+            )
+        self._handler = handler
+
+    async def __call__(self, raw: bytes, intake: IntakeContext | None = None) -> R:
+        return await self._handler(raw, intake=intake)
 
 
-def intake_handler[H: Callable[..., Awaitable[object]]](handler: H) -> H:
-    """Mark ``handler`` as taking ``(body, intake)``, so :func:`deliver` hands it the context.
-
-    A marked handler must also accept the body alone, because a source that knows no peer still
-    calls it with one argument."""
-    setattr(handler, _INTAKE_MARK, True)
-    return handler
+def intake_handler[R](handler: Callable[..., Awaitable[R]]) -> IntakeHandler[R]:
+    """Wrap ``handler``, which takes ``(body, intake=None)``, so :func:`deliver` hands it the
+    context. Raises ``TypeError`` when ``handler`` takes no optional ``intake`` keyword."""
+    return IntakeHandler(handler)
 
 
 async def deliver[R](
     handler: Callable[[bytes], Awaitable[R]], raw: bytes, intake: IntakeContext | None
 ) -> R:
-    """Call ``handler`` with ``raw``, and with ``intake`` too when the handler is marked by
-    :func:`intake_handler` and there is a context to give. An unmarked handler is called exactly
-    as before, so a source passes its context without knowing which handler it was started with."""
-    if intake is not None and getattr(handler, _INTAKE_MARK, False) is True:
-        # The mark is the check the type system cannot make, as require_receipt's cast is.
-        takes_intake = cast("Callable[[bytes, IntakeContext], Awaitable[R]]", handler)
-        return await takes_intake(raw, intake)
+    """Call ``handler`` with ``raw``. An :class:`IntakeHandler`, which the runner starts every
+    source with, is always given ``intake=`` too, ``None`` included. Any other handler, such as a
+    test's one-argument fake, is called with the body alone."""
+    if isinstance(handler, IntakeHandler):
+        result: R = await handler(raw, intake=intake)
+        return result
     return await handler(raw)

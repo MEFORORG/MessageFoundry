@@ -16,6 +16,7 @@ import asyncio
 import json
 import re
 import sqlite3
+import ssl
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from messagefoundry.store.metadata import (
 from messagefoundry.transports.intake import (
     IntakeAuth,
     IntakeContext,
+    IntakeHandler,
     deliver,
     intake_handler,
 )
@@ -114,6 +116,64 @@ async def test_deliver_hands_the_context_only_to_a_handler_that_takes_one() -> N
     assert await deliver(aware, b"b", ctx) == "aware"
     assert await deliver(aware, b"c", None) == "aware"
     assert seen == [(b"a", None), (b"b", ctx), (b"c", None)]
+
+
+async def test_an_intake_handler_always_gets_the_keyword_and_a_wrong_one_fails_when_built() -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def keyword_only(raw: bytes, *, intake: IntakeContext | None = None) -> str:
+        calls.append({"raw": raw, "intake": intake})
+        return "ok"
+
+    wrapped = intake_handler(keyword_only)
+    assert isinstance(wrapped, IntakeHandler)
+    assert await deliver(wrapped, b"x", None) == "ok"
+    assert calls == [{"raw": b"x", "intake": None}]
+
+    async def one_argument(raw: bytes) -> str:
+        return "no"
+
+    async def required_intake(raw: bytes, intake: IntakeContext) -> str:
+        return "no"
+
+    for wrong in (one_argument, required_intake):
+        with pytest.raises(TypeError, match="optional intake= keyword"):
+            intake_handler(wrong)
+
+
+async def test_a_one_argument_wrapper_around_the_runners_handler_is_not_given_the_context() -> None:
+    """functools.wraps copies attributes, which broke an attribute mark; the class check does not
+    carry over, so the wrapper is called with the body alone rather than failing every frame."""
+    import functools
+
+    @intake_handler
+    async def inner(raw: bytes, intake: IntakeContext | None = None) -> str:
+        return "inner"
+
+    @functools.wraps(inner)
+    async def outer(raw: bytes) -> str:
+        return await inner(raw)
+
+    ctx = IntakeContext(transport="mllp", auth_mode=IntakeAuth.NONE)
+    assert await deliver(outer, b"x", ctx) == "inner"
+
+
+def test_peer_subject_raises_a_defect_and_reads_an_unreadable_certificate_as_none() -> None:
+    from messagefoundry.pki import peer_subject
+
+    class _Raises:
+        def __init__(self, exc: BaseException) -> None:
+            self._exc = exc
+
+        def getpeercert(self, binary_form: bool = False) -> bytes:
+            raise self._exc
+
+    assert peer_subject(_Raises(ValueError("handshake not done"))) is None
+    assert peer_subject(_Raises(ssl.SSLError("bad"))) is None
+    assert peer_subject(object()) is None  # no getpeercert: no certificate
+    assert peer_subject(None) is None
+    with pytest.raises(RuntimeError):
+        peer_subject(_Raises(RuntimeError("a defect")))
 
 
 def test_the_context_fields_leave_out_what_the_source_could_not_say() -> None:

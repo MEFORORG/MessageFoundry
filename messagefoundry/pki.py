@@ -728,17 +728,22 @@ def peer_subject(ssl_object: Any) -> str | None:
     """The RFC 4514 subject of a TLS connection's peer certificate, read from its DER, or ``None``
     when there is none or it cannot be read (vault BACKLOG #2607, the intake context).
 
-    Never raises, as :func:`peer_othernames_intact` beside it does not: it runs after the listener
-    admitted the peer, and a fault here must not drop a message the peer sent. The subject only
-    names the peer, it decides nothing. A fault is logged by its type alone, since a subject can
+    It runs after the listener admitted the peer, and the subject only names the peer, it decides
+    nothing, so a certificate that cannot be read stores the message without it rather than drop
+    it: ``ValueError`` (a handshake not done, or a leaf ``cryptography`` refuses) and
+    ``ssl.SSLError``. An ``ssl_object`` with no ``getpeercert`` reads as no certificate. Any other
+    exception is a defect and raises. A fault is logged by its type alone, since a subject can
     name a person."""
+    getpeercert = getattr(ssl_object, "getpeercert", None)
+    if getpeercert is None:
+        return None
     try:
-        der = ssl_object.getpeercert(binary_form=True) if ssl_object is not None else None
+        der = getpeercert(binary_form=True)
         if not der:
             return None
         # A SAN-only leaf has an empty subject, which names nobody, so it reads as none.
         return x509.load_der_x509_certificate(der).subject.rfc4514_string() or None
-    except Exception as exc:
+    except (ValueError, ssl.SSLError) as exc:
         _log.warning(
             "could not read a peer certificate's subject; the message is stored without it: %s",
             type(exc).__name__,
