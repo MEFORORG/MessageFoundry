@@ -1741,7 +1741,10 @@ answered the same way, a 423 or listed as failed, but reported under
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
 lists nothing, pages `authority-seal-transit` and writes no audit row.
 At least the pages that read the name through `_shown_name` catch a 423 or a 503 from that read
-and answer 200, and `GET /ui/users/{user_id}/delete-confirm` does the same for a 423.
+and answer 200, and `GET /ui/users/{user_id}/delete-confirm` does the same for a 423. When
+`POST /ui/users/{user_id}/delete` is refused and the user page it re-renders is then refused too,
+at least with a 423 or a 503, it logs a WARNING and answers 400 with the delete's own refusal and
+no `Retry-After`.
 
 A custom role save checks the role name (BACKLOG #5785) after its gate. Where
 `[auth].require_action_step_up` is on, the default, and the save would end the caller's own
