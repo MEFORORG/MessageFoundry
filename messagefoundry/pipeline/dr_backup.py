@@ -6637,7 +6637,8 @@ def _extract_config_members(
     streamed bytes counted). Member names are gated by the shared ASVS 5.3.2 check
     (:func:`~messagefoundry.parsing.sniff.archive_member_name_reason`) rather than a second private one,
     so a traversal, a backslash separator, a drive-relative prefix or a control character is refused
-    here exactly as it is on the inbound-archive path.
+    here exactly as it is on the inbound-archive path. On a Windows host a colon anywhere in the name
+    is refused as well, because NTFS would read it as an alternate data stream.
 
     The per-member cap is not enough on its own here — N members each just under it would still fill the
     disk — so the bundle also carries an AGGREGATE byte ceiling and a member-count ceiling.
@@ -6680,6 +6681,12 @@ def _extract_config_members(
                 )
             rel = member.name[len(_CONFIG_PREFIX) :]
             reason = archive_member_name_reason(rel)
+            # The shared gate refuses a colon only at index 1, and NTFS reads one anywhere else as
+            # a data stream: `a.toml:evil` would land hidden inside the restored `a.toml`. Only the
+            # colon, and only on this host: a POSIX file may legally carry one, and refusing the
+            # other Windows name shapes here would fail a recovery of bundles that back up fine.
+            if reason is None and sys.platform == "win32" and ":" in rel:
+                reason = f"{member.name!r} contains a colon, which Windows reads as a data stream"
             if reason is not None:
                 raise BackupError(
                     "restore", f"archive carries an unsafe config member name ({reason})"
@@ -6708,9 +6715,9 @@ def _extract_config_members(
             src = tar.extractfile(data)
             if src is None:
                 continue
-            # The directories this member's mkdir is about to CREATE, deepest first, read before the
-            # mkdir so the ledger holds exactly what it made and never a directory that was already
-            # there. The walk stops at the destination root; the second guard is belt-and-braces
+            # The directories this member may need to CREATE, deepest first, read before any mkdir;
+            # the loop below records only those it really made. The walk stops at the
+            # destination root; the second guard is belt-and-braces
             # against a path whose parent is itself (a filesystem root), which the `is_relative_to`
             # check above already rules out.
             new_dirs: list[Path] = []
@@ -6722,15 +6729,27 @@ def _extract_config_members(
             # pass the name gate, and the second one's mkdir then re-raises FileExistsError because the
             # existing path is not a directory -- uncaught all the way out to a CLI traceback.
             try:
-                out.parent.mkdir(parents=True, exist_ok=True)
+                # The nearest existing ancestor first: where it is a file this raises
+                # FileExistsError, while a mkdir beneath it reads as FileNotFoundError on Windows.
+                probe.mkdir(exist_ok=True)
+                # One level at a time, each recorded as it is made, so a failure part way down the
+                # chain (a component too long for the filesystem) leaves nothing unrecorded to trip
+                # the non-empty refusal on the retry.
+                for new_dir in reversed(new_dirs):
+                    try:
+                        new_dir.mkdir()
+                    except FileExistsError:
+                        if not new_dir.is_dir():
+                            raise
+                        continue  # another process made it, so it is not this restore's to remove
+                    if written is not None:
+                        written.append(new_dir)
             except (FileExistsError, NotADirectoryError) as exc:
                 raise BackupError(
                     "restore",
                     f"archive carries a config member at {member.name} whose parent directory "
                     "collides with a member already extracted as a file",
                 ) from exc
-            if written is not None:
-                written.extend(reversed(new_dirs))  # shallowest first: creation order
             streamed = 0
             # EXCLUSIVE create, so a member can never land on a file that is already there. The
             # overlapping-destination refusal is the control for the case that made this reachable
