@@ -132,6 +132,18 @@
       for (const s of roots) { emit(s); }
       return slots;
     }
+    // Mirror of stepsModel.resolveInsertAnchor (BACKLOG #5839): an insert AFTER an if/elif/else/for
+    // header is requested BEFORE the block's first body row, since right after the header line, at the
+    // header's indent, the engine's re-parse refuses it. Any other anchor and position is unchanged.
+    function resolveInsertAnchor(rws, anchorLineStart, position) {
+      const anchor = rws.find((r) => r.lineStart === anchorLineStart);
+      if (!anchor) { return null; }
+      const isHeader = anchor.kind === 'control' && anchor.control !== undefined && anchor.control !== 'raise';
+      if (position !== 'after' || !isHeader) { return { anchor, position }; }
+      const bodySuite = String(anchor.lineStart);
+      const first = rws.find((r) => r.suite === bodySuite);
+      return first ? { anchor: first, position: 'before' } : null;
+    }
     function walkMove(allRws, blockStartLine, direction) {
       const start = allRws.find((r) => r.lineStart === blockStartLine);
       if (!start) { return null; }
@@ -756,23 +768,10 @@
       if (sel.value === '' || !selected) { return; }
       // ADR 0104 fan-out: insert BEFORE a terminal return / scaffold footer (no dead code), AFTER a
       // mid-body append send or any other step.
-      const position = selected.isReturn ? 'before' : 'after';
-      // Remember what to select after the insert re-projects (the new neighbour of the anchor row).
-      vscode.setState(Object.assign({}, vscode.getState() || {}, {
-        selectAfterInsert: { handler: selected.handler, anchorExpectSrc: selected.expectSrc, position },
-      }));
-      vscode.postMessage({
-        command: 'insertItem',
-        itemId: sel.value,
-        // Pass the isReturn-aware position (a mid-body append → after, a return/footer → before) so the
-        // provider does not have to re-derive it from `kind` alone (which can't tell an append from a return).
-        position: position,
-        handler: selected.handler,
-        lineStart: selected.lineStart,
-        lineEnd: selected.lineEnd,
-        expectSrc: selected.expectSrc,
-        kind: selected.kind,
-      });
+      // Pass the isReturn-aware position (a mid-body append → after, a return/footer → before) so the
+      // provider does not have to re-derive it from `kind` alone (which can't tell an append from a return).
+      const opt = sel.selectedOptions && sel.selectedOptions[0];
+      menuInsert(sel.value, selected.isReturn ? 'before' : 'after', !!(opt && opt.dataset.anchor === 'if_chain'));
     });
 
     // Filter: hide rows that don't match the query (segment / field path / action / Send target). Pure client-
@@ -796,17 +795,26 @@
     // pure stepsModel.contextMenuEnablement (unit-tested there). Copy/Cut/Paste stay keyboard-served (they
     // are deliberately NOT in this menu). Dispatch helpers use the currently `selected` row. These post to
     // the SAME provider handlers, so the byte-stable lens-rewrite path + F7 stale guard are unchanged.
-    function menuInsert(itemId, position) {
+    // Shared by the toolbar Add and the menu's Insert before / after. `clause` marks an Else / Else If
+    // item (data-anchor="if_chain"), whose anchor must stay the if/elif row it extends; every other item
+    // goes through resolveInsertAnchor, so "after a header" lands as the block's first statement.
+    function menuInsert(itemId, position, clause) {
       if (!selected || !itemId || (position !== 'before' && position !== 'after')) { return; }
-      // Remember which row to re-select after the insert re-projects (the new neighbour of the anchor),
-      // exactly as the toolbar Add does — the position drives before/after neighbour selection.
+      let at = selected;
+      if (!clause) {
+        const res = resolveInsertAnchor(stepsCtxRows(), selected.lineStart, position);
+        // No body row to anchor on: send the request as asked, and the engine's refusal is shown.
+        if (res) { at = res.anchor; position = res.position; }
+      }
+      // Remember which row to re-select after the insert re-projects (the new neighbour of the anchor);
+      // the position drives before/after neighbour selection.
       vscode.setState(Object.assign({}, vscode.getState() || {}, {
-        selectAfterInsert: { handler: selected.handler, anchorExpectSrc: selected.expectSrc, position: position },
+        selectAfterInsert: { handler: at.handler, anchorExpectSrc: at.expectSrc, position: position },
       }));
       vscode.postMessage({
         command: 'insertItem', itemId: itemId, position: position,
-        handler: selected.handler, lineStart: selected.lineStart, lineEnd: selected.lineEnd,
-        expectSrc: selected.expectSrc, kind: selected.kind,
+        handler: at.handler, lineStart: at.lineStart, lineEnd: at.lineEnd,
+        expectSrc: at.expectSrc, kind: at.kind,
       });
     }
     function menuDelete() {
@@ -973,7 +981,7 @@
           const item = ev.target.closest('.ctx-item');
           if (!item || item.disabled) { return; }
           const cmd = item.dataset.cmd;
-          if (cmd === 'insert') { menuInsert(item.dataset.itemId, item.dataset.position); }
+          if (cmd === 'insert') { menuInsert(item.dataset.itemId, item.dataset.position, item.dataset.anchor === 'if_chain'); }
           else if (cmd === 'deleteRow') { menuDelete(); }
           else if (cmd === 'addDestination') { menuAddDestination(); }
           else if (cmd === 'moveUp') { menuMove('up'); }
@@ -1053,6 +1061,7 @@
         clipLabel: clipLabel,
         buildDropSlots: buildDropSlots,
         walkMove: walkMove,
+        resolveInsertAnchor: resolveInsertAnchor,
         canDrop: canDrop,
         scopeLabel: scopeLabel,
         resolveDrop: resolveDrop,

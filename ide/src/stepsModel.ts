@@ -1587,6 +1587,37 @@ export function buildToolbarInsertRequest(
   return buildInsertRequest(anchor, action, params, pos);
 }
 
+/**
+ * The anchor row and position an insert relative to the row at `anchorLineStart` is requested at (pure;
+ * the webview mirrors it). An insert AFTER an `if`/`elif`/`else`/`for` header would land directly after
+ * the header line at the header's own indent, which the engine's re-parse refuses as an indentation
+ * failure (BACKLOG #5839). The Steps view draws the block's body right below its header, so "after the
+ * header" is requested as "before the block's first body row" (the body's suite id is the header's line
+ * number), which the engine indents into the body. Every other anchor and position comes back unchanged.
+ * Null when no row starts at `anchorLineStart`, or a header has no body row to anchor on. An `elif` /
+ * `else` clause insert must keep the `if` row as its anchor, so its callers do not route it through here.
+ */
+export function resolveInsertAnchor<
+  T extends { lineStart: number; kind: RowKind; suite: string; control?: string },
+>(
+  rows: readonly T[],
+  anchorLineStart: number,
+  position: "before" | "after",
+): { anchor: T; position: "before" | "after" } | null {
+  const anchor = rows.find((r) => r.lineStart === anchorLineStart);
+  if (!anchor) {
+    return null;
+  }
+  const isHeader =
+    anchor.kind === "control" && anchor.control !== undefined && anchor.control !== "raise";
+  if (position !== "after" || !isHeader) {
+    return { anchor, position };
+  }
+  const bodySuite = String(anchor.lineStart);
+  const first = rows.find((r) => r.suite === bodySuite);
+  return first ? { anchor: first, position: "before" } : null;
+}
+
 // ---- ADR 0106 grouped Add menu (the full palette) ----------------------------------------------------
 //
 // ADD_MENU_CATALOG is the SINGLE source of truth for the grouped <optgroup> select, the right-click

@@ -1376,6 +1376,8 @@ const MIRRORED = new Set([
   "resolveDrop",
   "barAnchor",
   "inRole",
+  // Its parity test is in b622-5839-steps-header-insert.test.ts (BACKLOG #5839).
+  "resolveInsertAnchor",
 ]);
 
 /** Top-level functions that are NOT mirrors — DOM/wiring helpers with no pure model counterpart. Each
@@ -1395,7 +1397,7 @@ const NOT_A_MIRROR: Record<string, string> = {
   clearIndicators: "DOM: removes the insertion bar + scope pill and the scope tint",
   rowByLineStart: "DOM: finds an <li> by data-line-start",
   showIndicators: "DOM: positions the bar/pill from getBoundingClientRect (layout, not logic)",
-  menuInsert: "wiring: posts the same insertItem message the toolbar Add posts",
+  menuInsert: "wiring: resolveInsertAnchor + the insertItem message the toolbar Add and the menu post",
   menuDelete: "wiring: posts the same deleteRow message the row button posts",
   menuMove: "wiring: walkMove + the same moveTo message the row arrows post",
   menuAddDestination: "wiring: posts the same addDestination message the row button posts",
