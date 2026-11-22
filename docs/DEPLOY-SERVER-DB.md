@@ -574,13 +574,15 @@ in that CA's own `.p7b` chain, and accept every certificate it offers.
 
 The built-ins below do not run the helper's CA, chain and validity checks, and they put what they
 are given into the store you name, so use them only for a file holding one self-signed root CA
-you have checked yourself:
+you have checked yourself. Each line adds a trusted root to the machine store, so it refuses to
+run on any host but the one you mean: put that host's name, as `[Environment]::MachineName`
+prints it, in place of `<HOST>`. Run one of the two.
 
 ```powershell
 # PowerShell:
-Import-Certificate -FilePath C:\certs\internal-root-ca.crt -CertStoreLocation Cert:\LocalMachine\Root
+if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else { Import-Certificate -FilePath C:\certs\internal-root-ca.crt -CertStoreLocation Cert:\LocalMachine\Root }
 # certutil equivalent:
-certutil -addstore -f Root C:\certs\internal-root-ca.crt
+if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else { certutil -addstore -f Root C:\certs\internal-root-ca.crt }
 ```
 
 Both write `LocalMachine\Root` and are idempotent (keyed on thumbprint). After import, the DB server
@@ -724,13 +726,17 @@ If Group Policy already sets **SSL Cipher Suite Order** on the host, change that
 **2. Turn TLS 1.0 and 1.1 off for the client role (vendor-documented).** Microsoft's
 [TLS registry settings](https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings)
 page gives the key: a DWORD named `Enabled` with value `0` under the version's `Client` subkey. These
-hops are TLS clients, so `Client` is the subkey that matters here. From an elevated PowerShell:
+hops are TLS clients, so `Client` is the subkey that matters here. The command changes the whole
+host's TLS clients, so it refuses to run on any host but the one you mean; put that host's name,
+as `[Environment]::MachineName` prints it, in place of `<HOST>`. From an elevated PowerShell:
 
 ```powershell
-foreach ($v in 'TLS 1.0', 'TLS 1.1') {
-    $key = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$v\Client"
-    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
-    New-ItemProperty -Path $key -Name Enabled -Value 0 -PropertyType DWord -Force | Out-Null
+if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else {
+    foreach ($v in 'TLS 1.0', 'TLS 1.1') {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$v\Client"
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+        New-ItemProperty -Path $key -Name Enabled -Value 0 -PropertyType DWord -Force | Out-Null
+    }
 }
 ```
 

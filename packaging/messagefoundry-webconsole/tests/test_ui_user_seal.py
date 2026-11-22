@@ -329,16 +329,18 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     ],
     ids=["outside-the-refusals", "listed-defect"],
 )
-async def test_a_defect_in_the_post_action_name_read_raises(
+async def test_a_defect_in_the_post_action_name_read_still_shows_the_credential(
     keyed: tuple[Engine, Path],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     defect: Exception,
 ) -> None:
-    """An error outside the refusal set, and a listed defect inside it (``AUDIT_WRITE_DEFECTS``;
-    NotImplementedError is a RuntimeError), are bugs, not refusals, so the name read raises them
-    rather than naming the account by id, as ``_shown_name``'s docstring states. No fallback line
-    is logged for them. The control for a refusal is the test above."""
+    """The reset has landed by the time its page reads the name, and its one-time credential is
+    shown nowhere else. So an error outside the refusal set, and a listed defect inside it
+    (``AUDIT_WRITE_DEFECTS``; NotImplementedError is a RuntimeError), still render the page with
+    the id, and log one ERROR naming the exception's type and the frames it was raised from,
+    with none of its message, which here carries record text. On 8602d349a8a they raised, and
+    the credential was lost. The control for a refusal is the test above."""
     engine, _path = keyed
     service, _alerts, _intact, victim = await _setup(engine)
 
@@ -350,9 +352,23 @@ async def test_a_defect_in_the_post_action_name_read_raises(
         monkeypatch.setattr(service, "checked_user", failing)
         path = f"/ui/users/{victim}/reset-password"
         await mint_bound_proof(c, path)
-        with pytest.raises(type(defect)):
-            await c.post(path, headers=SAME_ORIGIN)
-    assert not [rec for rec in caplog.records if "names the account by id" in rec.getMessage()]
+        r = await c.post(path, headers=SAME_ORIGIN)
+    assert r.status_code == 200
+    assert "Temporary password issued" in r.text and "<code>" in r.text
+    assert f"Convey this to {victim} " in r.text
+    errors = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "ERROR" and "names the account by id" in rec.getMessage()
+    ]
+    assert len(errors) == 1, caplog.text
+    assert victim in errors[0].getMessage()
+    assert type(defect).__name__ in errors[0].getMessage()
+    # The frames name the code the defect was raised from: here the stand-in reader.
+    assert "failing:" in errors[0].getMessage()
+    assert not errors[0].exc_info
+    # No log line from the request holds the record text the exception carried.
+    assert _PLANTED not in caplog.text
 
 
 async def test_the_summary_takes_its_roles_from_a_checked_record_only(

@@ -256,6 +256,43 @@ def _group_keys(pairs: list[tuple[str, str]]) -> list[str]:
     return [v.strip(" \t\r\n") for k, v in pairs if k == "ad_group"]
 
 
+def _frames(exc: BaseException) -> str:
+    """Where ``exc`` was raised from, its own frames then each ``__cause__``'s, as code-object
+    names and line numbers alone, outermost call first. ``walk_tb`` reads no source line, so no
+    file is opened on the event loop, and nothing of the exception's message is included
+    (BACKLOG #5559)."""
+    chain: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(
+            " -> ".join(
+                f"{frame.f_code.co_qualname}:{lineno}"
+                for frame, lineno in traceback.walk_tb(current.__traceback__)
+            )
+            or "(no frames)"
+        )
+        current = current.__cause__
+    return " | caused by ".join(chain)
+
+
+def _fallback_refused(user_id: str, reason: str, exc: BaseException) -> None:
+    """The log lines ``_shown_name`` writes for a refused read; its docstring says which."""
+    _log.warning(
+        "the name of account %s for a page after a landed action was not shown: its checked "
+        "read %s; the page names the account by id",
+        scrub_log_argument(user_id),
+        reason,
+    )
+    if _log.isEnabledFor(logging.DEBUG):
+        _log.debug(
+            "the checked read of account %s raised from (message withheld): %s",
+            scrub_log_argument(user_id),
+            _frames(exc),
+        )
+
+
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L4a admin surface (ADR 0065; #75 phase 4): user, role, and AD-group-mapping /ui pages + actions. Clients of the injected JSON handlers (called directly, re-asserting each gate via require_ui*)."""
     admin = deps.admin
@@ -277,37 +314,35 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         reads it (BACKLOG #5559). This docstring states the fallback's rule; the console
         CHANGELOG and docs/SECURITY.md point here.
 
-        The action's one-time output was already issued, so a refusal of a read made only to
-        label it does not replace the page that hands it over. When the read raises
-        ``HTTPException`` or one of ``account_read_errors()`` other than ``AUDIT_WRITE_DEFECTS``,
-        the page names the account by its id, and a WARNING names the account and the status or
-        the exception's type. A DEBUG line then carries the traceback's frames, without the
-        exception's message, which can hold the record's values (docs/PHI.md). Neither line is
-        rate-limited. Any other exception, a listed defect included, raises (CLAUDE.md section 6),
-        and the page that would show the credential is not rendered."""
-        failure: BaseException
+        The action's one-time output was already issued and is shown nowhere else, so no
+        ``Exception`` from a read made only to label it replaces the page that hands it over: the
+        page names the account by its id. A refusal, ``HTTPException`` or one of
+        ``account_read_errors()`` other than ``AUDIT_WRITE_DEFECTS``, logs a WARNING naming the
+        account and the status or the exception's type, then a DEBUG line with the traceback's
+        frames. Any other exception, a listed defect included, logs one ERROR naming the account,
+        the exception's type and the frames. Frames are code-object names and line numbers alone,
+        read without opening a source file, and no line carries the exception's message, which
+        can hold the record's values (docs/PHI.md). None of these lines is rate-limited."""
         try:
             user = await _checked(user_id, service)
         except HTTPException as exc:
             # 404 gone since the action, 423 a record refused for its seal, 503 a Vault Outage.
-            reason, failure = f"answered {exc.status_code}", exc
-        except account_read_errors() as exc:
-            if isinstance(exc, AUDIT_WRITE_DEFECTS):
-                raise
-            reason, failure = f"failed ({type(exc).__name__})", exc
+            _fallback_refused(user_id, f"answered {exc.status_code}", exc)
+        except Exception as exc:
+            # Broad on purpose: the credential was issued, and the docstring says why.
+            if isinstance(exc, account_read_errors()) and not isinstance(exc, AUDIT_WRITE_DEFECTS):
+                _fallback_refused(user_id, f"failed ({type(exc).__name__})", exc)
+            elif _log.isEnabledFor(logging.ERROR):
+                _log.error(
+                    "the name of account %s for a page after a landed action was not shown: its "
+                    "checked read raised a defect (%s, message withheld) from %s; the page names "
+                    "the account by id",
+                    scrub_log_argument(user_id),
+                    type(exc).__name__,
+                    _frames(exc),
+                )
         else:
             return str(user.username)
-        _log.warning(
-            "the name of account %s for a page after a landed action was not shown: its checked "
-            "read %s; the page names the account by id",
-            scrub_log_argument(user_id),
-            reason,
-        )
-        _log.debug(
-            "the checked read of account %s raised from (message withheld):\n%s",
-            scrub_log_argument(user_id),
-            "".join(traceback.format_tb(failure.__traceback__)),
-        )
         return user_id
 
     async def _user_detail(
