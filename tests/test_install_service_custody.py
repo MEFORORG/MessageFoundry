@@ -174,26 +174,30 @@ _GRANTS: list[tuple[str, bool]] = [
     ("M", False),
     ("F", False),
     ("(GR,WD)", False),  # a generic right is not read as the rights it maps to
+    ("(RX,WD)+deny(WD)", False),  # a deny for the account itself takes add-file away
 ]
 
 
 @_windows_only
 def test_the_custody_grant_rule(tmp_path: Path) -> None:
-    """Get-CustodyGrantProblem on a real directory's list, one per grant. A deny entry is not a
-    grant, so it neither widens nor narrows the verdict."""
+    """Get-CustodyGrantProblem on a real directory's list, one per grant. A deny entry for another
+    account, here Users, neither widens nor narrows the verdict; one for the account itself that
+    reaches add-file is refused."""
     assert _SCRIPT is not None
     dirs = []
-    for i, (grant, _) in enumerate(_GRANTS):
+    for i, (spelled, _) in enumerate(_GRANTS):
         d = tmp_path / f"g{i}"
         d.mkdir()
-        dirs.append((str(d), grant))
+        grant, _, deny = spelled.partition("+deny")
+        dirs.append((str(d), grant, deny))
     cases = "\n".join(
         f'  & icacls {_psq(d)} /inheritance:r /grant:r "*${{mySid}}:{grant}" '
         f"'*S-1-5-32-544:(OI)F' | Out-Null\n"
         f"  & icacls {_psq(d)} /deny '*S-1-5-32-545:(WD)' | Out-Null\n"
-        f"  $out += [string](Get-CustodyGrantProblem -Acl (Get-Acl -LiteralPath {_psq(d)}) "
+        + (f'  & icacls {_psq(d)} /deny "*${{mySid}}:{deny}" | Out-Null\n' if deny else "")
+        + f"  $out += [string](Get-CustodyGrantProblem -Acl (Get-Acl -LiteralPath {_psq(d)}) "
         "-AccountSid $mySid)"
-        for d, grant in dirs
+        for d, grant, deny in dirs
     )
     body = (
         "  $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
@@ -203,9 +207,10 @@ def test_the_custody_grant_rule(tmp_path: Path) -> None:
         got = json.loads(_ok(_extract(_SCRIPT, ["Get-CustodyGrantProblem"], body), tmp_path))
     finally:
         restore = "\n".join(
-            f'  & icacls {_psq(d)} /inheritance:e /grant "*$([Security.Principal.WindowsIdentity]'
-            '::GetCurrent().User.Value):(OI)(CI)F" | Out-Null'
-            for d, _ in dirs
+            "  $s = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
+            f'  & icacls {_psq(d)} /remove:d "*$s" | Out-Null\n'
+            f'  & icacls {_psq(d)} /inheritance:e /grant "*${{s}}:(OI)(CI)F" | Out-Null'
+            for d, _, _ in dirs
         )
         _run(_extract(_SCRIPT, [], restore), tmp_path)
     assert [not p for p in got] == [ok for _, ok in _GRANTS], list(zip(_GRANTS, got, strict=True))
@@ -213,10 +218,11 @@ def test_the_custody_grant_rule(tmp_path: Path) -> None:
 
 @_windows_only
 def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_path: Path) -> None:
-    """Set-CustodyDirAcl on a directory that inherits Users read and the account's Modify. The
-    account ends with read and add-file on the directory alone, nothing inherited, and the engine's
-    own check of a custody directory passes it, where it refused the directory before. Unelevated,
-    the owner change is refused, and the function refuses for that alone."""
+    """Set-CustodyDirAcl on a directory that inherits Users read and the account's Modify, and
+    denies the account add-file. The account ends with read and add-file on the directory alone,
+    nothing inherited and no deny, and the engine's own check of a custody directory passes it,
+    where it refused the directory before. Unelevated, the owner change is refused, and the
+    function refuses for that alone."""
     from messagefoundry.store import custody_host
 
     assert _SCRIPT is not None
@@ -226,6 +232,7 @@ def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_pat
     pre = rf"""
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)RX' "${{me}}:(OI)(CI)M" | Out-Null
+  & icacls {_psq(str(custody))} /deny "${{me}}:(WD)" | Out-Null
 """
     _ok(_extract(_SCRIPT, [], pre), tmp_path)
     environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody)}

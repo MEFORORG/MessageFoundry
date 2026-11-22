@@ -308,6 +308,39 @@ def test_a_key_file_left_in_the_secrets_directory_is_not_taken_for_no_key(tmp_pa
             _settings(tmp_path), enforcing=True, environ={"MEFOR_SECRETS_DIRECTORY": str(secrets)}
         )
     assert "move it into" not in str(read.value)
+    # With no secrets directory, beside a SQLite store, where a mint with neither variable writes.
+    (secrets / "handoff.key").unlink()
+    beside = tmp_path / "handoff.key"
+    beside.write_bytes(b"not read")
+    with pytest.raises(HostCustodyRefused, match="move it into") as refused:
+        load_host_custody(
+            _settings(tmp_path),
+            enforcing=True,
+            environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
+        )
+    assert str(beside) in str(refused.value)
+
+
+@pytest.mark.parametrize("where", ["custody", "secrets", "beside the store"])
+def test_a_host_blob_anywhere_the_host_provider_reads_refuses_every_other_key_provider(
+    tmp_path: Path, where: str
+) -> None:
+    """Rule 13 reads the custody directory of its own and the directory the host provider reads
+    without it, so a key file left in either refuses another provider. A custody variable that is
+    not an absolute path does not turn the check off."""
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    target = {"custody": custody_dir, "secrets": secrets, "beside the store": tmp_path}[where]
+    (target / "master.key").write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+    if where != "beside the store":
+        environ["MEFOR_SECRETS_DIRECTORY"] = str(secrets)
+    refusal = foreign_custody_refusal(settings, environ=environ)
+    assert refusal is not None and str(target) in refusal, refusal
+    if where != "custody":
+        unusable = {**environ, "MEFOR_CUSTODY_DIRECTORY": "relative"}
+        assert foreign_custody_refusal(settings, environ=unusable) is not None
 
 
 def test_the_way_on_names_the_custody_directory_of_its_own(tmp_path: Path) -> None:
@@ -338,13 +371,9 @@ async def test_the_first_start_converts_into_a_directory_it_may_only_read_and_ad
     )
     await _create(settings, blob)
     _handoff(custody_dir / "handoff.key", blob)
-    _grant(
-        custody_dir,
-        "*S-1-5-18:(OI)F",
-        "*S-1-5-32-544:(OI)F",
-        f"{_me()}:(RX,WD)",
-        reset=True,
-    )
+    # No Administrators entry, unlike the installer's list: on an elevated runner it would give
+    # this token full control, and the case would no longer measure read and add-file alone.
+    _grant(custody_dir, "*S-1-5-18:(OI)F", f"{_me()}:(RX,WD)", reset=True)
     try:
         # The grant took: this account may add a file there.
         assert restricted_file.can_add_a_file(custody_dir) is True

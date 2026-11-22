@@ -274,18 +274,21 @@ directory's rules, made restricted in one step, and then given this list:
 - SYSTEM and Administrators: full control, inherited by the files in it;
 - the service account: read and add-file on the directory itself, inherited by nothing.
 
-The script replaces any other grant the service account holds there and removes every other
-account's entry. It refuses, and disables the service, when what it reads back has another owner,
-still inherits, still has an entry for another account, or gives the service account more or less
-than that grant. When the script does not read that provider, it refuses `-CustodyDir`.
+The script replaces any other grant or deny the service account holds there and removes every
+other account's entry. It then reads the list back, and refuses, disabling the service, at least
+when it has another owner, still inherits, still has an entry for another account, or gives the
+service account more than that grant or, through a missing entry or a deny, less. When the script
+does not read that provider, it refuses `-CustodyDir`.
 
 **The engine.** When `MEFOR_CUSTODY_DIRECTORY` is set, the host provider reads and writes the two
 files there, in place of the directory `MEFOR_SECRETS_DIRECTORY` names or the store's own data
-directory. Before it reads or mints, it checks that directory as it checks a secrets directory: a
-known broad group's right to read it, add a file to it or delete one in it is refused, and so is a
-link, at any enforcement setting. It does not refuse one account's add-file right, the service's.
-While the variable is set, a key file found only in the secrets directory is refused rather than
-taken for no key at all, so a mint run without the variable does not lead to a second key.
+directory. Before it reads or mints, it checks that directory as it checks a secrets directory, at
+any enforcement setting: a known broad group's right to read it, add a file to it or delete one in
+it is refused, and so is a link. That check reads known broad groups only, so it refuses no entry
+for one account, the service's or any other; the list the script sets is what leaves other
+accounts no entry. While the variable is set, a key file found where the provider would look without it, the
+secrets directory or beside a SQLite store, is refused rather than taken for no key at all, so a
+mint run without the variable does not lead to a second key.
 
 **Minting.** Set the variable in the elevated shell that runs `provision-admin --service-account`,
 to the same path, so the handoff lands where the service looks:

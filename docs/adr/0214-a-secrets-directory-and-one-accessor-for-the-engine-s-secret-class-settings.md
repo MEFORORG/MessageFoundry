@@ -162,10 +162,12 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   `MEFOR_CUSTODY_DIRECTORY` names one, an absolute path, which wins over `MEFOR_SECRETS_DIRECTORY`
   for them; unset, they stay where they were, in this directory or beside a SQLite store. Before
   a read or a mint, the engine applies decision 4's check to the directory that variable names,
-  `broad_access_problem` with `directory`, at every enforcement setting; it does not refuse one
-  account's right to add a file there. A host file or handoff found only in this directory while
-  the variable is set refuses the read, so a mint made without the variable is not taken for no
-  key. `install-service.ps1` makes the directory only when it reads that provider: `-CustodyDir`,
+  `broad_access_problem` with `directory`, at every enforcement setting; like decision 4's check,
+  it reads known broad groups only, so it refuses no entry for one account, the service's add-file
+  right included. While the variable is set, a host file or handoff found only where the provider
+  reads without it, this directory or beside a SQLite store, refuses the read, so a mint made
+  without the variable is not taken for no key; and the check that refuses another key provider
+  beside a host file or handoff looks in both places. `install-service.ps1` makes the directory only when it reads that provider: `-CustodyDir`,
   else the one the service names, else `<DataDir>-custody`, judged by slice C's rules with this
   directory added to the paths it must not be, hold or sit inside, made restricted in one step,
   and restricted to Administrators as owner, SYSTEM and Administrators with full control, and the

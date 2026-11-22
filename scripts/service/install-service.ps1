@@ -1105,9 +1105,9 @@ function Get-CustodyGrantProblem {
     <#
       Why the access list $Acl does not give the account $AccountSid exactly what the custody
       directory grants it, or "" when it does (vault BACKLOG #3411, ADR 0214's 2026-11-22
-      amendment): read and add-file on the directory itself, inherited by nothing. A right beyond
-      those, or an allow entry that files or folders inside inherit, is a problem, and so is a
-      missing read or add-file. Deny entries grant nothing and are not read.
+      amendment): read and add-file on the directory itself, inherited by nothing. At least a right
+      beyond those, an allow entry that files or folders inside inherit, a missing read or add-file,
+      and a deny entry for the account that takes away part of either, are problems.
 
       WHY ADD-FILE AND NOTHING MORE. The service's first start writes its own key file, master.key,
       into this directory, so it must add a file there. It deletes the handoff through the handle it
@@ -1122,10 +1122,16 @@ function Get-CustodyGrantProblem {
     $allowed = [int64]($read -bor $add -bor $rights::Synchronize)
     $held = [int64]0
     foreach ($rule in @($Acl.Access)) {
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
         $sid = try { $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
                catch { "$($rule.IdentityReference)" }
         if ($sid -ne $AccountSid) { continue }
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            # A deny is read before an allow, so one that reaches read or add-file takes it away.
+            if ([int64]$rule.FileSystemRights -band ([int64]$read -bor [int64]$add)) {
+                return "a deny entry for it takes away $($rule.FileSystemRights)"
+            }
+            continue
+        }
         if ($rule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None) {
             return "an entry for it is inherited by what the directory holds ($($rule.FileSystemRights))"
         }
@@ -1170,6 +1176,8 @@ function Set-CustodyDirAcl {
     if ($LASTEXITCODE -ne 0) {
         $problems += "inheritance could not be turned off with SYSTEM and Administrators granted (icacls exit $LASTEXITCODE)"
     }
+    # A deny for the account would outrank its grant; /grant:r leaves one in place.
+    & icacls $Path /remove:d $Account | Out-Null
     # No inheritance flag: the grant is on the directory, and the key files carry their own lists.
     & icacls $Path /grant:r "${Account}:(RX,WD)" | Out-Null
     if ($LASTEXITCODE -ne 0) {
@@ -3558,7 +3566,8 @@ if ($HostCustody) {
             Write-Warning ("The service's MEFOR_CUSTODY_DIRECTORY named '$replacedCustodyDir' and now " +
                 "names '$CustodyDir', as -CustodyDir asked. The engine reads no key file from the old " +
                 "directory: if master.key or handoff.key is there, move it into the new one as an " +
-                "administrator, on the same volume so it keeps its own access list.")
+                "administrator, on the same volume so it keeps its own access list. Then remove the " +
+                "service account's grant on the old directory.")
         }
         Write-Host "  Custody: '$CustodyDir', named to the service as MEFOR_CUSTODY_DIRECTORY (docs/SERVICE.md)."
     } catch {

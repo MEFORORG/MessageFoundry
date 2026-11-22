@@ -955,8 +955,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/store/custody_host.py::_custody_paths": Site(
         2,
         OPERATOR,
-        "The two fixed custody file names under the directory MEFOR_SECRETS_DIRECTORY names, or "
-        "the operator's [store].path directory.",
+        "The two fixed custody file names under the directory MEFOR_CUSTODY_DIRECTORY or "
+        "MEFOR_SECRETS_DIRECTORY names, or the operator's [store].path directory.",
     ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
@@ -1256,7 +1256,7 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        44,
+        45,
         OPERATOR,
         "Fixed names, and a folder named from a fresh GUID under the Windows temp folder, under "
         "paths the operator passes or the script derives (repo root, install "
@@ -1264,7 +1264,8 @@ SCRIPT_SITES: dict[str, Site] = {
         "wheel's folder, "
         "the base interpreter's folder and the one above it, "
         "project root, data directory and the folder above it, ProgramData, NSSM directory, temp), "
-        "the data directory's own leaf name with -secrets after it, the leaf name of the engine wheel "
+        "the data directory's own leaf name with -secrets or -custody after it, the leaf name of "
+        "the engine wheel "
         "the operator passes, which must match messagefoundry-<version>-*.whl, plus registry keys "
         "named after the service's own images, and the fixed Parameters key under each key the "
         "registry lists below Services.",
