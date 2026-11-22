@@ -3172,9 +3172,7 @@ class RestDestination(DestinationConnector):
         # names the settings only, never their values.
         if self._ech_sidecar is not None:
             unapplied = [
-                key
-                for key in ("tls_allow_expired", "tls_ca_file", "tls_ca_pin")
-                if (bool(s.get(key, False)) if key == "tls_allow_expired" else s.get(key))
+                key for key in ("tls_allow_expired", "tls_ca_file", "tls_ca_pin") if s.get(key)
             ]
             if unapplied:
                 raise ValueError(
@@ -3399,9 +3397,8 @@ class RestDestination(DestinationConnector):
                 revocation_attested_reason=config.tls_revocation_attested_reason,
                 opener=None if no_crl_evidence else self._opener,
                 ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
-                # The sidecar, not the engine, dials the partner on an ECH hop, so the relaxation
-                # never reaches it there and the ECH remedy above stands.
-                expiry_relaxed=self._ech_sidecar is None and allow_expired,
+                # tls_allow_expired beside an ECH sidecar is refused near the top of __init__.
+                expiry_relaxed=allow_expired,
                 connection=config.name,
             )
         if self._ech_sidecar is not None and ech_sidecar_is_cleartext(self._ech_sidecar):

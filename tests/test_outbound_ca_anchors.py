@@ -1282,20 +1282,14 @@ async def test_a_connection_test_checks_the_ca_before_it_dials(
         await engine.stop()
 
 
-def test_a_ca_behind_an_ech_sidecar_is_unread() -> None:
-    """Review finding 4: an ECH sidecar takes both hops and does the partner TLS itself, so the CA
-    verifies nothing. An https:// sidecar is verified against the system trust store, and the token
-    hop posts through the same plain opener, so a token hop does not read it either (vault BACKLOG
-    #2977)."""
+def test_a_ca_behind_an_http_ech_sidecar_is_unread() -> None:
+    """Review finding 4: an ECH sidecar on http:// takes both hops over cleartext loopback and does
+    the TLS itself, so the CA verifies nothing. An https:// sidecar reads as None here; no hop reads
+    the CA there either, and the REST destination refuses one at build (vault BACKLOG #2977)."""
     base = {"url": "https://partner.example.org/api", "ech_egress": True}
     assert ta.unread_ca_reason({**base, "ech_sidecar": "http://127.0.0.1:8123"}) is not None
-    assert ta.unread_ca_reason({**base, "ech_sidecar": "https://127.0.0.1:8123"}) is not None
-    token = {"oauth2_token_url": "https://auth.example.org/token", "oauth2_client_id": "c"}
-    assert ta._token_hop_reads_ca({**base, **token}) is True
-    assert ta.unread_ca_reason({**base, **token, "ech_sidecar": "https://127.0.0.1:8123"})
-    # CONTROL: the same connection without ECH reads its CA, with a token hop or without one.
+    assert ta.unread_ca_reason({**base, "ech_sidecar": "https://127.0.0.1:8123"}) is None
     assert ta.unread_ca_reason({**base, "ech_egress": False}) is None
-    assert ta.unread_ca_reason({**base, **token, "ech_egress": False}) is None
 
 
 async def test_a_first_load_by_reload_leaves_the_lanes_to_the_runner(

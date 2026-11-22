@@ -5,6 +5,5 @@
   never consult it. That opener is now built with no CRL. `tls_allow_expired`, `tls_ca_file` and
   `tls_ca_pin` beside `ech_egress` are now refused at build, as `verify_tls = false` already was:
   the sidecar verifies the partner, and the engine verifies an `https://` sidecar against the
-  system trust store. The refusal names the settings, not their values. The CA check at start and
-  reload now treats a CA behind either sidecar scheme as unread. The hop's revocation refusal is
-  unchanged.
+  system trust store. The refusal names the settings, not their values. The hop's revocation
+  refusal is unchanged.
