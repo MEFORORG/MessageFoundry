@@ -130,6 +130,21 @@ _RUN_MEMO: ContextVar[dict[tuple[object, ...], object] | None] = ContextVar(
 )
 
 
+def _ambient() -> tuple[str | None, tuple[tuple[str, str], ...]]:
+    """The working directory and the environment, as a :data:`_RUN_MEMO` key part. Both feed the
+    answer as well as the arguments do: the search reads ``./messagefoundry.toml``, a relative
+    path resolves against the working directory, and the load reads ``MEFOR_*``. Keying on them
+    means a change during a run, by the caller or another thread, reads afresh rather than reusing
+    an answer to a different question; the whole environment, because the loader may read more than
+    ``MEFOR_*``. An unreadable working directory is ``None``: the uncached call then meets the same
+    fault itself."""
+    try:
+        cwd: str | None = os.getcwd()
+    except OSError:
+        cwd = None
+    return cwd, tuple(sorted(os.environ.items()))
+
+
 def _config_modules(
     name: str, config_dir: str | Path, *, required: bool = False
 ) -> list[Path] | CheckResult:
@@ -2218,14 +2233,15 @@ def _settings_source(
 
     ``(None, False)`` is the SKIP the legs have always given a bare dir.
 
-    Inside :func:`run_checks` it resolves once per distinct argument set (:data:`_RUN_MEMO`)."""
+    Inside :func:`run_checks` it resolves once per distinct argument set, working directory and
+    environment (:data:`_RUN_MEMO`)."""
     memo = _RUN_MEMO.get()
     if memo is None:
         return _settings_source_uncached(
             config_dir, service_config=service_config, suppress_search=suppress_search, env=env
         )
     explicit = None if service_config is None else str(service_config)
-    key = ("source", str(config_dir), explicit, suppress_search, env)
+    key = ("source", str(config_dir), explicit, suppress_search, env, _ambient())
     if key not in memo:
         memo[key] = _settings_source_uncached(
             config_dir, service_config=service_config, suppress_search=suppress_search, env=env
@@ -2270,13 +2286,14 @@ def _load_check_settings(
     ``env`` is ``check --env``, applied as ``serve`` applies its own ``--env``: a CLI override of
     ``[ai].environment``, above the file and ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355).
 
-    Inside :func:`run_checks` the load runs once per distinct argument set, a refusal of
+    Inside :func:`run_checks` the load runs once per distinct argument set, working directory and
+    environment, a refusal of
     :data:`_SETTINGS_LOAD_ERRORS` included, and every later leg gets that answer
     (:data:`_RUN_MEMO`): its own deep copy, so no leg sees another's change to the model."""
     memo = _RUN_MEMO.get()
     if memo is None:
         return _load_check_settings_uncached(toml, cli=cli, env=env)
-    key = ("load", None if toml is None else str(toml), repr(cli), env)
+    key = ("load", None if toml is None else str(toml), repr(cli), env, _ambient())
     if key not in memo:
         try:
             memo[key] = _load_check_settings_uncached(toml, cli=cli, env=env)
