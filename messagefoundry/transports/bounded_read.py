@@ -1287,7 +1287,7 @@ def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | 
     come before a credential refusal that applies. Nothing else is caught. Any other error says
     nothing about the header, so it stops the request where it is raised.
 
-    **Two callers ask this, and only one answer decides whether a header is judged.**
+    **At least three callers ask this, and only one answer decides whether a header is judged.**
     :func:`_verdict_on` asks about a spelling other than the plain one, and a header that got
     an answer is not asked about again while its request keeps that verdict.
     :func:`_proxy_header_verdicts` says how long that is, and which header counts as one not
@@ -1297,6 +1297,9 @@ def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | 
     again. :func:`_refuse_a_proxy_header_that_can_never_be_sent` asks about the value of a
     plainly spelled header, at each open and keeping nothing. That answer can only add a
     refusal to a header the rule has already let through, so a changed answer lets nothing out.
+    :func:`~messagefoundry.transports.rest.refuse_unsendable_static_request` asks about each
+    configured header once, at construction, and keeps nothing; its answer only refuses a build
+    (BACKLOG #5911).
     """
     probe = _StrictHTTPConnection("localhost")
     probe.putrequest("GET", "/")

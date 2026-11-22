@@ -89,6 +89,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_unrevoked_verified_hop,
+    refuse_unsendable_static_request,
     refuse_url_credentials,
     refuse_verify_off,
     url_scheme,
@@ -469,6 +470,12 @@ class DicomWebDestination(DestinationConnector):
         accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
+        # the proxy route's hop gate, rather than every message at send time.
+        self._headers = self._build_headers(s)
+        refuse_unsendable_static_request(
+            url, self._headers, setting="DICOMweb destination", leave_proxy_credential_names=True
+        )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(
             s,
@@ -479,7 +486,6 @@ class DicomWebDestination(DestinationConnector):
         )
         proxy_dest = self._proxy.for_host(self.base_url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
-        self._headers = self._build_headers(s)
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
             self._headers.update(proxy_dest.auth_headers())

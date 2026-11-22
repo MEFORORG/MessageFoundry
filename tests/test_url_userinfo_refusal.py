@@ -377,13 +377,28 @@ def test_the_proxy_config_repr_carries_no_credential() -> None:
 # --- 3. DICOMweb and SOAP classify an InvalidURL instead of letting it escape --------------------------
 
 
-#: A URL that constructs but that ``http.client`` refuses before connecting: a space in the path. The
-#: ``InvalidURL`` it raises is REAL, not faked, and carries no credential.
+#: A URL that ``http.client`` refuses before connecting: a space in the path. The ``InvalidURL`` it
+#: raises is REAL, not faked, and carries no credential. Construction refuses it since BACKLOG #5911,
+#: so each test below builds on a clean URL and sets this one after the build, to reach the
+#: send-time arm it pins.
 _SPACE_URL = "http://127.0.0.1/dicom web"
 
 
+def _dicomweb_with_space_url() -> DicomWebDestination:
+    dest = DicomWebDestination(_dest(ConnectorType.DICOMWEB, "http://127.0.0.1/dicomweb"))
+    dest.base_url = _SPACE_URL
+    dest._target_url = dest._resolve_target_url()
+    return dest
+
+
+def _soap_with_space_url() -> SoapDestination:
+    dest = SoapDestination(_dest(ConnectorType.SOAP, "http://127.0.0.1/ws", soap_action="urn:x"))
+    dest.url = "http://127.0.0.1/ws x"
+    return dest
+
+
 def test_dicomweb_post_classifies_a_real_invalid_url() -> None:
-    dest = DicomWebDestination(_dest(ConnectorType.DICOMWEB, _SPACE_URL))
+    dest = _dicomweb_with_space_url()
     with pytest.raises(NegativeAckError) as exc:
         dest._post(b"\x00" * 16)
     assert exc.value.permanent is True
@@ -399,14 +414,14 @@ def test_dicomweb_post_does_not_carry_an_invalid_url_message() -> None:
 
 
 async def test_dicomweb_probe_classifies_a_real_invalid_url() -> None:
-    dest = DicomWebDestination(_dest(ConnectorType.DICOMWEB, _SPACE_URL))
+    dest = _dicomweb_with_space_url()
     with pytest.raises(DeliveryError) as exc:
         await dest.test_connection()
     assert "rejected an invalid request value" in str(exc.value)
 
 
 async def test_soap_send_classifies_a_real_invalid_url() -> None:
-    dest = SoapDestination(_dest(ConnectorType.SOAP, "http://127.0.0.1/ws x", soap_action="urn:x"))
+    dest = _soap_with_space_url()
     with pytest.raises(NegativeAckError) as exc:
         await dest.send("<a/>")
     assert exc.value.permanent is True
@@ -431,7 +446,7 @@ async def test_soap_send_classifies_a_value_error_too() -> None:
 
 
 async def test_soap_probe_classifies_a_real_invalid_url() -> None:
-    dest = SoapDestination(_dest(ConnectorType.SOAP, "http://127.0.0.1/ws x", soap_action="urn:x"))
+    dest = _soap_with_space_url()
     with pytest.raises(DeliveryError) as exc:
         await dest.test_connection()
     assert "rejected an invalid request value" in str(exc.value)
@@ -444,7 +459,9 @@ async def test_soap_probe_classifies_a_real_invalid_url() -> None:
 
 
 async def test_rest_probe_classifies_a_real_invalid_url() -> None:
-    dest = RestDestination(_dest(ConnectorType.REST, "http://127.0.0.1/api x"))
+    # BACKLOG #5911: construction now refuses this URL, so it is set after the build.
+    dest = RestDestination(_dest(ConnectorType.REST, "http://127.0.0.1/api"))
+    dest.url = "http://127.0.0.1/api x"
     with pytest.raises(DeliveryError) as exc:
         await dest.test_connection()
     assert str(exc.value) == "REST http://127.0.0.1/api x rejected an invalid request value"

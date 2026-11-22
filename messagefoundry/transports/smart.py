@@ -93,6 +93,7 @@ from messagefoundry.transports.rest import (
     refuse_url_credentials,
     # Re-exported: it moved to rest.py beside its cleartext twin (vault BACKLOG #3139).
     revocation_attestation_from_settings,
+    unsendable_request_target,
     url_scheme,
 )
 from messagefoundry.transports.signing import (
@@ -349,6 +350,14 @@ class _TokenEndpointProvider(abc.ABC):
         refuse_url_credentials(
             token_url, cls._URL_SETTING, use=cls._CREDENTIAL_SETTINGS, error=cls._ERROR
         )
+        # BACKLOG #5911: a token URL http.client could never send fails the connection here, not
+        # each mint. The POST goes to the URL as it stands, so a '#' is only dropped by urllib.
+        if unsendable_request_target(token_url, refuse_fragment=False):
+            raise cls._ERROR(
+                f"{cls._URL_SETTING} must be ASCII with no whitespace or control character "
+                "(http.client sends it as ASCII); percent-encode it, and give an "
+                "internationalized host in its IDNA form"
+            )
         # The token POST carries a credential, so an off-box cleartext hop is refused with no
         # escape, as the delivery cells' credentials are (vault BACKLOG #3533 item 4): neither
         # tls_hop_attested nor cleartext_accepted lifts it, only a loopback host. InsecureHopRefused

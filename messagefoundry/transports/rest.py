@@ -93,6 +93,8 @@ from messagefoundry.transports.base import (
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
+    _FIELD_NAME,
+    _VALUE_CTL,
     EgressReplyError,
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
@@ -139,6 +141,7 @@ __all__ = [
     "refuse_unsendable_static_request",
     "refuse_url_credentials",
     "refuse_verify_off",
+    "unsendable_request_target",
     "url_host_label",
     "url_scheme",
 ]
@@ -1857,34 +1860,75 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
     )
 
 
-def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, setting: str) -> None:
+def unsendable_request_target(url: str, *, refuse_fragment: bool = True) -> bool:
+    """Whether ``http.client`` could never send ``url`` as a request target (BACKLOG #5911).
+
+    It sends the target as ASCII and refuses a control character or a space in it, and urllib
+    sets the ``Host`` header from the URL's host as it stands, which ``http.client`` encodes as
+    Latin-1 rather than IDNA. Every whitespace character is a control, a space or not ASCII, so
+    all three are refused. ``refuse_fragment`` refuses a ``#`` as well, for a caller that appends
+    paths to the URL: urllib splits the ``#`` off client-side, so every appended path would be
+    dropped.
+    """
+    return (
+        not url.isascii()
+        or any(ch <= " " or ch == "\x7f" for ch in url)
+        or (refuse_fragment and "#" in url)
+    )
+
+
+def refuse_unsendable_static_request(
+    url: str,
+    headers: Mapping[str, str],
+    *,
+    setting: str,
+    refuse_fragment: bool = True,
+    leave_proxy_credential_names: bool = False,
+) -> None:
     """Refuse at construction a static URL or header ``http.client`` could never send (BACKLOG #5911).
 
     The screen a configured value needs beside :func:`enforce_outbound_length_limits`: that gate
     bounds lengths only, and these values are the same for every message, so one the wire refuses
-    would fail every send. A URL must be ASCII with no whitespace: ``http.client`` sends the request
-    target as ASCII and refuses a space in it, and urllib sets the ``Host`` header from the URL's
-    host as it stands, which ``http.client`` encodes as Latin-1 rather than IDNA. A ``#`` is refused
-    too, because urllib splits it off client-side, so every path the connector appends to the URL
-    would be dropped. Each header is put to ``http.client`` itself, as
+    would fail every send. The URL is judged by :func:`unsendable_request_target`, with
+    ``refuse_fragment`` passed through: a connector that appends paths to the URL refuses a ``#``,
+    and one that sends the URL as it stands does not, since urllib only drops the fragment there.
+    Each header name must be an RFC 9110 token. Each header is put to ``http.client`` itself, as
     :func:`~messagefoundry.transports.bounded_read._refusal_by_http_client` does for a proxy
-    header, so the screen follows its name and value rules in every Python version.
+    header, so the screen follows its name and value rules in every Python version. Those rules
+    let a NUL or a folded line through in a value, so a control character other than HTAB, which
+    RFC 9110 section 5.5 forbids in a value, is refused here as well.
+
+    A header whose name :func:`~messagefoundry.transports.bounded_read.is_proxy_credential_header_name`
+    reads is a proxy credential, which the proxy-header rule refuses with its own text (vault
+    BACKLOG #3443, #3457). The two RFC 9110 checks above skip it, so that text is the one an
+    operator reads. ``leave_proxy_credential_names`` skips it entirely, for a connector that
+    left such a header to that rule alone before this screen reached it.
 
     Raises :class:`ValueError` naming ``setting``, and a header key only as
     :func:`_shown_header_key` shows it, never a value, which an ``env()`` binding can fill with a
     credential. Every raise sits outside any ``except`` block, so no ``__context__`` carries the
     value (see :func:`_latin1_refusal_position`).
     """
-    if not url.isascii() or any(ch.isspace() for ch in url) or "#" in url:
+    if unsendable_request_target(url, refuse_fragment=refuse_fragment):
+        refused = (
+            "whitespace, a control character or '#'"
+            if refuse_fragment
+            else ("whitespace or a control character")
+        )
         raise ValueError(
-            f"{setting} 'url' must be ASCII with no whitespace or '#' (http.client sends it as "
+            f"{setting} 'url' must be ASCII with no {refused} (http.client sends it as "
             "ASCII); percent-encode it, and give an internationalized host in its IDNA form"
         )
     for name, value in headers.items():
-        if _refusal_by_http_client(name, "") is not None:
+        proxy_named = is_proxy_credential_header_name(name)
+        if proxy_named and leave_proxy_credential_names:
+            continue
+        if (not proxy_named and not _FIELD_NAME.fullmatch(name)) or _refusal_by_http_client(
+            name, ""
+        ) is not None:
             raise ValueError(
-                f"{setting} header {_shown_header_key(name)} is not a header name http.client "
-                "can send"
+                f"{setting} header {_shown_header_key(name)} is not a header name the engine "
+                "sends (a header name is an RFC 9110 token)"
             )
         if _latin1_refusal_position(value) is not None:
             raise ValueError(
@@ -1895,6 +1939,11 @@ def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, se
             raise ValueError(
                 f"{setting} header {_shown_header_key(name)} has a value http.client refuses to "
                 "send"
+            )
+        if not proxy_named and _VALUE_CTL.search(value):
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} has a control character in its "
+                "value (RFC 9110 allows none but HTAB)"
             )
 
 
@@ -3082,6 +3131,17 @@ class RestDestination(DestinationConnector):
                 f"{hop_name_prefix(config.name)}ech_egress and HTTP Digest are mutually exclusive -- "
                 "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"
             )
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
+        # the proxy route's hop gate, rather than every message at send time. The url is sent as it
+        # stands, so a '#' is only dropped by urllib and is not refused.
+        self._headers = self._build_headers(s)
+        refuse_unsendable_static_request(
+            url,
+            self._headers,
+            setting="REST destination",
+            refuse_fragment=False,
+            leave_proxy_credential_names=True,
+        )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
         self._proxy: ProxyConfig | None = (
@@ -3098,7 +3158,6 @@ class RestDestination(DestinationConnector):
         )
         proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
-        self._headers = self._build_headers(s)
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none). urllib moves it into the
             # CONNECT tunnel for an https destination, sends it to the proxy for an http one (ADR 0126).
