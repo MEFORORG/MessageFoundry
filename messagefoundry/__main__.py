@@ -13518,8 +13518,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         status, code = "FAIL", 1
         reason = (
             f"the audit stopped part way on an error ({stopped}). The values after it were not "
-            "read, and the per-cell counts are not reported: treat the store as unaudited until a "
-            "run that finishes says otherwise"
+            "read, and no counts are reported: treat the store as unaudited until a run that "
+            "finishes says otherwise"
         )
         if failing is not None:
             # The first failing line only: a count over the values read before the stop would
@@ -13576,8 +13576,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             "on it, or let the service's open migrate the store, and run again"
         )
 
-    # A walk that stopped, on an error or on the key mismatch, has no counts worth printing: zeros
-    # would read as an empty store.
+    # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted
+    # before the stop would read as the whole store's.
     counted = stopped is None and audit.key_mismatch is None
     cell_rows = audit.tallies if counted else []
     if as_json:
