@@ -13314,6 +13314,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             return 2
         cells = tuple(c for c in inventory if c.table in set(args.table))
     stopped: str | None = None
+    # A VACUUM or other schema change stopped the SQLite walk, so a rowid locator may have moved.
+    interrupted = False
     audit = CipherAudit()
     # A server store's cells, and its `keyed_surface`, that its catalog read did not show this login.
     hidden: list[str] = []
@@ -13330,23 +13332,24 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         cause = exc.__cause__
         return type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
 
-    def failing_value(found: CipherAudit) -> str | None:
-        # The FAIL reason the values read earn, a value that did not open or a BLOB before an
-        # unmarked value the store refuses at read; None when every value read passes. The one
-        # ranking: the verdict below and a walk stopped part way both read it.
+    def failing_value(found: CipherAudit) -> tuple[str, str] | None:
+        # The FAIL reason the values read earn and the first failing value's line: a value that
+        # did not open or a BLOB before an unmarked value the store refuses at read; None when
+        # every value read passes. The one ranking: the verdict below and a walk stopped part
+        # way both read it.
         if found.failed or found.blob:
             first = next(t.first_failure for t in found.tallies if t.first_failure)
             return (
                 f"{found.failed} sealed value(s) did not open, and {found.blob} BLOB(s) sit where "
                 f"the store writes only text; the first: {first}"
-            )
+            ), first
         if found.unmarked and not store.allow_unmarked_ciphertext:
             first = next(t.first_unmarked for t in found.tallies if t.first_unmarked)
             return (
                 f"{found.unmarked} non-blank value(s) on surfaces this keyed store has sealed "
                 "carry no at-rest marker, so the store refuses each at read: a damaged or "
                 f"stripped marker, or a planted row (BACKLOG #1169); the first: {first}"
-            )
+            ), first
         return None
 
     if server:
@@ -13498,6 +13501,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             stopped = _store_error_text(exc)
         except CipherWalkInterrupted as exc:
             stopped = str(exc)
+            interrupted = True
         except key_service_down as exc:
             stopped = stopped_by_key_service(exc)
         finally:
@@ -13518,10 +13522,17 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             "run that finishes says otherwise"
         )
         if failing is not None:
-            reason += f". Before it stopped, the values it read already fail: {failing}"
+            # The first failing line only: a count over the values read before the stop would
+            # read as the store's.
+            reason += f". Before it stopped, a value it read already fails: {failing[1]}"
+            if interrupted:
+                reason += (
+                    ". The change that stopped the walk may have renumbered the rowid that line "
+                    "names"
+                )
     elif failing is not None:
         status, code = "FAIL", 1
-        reason = failing
+        reason = failing[0]
     elif hidden:
         # A server schema is the build's own, so an expected cell the catalog read did not show
         # was hidden from this login (at least a missing grant) rather than never created. Its

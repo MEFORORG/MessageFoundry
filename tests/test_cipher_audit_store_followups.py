@@ -195,6 +195,9 @@ def test_a_sqlite_stop_keeps_the_failure_found_before_it(
         )
     rc, payload, out = _sqlite_cli(db, monkeypatch, capsys)
     _assert_stop_names_the_failure(rc, payload, out)
+    # Only a walk the store changed under warns that its rowid may have moved; no subset count.
+    assert ("renumbered" in payload["reason"]) is isinstance(stop, CipherWalkInterrupted), payload
+    assert "sealed value(s) did not open" not in payload["reason"], payload
 
 
 def test_a_mid_walk_grant_error_with_nothing_failing_still_could_not_start(

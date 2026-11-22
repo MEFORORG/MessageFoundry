@@ -4809,9 +4809,9 @@ class SqlServerStore(ServerCipherWalk):
         ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
         then ``column``'s. ``sealed_only`` keeps a value that starts with the marker in any ASCII
         case, as ``cipher_cells._sealed_test`` reads one. The comparison runs under the column's
-        collation, so one that ignores width or accents also keeps a non-ASCII lookalike of the
-        marker; the walk's own marker test then reads that value as unsealed (BACKLOG #1719 item
-        19)."""
+        collation, so one that folds characters, at least by ignoring width or accents, can also
+        keep a non-ASCII lookalike of the marker; the walk's own marker test then reads that value
+        as unsealed (BACKLOG #1719 item 19)."""
         check_walk_identifiers(table, column, *select, *order)
         params: list[Any] = [int(limit)]
         where = [f"[{column}] IS NOT NULL"]
