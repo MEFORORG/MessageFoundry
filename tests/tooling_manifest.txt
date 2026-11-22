@@ -48,6 +48,7 @@ tests/test_b616_5879_codex_hook_shell_and_budget.py
 tests/test_b616_5880_codex_skills_from_primary_checkout.py
 tests/test_bash_probe_path.py
 tests/test_bash_resolver.py
+tests/test_bench_stage_residency.py
 tests/test_blanket_stage_config_env.py
 tests/test_blanket_stage_guard.py
 tests/test_branch_leak_scan_range.py

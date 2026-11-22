@@ -557,6 +557,54 @@ def test_a_closed_stdout_pipe_exits_2_not_120(tree: tuple[Path, Path], tmp_path:
     assert proc.wait(timeout=120) == EXIT_INSTRUMENT
 
 
+def test_a_name_the_filesystem_cannot_hold_is_a_missing_file(
+    tree: tuple[Path, Path], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """RED when: one stale citation with an impossible name aborts the report for every anchor."""
+    root, _ = tree
+    record = tmp_path / "long.toml"
+    text = _scorecard(record).read_text(encoding="utf-8")
+    record.write_text(text.replace("engine_module.py", "x" * 300 + ".py"), encoding="utf-8")
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    assert code == EXIT_FINDINGS, out
+    assert "file missing     : 1" in out, out
+
+
+def test_a_closed_stderr_pipe_still_exits_2(tmp_path: Path) -> None:
+    """RED when: a refusal buffered for a closed stderr fails at interpreter exit, as 120."""
+    record = _scorecard(tmp_path / "record.toml")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "asvs" / "anchor_report.py"),
+            "--scorecard",
+            str(record),
+            "--root",
+            str(tmp_path / "absent"),
+        ],
+        cwd=tmp_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stderr is not None
+    proc.stderr.close()
+
+    assert proc.wait(timeout=120) == EXIT_INSTRUMENT
+
+
+def test_a_stripped_docstring_does_not_become_a_findings_exit(tmp_path: Path) -> None:
+    """RED when: ``-OO`` removes ``__doc__`` and argument parsing dies with exit 1."""
+    proc = subprocess.run(
+        [sys.executable, "-OO", str(ROOT / "scripts" / "asvs" / "anchor_report.py"), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        timeout=120,
+    )
+    assert proc.returncode == EXIT_OK, proc.stderr
+
+
 def test_a_console_that_cannot_encode_the_report_is_an_instrument_failure(tmp_path: Path) -> None:
     """RED when: a cp1252 stdout exits 1. A real interpreter, because the codec is the fault, and
     no ``-I``, which would make it ignore PYTHONIOENCODING. The root's name is what cp1252 lacks."""

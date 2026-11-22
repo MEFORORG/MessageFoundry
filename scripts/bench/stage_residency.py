@@ -103,9 +103,9 @@ re-arm compressing a swept-discovered backlog.
 ``concurrency.n_outbound_rows`` is the time-average of ``N(t) = #transformed<=t - #delivered<=t`` — a
 counting process over the rung's full event streams. No pairing, no ``claimed_at``, no Little's law.
 It assumes one outbound row per ``transformed``, which the stores do not guarantee: they write one
-per handler handoff. So it is ``None`` when any cohort message has a different count of the two
-(``concurrency.n_outbound_parity``), and that check is necessary rather than sufficient
-(``_outbound_parity``). Two things it is NOT:
+per handler handoff. So it is ``None`` when any message received before the window's end has a
+different count of the two or a repeated destination (``concurrency.n_outbound_parity``), and that
+check is necessary rather than sufficient (``_outbound_parity``). Two things it is NOT:
 
 * it is NOT capped at 8. It counts QUEUED **plus** IN-SERVICE outbound rows; only rows in service are
   bounded by the 8 destination lanes. "N is about 8, therefore the lanes are saturated" is a category error.
@@ -617,7 +617,9 @@ def _outbound_parity(aggs: list[_Agg], hi: float) -> dict[str, int]:
     says it does not, so a message whose two counts differ voids the figure instead. An in-flight or
     dead-lettered message differs too: from these events it cannot be told from a handoff that
     produced no row. ``retried`` voids it as well: a redelivery can offset a row that never delivered,
-    and a ``delivered`` with no destination is counted here but absent from the death stream.
+    and a ``delivered`` with no destination is counted here but absent from the death stream. Two
+    handlers each delivering once to one shared connection look the same and lose the figure too:
+    without the event detail they cannot be told from a redelivery, and None is the safe answer.
 
     Only messages received before ``hi`` count. A later one has no mark inside the window, so the
     stop edge a tail trim exists to exclude cannot erase the rung's figure.
@@ -1006,7 +1008,8 @@ def _render_concurrency(c: dict[str, Any]) -> list[str]:
     if o is None:
         outbound = (
             f"  N_outbound_rows   UNAVAILABLE: {parity['mismatched_messages']} of "
-            f"{parity['messages']} messages have transformed != delivered rows"
+            f"{parity['messages']} messages have transformed != delivered rows or a destination "
+            "delivered more than once"
         )
     else:
         outbound = (

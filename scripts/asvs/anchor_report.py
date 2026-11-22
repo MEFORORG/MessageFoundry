@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import os
 import stat
@@ -65,6 +66,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # The sibling verifier, imported by PATH rather than as a package: ``scripts/asvs`` has no
 # ``__init__.py``, and the vault runs these tools as bare scripts from its own working directory.
@@ -135,6 +137,12 @@ def _read_cited(target: Path) -> str | None:
         mode = target.stat().st_mode
     except (FileNotFoundError, NotADirectoryError):
         return None
+    except OSError as exc:
+        # A name this filesystem cannot hold cannot exist here. Windows maps its invalid-name
+        # error to EINVAL.
+        if exc.errno in (errno.ENAMETOOLONG, errno.EINVAL):
+            return None
+        raise
     if not stat.S_ISREG(mode):
         return None
     return target.read_text(encoding="utf-8", errors="replace")
@@ -312,7 +320,8 @@ def _refuse_unfinished(exc: BaseException) -> int:
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # `python -OO` strips the docstring, and that must not become a traceback and exit 1.
+    ap = argparse.ArgumentParser(description=(__doc__ or "ASVS anchor report\n").splitlines()[0])
     # REQUIRED, with no default. The record is not in this repository, so a default would name a path
     # here and quietly measure the wrong tree -- or nothing at all -- while printing a full report.
     ap.add_argument(
@@ -393,10 +402,11 @@ def _measure(args: argparse.Namespace) -> int:
         # Reported inside the summary rather than fatal: the anchor population was read successfully,
         # so the main answer stands. Only the narrowing is unavailable, and it says so in its own row.
         # A git that RAISED is not this case; it reaches the guard in main.
-        sys.stderr.write(
-            f"NOTE: git could not resolve {args.changed_since}...HEAD in {args.root}, so the "
-            "changed-file narrowing is UNKNOWN rather than empty.\n"
-        )
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            sys.stderr.write(
+                f"NOTE: git could not resolve {args.changed_since}...HEAD in {args.root}, so the "
+                "changed-file narrowing is UNKNOWN rather than empty.\n"
+            )
 
     print(
         "\n".join(
@@ -428,18 +438,21 @@ def main(argv: list[str] | None = None) -> int:
         return _refuse_unfinished(exc)
 
 
-def _discard_unwritten_stdout() -> None:
-    # After a failed flush the buffer still holds the text, and the interpreter's own flush at exit
+def _flush_or_discard(stream: Any) -> None:
+    # After a failed write the buffer still holds the text, and the interpreter's own flush at exit
     # would fail again and turn this exit code into 120. Pointing the descriptor at the null device
     # is the recipe in the Python docs for SIGPIPE. Not in main(): it would close an in-process
-    # caller's stdout.
+    # caller's stream.
     with contextlib.suppress(AttributeError, OSError, ValueError):
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        try:
+            stream.flush()
+        except OSError:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
 
 
 if __name__ == "__main__":
     # Stdout stays strict on purpose: a report it cannot write is a refusal, never one with holes.
     exit_code = main()
-    if exit_code == EXIT_INSTRUMENT:
-        _discard_unwritten_stdout()
+    _flush_or_discard(sys.stdout)
+    _flush_or_discard(sys.stderr)
     raise SystemExit(exit_code)
