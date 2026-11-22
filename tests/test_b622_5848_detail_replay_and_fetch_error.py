@@ -106,6 +106,25 @@ def test_replay_is_not_offered_while_a_newer_open_is_loading(qapp: Any) -> None:
         panel.stop()
 
 
+def test_a_selection_made_during_replay_is_not_overridden_by_its_refresh(qapp: Any) -> None:
+    """replay() can open a step-up prompt whose nested event loop selects another row. The refresh
+    after the replay must not reopen the replayed message over that newer selection."""
+    client = _FakeClient()
+    panel = _panel(client)
+    try:
+        panel.load("m0")
+        _pump_until(qapp, panel._replay.isEnabled)
+        client.replay = lambda message_id: panel.load("m2")  # type: ignore[method-assign]
+        panel._on_replay()
+        assert panel._pending_id == "m2"
+        client.release.set()
+        _pump_until(qapp, lambda: "CTL-m2" in panel._summary.text())
+    finally:
+        client.release.set()
+        panel.stop()
+        del client.replay  # the stub holds the panel: break that cycle on this thread
+
+
 def test_a_non_api_error_fetch_clears_the_previous_message_and_reports(qapp: Any) -> None:
     """A raise other than ApiError while opening m1 must not leave m0 under the new selection, and
     must say something. m0 rendered first is the control."""
