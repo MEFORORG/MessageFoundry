@@ -3079,8 +3079,9 @@ keyed audit chain, for a changed key that chain has not been rolled to; it opens
 for that key instead, or keeps one already open for another key, and the key's age runs from the
 prior stamp, or from the record where there is none, until a run completes (BACKLOG #3737, #4942;
 [PHI.md](PHI.md) says when each applies). Under `enforcement = enforce` that date can refuse a start.
-Where no run can roll the chain, setting `store_key_last_rotated` is one way out; [PHI.md](PHI.md)
-names at least one other. The connector/AD/SMTP/Vault/OIDC
+Where no run can roll the chain, the dedicated way out is `rotate-key --close-without-roll
+"<reason>"`, which writes an audit row, and setting `store_key_last_rotated` is another;
+[PHI.md](PHI.md) says what each does and names at least one more. The connector/AD/SMTP/Vault/OIDC
 credentials the engine holds are tracked too — each fingerprinted with a keyed MAC sealed as a
 store-cipher cell, its clock reset when the secret no longer matches it (rotation auto-detected). A store
 key rotation re-seals the cells and resets no clock, and a cell the engine cannot read keeps its dates

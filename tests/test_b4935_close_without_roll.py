@@ -115,6 +115,7 @@ def test_a_broken_chain_closes_with_an_audited_reason_and_a_start_then_stamps_no
     assert str(audited[0]["actor"]).startswith("cli:")
     detail = json.loads(str(audited[0]["detail"]))
     assert detail["reason"] == _REASON
+    assert detail["key_id"] == _key_id(key_b)
     assert detail["roll_refusal"].startswith("refusing to roll a broken audit chain")
     # A serve start now finds the key stamped, so it opens no record and holds nothing.
     after = asyncio.run(_serve_reconcile(db, key_b, key_a))
@@ -183,7 +184,7 @@ def test_a_chain_that_rolls_closes_as_usual_and_writes_no_close_row(
     captured = capsys.readouterr()
     assert "OK:" in captured.out
     assert "--close-without-roll was not used" in captured.err
-    assert "This run completed and closed the rotation record." in captured.err
+    assert "This run completed, so it closed any rotation record that was open." in captured.err
     rows = asyncio.run(_rows(db, key_b, key_a))
     assert rows[ROTATION_RECORD_ID].fingerprint == ""
     assert _closed_rows(db, key_b, key_a) == []
@@ -203,7 +204,7 @@ def test_a_chain_that_rolls_with_a_skip_says_the_record_stays_open(
     assert main(["rotate-key", "--db", str(db), "--close-without-roll", _REASON]) == 1
     captured = capsys.readouterr()
     assert "PARTIAL:" in captured.out
-    assert "This run did not complete, so the rotation record stays open." in captured.err
+    assert "This run did not complete, so any rotation record stays open." in captured.err
     assert "closed the rotation record" not in captured.err
     rows = asyncio.run(_rows(db, key_b, key_a))
     assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
@@ -224,3 +225,35 @@ def test_a_blank_or_too_long_reason_changes_nothing(
     assert "Nothing was changed." in err
     assert "Traceback" not in err
     assert {p.name: p.read_bytes() for p in tmp_path.glob("rot.db*")} == before
+
+
+def test_a_close_that_stops_at_the_record_leaves_a_record_a_re_run_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The record closes before the key is stamped, so a run that stops at the close has stamped
+    nothing, and a re-run with the flag still finds the record naming an unstamped key and closes
+    it. Stamped first, the record would name a stamped key, which opens no record for a re-run.
+
+    Mutation: drop the close before the stamp; the re-run then closes nothing."""
+    from messagefoundry.store.store import MessageStore
+
+    db, _, key_a, key_b = _broken_chain(tmp_path, monkeypatch, capsys)
+    real = MessageStore.upsert_secret_rotation_meta
+
+    async def close_fails(self: MessageStore, class_id: str, **kwargs: str) -> None:
+        if class_id == ROTATION_RECORD_ID and kwargs.get("fingerprint") == "":
+            raise RuntimeError("synthetic stop at the record's close")
+        await real(self, class_id, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(MessageStore, "upsert_secret_rotation_meta", close_fails)
+        assert main(["rotate-key", "--db", str(db), "--close-without-roll", _REASON]) != 0
+    capsys.readouterr()
+    rows = asyncio.run(_rows(db, key_b, key_a))
+    assert rows[_DEK].last_rotated == _OLD_DATE
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
+    assert main(["rotate-key", "--db", str(db), "--close-without-roll", _REASON]) == 1
+    assert "--close-without-roll closed the rotation record" in capsys.readouterr().err
+    rows = asyncio.run(_rows(db, key_b, key_a))
+    assert rows[ROTATION_RECORD_ID].fingerprint == ""
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))

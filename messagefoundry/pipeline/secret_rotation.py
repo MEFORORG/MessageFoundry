@@ -592,7 +592,8 @@ async def reconcile_rotation_meta(
     BACKLOG #2242 re-key rule).
 
     **A changed DEK is not stamped while the rotation record names it (BACKLOG #3737).** ``rotate-key``
-    opens that record before either data pass and closes it only when a whole run is done. The
+    opens that record before either data pass and closes it when a whole run is done, or when an
+    operator closes it with ``--close-without-roll`` over a chain no run can roll (BACKLOG #4935). The
     DEK row is left as it is, and this start reads its dates.
 
     **A changed DEK the audit chain has not rolled to opens that record here (BACKLOG #4942,
@@ -607,7 +608,9 @@ async def reconcile_rotation_meta(
     stamps only where ``audit_rolled`` is not ``False``: ``None``, a store with no keyed chain to
     ask, such as one whose rows open with no genesis row, or ``True``, a chain already rolled to
     the key. So on a store with a keyed chain a stamp says the chain was rolled to the key, by a
-    run or by its genesis row, and elsewhere it proves only a changed key.
+    run or by its genesis row, unless a ``store.rotation_closed_without_roll`` audit row records
+    that an operator closed the record without a roll (BACKLOG #4935); elsewhere it proves only a
+    changed key.
 
     It then arms the **ENFORCE escalation**: under ``[security].enforcement=ENFORCE``, a DEK older than
     ``store_key_max_age_days + enforce_grace_days`` emits its ``secret_rotation_due`` alert with

@@ -506,8 +506,8 @@ def test_a_cipher_refusal_once_the_write_has_started_reaches_the_floor(
     must not be reported as could not start, with "nothing was written" and the advice to delete
     the entry. A real SQLite store, so the open succeeds and the write is reached.
 
-    Mutation: drop the ``if write_started: raise`` branch from that arm; the run then exits 2 and
-    says nothing was written."""
+    Mutation: drop the ``if write_started: raise`` branch from that arm; the run then exits 2,
+    which the exit-code assertion catches."""
     from messagefoundry.auth.service import AuthService
     from messagefoundry.store.crypto import CipherError
 

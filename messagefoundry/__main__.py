@@ -1035,7 +1035,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         metavar="REASON",
         help="close the rotation record, with an audit row carrying REASON, when this run "
         "re-seals the data with no skip and its audit chain step refuses in a way no run clears, "
-        "under any key (BACKLOG #4935). It stamps the key's rotation date as a completed run does. "
+        "under any key (BACKLOG #4935). It records the key as a completed run does. "
         "It rolls nothing and repairs nothing in the chain, and the run still exits 1",
     )
 
@@ -12520,7 +12520,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     either data pass too; the audit range rolls after both, and the stamp and the record's close come
     last, on a run with no skip, an uploads directory both its pre-check and its uploads pass could
     list (BACKLOG #4940; a listable directory that is not the one holding the uploads passes both,
-    which docs/PHI.md states) and a good roll. One it cannot list at the start refuses before
+    which docs/PHI.md states) and a good roll, or a run passed ``--close-without-roll`` whose
+    roll refused for good (BACKLOG #4935). One it cannot list at the start refuses before
     anything is written; one its uploads pass cannot list aborts the run before the roll, which is
     not a skip. A skip does not stop the roll (owner ruling 2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
     that verifies. A refused roll rolls nothing. A roll that succeeds costs the way back to the prior
@@ -12788,22 +12789,30 @@ def _rotate_key(args: argparse.Namespace) -> int:
                     detail=json.dumps(
                         {
                             "reason": close_reason,
+                            "key_id": key_id,
                             "roll_refusal": rolled[1][:_ROTATION_CLOSE_REASON_MAX],
                         }
                     ),
                 )
+                # Closed before the stamp, so a run killed between the two leaves an unstamped key
+                # whose next start reopens the record (BACKLOG #4942), and a re-run with the flag
+                # closes it again. Stamped first, the record would name a stamped key, which opens
+                # no record for a re-run to close.
+                if isinstance(store, SecretRotationMetaStore):
+                    await close_rotation_record(store, today)
             # ASVS 13.3.4: stamp the DEK rotation so the watcher's clock resets automatically (rotation
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
             # fingerprint; preserve the tracked-since floor. NON-SECRET (key-id + dates only).
             # Only once the whole rotation is done, so after the audit step (BACKLOG #3181). After a
             # skipped upload, part of that file may still be under the prior key, and after a failed
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
+            # The one exception is `closing` (BACKLOG #4935): the operator's audited close of a
+            # record no roll can clear, which stamps over a chain whose newest range may still be
+            # under the prior key, as the close's note says.
             # The run that completes still sees the old fingerprint here and stamps then, because the
             # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
-            if (
-                isinstance(store, SecretRotationMetaStore)
-                and (rolled[0] or closing)
-                and not uploads.incomplete
+            if isinstance(store, SecretRotationMetaStore) and (
+                (rolled[0] and not uploads.incomplete) or closing
             ):
                 if key_id:
                     meta = await store.get_secret_rotation_meta()
@@ -13036,13 +13045,14 @@ def _rotate_key(args: argparse.Namespace) -> int:
             )
         if closed:  # BACKLOG #4935, decided in run()
             print(
-                "note: --close-without-roll closed the rotation record and stamped this key, "
-                f"with a {ROTATION_CLOSED_WITHOUT_ROLL_ACTION} audit row naming "
-                "the reason. The audit chain did not roll and still does not verify; "
+                "note: --close-without-roll closed the rotation record and recorded this key "
+                f"as the one in use, with a {ROTATION_CLOSED_WITHOUT_ROLL_ACTION} audit row "
+                "naming the reason. The audit chain did not roll and still does not verify; "
                 "`messagefoundry audit-verify` names the break. Keep the prior key in "
-                "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED: the audit rows it MACed do not verify "
-                "without it, and where the chain's current range is under it, new audit rows "
-                "are still MACed under it, since no run can roll the chain off it.",
+                "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED: the audit rows it MACed in a range no roll "
+                "closed do not verify without it, and where the chain's current range is under "
+                "it, new audit rows are still MACed under it, since no run can roll the chain "
+                "off it.",
                 file=sys.stderr,
             )
         elif close_reason is not None:
@@ -13060,9 +13070,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "note: --close-without-roll was not used: the audit chain step completed, so the "
             "flag does not apply. "
             + (
-                "This run completed and closed the rotation record. "
+                "This run completed, so it closed any rotation record that was open. "
                 if complete
-                else "This run did not complete, so the rotation record stays open. "
+                else "This run did not complete, so any rotation record stays open. "
             )
             + "No audit row was written for the flag.",
             file=sys.stderr,
