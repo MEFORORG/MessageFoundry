@@ -772,7 +772,7 @@ REFINED_READING_DENY = [
     # A combining mark after an apostrophe leaves it a quote to bash, and the later `))` must not
     # close the arithmetic reading the first `) ` already refused.
     pytest.param(
-        "echo \"$((echo 'a'́; find /proc) )\"; echo ')) '",
+        "echo \"$((echo 'a'\u0301; find /proc) )\"; echo ')) '",
         id="combining-mark-after-a-quote-in-a-subshell-substitution",
     ),
     pytest.param('echo "$( (( a << b ))\nfind /proc)"', id="spaced-shift-in-an-arithmetic-command"),
@@ -832,6 +832,11 @@ REFINED_FALSE_DENY_ALLOW = [
         "(" * 250 + "true" + ") " * 250 + '; echo "$(( find / 2 ))"',
         id="arithmetic-after-many-nested-subshells",
     ),
+    # Shallow enough that the refined view runs to the end rather than giving up on its budget.
+    pytest.param(
+        "(" * 60 + "true" + ") " * 60 + '; echo "$(( find / 2 ))"',
+        id="arithmetic-after-some-nested-subshells",
+    ),
     pytest.param('a[x<<y]=1\necho "\ny\nfind /proc\n"', id="glued-shift-in-an-array-subscript"),
     pytest.param(
         'a[(i<<k)]=v\necho "\nk\nfind /proc\n"', id="glued-shift-in-parens-in-a-subscript"
@@ -847,6 +852,15 @@ REFINED_FALSE_DENY_ALLOW = [
         id="arithmetic-glued-to-else",
     ),
     pytest.param("cat <<EOF\nx\nEOF\nfind . # see; ls /proc", id="comment-in-a-quote-free-command"),
+    # The refined view exposes a span the bash view blanked; a comment in it must not hand its words
+    # to the operand loop, which reads the raw text to the end of a bound.
+    pytest.param(
+        'echo "$(cat<<EOF\nit\'s\nEOF\n)"; find . # see; ls /proc',
+        id="comment-after-a-glued-heredoc",
+    ),
+    pytest.param(
+        'echo "$((echo a) ) x"; find . # note; ls /proc', id="comment-after-a-subshell-substitution"
+    ),
     pytest.param('(( x<<y ))\necho "\ny\nfind /proc\n"', id="glued-shift-in-an-arithmetic-command"),
     pytest.param('x=$((a<<b))\necho "\nb\nfind /proc\n"', id="glued-shift-in-arithmetic"),
     pytest.param('((x<<y)\necho "\ny\nfind /proc\n"', id="glued-shift-after-a-subshell-pair"),
@@ -914,7 +928,7 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_READING_DENY": 11,
     "REFINED_FLOOR_DENY": 3,
     "REFINED_CONTROL_ALLOW": 2,
-    "REFINED_FALSE_DENY_ALLOW": 10,
+    "REFINED_FALSE_DENY_ALLOW": 13,
 }
 
 

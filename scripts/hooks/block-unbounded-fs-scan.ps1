@@ -112,9 +112,10 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # slice of the text. Past a processed-character budget it gives up and returns $null, and the
 # caller then adds nothing. It still does not read at least these, which stay as the bash view
 # reads them: a spaced shift in a command with no quote, `((` glued to a keyword (`do((`), a
-# `$((cmd) )` nested inside arithmetic, a case pattern's `)`, a terminator compared after
-# trimming, delimiters such as `<<END-X` and `<<E"O"F`, and a glued opener whose word is not a plain
-# name. The older masker in block-blanket-git-stage.ps1 is untouched.
+# substitution in the body of a heredoc whose delimiter is unquoted, a glued opener after a bare
+# `(` or later on a line that opened arithmetic, a `$((cmd) )` nested inside arithmetic, a case
+# pattern's `)`, a terminator compared after trimming, delimiters such as `<<END-X` and
+# `<<E"O"F`, and a glued opener whose word is not a plain name. The older masker in block-blanket-git-stage.ps1 is untouched.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
     if ($Plain) {
@@ -154,6 +155,7 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         # bodies still to blank, in order.
         $saves = [System.Collections.Generic.List[object]]::new()
         $subshellSites = [System.Collections.Generic.HashSet[int]]::new()
+        $siteStack = [System.Collections.Generic.List[int]]::new()
         $pendingQ = [System.Collections.Generic.List[string]]::new()
         $bodyQ = [System.Collections.Generic.List[string]]::new()
         $arithOnLine = $false
@@ -211,8 +213,12 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
                     $sv = $saves[$saves.Count - 1]
                     $saves.RemoveAt($saves.Count - 1)
                     if ($next -cne ')') {
-                        [void]$subshellSites.Add($sv.Site)
-                        foreach ($site in @($subshellSites)) { if ($site -gt $sv.Site) { [void]$subshellSites.Remove($site) } }
+                        # Sites are pushed in ascending order, as every later one is cut first.
+                        while ($siteStack.Count -gt 0 -and $siteStack[$siteStack.Count - 1] -gt $sv.Site) {
+                            [void]$subshellSites.Remove($siteStack[$siteStack.Count - 1])
+                            $siteStack.RemoveAt($siteStack.Count - 1)
+                        }
+                        if ($subshellSites.Add($sv.Site)) { $siteStack.Add($sv.Site) }
                         $sb.Length = $sv.SbLen
                         $kinds = $sv.Kinds; $depths = $sv.Depths
                         $prevDollar = $sv.PrevDollar; $wordStart = $sv.WordStart; $braceDepth = $sv.BraceDepth
@@ -389,6 +395,10 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
                 if ($tick -ge 0 -and $tick -lt $end) { $end = $tick }
             }
             [void]$sb.Append('#' + ' ' * ($end - $n - 1)); $prevDollar = $false
+            # The operand loop reads the RAW text to the end of a bound, so a comment the refined
+            # view exposes would hand it the comment's words (`find . # see; ls /proc`). Ending the
+            # bound at the `#` keeps them out.
+            if ($Refined) { $sb[$sb.Length - ($end - $n)] = [char]';' }
             $n = $end; continue
         }
         # An unquoted backslash escapes the next character, whatever it is.
