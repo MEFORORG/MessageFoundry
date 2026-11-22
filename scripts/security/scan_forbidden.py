@@ -498,26 +498,29 @@ _PR_STRONG_VERB = (
     r"|(?:went|goes|moves?|moved) from)"
 )
 _PR_PLAIN_STATE_VERB = rf"(?:{_PR_STRONG_VERB}|is(?: now| still)?|was|are|reads|now|at|from)"
+#: The adverbs a record sentence hedges a verdict with, one list for each place one may stand: before
+#: the verb (_PR_AUX), after a modal (_PR_MODAL), between "has" and "been", and before the verdict
+#: (_PR_QUALIFIER). Lists kept apart drifted, so a word one place took unbound another (BACKLOG #8175
+#: item 6): "<id> has likely been met", "<id> is only partial", "<id> never stays partial".
+_PR_HEDGE = r"(?:likely|probably|still|now|also|only|then|already|so|never|yet|honestly|since)"
+#: "has been" with an optional negation and any hedges between ("has since been", "hasn't yet been").
+_PR_HAS_BEEN = rf"(?:has|have|had)(?: not|n['\u2019]t)?(?: {_PR_HEDGE})* been"
 #: The passive and negated forms ("were", "has been", "isn't", "has not been", "is no longer") bind an
 #: unmarked identifier only with a state verdict ending its clause (_pr_verdict_bound).
 _PR_STATE_VERB = (
-    rf"(?:{_PR_PLAIN_STATE_VERB}|were"
-    # A word may stand between "has" and "been" ("has since been met", "has never been met").
-    r"|(?:(?:has|have|had)(?: not|n['\u2019]t)?(?: (?:since|still|now|yet|never|already))* )?been"
+    rf"(?:{_PR_PLAIN_STATE_VERB}|were|(?:{_PR_HAS_BEEN}|been)"
     r"|(?:is|was|are|were)(?:n['\u2019]t| not| no longer))"
 )
-_PR_PLAIN_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
+_PR_PLAIN_QUALIFIER_WORDS = r"a|an|the|its|permanent|genuine|accepted|honest"
+_PR_PLAIN_QUALIFIER = rf"(?:(?:{_PR_PLAIN_QUALIFIER_WORDS}){_PR_SEP})*"
 _PR_QUALIFIER = (
-    r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest|recorded|known|interim|provisional"
-    r"|likely|probably|still|already|never)" + _PR_SEP + r")*"
+    rf"(?:(?:{_PR_PLAIN_QUALIFIER_WORDS}|recorded|known|interim|provisional|{_PR_HEDGE}){_PR_SEP})*"
 )
 #: Words that may stand between the identifier and its verb without unbinding it: a passive auxiliary
-#: ("<id> was held at partial"), a negated one ("<id> isn't met") and the adverbs a record sentence
-#: hedges with ("<id> likely stays").
+#: ("<id> was held at partial"), a negated one ("<id> isn't met") and the hedges ("<id> likely stays").
 _PR_AUX = (
-    r"(?:(?:is|was|are|were|be|been|(?:has|have|had)(?: not)? been|(?:has|have|had)n['\u2019]t been"
-    r"|(?:is|was|are|were)n['\u2019]t|not|no longer|likely|probably|still|now|also|only|then"
-    r"|already|so)" + _PR_SEP + r")*"
+    rf"(?:(?:is|was|are|were|be|been|{_PR_HAS_BEEN}"
+    rf"|(?:is|was|are|were)n['\u2019]t|not|no longer|{_PR_HEDGE})" + _PR_SEP + r")*"
 )
 #: A modal or a negation bound to a bare verdict verb: "<id> cannot pass", "<id> would not be met",
 #: "<id> needs to pass", "<id> will remain partial". On an identifier the text does not mark as a
@@ -526,8 +529,7 @@ _PR_AUX = (
 _PR_MODAL = (
     r"(?:can(?:not)?|can['\u2019]t|could|would|will|should|may|might|must|does|do|did"
     r"|(?:does|did|wo|would|could|should)n['\u2019]t|needs? to|has to|is (?:un)?able to)"
-    rf"(?:{_PR_SEP}(?:not|now|still|yet|never|only|honestly|also|then|reach|have|be|been|stay"
-    r"|remain|likely|probably))*"
+    rf"(?:{_PR_SEP}(?:not|{_PR_HEDGE}|reach|have|be|been|stay|remain))*"
 )
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
@@ -555,7 +557,8 @@ _PR_MODAL_STRONG = re.compile(r"(?i)(?:stay|remain)$")
 #: preposition is not one: "<version> will fail on the strict validator" is a verb and its phrase.
 _PR_VERDICT_END = re.compile(
     rf"(?i){_PR_FMT}(?:\s*(?:$|[.,;:!?)\]|])"
-    r"|\s+(?:yet|today|now|either|again|until|unless|because)\b)"
+    # Underscore emphasis on the word ("_yet_") does not hide it, as "\b" did.
+    rf"|\s+_{{0,2}}(?:yet|today|now|either|again|until|unless|because){_PR_EA})"
 )
 #: A verb that states the verdict BEFORE the identifier: "does not meet <id>", "satisfies ASVS <id>",
 #: and the record's idiom for a requirement that does not pass yet, "an honest pass for <id>". "pass"
@@ -609,8 +612,9 @@ _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`
 #: one deleted, inside a word or a cell as well as around one, and keeps the hits of both readings.
 #: The deletion reaches the text the verdict, gap and map patterns read, not the line's kind:
 #: _pr_units decides a row, heading, list item or empty line from the line as written, so an
-#: invisible character before a row's first pipe makes it a paragraph in both readings (an open
-#: evasion). A fixed table, so an import pays nothing for it.
+#: invisible character before a row's first pipe makes it a paragraph in both readings. A third
+#: reading deletes them before the kinds are read (_pr_scan_reading). A fixed table, so an import
+#: pays nothing for it.
 _PR_DEFAULT_IGNORABLE = (
     (0x00AD, 0x00AD),
     (0x034F, 0x034F),
@@ -798,8 +802,8 @@ _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
 #: time; those patterns backtrack on a long run, and tests/test_scan_forbidden.py keeps them as its
 #: oracles and pins the two functions equal to them. Do not
 #: tighten any of the three: a change to one is a change to the floor. The pass runs this module's
-#: table model, whose loose reading keeps a table's ASVS columns wherever main kept them
-#: (_pr_loose_columns).
+#: table model, whose loose reading keeps a table's ASVS columns wherever main kept them but past a
+#: blank line under a header that has had a data row (_pr_loose_columns).
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
 #: The lookahead class of main's full-stop split.
 _PR_BASE_SPLIT_LOOKAHEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ*`[(\"'#>-")
@@ -1159,6 +1163,11 @@ def _pr_is_delimiter(row: str) -> bool:
     return "-" in row and set(row) <= _PR_TABLE_DELIMITER_CHARS
 
 
+def _pr_between(found: list[int], above: int, below: int) -> bool:
+    """Whether a line number in ``found``, which is sorted, lies strictly between two lines."""
+    return bisect.bisect_right(found, above) < bisect.bisect_left(found, below)
+
+
 def _pr_table_starts(
     units: _PrUnits, blanks: list[int], quote_blanks: list[int], quoted: set[int]
 ) -> list[bool]:
@@ -1174,10 +1183,7 @@ def _pr_table_starts(
     else, a lone ">" between rows does not end the run, as main read no blank line at all.
 
     These runs bound only the GFM reading (_pr_table_columns), whose columns can only add marks; the
-    loose reading (_pr_loose_columns), which keeps every mark main kept, does not read them."""
-
-    def between(found: list[int], above: int, below: int) -> bool:
-        return bisect.bisect_right(found, above) < bisect.bisect_left(found, below)
+    loose reading (_pr_loose_columns) does not read them."""
 
     starts = []
     # Whether every row since the last unit that is not a row opens with a quote marker.
@@ -1191,8 +1197,8 @@ def _pr_table_starts(
             and (
                 above is None
                 or not above[2]
-                or between(blanks, above[0][0][1], line)
-                or (block_quoted and between(quote_blanks, above[0][0][1], line))
+                or _pr_between(blanks, above[0][0][1], line)
+                or (block_quoted and _pr_between(quote_blanks, above[0][0][1], line))
             )
         )
     return starts
@@ -1245,24 +1251,29 @@ def _pr_table_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
     return columns
 
 
-def _pr_loose_columns(units: _PrUnits) -> list[set[int]]:
+def _pr_loose_columns(units: _PrUnits, blanks: list[int]) -> list[set[int]]:
     """For each unit, the ASVS columns as main read them, united with the GFM reading above: every
-    row above a dash-shaped unit is re-read as a header, and its cells are split at every pipe. Only
-    a unit that is not a row ends this reading, as on main, so a blank line or a quote-marker-only
-    line between rows ends nothing here and every mark main kept is kept. Step 9, which ended this
-    reading at such a line, was removed; the false positive it quieted stays open on BACKLOG #3364."""
+    row above a dash-shaped unit is re-read as a header, and its cells are split at every pipe.
+
+    A unit that is not a row ends this reading, as on main. So does a blank line (``blanks``, as
+    _pr_lines counts one) between two rows once the header has had a data row: the pipe lines below
+    it are another block, which the header above does not name (BACKLOG #3364 step 9). This is the
+    one place the reading drops a mark main kept. A blank line above the first data row, or a
+    quote-marker-only line anywhere, ends nothing, as on main: a header with no rows yet is read as
+    heading the rows below it."""
     columns: list[set[int]] = []
     current: set[int] = set()
-    for index, (_, text, is_row) in enumerate(units):
-        if not is_row:
-            current = set()
-        if (
-            is_row
-            and not _pr_is_delimiter(text)
-            and index + 1 < len(units)
-            and _pr_is_delimiter(units[index + 1][1])
-        ):
-            current = _pr_asvs_columns(text, loose=True)
+    # Whether a data row has been read under the current header.
+    has_rows = False
+    for index, (marks, text, is_row) in enumerate(units):
+        # A data row above implies the unit above is a row, as any other unit clears it.
+        if not is_row or (has_rows and _pr_between(blanks, units[index - 1][0][0][1], marks[0][1])):
+            current, has_rows = set(), False
+        if is_row and not _pr_is_delimiter(text):
+            if index + 1 < len(units) and _pr_is_delimiter(units[index + 1][1]):
+                current, has_rows = _pr_asvs_columns(text, loose=True), False
+            elif current:
+                has_rows = True
         columns.append(current)
     return columns
 
@@ -1353,6 +1364,22 @@ def scan_pr_body(body: str) -> list[str]:
     return [f"pr-body:{line}: {PR_BODY_REASONS[kinds[kind]]}" for line, kind in sorted(found)]
 
 
+def _pr_scan_units(
+    units: _PrUnits,
+    gfm: tuple[list[int], list[int], set[int]],
+    sentences: Callable[[str, bool], list[tuple[int, str]]],
+    kinds: frozenset[str],
+    found: set[tuple[int, int]],
+) -> tuple[list[bool], list[set[int]], list[set[int]]]:
+    """Scan every unit with its own runs of rows and columns; return the runs and both columns."""
+    starts = _pr_table_starts(units, *gfm)
+    asvs = _pr_table_columns(units, starts)
+    loose = _pr_loose_columns(units, gfm[0])
+    for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
+        _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
+    return starts, asvs, loose
+
+
 def _pr_scan_reading(
     lines: list[str],
     gfm: tuple[list[int], list[int], set[int]],
@@ -1366,11 +1393,7 @@ def _pr_scan_reading(
     sentences = _pr_base_sentences if reading == _PR_BASE else _pr_sentences
     # Both passes of a reading share the units' kinds and lines, so they share where each run of rows
     # starts.
-    starts = _pr_table_starts(units, *gfm)
-    asvs = _pr_table_columns(units, starts)
-    loose = _pr_loose_columns(units)
-    for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
-        _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
+    starts, asvs, loose = _pr_scan_units(units, gfm, sentences, kinds, found)
     # Where the body holds an invisible character, it is read again with each one deleted. A unit
     # whose text and columns that leaves unchanged reads the same, so only the others are scanned.
     if invisible:
@@ -1378,7 +1401,7 @@ def _pr_scan_reading(
         for unit, unit_asvs, unit_loose, plain, plain_asvs, plain_loose in zip(
             deleted,
             _pr_table_columns(deleted, starts),
-            _pr_loose_columns(deleted),
+            _pr_loose_columns(deleted, gfm[0]),
             units,
             asvs,
             loose,
@@ -1386,6 +1409,13 @@ def _pr_scan_reading(
         ):
             if unit[1] != plain[1] or unit_asvs != plain_asvs or unit_loose != plain_loose:
                 _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
+        # The passes above read each line's kind as written, so an invisible character before a
+        # row's first pipe makes it a paragraph there. A third pass deletes every one before the
+        # kinds are read, so such a line is read as a row, with its own runs of rows. It only adds
+        # hits; where it builds the units the second pass built, it would add none.
+        regrouped = _pr_units([_PR_INVISIBLE.sub("", line) for line in lines], False, reading)
+        if regrouped != deleted:
+            _pr_scan_units(regrouped, gfm, sentences, kinds, found)
 
 
 def _pr_scan_unit(

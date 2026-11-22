@@ -1236,14 +1236,8 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ),
     ("9", "verdict", f"> | ASVS | Note | Result |\n>\n> |---|---|---|\n> {_ROW}"),
     ("9", "verdict", f"> {_HEAD.replace(chr(10), chr(10) + '> ')}\n> {_ROW}"),
-    # Step 9 is removed: a blank line, or a quote-marker-only line in a quoted table, between data
-    # rows ends nothing, so the header still marks the rows below it, as main reads it. The first
-    # body is the one step 9 quieted; its false positive stays open on BACKLOG #3364.
-    *(
-        ("9", "verdict", f"{_HEAD}| a | b | c |\n{blank}\n{_ROW}")
-        for blank in ("", "  ", "\n", "\r")
-    ),
-    ("9", "verdict", f"{_HEAD}| a | b | c |\r\n\r\n{_ROW}"),
+    # Step 9 ends the header's mark only at a blank line under a data row (_PR_STEP9_DROPPED). A
+    # quote-marker-only line between quoted data rows ends nothing, as main reads it.
     *(
         (
             "9",
@@ -1317,7 +1311,73 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # A marked identifier is never exempt.
     ("10", "verdict", f"ASVS {_REQ}: the row is not failing but stays {_PARTIAL}."),
     ("10", "verdict", f"| ASVS {_REQ} | the parser | is never failing; the cell is failing |"),
+    # Step 9's must-fire controls: a blank line ends a header's mark only under a data row. A dash
+    # placeholder is no data row, and a block below the blank line that marks its own id or has its
+    # own ASVS header still binds.
+    ("9", "verdict", f"{_HEAD}| - | - | - |\n\n{_ROW}"),
+    (
+        "9",
+        "verdict",
+        f"{_HEAD}| a | b | c |\n\n| ASVS {_REQ} | the limb | {_PASS.title()} (12 messages) |",
+    ),
+    ("9", "verdict", f"{_HEAD}| a | b | c |\n\n{_HEAD}{_ROW}"),
+    # Step 8: an escaped pipe in the header and in the row, and an escaped backslash before a real
+    # pipe in the header. Main flags each too; these pin the columns.
+    ("8", "verdict", f"| a \\| b | ASVS | Note | Result |\n|---|---|---|---|\n| a \\| b {_ROW}"),
+    ("8", "verdict", f"| a \\\\| ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
+    # Step 11, the hedge vocabularies: one list (_PR_HEDGE) for every place a hedge stands. Each of
+    # these missed while the lists differed.
+    ("11", "verdict", f"ASVS {_REQ} has likely been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} is only {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} is also {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} never stays {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} will already stay {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} honestly stays {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} will so stay {_PARTIAL}."),
+    # Step 11: underscore emphasis on the word that ends a modal's clause.
+    ("11", "verdict", f"{_REQ} cannot {_PASS} _yet_."),
+    ("11", "verdict", f"{_REQ} will {_FAIL} _today_."),
+    # Step 11: underscore emphasis on a cell's connective and on a list's "and". Main flags each
+    # through the markup-deleted reading of the cell; these pin it.
+    ("11", "verdict", f"| ASVS {_REQ} | the limb | {_PASS.title()} _until_ the fix |"),
+    ("11", "verdict", f"| {_REQ} _and_ {_REQ_B} | {_PARTIAL} |"),
+    # Step 11: a zero-width character before the first pipe of a data row, a delimiter row or a
+    # header row.
+    ("11", "verdict", f"{_HEAD}{chr(0x200B)}{_ROW}"),
+    ("11", "verdict", f"| ASVS | Note | Result |\n{chr(0x200B)}|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"{chr(0x200B)}{_HEAD}{_ROW}"),
 ]
+#: Step 9 (BACKLOG #3364): a blank line under an ASVS table that has had a data row ends the table, so
+#: the header no longer marks the headerless pipe block below it. Main flags each body at the line
+#: given; head reports nothing. Each superset guard excuses exactly the (body, hit) pairs listed here
+#: and no other, and the test below checks that each listed hit is really dropped.
+_PR_STEP9_DROPPED: list[tuple[str, int]] = [
+    *((f"{_HEAD}| a | b | c |\n{blank}\n{_ROW}", 5) for blank in ("", "  ", "\r")),
+    (f"{_HEAD}| a | b | c |\n\n\n{_ROW}", 6),
+    (f"{_HEAD}| a | b | c |\r\n\r\n{_ROW}", 5),
+    # Two quotes a blank line separates.
+    (f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n\n> {_ROW}", 5),
+]
+
+
+def _step9_excused(sf, body: str) -> set[str]:
+    """The hits the step 9 drop excuses in one body: none, unless it is listed above."""
+    return {
+        f"pr-body:{line}: {sf.PR_BODY_REASONS['verdict']}"
+        for listed, line in _PR_STEP9_DROPPED
+        if listed == body
+    }
+
+
+@pytest.mark.parametrize(("body", "line"), _PR_STEP9_DROPPED)
+def test_a_blank_line_under_a_data_row_ends_the_asvs_header(
+    sf, sf_frozen_main, body: str, line: int
+) -> None:
+    """Step 9's quiet control, and the exception it is: main flags exactly the listed hit."""
+    assert sf_frozen_main.scan_pr_body(body) == sorted(_step9_excused(sf, body)), body
+    assert sf.scan_pr_body(body) == [], body
+
+
 #: The six bodies engine PR 2893's review named as false positives: CI prose and a component row about
 #: HL7 v2.5.1. Main flags each. Step 10, which an earlier head of this branch built to drop them, was
 #: removed, because it dropped a verdict only from a body exactly equal to one of the six, which no
@@ -1502,6 +1562,13 @@ _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     ("11", f"| Version (not an ASVS id) | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", f"| Version (not  ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", f"| Not in ASVS | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # Step 11: the same hedges beside a version, or before a CI verdict on an unmarked id; emphasis
+    # on a word that starts an object; a zero-width character before a row under a header that does
+    # not name ASVS.
+    ("11", f"Python 3.9.7 has likely been {_MET}."),
+    ("11", "The parser on 2.5.1 is only passing locally."),
+    ("11", f"{_REQ} will {_FAIL} _the_ handshake."),
+    ("11", f"| Version | Note | Result |\n|---|---|---|\n{chr(0x200B)}{_ROW}"),
 ]
 
 
@@ -1605,6 +1672,7 @@ def _superset_bodies() -> dict[str, str]:
             for i, (s, body) in enumerate(_PR_FINDINGS_MUST_STAY_QUIET)
         }
     )
+    bodies.update({f"step9-dropped-{i}": body for i, (body, _) in enumerate(_PR_STEP9_DROPPED)})
     marked_head = "| x | ASVS | Note | Result |\n|---|---|---|---|\n"
     bodies.update(
         {
@@ -1665,11 +1733,11 @@ def test_the_head_reports_every_hit_main_reports_in_a_constructed_body(
     sf, sf_frozen_main, name: str
 ) -> None:
     """BACKLOG #3364: on each constructed body, head reports every hit main reports, at main's line
-    number, with no exception. A finite set: it pins these bodies, and a loss on a body outside it
-    is not caught here."""
+    number, excepting only the hits _PR_STEP9_DROPPED lists. A finite set: it pins these bodies,
+    and a loss on a body outside it is not caught here."""
     body = _SUPERSET_BODIES[name]
     lost = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
-    assert not lost, (name, sorted(lost))
+    assert not lost - _step9_excused(sf, body), (name, sorted(lost))
 
 
 def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
@@ -2815,8 +2883,9 @@ def _generated_pr_bodies(count: int = 600) -> list[str]:
 
 def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf, sf_frozen_main) -> None:
     """The baseline is one pass of the union, but it runs the head's table model, so this is not true
-    by construction. The test pins it, with no exception, against two oracles: the pre-BACKLOG #5582
-    reading rebuilt here, and the vendored origin/main scanner with #5582's readings."""
+    by construction. The test pins it, excepting only the hits _PR_STEP9_DROPPED lists, against two
+    oracles: the pre-BACKLOG #5582 reading rebuilt here, and the vendored origin/main scanner with
+    #5582's readings."""
     harvested = set(_harvested_pr_bodies())
     fired_harvested = fired_generated = 0
     for body in [*harvested, *_generated_pr_bodies()]:
@@ -2826,7 +2895,7 @@ def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf, sf_frozen_
                 fired_harvested += 1
             else:
                 fired_generated += 1
-        missed = main_hits - set(sf.scan_pr_body(body))
+        missed = main_hits - set(sf.scan_pr_body(body)) - _step9_excused(sf, body)
         assert not missed, (body, sorted(missed))
     # Controls: the oracle fires on many fixtures and many generated bodies, or this proves nothing.
     assert fired_harvested > 100 and fired_generated > 100, (fired_harvested, fired_generated)
