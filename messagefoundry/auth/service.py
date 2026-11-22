@@ -10206,9 +10206,9 @@ class AuthService:
             # pass -- reachable whenever an account is renamed and role-demoted in the same pass.
             # Both reads see the pre-rename name this way, and the rename still lands on this pass.
             #
-            # Vault BACKLOG #3069 item 1: ONE catch for every checked read of this rename, the
-            # held read here and each read inside the refresh, so a Vault transit answer at any of
-            # them skips this rename rather than ending the pass (see _rename_read_seal_answer).
+            # Vault BACKLOG #3069 item 1: one catch around the held read here and the refresh, so
+            # a Vault transit answer at a checked read in either skips this rename rather than
+            # ending the pass (see _rename_read_seal_answer).
             try:
                 await self._refresh_cached_username(
                     user_id=refresh.user_id,
@@ -10631,9 +10631,11 @@ class AuthService:
         the record it read could not be verified (Unverifiable), or Transit did not answer
         (Outage) (vault BACKLOG #3069 item 1). The reconcile loop then skips that one rename, as
         the write's seal arm in :meth:`_refresh_cached_username` does (note T2): a raise would end
-        the pass and every rename after it. Each read that can raise it runs before the rename's
-        write lands, so nothing was written. A Forged record is not raised by these reads; it comes
-        back refused, for the refresh to handle as it already does.
+        the pass and every rename after it. The checked reads it was written for run before the
+        rename's write lands, or after a write that wrote nothing, which is why the line says the
+        rename was not applied. A record that fails its seal is mostly not raised by these reads:
+        it comes back refused, for the refresh to handle as it already does. A row whose id cannot
+        be read is still raised (:func:`read_user_or_unreadable`) and is not caught here.
 
         Logged at ERROR, and an Outage is paged on the seal pager as the write's arm pages it. An
         Unverifiable answer is not reported under an account here: the answer does not say which
@@ -10647,6 +10649,7 @@ class AuthService:
             user_id,
             scrub_log_argument(new_username),
             "did not answer for" if outage else "could not verify",
+            exc_info=exc,
         )
         if outage:
             self._user_seal_outage("rename")

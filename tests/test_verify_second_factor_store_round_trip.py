@@ -94,7 +94,7 @@ async def test_a_replay_makes_one_refused_totp_store_call_and_the_same_walk(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
     """RED when: a replay skips ``consume_totp_step``, or skips the recovery-code walk a wrong code
-    runs, or spends a recovery code."""
+    runs."""
     calls, verifies = await _round_trips(monkeypatch, store, 4242, consumed=True)
 
     assert calls == ["consume_totp_step(4242)"]

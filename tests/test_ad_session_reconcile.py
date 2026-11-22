@@ -6892,8 +6892,9 @@ async def test_a_transit_answer_at_a_rename_read_does_not_end_the_pass(
 ) -> None:
     """Vault BACKLOG #3069 item 1. Vault transit could not verify, or did not answer for, the
     record one of ``jdoe``'s rename reads checked. The reconcile loop logs it at ERROR, pages an
-    Outage as the write's seal arm does (note T2), skips that rename and goes on, so ``asmith``'s
-    rename still applies. RED when: the answer escapes the pass. Called the way the login path
+    Outage as the write's seal arm does (note T2), skips that rename, and the pass returns its
+    plan with ``asmith``'s rename applied (the plan's order is not fixed, so that rename may run
+    first). RED when: the answer escapes the pass. Called the way the login path
     calls it, the answer is raised."""
     store, service, notifier = await _two_renamed_accounts()
     try:
