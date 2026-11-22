@@ -53,8 +53,8 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import no_audit_row
 from tests._doc_blockquote import blockquote_lines, plant_in_blockquote, route_tokens, unwrap
+from tests._store_audit import no_operator_audit
 from tests.test_approvals import ON, _add, _token
 from tests.test_approvals import _client as _approvals_client
 
@@ -429,7 +429,7 @@ async def _measure_ui_resend_done(k: _Callers) -> None:
         to="OB_Y",
         from_="OB_X",
         idempotency_key="k-ran",
-        audit=no_audit_row,
+        audit=no_operator_audit,
     )
     assert (outcome.status, outcome.from_destination) == ("resent", "OB_X"), outcome
     path, ran = f"/ui/messages/{ids['IB_A']}/resend-done", {"to": "OB_Y", "key": "k-ran"}

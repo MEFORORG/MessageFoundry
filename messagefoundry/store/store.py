@@ -10375,14 +10375,19 @@ def require_operator_audit(audit: object, mutation: str) -> None:
 
 
 def mutation_changed(result: object) -> bool:
-    """Whether an operator mutation's ``result`` says it changed the store: a positive count, a
-    resend that created a row, or a re-ingress that created a message. A zero count and a
-    ``duplicate`` outcome changed nothing (BACKLOG #5069)."""
-    if isinstance(result, ResendOutcome):
-        return result.status == "resent"
-    if isinstance(result, ReingressOutcome):
-        return result.status == "resubmitted"
-    return isinstance(result, int) and not isinstance(result, bool) and result > 0
+    """Whether the result of replay, dead-letter replay, resend, re-ingress or purge says it changed
+    the store (BACKLOG #5069). A count changed the store unless it is ``0``, so a driver's ``-1``,
+    an unknown count, counts as a change. A resend or re-ingress outcome changed nothing only as a
+    ``duplicate``. Any other result type raises :class:`TypeError`, so a new result type must be
+    classified here rather than read as no change."""
+    if isinstance(result, ResendOutcome | ReingressOutcome):
+        return result.status != "duplicate"
+    if isinstance(result, int) and not isinstance(result, bool):
+        return result != 0
+    raise TypeError(
+        f"an operator mutation returned {type(result).__name__}, which mutation_changed does not"
+        " classify (BACKLOG #5069)"
+    )
 
 
 def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> OperatorAudit[R]:
@@ -10391,18 +10396,18 @@ def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> Operato
 
     It refuses a missing audit as :func:`require_operator_audit` does, before any write. The audit
     it returns also refuses a ``None`` row for a result that changed the store
-    (:func:`mutation_changed`): the store calls it inside the mutation's transaction, so that
-    :class:`TypeError` rolls the change back, and a replay, resend or re-ingress that ran cannot
-    record nothing. A result that changed nothing may still record nothing."""
+    (:func:`mutation_changed`). The store calls it inside the mutation's transaction, before the
+    commit, so that :class:`TypeError` keeps the change from committing. It keys on the result the
+    mutation returns, not on every write the mutation made. A result that changed nothing may still
+    record nothing."""
     require_operator_audit(audit, mutation)
-    build = audit
 
     def row_when_changed(result: R) -> AuditAppend | None:
-        row = build(result)
+        row = audit(result)
         if row is None and mutation_changed(result):
             raise TypeError(
                 f"{mutation}'s audit returned no row for a result that changed the store, so the"
-                " change was rolled back (BACKLOG #5069)"
+                " mutation does not commit it (BACKLOG #5069)"
             )
         return row
 

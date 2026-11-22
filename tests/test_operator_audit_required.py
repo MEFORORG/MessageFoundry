@@ -18,8 +18,9 @@ reason, and the walk must find exactly those; on :class:`Engine` none is exempt.
 What it does not catch, at least: a new operator mutation that takes no ``audit`` at all, or names
 it something else; a ``None``-admitting annotation spelled through an alias; and a caller that
 passes an ``audit`` which never returns a row. None of these is a type the walk can see. The
-runtime half, a ``TypeError`` on an explicit ``None`` before any write (BACKLOG #5069), is pinned on
-every backend by ``tests/_operator_audit_atomic_contract.py``; the shared helpers are pinned here.
+runtime half, a ``TypeError`` on an explicit ``None`` before any write, and on a ``None`` row for a
+result that changed the store (BACKLOG #5069, ``require_mutation_audit``), is pinned on every
+backend by ``tests/_operator_audit_atomic_contract.py``; the shared helpers are pinned here.
 
 The account and approval writes' ``audits`` sequence is held the same way (BACKLOG #5070).
 """
@@ -409,13 +410,12 @@ def test_the_mutation_audit_refuses_no_row_for_a_change() -> None:
 
     changed: list[object] = [
         1,
+        -1,  # a driver's unknown count
         ResendOutcome("resent", "m", "OB_B", "OB_A", "o1"),
         ReingressOutcome("resubmitted", "m", "m2", "IB_A"),
     ]
     unchanged: list[object] = [
         0,
-        False,
-        True,
         ResendOutcome("duplicate", "m", "OB_B", "OB_A", "o1"),
         ReingressOutcome("duplicate", "m", "m2", "IB_A"),
     ]
@@ -428,6 +428,10 @@ def test_the_mutation_audit_refuses_no_row_for_a_change() -> None:
     for result in unchanged:
         assert not mutation_changed(result), result
         assert guarded(result) is None
+    # A result type nothing classified is refused, not read as no change; a bool among them.
+    for unknown in (True, False, "m", None):
+        with pytest.raises(TypeError, match="does not classify"):
+            mutation_changed(unknown)
     with pytest.raises(TypeError, match="BACKLOG #5069"):
         require_mutation_audit(None, "store.test")  # type: ignore[arg-type]
 
@@ -491,3 +495,17 @@ def test_control_a_missing_or_discarded_guard_fails_the_check() -> None:
     }
     assert got["real"] is None
     assert all(got[name] is not None for name in ("absent", "dropped", "wrong origin"))
+    # The five mutations' guard: the pre-#5069 line, and the wrapped audit computed then dropped,
+    # are both refused.
+    mutation = _ENTRY_GUARDS["replay"]
+    old_shapes = {
+        "unwrapped": "require_operator_audit(audit, 'store.replay')",
+        "dropped": "require_mutation_audit(audit, 'store.replay')",
+        "real": mutation,
+    }
+    got = {
+        name: entry_problem(name, template.format(line), mutation)
+        for name, line in old_shapes.items()
+    }
+    assert got["real"] is None
+    assert got["unwrapped"] is not None and got["dropped"] is not None

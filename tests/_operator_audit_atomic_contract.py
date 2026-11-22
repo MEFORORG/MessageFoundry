@@ -639,6 +639,11 @@ async def _assert_missing_audit_refused(store: Any, tag: str) -> None:
         audit=_builder(f"contract.silent_control.{tag}", ch),
     )
     assert resent.status == "resent"
+    # A duplicate under the same key changed nothing, so the silent audit is accepted for it.
+    again = await store.resend_to(
+        message_id=done, to=f"OB_NA{tag}", idempotency_key=f"silent-{tag}", audit=silent
+    )
+    assert again.status == "duplicate"
 
     inject_ch = f"IB_NI{tag}"
     for origin in (MessageOrigin.OPERATOR_UPLOAD, MessageOrigin.OPERATOR_EDIT):
