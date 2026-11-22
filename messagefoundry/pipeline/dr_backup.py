@@ -4510,24 +4510,28 @@ def _decode_store_key(key_b64: str) -> bytes:
     raise StoreCipherConfigError(reason)
 
 
-#: The ``[store].key_provider`` names whose key resolve writes nothing, so a thread abandoned by a
-#: caller's timeout has no effect to leave behind: ``env`` reads settings, ``auto`` and ``dpapi`` read
-#: and unprotect a key file, and ``vault`` asks Transit to read a key's type and decrypt. ``host`` is
-#: left out because its resolve can convert and delete a custody handoff. A name not listed here,
-#: a provider added later included, resolves on the loop.
+#: The ``[store].key_provider`` names whose key resolve writes no custody or key file: ``env`` reads
+#: settings, ``auto`` and ``dpapi`` read and unprotect a key file, and ``vault`` asks Transit for a
+#: key's type and a decrypt. A thread abandoned on one of these can still do that work, the Vault
+#: calls and their audit entries included. ``host`` is left out because its resolve can convert and
+#: delete a custody handoff. A name not listed here resolves on the loop.
 _READ_ONLY_KEY_PROVIDERS: tuple[str, ...] = ("auto", "env", "dpapi", "vault")
 
 
-async def _key_hop[T](store_settings: object, resolve: Callable[[], T]) -> T:
-    """``resolve()``, in its own thread hop for a read-only provider and on the loop for any other,
-    so an abort cannot land in the middle of a custody write (BACKLOG #5888). On the loop it blocks
-    the engine, and no timeout can fire, for as long as the provider takes.
+async def _key_hop[**P, T](
+    store_settings: object, resolve: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """``resolve(...)``, in its own thread hop for a read-only provider and on the loop for any
+    other, so a timeout cannot abandon THIS resolve in the middle of a custody write (BACKLOG
+    #5888). A full verify opens the snapshot in its worker thread and can resolve the key again
+    there; this does not cover that. On the loop it blocks the engine, and no timeout can fire, for
+    as long as the provider takes.
 
     A caller's timeout cannot stop the thread. One left behind runs until the provider returns,
     which nothing here bounds, and holds process exit until then; its value is dropped."""
     if getattr(store_settings, "key_provider", None) in _READ_ONLY_KEY_PROVIDERS:
-        return await asyncio.to_thread(resolve)
-    return resolve()
+        return await asyncio.to_thread(resolve, *args, **kwargs)
+    return resolve(*args, **kwargs)
 
 
 def _resolve_decrypt_keyring(store_settings: object, posture: HopPosture | None) -> list[bytes]:
@@ -4565,7 +4569,7 @@ async def run_restore_verify(
     # `posture` is the caller's, for the Vault hop the key resolve and a full verify can dial
     # (vault BACKLOG #2983). The engine's DR activation passes its own; the `restore-verify`
     # command holds none, and `None` counts as enforcing on that hop.
-    keys = await _key_hop(store_settings, lambda: _resolve_decrypt_keyring(store_settings, posture))
+    keys = await _key_hop(store_settings, _resolve_decrypt_keyring, store_settings, posture)
     # `staging_root=None` is a standalone verify: a private directory under the OS temp dir, never
     # where the backup runner stages. See the staging-location block above `_Staging` (BACKLOG #1174).
     return await asyncio.to_thread(
@@ -5339,7 +5343,7 @@ async def run_restore(
     ``posture`` is the caller's, for the Vault hop the key resolve can dial, as on
     :func:`run_restore_verify`. ``None`` counts as enforcing on that hop; the ``restore`` command
     passes none."""
-    keys = await _key_hop(store_settings, lambda: _resolve_decrypt_keyring(store_settings, posture))
+    keys = await _key_hop(store_settings, _resolve_decrypt_keyring, store_settings, posture)
     return await asyncio.to_thread(
         _restore_blocking,
         archive_path=archive_path,

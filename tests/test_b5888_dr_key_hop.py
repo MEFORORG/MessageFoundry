@@ -257,7 +257,8 @@ async def test_a_writing_or_unknown_provider_resolves_on_the_loop(
 
 
 def test_every_known_provider_but_host_is_classified_read_only() -> None:
-    """A provider added later takes the inline path until someone checks it and lists it here."""
+    """A provider added later turns this red, though it resolves on the loop meanwhile. List it as
+    read-only only after checking that its resolve writes no custody or key file."""
     assert {*dr_backup._READ_ONLY_KEY_PROVIDERS, "host"} == set(KNOWN_PROVIDERS)
 
 
