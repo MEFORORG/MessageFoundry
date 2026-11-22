@@ -1029,8 +1029,13 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     //   * THROUGH THE EXISTING DEBOUNCED CHANNEL, so rapid typing coalesces exactly as rapid saves
     //     already do. No second timer, and `render()` still cancels it on entry.
     //
-    // The update-loop guard is unchanged and still runs first: our own `lens rewrite` WorkspaceEdit
-    // must not re-trigger a projection.
+    // Our own `lens rewrite` WorkspaceEdit must not re-trigger a projection (the update loop ADR 0076
+    // section 5's guard exists to break). The focus check runs BEFORE the guard (BACKLOG #5845): a
+    // param edit typed in the webview applies while the slot is held, so noting that change as
+    // suppressed first made releaseEdit pay it as a full re-render after every edit, replacing the HTML
+    // and dropping focus and half-typed input. A change while the webview holds focus is not
+    // re-projected whether or not the slot is held; one while it does not is deferred if the slot is
+    // held (a split-editor change that raced a rewrite), as before.
     const changeSub = vscode.workspace.onDidChangeTextDocument((e) => {
       if (e.document.uri.toString() !== document.uri.toString()) {
         return;
@@ -1040,11 +1045,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       if (e.contentChanges.length === 0) {
         return;
       }
-      if (!guard.shouldReactToDocumentChange()) {
-        guard.noteSuppressedChange();
+      if (panel.active) {
         return;
       }
-      if (panel.active) {
+      if (!guard.shouldReactToDocumentChange()) {
+        guard.noteSuppressedChange();
         return;
       }
       scheduleRowsOnlyRerender();
