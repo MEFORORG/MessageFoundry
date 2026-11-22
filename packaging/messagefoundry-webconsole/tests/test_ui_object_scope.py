@@ -144,7 +144,7 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The page shows each rule's connection, not its id, so the connection names are the markers.
-    # A scoped caller sees only rules on an inbound of a loaded graph (BACKLOG #3378), so a
+    # A scoped caller sees only rules on names in inbound_names() (BACKLOG #3378), so a
     # stand-in runner declares both; the route reads only these attributes.
     graph = SimpleNamespace(inbound_names=lambda: frozenset({"IB_MINE", "IB_THEIRS"}))
     monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(registry=graph))

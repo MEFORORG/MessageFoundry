@@ -1,9 +1,10 @@
-- **`GET /alerts/rules` no longer shows a channel-scoped caller the rules of an outbound its scope
-  lists.** The filter tested only whether each name was in the scope, never which side of the
-  graph it was on, so a scope naming an outbound read that outbound's rules, while the flag route
-  refuses every outbound to such a caller. On a first deployment that would have shown them. The
-  route now shows such a caller a rule only when each name it carries is an in-scope inbound of
-  the loaded graph, and never a `restart_outbound` rule. With no graph loaded it shows such a
-  caller no rule that names a connection. The alert-instance routes are unchanged.
-  [SECURITY.md](../docs/SECURITY.md), in the `GET /alerts/rules` paragraph, says what such a
-  caller reads and who decided it. (`BACKLOG #3378`)
+- **`GET /alerts/rules` shows a channel-scoped caller only rules on its in-scope inbounds.** The
+  filter used to test only whether each name was in the scope. It never asked which side of the
+  graph a name was on. So a scope naming an outbound read that outbound's rules, while the flag
+  route refuses every outbound to such a caller. On a first deployment that would have shown
+  them. The route now shows such a caller a rule only when each name it carries is in its scope
+  and in the config's inbound names. It never shows it a `restart_outbound` rule. With no graph
+  loaded it shows it no rule that names a connection. A name that is also an outbound still
+  passes, and the alert-instance routes are unchanged. [SECURITY.md](../docs/SECURITY.md), in
+  the `GET /alerts/rules` paragraph, says what such a caller reads and who decided it.
+  (`BACKLOG #3378`)

@@ -10638,7 +10638,9 @@ def create_app(
                 return False
             # restart_outbound acts on an outbound whatever the graph holds, a name that is also an
             # inbound and a "*" rule's firing connection included.
-            return not (scoped and rule.control_action == "restart_outbound")
+            return not (
+                scoped and _CONTROL_ACTION_SIDE.get(rule.control_action or "") == "outbound"
+            )
 
         rules = [r for r in alerts.rules if visible(r)]
         show_ids = not scoped

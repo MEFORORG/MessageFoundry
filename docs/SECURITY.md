@@ -2391,10 +2391,11 @@ the same permission set on the same method reds CI until it is listed here.
 > exists nowhere, is withheld from a scoped caller, and with no graph loaded every rule that
 > names a connection is. A name that is both an inbound and an outbound passes that test. Every
 > `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
-> its action names the outbound side. The routes that read or act on alert instances were left as
-> they were, on purpose: the batch Manager decided on 2026-11-22 to read the owner's ruling as
-> covering rules and flagging, and not instances. What those routes admit is in the ack, resolve,
-> suspend and resume bullet under *Single-route data rules*, below. Each rule it shows has a null `id`
+> its action names the outbound side. Other routes were left as they were, on purpose, at least
+> the alert-instance routes and `GET /connections/{name}/events`. The batch Manager decided this
+> on 2026-11-22. It read the owner's ruling as covering rules and flagging, not instances or
+> events. What the ack, resolve, suspend and resume routes admit is in their bullet under
+> *Single-route data rules*, below. Each rule it shows has a null `id`
 > (BACKLOG #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
 > connection name in it, and nothing here reliably tells a label that names one from one that
 > does not. An

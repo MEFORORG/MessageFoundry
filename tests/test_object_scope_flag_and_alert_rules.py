@@ -8,7 +8,7 @@
   refusal the per-name routes give (BACKLOG #2551, #2640) to every target outside the caller's scope.
 * ``GET /alerts/rules`` returned every rule's ``connection`` and ``control_target``. It now withholds
   any rule that names a connection outside the caller's scope and, since BACKLOG #3378, any rule
-  naming a name that is not an inbound of the loaded graph, and every ``restart_outbound`` rule.
+  naming a name not in the loaded config's inbound_names(), and every ``restart_outbound`` rule.
 
 NOT-DEPLOYED beta: each gap was one a first deployment would have carried, not a live exposure.
 """
@@ -205,7 +205,7 @@ def _attach_graph(
     inbounds: tuple[str, ...] = _GRAPH,
 ) -> None:
     """Give ``engine`` a stand-in runner whose graph declares ``inbounds``, since
-    ``GET /alerts/rules`` shows a scoped caller only rules on an in-scope inbound of a loaded graph
+    ``GET /alerts/rules`` shows a scoped caller only rules on in-scope names in ``inbound_names()``
     (BACKLOG #3378). Of the runner, that route reads only ``registry.inbound_names()``.
     ``monkeypatch`` restores the engine's own (None) runner before the engine fixture stops it, as
     long as the test names ``engine`` first."""
@@ -321,7 +321,7 @@ async def test_alert_rules_withhold_an_outbound_the_scope_lists(
     assert json.loads(str(rows[0]["detail"])) == {"shown": 1, "withheld": 3}
 
 
-async def test_alert_rules_a_name_on_both_sides_counts_as_its_inbound(
+async def test_alert_rules_admit_an_inbound_whatever_its_other_side(
     engine: Engine,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
