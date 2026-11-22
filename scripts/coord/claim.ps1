@@ -389,22 +389,37 @@ function Add-HistoryLine([string]$Line) {
 # probe loaded, reported itself Available, and returned zero vetoing sessions for that exact path.
 # Every other outcome, including the probe failing to load at all, stays `present`. A missing
 # answer must cost a refusal, never a licence.
-$script:OccupancyProbe = $null   # $null = not yet tried; $false = unavailable; else the object
+#
+# ONE PROBE PER HOLDER REPOSITORY (BACKLOG #5870). Get-WorktreeOccupancy places a session only inside
+# the worktrees of the repository it was asked about, and -AsWorktree can record a holder in another
+# one, so a single probe of $repo would answer "nobody there" for a holder it never looked at. The
+# cache is keyed by git common dir so one repository's failed probe cannot stand in for another's.
+$script:OccupancyProbedRepos = @{}   # common dirs already probed, whether or not the probe answered
+# Normalised worktree path -> the probe's object, or $false when that probe was unavailable. Only a
+# worktree the answer actually lists gets an entry, so zero occupants is never read for a path the
+# probe did not cover. It also spares a git spawn per holder: -List can walk hundreds of claims.
+$script:OccupancyByWorktree = @{}
 
-function Get-OccupancyOnce {
-    if ($null -ne $script:OccupancyProbe) { return $script:OccupancyProbe }
+function Get-OccupancyForHolder([string]$HeldPath) {
     try {
-        if (-not (Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)) {
-            $script:OccupancyProbe = $false
-            return $false
-        }
-        $occ = Get-WorktreeOccupancy -Repo $repo
+        if (-not (Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)) { return $false }
+        $heldNorm = ConvertTo-Norm $HeldPath
+        if ($script:OccupancyByWorktree.ContainsKey($heldNorm)) { return $script:OccupancyByWorktree[$heldNorm] }
+        $key = Get-RepoCommonDir $HeldPath
+        if (-not $key -or $script:OccupancyProbedRepos.ContainsKey($key)) { return $false }
+        # Recorded first, so a probe that throws is not re-run for every holder in this repository.
+        $script:OccupancyProbedRepos[$key] = $true
+        $occ = Get-WorktreeOccupancy -Repo $HeldPath
         # `Available` false means the fence could not be built -- an unplaceable record, no repo.
         # Treat that exactly like a failed probe.
-        $script:OccupancyProbe = if ($occ -and $occ.Available) { $occ } else { $false }
+        $answer = if ($occ -and $occ.Available) { $occ } else { $false }
+        foreach ($w in @($occ.Worktrees)) {
+            if ($w) { $script:OccupancyByWorktree[(ConvertTo-Norm $w.Path)] = $answer }
+        }
+        if ($script:OccupancyByWorktree.ContainsKey($heldNorm)) { return $script:OccupancyByWorktree[$heldNorm] }
+        return $false
     }
-    catch { $script:OccupancyProbe = $false }
-    return $script:OccupancyProbe
+    catch { return $false }
 }
 
 function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
@@ -420,7 +435,7 @@ function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
         $ct = & git -C $HeldPath log -1 --format=%ct 2>$null
         if ($ct) {
             $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
-            $occ = Get-OccupancyOnce
+            $occ = Get-OccupancyForHolder $HeldPath
             if ($occ) {
                 $who = @(Get-WorktreeOccupants -Occupancy $occ -Path $HeldPath)
                 if ($who.Count -eq 0) {
