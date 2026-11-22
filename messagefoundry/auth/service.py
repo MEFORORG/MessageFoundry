@@ -19851,7 +19851,7 @@ class AuthService:
         stamped (vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068 amendment of that
         date). Returns a not-``ok`` :class:`Elevation` for invalid input rather than raising, but an
         exception can still raise, at least from the passkey re-read as the last paragraph says. A
-        missing token, session or account, or a disabled account, returns one with no audit row.
+        missing token, session or account, or a disabled account, returns one with no ``auth.*`` row.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from

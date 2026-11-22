@@ -70,4 +70,4 @@ def test_the_docstring_no_longer_promises_no_raise_or_an_audit_row() -> None:
     doc = " ".join((inspect.getdoc(AuthService.finish_webauthn_assertion) or "").split())
     assert "(never raises)" not in doc
     assert "always audited" not in doc
-    assert "returns one with no audit row" in doc
+    assert "returns one with no ``auth.*`` row" in doc
