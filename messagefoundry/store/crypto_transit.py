@@ -99,6 +99,7 @@ from messagefoundry.store.keyprovider_vault import (
     is_vault_timeout_reply,
     is_vault_unavailable,
     require_transit_key_type,
+    store_vault_address,
     store_vault_hop,
     store_vault_token,
     vault_failure_text,
@@ -630,7 +631,7 @@ class _StoreToken:
         except Exception as exc:  # noqa: BLE001 -- the caller's 403 stands; logged by class
             kind = type(exc).__name__
             _warn_when_due(
-                lambda: "token-reread-failed",
+                lambda: ("token-reread-failed", kind),
                 lambda: ("re-reading the Vault token after a Transit 403 raised %s", kind),
             )
         finally:
@@ -743,9 +744,11 @@ class TransitCipher(_UnmarkedPolicy):
         if source is None or not is_vault_forbidden(exc):
             return None
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
-        if held is None or not source.replaced_since(held.token_epoch):
+        if held is None:
             return None
         try:
+            if not source.replaced_since(held.token_epoch):
+                return None
             return self._client
         except Exception as build_exc:  # noqa: BLE001 -- the caller raises the 403; logged by class
             kind = type(build_exc).__name__
@@ -1508,15 +1511,36 @@ class TransitCipher(_UnmarkedPolicy):
         handler so no chain carries Vault's reply; anything else raises :class:`CipherError`.
         Blocking."""
         refused = 0
+        epoch = self._token_epoch()
         try:
             return self._transit_verify(key_name, digest, mac)
         except Exception as exc:
             refused = 400 if is_vault_bad_request(exc) else 403 if is_vault_forbidden(exc) else 0
-            if not refused:
+            if not refused or (refused == 403 and not self._token_kept_serving(epoch)):
                 raise CipherError(
                     f"Transit row seal verify failed (key={key_name!r}): {vault_failure_text(exc)}"
                 ) from exc
         raise TransitSealRefused(refused)
+
+    def _token_kept_serving(self, epoch: int) -> bool:
+        """Whether a seal verify's 403 is about that key rather than a dead token (BACKLOG #5609).
+        False when the token changed since ``epoch`` or the current client cannot MAC fixed input,
+        so the sealer reads an Outage and a sound seal is not called unverifiable mid-rotation.
+        The request is sent directly, so it cannot itself move the token. Always True for a cipher
+        that cannot replace its token."""
+        if self._token_source is None:
+            return True
+        if self._token_epoch() != epoch:
+            return False
+        try:
+            self._client.secrets.transit.generate_hmac(
+                name=self._audit_key,
+                hash_input=_VERSION_PROBE_INPUT,
+                algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            )
+        except Exception:  # noqa: BLE001 -- any failure means the token is not shown to serve
+            return False
+        return True
 
     def audit_mac_fn(self) -> AuditMacVerifier:
         """The audit-chain MAC provider: route each row's MAC through Transit (:meth:`audit_hmac`),
@@ -1562,6 +1586,27 @@ def _key_names() -> tuple[str, str]:
     )
 
 
+def _refuse_over_granted(candidate: str, client_for: Callable[[str], Any]) -> None:
+    """Raise unless a replaced token passes the ADR 0216 judgement ``serve`` makes at start
+    (BACKLOG #5609). A refusing grant or an unjudged probe failure keeps the current token, under
+    either enforcement setting and whatever the opt-out says: those are read at start, where
+    accepting a grant is audited, so such a token can come in only through a restart. A probe
+    stopped by a 403 does not refuse, so this adds no required Vault capability."""
+    from messagefoundry.privilege_check import VaultConsumer, vault_hop  # noqa: PLC0415
+    from messagefoundry.privilege_probes import read_vault_token  # noqa: PLC0415
+
+    reading = read_vault_token(
+        lambda: candidate,
+        store_vault_address,
+        lambda _address, token: client_for(token),
+        transit_cipher_required_capabilities,
+    )
+    consumer = VaultConsumer("vault.store", "transit", "store Transit cipher", "Transit grants")
+    hop = vault_hop(consumer, reading, shared={})
+    if hop.refusing or hop.unexcused:
+        raise KeyProviderError("the replaced Vault token failed the privilege check")
+
+
 def build_transit_cipher(
     settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> TransitCipher:
@@ -1600,11 +1645,27 @@ def build_transit_cipher(
         )
 
     def token_serves(candidate: str) -> None:
-        # A read of the data key's metadata, which the startup check already requires, so this
-        # adds no Vault capability. Any refusal raises, and the candidate is not adopted.
+        # Every Transit operation the cipher needs, over fixed input, so a token that can do only
+        # some of them cannot replace one that works. These are grants the cipher already requires.
+        _refuse_over_granted(candidate, client_for)
         probe = client_for(candidate)
         try:
-            probe.secrets.transit.read_key(name=key_name)
+            transit = probe.secrets.transit
+            sealed = transit.encrypt_data(name=key_name, plaintext=_VERSION_PROBE_INPUT)
+            transit.decrypt_data(name=key_name, ciphertext=sealed["data"]["ciphertext"])
+            answer = transit.generate_hmac(
+                name=audit_key,
+                hash_input=_VERSION_PROBE_INPUT,
+                algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            )
+            verdict = transit.verify_signed_data(
+                name=audit_key,
+                hash_input=_VERSION_PROBE_INPUT,
+                hmac=answer["data"]["hmac"],
+                hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            )
+            if verdict["data"]["valid"] is not True:
+                raise KeyProviderError("the replaced Vault token did not verify a fixed-input MAC")
         finally:
             _close_client(probe, threading.get_ident())
 

@@ -1600,7 +1600,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # host blob's master key (HKDF-SHA256 in store/custody_host.py).
     "messagefoundry/store/base.py": frozenset(
         {
+            # BACKLOG #5609: build_transit_cipher now holds the replaced token's fixed-input Transit
+            # check and its privilege judgement, whose probe hashes the token's identity.
+            "cipher:via messagefoundry.store.crypto_transit",
+            "hash:via messagefoundry.store.crypto_transit",
             "kdf:via messagefoundry.store.custody_host",
+            "mac:via messagefoundry.store.crypto_transit",
+            "sign_verify:via messagefoundry.store.crypto_transit",
             "tls_context:via messagefoundry.store.crypto_transit",
         }
     ),
@@ -1635,6 +1641,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # and decrypt (the latter through store.crypto's decrypt_or_error).
             "cipher:.encrypt()",
             "cipher:via messagefoundry.store.crypto",
+            # BACKLOG #5609: a replaced token takes the ADR 0216 privilege probe before adoption.
+            "hash:via messagefoundry.privilege_probes",
             "mac:.generate_hmac()",
             # ADR 0217: a row seal's HMAC, and BACKLOG #2720: an audit row's stored MAC, each
             # checked INSIDE Transit (transit/verify), never compared in process. A MAC check, not

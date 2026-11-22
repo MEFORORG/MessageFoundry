@@ -26,8 +26,9 @@ pytest.importorskip("hvac")
 from hvac.exceptions import Forbidden  # type: ignore[import-untyped]  # noqa: E402
 
 from messagefoundry.config.settings import StoreSettings  # noqa: E402
+from messagefoundry.privilege_check import HopPrivilege, HopState  # noqa: E402
 from messagefoundry.store import crypto_transit  # noqa: E402
-from messagefoundry.store.crypto import CipherError  # noqa: E402
+from messagefoundry.store.crypto import CipherError, TransitSealRefused  # noqa: E402
 from messagefoundry.store.crypto_transit import (  # noqa: E402
     TransitCipher,
     build_transit_cipher,
@@ -39,6 +40,7 @@ from tests.test_crypto_transit import _KEY_NAME, _FakeClient, _FakeTransit  # no
 from tests.test_engine_secrets import _directory_in_process  # noqa: E402
 from tests.test_transit_batch import _BatchTransit  # noqa: E402
 
+real_refuse_over_granted = crypto_transit._refuse_over_granted
 _OLD = "hvs.synthetic-old-token"  # nosec B105 - a made-up test value
 _NEW = "hvs.synthetic-new-token"  # nosec B105 - a made-up test value
 _TOKEN_VAR = "MEFOR_STORE_VAULT_TOKEN"
@@ -96,6 +98,8 @@ def vault(monkeypatch: pytest.MonkeyPatch) -> tuple[_Gate, list[str]]:
         return client
 
     monkeypatch.setattr(crypto_transit, "_build_client", build)
+    # The fake has no lookup-self; the judgement has its own tests below.
+    monkeypatch.setattr(crypto_transit, "_refuse_over_granted", lambda *_: None)
     return gate, built
 
 
@@ -144,7 +148,7 @@ def test_a_403_then_a_replaced_token_succeeds(
     _expire_and_replace(monkeypatch, gate)
     gate.asked.clear()
     assert cipher.decrypt(stored, aad=_AAD) == "synthetic"
-    assert gate.asked == [_OLD, _NEW, _NEW]  # refused, the new token's check, the retry
+    assert gate.asked == [_OLD, *[_NEW] * 4, _NEW]  # refused, four checks, the retry
     assert built[-1] == _NEW
 
 
@@ -169,8 +173,8 @@ def test_every_write_path_recovers(
     gate.asked.clear()
     call(cipher)
     assert gate.asked[0] == _OLD and gate.asked[-1] == _NEW
-    # Refused, the new token's check, the retry; a batch is not split into single requests.
-    assert len(gate.asked) == 3
+    # Refused, four checks of the new token, the retry; a batch is not split into singles.
+    assert len(gate.asked) == 6
 
 
 def test_decrypt_many_recovers_without_turning_batching_off(
@@ -322,7 +326,7 @@ def test_every_thread_moves_to_the_new_token(
     assert gate.asked[-1] == _NEW
     # Each thread's first call, and at most one 403: a thread that starts after the swap has none.
     assert workers < gate.asked.count(_OLD) <= workers * 2
-    assert gate.asked.count(_NEW) == workers * 2 + 1  # one check of the new token
+    assert gate.asked.count(_NEW) == workers * 2 + 4  # four checks, once
 
 
 @pytest.mark.parametrize("op", ["encrypt", "decrypt"])
@@ -409,7 +413,7 @@ def test_a_hung_reread_charges_its_wait_once(
 ) -> None:
     gate, _ = vault
     monkeypatch.setattr(crypto_transit, "_TOKEN_REREAD_INTERVAL_S", 3600.0)
-    monkeypatch.setattr(crypto_transit, "_TOKEN_REREAD_WAIT_S", 1.0)
+    monkeypatch.setattr(crypto_transit, "_TOKEN_REREAD_WAIT_S", 3.0)
     release = threading.Event()
 
     def hung() -> str:
@@ -425,7 +429,7 @@ def test_a_hung_reread_charges_its_wait_once(
         started = time.monotonic()
         with pytest.raises(CipherError):
             cipher.encrypt("synthetic", aad=_AAD)
-        assert time.monotonic() - started < 0.5
+        assert time.monotonic() - started < 1.5
     finally:
         release.set()
         _finish_reread(cipher)
@@ -488,6 +492,57 @@ def test_a_cipher_without_a_token_source_is_unchanged() -> None:
     with pytest.raises(CipherError):
         cipher.encrypt("synthetic", aad=_AAD)
     assert gate.asked == [_OLD]
+
+
+@pytest.mark.parametrize(
+    ("refusing", "unexcused", "adopted"),
+    [(("root",), (), False), ((), ("TypeError",), False), ((), (), True)],
+)
+def test_a_replacement_is_held_to_the_start_privilege_judgement(
+    vault: tuple[_Gate, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    refusing: tuple[str, ...],
+    unexcused: tuple[str, ...],
+    adopted: bool,
+) -> None:
+    gate, _ = vault
+    monkeypatch.setattr(crypto_transit, "_refuse_over_granted", real_refuse_over_granted)
+    hop = HopPrivilege(
+        "vault.store", HopState.OVER_GRANTED, "i", "m", "d", refusing=refusing, unexcused=unexcused
+    )
+    monkeypatch.setattr("messagefoundry.privilege_probes.read_vault_token", lambda *_: object())
+    monkeypatch.setattr("messagefoundry.privilege_check.vault_hop", lambda *_, **__: hop)
+    cipher = build_transit_cipher(StoreSettings())
+    source = cipher._token_source
+    assert source is not None
+    gate.valid = {_OLD, _NEW}
+    monkeypatch.setenv(_TOKEN_VAR, _NEW)
+    source._reread()
+    assert (source.value == _NEW) is adopted
+
+
+def test_a_seal_403_from_a_dead_token_is_an_outage_and_a_key_403_is_a_refusal(
+    vault: tuple[_Gate, list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, _ = vault
+    monkeypatch.setattr(crypto_transit, "_TOKEN_REREAD_INTERVAL_S", 3600.0)
+    cipher = build_transit_cipher(StoreSettings())
+    client = cipher._client
+    inner = client.secrets.transit
+
+    class _RefusesVerify:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(inner, name)
+
+        def verify_signed_data(self, **_: Any) -> Any:
+            raise Forbidden("permission denied")
+
+    client.secrets.transit = _RefusesVerify()
+    with pytest.raises(TransitSealRefused):  # the token still serves: the key refused it
+        cipher.verify_seal_hmac(_KEY_NAME, b"d" * 32, "vault:v1:bWFj")
+    gate.valid = set()
+    with pytest.raises(CipherError):  # the token is dead: an outage, not a refused seal
+        cipher.verify_seal_hmac(_KEY_NAME, b"d" * 32, "vault:v1:bWFj")
 
 
 def test_a_missing_token_at_build_still_refuses(

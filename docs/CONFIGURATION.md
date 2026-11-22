@@ -2982,15 +2982,19 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
   the file at least at every store open and every DR backup pass, and for
   `[secrets].provider = "vault"` at every secret read. The `vault_transit` cipher reads it when
   the store opens and again after Vault answers a Transit request with HTTP 403 (BACKLOG #5609),
-  at most once in 5 seconds. A changed token is used only once Vault accepts it for a read of the
-  Transit data key's metadata, a grant the cipher already requires. Every thread's Vault client
-  then moves to it on its next request, and a call off the event loop is asked once more. A call
-  on the event loop does not wait for the read: it fails, and a later call uses the new token. So
-  replacing the file needs no restart. The engine does not renew a token and does not read the
-  file until a 403 arrives, so expect at least one refused request at each changeover, and on the
-  event loop one failed call. As at startup, the read takes the file and, when there is no file,
-  `MEFOR_STORE_VAULT_TOKEN` from the environment. If that gives no token, the same token, or one
-  Vault refuses, the call fails closed as any Transit refusal does.
+  at most once in 5 seconds. A changed token is used only once it encrypts, decrypts, MACs and
+  verifies over fixed input with the grants the cipher already requires, and passes the privilege
+  judgement `serve` makes at start. A token holding the root policy or a grant on an administrative
+  path is not adopted here, whatever `[security].allow_over_granted_vault_token` says; it can come
+  in only through a restart, where that setting is read and audited. Once a token is adopted, every
+  thread's Vault client moves to it on its next request. A call off the event loop waits up to 2
+  seconds for the read and, if the token was adopted by then, is asked once more. A call on the
+  event loop does not wait: it fails. So replacing the file needs no restart, but the engine does
+  not renew a token and does not read the file until a 403 arrives, so expect at least one refused
+  request at each changeover, and on the event loop at least one failed call, for as long as the
+  read and the 5-second limit take. As at startup, the read takes the file and, when there is no
+  file, `MEFOR_STORE_VAULT_TOKEN` from the environment. If that gives no token, the same token, or
+  one that fails these checks, the call fails closed as any Transit refusal does.
 
 **A Vault Agent sink can write that file, where this route is offered.** A site running Vault
 Agent auto-auth points the agent's file sink at the file, and leaves the sink unwrapped and
