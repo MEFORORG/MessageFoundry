@@ -6429,27 +6429,26 @@ class AlertsSettings(_Section):
         settings load, ``check`` and the serve pre-flight passed it before. An empty value stays
         "not configured", as every consumer reads it. The path can hold the webhook's token, so the
         message carries nothing of the value: urlsplit's own ``ValueError`` quotes the netloc, so it
-        is caught and not chained. A control character or surrounding space is refused too: urlsplit
-        drops leading spaces and controls and every tab, CR and LF, so the scheme it reports need
-        not be the one urllib dials. The uncached split keeps the URL out of urllib's cache (vault
-        BACKLOG #5287).
+        is caught and not chained. Surrounding whitespace is ignored, as urllib's dial strips it. A
+        control character or lone surrogate left inside is refused: urlsplit drops every tab, CR
+        and LF, so the scheme it reports need not be the one urllib dials. This check's own split
+        is uncached (vault BACKLOG #5287); the notifier build still splits through the cached one.
         """
         if not v:
             return v
-        # Lazy, as at the proxy_url check: the transport owns the uncached split.
-        from messagefoundry.transports.proxy_address import _UNCACHED_URLSPLIT
+        import inspect
 
+        candidate = v.strip()
         scheme: str | None = None
-        if v == v.strip() and not has_control_char(v) and not has_lone_surrogate(v):
+        if not has_control_char(candidate) and not has_lone_surrogate(candidate):
             try:
-                scheme = _UNCACHED_URLSPLIT(v).scheme
+                scheme = inspect.unwrap(urlsplit)(candidate).scheme
             except ValueError:
                 scheme = None
         if scheme != "https":
             raise ValueError(
-                "[alerts].webhook_url must be a well-formed https URL with no control characters "
-                "or surrounding spaces; the value is not repeated here, since its path can carry "
-                "the webhook's token. Refused, with no escape"
+                "[alerts].webhook_url must be a well-formed https URL; the value is not repeated "
+                "here, since its path can carry the webhook's token. Refused, with no escape"
             )
         return v
 

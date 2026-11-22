@@ -194,7 +194,8 @@ _WEBHOOK_TOKEN = "T0KEN-in-the-path"
         # urlsplit drops these, so it would read the scheme as https.
         f"ht\ttps://hooks.example/{_WEBHOOK_TOKEN}",
         f"https\n://hooks.example/{_WEBHOOK_TOKEN}",
-        f" https://hooks.example/{_WEBHOOK_TOKEN}",
+        # Surrounding whitespace is ignored, so an http URL inside it is still refused.
+        f" http://hooks.example/{_WEBHOOK_TOKEN}\n",
     ],
     ids=[
         "http",
@@ -205,7 +206,7 @@ _WEBHOOK_TOKEN = "T0KEN-in-the-path"
         "bad-bracket",
         "tab",
         "lf",
-        "space",
+        "space-http",
     ],
 )
 def test_a_non_https_webhook_is_refused_at_load_without_echoing_it(url: str) -> None:
@@ -217,6 +218,8 @@ def test_a_non_https_webhook_is_refused_at_load_without_echoing_it(url: str) -> 
     text = str(info.value)
     assert _WEBHOOK_TOKEN not in text and "hooks.example" not in text
     assert "ftp" not in text.lower()
+    as_json = info.value.json()
+    assert _WEBHOOK_TOKEN not in as_json and "hooks.example" not in as_json
 
 
 def test_a_non_https_webhook_is_refused_by_the_settings_loader(tmp_path: Path) -> None:
@@ -229,9 +232,13 @@ def test_a_non_https_webhook_is_refused_by_the_settings_loader(tmp_path: Path) -
     assert _WEBHOOK_TOKEN not in str(info.value)
 
 
-@pytest.mark.parametrize("url", [None, "", "https://hooks.example/x", "HTTPS://hooks.example/x"])
+@pytest.mark.parametrize(
+    "url",
+    [None, "", "https://hooks.example/x", "HTTPS://hooks.example/x", " https://hooks.example/x\n"],
+)
 def test_an_https_or_unset_webhook_loads(url: str | None) -> None:
-    # Negative control: an https URL loads, and an empty value stays "not configured".
+    # Negative control: an https URL loads, inside surrounding whitespace too (urllib's dial strips
+    # it), and an empty value stays "not configured".
     assert AlertsSettings(webhook_url=url).webhook_url == url
 
 
