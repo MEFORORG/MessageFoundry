@@ -34,7 +34,10 @@ renaming the ``mount_strict_reply_adapter`` call in either one failed that test 
 renaming either link of the chain from the mount to the Vault guard failed
 :func:`test_every_guard_name_reaches_a_root`. So did a second def named ``refuse_an_unrevoked_hop``
 in another module, and renaming the Vault guard's ``_crossed_unrevoked`` call failed
-:func:`test_the_vault_root_decides_through_the_authority`.
+:func:`test_the_vault_root_decides_through_the_authority`. Moving the ``EmailDestination.__init__``
+entry from Guarded to Exempt and deleting its ``RevocationHopGuard.capture`` call failed
+:func:`test_the_exempt_sites_are_the_pinned_list` and no other test in this file; before that test
+existed, the same change passed them all (vault BACKLOG #3512).
 
 **The relaxed-hop handoff census** at the end of this file is a second list, of the sites that
 reach ``relax_verify_expiry`` (vault BACKLOG #5086). ``RevocationHopGuard.capture`` gives no CRL
@@ -324,6 +327,31 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
 }
 
+#: The sites :data:`_CENSUS` lists as Exempt, pinned exactly (vault BACKLOG #3512). A Guarded hop
+#: moved to Exempt, with its guard call deleted, can pass every other check here (a relaxed
+#: hop fails its own census below), so this list is the second edit such a change needs, and review sees it. A diff that
+#: edits both still passes.
+_EXEMPT_SITES = frozenset(
+    {
+        "messagefoundry/apiclient/client.py::_build_verify_context",
+        "messagefoundry/auth/trust_anchors.py::anchor_cadata",
+        "messagefoundry/config/tls_policy.py::<module>",
+        "messagefoundry/config/tls_policy.py::crl_scratch_context",
+        "messagefoundry/config/tls_probe.py::_offer_context",
+        "messagefoundry/pki.py::_all_load_as_no_ca",
+        "messagefoundry/pki.py::_openssl_reads_as_ca",
+        "messagefoundry/pki.py::_refuse_unless_openssl_loads",
+        "messagefoundry/transports/http_listener.py::HttpSource.__init__",
+        "messagefoundry/transports/mllp.py::MLLPSource.__init__",
+        "messagefoundry/transports/rest.py::_insecure_opener",
+        "messagefoundry/transports/rest.py::_shared_no_redirect_opener",
+        "messagefoundry/tray/probe.py::_pinned_context",
+        "messagefoundry/tray/probe.py::build_verify",
+        "messagefoundry/verify/federation.py::_idp_opener",
+        "messagefoundry/verify/smoke.py::live_smoke_ssl_context",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _Scan:
@@ -435,7 +463,11 @@ def _scan() -> _Scan:
 
 def test_every_site_is_in_the_census() -> None:
     """The check that stops the next unguarded hop: a new site fails here until it is classified."""
-    unlisted = sorted(_scan().sites - _CENSUS.keys())
+    sites = _scan().sites
+    # 42 sites when this floor was set (vault BACKLOG #3512), so 30 lets twelve go with no edit here.
+    # It fails a scan that finds nothing, over which the check below would pass.
+    assert len(sites) >= 30, f"the scan found only {len(sites)} sites, floor 30"
+    unlisted = sorted(sites - _CENSUS.keys())
     assert not unlisted, (
         f"verifying client TLS context(s) with no census entry: {unlisted}. Add a guard "
         f"(RevocationHopGuard.capture, refuse_unrevoked_verified_hop for an https hop, or "
@@ -447,6 +479,9 @@ def test_every_site_is_in_the_census() -> None:
 
 def test_every_census_entry_is_still_a_site() -> None:
     """A stale entry would keep an exemption alive for code that no longer exists."""
+    # 42 entries when this floor was set (vault BACKLOG #3512). It fails a census emptied, over
+    # which the check below would pass.
+    assert len(_CENSUS) >= 30, f"only {len(_CENSUS)} census entries, floor 30"
     stale = sorted(_CENSUS.keys() - _scan().sites)
     assert not stale, f"census entries that are no longer a site: {stale}"
 
@@ -456,7 +491,7 @@ def test_every_guarded_site_calls_a_guard() -> None:
     guarded = {site: entry for site, entry in _CENSUS.items() if isinstance(entry, Guarded)}
     # 15 sites were Guarded when this floor was set, so 10 lets up to five retire with no edit here.
     # It is a floor against a census emptied or turned all Exempt, over which the check below would
-    # pass on nothing. It does not catch a single hop moved from Guarded to Exempt; review does.
+    # pass on nothing. A single hop moved from Guarded to Exempt is caught by the test below.
     assert len(guarded) >= 10, f"only {len(guarded)} Guarded census entries, floor 10"
     unguarded = [
         f"{site} (guard expected in {entry.by or 'the site itself'}; {entry.note or 'no note'})"
@@ -464,6 +499,15 @@ def test_every_guarded_site_calls_a_guard() -> None:
         if (entry.by or site) not in scan.guard_calls
     ]
     assert not unguarded, f"census sites marked Guarded whose guard call is gone: {unguarded}"
+
+
+def test_the_exempt_sites_are_the_pinned_list() -> None:
+    """A Guarded hop moved to Exempt fails here, naming it, unless :data:`_EXEMPT_SITES` moves too."""
+    exempt = {site for site, entry in _CENSUS.items() if isinstance(entry, Exempt)}
+    assert sorted(exempt - _EXEMPT_SITES) == [], "census sites Exempt but not in _EXEMPT_SITES"
+    assert sorted(_EXEMPT_SITES - exempt) == [], (
+        "_EXEMPT_SITES names sites the census does not exempt"
+    )
 
 
 def _def_count(name: str) -> int:
