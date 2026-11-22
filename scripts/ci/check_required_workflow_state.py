@@ -180,7 +180,7 @@ def _workflow_states(
         # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
         route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
         payload = gh_api(["--paginate", "--slurp", route])
-    # A repeat that disagrees on a required file is refused; for any other file, setdefault keeps the first state listed.
+    # A repeat that disagrees on a required file is refused.
     states: dict[str, str] = {}
     for path, state in map(_workflow_state, _workflow_entries(payload)):
         name = _direct_workflow_file(path)
