@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The two de-identified HAPI sample corpora, and the manifest that describes the set (BACKLOG #5557, #5558).
+"""The de-identified HAPI sample corpora, and the manifest that describes the set (BACKLOG #5557, #5558, #5825).
 
-``batch_18_messages.txt`` and ``oml_o21.hl7`` under ``samples/messages/hapi-hl7v2/`` were scrubbed
+``batch_18_messages.txt``, ``oml_o21.hl7`` and ``adt_a03.txt`` under ``samples/messages/hapi-hl7v2/`` were scrubbed
 by DEFAULT_RULES plus a committed overlay each, under ``tests/fixtures/anon/``. These tests hold
 each corpus to its overlay in two ways:
 
@@ -27,6 +27,7 @@ import re
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -53,9 +54,21 @@ from messagefoundry_toolkit.anon.surrogates import (
 _REPO = Path(__file__).resolve().parent.parent
 _HAPI = _REPO / "samples" / "messages" / "hapi-hl7v2"
 _FIXTURES = _REPO / "tests" / "fixtures" / "anon"
+
+
+class _Corpus(NamedTuple):
+    overlay: Path
+    #: The least the corpus must yield, so a read that stopped early fails instead of passing
+    #: empty: the overlay's own scrubbed fields, and the values of a judged kind the surrogate
+    #: check reads.
+    min_overlay_fields: int
+    min_checked: int
+
+
 _CORPORA = {
-    "batch_18_messages.txt": _FIXTURES / "batch_18.anon.toml",
-    "oml_o21.hl7": _FIXTURES / "oml_o21.anon.toml",
+    "batch_18_messages.txt": _Corpus(_FIXTURES / "batch_18.anon.toml", 7, 100),
+    "oml_o21.hl7": _Corpus(_FIXTURES / "oml_o21.anon.toml", 7, 100),
+    "adt_a03.txt": _Corpus(_FIXTURES / "adt_a03.anon.toml", 0, 9),
 }
 _SEGMENT = re.compile(r"[A-Z][A-Z0-9]{2}\|")
 # batch_18 keeps one malformed MSH-2 on purpose: three encoding characters, so no parser can read
@@ -86,7 +99,7 @@ def _messages(name: str) -> tuple[str, ...]:
 
 @functools.cache
 def _rules(name: str) -> tuple[FieldRule, ...]:
-    return load_rules(_CORPORA[name])
+    return load_rules(_CORPORA[name].overlay)
 
 
 _CASES = [(name, i) for name in _CORPORA for i in range(len(_messages(name)))]
@@ -114,7 +127,11 @@ def _is_filled_date(comps: list[str], rep: str, seps: Seps) -> bool:
 
 
 def _is_identifier(comps: list[str], rep: str, seps: Seps) -> bool:
-    return bool(comps[0]) and _kept_tail(comps, _CX_KEPT_COMPONENTS) == comps[1:]
+    # The surrogate leaves an empty id empty and still writes the kept components, as in adt_a03's
+    # ``^^^^TEAM`` repetition, so an empty id passes only beside a kept component.
+    return (bool(comps[0]) or len(comps) > 1) and _kept_tail(comps, _CX_KEPT_COMPONENTS) == comps[
+        1:
+    ]
 
 
 _IDENTIFIER = (_is_identifier, "components an identifier surrogate blanks are set")
@@ -184,9 +201,9 @@ def test_the_coverage_check_names_a_field_whose_keep_is_removed() -> None:
 def test_the_overlay_scrubs_only_fields_no_default_maps(name: str) -> None:
     """Each overlay says why its scrubbed fields are not defaults. If one becomes a default, that
     reason is stale, and this is the prompt to rewrite it."""
-    with _CORPORA[name].open("rb") as handle:
-        overlay_fields = set(tomllib.load(handle)["hl7"]["fields"])
-    assert len(overlay_fields) >= 7
+    with _CORPORA[name].overlay.open("rb") as handle:
+        overlay_fields = set(tomllib.load(handle)["hl7"].get("fields", {}))
+    assert len(overlay_fields) >= _CORPORA[name].min_overlay_fields
     assert overlay_fields.isdisjoint(rule.path for rule in DEFAULT_RULES)
 
 
@@ -198,9 +215,9 @@ def test_every_scrubbed_field_holds_a_surrogate(name: str) -> None:
         count, problems = _residue(message, _rules(name))
         checked += count
         found += [f"msg{i + 1} {problem}" for problem in problems]
-    # Each corpus holds well over a hundred values of a judged kind. Far fewer means the walk
-    # stopped reading fields, and then an empty list below would prove nothing.
-    assert checked >= 100
+    # Far fewer judged values than the corpus holds means the walk stopped reading fields, and
+    # then an empty list below would prove nothing.
+    assert checked >= _CORPORA[name].min_checked
     assert found == []
 
 

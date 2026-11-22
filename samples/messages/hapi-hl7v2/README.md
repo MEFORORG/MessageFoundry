@@ -19,11 +19,11 @@ message rides along at its end. Strip the comment lines first.
   source linked into the engine — using them to drive tests is unaffected by the license.
   If any file is ever modified, MPL-2.0 requires that file to carry its source notice.
 
-All files except `batch_18_messages.txt` and `oml_o21.hl7` are copied **verbatim** (bytes
+All files except `batch_18_messages.txt`, `oml_o21.hl7` and `adt_a03.txt` are copied **verbatim** (bytes
 unchanged) from the upstream paths below; the `hapi-osgi-test` tree carries byte-identical
 duplicates of several of these and was skipped.
 
-Both modified files were scrubbed with the project's own de-identification framework
+All three modified files were scrubbed with the project's own de-identification framework
 ([`messagefoundry_toolkit/anon/`](../../../messagefoundry_toolkit/anon/), ADR 0030), the same
 deterministic, salt-keyed surrogate machinery the tee relay and test harness use, over
 `DEFAULT_RULES` plus a committed rule overlay for each file. **No ad-hoc redaction logic was
@@ -112,6 +112,32 @@ component holds a surname.
 The parser parity record, `tests/golden/python_hl7_oracle.json`, still holds this file's upstream
 bytes as its own frozen input, the upstream names included. Nothing can regenerate that record
 (ADR 0054), so this scrub does not reach it, and those names are still in the repository there.
+
+### `adt_a03.txt` is MODIFIED — de-identified, not verbatim
+
+> **Source notice (MPL-2.0 §3.3).** This file is a **modified** copy of
+> `hapi-test/.../ca/uhn/hl7v2/parser/adt_a03.txt` from
+> https://github.com/hapifhir/hapi-hl7v2 at commit `de1503651040`, licensed MPL-2.0.
+> The modification is de-identification only, described below.
+
+Upstream this one-message file carries a named hospital and ward, a patient key, an identifier in
+the shape of an Italian fiscal code, a birth date, a visit number and two clinicians (BACKLOG
+#5825). The patient and clinician names are placeholders, but the hospital, ward and identifiers
+are not plainly so, so it was scrubbed, by `DEFAULT_RULES` plus
+[`tests/fixtures/anon/adt_a03.anon.toml`](../../../tests/fixtures/anon/adt_a03.anon.toml). Every
+field it scrubs is a default, so that overlay only lists the fields it keeps.
+
+**What was deliberately preserved:** the five segments in order, their field counts, the CRLF line
+endings with no final line ending, the MSH routing fields, the identifiers' assigning authorities
+and type codes, and the coded procedure. The same limits as above apply. In addition, at least:
+
+- The hospital and ward in `PV1-3` and `PV1-6` are now `[REDACTED]`.
+- The event, admit and procedure dates keep only their year; the birth date is drawn at random.
+- The fiscal-code and SSN repetitions of `PID-3` held one upstream value and now hold two
+  different surrogates, and the effective and expiration dates of the SSN repetition are blanked.
+- The patient name gained a middle initial, and the clinicians are drawn from the surrogate pool.
+- `MSH-7`, `MSH-10` and the sending and receiving facility in `MSH-4` and `MSH-6` keep their
+  upstream values.
 
 ## Manifest
 
