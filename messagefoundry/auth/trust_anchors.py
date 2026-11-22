@@ -1960,9 +1960,10 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     ``protocol`` of plain ``ftp``, ``tls_verify`` off, ``ech_egress`` through an ``http://``
     sidecar, and on the HTTP family ``verify_tls`` off or an ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
     loopback and verifies the server itself (ADR 0139). An ``https://`` sidecar reads as ``None``
-    here although no hop reads the CA there either (the sidecar opener uses the system trust
-    store); the REST destination refuses a ``tls_ca_file`` beside ``ech_egress`` at build (vault
-    BACKLOG #2977), so on that connector this only checks a file the build then refuses. An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
+    here on purpose: these settings do not say which connector holds them, and a ``FhirLookup``
+    ignores ``ech_egress`` and reads its CA. The REST destination refuses a ``tls_ca_file`` beside
+    ``ech_egress`` at build whatever the scheme (``RestDestination.__init__``, vault BACKLOG #2977),
+    so there this checks a file the build then refuses. An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
     check after resolution decides. Each caller refuses a pin beside an unread CA and checks no
     file there: a pin nothing checks reads as pinned while nothing is.
 

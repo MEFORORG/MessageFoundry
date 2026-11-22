@@ -3166,7 +3166,8 @@ class RestDestination(DestinationConnector):
             )
         # Vault BACKLOG #2977 item 7, by the reasoning item 8 gives for verify_tls=false above: the
         # sidecar verifies the destination's certificate, the engine verifies an https sidecar
-        # against the system trust store, and the token hop posts through the same plain opener.
+        # against the system trust store, and the token hop posts through an opener built the same
+        # way (smart.py).
         # So no hop of this connection applies a tls_allow_expired relaxation, a tls_ca_file or a
         # tls_ca_pin. Accepted, each would read as in force while nothing applies it. The message
         # names the settings only, never their values.
@@ -3176,8 +3177,8 @@ class RestDestination(DestinationConnector):
             ]
             if unapplied:
                 raise ValueError(
-                    f"ech_egress and {', '.join(unapplied)} are mutually exclusive -- no hop of "
-                    "this connection applies "
+                    f"ech_egress excludes {' and '.join(unapplied)} — no hop of this connection "
+                    "applies "
                     + ("it" if len(unapplied) == 1 else "them")
                     + ": the ECH sidecar verifies the destination's certificate, and the engine "
                     "verifies an https sidecar against the system trust store (ADR 0139)"

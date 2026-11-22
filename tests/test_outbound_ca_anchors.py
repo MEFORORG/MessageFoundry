@@ -1284,8 +1284,9 @@ async def test_a_connection_test_checks_the_ca_before_it_dials(
 
 def test_a_ca_behind_an_http_ech_sidecar_is_unread() -> None:
     """Review finding 4: an ECH sidecar on http:// takes both hops over cleartext loopback and does
-    the TLS itself, so the CA verifies nothing. An https:// sidecar reads as None here; no hop reads
-    the CA there either, and the REST destination refuses one at build (vault BACKLOG #2977)."""
+    the TLS itself, so the CA verifies nothing. An https:// sidecar reads as None here on purpose:
+    the settings do not say which connector holds them, and a FhirLookup ignores ech_egress and
+    reads its CA. The REST destination refuses that CA at build (vault BACKLOG #2977)."""
     base = {"url": "https://partner.example.org/api", "ech_egress": True}
     assert ta.unread_ca_reason({**base, "ech_sidecar": "http://127.0.0.1:8123"}) is not None
     assert ta.unread_ca_reason({**base, "ech_sidecar": "https://127.0.0.1:8123"}) is None
