@@ -10643,14 +10643,15 @@ class AuthService:
         of ``user_id``'s own record; otherwise it is the name whose holder was read, and that
         holder's id is read again, unchecked (:meth:`_username_holder_id`), only to name it in the
         report. When that read finds no row, or fails, the ERROR line is the only report."""
-        outage = isinstance(exc, TransitSealUnavailableError)
         _log.error(
             "directory reconcile: account %s (renaming to %s): Vault transit %s the integrity seal "
             "of the record the rename's %s read, so the rename was not applied; the pass goes on, "
             "and the seal answer is reported through its seal path (vault BACKLOG #3069)",
             user_id,
             scrub_log_argument(new_username),
-            "did not answer for" if outage else "could not verify",
+            "did not answer for"
+            if isinstance(exc, TransitSealUnavailableError)
+            else "could not verify",
             read_name,
         )
         if isinstance(exc, TransitSealUnavailableError):

@@ -333,7 +333,8 @@ async def assert_a_session_for_a_missing_account_is_refused(store: Any) -> None:
     beside the passkey case above, so the three suites that run this module run both. Pass F found
     SQL Server committing one, for lack of the session's user foreign key. ``create_session`` now
     refuses a missing account itself, returning ``False`` before its INSERT, so this no longer
-    reaches the key; ``test_sqlserver_store.py`` checks the key is in force."""
+    reaches the key. Each backend's suite checks the key is in force on its own
+    (``test_webauthn_store.py``, ``test_postgres_store.py``, ``test_sqlserver_store.py``)."""
     written = await store.create_session(
         token_hash="o" * 64, user_id="no-such-account", expires_at=9e9
     )

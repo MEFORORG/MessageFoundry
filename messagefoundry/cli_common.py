@@ -335,7 +335,13 @@ def _load_operator_json(raw: str, what: str) -> Any:
     raise _OperatorJsonError(refused)
 
 
-def _emit_error(message: str, *, as_json: bool, code: str | None = None) -> int:
+def _emit_error(
+    message: str,
+    *,
+    as_json: bool,
+    code: str | None = None,
+    extra: Mapping[str, object] | None = None,
+) -> int:
     """Report a command failure on the right stream and return its exit code.
 
     Text goes to **stderr**. A shell redirect of a command's output --
@@ -349,9 +355,12 @@ def _emit_error(message: str, *, as_json: bool, code: str | None = None) -> int:
 
     ``code`` adds a machine-readable ``"code"`` key beside ``"error"`` in the JSON form, for a consumer
     that must branch on the failure family without matching message text (``lens rewrite``, BACKLOG
-    #237)."""
+    #237). ``extra`` adds further keys to the JSON form only, after those two."""
     if as_json:
-        payload = {"error": message} if code is None else {"error": message, "code": code}
+        payload: dict[str, object] = {"error": message}
+        if code is not None:
+            payload["code"] = code
+        payload.update(extra or {})
         print(json.dumps(payload))
     else:
         print(f"error: {message}", file=sys.stderr)
