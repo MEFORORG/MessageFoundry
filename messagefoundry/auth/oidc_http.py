@@ -53,10 +53,12 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
+    ContentCodedReplyError,
     EgressReplyError,
     NoRedirectHandler,
     TruncatedResponseError,
     build_strict_opener,
+    is_content_coded_fault,
     read_reply_body,
     reply_framing_fault,
 )
@@ -73,6 +75,11 @@ __all__ = [
     "is_idp_transport_http_exception",
     "jwks_fetcher",
 ]
+
+#: How a refused JWKS reply is named: a coded body for its coding, any other for its framing
+#: (BACKLOG #5910). Fixed text, never a byte of the reply.
+_JWKS_CODED = "JWKS response is in a content coding the engine does not decode"
+_JWKS_MISFRAMED = "JWKS response framed its body length ambiguously"
 
 #: Wall-clock bound for a single IdP HTTP round trip. Deliberately short: both legs run inside a
 #: browser request, and a hung IdP must degrade the federated login, never pin a worker thread.
@@ -240,8 +247,11 @@ def jwks_fetcher(
             # rule read_bounded applies to connector replies. A reply arrived, so it is an answer
             # and does not mark the IdP (BACKLOG #3221). Logins inside the refetch floor after this
             # see the cache's throttle, as after any failed fetch.
-            if reply_framing_fault(resp) is not None:
-                raise IdpReplyUnusableError("JWKS response framed its body length ambiguously")
+            fault = reply_framing_fault(resp)
+            if fault is not None:
+                raise IdpReplyUnusableError(
+                    _JWKS_CODED if is_content_coded_fault(fault) else _JWKS_MISFRAMED
+                )
             # BACKLOG #1979: the strict reader under read_bounded. Not read_bounded itself, because
             # JwksCache judges the length and expects the extra byte. Refusals are retyped to an
             # IdpReplyError, outside the handler so nothing chains to them.
@@ -250,8 +260,10 @@ def jwks_fetcher(
                 body = read_reply_body(
                     resp, _MAX_JWKS_BYTES + 1, connector="OIDC jwks_uri endpoint"
                 )
+            except ContentCodedReplyError:  # BACKLOG #5910: named for its coding, not its length
+                message = _JWKS_CODED
             except AmbiguousFramingError:
-                message = "JWKS response framed its body length ambiguously"
+                message = _JWKS_MISFRAMED
             except TruncatedResponseError:
                 failure, message = IdpReplyCutShortError, "JWKS response was cut short"
             except EgressReplyError:  # the family, so a later sibling is retyped too

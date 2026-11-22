@@ -2190,11 +2190,30 @@ def test_oidc_token_exchange_refuses_a_content_coded_reply() -> None:
     with _serve(raw) as url, pytest.raises(oidc.TokenRefusedError) as raised:
         _exchange(url)
     assert raised.value.status == 200
+    # #5910 step 1: named for its coding, not as a body framed ambiguously.
+    assert "content coding" in str(raised.value)
+    assert "ambiguously" not in str(raised.value)
 
 
 def test_oidc_jwks_fetch_refuses_a_content_coded_reply() -> None:
     from messagefoundry.auth.oidc_http import jwks_fetcher
 
     raw = _coded(b"200 OK", b"gzip", _TOKEN_JSON)
-    with _serve(raw) as url, pytest.raises(IdpReplyUnusableError, match="ambiguously"):
+    # #5910 step 1: named for its coding, not as a body framed ambiguously.
+    with _serve(raw) as url, pytest.raises(IdpReplyUnusableError, match="content coding"):
         jwks_fetcher(url, urllib.request.build_opener())()
+
+
+def test_a_coded_refusal_is_told_apart_by_its_type() -> None:
+    """#5910 added step 2: the coded refusal has a type of its own, and a framing refusal does not
+    read as coded whatever its reason says."""
+    from messagefoundry.transports.bounded_read import (
+        ContentCodedReplyError,
+        is_content_coded_refusal,
+    )
+
+    resp = _wire(_OK + b"Content-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello")
+    with pytest.raises(ContentCodedReplyError) as raised:
+        read_bounded(resp, connector="c")
+    assert is_content_coded_refusal(raised.value)
+    assert not is_content_coded_refusal(AmbiguousFramingError("x", reason=_CODED_REASON))

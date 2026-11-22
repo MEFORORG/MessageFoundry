@@ -1965,7 +1965,8 @@ def _mint_bearer(token: Any, prefix: str) -> str:
 
     The mint runs before the GET's own ``try``. The provider raises ``DeliveryError`` for a failed
     mint: a refused or unreachable endpoint, an unparseable reply, or a refused reply body (an
-    ``EgressReplyError``, which is a subclass). It raises ``ValueError`` when a configured value is
+    ``EgressReplyError``, or, for a 2xx reply in a content coding, the ``token-reply-coded``
+    ``NegativeAckError`` of BACKLOG #5910; both are subclasses). It raises ``ValueError`` when a configured value is
     over the length limit. Neither is a lookup error, so a Handler that caught ``FhirLookupError``
     missed it (BACKLOG #1980). The ``DeliveryError`` text names the redacted token URL and a status
     or reason, or, for a refused reply body, only the fixed hop label (BACKLOG #2060). It never

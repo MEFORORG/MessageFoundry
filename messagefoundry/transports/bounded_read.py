@@ -147,6 +147,7 @@ __all__ = [
     "REPLY_TOO_LARGE_CODE",
     "REPLY_TRUNCATED_CODE",
     "AmbiguousFramingError",
+    "ContentCodedReplyError",
     "EgressReplyError",
     "LoopbackDirectProxyHandler",
     "MalformedReplyHeadError",
@@ -160,6 +161,7 @@ __all__ = [
     "build_strict_opener",
     "drain_bounded",
     "hop_identity",
+    "is_content_coded_fault",
     "is_content_coded_refusal",
     "is_never_proxied_host",
     "is_proxy_credential_header_name",
@@ -269,9 +271,8 @@ class AmbiguousFramingError(EgressReplyError):
     length, and ``Transfer-Encoding`` on HTTP/1.0. There, a correct read depends on which field
     ``http.client`` happens to consult first. The shapes are listed on :func:`reply_framing_fault`.
 
-    Also raised for a body in a content coding other than ``identity`` (BACKLOG #5910). That body
-    is framed legally, but the engine does not decode it, so the caller would take compressed
-    bytes as the reply's text. It is refused before any body byte is read. Its reason names the coding fault, not a length.
+    Its subclass :class:`ContentCodedReplyError` is raised for a body in a content coding other
+    than ``identity`` (BACKLOG #5910).
 
     Also raised part-way through a chunked body, at the first chunk-size line, chunk terminator or
     trailer line that breaks the RFC 9112 section 7.1 grammar. By then some bytes have been read,
@@ -281,7 +282,10 @@ class AmbiguousFramingError(EgressReplyError):
     siblings: the delivery worker records it on the row, retries under the connection's policy and
     dead-letters it when the policy runs out. It is not a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError`, because a misframed reply may come
-    from an intermediary on one path rather than from the partner itself.
+    from an intermediary on one path rather than from the partner itself. A caller may retype it:
+    at least :func:`~messagefoundry.transports.smart.request_token` turns a
+    :class:`ContentCodedReplyError` on a 2xx token reply into the permanent ``token-reply-coded``
+    refusal.
 
     A destination that reads its 2xx reply through :func:`read_2xx_reply_text` does not let a
     misframed body travel that far, because a retry would re-send the request (BACKLOG #2989).
@@ -296,6 +300,16 @@ class AmbiguousFramingError(EgressReplyError):
         # BaseException pickles and copies as cls(*self.args), and args holds only the message, so
         # the keyword-only reason must travel with the constructor or the rebuild raises TypeError.
         return (functools.partial(type(self), reason=self.reason), self.args, self.__dict__)
+
+
+class ContentCodedReplyError(AmbiguousFramingError):
+    """An egress reply whose body is in a content coding other than ``identity`` (BACKLOG #5910).
+
+    That body is framed legally, but the engine does not decode it, so the caller would take
+    compressed bytes as the reply's text. It is refused before any body byte is read, and its
+    reason names the coding, not a length. A caller tells it from its parent by this type, never by
+    the reason text (:func:`is_content_coded_refusal`).
+    """
 
 
 class MalformedReplyHeadError(AmbiguousFramingError, http.client.HTTPException):
@@ -494,7 +508,10 @@ def reply_framing_fault(reader: object) -> str | None:
       ``Transfer-Encoding`` and ``Content-Length`` rules above, so a framing fault is the reason
       given when both apply. An operator-supplied ``Accept-Encoding`` request header is not
       overridden: a reply it brings back coded is refused here instead. Raised through
-      :class:`AmbiguousFramingError`, so on a 2xx it is the ``reply-misframed`` refusal.
+      :class:`ContentCodedReplyError`, an :class:`AmbiguousFramingError`, so a 2xx delivery
+      reply is handled as a misframed body, refused as ``reply-misframed`` where it is not
+      dropped. A token read refuses a coded 2xx as
+      ``token-reply-coded`` instead (:func:`~messagefoundry.transports.smart.request_token`).
 
     A reply to ``HEAD`` is not checked: ``http.client`` returns no body for it whatever the headers
     say. A ``204``, a ``304`` and any ``1xx`` have no body either, and ``http.client`` sets
@@ -545,19 +562,26 @@ _CONTENT_CODED_REASON = "a content coding other than identity, which the engine 
 def is_content_coded_refusal(exc: BaseException) -> bool:
     """Whether ``exc`` is the refusal of a body in a content coding the engine does not decode
     (BACKLOG #5910), rather than of a body that is misframed, cut short or over its bound."""
-    return isinstance(exc, AmbiguousFramingError) and exc.reason == _CONTENT_CODED_REASON
+    return isinstance(exc, ContentCodedReplyError)
 
 
-def refused_error_body_phrase(refusal: EgressReplyError, body: str) -> str:
-    """How a WARNING names a non-2xx ``body`` the engine refused with ``refusal`` (BACKLOG #5910).
+def is_content_coded_fault(fault: str | None) -> bool:
+    """Whether a :func:`reply_framing_fault` result refuses the body for its content coding, for a
+    caller that reads the fault itself rather than through :func:`read_bounded` (BACKLOG #5910)."""
+    return fault == _CONTENT_CODED_REASON
+
+
+def refused_error_body_phrase(refusal: EgressReplyError, label: str) -> str:
+    """How a WARNING names a non-2xx body, called ``label``, the engine refused with ``refusal``
+    (BACKLOG #5910).
 
     A content-coded body is refused before any byte of it is read, for its coding, which the engine
     does not decode, and not for its length, so the warning names the coding rather than saying
     "could not read whole". Fixed text only, never a byte of the reply.
     """
     if is_content_coded_refusal(refusal):
-        return f"{body} in a content coding the engine does not decode"
-    return f"{body} the engine could not read whole"
+        return f"{label} in a content coding the engine does not decode"
+    return f"{label} the engine could not read whole"
 
 
 def _codings(fields: Collection[object]) -> list[str]:
@@ -666,7 +690,8 @@ def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes
 def _framing_error(connector: str, reason: str) -> AmbiguousFramingError:
     # The reason is always a fixed string from this module, never a header value or a body byte, so
     # the message carries nothing the peer supplied.
-    return AmbiguousFramingError(
+    kind = ContentCodedReplyError if reason == _CONTENT_CODED_REASON else AmbiguousFramingError
+    return kind(
         f"{connector} framed its response body ambiguously ({reason}); refusing to read it",
         reason=reason,
     )
