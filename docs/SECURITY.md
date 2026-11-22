@@ -1698,15 +1698,10 @@ only when the checked read refuses the record for its seal.
 `GET /ui/users/{user_id}`, `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
-account's name the same way. When that read raises any Python `Exception`, they name the account
-by its id and still show what was issued, and log one line naming the account, which is not
-rate-limited, unlike the seal-failure report below. That line is a WARNING, naming the status or
-the exception type alone, for an HTTP answer (a 423 for a record that fails its seal, a 404, a
-503) or a refusal the checked read is declared to raise (`account_read_errors()`, at least a
-refused store call and a record that cannot be decrypted), less `AUDIT_WRITE_DEFECTS`. A bug
-whose type is in that refusal set, such as a `ValueError`, is logged the same way. Any other
-exception is an ERROR naming its type alone. No such line carries the exception's message or
-traceback. A failure is reported
+account's name the same way. Which refusals of that read still show what was issued, naming the
+account by its id, and what each logs, is stated once, in the docstring of `_shown_name` in
+[`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py). A
+failure is reported
 per account and rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal

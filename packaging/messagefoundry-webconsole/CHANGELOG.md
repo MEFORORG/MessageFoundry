@@ -92,9 +92,11 @@ this line.**
   rate-limited seal-failure report. The users list names
   such an account by its id and, for a `users:manage` holder only, offers its delete through a new
   confirmation page, `GET /ui/users/{user_id}/delete-confirm`, which sends an intact account to
-  its own page. A page shown after a password reset, a factor reset or an enrolment code was
-  issued names the account by its id when its name read raises any `Exception`, so the one-time
-  credential is still shown. The supported engine seam
+  its own page. The page says the record could not be verified against its seal, since the 423
+  does not say whether the seal failed or could not be verified. A page shown after a password
+  reset, a factor reset or an enrolment code was issued names the account by its id on the
+  refusals `_shown_name` in `routes/admin.py` names; its docstring states that rule and what each
+  case logs. The supported engine seam
   moved with it: `admin.checked_user` is part of it. (`BACKLOG #5559`)
 - **The cookie WebSocket gate refuses a blank or repeated `Origin`.** `authorize_ui_ws` read
   only the first `Origin` header. It now reads every copy and refuses a blank `Origin`, or more

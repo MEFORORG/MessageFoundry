@@ -19,6 +19,7 @@ tampering.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -279,6 +280,7 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     since it was issued. The failure is stood in for at the service's checked reader, after the
     reset's own read."""
     engine, _path = keyed
+    caplog.set_level(logging.DEBUG, logger="messagefoundry_webconsole.routes.admin")
     service, _alerts, intact, victim = await _setup(engine)
     async with _client(engine, service) as c:
         await cookie_login(c, "root")
@@ -308,6 +310,14 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     ]
     assert fallback
     assert all(not rec.exc_info and "stand-in" not in rec.getMessage() for rec in fallback)
+    # The traceback's frames go to DEBUG, still without the exception's message.
+    frames = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "DEBUG" and "message withheld" in rec.getMessage()
+    ]
+    assert frames and all(victim in rec.getMessage() for rec in frames)
+    assert all("stand-in" not in rec.getMessage() and not rec.exc_info for rec in frames)
 
 
 @pytest.mark.parametrize(
@@ -319,18 +329,16 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     ],
     ids=["outside-the-refusals", "listed-defect"],
 )
-async def test_a_defect_in_the_post_action_name_read_still_shows_the_credential(
+async def test_a_defect_in_the_post_action_name_read_raises(
     keyed: tuple[Engine, Path],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     defect: Exception,
 ) -> None:
-    """The reset has landed by the time its page reads the name, and its one-time credential is
-    shown nowhere else. So an error outside the refusal set, and a listed defect inside it
-    (``AUDIT_WRITE_DEFECTS``; NotImplementedError is a RuntimeError), still render the page with
-    the id, and log an ERROR naming the exception's type, with no traceback and none of its
-    message, which here carries record text. On the code before this test they raised, and the
-    credential was lost. The control for a refusal is the test above."""
+    """An error outside the refusal set, and a listed defect inside it (``AUDIT_WRITE_DEFECTS``;
+    NotImplementedError is a RuntimeError), are bugs, not refusals, so the name read raises them
+    rather than naming the account by id, as ``_shown_name``'s docstring states. No fallback line
+    is logged for them. The control for a refusal is the test above."""
     engine, _path = keyed
     service, _alerts, _intact, victim = await _setup(engine)
 
@@ -342,21 +350,9 @@ async def test_a_defect_in_the_post_action_name_read_still_shows_the_credential(
         monkeypatch.setattr(service, "checked_user", failing)
         path = f"/ui/users/{victim}/reset-password"
         await mint_bound_proof(c, path)
-        r = await c.post(path, headers=SAME_ORIGIN)
-    assert r.status_code == 200
-    assert "Temporary password issued" in r.text and "<code>" in r.text
-    assert f"Convey this to {victim} " in r.text
-    errors = [
-        rec
-        for rec in caplog.records
-        if rec.levelname == "ERROR" and "names the account by id" in rec.getMessage()
-    ]
-    assert len(errors) == 1, caplog.text
-    assert victim in errors[0].getMessage()
-    assert type(defect).__name__ in errors[0].getMessage()
-    assert not errors[0].exc_info
-    # No log line from the request holds the record text the exception carried.
-    assert _PLANTED not in caplog.text
+        with pytest.raises(type(defect)):
+            await c.post(path, headers=SAME_ORIGIN)
+    assert not [rec for rec in caplog.records if "names the account by id" in rec.getMessage()]
 
 
 async def test_the_summary_takes_its_roles_from_a_checked_record_only(
@@ -392,6 +388,18 @@ def test_the_delete_confirmation_offers_no_form_for_the_callers_own_account() ->
     other = str(user_delete_confirm_page("u1", is_self=False))
     assert "/ui/users/u1/delete" not in own and "cannot delete your own account" in own
     assert 'action="/ui/users/u1/delete"' in other  # control
+
+
+def test_the_delete_confirmation_claims_no_cause_the_423_does_not_carry() -> None:
+    """The checked read answers one fixed 423 whether the seal failed or Vault transit could not
+    verify it (ADR 0217), so a genuine record can reach this page. The page must not tell an
+    administrator, before a delete with no undo, that the record failed its check."""
+    from messagefoundry_webconsole.pages.admin import user_delete_confirm_page
+
+    text = str(user_delete_confirm_page("u1", is_self=False))
+    assert "failed its integrity check" not in text
+    assert "could not be verified against its seal" in text
+    assert "cannot tell which applies" in text
 
 
 async def test_a_users_read_only_reader_is_offered_no_delete_of_a_failing_account(

@@ -275,7 +275,9 @@ def user_delete_confirm_page(user_id: str, *, is_self: bool) -> Markup:
     """The confirm step for the delete the users list offers on an account whose record fails its
     integrity seal (BACKLOG #5559): it says what the delete does before the one POST that acts.
 
-    The route renders it only after the checked read refused the record for its seal. It names
+    The route renders it only after the checked read refused the record for its seal. That 423
+    carries one fixed text whether the seal failed or could not be verified (ADR 0217), so the
+    page claims neither. It names
     the account by id alone, so nothing here may read as its name or roles. The caller's own
     account gets a note and no form, since the delete refuses it. The list leads here with a link,
     as the federated identity screen leads to its unlink confirmation, so the list itself holds no
@@ -290,8 +292,10 @@ def user_delete_confirm_page(user_id: str, *, is_self: bool) -> Markup:
         el("h1", f"Delete account {user_id}"),
         el(
             "p",
-            "This account's record failed its integrity check, so its name and roles are not "
-            "shown. Deleting it removes the account; the console has no undo.",
+            "This account's record could not be verified against its seal, so its name and "
+            "roles are not shown. The engine refuses a record whose seal check fails and one "
+            "whose seal it cannot verify the same way, so this page cannot tell which applies. "
+            "Deleting it removes the account; the console has no undo.",
         ),
         action,
         el("p", el("a", "Cancel", href="/ui/users")),

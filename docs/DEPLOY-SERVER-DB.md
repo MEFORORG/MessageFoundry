@@ -572,8 +572,9 @@ chain (its help says how). With `-Confirm` you may still
 decline the root and accept another CA, so give it the root of the CA you mean to trust, alone or
 in that CA's own `.p7b` chain, and accept every certificate it offers.
 
-The built-ins below check none of that, so use them only for a file holding one self-signed root
-CA you have checked yourself:
+The built-ins below do not run the helper's CA, chain and validity checks, and they put what they
+are given into the store you name, so use them only for a file holding one self-signed root CA
+you have checked yourself:
 
 ```powershell
 # PowerShell:
@@ -619,12 +620,17 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
      validity check, so it lists them even once the old root has expired; a file it cannot read
      at all lists nothing, so find its certificates by Subject in
      `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA` instead.
-     Then remove them all at once:
+     Then remove them all at once. Removing a CA a host still relies on breaks that host's
+     connections, so the command refuses to run on any host but the one you checked: put that
+     host's name, as `[Environment]::MachineName`
+     prints it, in place of `<HOST>`.
 
      ```powershell
-     $old = @('<old thumbprint>', '<old thumbprint>')  # every old one the new file does not hold
-     Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA |
-         Where-Object Thumbprint -in $old | Remove-Item
+     if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else {
+         $old = @('<old thumbprint>', '<old thumbprint>')  # every old one the new file does not hold
+         Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA |
+             Where-Object Thumbprint -in $old | Remove-Item
+     }
      ```
    - **PostgreSQL:** drop the old CA from the PEM bundle and reload. Where the PostgreSQL hop uses
      the machine stores instead of a file pin, remove the old CA from them as the SQL Server step

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
+import traceback
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -273,39 +274,41 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     async def _shown_name(user_id: str, service: AuthService) -> str:
         """The username a page shows after an action already landed, read as :func:`_checked`
-        reads it, or the id when that read raises any ``Exception`` (BACKLOG #5559).
+        reads it (BACKLOG #5559). This docstring states the fallback's rule; the console
+        CHANGELOG and docs/SECURITY.md point here.
 
-        The action's one-time output was already issued and is shown nowhere else, so no failure
-        of a read made only to label it may replace the page that hands it over. As
-        :func:`~messagefoundry.audit_write.write_audit_soft` says of its ``defects``, a raise here
-        would report an operation that already ran as a failure. An ``HTTPException`` logs a
-        WARNING naming the account and the status, one of ``account_read_errors()`` outside
-        ``AUDIT_WRITE_DEFECTS`` a WARNING naming its type, and anything else, a defect included,
-        an ERROR naming its type. No line carries the exception's message or traceback, since
-        either can hold the record's values (docs/PHI.md). None of these lines is rate-limited."""
-
-        def fallback(level: int, reason: str) -> str:
-            _log.log(
-                level,
-                "the name of account %s for a page after a landed action was not shown: its "
-                "checked read %s; the page names the account by id",
-                scrub_log_argument(user_id),
-                reason,
-            )
-            return user_id
-
+        The action's one-time output was already issued, so a refusal of a read made only to
+        label it does not replace the page that hands it over. When the read raises
+        ``HTTPException`` or one of ``account_read_errors()`` other than ``AUDIT_WRITE_DEFECTS``,
+        the page names the account by its id, and a WARNING names the account and the status or
+        the exception's type. A DEBUG line then carries the traceback's frames, without the
+        exception's message, which can hold the record's values (docs/PHI.md). Neither line is
+        rate-limited. Any other exception, a listed defect included, raises (CLAUDE.md section 6),
+        and the page that would show the credential is not rendered."""
+        failure: BaseException
         try:
             user = await _checked(user_id, service)
         except HTTPException as exc:
-            # 404 gone since the action, 423 a record that fails its seal, 503 a Vault Outage.
-            return fallback(logging.WARNING, f"answered {exc.status_code}")
-        except Exception as exc:
-            # Broad on purpose: the credential was issued, and the docstring says why.
-            reason = f"failed ({type(exc).__name__})"
-            if isinstance(exc, account_read_errors()) and not isinstance(exc, AUDIT_WRITE_DEFECTS):
-                return fallback(logging.WARNING, reason)
-            return fallback(logging.ERROR, reason)
-        return str(user.username)
+            # 404 gone since the action, 423 a record refused for its seal, 503 a Vault Outage.
+            reason, failure = f"answered {exc.status_code}", exc
+        except account_read_errors() as exc:
+            if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                raise
+            reason, failure = f"failed ({type(exc).__name__})", exc
+        else:
+            return str(user.username)
+        _log.warning(
+            "the name of account %s for a page after a landed action was not shown: its checked "
+            "read %s; the page names the account by id",
+            scrub_log_argument(user_id),
+            reason,
+        )
+        _log.debug(
+            "the checked read of account %s raised from (message withheld):\n%s",
+            scrub_log_argument(user_id),
+            "".join(traceback.format_tb(failure.__traceback__)),
+        )
+        return user_id
 
     async def _user_detail(
         user_id: str,
@@ -1039,7 +1042,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         # BACKLOG #5559: the confirmation the users list leads to for an account whose record
         # fails its seal, behind the delete's own gate. The account is read through the checked
-        # read first, so the page says a record failed its check only when it did: an intact
+        # read first, so the page is shown only for a record that read refused for its seal: an intact
         # account goes to its own detail page, and a missing one, or any other refusal, is that
         # read's answer. The page names the id alone, and the POST it carries makes every check
         # the delete makes.
