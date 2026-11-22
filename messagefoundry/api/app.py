@@ -10623,7 +10623,8 @@ def create_app(
             # An outbound spans channels, so a scope that lists one does not reach it (BACKLOG #3378
             # item 4, owner ruling 2026-11-04). knows_outbound also counts a reload-dropped outbound
             # still draining, as the alert's own control action does. A name that is also an
-            # inbound anywhere in the deployment counts as the inbound, as the flag route reads it.
+            # inbound anywhere in the deployment (inbound_names(), the set the flag route's scope
+            # test reads) counts as the inbound; the flag route itself refuses direction=outbound.
             return rr is not None and rr.knows_outbound(name) and name not in inbounds
 
         def visible(rule: AlertRule) -> bool:

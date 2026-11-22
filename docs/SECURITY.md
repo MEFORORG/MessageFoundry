@@ -2388,10 +2388,12 @@ the same permission set on the same method reds CI until it is listed here.
 > ruling 2026-11-04). A name counts as an outbound when the running graph knows it as one, a
 > reload-dropped outbound still draining included, and it is not an inbound anywhere in the
 > deployment, the set the flag route reads. A `restart_outbound` rule is withheld whatever the
-> graph holds, since it acts on an outbound. With no graph loaded only that last test applies. The flag route refuses more than this: at least a name in
-> the scope that exists nowhere, which a rule here may still name. Each rule it shows has a null
-> `id` (BACKLOG
-> #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
+> graph holds, since its action names the outbound side. With no graph loaded no name counts as
+> an outbound, so of these two outbound tests only the `restart_outbound` one withholds; the
+> scope tests above still apply. So at least a scope-listed outbound's other rules show while no
+> graph is loaded, and a rule on a name that is also an inbound shows, whatever its event type.
+> The flag route refuses more than this: at least a name in the scope that exists nowhere, which
+> a rule here may still name. Each rule it shows has a null `id` (BACKLOG #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
 > connection name in it, and nothing here reliably tells a label that names one from one that
 > does not. An
 > all-channels caller reads every id. A withheld id writes no audit row, since the rule itself is

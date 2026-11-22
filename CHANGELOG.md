@@ -39,9 +39,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   lists.** The filter tested only whether each name was in the scope, never which side of the
   graph it was on, so a scope naming an outbound read that outbound's rules, while the flag route
   refuses every outbound to such a caller. On a first deployment that would have shown them. The
-  route now withholds from such a caller a rule that names an outbound, as the owner ruled on
-  2026-11-04. `docs/SECURITY.md`, in the `GET /alerts/rules` paragraph, says which names count
-  and what such a caller reads (`BACKLOG #3378`).
+  route now withholds from such a caller at least a rule naming an outbound the running graph
+  knows, and every `restart_outbound` rule, as the owner ruled on 2026-11-04. Some outbound rules
+  still show, at least while no graph is loaded; `docs/SECURITY.md`, in the `GET /alerts/rules`
+  paragraph, says which names count and what such a caller reads (`BACKLOG #3378`).
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
   restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
   forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a
