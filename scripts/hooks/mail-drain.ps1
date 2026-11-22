@@ -382,7 +382,8 @@ function Write-Injection {
 
 function Write-StateNotice {
     # A notice about the channel's state rather than about mail. Output at Stop re-wakes the model, so
-    # there it goes to stderr, which still leaves a running session a signal and wakes nothing.
+    # there it goes to stderr, which wakes nothing. THE MODEL DOES NOT RECEIVE STDERR from a hook that
+    # exits 0: that line is for whoever reads the hook's output, and the model hears at SessionStart.
     param([bool]$Consuming, [string]$Event, [string]$Text)
     if ($Consuming) { try { [Console]::Error.WriteLine($Text) } catch { } }
     else { Write-Injection -Event $Event -Text $Text }

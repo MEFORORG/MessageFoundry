@@ -244,10 +244,12 @@ def seed(
 
 
 # Sets the culture, then runs the hook in the same process so it inherits stdin and the culture.
+# The path and culture arrive by environment, because pwsh joins -Command arguments into its text.
+# The explicit exit carries the hook's code out, or run_drain's exit-0 check would prove nothing.
 _CULTURE_WRAPPER = (
-    "& { param($Drain, $Culture) "
-    "[Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo($Culture); "
-    "& $Drain @args } @args"
+    "[Globalization.CultureInfo]::CurrentCulture = "
+    "[Globalization.CultureInfo]::GetCultureInfo($env:MAIL_TEST_CULTURE); "
+    "& $env:MAIL_TEST_DRAIN; exit $LASTEXITCODE"
 )
 
 
@@ -284,13 +286,15 @@ def run_drain(
     if session_id is not None:
         payload["session_id"] = session_id
     argv = ["pwsh", "-NoProfile", "-NonInteractive"]
+    env: dict[str, str] | None = None
     if culture is None:
         argv += ["-File", str(DRAIN)]
+        if anchor_repo is not None:
+            argv += ["-AnchorRepo", str(anchor_repo)]
     else:
-        # The drain's path and the culture go in as arguments, never spliced into the command text.
-        argv += ["-Command", _CULTURE_WRAPPER, str(DRAIN), culture]
-    if anchor_repo is not None:
-        argv += ["-AnchorRepo", str(anchor_repo)]
+        assert anchor_repo is None, "the culture wrapper does not forward -AnchorRepo"
+        argv += ["-Command", _CULTURE_WRAPPER]
+        env = {**os.environ, "MAIL_TEST_DRAIN": str(DRAIN), "MAIL_TEST_CULTURE": culture}
     # run_from exists because the PAYLOAD cwd and the PROCESS cwd are separable in production and
     # must be separable here: a payload can name a directory that no longer exists, which Windows
     # refuses as a process working directory. Defaulting it to the payload keeps every other test
@@ -303,6 +307,7 @@ def run_drain(
         text=True,
         timeout=TIMEOUT,
         check=False,
+        env=env,
     )
     # FAIL OPEN, asserted in the helper and not per-test. A Stop hook that fails can end a turn badly
     # and a SessionStart hook that fails replaces the whole starting context; asserting it per-test
@@ -2455,8 +2460,24 @@ _EXPIRY_CULTURES = ["en-GB", "en-US"]
 _EXPIRY_STEM = "20260101T000000001-aaaaaa"
 
 
-def _one_hour_from_now() -> str:
-    return (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+def _offset_stamp(hours: int) -> str:
+    return (datetime.now(UTC) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def test_the_culture_wrapper_carries_the_exit_code(tmp_path: Path) -> None:
+    """The control for run_drain's exit-0 check on every culture= call."""
+    script = tmp_path / "exit seven.ps1"
+    script.write_text("exit 7\n", encoding="ascii")
+    env = {**os.environ, "MAIL_TEST_DRAIN": str(script), "MAIL_TEST_CULTURE": "en-GB"}
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", _CULTURE_WRAPPER],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 7, proc.stderr
 
 
 def _raw_message(stem: str, body: str, expires: str | None) -> dict[str, Any]:
@@ -2512,21 +2533,36 @@ def test_a_future_stamp_outlives_the_floor_under_every_culture(
 def test_an_offset_stamp_is_read_as_the_instant_it_names(
     repo: Path, tmp_path: Path, culture: str
 ) -> None:
-    """Coerced to a Local DateTime. Read as a wall clock, it goes wrong on any host not on UTC."""
-    seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "live for an hour", _one_hour_from_now())])
-    assert "live for an hour" in injection(run_drain(repo, culture=culture))
+    """Coerced to a Local DateTime, and read as a wall clock it would be off by the host's offset.
+
+    The two stamps cover both directions: the live one catches a host west of UTC, the dead one a
+    host east of it. A host ON UTC cannot tell the old reader from this one.
+    """
+    specs = [
+        _raw_message(_EXPIRY_STEM, "live for an hour", _offset_stamp(1)),
+        _raw_message("20260101T000000002-aaaaaa", "dead for an hour", _offset_stamp(-1)),
+    ]
+    info = seed(repo, tmp_path, specs)
+    text = injection(run_drain(repo, culture=culture))
+    assert "live for an hour" in text, text
+    assert "dead for an hour" not in text, text
+    assert len(box_files(repo, str(info["key"]), "expired")) == 1
 
 
 @pytest.mark.parametrize("expires", [None, "03/04/2026", "not a date"])
 def test_the_floor_still_covers_a_missing_or_unreadable_stamp(
     repo: Path, tmp_path: Path, expires: str | None
 ) -> None:
-    seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "inside the floor", expires)])
+    info = seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "inside the floor", expires)])
+    key = str(info["key"])
     assert "inside the floor" in injection(run_drain(repo, event="SessionStart", culture="en-GB"))
     _age_inbox(repo, 8)
     assert "inside the floor" not in injection(
         run_drain(repo, session_id=f"{uuid.uuid4()}", culture="en-GB")
     )
+    # Absence from the text alone would also pass for a message left in the inbox.
+    assert box_files(repo, key, "inbox") == []
+    assert len(box_files(repo, key, "expired")) == 1
 
 
 def test_the_moved_box_count_reads_expiry_the_same_way(repo: Path, tmp_path: Path) -> None:
@@ -2537,8 +2573,9 @@ def test_the_moved_box_count_reads_expiry_the_same_way(repo: Path, tmp_path: Pat
         capture_output=True,
     )
     specs = [
-        _raw_message(_EXPIRY_STEM, "live", _one_hour_from_now()),
+        _raw_message(_EXPIRY_STEM, "live", _offset_stamp(1)),
         _raw_message("20260101T000000002-aaaaaa", "dead", "2020-01-13T00:00:00.000Z"),
+        _raw_message("20260101T000000003-aaaaaa", "just dead", _offset_stamp(-1)),
     ]
     seed(repo, tmp_path, specs, box_cwd=wt)
     sid = str(uuid.uuid4())
