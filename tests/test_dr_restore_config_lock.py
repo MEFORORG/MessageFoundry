@@ -12,6 +12,7 @@ import io
 import sys
 import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -73,14 +74,64 @@ def test_a_posix_restore_still_lands_a_colon_name(tmp_path: Path) -> None:
     assert (tmp_path / "bundle" / "s:t" / "c.toml").read_bytes() == b"y"
 
 
-@pytest.mark.parametrize("rel", ["aux.py", "con.toml", "com1.txt", "sub/aux.py", "dot.", "sp "])
-def test_names_outside_the_colon_rule_behave_as_the_platform_does(tmp_path: Path, rel: str) -> None:
-    # This change refuses colons alone. Whatever the host does with these, it is not this refusal.
+@pytest.mark.parametrize("rel", ["aux.py", "con.toml", "com1.txt", "sub/aux.py"])
+def test_a_reserved_stem_still_restores_as_a_file(tmp_path: Path, rel: str) -> None:
+    cfg = tmp_path / "bundle"
+    # Which of these reach a device differs by Windows build; never write to one from a test.
+    if dr_backup._win_rewritten(cfg / rel):
+        pytest.skip("this Windows build opens the name as a device")
     tar = _tar(tmp_path / "bundle.tar", [(f"config/{rel}", b"x")])
-    try:
-        dr_backup._restore_config_members(tar, tmp_path / "bundle")
-    except BackupError as exc:
-        assert "unsafe config member name" not in str(exc)
+    assert dr_backup._restore_config_members(tar, cfg) == 1
+    assert (cfg / rel).read_bytes() == b"x"
+
+
+@pytest.mark.parametrize("rel", ["dot.", "sp "])
+def test_a_trailing_dot_or_space_still_restores(tmp_path: Path, rel: str) -> None:
+    cfg = tmp_path / "bundle"
+    tar = _tar(tmp_path / "bundle.tar", [(f"config/{rel}", b"x")])
+    assert dr_backup._restore_config_members(tar, cfg) == 1
+    landed = rel[:-1] if sys.platform == "win32" else rel  # Win32 drops the last character
+    assert [p.name for p in cfg.iterdir()] == [landed]
+
+
+def _lose_the_mkdir_race(monkeypatch: pytest.MonkeyPatch, *, to_a_file: bool) -> None:
+    """Another process makes ``raced`` between the restore's existence probe and its mkdir."""
+    real_mkdir = Path.mkdir
+
+    def mkdir(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self.name == "raced" and not self.exists():
+            if to_a_file:
+                self.write_bytes(b"theirs")
+            else:
+                real_mkdir(self)
+            raise FileExistsError(self)
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+
+
+def test_a_directory_another_process_made_is_not_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar = _tar(tmp_path / "bundle.tar", [("config/raced/x.toml", b"x")])
+    cfg = tmp_path / "bundle"
+    written: list[Path] = []
+    _lose_the_mkdir_race(monkeypatch, to_a_file=False)
+    assert dr_backup._restore_config_members(tar, cfg, written=written) == 1
+    assert written == [cfg.resolve() / "raced" / "x.toml"]
+
+
+def test_a_file_another_process_made_is_a_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar = _tar(tmp_path / "bundle.tar", [("config/raced/x.toml", b"x")])
+    cfg = tmp_path / "bundle"
+    written: list[Path] = []
+    _lose_the_mkdir_race(monkeypatch, to_a_file=True)
+    with pytest.raises(BackupError, match="collides with a member already extracted"):
+        dr_backup._restore_config_members(tar, cfg, written=written)
+    assert written == []
+    assert (cfg / "raced").read_bytes() == b"theirs"
 
 
 def test_a_failed_mkdir_chain_rolls_back_and_the_retry_runs(tmp_path: Path) -> None:

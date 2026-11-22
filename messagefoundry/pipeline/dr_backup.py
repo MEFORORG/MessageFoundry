@@ -6729,9 +6729,10 @@ def _extract_config_members(
             # pass the name gate, and the second one's mkdir then re-raises FileExistsError because the
             # existing path is not a directory -- uncaught all the way out to a CLI traceback.
             try:
-                # The nearest existing ancestor first: where it is a file this raises
-                # FileExistsError, while a mkdir beneath it reads as FileNotFoundError on Windows.
-                probe.mkdir(exist_ok=True)
+                # The nearest existing ancestor first: a mkdir beneath a file reads as
+                # FileNotFoundError on Windows, which is not the collision it is.
+                if not probe.is_dir():
+                    raise FileExistsError(probe)
                 # One level at a time, each recorded as it is made, so a failure part way down the
                 # chain (a component too long for the filesystem) leaves nothing unrecorded to trip
                 # the non-empty refusal on the retry.
