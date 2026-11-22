@@ -16,6 +16,7 @@ import pytest
 
 from harness.acceptance import probes
 from harness.acceptance.matrix import MATRIX, Status
+from harness.endpoints import tcp as tcp_endpoints
 
 
 def _a5_title() -> str:
@@ -30,8 +31,9 @@ def test_every_listener_row_a5_names_is_in_the_probe_port_map() -> None:
 
 
 def test_the_tcp_port_is_the_harness_tcp_inbound_default() -> None:
-    # harness/config/tcp_x12.py: IB_Harness_TCP listens on env("harness_tcp_in", default=2580).
-    assert probes._DEFAULT_PORTS["TCP"] == 2580
+    # Read from the endpoint registry, so a moved IB_Harness_TCP default fails here.
+    tcp_in = next(e for e in tcp_endpoints.ENDPOINTS if e.key == "tcp_in")
+    assert probes._DEFAULT_PORTS["TCP"] == int(tcp_in.default)
 
 
 def test_a5_reports_a_held_tcp_port_as_in_use(monkeypatch: pytest.MonkeyPatch) -> None:

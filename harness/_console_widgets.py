@@ -292,15 +292,25 @@ class MessageDetailPanel(QWidget):
         # an in-flight one (rapid row clicks / replay), so a stale result is dropped in _apply.
         self._open_seq += 1
         self._pending_id = message_id
-        # No Show body or Replay until this open lands: a press now would act on the previous
-        # message, not the one just selected (BACKLOG #5848).
+        # Nothing is open until this open lands: Show body or Replay pressed now would act on the
+        # previous message, not the one just selected (BACKLOG #5848).
+        self._message_id = None
         self._show_body.setEnabled(False)
         self._replay.setEnabled(False)
         open_seq = self._open_seq
+        # A raise other than ApiError (a transport error, say) takes _apply's error path too, so the
+        # previous message is not left on screen with nothing said (BACKLOG #5848).
         self._runner.submit(
             lambda: self._fetch(message_id, open_seq),
             on_done=self._apply,
-            on_error=lambda exc: self._open_failed(message_id, open_seq, exc),
+            on_error=lambda exc: self._apply(
+                _DetailSnapshot(
+                    message_id,
+                    open_seq,
+                    None,
+                    f"the message could not be opened: {type(exc).__name__}",
+                )
+            ),
         )
 
     def stop(self) -> None:
@@ -318,27 +328,14 @@ class MessageDetailPanel(QWidget):
         except ApiError as exc:
             return _DetailSnapshot(message_id, open_seq, None, str(exc))
 
-    def _is_current(self, message_id: str, open_seq: int) -> bool:
-        """False once a newer load() (or a clear()) has superseded the open that asked."""
-        return open_seq == self._open_seq and message_id == self._pending_id
-
-    def _open_failed(self, message_id: str, open_seq: int, exc: BaseException) -> None:
-        """The open raised something other than ApiError (a transport error, say). Without this
-        the previous message stayed on screen under the new selection (BACKLOG #5848)."""
-        if self._is_current(message_id, open_seq):
-            self._show_open_error(f"the message could not be opened: {type(exc).__name__}")
-
-    def _show_open_error(self, error: str) -> None:
-        self.error.emit(error)
-        # Never leave the previous message's metadata and body under the newly selected row.
-        self._reset("The message could not be opened.")
-
     def _apply(self, snap: _DetailSnapshot) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
-        if not self._is_current(snap.message_id, snap.open_seq):
-            return
+        if snap.open_seq != self._open_seq or snap.message_id != self._pending_id:
+            return  # a newer load() (or a clear()) superseded this result
         if snap.error is not None:
-            self._show_open_error(snap.error)
+            self.error.emit(snap.error)
+            # Never leave the previous message's metadata and body under the newly selected row.
+            self._reset("The message could not be opened.")
             return
         detail = snap.detail
         assert detail is not None
@@ -428,7 +425,7 @@ class MessageDetailPanel(QWidget):
         self._raw.setPlainText(snap.raw.replace("\r", "\n"))
 
     def _on_replay(self) -> None:
-        if self._message_id is None or self._message_id != self._pending_id:
+        if self._message_id is None:
             return  # nothing open, or a newer load() is still in flight
         try:
             self._client.replay(self._message_id)
