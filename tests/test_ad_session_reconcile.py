@@ -70,6 +70,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.row_seal import (
@@ -6896,8 +6897,9 @@ async def test_a_transit_answer_at_a_rename_read(
     its plan with ``asmith``'s rename applied (the plan's order is not fixed, so that rename may
     run first). RED when: the answer escapes the pass, or it pages.
 
-    Outage (Manager decision, 2026-11-22): the key service is down, so the loop pages it once and
-    the pass ends with it, as on main, where it was not paged. RED when: the pass goes on, or the Outage is not paged once.
+    Outage (Manager decisions, 2026-11-22): the key service is down, so the loop pages it once and
+    stops the renames, and the pass still returns its plan (on main it raised out of the pass,
+    unpaged). RED when: the answer escapes the pass, or the Outage is not paged once.
 
     Called the way the login path calls it, either answer is raised."""
     store, service, notifier = await _two_renamed_accounts()
@@ -6952,18 +6954,15 @@ async def test_a_transit_answer_at_a_rename_read(
         service._refresh_cached_username = refresh  # type: ignore[method-assign]
         outage = answer is TransitSealUnavailableError
         with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
-            if outage:
-                with pytest.raises(TransitSealUnavailableError):
-                    await service.reconcile_directory_sessions()
-            else:
-                plan = await service.reconcile_directory_sessions()
+            plan = await service.reconcile_directory_sessions()
         assert reached == [read], "the read was not reached"
         still = await real_by_id(jdoe.id)
         assert still is not None and still.username == "jdoe"
+        assert plan.aborted is None and len(plan.renames) == 2
         if outage:
             assert len(pages) == 1, "the Outage was not paged exactly once"
+            assert _logged_at_error(caplog, f"account {jdoe.id} (renaming to jdoe-new)", "not")
         else:
-            assert plan.aborted is None and len(plan.renames) == 2
             assert await real_by_name("asmith-new") is not None, "the other rename was skipped"
             assert _logged_at_error(
                 caplog, f"account {jdoe.id} (renaming to jdoe-new)", "could not verify"
@@ -6983,6 +6982,102 @@ async def test_a_transit_answer_at_a_rename_read(
                     from_plan=False,
                     audit_soft=False,
                 )
+    finally:
+        await store.close()
+
+
+async def _renames_beside_a_revocation() -> tuple[MessageStore, AuthService, list[str]]:
+    """``jdoe`` and ``asmith`` signed in and renamed in the directory, and ``bob`` signed in and
+    gone from it, so one pass at one strike plans two renames and one revocation."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ("jdoe", "asmith", "bob")
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(
+            store,
+            _ad_settings(ad_session_recheck_strikes=1),
+            ldap=ldap,  # type: ignore[arg-type]
+        )
+        await service.initialize()
+        for name in names:
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ldap.present = {
+            f"{n}-new": _principal(f"{n}-new", object_id=_object_id_for(n))
+            for n in ("jdoe", "asmith")
+        }
+        pages: list[str] = []
+        store.seal_pager().arm(lambda subject, reason: pages.append(subject))
+    except BaseException:
+        await store.close()
+        raise
+    return store, service, pages
+
+
+class _RevokedSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.revoked: list[str] = []
+
+    def ad_session_revoked(self, name: str, *, reason: str) -> None:
+        self.revoked.append(name)
+
+
+@pytest.mark.parametrize("where", ["read", "write-then-read"])
+async def test_an_outage_at_a_rename_stops_the_renames_and_keeps_the_revocation_alerts(
+    where: str,
+) -> None:
+    """Vault BACKLOG #3069 item 1, Manager decisions 2026-11-22. An Outage at the first rename's
+    read stops the rename loop, but the pass returns its plan, so ``bob``'s applied revocation
+    still raises its ``ad_session_revoked`` alert, and the Outage is paged exactly once. With
+    ``write-then-read`` the first rename's write meets the Outage (note T2, which goes on) and the
+    second rename's read meets it again: still one page for the pass. RED when: the Outage raises
+    out of the pass (no plan, no alert), or one outage pages twice."""
+    from messagefoundry.api.app import _alert_reconcile_plan
+
+    store, service, pages = await _renames_beside_a_revocation()
+    try:
+        real_verified = service._verified
+        real_rename = store.set_user_username
+        renamed: list[str] = []
+
+        async def rename(user_id: str, username: str, **kwargs: Any) -> bool:
+            renamed.append(username)
+            if where == "write-then-read" and len(renamed) == 1:
+                raise TransitSealUnavailableError()
+            return await real_rename(user_id, username, **kwargs)
+
+        async def verified(user: UserRecord | None) -> Any:
+            # One checked read is refused once the renames begin: the first rename's for
+            # ``read``, the second's (after the write met the outage) for ``write-then-read``.
+            due = renamed if where == "write-then-read" else [True]
+            if renaming and due and user is not None and not refused:
+                refused.append(user.id)
+                raise TransitSealUnavailableError()
+            return await real_verified(user)
+
+        refused: list[str] = []
+        renaming: list[bool] = []
+        real_load_by_name = service._load_user_by_username
+
+        async def load_by_name(username: str) -> VerifiedUser | None:
+            if username.endswith("-new"):
+                renaming.append(True)
+            return await real_load_by_name(username)
+
+        service._load_user_by_username = load_by_name  # type: ignore[method-assign]
+        service._verified = verified  # type: ignore[method-assign]
+        store.set_user_username = rename  # type: ignore[method-assign]
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert refused, "no checked read met the outage"
+        assert plan.aborted is None
+        assert [r.username for r in plan.revocations] == ["bob"]
+        assert len(pages) == 1, f"one outage paged {len(pages)} times"
+        for name in ("jdoe-new", "asmith-new"):
+            assert await store.get_user_by_username(name) is None, name
+        sink = _RevokedSink()
+        _alert_reconcile_plan(plan, service, sink)
+        assert sink.revoked == ["bob"], "the applied revocation lost its alert"
     finally:
         await store.close()
 

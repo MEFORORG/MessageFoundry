@@ -4489,6 +4489,9 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        # Whether this reconcile pass's renames already paged a Vault transit Outage, so the
+        # write's seal arm and the loop's read arm page one outage once (vault BACKLOG #3069).
+        self._rename_outage_paged = False
         #: Latched LDAP referral (BACKLOG #2538). Its own latch, like the hold's, because a pass with
         #: a referral beside other answers is not aborted and so clears `_reconcile_alert`. Set on a
         #: pass with a referral. Cleared by `_mark_reconcile_clears` on the referral clear's test.
@@ -10201,7 +10204,8 @@ class AuthService:
                 applied.append(revocation)
             if outcome == "reported":
                 reported.append(revocation)
-        for refresh in plan.renames:
+        self._rename_outage_paged = False
+        for i, refresh in enumerate(plan.renames):
             # BACKLOG #1532. Applied only on a pass that was NOT aborted, with every other write the
             # plan carries: the reconciler's invariant is that an aborted pass leaves the store
             # byte-identical, and a rename is a store write like any other.
@@ -10216,8 +10220,10 @@ class AuthService:
             # Unverifiable answer at a checked read in either is about one record, so it skips
             # this rename and the pass goes on (see _rename_read_seal_answer). An Outage is the
             # key service being down, which every later rename would meet again, so it is paged
-            # here and then ends the pass, as it ended it before this catch existed, when it was not
-            # paged (Manager decision, 2026-11-22).
+            # once and the rename loop stops; the recorders below still run and the plan is
+            # returned, so the revocations already applied keep their alerts (Manager decisions,
+            # 2026-11-22). Before this catch the Outage raised out of the pass, unpaged, and those
+            # alerts were lost.
             try:
                 await self._refresh_cached_username(
                     user_id=refresh.user_id,
@@ -10232,9 +10238,19 @@ class AuthService:
                 self._rename_read_seal_answer(
                     exc, user_id=refresh.user_id, new_username=refresh.new_username
                 )
-            except TransitSealUnavailableError:
-                self._user_seal_outage("rename")
-                raise
+            except TransitSealUnavailableError as exc:
+                _log.error(
+                    "directory reconcile: account %s (renaming to %s): Vault transit did not "
+                    "answer for a record one of the rename's reads checked, so this rename and "
+                    "the %d after it were not applied on this pass; the rest of the pass goes on "
+                    "(vault BACKLOG #3069)",
+                    refresh.user_id,
+                    scrub_log_argument(refresh.new_username),
+                    len(plan.renames) - i - 1,
+                    exc_info=exc,
+                )
+                self._page_rename_outage()
+                break
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
         await self._record_reconcile_referral(plan, first=referral)
@@ -10632,6 +10648,14 @@ class AuthService:
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"
 
+    def _page_rename_outage(self) -> None:
+        """Page a Vault transit Outage a reconcile pass's renames met, once per pass: the write's
+        seal arm and the loop's read arm share the flag, which the pass clears before its renames
+        (vault BACKLOG #3069)."""
+        if not self._rename_outage_paged:
+            self._rename_outage_paged = True
+            self._user_seal_outage("rename")
+
     def _rename_read_seal_answer(
         self,
         exc: TransitSealUnverifiableError,
@@ -10688,7 +10712,8 @@ class AuthService:
         (BACKLOG #3070; the reason is at that read), and a seal refusal at the write be logged and
         reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm). A
         Vault transit answer at one of its checked reads still raises out of it; the reconcile loop
-        absorbs an Unverifiable one (:meth:`_rename_read_seal_answer`, item 1).
+        absorbs an Unverifiable one (:meth:`_rename_read_seal_answer`, item 1) and stops its
+        renames on an Outage.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -11031,7 +11056,7 @@ class AuthService:
             elif isinstance(exc, RowSealUnverifiableError):
                 await self._user_seal_unverifiable(user_id, exc)
             else:
-                self._user_seal_outage("rename")
+                self._page_rename_outage()
             return
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
