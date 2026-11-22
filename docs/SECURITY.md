@@ -5668,8 +5668,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   answers by revoking the session under both hashes, best effort, and failing the ceremony
   closed (BACKLOG #3023). The SQLite store runs one writer at a time, so it has no lock order to get wrong.
 - **An account with no binding still signs in by Windows SSO, and its first engine factor needs
-  an enrolment code** (ADR 0207). The directory credential alone no longer binds it: the binding
-  step also asks a single-use issued code, and so does a federated session on a
+  an enrolment code** (ADR 0207). The directory credential alone no longer enrols its first engine
+  factor: enrolling it also asks a single-use issued code, and so does a federated session on a
   site that turned `oidc_require_mfa_claim` off. See [Directory-account enrolment
   codes](#directory-account-enrolment-codes-adr-0207). The Kerberos row of the [pathway
   table](#authentication-pathways--comparative-strength) describes that leg.
@@ -6797,8 +6797,11 @@ the email channel sends:
   form require an address and refuse anything but one plain mailbox (BACKLOG #2018). An
   administrator reaches an existing account with none, before its next sign-in, by setting one with
   `PATCH /users/{id}` `notify_email`.
-- **`GET /me/security-events`** — a pull-based feed of the caller's own audited `auth.*` events
-  (sign-ins, lockouts, password changes), most-recent-first, for accounts without a deliverable mailbox.
+- **`GET /me/security-events`** — a pull-based feed of audited `auth.*` events (sign-ins, lockouts,
+  password changes), most-recent-first, for accounts without a deliverable mailbox. Whose rows it
+  shows is the `GET /me/security-events` bullet under *Single-route data rules*, in [The `/ui`
+  console plane](#the-ui-console-plane-serve_uitrue), with the store-side name-compare residuals
+  that `_security_events_where` in `messagefoundry/store/store.py` lists.
   Both 6.3.5 signals are in it, as `auth.account_locked` and `auth.login_after_failures`, whichever leg
   raised them. It is a read-only view over the tamper-evident audit log (no new store of record). Admin-initiated
   changes (whose audit `actor` is the admin) are delivered by the email channel, not shown in this self
@@ -7725,12 +7728,11 @@ temporary credential lapsed, with at least these `at` values: `"session"` with n
 behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on the same browser,
 which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
-never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
-selects rows by the caller's own username at or after the account's `created_at`, so it shows the
-holder their own rows. It can show another account's, at least where an account keeps its
-`created_at` while its name or holder changes, and on the store-side name-compare residuals
-`_security_events_where` in `messagefoundry/store/store.py` lists (the `GET /me/security-events` bullet under *Single-route data rules*, in
-[The `/ui` console plane](#the-ui-console-plane-serve_uitrue)).
+never comes back short. The account holder's own `/me/security-events` feed is not filtered this
+way, and it can show another account's rows. Whose rows it shows is the `GET /me/security-events`
+bullet under *Single-route data rules*, in [The `/ui` console plane](#the-ui-console-plane-serve_uitrue),
+with the store-side name-compare residuals that `_security_events_where` in
+`messagefoundry/store/store.py` lists.
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
 
