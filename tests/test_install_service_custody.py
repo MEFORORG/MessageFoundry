@@ -174,15 +174,16 @@ _GRANTS: list[tuple[str, bool]] = [
     ("M", False),
     ("F", False),
     ("(GR,WD)", False),  # a generic right is not read as the rights it maps to
-    ("(RX,WD)+deny(WD)", False),  # a deny for the account itself takes add-file away
+    ("(RX,WD)+deny${me}:(WD)", False),  # a deny for the account itself takes add-file away
+    # One for a group it is in binds it too, and the groups are not read, so any deny is refused.
+    ("(RX,WD)+deny*S-1-5-32-545:(WD)", False),
+    ("(RX,WD)+deny*S-1-5-32-545:(OI)(IO)(WD)", True),  # inherit-only: not on the directory
 ]
 
 
 @_windows_only
 def test_the_custody_grant_rule(tmp_path: Path) -> None:
-    """Get-CustodyGrantProblem on a real directory's list, one per grant. A deny entry for another
-    account, here Users, neither widens nor narrows the verdict; one for the account itself that
-    reaches add-file is refused."""
+    """Get-CustodyGrantProblem on a real directory's list, one per grant and deny."""
     assert _SCRIPT is not None
     dirs = []
     for i, (spelled, _) in enumerate(_GRANTS):
@@ -193,14 +194,14 @@ def test_the_custody_grant_rule(tmp_path: Path) -> None:
     cases = "\n".join(
         f'  & icacls {_psq(d)} /inheritance:r /grant:r "*${{mySid}}:{grant}" '
         f"'*S-1-5-32-544:(OI)F' | Out-Null\n"
-        f"  & icacls {_psq(d)} /deny '*S-1-5-32-545:(WD)' | Out-Null\n"
-        + (f'  & icacls {_psq(d)} /deny "*${{mySid}}:{deny}" | Out-Null\n' if deny else "")
+        + (f'  & icacls {_psq(d)} /deny "{deny}" | Out-Null\n' if deny else "")
         + f"  $out += [string](Get-CustodyGrantProblem -Acl (Get-Acl -LiteralPath {_psq(d)}) "
         "-AccountSid $mySid)"
         for d, grant, deny in dirs
     )
     body = (
         "  $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
+        '  $me = "*$mySid"\n'
         f"  $out = @()\n{cases}\n  ConvertTo-Json -InputObject $out -Compress\n"
     )
     try:
@@ -208,7 +209,7 @@ def test_the_custody_grant_rule(tmp_path: Path) -> None:
     finally:
         restore = "\n".join(
             "  $s = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
-            f'  & icacls {_psq(d)} /remove:d "*$s" | Out-Null\n'
+            f'  & icacls {_psq(d)} /remove:d "*$s" "*S-1-5-32-545" | Out-Null\n'
             f'  & icacls {_psq(d)} /inheritance:e /grant "*${{s}}:(OI)(CI)F" | Out-Null'
             for d, _, _ in dirs
         )
@@ -219,7 +220,7 @@ def test_the_custody_grant_rule(tmp_path: Path) -> None:
 @_windows_only
 def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_path: Path) -> None:
     """Set-CustodyDirAcl on a directory that inherits Users read and the account's Modify, and
-    denies the account add-file. The account ends with read and add-file on the directory alone,
+    denies the account and Users add-file. The account ends with read and add-file on the directory alone,
     nothing inherited and no deny, and the engine's own check of a custody directory passes it,
     where it refused the directory before. Unelevated, the owner change is refused, and the
     function refuses for that alone."""
@@ -232,7 +233,7 @@ def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_pat
     pre = rf"""
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)RX' "${{me}}:(OI)(CI)M" | Out-Null
-  & icacls {_psq(str(custody))} /deny "${{me}}:(WD)" | Out-Null
+  & icacls {_psq(str(custody))} /deny "${{me}}:(WD)" '*S-1-5-32-545:(WD)' | Out-Null
 """
     _ok(_extract(_SCRIPT, [], pre), tmp_path)
     environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody)}
@@ -252,6 +253,7 @@ def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_pat
   [pscustomobject]@{{
     refusal = $refusal
     inherited = @($acl.Access | Where-Object {{ $_.IsInherited }}).Count
+    denies = @($acl.Access | Where-Object {{ "$($_.AccessControlType)" -eq 'Deny' }}).Count
     protected = $acl.AreAccessRulesProtected
     mine = @($mine | ForEach-Object {{ [pscustomobject]@{{
       type = "$($_.AccessControlType)"; rights = [int64]$_.FileSystemRights;
@@ -278,6 +280,7 @@ def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_pat
         _run(_extract(_SCRIPT, [], restore), tmp_path)
     assert after is None, f"the engine refuses the locked directory: {after}\n{got['text']}"
     assert got["protected"] and got["inherited"] == 0, got["text"]
+    assert got["denies"] == 0, f"a deny survived the lockdown:\n{got['text']}"
     mine = got["mine"] if isinstance(got["mine"], list) else [got["mine"]]
     # ReadAndExecute | CreateFiles | Synchronize, in one allow entry inherited by nothing.
     assert mine == [{"type": "Allow", "rights": 0x1200AB, "inherit": "None"}], got["text"]
@@ -305,6 +308,11 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
     assert "-AllowMissing" in check["text"] and "$SecretsDir" in check["text"], check["text"]
     sharers = _sole_call_on(facts, "Get-OtherServiceNamingPath", "-Path $CustodyDir")
     creates = _sole_call_on(facts, "New-RestrictedDirectory", "-Path $CustodyDir")
+    assert not [
+        c
+        for c in facts["commands"]
+        if c["name"] in ("New-AdminOnlyFolder", "New-Item") and "-Path $CustodyDir" in c["text"]
+    ], "the custody directory itself must not be made by New-Item"
     lock = _sole_call(facts, "Set-CustodyDirAcl")
     assert "-Path $CustodyDir" in lock["text"] and "-Account $ServiceAccount" in lock["text"]
     secrets_lock = _sole_call(facts, "Set-SecretsDirAcl")

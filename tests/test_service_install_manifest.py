@@ -1139,6 +1139,7 @@ _PATH_PARAMS = [
     "ProjectRoot",
     "DbPath",
     "SecretsDir",
+    "CustodyDir",  # vault BACKLOG #3411
     # -EngineWheel's inputs (vault BACKLOG #2626), read before the build acts.
     "EngineWheel",
     "RequirementsLock",

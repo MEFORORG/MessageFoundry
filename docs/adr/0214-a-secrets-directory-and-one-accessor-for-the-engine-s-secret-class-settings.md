@@ -164,10 +164,10 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   a read or a mint, the engine applies decision 4's check to the directory that variable names,
   `broad_access_problem` with `directory`, at every enforcement setting; like decision 4's check,
   it reads known broad groups only, so it refuses no entry for one account, the service's add-file
-  right included. While the variable is set, a host file or handoff found only where the provider
-  reads without it, this directory or beside a SQLite store, refuses the read, so a mint made
+  right included. While the variable is set and neither file is in that directory, a host file or
+  handoff in this directory or beside a SQLite store refuses a read and a mint, so one made
   without the variable is not taken for no key; and the check that refuses another key provider
-  beside a host file or handoff looks in both places. `install-service.ps1` makes the directory only when it reads that provider: `-CustodyDir`,
+  beside a host file or handoff looks in all three places. `install-service.ps1` makes the directory only when it reads that provider: `-CustodyDir`,
   else the one the service names, else `<DataDir>-custody`, judged by slice C's rules with this
   directory added to the paths it must not be, hold or sit inside, made restricted in one step,
   and restricted to Administrators as owner, SYSTEM and Administrators with full control, and the

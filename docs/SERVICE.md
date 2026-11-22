@@ -274,11 +274,12 @@ directory's rules, made restricted in one step, and then given this list:
 - SYSTEM and Administrators: full control, inherited by the files in it;
 - the service account: read and add-file on the directory itself, inherited by nothing.
 
-The script replaces any other grant or deny the service account holds there and removes every
-other account's entry. It then reads the list back, and refuses, disabling the service, at least
-when it has another owner, still inherits, still has an entry for another account, or gives the
-service account more than that grant or, through a missing entry or a deny, less. When the script
-does not read that provider, it refuses `-CustodyDir`.
+The script replaces any other grant the service account holds there, and removes every other
+account's allow entry and every deny entry, whoever it names. It then reads the list back, and
+refuses, disabling the service, at least when it has another owner, still inherits, still has an
+allow entry for another account or a deny entry on the directory, or gives the service account
+more or less than that grant. When the script does not read that provider, it refuses
+`-CustodyDir`.
 
 **The engine.** When `MEFOR_CUSTODY_DIRECTORY` is set, the host provider reads and writes the two
 files there, in place of the directory `MEFOR_SECRETS_DIRECTORY` names or the store's own data
@@ -286,9 +287,9 @@ directory. Before it reads or mints, it checks that directory as it checks a sec
 any enforcement setting: a known broad group's right to read it, add a file to it or delete one in
 it is refused, and so is a link. That check reads known broad groups only, so it refuses no entry
 for one account, the service's or any other; the list the script sets is what leaves other
-accounts no entry. While the variable is set, a key file found where the provider would look without it, the
-secrets directory or beside a SQLite store, is refused rather than taken for no key at all, so a
-mint run without the variable does not lead to a second key.
+accounts no entry. While the variable is set and neither file is there, a key file in the secrets
+directory or beside a SQLite store refuses a read and a mint, rather than being taken for no key at
+all, so a mint run without the variable does not lead to a second key.
 
 **Minting.** Set the variable in the elevated shell that runs `provision-admin --service-account`,
 to the same path, so the handoff lands where the service looks:
@@ -726,7 +727,7 @@ NSSM environment.
   file or a folder holding a folder, that sits below a junction, or that is, holds or sits inside
   at least the data, log, store, config, value-file and settings-file folders, NSSM's folder, the
   engine install, the checkout, the Windows folder and Program Files. It refuses a path another
-  service already names as its `MEFOR_SECRETS_DIRECTORY`, or a folder inside or around one, so a second service on the same
+  service already names as its `MEFOR_SECRETS_DIRECTORY` or `MEFOR_CUSTODY_DIRECTORY`, or a folder inside or around one, so a second service on the same
   `-DataDir` needs its own `-SecretsDir`. The installer makes the directory with its owner and
   access list in one step. The directory starts empty: as an administrator, create or copy in one
   file per setting, named as its variable, and restart the service. Do not move a file in: a

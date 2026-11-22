@@ -319,6 +319,17 @@ def test_a_key_file_left_in_the_secrets_directory_is_not_taken_for_no_key(tmp_pa
             environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
         )
     assert str(beside) in str(refused.value)
+    # A mint is stopped the same way, before anything is minted.
+    with pytest.raises(HostCustodyRefused, match="move it into"):
+        mint_target(
+            _settings(tmp_path),
+            service_account=None,
+            enforcing=True,
+            environ={
+                "MEFOR_CUSTODY_DIRECTORY": str(custody_dir),
+                "MEFOR_SECRETS_DIRECTORY": str(secrets),
+            },
+        )
 
 
 @pytest.mark.parametrize("where", ["custody", "secrets", "beside the store"])

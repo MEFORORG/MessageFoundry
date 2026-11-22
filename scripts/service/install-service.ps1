@@ -1107,7 +1107,7 @@ function Get-CustodyGrantProblem {
       directory grants it, or "" when it does (vault BACKLOG #3411, ADR 0214's 2026-11-22
       amendment): read and add-file on the directory itself, inherited by nothing. At least a right
       beyond those, an allow entry that files or folders inside inherit, a missing read or add-file,
-      and a deny entry for the account that takes away part of either, are problems.
+      and any deny entry that applies to the directory itself, whoever it names, are problems.
 
       WHY ADD-FILE AND NOTHING MORE. The service's first start writes its own key file, master.key,
       into this directory, so it must add a file there. It deletes the handoff through the handle it
@@ -1124,14 +1124,16 @@ function Get-CustodyGrantProblem {
     foreach ($rule in @($Acl.Access)) {
         $sid = try { $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
                catch { "$($rule.IdentityReference)" }
-        if ($sid -ne $AccountSid) { continue }
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
-            # A deny is read before an allow, so one that reaches read or add-file takes it away.
-            if ([int64]$rule.FileSystemRights -band ([int64]$read -bor [int64]$add)) {
-                return "a deny entry for it takes away $($rule.FileSystemRights)"
+            # A deny is read before an allow, and one for a group the account is in, such as
+            # Users, binds it as one for the account does. Which groups it is in is not read here,
+            # so any deny that applies to the directory itself is refused.
+            if (-not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) {
+                return "a deny entry for $($rule.IdentityReference) applies to the directory ($($rule.FileSystemRights))"
             }
             continue
         }
+        if ($sid -ne $AccountSid) { continue }
         if ($rule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None) {
             return "an entry for it is inherited by what the directory holds ($($rule.FileSystemRights))"
         }
@@ -1176,8 +1178,17 @@ function Set-CustodyDirAcl {
     if ($LASTEXITCODE -ne 0) {
         $problems += "inheritance could not be turned off with SYSTEM and Administrators granted (icacls exit $LASTEXITCODE)"
     }
-    # A deny for the account would outrank its grant; /grant:r leaves one in place.
-    & icacls $Path /remove:d $Account | Out-Null
+    # A deny for the account, or for a group it is in, would outrank its grant, and /grant:r and
+    # /remove:g leave every deny in place, so each one goes. The read-back refuses any left.
+    $denied = @(try { (Get-Acl -LiteralPath $Path).Access } catch { @() }) | Where-Object {
+        $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny -and -not $_.IsInherited }
+    foreach ($holder in @($denied | ForEach-Object {
+                $who = $_.IdentityReference
+                try { $who.Translate([Security.Principal.SecurityIdentifier]).Value } catch { "$who" }
+            } | Select-Object -Unique)) {
+        $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
+        & icacls $Path /remove:d $spelled | Out-Null
+    }
     # No inheritance flag: the grant is on the directory, and the key files carry their own lists.
     & icacls $Path /grant:r "${Account}:(RX,WD)" | Out-Null
     if ($LASTEXITCODE -ne 0) {
@@ -3069,8 +3080,12 @@ if (-not $HostCustody) {
     $CustodyDirNamed = [bool]$RegisteredCustodyDir -and ($RegisteredCustodyDir.TrimEnd('\') -eq $CustodyDir.TrimEnd('\'))
     if (-not $custodyProblem -and (Test-Path -LiteralPath $CustodyDir)) {
         if (-not $CustodyDirNamed) {
-            $custodyProblem = ("it already exists and the service does not name it. Remove it, check " +
-                "who made it, and re-run the installer, which then makes it restricted")
+            $custodyProblem = ("it already exists and the service does not name it. Check who made " +
+                "it. If it holds master.key or handoff.key, that may be the only copy of a store's key " +
+                "on this host: do not delete it. Move each such file, as an administrator, to a folder " +
+                "only administrators can read on the same volume, so it keeps its own access list. Then " +
+                "remove the directory, re-run the installer, which makes it restricted, and move the " +
+                "files back into it")
         } else {
             $owner = (Get-Acl -LiteralPath $CustodyDir).GetOwner([Security.Principal.SecurityIdentifier]).Value
             if ($owner -ne "S-1-5-32-544" -and $owner -ne "S-1-5-18") {
