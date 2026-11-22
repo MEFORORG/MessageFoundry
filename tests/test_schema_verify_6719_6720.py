@@ -649,6 +649,22 @@ async def test_the_foreign_object_is_matched_against_the_file(
             ("vv", "vv: no such column"),
             id="broken-vv-beside-a-healthy-message-name",
         ),
+        pytest.param(
+            ("a:b", "a"),
+            "missing FROM t",
+            "ALTER TABLE t RENAME TO t2",
+            "error in view a:b: no such column: missing",
+            ("a:b",),
+            id="a-bare-colon-is-not-the-separator",
+        ),
+        pytest.param(
+            ("users after drop column", "users"),
+            "missing FROM t",
+            "ALTER TABLE t RENAME TO t2",
+            "error in view users after drop column: no such column: missing",
+            (),
+            id="a-candidate-under-an-expected-name",
+        ),
     ],
 )
 async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
@@ -663,8 +679,11 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
     # would tell the operator to drop "vv after" when "vv" stopped the change. Each cause is
     # SQLite's own text, and views[0] is the broken view. A view already broken fails SQLite's
     # first check, with no suffix; a view the change breaks fails its re-check after the change,
-    # with the "after drop column" suffix. The last two pairs are ones the text cannot settle: the
-    # healthy view's own name holds the suffix or the message, so both views are named.
+    # with the "after drop column" suffix. Where both names rank first the text cannot settle the
+    # pair, so both views are named: "vv after after drop column" fits both, and in the two
+    # broken-vv pairs the healthy view's own name holds the suffix or the message. SQLite writes
+    # ": " after a name, so "a" is no candidate for "a:b". A view under a name this build creates
+    # among the candidates gives the plain remedy, so nothing is returned.
     from messagefoundry.store.schema_verify import _foreign_objects
 
     path = tmp_path / "prefix.db"
@@ -701,12 +720,37 @@ async def test_names_the_text_cannot_tell_apart_are_all_named_in_the_remedy(
             await run_schema_step(
                 db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
             )
-    text = str(info.value)
-    assert text.startswith(
-        f"store {path}: drop whichever of the view 'vv' and the view 'vv after drop column' stops"
-        " its upgrade, then restart."
-    ), text
-    assert "recreate" not in text, text
+    cause = "error in view vv after drop column: no such column: c"
+    assert info.value.cause == cause
+    assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+    assert str(info.value) == (
+        f"store {path}: drop whichever of these stops its upgrade, then restart: the view 'vv' and"
+        " the view 'vv after drop column'. The error fits each name, and this build created none"
+        f" of them. The schema step failed: {cause}."
+    )
+
+
+async def test_three_names_the_text_cannot_tell_apart_are_listed_in_the_remedy(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "three.db"
+    _sql(
+        path,
+        "CREATE TABLE t (a, c)",
+        "CREATE TABLE u (c)",
+        "CREATE VIEW vv AS SELECT c FROM t",
+        'CREATE VIEW "vv after drop column" AS SELECT c FROM u',
+        'CREATE VIEW "vv after drop column: no such column" AS SELECT c FROM u',
+    )
+    async with _connected(path) as db:
+        with pytest.raises(SchemaMismatchError) as info:
+            await run_schema_step(
+                db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
+            )
+    assert str(info.value).startswith(
+        f"store {path}: drop whichever of these stops its upgrade, then restart: the view 'vv',"
+        " the view 'vv after drop column' and the view 'vv after drop column: no such column'."
+    ), str(info.value)
 
 
 @pytest.mark.parametrize(

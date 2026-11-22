@@ -81,8 +81,8 @@ _KEYED_DETAIL = (
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
 # The ALTER re-check names an object other than the altered table that fails to parse as
-# "error in <kind> <name>", then ":" or a suffix, at least " after rename" and " after drop column"
-# (measured on SQLite 3.50.4). Both start " after ", and _foreign_object's ranking assumes every
+# "error in <kind> <name>", then ": " or a suffix, at least " after rename" and " after drop column"
+# (measured on SQLite 3.50.4). Both start " after ", and _foreign_objects' ranks assume every
 # suffix does. Only views and triggers get the drop remedy (see _ORDINARY_TABLE for why they are
 # another tool's); SQLite uses the same form for a table or an index, which may be this build's own.
 # Dropping a view or a trigger removes no row, so that remedy keeps the store and its key.
@@ -455,12 +455,13 @@ async def run_schema_step[T](
             ) from exc
         if foreign:
             # The text cannot tell these apart, so the remedy names them all rather than tell the
-            # operator to drop one that may be healthy.
+            # operator to drop one that may be healthy. The instruction leads and the names follow
+            # it, so the 200-character cut keeps the instruction however long the names are.
             listed = [f"the {kind} {name!r}" for kind, name in foreign]
-            either = " and ".join(listed) if len(listed) == 2 else ", ".join(listed)
+            names = f"{', '.join(listed[:-1])} and {listed[-1]}"
             raise SchemaMismatchError(
-                f"store {path}: drop whichever of {either} stops its upgrade, then restart. The"
-                f" error fits each name, and this build created none of them. The schema step"
+                f"store {path}: drop whichever of these stops its upgrade, then restart: {names}."
+                f" The error fits each name, and this build created none of them. The schema step"
                 f" failed: {cause}.",
                 cause=cause,
             ) from exc
@@ -482,21 +483,26 @@ async def _foreign_objects(db: aiosqlite.Connection, cause: str) -> tuple[tuple[
 
     Several names can fit one text (the forms are in the note above ``_FOREIGN_OBJECTS_SQL``):
     ``vv`` and ``vv after`` both fit "error in view vv after rename: ...". A name whose remainder
-    starts with the colon or with " after " ranks first, and any other name last. Every name of the
-    first rank is returned, since no rule over the text can pick among them: SQLite writes "error in
-    view vv after drop column: ..." when ``vv`` breaks under the change, and the same text when a
-    view named ``vv after drop column`` was broken already. With ``vv`` and ``vv: no such column``,
+    starts with ": " or with " after " ranks first, and any other name last. Every name of the first
+    rank is returned, since no rule over the text can pick among them: SQLite writes "error in view
+    vv after drop column: ..." when ``vv`` breaks under the change, and the same text when a view
+    named ``vv after drop column`` was broken already. With ``vv`` and ``vv: no such column``,
     ``vv``'s own "error in view vv: no such column: c" fits both too. So where names collide like
-    this the ambiguity remains, and the remedy names each candidate. With no first-rank name, the
-    longest last-rank name is the one returned. Where any name returned is a view under a name this
-    build creates, the result is empty, the plain remedy (see :func:`run_schema_step`). The colon
-    and " after " share a rank because a
-    quoted name may hold either: with ``vv`` and ``vv: x``, "error in view vv: x after rename: ..."
-    must not name ``vv`` alone.
+    this the ambiguity remains, and the remedy names each candidate, a healthy one among them. With
+    no first-rank name, the longest last-rank name is the one returned.
 
-    Preparing each candidate against the live file is not used to settle a tie: the failed
-    ``ALTER`` is rolled back, so a view that only the change broke prepares as cleanly as a healthy
-    one, and a trigger has no read that runs its body without a write."""
+    The colon and " after " share a rank because a quoted name may hold either: with ``vv`` and
+    ``vv: x``, "error in view vv: x after rename: ..." must not name ``vv`` alone. Where any name
+    returned is a view under a name this build creates, the result is empty: that view holds the
+    place of a table or index, so the store is the incompatible one the plain remedy names, whichever
+    candidate stopped the change (see :func:`run_schema_step`).
+
+    Preparing each candidate against the live file is not used to settle a tie. A view that only
+    the change broke prepares as cleanly as a healthy one, since the failed ``ALTER`` is rolled
+    back. A failed prepare could rule out only the other reading, an object broken already, and
+    that rests on SQLite writing no suffix for an object it found broken before the change, which
+    this module has not measured for every ``ALTER``; a wrong ruling-out would name a healthy object
+    alone. A trigger also has no read that runs its body without a write."""
     try:
         async with db.execute(_FOREIGN_OBJECTS_SQL) as cur:
             objects = [(str(kind), str(name)) for kind, name in await cur.fetchall()]
@@ -505,13 +511,14 @@ async def _foreign_objects(db: aiosqlite.Connection, cause: str) -> tuple[tuple[
         for kind, name in objects:
             rest = cause.removeprefix(f"error in {kind} {name}")
             if rest != cause and rest[:1] in (":", " "):
-                exact = rest.startswith((":", " after "))
+                exact = rest.startswith((": ", " after "))
                 (first if exact else last).append((kind, name))
         named = first or ([max(last, key=lambda o: len(o[1]))] if last else [])
         if not named:
             return ()
-        expected = await _names_this_build_creates()
-        if any(kind == "view" and name.lower() in expected for kind, name in named):
+        views = [name.lower() for kind, name in named if kind == "view"]
+        # Only a view can hold an expected name's place, so a trigger needs no scratch build.
+        if views and not (await _names_this_build_creates()).isdisjoint(views):
             return ()
     except sqlite3.Error as exc:
         log.warning("could not read the views and triggers to pick the schema remedy: %s", exc)
