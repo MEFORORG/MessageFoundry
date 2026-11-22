@@ -54,7 +54,6 @@ import contextlib
 import errno
 import json
 import logging
-import math
 import os
 import re
 import sys
@@ -4400,40 +4399,6 @@ def _json_default(value: Any) -> Any:
     )
 
 
-def _rows_json(rows: Any) -> str:
-    """``rows`` as standard JSON text, with :func:`_json_default` for the column types ``json``
-    has no encoding for. A float NaN or Infinity in a row's columns is written as the string
-    ``"NaN"``, ``"Infinity"`` or ``"-Infinity"``, as a non-finite ``Decimal`` already is, never as
-    the bare token, which is not JSON and which a strict reader refuses (vault BACKLOG #6711, added
-    item 1). One anywhere else still raises ``ValueError``, with fixed text since ``json``'s own
-    names the value; every caller turns that into its refusal of the row or the capture."""
-    try:
-        return json.dumps(_finite_columns(rows), default=_json_default, allow_nan=False)
-    except ValueError:
-        pass
-    # Raised outside the handler, so json's error is on neither __cause__ nor __context__.
-    raise ValueError("a column value JSON cannot carry, such as a float NaN or Infinity")
-
-
-def _finite_columns(rows: Any) -> Any:
-    """``rows``, a row mapping or a list of them, with each non-finite float column value as its
-    JSON-safe text (:func:`_rows_json`)."""
-    if isinstance(rows, list):
-        return [_finite_columns(row) for row in rows]
-    if isinstance(rows, dict):
-        return {name: _finite_column(value) for name, value in rows.items()}
-    return rows
-
-
-def _finite_column(value: Any) -> Any:
-    """``value``, or for a non-finite float its text as ``str(Decimal)`` spells the same value."""
-    if not isinstance(value, float) or math.isfinite(value):
-        return value
-    if math.isnan(value):
-        return "NaN"
-    return "Infinity" if value > 0 else "-Infinity"
-
-
 async def _fetch_result_set(cur: Any) -> list[Any] | None:
     """The rows of ``cur``'s current result set, or ``None`` when the statement produced none.
 
@@ -4681,7 +4646,7 @@ class DatabaseDestination(DestinationConnector):
         try:
             cols = [d[0] for d in cur.description]
             data = [dict(zip(cols, tuple(row))) for row in rows]  # noqa: B905
-            body = _rows_json(data)
+            body = json.dumps(data, default=_json_default)
         except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
             # _json_default raises TypeError on a column type it can't encode; serializing must never
             # propagate (it runs pre-commit and would roll back an otherwise-successful write).
@@ -4743,7 +4708,7 @@ class DatabaseDestination(DestinationConnector):
                 body="", outcome="no_reply", detail="no OUT params / return value"
             )
         try:
-            body = _rows_json(merged)
+            body = json.dumps(merged, default=_json_default)
         except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
             return DeliveryResponse(
                 body="",
@@ -5486,7 +5451,7 @@ class DatabaseSource(SourceConnector):
             else:
                 text = value if isinstance(value, str) else str(value)
         else:
-            text = _rows_json(record)
+            text = json.dumps(record, default=_json_default)
         return self._through_codec(text.encode)
 
     def _through_codec[T](self, call: Callable[[str], T]) -> T:

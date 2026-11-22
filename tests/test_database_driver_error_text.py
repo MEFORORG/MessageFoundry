@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Driver-error text in the DATABASE connector and the log chain (vault BACKLOG #1661, added items
-1 to 4), and the poller's and capture's JSON (vault BACKLOG #6711, added item 1).
+1 to 4).
 
 Each test was red on the code before its fix, except where its docstring calls it a control or a
 pin. All values are synthetic.
@@ -10,7 +10,6 @@ pin. All values are synthetic.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sys
 import types
@@ -27,8 +26,6 @@ from tests.test_database_transport import (
     _FakeConn,
     _FakeCursor,
     _FakePool,
-    _RecordingHandler,
-    _run_poll,
     _src,
 )
 
@@ -325,50 +322,3 @@ async def test_finish_stop_logs_no_driver_value(caplog: pytest.LogCaptureFixture
     assert "poll task failed" in caplog.text
     assert "pool close failed" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
-
-
-# --- #6711 added item 1: JSON that is JSON -------------------------------------------------------
-
-
-def _strict(text: str) -> Any:
-    def refuse(token: str) -> Any:
-        raise AssertionError(f"non-standard JSON token {token}")
-
-    return json.loads(text, parse_constant=refuse)
-
-
-@pytest.mark.parametrize(
-    ("value", "text"),
-    [(float("nan"), "NaN"), (float("inf"), "Infinity"), (float("-inf"), "-Infinity")],
-)
-def test_a_non_finite_float_column_is_written_as_text(value: float, text: str) -> None:
-    """Red on main: ``json.dumps`` wrote the bare ``NaN`` or ``Infinity`` token, which is not JSON.
-    It is now the text ``str(Decimal)`` gives the same value, in a row and in a list of rows."""
-    assert _strict(database._rows_json({"x": value})) == {"x": text}
-    assert _strict(database._rows_json([{"x": value}, {"x": 1.5}])) == [{"x": text}, {"x": 1.5}]
-
-
-def test_a_non_finite_float_outside_a_column_is_refused_with_fixed_text() -> None:
-    """A value the column pass does not reach still never becomes a bare token."""
-    with pytest.raises(ValueError, match="JSON cannot carry") as refused:
-        database._rows_json([{"x": [float("nan")]}])
-    assert refused.value.__cause__ is None and refused.value.__context__ is None
-
-
-def test_a_finite_row_still_encodes() -> None:
-    """Control: an ordinary row encodes as before."""
-    assert database._rows_json({"x": 1.5, "y": None, "z": True}) == (
-        '{"x": 1.5, "y": null, "z": true}'
-    )
-
-
-async def test_the_poller_delivers_a_row_holding_nan_as_strict_json() -> None:
-    """The poller's record-to-JSON body. Red on main: the handler got a bare ``NaN``. The row is
-    still delivered, so a non-finite value cannot strand it unmarked at the head of the table."""
-    src = _src(body_column=None, mark_statement=None)
-    handler = _RecordingHandler()
-    await _run_poll(src, ["id", "v"], [(1, float("nan")), (2, 2.5)], handler)
-    assert [_strict(body.decode()) for body in handler.bodies] == [
-        {"id": 1, "v": "NaN"},
-        {"id": 2, "v": 2.5},
-    ]
