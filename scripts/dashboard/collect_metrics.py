@@ -5,9 +5,11 @@
 
 WHAT IT READS, at least: the private vault at its ``origin/main`` (never its working tree, which
 may be dirty or on another branch); GitHub through an already-authenticated ``gh``; the public PyPI
-JSON for the ``messagefoundry`` package; the engine's ``origin/main`` for the release distance; and,
-from THIS engine checkout's working tree, ``scripts/asvs/scorecard.py`` and
-``scripts/ci/check_stalled_prs.py``, which it runs and imports.
+JSON for the ``messagefoundry`` package; the engine's ``origin/main`` for the release distance, in
+the git checkout ``--engine-repo`` names (default: the checkout this script sits in), which is also
+the ``--root`` the scorecard tool stamps as ``engine=``; and, from the tree THIS script sits in,
+``scripts/asvs/scorecard.py`` and ``scripts/ci/check_stalled_prs.py``, which it runs and imports.
+That tree need not be a git checkout: the scheduled refresh runs a ``git archive`` copy.
 
 THE SNAPSHOT IS PRIVATE. It quotes counts read from the vault, so it must never land inside a git
 repository, where a ``git add .`` would publish it. ``--out`` is refused when its directory is inside
@@ -433,7 +435,10 @@ class Context:
     run: Runner = run_cmd
     run_raw: BytesRunner = run_bytes
     fetch: Fetcher = fetch_url
+    #: The tree the engine scripts are run and imported from.
     engine_root: Path = ENGINE_ROOT
+    #: The engine git checkout for the release distance and the scorecard's ``--root``.
+    engine_repo: Path = ENGINE_ROOT
     #: The stalled-PR checker's runner; None uses its own retrying `gh` runner.
     stall_runner: Callable[[list[str], float], str] | None = None
     today: dt.date = field(default_factory=lambda: dt.datetime.now(dt.UTC).date())
@@ -830,6 +835,8 @@ def c_asvs(ctx: Context, m: Metric) -> None:
             str(ctx.engine_root / "scripts" / "asvs" / "scorecard.py"),
             "--scorecard",
             str(toml),
+            "--root",
+            str(ctx.engine_repo),
             "--status",
         ],
         ctx.engine_root,
@@ -1012,7 +1019,7 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
     # Release tags are `v<version>` (webconsole-v* tag the other distribution; rescue/auto/* are
     # backup tags and are never consulted, since the tag is named from the PyPI version).
     tag = f"v{version}"
-    root = str(ctx.engine_root)
+    root = str(ctx.engine_repo)
     ctx.run(["git", "-C", root, "fetch", "-q", "--no-tags", "origin", "main"], None)
     # ls-remote, not a tag fetch: it creates no local ref. An annotated tag also prints its peeled
     # commit as `<ref>^{}`, which is preferred.
@@ -1187,10 +1194,14 @@ def refuse_dir_reason(parent: Path, run: Runner = run_probe) -> str | None:
 
 
 def write_json_atomic(out: Path, payload: Any) -> None:
-    """Write ``payload`` as strict JSON through a sibling temporary file, so a reader never sees
-    half. The temporary name is fresh (``mkstemp``), so a planted link or a concurrent run cannot
-    redirect it. A NaN or infinity raises rather than write invalid JSON."""
-    text = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    """Write ``payload`` as strict JSON with :func:`write_text_atomic`. A NaN or infinity raises
+    rather than write invalid JSON."""
+    write_text_atomic(out, json.dumps(payload, indent=2, allow_nan=False) + "\n")
+
+
+def write_text_atomic(out: Path, text: str) -> None:
+    """Write ``text`` through a sibling temporary file, so a reader never sees half. The temporary
+    name is fresh (``mkstemp``), so a planted link or a concurrent run cannot redirect it."""
     fd, name = tempfile.mkstemp(prefix=out.name + ".", suffix=".tmp", dir=out.parent)
     tmp = Path(name)
     try:
@@ -1222,6 +1233,13 @@ def main(argv: list[str] | None = None) -> int:
         "--vault", type=Path, required=True, help="the vault checkout (read at origin/main)"
     )
     ap.add_argument("--out", type=Path, required=True, help="snapshot JSON path, outside any repo")
+    ap.add_argument(
+        "--engine-repo",
+        type=Path,
+        default=ENGINE_ROOT,
+        help="the engine git checkout for the release distance and the scorecard's --root "
+        "(default: the checkout this script sits in)",
+    )
     ap.add_argument("--weeks", type=int, default=8, help="ISO weeks in the window (default 8)")
     ap.add_argument(
         "--through",
@@ -1253,7 +1271,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     tmp = Path(tempfile.mkdtemp(prefix="mf-metrics-"))
     try:
-        ctx = Context(vault=args.vault, through=through, weeks=args.weeks, workdir=tmp, today=today)
+        ctx = Context(
+            vault=args.vault,
+            through=through,
+            weeks=args.weeks,
+            workdir=tmp,
+            today=today,
+            engine_repo=args.engine_repo,
+        )
         metrics = collect(ctx)
         write_json_atomic(out, snapshot(ctx, metrics))
     finally:
