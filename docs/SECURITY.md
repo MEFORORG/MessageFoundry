@@ -8494,7 +8494,8 @@ HTTP 408 or 504 on both asks of a row's verify, in the walk only.
 **Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under
 that version then reads as a break, `audit-verify` exits 1, and the attestation counts as none. The
-audit key is the data key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` names another. So raising the data
+audit key is the data key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` is set to the name of a different
+Transit key; set empty, or to the data key's own name, it is still the data key. So raising the data
 key's `min_decryption_version` breaks the chain too; ADR 0193's 2026-11-11 amendment says which
 floor applies and what that rests on. Rotating is safe; retiring is not. The break text names both
 causes, a planted version and a retired one.
@@ -8520,7 +8521,8 @@ service account could be such a process. It would then run Python inside the eng
 everything the engine holds.
 
 The first control is a start refusal under `enforce`, which `[security].allow_remote_debugging`
-lifts (vault BACKLOG #2700). Which commands make it, and when it fires, is stated once, in
+lifts (vault BACKLOG #2700). Which commands make that refusal, and when it fires, are stated
+in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
 Three further controls answer it, and they differ in strength:
 
