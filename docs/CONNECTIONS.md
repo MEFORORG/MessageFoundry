@@ -2765,7 +2765,7 @@ then refuses to start while any listed hop has no opt-out. To keep a hop, name i
 ```toml
 [security]
 require_nonstatic_credentials = true
-static_credential_accepted = { "OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "no credential field exists" }
+static_credential_accepted = { "OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "the hook service offers only a URL token" }
 ```
 
 Each opt-out is logged at start with the hop's name and your reason, never a secret, and
@@ -2798,7 +2798,7 @@ opt-out. That is expected, and the table says which they are.
 | the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` on the SQL Server preset; on `dialect="generic"`, which only `Database` and `DatabasePoll` take, a client certificate (`SSLCERT` and `SSLKEY`, on a driver that reads them) or the service's own account |
 | `[store]` on SQL Server or Postgres | `settings:store` | SQL Server yes; Postgres **no** |
 | Vault token (store key, Transit, secrets) | `settings:vault.store_key`, `settings:vault.store_transit`, `settings:vault.secrets` | **no** |
-| `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink has no credential field) |
+| `[alerts]` webhook | `settings:alerts.webhook` | **no** (a token can ride in the URL path) |
 | `[alerts]` SMTP | `settings:alerts.smtp` | **no** |
 | `[ai]` broker key | `settings:ai.broker` | **no** |
 | `[auth]` OIDC client secret | `settings:auth.oidc` | yes: `oidc_token_endpoint_auth_method = "private_key_jwt"` (BACKLOG #296) |

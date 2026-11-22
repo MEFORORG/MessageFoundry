@@ -714,8 +714,10 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
     alerts = settings.alerts
     if settings.secrets.provider == "vault" and resolved_secret_refs(settings):
         add("vault.secrets", "static", "Vault token from MEFOR_SECRETS_VAULT_TOKEN", False)
+    # Vault BACKLOG #3533 item 24: a webhook service can put its token in the URL path, which every
+    # POST to that URL carries; the sink offers no other credential kind.
     if alerts.webhook_url:
-        add("alerts.webhook", "none", "the alert webhook sink has no credential field", False)
+        add("alerts.webhook", "static", "alert webhook URL; its path can carry a token", False)
     # Both SMTP consumers (the alert sinks and the security notifier) need a host and a sender.
     if alerts.email_smtp_host and alerts.email_from:
         if alerts.email_username or alerts.email_password or alerts.email_password_secret:
