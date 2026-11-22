@@ -132,8 +132,28 @@ def test_installer_splits_and_validates_times() -> None:
 def test_installer_keeps_the_runner_out_of_appdata() -> None:
     text = (_DIR / "install-schedule.ps1").read_text(encoding="utf-8")
     # The code after the help block, which names AppData only to say why it is avoided.
-    code = text[text.index("[CmdletBinding()]") :]
+    code = text[text.index("[CmdletBinding") :]
     code = "\n".join(ln for ln in code.splitlines() if not ln.lstrip().startswith("#"))
     assert "LOCALAPPDATA" not in code
     assert "'.mefor\\dashboard'" in code
     assert "[string]$RunnerDir" in code
+
+
+def test_installer_pins_the_task_to_a_checked_sha() -> None:
+    text = (_DIR / "install-schedule.ps1").read_text(encoding="utf-8")
+    assert "PositionalBinding = $false" in text
+    # The runner comes out of the pinned commit, never this work tree's copy.
+    assert "Copy-Item -LiteralPath (Join-Path $PSScriptRoot" not in text
+    assert "archive --format=tar" in text
+    assert "^[0-9a-f]{40}$" in text
+    # Only the resolved sha reaches the task's argument string, unquoted because it is hex.
+    assert "-Ref $sha -EngineRepo" in text
+    assert '-Ref `"$Ref`"' not in text
+
+
+def test_runner_validates_ref_and_fetches_main_only() -> None:
+    text = (_DIR / "scheduled-refresh.ps1").read_text(encoding="utf-8")
+    assert "'+refs/heads/main:refs/remotes/origin/main'" in text
+    assert "-NoFetch" in text
+    assert "is neither a 40-hex commit nor origin/<branch>" in text
+    assert "-like 'file://*'" in text

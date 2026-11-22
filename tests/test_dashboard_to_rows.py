@@ -27,7 +27,18 @@ def _load() -> ModuleType:
 
 tr = _load()
 
-METRIC_KEYS = {"id", "label", "question", "value", "unit", "status", "note", "source", "error"}
+METRIC_KEYS = {
+    "id",
+    "label",
+    "question",
+    "value",
+    "unit",
+    "status",
+    "note",
+    "source",
+    "error",
+    "ref",
+}
 
 
 def _metric(mid: str, **kw: Any) -> dict[str, Any]:
@@ -174,7 +185,7 @@ def test_series_rows() -> None:
 
 
 def test_main_writes_both_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    cm = tr._collector()
+    cm = tr.cm
     monkeypatch.setattr(cm, "refuse_dir_reason", lambda out: None)
     src = tmp_path / "snap.json"
     src.write_text(json.dumps(_snapshot()), encoding="utf-8")
@@ -194,7 +205,7 @@ def test_main_writes_both_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 def test_main_refuses_inside_a_repo_and_creates_nothing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    cm = tr._collector()
+    cm = tr.cm
     checked: list[Path] = []
 
     def refuse(out: Path) -> str:
@@ -211,7 +222,7 @@ def test_main_refuses_inside_a_repo_and_creates_nothing(
 def test_main_rejects_an_unreadable_snapshot(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(tr._collector(), "refuse_dir_reason", lambda out: None)
+    monkeypatch.setattr(tr.cm, "refuse_dir_reason", lambda out: None)
     bad = tmp_path / "bad.json"
     bad.write_text("[1, 2]", encoding="utf-8")
     assert tr.main([str(bad), str(tmp_path / "o")]) == 1
@@ -221,7 +232,7 @@ def test_main_rejects_an_unreadable_snapshot(
 def test_real_guard_refuses_this_checkout(tmp_path: Path) -> None:
     # The refusal is the inside-a-repo answer, not a fail-closed "cannot tell".
     here = Path(__file__).resolve().parent
-    reason = tr._collector().refuse_dir_reason(tr._nearest_existing(here / "no-such-dir"))
+    reason = tr.cm.refuse_dir_reason(tr.cm.nearest_existing(here / "no-such-dir"))
     assert reason is not None and "rev-parse said 'true'" in reason
     src = tmp_path / "snap.json"
     src.write_text(json.dumps(_snapshot()), encoding="utf-8")
@@ -255,7 +266,7 @@ def test_last_full_week_falls_back_to_the_collector_rule() -> None:
 def test_nan_in_the_snapshot_is_written_as_null(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(tr._collector(), "refuse_dir_reason", lambda out: None)
+    monkeypatch.setattr(tr.cm, "refuse_dir_reason", lambda out: None)
     src = tmp_path / "snap.json"
     src.write_text(
         json.dumps(_snapshot()).replace('"value": 90.0', '"value": NaN'), encoding="utf-8"
@@ -266,7 +277,7 @@ def test_nan_in_the_snapshot_is_written_as_null(
 
 
 def test_a_write_failure_exits_1(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(tr._collector(), "refuse_dir_reason", lambda out: None)
+    monkeypatch.setattr(tr.cm, "refuse_dir_reason", lambda out: None)
     src = tmp_path / "snap.json"
     src.write_text(json.dumps(_snapshot()), encoding="utf-8")
     out = tmp_path / "o"
@@ -292,3 +303,12 @@ def test_unresolved_week_marks_the_newest_partial() -> None:
     assert all(r["partial"] == (r["week"] == "2026-W47") for r in rows)
     snap["weeks"] = []
     assert tr.Snapshot(snap).last_full_week is None  # no IndexError
+
+
+def test_every_asvs_row_carries_the_ref_pair() -> None:
+    rows = _rows(_snapshot())
+    pair = "scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234"
+    asvs = [r for r in rows.values() if str(r["id"]).split(".")[0] == "asvs"]
+    assert len(asvs) == 4  # the headline row and its pass, partial and fail counts
+    assert all(r["ref"] == pair for r in asvs)
+    assert all(r["ref"] == "" for r in rows.values() if r not in asvs)

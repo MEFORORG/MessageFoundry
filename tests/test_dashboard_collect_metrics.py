@@ -34,6 +34,10 @@ cm = _load()
 #: happened. Raising alone is not enough: `collect()` catches it and turns it into a metric error.
 REACHED: list[str] = []
 
+A40, B40 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+VAULT_SHA = "0123456789abcdef0123456789abcdef01234567"
+NO_REPO = "fatal: not a git repository (or any of the parent directories): .git"
+
 
 def _no_fetch(url: str) -> bytes:
     REACHED.append(url)
@@ -253,7 +257,11 @@ def test_release_distance_with_fakes(tmp_path: Path) -> None:
             tab, nl = chr(9), chr(10)
             return nl.join(
                 f"{c}{tab}refs/tags/{r}"
-                for c, r in [("aaa", "v1.2.3"), ("bbb", "v1.2.3^{}"), ("ccc", "v1.2.30")]
+                for c, r in [
+                    (A40, "v1.2.3"),
+                    (B40, "v1.2.3^{}"),
+                    ("cccccccccccccccccccccccccccccccccccccccc", "v1.2.30"),
+                ]
             )
         return "42" if "rev-list" in argv else ""
 
@@ -265,9 +273,9 @@ def test_release_distance_with_fakes(tmp_path: Path) -> None:
     cm.c_release_distance(ctx, m)
     assert (m.value, m.status) == (42, "good")
     assert m.detail["tag"] == "v1.2.3"
-    assert m.detail["tag_commit"] == "bbb"
+    assert m.detail["tag_commit"] == B40
     assert m.detail["uploaded"] == "2026-10-01T00:00:00Z"
-    assert seen[-1][-1] == "bbb..origin/main"
+    assert seen[-1][-1] == f"{B40}..origin/main"
     # No local tag is created: nothing fetches into refs/tags.
     assert not any("refs/tags/" in a and ":" in a for argv in seen for a in argv)
 
@@ -286,35 +294,61 @@ def test_out_inside_a_repo_is_refused(tmp_path: Path) -> None:
     def inside(argv: Sequence[str], cwd: Path | None) -> str:
         return "true\n"
 
-    reason = cm.refuse_reason(tmp_path / "x.json", inside)
+    reason = cm.refuse_reason(tmp_path / "x.json", [inside])
     assert reason is not None and "inside a git repository" in reason
 
 
 def test_out_inside_dot_git_is_refused(tmp_path: Path) -> None:
-    assert cm.refuse_reason(tmp_path / "x.json", lambda a, c: "false\n") is not None
+    assert cm.refuse_reason(tmp_path / "x.json", [lambda a, c: "false\n"]) is not None
+
+
+def _outside(argv: Sequence[str], cwd: Path | None) -> str:
+    raise cm.CollectError("git -C x exited 128: " + NO_REPO, stderr=NO_REPO + "\n")
 
 
 def test_out_outside_a_repo_is_allowed(tmp_path: Path) -> None:
-    def outside(argv: Sequence[str], cwd: Path | None) -> str:
-        raise cm.CollectError("git -C x exited 128: fatal: not a git repository (or any ...)")
+    assert cm.refuse_reason(tmp_path / "x.json", [_outside]) is None
 
-    assert cm.refuse_reason(tmp_path / "x.json", outside) is None
+
+def test_either_probe_finding_a_repo_refuses(tmp_path: Path) -> None:
+    def inside(argv: Sequence[str], cwd: Path | None) -> str:
+        return "true\n"
+
+    assert cm.refuse_reason(tmp_path / "x.json", [_outside, inside]) is not None
+    assert cm.refuse_reason(tmp_path / "x.json", [inside, _outside]) is not None
+    assert cm.refuse_reason(tmp_path / "x.json", [_outside, _outside]) is None
+
+
+def test_the_safe_phrase_counts_only_as_gits_whole_stderr(tmp_path: Path) -> None:
+    # The phrase in the MESSAGE (which carries the probed path) is not git saying it.
+    def phrase_in_path(argv: Sequence[str], cwd: Path | None) -> str:
+        raise cm.CollectError(
+            "git -C D:/not a git repository (or any x exited 128: fatal: unsafe repository",
+            stderr="fatal: detected dubious ownership in repository",
+        )
+
+    def phrase_with_more(argv: Sequence[str], cwd: Path | None) -> str:
+        raise cm.CollectError("git exited 128", stderr=NO_REPO + "\nwarning: something else")
+
+    assert cm.refuse_reason(tmp_path / "x.json", [phrase_in_path]) is not None
+    assert cm.refuse_reason(tmp_path / "x.json", [phrase_with_more]) is not None
 
 
 def test_pruned_worktree_message_is_not_safe(tmp_path: Path) -> None:
     # git's answer for a pruned worktree's gitdir shares the short phrase but is inside a repo.
     def pruned(argv: Sequence[str], cwd: Path | None) -> str:
-        raise cm.CollectError("git exited 128: fatal: not a git repository: D:/r/.git/worktrees/x")
+        text = "fatal: not a git repository: D:/r/.git/worktrees/x"
+        raise cm.CollectError("git exited 128: " + text, stderr=text)
 
-    assert cm.refuse_reason(tmp_path / "x.json", pruned) is not None
+    assert cm.refuse_reason(tmp_path / "x.json", [pruned]) is not None
 
 
 def test_out_guard_fails_closed(tmp_path: Path) -> None:
     def broken(argv: Sequence[str], cwd: Path | None) -> str:
         raise cm.CollectError("git could not run: FileNotFoundError")
 
-    assert cm.refuse_reason(tmp_path / "x.json", broken) is not None
-    assert cm.refuse_reason(tmp_path / "missing" / "x.json", broken) is not None
+    assert cm.refuse_reason(tmp_path / "x.json", [broken]) is not None
+    assert cm.refuse_reason(tmp_path / "missing" / "x.json", [broken]) is not None
 
 
 def test_real_git_refuses_this_checkout() -> None:
@@ -423,34 +457,35 @@ def test_ci_main_per_week(tmp_path: Path) -> None:
     assert m.series == [{"week": "2026-W46", "value": 66.7}, {"week": "2026-W47", "value": None}]
 
 
-class _Census:
-    def __init__(self) -> None:
-        from collections import Counter
-
-        self.rows = 2000
-        self.weeks = {
-            "2026-W46": Counter({"filed": 4, "closed": 2, "declined": 1}),
-            "2026-W47": Counter({"filed": 1, "superseded": 3}),
-        }
-        self.open_by_verdict = Counter(
-            {"build": 5, "owner-ruling": 2, "demand-gate": 3, "none": 1, "other": 1}
-        )
-        self.undated = Counter({"filed": 9})
-
-    @property
-    def open_rows(self) -> int:
-        return sum(self.open_by_verdict.values())
+def _census(**kw: Any) -> Any:
+    base: dict[str, Any] = {
+        "rows": 2000,
+        "weeks": {
+            "2026-W46": {"filed": 4, "closed": 2, "declined": 1},
+            "2026-W47": {"filed": 1, "superseded": 3},
+        },
+        "undated": {"filed": 9},
+        "open_by_verdict": {"build": 5, "owner-ruling": 2, "demand-gate": 3, "none": 1, "other": 1},
+        "active_verdicts": ["build", "research", "decide", "owner-ruling"],
+        "deferred_verdict": "demand-gate",
+        "activity": ["filed", "closed", "declined", "superseded"],
+    }
+    return cm.Census(**{**base, **kw})
 
 
-class _Report:
-    ACTIVE_VERDICTS = ("build", "research", "decide", "owner-ruling")
-    DEFERRED_VERDICT = "demand-gate"
-
-
-def _vault_ctx(tmp_path: Path) -> Any:
+def _vault_ctx(tmp_path: Path, census: Any = None) -> Any:
     ctx = _ctx(tmp_path, _failing, weeks=2)
-    ctx._vault = cm.VaultRead(sha="abc", root=tmp_path, census=_Census(), report=_Report())
+    ctx._vault = cm.VaultRead(sha="abc", root=tmp_path, census=census or _census())
     return ctx
+
+
+def test_a_renamed_vault_key_is_an_error_not_zero(tmp_path: Path) -> None:
+    renamed = _census(activity=["filed", "shipped", "declined", "superseded"])
+    with pytest.raises(cm.CollectError, match="no longer defines"):
+        cm.c_backlog_burn(_vault_ctx(tmp_path, renamed), cm.Metric("x", "", "", "", ""))
+    gone = _census(active_verdicts=["build"])
+    with pytest.raises(cm.CollectError, match="owner-ruling"):
+        cm.c_owner_waiting(_vault_ctx(tmp_path, gone), cm.Metric("x", "", "", "", ""))
 
 
 def test_backlog_burn_from_census(tmp_path: Path) -> None:
@@ -578,7 +613,7 @@ def test_flow_health_measures_merges_when_they_read(tmp_path: Path) -> None:
 def test_release_distance_records_an_unreadable_upload_time(tmp_path: Path) -> None:
     def run(argv: Sequence[str], cwd: Path | None) -> str:
         if "ls-remote" in argv:
-            return "aaa" + chr(9) + "refs/tags/v1.0.0"
+            return A40 + chr(9) + "refs/tags/v1.0.0"
         return "3" if "rev-list" in argv else ""
 
     ctx = _ctx(tmp_path, run)
@@ -619,20 +654,33 @@ def test_real_git_refuses_this_checkout_despite_a_ceiling(monkeypatch: pytest.Mo
     for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):  # set under a git hook
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(Path(__file__).resolve().parents[1]))
-    assert cm.refuse_reason(Path(__file__), cm.run_cmd) is None
+    assert cm.refuse_reason(Path(__file__), [cm.run_cmd]) is None
     reason = cm.refuse_reason(Path(__file__))
     assert reason is not None and "rev-parse said 'true'" in reason
 
 
-def test_remove_tree_warns_and_does_not_raise(
+def test_remove_tree_reports_a_failure(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     def stuck(path: Path, onexc: Any) -> None:
         onexc(cm.os.unlink, str(path / "held.bin"), PermissionError("in use"))
 
     monkeypatch.setattr(cm.shutil, "rmtree", stuck)
-    cm.remove_tree(tmp_path)
-    assert "WARNING: could not remove temporary" in capsys.readouterr().err
+    assert cm.remove_tree(tmp_path) is False
+    assert "ERROR: could not remove temporary" in capsys.readouterr().err
+
+
+def test_sweep_removes_only_stale_prefixed_dirs(tmp_path: Path) -> None:
+    import os
+
+    old, fresh, other = tmp_path / "mf-metrics-old", tmp_path / "mf-metrics-new", tmp_path / "keep"
+    for d in (old, fresh, other):
+        d.mkdir()
+    long_ago = 1_000_000.0
+    os.utime(old, (long_ago, long_ago))
+    os.utime(other, (long_ago, long_ago))
+    cm.sweep_stale(tmp_path, "mf-metrics-")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["keep", "mf-metrics-new"]
 
 
 # -- the vault read, with a fake archive ------------------------------------------------------------
@@ -646,6 +694,9 @@ from backlog_status_check import LEDGER_FILE_GLOBS  # noqa: F401
 
 DEFAULT_SOURCES = ("docs/BACKLOG one.md",)
 MIN_TOTAL_ITEMS = 1
+ACTIVE_VERDICTS = ("build", "owner-ruling")
+DEFERRED_VERDICT = "demand-gate"
+ACTIVITY = ("filed", "closed", "declined", "superseded")
 
 
 def iso_week(date):
@@ -661,6 +712,7 @@ def iso_week(date):
 class Census:
     def __init__(self):
         self.rows, self.per_source, self.weeks, self.undated = 0, [], {}, Counter()
+        self.open_by_verdict = Counter({"owner-ruling": 1})
 
     def count(self, column, date):
         week = iso_week(date)
@@ -726,7 +778,7 @@ def _fake_archive(argv: Sequence[str]) -> bytes:
 
 def _vault_git(argv: Sequence[str], cwd: Path | None) -> str:
     if "rev-parse" in argv:
-        return "abc123\n"
+        return VAULT_SHA + "\n"
     if "ls-tree" in argv:
         assert "-z" in argv
         return "docs/BACKLOG one.md\0docs/notes.txt\0"
@@ -736,15 +788,61 @@ def _vault_git(argv: Sequence[str], cwd: Path | None) -> str:
 def test_read_vault_lists_with_nul_and_clips_at_through(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path, _vault_git)
     ctx.run_raw = _fake_archive
-    v = ctx.vault_read()
-    assert v.sha == "abc123"
+    v = ctx.vault_read()  # the vault code runs for real, in a child process
+    assert v.sha == VAULT_SHA
     c = v.census
     assert c.rows == 3
     assert c.weeks["2026-W47"]["filed"] == 1  # 2026-11-20 is after --through 2026-11-18
     assert c.weeks[cm.AFTER_THROUGH]["filed"] == 1
     assert c.undated["filed"] == 1  # an unparseable date is still undated, not clipped
-    # The wrapper is removed after the census.
-    assert v.report.iso_week("2026-11-20") == "2026-W47"
+    assert c.open_by_verdict == {"owner-ruling": 1}
+    # Nothing of the vault's was imported into this process.
+    assert "ledger_weekly_report" not in sys.modules
+    assert "backlog_status_check" not in sys.modules
+
+
+def test_the_vault_child_gets_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GH_TOKEN", "x")
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    monkeypatch.setenv("GIT_DIR", "x")
+    monkeypatch.setenv("USERPROFILE", "x")
+    env = cm.child_env()
+    assert not {k for k in env if "TOKEN" in k or k.startswith("GIT_")}
+    assert "USERPROFILE" not in env
+
+
+def test_a_census_that_never_clipped_is_refused(tmp_path: Path) -> None:
+    def driver(argv: Sequence[str]) -> str:
+        if argv[1] == "globs":
+            return json.dumps({"ledger_file_globs": ["docs/BACKLOG*.md"]})
+        return json.dumps(
+            {
+                "rows": 5,
+                "weeks": {},
+                "undated": {},
+                "open_by_verdict": {},
+                "active_verdicts": ["owner-ruling"],
+                "deferred_verdict": "demand-gate",
+                "activity": ["filed"],
+                "min_total_items": 1,
+                "structural_errors": [],
+                "clip_calls": 0,
+            }
+        )
+
+    ctx = _ctx(tmp_path, _vault_git)
+    ctx.run_raw = _fake_archive
+    ctx.run_vault = driver
+    with pytest.raises(cm.CollectError, match="--through was not applied"):
+        ctx.vault_read()
+
+
+def test_a_vault_ref_that_is_no_sha_is_refused(tmp_path: Path) -> None:
+    def git(argv: Sequence[str], cwd: Path | None) -> str:
+        return "origin/main\n" if "rev-parse" in argv else _vault_git(argv, cwd)
+
+    with pytest.raises(cm.CollectError, match="not a commit sha"):
+        _ctx(tmp_path, git).vault_read()
 
 
 def test_read_vault_refuses_when_no_ledger_matches(tmp_path: Path) -> None:
@@ -767,7 +865,7 @@ def _asvs_ctx(tmp_path: Path, printed: str) -> Any:
 
     ctx = _ctx(tmp_path, run)
     ctx.run_raw = _fake_archive
-    ctx._vault = cm.VaultRead(sha="abc123", root=tmp_path, census=_Census(), report=_Report())
+    ctx._vault = cm.VaultRead(sha="abc123", root=tmp_path, census=_census())
     return ctx
 
 
@@ -815,8 +913,68 @@ def test_main_writes_the_snapshot_and_prints_the_ref_pair(
     assert [m["id"] for m in snap["metrics"]] == ["asvs", "prs_merged"]
     assert sorted(p.name for p in tmp_path.iterdir()) == ["snap.json"]  # no temp left behind
     printed = capsys.readouterr().out
-    want = "asvs: value=50.0 status=warn scorecard=vault-origin-main@abc123 engine=deadbeef1234"
-    assert want in printed
+    # Id, status and a read flag only: no value, count, ref or error text reaches stdout.
+    assert printed.splitlines() == ["asvs: status=warn read=ok", "prs_merged: status=good read=ok"]
+
+
+def test_main_never_prints_values_or_errors(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    def metrics(ctx: Any) -> list[Any]:
+        bad = cm.Metric("ci_main", "CI", "?", "percent", "src")
+        bad.error = "git exited 1: secret-looking stderr"
+        return [*_main_metrics(partial=True), bad]
+
+    monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
+    monkeypatch.setattr(cm, "collect", metrics)
+    assert cm.main(["--vault", str(tmp_path), "--out", str(tmp_path / "s.json")]) == 3
+    printed = capsys.readouterr().out
+    assert "50.0" not in printed and "stderr" not in printed and "TimeoutExpired" not in printed
+    assert "prs_merged: status=good read=partial" in printed
+    assert "ci_main: status=unknown read=error" in printed
+
+
+def test_main_puts_its_work_dir_under_work_dir_and_refuses_a_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: list[Path] = []
+
+    def metrics(ctx: Any) -> list[Any]:
+        seen.append(ctx.workdir)
+        return _main_metrics(partial=False)
+
+    monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
+    monkeypatch.setattr(cm, "collect", metrics)
+    base = tmp_path / "work"
+    base.mkdir()
+    out = str(tmp_path / "s.json")
+    assert cm.main(["--vault", str(tmp_path), "--out", out, "--work-dir", str(base)]) == 0
+    assert seen[0].parent == base.resolve() and seen[0].name.startswith("mf-metrics-")
+    assert list(base.iterdir()) == []  # removed at exit
+    inside = Path(__file__).resolve().parent
+    assert cm.main(["--vault", str(tmp_path), "--out", out, "--work-dir", str(inside)]) == 1
+    assert len(seen) == 1  # nothing collected for a refused work dir
+
+
+def test_main_fails_when_its_work_dir_will_not_go(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
+    monkeypatch.setattr(cm, "collect", lambda ctx: _main_metrics(partial=False))
+    monkeypatch.setattr(cm, "remove_tree", lambda path: False)
+    assert cm.main(["--vault", str(tmp_path), "--out", str(tmp_path / "s.json")]) == 3
+
+
+def test_release_and_run_ids_are_validated(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path, lambda a, c: "")
+    ctx.fetch = lambda url: json.dumps({"info": {"version": "1.0 --upload-pack=x"}}).encode()
+    with pytest.raises(cm.CollectError, match="not a canonical release version"):
+        cm.c_release_distance(ctx, cm.Metric("x", "", "", "", ""))
+
+    def runs(argv: Sequence[str], cwd: Path | None) -> str:
+        return json.dumps([{"databaseId": "1;rm", "createdAt": "x"}])
+
+    assert "not a number" in cm._vuln_kpis(_ctx(tmp_path, runs))["error"]
 
 
 def test_main_exits_3_on_a_partial_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -868,21 +1026,15 @@ def test_a_merged_pr_failure_is_read_once(tmp_path: Path) -> None:
     assert len(calls) == 1
 
 
-def test_clipping_that_never_ran_is_refused(tmp_path: Path) -> None:
-    class Census:
-        rows = 5
+def test_the_driver_counts_its_clip_calls() -> None:
+    import types
 
-    class Report:
-        @staticmethod
-        def iso_week(date: str | None) -> str | None:
-            return None
-
-        @staticmethod
-        def census(sources: Any) -> Any:
-            return Census()  # dates nothing through iso_week
-
-    with pytest.raises(cm.CollectError, match="--through was not applied"):
-        cm._clipped_census(Report, [], dt.date(2026, 11, 18))
+    spec = importlib.util.spec_from_file_location("dashboard_vault_census", cm.VAULT_DRIVER)
+    assert spec is not None and spec.loader is not None
+    driver = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(driver)
+    report = types.SimpleNamespace(iso_week=lambda d: None, census=lambda sources: "c")
+    assert driver.clipped_census(report, [], dt.date(2026, 11, 18)) == ("c", 0)
 
 
 def test_asvs_with_an_unattributable_engine_ref_is_partial(tmp_path: Path) -> None:
@@ -932,7 +1084,7 @@ def test_release_distance_reads_the_engine_repo(tmp_path: Path) -> None:
     def run(argv: Sequence[str], cwd: Path | None) -> str:
         seen.append(list(argv))
         if "ls-remote" in argv:
-            return "aaa" + chr(9) + "refs/tags/v1.0.0"
+            return A40 + chr(9) + "refs/tags/v1.0.0"
         return "1" if "rev-list" in argv else ""
 
     ctx = _ctx(tmp_path, run)

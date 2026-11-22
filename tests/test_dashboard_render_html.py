@@ -75,7 +75,17 @@ def _snapshot() -> dict[str, Any]:
                 status="warn",
                 series=[{"week": w, "value": 90.0} for w in WEEKS],
             ),
-            _metric("asvs", error='<script>alert("x")</script>'),
+            _metric(
+                "asvs",
+                value=50.0,
+                unit="percent",
+                error='<script>alert("x")</script>',
+                detail={
+                    "counts": {"total": 2, "pass": 1, "fail": 1},
+                    "scorecard_sha": "abcdef0123456789",
+                    "engine_ref": "deadbeef1234",
+                },
+            ),
         ],
     }
 
@@ -136,10 +146,10 @@ def test_out_dir_resolution_order(tmp_path: Path) -> None:
 
 
 def _cm() -> Any:
-    return rh._to_rows()._collector()
+    return rh.cm
 
 
-def test_main_writes_page_and_snapshot(
+def test_main_writes_the_page_only(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     monkeypatch.setattr(_cm(), "refuse_dir_reason", lambda d: None)
@@ -148,8 +158,8 @@ def test_main_writes_page_and_snapshot(
     src.write_text(json.dumps(_snapshot()), encoding="utf-8")
     out = tmp_path / "site"
     assert rh.main([str(src), "--out-dir", str(out)]) == 0
-    assert sorted(p.name for p in out.iterdir()) == ["index.html", "snapshot.json"]
-    assert json.loads((out / "snapshot.json").read_text(encoding="utf-8")) == _snapshot()
+    # The snapshot is input only: nothing but the page lands in the page folder.
+    assert sorted(p.name for p in out.iterdir()) == ["index.html"]
     url = capsys.readouterr().out.strip()
     assert url == (out.resolve() / "index.html").as_uri()
     assert url.startswith("file:///")
@@ -181,3 +191,24 @@ def test_main_rejects_a_bad_snapshot(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert rh.main([str(bad), "--out-dir", str(tmp_path / "o")]) == 1
     assert rh.main([str(tmp_path / "nope.json"), "--out-dir", str(tmp_path / "o")]) == 1
     assert not (tmp_path / "o").exists()
+
+
+def test_the_asvs_ref_pair_sits_beside_its_value() -> None:
+    page = rh.render(_snapshot())
+    tile = page[page.index("<h3>asvs") :]
+    tile = tile[: tile.index("</section>")]
+    pair = "scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234"
+    assert '<span class="big">50%</span></div><dl>' in tile
+    assert f'<p class="refpair">{pair}</p>' in tile
+
+
+def test_print_out_dir_refuses_a_work_tree(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    inside = Path(__file__).resolve().parent / "no-such-dashboard-dir"
+    assert rh.main(["--print-out-dir", "--out-dir", str(inside)]) == 1
+    assert capsys.readouterr().out == ""
+    monkeypatch.setattr(rh.cm, "refuse_dir_reason", lambda d: None)
+    assert rh.main(["--print-out-dir", "--out-dir", str(tmp_path / "x")]) == 0
+    assert capsys.readouterr().out.strip() == str((tmp_path / "x").resolve())
+    assert not (tmp_path / "x").exists()  # nothing written

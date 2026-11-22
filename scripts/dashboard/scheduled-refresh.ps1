@@ -7,11 +7,14 @@ Unattended dashboard refresh: build the page from a git archive of -Ref, never f
 .DESCRIPTION
 Work trees come and go, so this runner reads none of them. It:
 
-1. runs `git -C <EngineRepo> fetch --no-tags origin`, which moves only remote-tracking refs and
-   touches no work tree, then the same in the vault; a failed vault fetch is a warning, because the
-   collector fetches the vault itself and confines that failure to the vault metrics;
-2. resolves -Ref to a commit and `git archive`s all of scripts/ at it into a fresh directory under
-   TEMP, outside every work tree, so a new import in the build needs no change here;
+1. fetches main ONLY, once per repository per run (`fetch --no-tags origin
+   +refs/heads/main:refs/remotes/origin/main`, in the engine checkout and then the vault), which
+   moves only refs/remotes/origin/main and touches no work tree, and tells the collector not to
+   fetch again; a failed fetch is a warning, and the run goes on with the refs already there;
+2. checks -Ref (a 40-hex commit, or origin/<branch>, which must already be fetched), resolves it
+   to a commit and `git archive`s all of scripts/ at it into a fresh directory under TEMP, outside
+   every work tree, so a new import in the build needs no change here; leftover directories from
+   a killed run, older than two hours, are swept first;
 3. runs that copy's build.ps1, so the page lands in the dashboard directory render_html.py
    resolves (MEFOR_DASHBOARD_DIR, else the OneDrive or profile default);
 4. appends one line (UTC time, ref commit, exit code, URL) to build.log in that directory, keeping
@@ -34,6 +37,10 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# -Ref reaches git and the build log: a 40-hex commit, or a remote branch name with no `..`.
+if (-not ($Ref -cmatch '^[0-9a-f]{40}$' -or ($Ref -cmatch '^origin/[A-Za-z0-9._/-]+$' -and $Ref -notlike '*..*'))) {
+    throw "-Ref '$Ref' is neither a 40-hex commit nor origin/<branch>"
+}
 # Unattended: a credential prompt would wait, hidden, until the task's time limit killed it.
 $env:GIT_TERMINAL_PROMPT = '0'
 $env:GCM_INTERACTIVE = 'never'
@@ -59,6 +66,20 @@ function Resolve-Python([string[]]$Given) {
     return , @('python')
 }
 
+function Remove-StaleTemp([string]$Base, [string]$Prefix) {
+    # A run killed by the task's time limit skips its finally. Two hours is past any live run.
+    # build.ps1 holds the same sweep for its own prefix; this file must stand alone once installed.
+    $cutoff = [DateTime]::UtcNow.AddHours(-2)
+    Get-ChildItem -LiteralPath $Base -Directory -Filter "$Prefix*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -lt $cutoff -and -not $_.LinkType } |
+        ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $_.FullName) {
+                [Console]::Error.WriteLine("ERROR: could not sweep stale $($_.FullName)")
+            }
+        }
+}
+
 function Get-FallbackOutDir {
     # render_html.py owns this rule; this copy is used only when the run failed before the
     # archived render_html.py could be asked, so an early failure is still logged.
@@ -70,9 +91,9 @@ function Get-FallbackOutDir {
 }
 
 function Write-BuildLog([string]$Dir, [string]$Line) {
-    # Only beside a page a render published there, which needed the work-tree refusal to pass
-    # at that time. This run's own refusal is not asked again: a directory that became part of a
-    # work tree after a page was published there still gets this line.
+    # Only beside a page a render published there, and never when this run's refusal fired. An
+    # early failure, before the archived render_html.py could be asked, logs through the fallback
+    # directory, whose refusal is then not asked.
     if (-not $Dir -or -not (Test-Path -LiteralPath (Join-Path $Dir 'index.html') -PathType Leaf)) {
         [Console]::Error.WriteLine("build.log not written (no published page in '$Dir'): $Line")
         return
@@ -93,20 +114,26 @@ function Write-BuildLog([string]$Dir, [string]$Line) {
 }
 
 $py = Resolve-Python $Python
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ('mf-dashboard-src-' + [guid]::NewGuid().ToString('N'))
+$base = [IO.Path]::GetTempPath()
+Remove-StaleTemp $base 'mf-dashboard-src-'
+$tmp = Join-Path $base ('mf-dashboard-src-' + [guid]::NewGuid().ToString('N'))
 $sha = 'unresolved'
 $url = ''
 $outDir = ''
+$refused = $false
 $code = 1
 try {
     New-Item -ItemType Directory -Path $tmp | Out-Null
-    Invoke-Git @('-C', $EngineRepo, 'fetch', '--quiet', '--no-tags', 'origin') | Out-Null
-    try {
-        Invoke-Git @('-C', $Vault, 'fetch', '--quiet', '--no-tags', 'origin') | Out-Null
-    } catch {
-        [Console]::Error.WriteLine("WARNING: vault fetch failed, the collector retries it: $($_.Exception.Message)")
+    foreach ($repo in @($EngineRepo, $Vault)) {
+        try {
+            Invoke-Git @('-C', $repo, 'fetch', '--quiet', '--no-tags', 'origin',
+                '+refs/heads/main:refs/remotes/origin/main') | Out-Null
+        } catch {
+            [Console]::Error.WriteLine("WARNING: fetch failed in $repo, using the refs already there: $($_.Exception.Message)")
+        }
     }
     $sha = (Invoke-Git @('-C', $EngineRepo, 'rev-parse', '--verify', "$Ref^{commit}") | Select-Object -First 1).Trim()
+    if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw "-Ref resolved to '$sha', not a commit" }
     $tar = Join-Path $tmp 'src.tar'
     Invoke-Git (@('-C', $EngineRepo, 'archive', '--format=tar', '-o', $tar, $sha, '--') + $ArchivePaths) | Out-Null
     $src = Join-Path $tmp 'src'
@@ -118,13 +145,18 @@ try {
 
     $render = Join-Path $src 'scripts\dashboard\render_html.py'
     $outDir = (& $py[0] @($py | Select-Object -Skip 1) -I $render --print-out-dir | Select-Object -Last 1)
-    if ($LASTEXITCODE -ne 0) { throw "render_html.py --print-out-dir exited $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) {
+        # Refused: nothing, the log included, is written into that directory.
+        $refused = $true
+        throw "render_html.py --print-out-dir exited $LASTEXITCODE (the dashboard directory is refused)"
+    }
 
     $build = Join-Path $src 'scripts\dashboard\build.ps1'
-    $output = @(& $build -Vault $Vault -Weeks $Weeks -EngineRepo $EngineRepo -ArchiveRef $sha -Python $py)
+    $output = @(& $build -Vault $Vault -Weeks $Weeks -EngineRepo $EngineRepo -ArchiveRef $sha -Python $py -NoFetch)
     $code = $LASTEXITCODE
     $output | ForEach-Object { Write-Output $_ }
-    $url = @($output | Where-Object { "$_" -like 'file:///*' } | Select-Object -Last 1) -join ''
+    # file:///C:/... for a drive, file://server/share/... for a UNC path.
+    $url = @($output | Where-Object { "$_" -like 'file://*' } | Select-Object -Last 1) -join ''
 } catch {
     [Console]::Error.WriteLine("ERROR: $($_.Exception.Message)")
     $code = 1
@@ -134,7 +166,7 @@ try {
         [Console]::Error.WriteLine("WARNING: could not remove temporary $tmp")
     }
 }
-if (-not $outDir) { $outDir = Get-FallbackOutDir }
+if ($refused) { $outDir = '' } elseif (-not $outDir) { $outDir = Get-FallbackOutDir }
 $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 $shown = if ($url) { $url } else { 'none' }
 Write-BuildLog $outDir "$stamp ref=$Ref sha=$sha exit=$code url=$shown"

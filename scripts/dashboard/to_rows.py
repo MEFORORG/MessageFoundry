@@ -8,7 +8,9 @@ WRITES ``<out>/metrics.json`` (one row per headline metric, then one per fact) a
 [...]}``, and ``meta`` carries this converter's own source and the snapshot it read.
 
 THE ROWS ARE AS PRIVATE AS THE SNAPSHOT: they quote the same vault counts. ``--out`` is refused
-inside a git work tree with the collector's own guard (``refuse_reason``).
+wherever the collector's own guard (``refuse_out_dir``) finds git reporting a work tree; that
+guard's docstring says what it cannot see. Every row quoting an ASVS number carries the scorecard
+tool's ref pair in its ``ref`` field (empty on every other row).
 
 A VALUE THAT IS NOT IN THE SNAPSHOT IS ``null``, never ``0`` or NaN: a metric that errored has no
 detail, and its facts read null rather than as a quiet zero.
@@ -26,36 +28,22 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import importlib.util
 import json
 import math
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
-_HERE = Path(__file__).resolve().parent
-
-
-def _collector() -> ModuleType:
-    """The sibling collector, loaded by path: this directory is no package."""
-    name = "dashboard_collect_metrics"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, _HERE / "collect_metrics.py")
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {_HERE / 'collect_metrics.py'}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+# The sibling scripts are imported by name from this directory: it is no package, and under
+# ``python -I`` the script's own directory is not on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import collect_metrics as cm  # noqa: E402
 
 
 def repo_series() -> tuple[tuple[str, str], ...]:
     """The ``prs_merged`` per-repo key -> the series name the dashboard plots, keyed by the
     collector's own repo names so a rename cannot leave a series quietly empty."""
-    cm = _collector()
     return ((cm.ENGINE_REPO, "Engine"), (cm.VAULT_REPO, "Vault"), (cm.KORUS_REPO, "Korus"))
 
 
@@ -98,15 +86,15 @@ class Snapshot:
         try:
             through = dt.date.fromisoformat(str(self.data["through"]))
             made = dt.datetime.fromisoformat(str(self.data["generated_at"])).date()
-            week = _collector().last_full_week(through, self.weeks, made)
-        except (KeyError, ValueError, IndexError, _collector().CollectError):
+            week = cm.last_full_week(through, self.weeks, made)
+        except (KeyError, ValueError, IndexError, cm.CollectError):
             return None
         return str(week)
 
 
 def asvs_pair(snap: Snapshot) -> str:
     """The ref pair every ASVS number is quoted beside, rendered by the collector itself."""
-    return str(_collector().asvs_ref_pair(snap.detail("asvs")))
+    return str(cm.asvs_ref_pair(snap.detail("asvs")))
 
 
 def notes(snap: Snapshot) -> dict[str, str]:
@@ -203,6 +191,7 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
             "note": note.get(str(m["id"]), ""),
             "source": m.get("source", ""),
             "error": error(m),
+            "ref": asvs_pair(snap) if m["id"] == "asvs" else "",
         }
         for m in snap.metrics
     ]
@@ -227,6 +216,8 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
                 "note": f"Measured at {asvs_pair(snap)}." if mid == "asvs" else "",
                 "source": snap.by_id[mid].get("source", ""),
                 "error": reason,
+                # The ref pair the scorecard tool printed, for every row quoting an ASVS number.
+                "ref": asvs_pair(snap) if mid == "asvs" else "",
             }
         )
     return rows
@@ -279,10 +270,16 @@ def meta(src: Path, snap: Snapshot) -> list[dict[str, Any]]:
     ]
 
 
-def _nearest_existing(path: Path) -> Path:
-    while not path.exists() and path.parent != path:
-        path = path.parent
-    return path
+def load_snapshot(path: Path) -> dict[str, Any] | str:
+    """The snapshot at ``path``, or why it cannot be read. A NaN or infinity reads as null: it is
+    no measurement, nor valid JSON."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"), parse_constant=lambda _: None)
+    except (OSError, ValueError) as exc:
+        return f"cannot read {path}: {type(exc).__name__}: {exc}"
+    if not isinstance(data, dict):
+        return f"{path} is not a snapshot object"
+    return data
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -292,23 +289,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("snapshot", type=Path, help="a snapshot written by collect_metrics.py")
     ap.add_argument("out", type=Path, help="directory for metrics.json and series.json")
     args = ap.parse_args(argv)
-    cm = _collector()
     out = args.out.resolve()
-    # Checked against the nearest directory that exists, BEFORE anything is created, so a refused
-    # --out leaves no directory behind inside a repository.
     # The DIRECTORY is checked, never a leaf name that a planted link could point elsewhere.
-    reason = cm.refuse_dir_reason(_nearest_existing(out).resolve())
+    reason = cm.refuse_out_dir(out)
     if reason is not None:
         print(f"ERROR: refusing out {args.out}: {reason}", file=sys.stderr)
         return 1
-    try:
-        # A NaN or infinity in the snapshot reads as null: it is no measurement, nor valid JSON.
-        data = json.loads(args.snapshot.read_text(encoding="utf-8"), parse_constant=lambda _: None)
-    except (OSError, ValueError) as exc:
-        print(f"ERROR: cannot read {args.snapshot}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    if not isinstance(data, dict):
-        print(f"ERROR: {args.snapshot} is not a snapshot object", file=sys.stderr)
+    data = load_snapshot(args.snapshot)
+    if isinstance(data, str):
+        print(f"ERROR: {data}", file=sys.stderr)
         return 1
     snap = Snapshot(data)
     info = meta(args.snapshot, snap)

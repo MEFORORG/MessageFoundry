@@ -13,19 +13,33 @@ which it runs and imports. That tree need not be a git checkout: the scheduled r
 scorecard tool then stamps ``engine=NO-GIT``.
 
 THE SNAPSHOT IS PRIVATE. It quotes counts read from the vault, so it must never land inside a git
-repository, where a ``git add .`` would publish it. ``--out`` is refused when its directory is inside
-any git work tree (or inside a ``.git`` directory).
+repository, where a ``git add .`` would publish it. ``--out``'s directory, and the work directory the
+vault files are extracted into, are refused when git, run from that directory, reports a work tree
+or a ``.git`` directory: probed twice, once with every ``GIT_*`` variable dropped and once with the
+caller's own environment, and refused if either says so or either cannot answer. A repository git
+cannot discover from there is not caught: for example a bare repository whose ``core.worktree``
+points at a parent directory, reached only through an explicit ``--git-dir``.
+
+THE VAULT'S CODE RUNS IN A CHILD PROCESS. The ledger census is the vault's own
+``scripts/docs/ledger_weekly_report.py``, archived from vault ``origin/main``. It runs through
+``_vault_census.py`` under ``python -I`` with an allowlisted environment that holds no token and no
+``GIT_*`` variable, never imported into this process. The vault commit it ran at is recorded.
+
+STDOUT CARRIES NO VALUE. The console summary is each metric's id, status and whether it holds an
+error; the values, the counts and the error text are only in the snapshot.
 
 A METRIC THAT COULD NOT BE READ IS ``null``, NEVER ``0``. Each collector runs isolated: one that
 raises leaves its metric at ``value: null``, ``status: "unknown"`` and its ``error`` text, and the
 others still run. A zero would read exactly like a quiet week.
 
-WHAT IT WRITES outside ``--out``, at least: two ``git fetch --no-tags origin main``, one in the
-vault and one in the engine checkout. Each moves ``refs/remotes/origin/main`` and also writes
+WHAT IT WRITES outside ``--out``, at least: unless ``--no-fetch``, two
+``git fetch --no-tags origin main``, one in the vault and one in the engine checkout. Each moves ``refs/remotes/origin/main`` and also writes
 ``FETCH_HEAD`` and fetched objects, and may start git's own auto-maintenance. No local tag or branch
 is created; the release tag is resolved with ``git ls-remote``. Importing the stalled-PR checker can
-write ``__pycache__`` in the tree this script sits in. Vault files and downloads go to a temporary directory
-removed at exit.
+write ``__pycache__`` in the tree this script sits in. Vault files and downloads go to a fresh
+``mf-metrics-*`` directory under ``--work-dir`` (default: Python's temporary directory), removed at
+exit; a removal that fails is an error, and such directories older than two hours are swept at the
+start of the next run, since a run killed by a time limit skips its cleanup.
 
 WINDOWED AND CURRENT METRICS. ``--weeks``/``--through`` bound the weekly series. The state metrics
 (open PRs, open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
@@ -35,8 +49,9 @@ The final window week ends at ``--through``, for the ledger counts as for the Gi
 
 EXIT STATUS. 0 when every metric and every optional part was read. 3 when the snapshot WAS written
 but a metric carries an error or a detail carries a ``partial_error``, so a scheduled caller goes red
-on an outage rather than publishing nulls quietly. 1 when nothing was written (a refused ``--out``, a
-bad ``--weeks`` or ``--through``); 2 is argparse's own usage error, and nothing was written either.
+on an outage rather than publishing nulls quietly, and also when the work directory could not be
+removed. 1 when nothing was written (a refused ``--out`` or work directory, a bad ``--weeks`` or
+``--through``); 2 is argparse's own usage error, and nothing was written either.
 
 Usage::
 
@@ -62,8 +77,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -114,6 +128,12 @@ _TRANSIENT = re.compile(
 #: clipped at ``--through`` without the date reading as undated.
 AFTER_THROUGH = "after-through"
 
+_SHA40 = re.compile(r"[0-9a-f]{40}")
+#: The canonical public PEP 440 forms this project releases (``1.2.3``, ``1.2.3rc1``,
+#: ``1.2.3.post1``, ``1.2.3.dev4``). Anything else from PyPI is refused before it reaches a git
+#: argument or a ref glob.
+_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?(?:\.dev[0-9]+)?")
+
 #: Run conclusions that count toward the CI pass rate. ``cancelled`` and ``skipped`` are left out of
 #: both sides: a run superseded by a newer push says nothing about whether main is green.
 CI_PASS = frozenset({"success"})
@@ -144,7 +164,15 @@ THRESHOLDS: dict[str, dict[str, float]] = {
 
 
 class CollectError(Exception):
-    """A source could not be read. Its text becomes the metric's ``error``."""
+    """A source could not be read. Its text becomes the metric's ``error``.
+
+    ``stderr`` is the failed command's own stderr, kept apart from the message, which also names
+    the command and its arguments: a check of what the command SAID must not read its arguments.
+    """
+
+    def __init__(self, message: str, *, stderr: str = "") -> None:
+        super().__init__(message)
+        self.stderr = stderr
 
 
 # --------------------------------------------------------------------------------------------------
@@ -352,8 +380,10 @@ def run_bytes(
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CollectError(f"{argv[0]} could not run: {type(exc).__name__}: {exc}") from None
     if proc.returncode != 0:
-        tail = proc.stderr.decode("utf-8", "replace").strip()[-400:]
-        raise CollectError(f"{' '.join(argv[:4])} exited {proc.returncode}: {tail}")
+        stderr = proc.stderr.decode("utf-8", "replace").strip()
+        raise CollectError(
+            f"{' '.join(argv[:4])} exited {proc.returncode}: {stderr[-400:]}", stderr=stderr
+        )
     return proc.stdout
 
 
@@ -365,6 +395,30 @@ def run_cmd(argv: Sequence[str], cwd: Path | None = None) -> str:
 def run_probe(argv: Sequence[str], cwd: Path | None = None) -> str:
     """:func:`run_cmd` under :func:`probe_env`, for the ``--out`` guard."""
     return run_bytes(argv, cwd, env=probe_env()).decode("utf-8", "replace")
+
+
+#: The environment the vault's census code runs under: what a Windows or POSIX Python needs to
+#: start, and nothing else. No token (GH_TOKEN, GITHUB_TOKEN), no GIT_* and no profile variable.
+_CHILD_ENV_KEEP = (
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+)
+
+
+def child_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k.upper() in _CHILD_ENV_KEEP}
+    return {**env, "LC_ALL": "C", "PYTHONUTF8": "1"}
+
+
+def run_child(argv: Sequence[str]) -> str:
+    """Run the vault census driver: ``python -I`` under :func:`child_env`."""
+    return run_bytes([sys.executable, "-I", *argv], None, env=child_env()).decode("utf-8")
 
 
 def fetch_url(url: str) -> bytes:
@@ -420,11 +474,37 @@ def add_partial(detail: dict[str, Any], text: str) -> None:
 
 
 @dataclass
+class Census:
+    """The vault census as the driver printed it, with the vault vocabulary it was read in."""
+
+    rows: int
+    weeks: dict[str, dict[str, int]]
+    undated: dict[str, int]
+    open_by_verdict: dict[str, int]
+    active_verdicts: list[str]
+    deferred_verdict: str
+    activity: list[str]
+
+    @property
+    def open_rows(self) -> int:
+        return sum(self.open_by_verdict.values())
+
+    def require(self, columns: Sequence[str] = (), verdicts: Sequence[str] = ()) -> None:
+        """Refuse a key the vault no longer defines: a renamed column would otherwise read 0."""
+        missing = [c for c in columns if c not in self.activity]
+        missing += [v for v in verdicts if v not in self.active_verdicts]
+        if missing:
+            raise CollectError(f"the vault census no longer defines {missing}")
+
+
+@dataclass
 class VaultRead:
     sha: str
     root: Path
-    census: Any
-    report: ModuleType
+    census: Census
+
+
+VAULT_DRIVER = Path(__file__).resolve().parent / "_vault_census.py"
 
 
 @dataclass
@@ -435,7 +515,11 @@ class Context:
     workdir: Path
     run: Runner = run_cmd
     run_raw: BytesRunner = run_bytes
+    #: Runs the vault census driver in a child process; see :func:`run_child`.
+    run_vault: Callable[[Sequence[str]], str] = run_child
     fetch: Fetcher = fetch_url
+    #: False when the caller already fetched both repositories' main this run.
+    git_fetch: bool = True
     #: The tree the engine scripts are run and imported from.
     engine_root: Path = ENGINE_ROOT
     #: The engine git checkout for the release distance.
@@ -460,15 +544,7 @@ class Context:
                 self._vault = _read_vault(self)
             except CollectError as exc:
                 self._vault = exc
-            except (
-                OSError,
-                ValueError,
-                KeyError,
-                AttributeError,
-                TypeError,
-                ImportError,
-                tarfile.TarError,
-            ) as exc:
+            except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
                 # Cached too: a retry would only fail again, slower.
                 self._vault = CollectError(f"vault read failed: {type(exc).__name__}: {exc}")
         if isinstance(self._vault, CollectError):
@@ -486,15 +562,6 @@ def _load_module(name: str, path: Path) -> ModuleType:
     return mod
 
 
-@contextmanager
-def _on_path(directory: Path) -> Iterator[None]:
-    sys.path.insert(0, str(directory))
-    try:
-        yield
-    finally:
-        sys.path.remove(str(directory))
-
-
 def _archive_into(ctx: Context, vault: str, sha: str, paths: Sequence[str], root: Path) -> None:
     # Literal pathspecs: a listed ledger name holding `*`, `?` or `[` archives that file alone.
     argv = ["git", "--literal-pathspecs", "-C", vault, "archive", "--format=tar", sha, "--"]
@@ -503,24 +570,30 @@ def _archive_into(ctx: Context, vault: str, sha: str, paths: Sequence[str], root
         tar.extractall(root, filter="data")
 
 
+def _driver(ctx: Context, *args: str) -> dict[str, Any]:
+    out = json.loads(ctx.run_vault([str(VAULT_DRIVER), *args]))
+    if not isinstance(out, dict):
+        raise CollectError(f"the vault census driver printed {type(out).__name__}")
+    return out
+
+
 def _read_vault(ctx: Context) -> VaultRead:
     vault = str(ctx.vault)
-    ctx.run(["git", "-C", vault, "fetch", "-q", "--no-tags", "origin", "main"], None)
-    sha = ctx.run(["git", "-C", vault, "rev-parse", "origin/main"], None).strip()
+    if ctx.git_fetch:
+        ctx.run(["git", "-C", vault, "fetch", "-q", "--no-tags", "origin", "main"], None)
+    sha = ctx.run(["git", "-C", vault, "rev-parse", "--verify", "origin/main^{commit}"], None)
+    sha = sha.strip()
+    if not _SHA40.fullmatch(sha):
+        raise CollectError(f"vault origin/main resolved to {sha!r}, not a commit sha")
     # A fresh directory per attempt, so an uncaught failure retried by the next metric reports its
     # own cause, never a FileExistsError. RESOLVED, because the vault's read_sources labels a source
     # by path.resolve().relative_to(root): an unresolved temp path (a junction, an 8.3 short TEMP,
     # macOS /var) makes every label absolute, which its floors read as dropped files.
     root = Path(tempfile.mkdtemp(prefix="vault-", dir=ctx.workdir)).resolve()
     _archive_into(ctx, vault, sha, VAULT_PATHS, root)
-
-    docs = root / "scripts" / "docs"
-    # The vault's bare `from backlog_status_check import ...` must resolve to the ARCHIVED copy, so a
-    # same-named module already imported (or on the path) is dropped first.
-    sys.modules.pop("backlog_status_check", None)
-    with _on_path(docs):
-        report = _load_module("vault_ledger_weekly_report", docs / "ledger_weekly_report.py")
-    checker = sys.modules["backlog_status_check"]
+    globs = _driver(ctx, "globs", str(root)).get("ledger_file_globs")
+    if not isinstance(globs, list) or not all(isinstance(g, str) for g in globs):
+        raise CollectError("the vault census driver printed no ledger globs")
     # -z: a path git would otherwise quote (a space, a non-ASCII byte) comes back as written.
     tree = ctx.run(
         ["git", "-C", vault, "ls-tree", "-r", "-z", "--name-only", sha, "--", "docs"], None
@@ -528,62 +601,35 @@ def _read_vault(ctx: Context) -> VaultRead:
     ledger = [
         name
         for name in tree.split("\0")
-        if name
-        and any(
-            PurePosixPath(name).full_match(g, case_sensitive=True)
-            for g in checker.LEDGER_FILE_GLOBS
-        )
+        if name and any(PurePosixPath(name).full_match(g, case_sensitive=True) for g in globs)
     ]
     if not ledger:
         raise CollectError(f"no ledger file matches the checker's globs at vault {sha}")
     _archive_into(ctx, vault, sha, ledger, root)
 
-    paths = [root / p for p in report.DEFAULT_SOURCES]
-    sources = report.read_sources(paths, root, explicit=True)
-    census = _clipped_census(report, sources, ctx.through)
+    got = _driver(ctx, "census", str(root), ctx.through.isoformat())
+    census = Census(
+        rows=int(got["rows"]),
+        weeks={str(w): {str(k): int(v) for k, v in c.items()} for w, c in got["weeks"].items()},
+        undated={str(k): int(v) for k, v in got["undated"].items()},
+        open_by_verdict={str(k): int(v) for k, v in got["open_by_verdict"].items()},
+        active_verdicts=[str(v) for v in got["active_verdicts"]],
+        deferred_verdict=str(got["deferred_verdict"]),
+        activity=[str(c) for c in got["activity"]],
+    )
     # The checker's anti-narrowing floors, reused: a dropped, emptied or unscanned ledger file, then
     # the row-count floor. The archive is no git top level, so the checker globs it from disk.
-    structural = report.default_corpus_errors(root, census.per_source)
-    if structural:
-        raise CollectError("; ".join(structural))
-    if census.rows < report.MIN_TOTAL_ITEMS:
+    if got["structural_errors"]:
+        raise CollectError("; ".join(str(e) for e in got["structural_errors"]))
+    if census.rows < int(got["min_total_items"]):
         raise CollectError(
-            f"{census.rows} ledger rows read, below the floor of {report.MIN_TOTAL_ITEMS}"
+            f"{census.rows} ledger rows read, below the floor of {got['min_total_items']}"
         )
-    return VaultRead(sha=sha, root=root, census=census, report=report)
-
-
-def _clipped_census(report: ModuleType, sources: Any, through: dt.date) -> Any:
-    """The vault's census, with every date after ``through`` counted under :data:`AFTER_THROUGH`.
-
-    The census buckets by ISO week alone, so a past ``--through`` would otherwise count the rest of
-    its own week. Its ``Census.count`` resolves the module-level ``iso_week`` at call time, which
-    is wrapped for the one call and restored after.
-    """
-    original = getattr(report, "iso_week", None)
-    if not callable(original):
-        raise CollectError("the vault census has no iso_week to clip at --through")
-
-    calls = 0
-
-    def clipped(date: str | None) -> str | None:
-        nonlocal calls
-        calls += 1
-        week: str | None = original(date)
-        if week is not None and date is not None and dt.date.fromisoformat(date) > through:
-            return AFTER_THROUGH
-        return week
-
-    setattr(report, "iso_week", clipped)  # noqa: B010 - a vault module, typed only as ModuleType
-    try:
-        census = report.census(sources)
-    finally:
-        setattr(report, "iso_week", original)  # noqa: B010
-    # The wrap works only while the census dates through that global. A census that read rows but
+    # The clip works only while the census dates through iso_week. A census that read rows but
     # never called it has stopped doing so, and would count past --through without a sound.
-    if getattr(census, "rows", 0) and not calls:
+    if census.rows and not got["clip_calls"]:
         raise CollectError("the vault census never called iso_week, so --through was not applied")
-    return census
+    return VaultRead(sha=sha, root=root, census=census)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -594,9 +640,10 @@ def _clipped_census(report: ModuleType, sources: Any, through: dt.date) -> Any:
 def c_backlog_burn(ctx: Context, m: Metric) -> None:
     v = ctx.vault_read()
     c = v.census
+    c.require(columns=("filed", "closed", "declined", "superseded"))
     labels = ctx.labels
-    filed_series = []
-    closed_series = []
+    filed_series: list[dict[str, Any]] = []
+    closed_series: list[dict[str, Any]] = []
     for w in labels:
         got = c.weeks.get(w, {})
         filed_series.append({"week": w, "value": got.get("filed", 0)})
@@ -606,10 +653,10 @@ def c_backlog_burn(ctx: Context, m: Metric) -> None:
                 "value": sum(got.get(k, 0) for k in ("closed", "declined", "superseded")),
             }
         )
-    filed = sum(p["value"] for p in filed_series)
-    closed = sum(p["value"] for p in closed_series)
-    active = sum(c.open_by_verdict[k] for k in v.report.ACTIVE_VERDICTS)
-    deferred = c.open_by_verdict[v.report.DEFERRED_VERDICT]
+    filed = sum(int(p["value"]) for p in filed_series)
+    closed = sum(int(p["value"]) for p in closed_series)
+    active = sum(c.open_by_verdict.get(k, 0) for k in c.active_verdicts)
+    deferred = c.open_by_verdict.get(c.deferred_verdict, 0)
     m.value = closed - filed
     m.status = status_burn(filed, closed)
     m.series = [
@@ -627,7 +674,8 @@ def c_backlog_burn(ctx: Context, m: Metric) -> None:
         "open_total": c.open_rows,
         "open_active": active,
         "open_deferred": deferred,
-        "open_unclassified": c.open_by_verdict["none"] + c.open_by_verdict["other"],
+        # Whatever is neither active nor deferred, so no bucket name of the vault's is assumed.
+        "open_unclassified": c.open_rows - active - deferred,
         "rows_total": c.rows,
         "undated": dict(c.undated),
         "series_is": "closed minus filed, per week",
@@ -975,6 +1023,8 @@ def _vuln_kpis(ctx: Context) -> dict[str, Any]:
         if not isinstance(runs, list) or not runs:
             raise CollectError("no successful vuln-metrics run found")
         run_id = str(runs[0]["databaseId"])
+        if not run_id.isascii() or not run_id.isdigit():
+            raise CollectError(f"vuln-metrics run id {run_id!r} is not a number")
         dest = ctx.workdir / f"vuln-metrics-{run_id}"
         ctx.run(
             [
@@ -1002,7 +1052,8 @@ def _vuln_kpis(ctx: Context) -> dict[str, Any]:
 
 def c_owner_waiting(ctx: Context, m: Metric) -> None:
     v = ctx.vault_read()
-    n = int(v.census.open_by_verdict["owner-ruling"])
+    v.census.require(verdicts=("owner-ruling",))
+    n = int(v.census.open_by_verdict.get("owner-ruling", 0))
     m.value = n
     m.status = status_max(n, "owner_waiting")
     m.detail = {
@@ -1022,6 +1073,8 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
         version = str(info["info"]["version"])
     except (ValueError, KeyError, TypeError) as exc:
         raise CollectError(f"unreadable PyPI JSON: {type(exc).__name__}: {exc}") from None
+    if not _VERSION.fullmatch(version):
+        raise CollectError(f"PyPI version {version!r} is not a canonical release version")
     uploaded_error: str | None = None
     try:
         # `urls` lists the latest version's files; the deprecated `releases` map is not needed.
@@ -1033,7 +1086,8 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
     # backup tags and are never consulted, since the tag is named from the PyPI version).
     tag = f"v{version}"
     root = str(ctx.engine_repo)
-    ctx.run(["git", "-C", root, "fetch", "-q", "--no-tags", "origin", "main"], None)
+    if ctx.git_fetch:
+        ctx.run(["git", "-C", root, "fetch", "-q", "--no-tags", "origin", "main"], None)
     # ls-remote, not a tag fetch: it creates no local ref. An annotated tag also prints its peeled
     # commit as `<ref>^{}`, which is preferred.
     listed = ctx.run(["git", "-C", root, "ls-remote", "origin", f"refs/tags/{tag}*"], None)
@@ -1044,6 +1098,8 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
     sha = refs.get(f"refs/tags/{tag}^{{}}") or refs.get(f"refs/tags/{tag}")
     if sha is None:
         raise CollectError(f"origin carries no tag {tag} for PyPI version {version}")
+    if not _SHA40.fullmatch(sha):
+        raise CollectError(f"tag {tag} resolved to {sha!r}, not a commit sha")
     count = int(ctx.run(["git", "-C", root, "rev-list", "--count", f"{sha}..origin/main"], None))
     m.value = count
     m.status = status_max(count, "release_distance")
@@ -1175,35 +1231,57 @@ def snapshot(
 # --------------------------------------------------------------------------------------------------
 
 
-def refuse_reason(out: Path, run: Runner = run_probe) -> str | None:
+#: git's whole stderr for a directory in no repository, under LC_ALL=C: the one failure that
+#: means "safe". Matched against stderr alone and in full, never against the message, which also
+#: carries the probed path. A bare "not a git repository" is also git's answer for a pruned
+#: worktree's gitdir or a bad GIT_DIR, which ARE inside a repository's tree.
+_NO_REPO = re.compile(r"fatal: not a git repository \(or any of the parent directories\): \.git")
+
+#: The probes :func:`refuse_dir_reason` runs: GIT_* dropped, then the caller's own environment.
+PROBES: tuple[Runner, ...] = (run_probe, run_cmd)
+
+
+def refuse_reason(out: Path, runs: Sequence[Runner] = PROBES) -> str | None:
     """Why the file ``out`` may not be written, or ``None``; see :func:`refuse_dir_reason`."""
-    return refuse_dir_reason(out.resolve().parent, run)
+    return refuse_dir_reason(out.resolve().parent, runs)
 
 
-def refuse_dir_reason(parent: Path, run: Runner = run_probe) -> str | None:
+def refuse_dir_reason(parent: Path, runs: Sequence[Runner] = PROBES) -> str | None:
     """Why no file may be written in the directory ``parent``, or ``None``. Fails CLOSED when git
     cannot answer.
 
-    git runs under :func:`probe_env`, so no ``GIT_*`` variable in the caller's environment can
-    steer the answer. The caller passes the directory it will write into, already resolved.
+    Each runner in ``runs`` asks git from ``parent``; any one that finds a repository, or cannot
+    answer, refuses. The default pair is :func:`run_probe`, so no ``GIT_*`` variable in the
+    caller's environment can hide a repository, and :func:`run_cmd`, so a ``GIT_DIR`` or
+    ``GIT_WORK_TREE`` the caller set is seen too. What this does not catch is in the module
+    docstring. The caller passes the directory it will write into, already resolved.
     """
     if not parent.is_dir():
         return f"{parent} is not an existing directory"
-    try:
-        answer = run(["git", "-C", str(parent), "rev-parse", "--is-inside-work-tree"], None).strip()
-    except CollectError as exc:
-        text = str(exc)
-        # git's own answer for a directory in no repository: the one failure that means "safe".
-        # run_bytes runs git under LC_ALL=C, so the message is not localized.
-        # The full phrase: a bare "not a git repository" is also git's answer for a pruned
-        # worktree's gitdir or a bad GIT_DIR, which ARE inside a repository's tree.
-        if "not a git repository (or any" in text:
-            return None
-        return f"cannot tell whether {parent} is inside a git repository: {text}"
-    # "true" is a work tree; "false" is inside a .git directory. Both are a repository.
-    return (
-        f"{parent} is inside a git repository (rev-parse said {answer!r}); the snapshot is private"
-    )
+    for run in runs:
+        try:
+            argv = ["git", "-C", str(parent), "rev-parse", "--is-inside-work-tree"]
+            answer = run(argv, None).strip()
+        except CollectError as exc:
+            if _NO_REPO.fullmatch(exc.stderr.strip()):
+                continue
+            return f"cannot tell whether {parent} is inside a git repository: {exc}"
+        # "true" is a work tree; "false" is inside a .git directory. Both are a repository.
+        return f"{parent} is inside a git repository (rev-parse said {answer!r}); it is private"
+    return None
+
+
+def nearest_existing(path: Path) -> Path:
+    """``path``, or its nearest ancestor that exists."""
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def refuse_out_dir(out: Path) -> str | None:
+    """:func:`refuse_dir_reason` for a directory that may not exist yet, checked at its nearest
+    existing ancestor BEFORE anything is created, so a refusal leaves nothing behind."""
+    return refuse_dir_reason(nearest_existing(out.resolve()).resolve())
 
 
 def write_json_atomic(out: Path, payload: Any) -> None:
@@ -1226,16 +1304,37 @@ def write_text_atomic(out: Path, text: str) -> None:
         raise
 
 
-def remove_tree(path: Path) -> None:
-    """Remove a temporary tree; each path that will not go is warned about on stderr, not raised."""
+def remove_tree(path: Path) -> bool:
+    """Remove a temporary tree; each path that will not go is reported on stderr. False when any
+    did not, so the caller can fail the run: the tree holds private vault files."""
+    failed = False
 
-    def warn(func: Callable[..., Any], target: str, exc: BaseException) -> None:
+    def report(func: Callable[..., Any], target: str, exc: BaseException) -> None:
+        nonlocal failed
+        failed = True
         print(
-            f"WARNING: could not remove temporary {target}: {type(exc).__name__}: {exc}",
+            f"ERROR: could not remove temporary {target}: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
 
-    shutil.rmtree(path, onexc=warn)
+    shutil.rmtree(path, onexc=report)
+    return not failed
+
+
+#: A leftover work directory older than this is a killed run's, never a live one: the scheduled
+#: task stops a run at 30 minutes.
+STALE_SECONDS = 2 * 3600
+
+
+def sweep_stale(base: Path, prefix: str, now: float | None = None) -> None:
+    """Remove ``base/<prefix>*`` directories older than :data:`STALE_SECONDS`."""
+    cutoff = (time.time() if now is None else now) - STALE_SECONDS
+    for old in base.glob(f"{prefix}*"):
+        try:
+            if old.is_dir() and not old.is_symlink() and old.stat().st_mtime < cutoff:
+                remove_tree(old)
+        except OSError as exc:
+            print(f"ERROR: could not sweep {old}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1258,6 +1357,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="SHA",
         help="the engine commit this script's tree was git-archived from, when it is no checkout",
+    )
+    ap.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help="where the run's private mf-metrics-* directory goes (default: Python's temp dir)",
+    )
+    ap.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="the caller already fetched origin main in the vault and the engine checkout",
     )
     ap.add_argument("--weeks", type=int, default=8, help="ISO weeks in the window (default 8)")
     ap.add_argument(
@@ -1288,7 +1398,14 @@ def main(argv: list[str] | None = None) -> int:
     if through > today:
         print(f"ERROR: --through {through} is after today ({today}, UTC)", file=sys.stderr)
         return 1
-    tmp = Path(tempfile.mkdtemp(prefix="mf-metrics-"))
+    base = (args.work_dir or Path(tempfile.gettempdir())).resolve()
+    reason = refuse_dir_reason(base)
+    if reason is not None:
+        print(f"ERROR: refusing work dir {base}: {reason}", file=sys.stderr)
+        return 1
+    sweep_stale(base, "mf-metrics-")
+    tmp = Path(tempfile.mkdtemp(prefix="mf-metrics-", dir=base))
+    cleaned = False
     try:
         ctx = Context(
             vault=args.vault,
@@ -1299,20 +1416,21 @@ def main(argv: list[str] | None = None) -> int:
             # Resolved once, so a relative path names the same tree for every git call.
             engine_repo=args.engine_repo.resolve(),
             archive_ref=args.archive_ref,
+            git_fetch=not args.no_fetch,
         )
         metrics = collect(ctx)
         write_json_atomic(out, snapshot(ctx, metrics))
     finally:
-        # A cleanup failure (a scanner holding a downloaded file) never discards a finished run.
-        remove_tree(tmp)
+        # A cleanup failure never discards a finished run, but it fails it (exit 3).
+        cleaned = remove_tree(tmp)
+    # Id, status and an error flag only: values and error text stay in the private snapshot, never
+    # in a transcript or a log that captures stdout.
     for m in metrics:
-        line = f"{m.id}: value={m.value} status={m.status}"
-        if m.id == "asvs" and m.detail:
-            # An ASVS number is quoted only beside the ref pair it was measured at.
-            line += f" {asvs_ref_pair(m.detail)}"
-        print(line + (f" error={m.error}" if m.error else ""))
+        flag = "error" if m.error else "partial" if m.detail.get("partial_error") else "ok"
+        print(f"{m.id}: status={m.status} read={flag}")
     # 3 when anything could not be read, after the snapshot is written: an outage goes red.
-    return 3 if any(m.error or m.detail.get("partial_error") for m in metrics) else 0
+    partial = any(m.error or m.detail.get("partial_error") for m in metrics)
+    return 3 if partial or not cleaned else 0
 
 
 if __name__ == "__main__":  # pragma: no cover

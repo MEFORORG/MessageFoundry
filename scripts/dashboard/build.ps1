@@ -12,8 +12,14 @@ page's URL as the last line, and removes the temporary snapshot.
 The page goes where render_html.py resolves it: -OutDir, else MEFOR_DASHBOARD_DIR, else
 OneDrive\Desktop\MEFOR\dashboard when OneDrive\Desktop\MEFOR exists, else %USERPROFILE%\MEFOR\dashboard.
 
+The dashboard directory is checked first (render_html.py --print-out-dir), so a refused directory
+stops the run before anything is collected. The collector's own work directory is put inside this
+script's temporary directory, and leftover mf-dashboard-* directories older than two hours, from a
+run that was killed, are swept first.
+
 Exit status: 0 when every metric was read; 3 when the page was written but a metric or part could
-not be read (the collector's own 3); any other non-zero when no page was written. A failed render
+not be read (the collector's own 3), or the temporary directory could not be removed; any other
+non-zero when no page was written. A failed render
 leaves the previous index.html in place, because render_html.py replaces it atomically.
 
 .EXAMPLE
@@ -31,7 +37,9 @@ param(
     [string]$ArchiveRef = '',
     # The interpreter as an argv prefix, for example 'py','-3.14'. Empty: py -3.14 when it runs,
     # else python on PATH.
-    [string[]]$Python = @()
+    [string[]]$Python = @(),
+    # The caller already fetched origin main in the vault and the engine checkout.
+    [switch]$NoFetch
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -45,27 +53,56 @@ function Resolve-Python([string[]]$Given) {
     return , @('python')
 }
 
+function Remove-StaleTemp([string]$Base, [string]$Prefix) {
+    # A run killed by the task's time limit skips its finally, so its private snapshot outlives
+    # it. Two hours is past any live run.
+    $cutoff = [DateTime]::UtcNow.AddHours(-2)
+    Get-ChildItem -LiteralPath $Base -Directory -Filter "$Prefix*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -lt $cutoff -and -not $_.LinkType } |
+        ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $_.FullName) {
+                [Console]::Error.WriteLine("ERROR: could not sweep stale $($_.FullName)")
+            }
+        }
+}
+
 $py = Resolve-Python $Python
 $exe = $py[0]
 $prefix = @($py | Select-Object -Skip 1)
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ('mf-dashboard-' + [guid]::NewGuid().ToString('N'))
+$render = Join-Path $PSScriptRoot 'render_html.py'
+$outArgs = @()
+if ($OutDir) { $outArgs = @('--out-dir', $OutDir) }
+
+# The page directory is refused BEFORE collecting, so nothing private is gathered for a directory
+# the page may not be written to.
+$null = & $exe @prefix -I $render @outArgs --print-out-dir
+if ($LASTEXITCODE -ne 0) {
+    [Console]::Error.WriteLine("ERROR: the dashboard directory is refused; nothing collected")
+    exit 1
+}
+
+$base = [IO.Path]::GetTempPath()
+Remove-StaleTemp $base 'mf-dashboard-'
+$tmp = Join-Path $base ('mf-dashboard-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $snapshot = Join-Path $tmp 'metrics.json'
 $code = 0
 try {
+    # --work-dir: the collector's own private directory goes under this one, so one cleanup
+    # covers both and TMP versus TMPDIR can never split them.
     $collectArgs = @('-I', (Join-Path $PSScriptRoot 'collect_metrics.py'), '--vault', $Vault,
-        '--out', $snapshot, '--weeks', $Weeks)
+        '--out', $snapshot, '--weeks', $Weeks, '--work-dir', $tmp)
     if ($EngineRepo) { $collectArgs += @('--engine-repo', $EngineRepo) }
     if ($ArchiveRef) { $collectArgs += @('--archive-ref', $ArchiveRef) }
+    if ($NoFetch) { $collectArgs += @('--no-fetch') }
     & $exe @prefix @collectArgs
     $collected = $LASTEXITCODE
     if ($collected -ne 0 -and $collected -ne 3) {
         [Console]::Error.WriteLine("ERROR: collect_metrics.py exited $collected; no page written")
         $code = $collected
     } else {
-        $renderArgs = @('-I', (Join-Path $PSScriptRoot 'render_html.py'), $snapshot)
-        if ($OutDir) { $renderArgs += @('--out-dir', $OutDir) }
-        $url = & $exe @prefix @renderArgs
+        $url = & $exe @prefix -I $render $snapshot @outArgs
         $rendered = $LASTEXITCODE
         if ($rendered -ne 0) {
             [Console]::Error.WriteLine("ERROR: render_html.py exited $rendered; the previous page stands")
@@ -76,10 +113,12 @@ try {
         }
     }
 } finally {
-    # Our own temporary directory, made above; the snapshot in it is a private file.
+    # Our own temporary directory, made above; the snapshot in it is a private file, so a
+    # directory that will not go fails the run.
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $tmp) {
-        [Console]::Error.WriteLine("WARNING: could not remove temporary $tmp")
+        [Console]::Error.WriteLine("ERROR: could not remove temporary $tmp, which holds a private snapshot")
+        if ($code -eq 0) { $code = 3 }
     }
 }
 exit $code

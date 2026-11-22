@@ -12,10 +12,12 @@ that could not be read renders as "no data", never as zero.
 
 WHERE IT WRITES, first match wins: ``--out-dir``; the ``MEFOR_DASHBOARD_DIR`` environment variable;
 ``%USERPROFILE%/OneDrive/Desktop/MEFOR/dashboard`` when ``OneDrive/Desktop/MEFOR`` already exists;
-otherwise ``%USERPROFILE%/MEFOR/dashboard``. It writes ``index.html`` and a copy of the snapshot as
-``snapshot.json``, each through a temporary file and an atomic replace, so a failed run leaves the
-previous page whole. The directory is refused inside a git work tree, with the collector's guard:
-the page quotes the same private vault counts as the snapshot.
+otherwise ``%USERPROFILE%/MEFOR/dashboard``. It writes ``index.html`` alone, through a temporary
+file and an atomic replace, so a failed run leaves the previous page whole; the snapshot is its
+input and is never copied beside the page. The page quotes the same private vault counts as the
+snapshot, so the directory is refused, before anything is read, whenever the collector's guard
+(``refuse_dir_reason``) finds git reporting a work tree there; that guard's docstring says what
+it cannot see. Every ASVS number is shown beside the ref pair the scorecard tool measured it at.
 
 The rows are built by ``to_rows.py``, so the page and the row files never disagree.
 
@@ -30,34 +32,21 @@ from __future__ import annotations
 
 import argparse
 import html
-import importlib.util
 import io
-import json
 import os
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
-_HERE = Path(__file__).resolve().parent
+# The sibling scripts are imported by name from this directory: it is no package, and under
+# ``python -I`` the script's own directory is not on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import collect_metrics as cm  # noqa: E402
+import to_rows as tr  # noqa: E402
 
 ENV_DIR = "MEFOR_DASHBOARD_DIR"
 STATUSES = ("good", "warn", "bad", "unknown")
-
-
-def _to_rows() -> ModuleType:
-    """The sibling converter, loaded by path: this directory is no package."""
-    name = "dashboard_to_rows"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, _HERE / "to_rows.py")
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {_HERE / 'to_rows.py'}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def esc(value: Any) -> str:
@@ -277,6 +266,7 @@ border:1px solid currentColor;margin-left:8px;vertical-align:middle}
 dl{display:grid;grid-template-columns:1fr auto;gap:2px 12px;margin:10px 0;font-size:13px}
 dt{color:var(--muted)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
 .note{color:var(--muted);font-size:12px;margin:8px 0 0}
+.refpair{font:12px/1.4 ui-monospace,Consolas,monospace;margin:4px 0 0;overflow-wrap:anywhere}
 .err{color:var(--bad);font-size:12px;margin:6px 0 0;overflow-wrap:anywhere}
 .nodata{color:var(--muted);font-style:italic;font-weight:400}
 .charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;margin-top:20px}
@@ -326,6 +316,8 @@ def tile(row: Mapping[str, Any], facts: Sequence[Mapping[str, Any]]) -> str:
         + (f'<span class="unit">{esc(shown_unit)}</span>' if shown_unit else "")
         + "</div>"
         + (f"<dl>{dl}</dl>" if dl else "")
+        # The ASVS ref pair sits beside the value it qualifies, never only in a footnote.
+        + (f'<p class="refpair">{esc(row["ref"])}</p>' if row.get("ref") else "")
         + (f'<p class="note">{esc(row["note"])}</p>' if row.get("note") else "")
         + (f'<p class="err">{esc(error)}</p>' if error else "")
         + "</section>"
@@ -336,9 +328,8 @@ def _points(series: Sequence[Mapping[str, Any]], name: str) -> dict[str, Any]:
     return {str(r["week"]): r.get("value") for r in series if r.get("series") == name}
 
 
-def render(data: dict[str, Any], *, source_name: str = "snapshot.json") -> str:
+def render(data: dict[str, Any]) -> str:
     """The whole page for one snapshot. Never raises on a missing metric or field."""
-    tr = _to_rows()
     snap = tr.Snapshot(data)
     rows = tr.metric_rows(snap)
     series = tr.series_rows(snap)
@@ -365,7 +356,7 @@ def render(data: dict[str, Any], *, source_name: str = "snapshot.json") -> str:
         [(n, c, _points(series, n)) for n, c in repos],
         partial,
     )
-    ci_bar = float(tr._collector().THRESHOLDS["ci_main"]["good_pct"])
+    ci_bar = float(cm.THRESHOLDS["ci_main"]["good_pct"])
     ci = line_chart(
         "CI pass percent on main per week",
         weeks,
@@ -403,7 +394,7 @@ def render(data: dict[str, Any], *, source_name: str = "snapshot.json") -> str:
 {legend([("CI pass %", "s1")])}</section>
 </div>
 <footer>
-<p>Generated at {esc(generated)} from {esc(source_name)}.</p>
+<p>Generated at {esc(generated)} from a collect_metrics.py snapshot.</p>
 <p>Method: scripts/dashboard/collect_metrics.py read each source at run time; to_rows.py flattened
 the snapshot and render_html.py drew this page. A value that could not be read shows as no data,
 never as zero, and its reason is printed in its tile. A hollow point or faded bar is a week still in
@@ -435,31 +426,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(encoding="utf-8", errors="strict")
     out = resolve_out_dir(args.out_dir, os.environ, _home(os.environ)).resolve()
+    # Refused before anything else, --print-out-dir included, so a caller asks this FIRST and
+    # never collects for a directory the page may not be written to.
+    reason = cm.refuse_out_dir(out)
+    if reason is not None:
+        print(f"ERROR: refusing out dir {out}: {reason}", file=sys.stderr)
+        return 1
     if args.print_out_dir:
         print(out)
         return 0
     if args.snapshot is None:
         ap.error("the snapshot path is required unless --print-out-dir is given")
-    tr = _to_rows()
-    cm = tr._collector()
-    reason = cm.refuse_dir_reason(tr._nearest_existing(out).resolve())
-    if reason is not None:
-        print(f"ERROR: refusing out dir {out}: {reason}", file=sys.stderr)
+    data = tr.load_snapshot(args.snapshot)
+    if isinstance(data, str):
+        print(f"ERROR: {data}", file=sys.stderr)
         return 1
-    try:
-        data = json.loads(args.snapshot.read_text(encoding="utf-8"), parse_constant=lambda _: None)
-    except (OSError, ValueError) as exc:
-        print(f"ERROR: cannot read {args.snapshot}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    if not isinstance(data, dict):
-        print(f"ERROR: {args.snapshot} is not a snapshot object", file=sys.stderr)
-        return 1
-    # The footer names the copy published beside the page, not the input, which may be temporary.
-    page = render(data, source_name="snapshot.json")
+    page = render(data)
     try:
         out.mkdir(parents=True, exist_ok=True)
-        # The snapshot first: a page is never newer than the data published beside it.
-        cm.write_json_atomic(out / "snapshot.json", data)
+        # The page only: the snapshot is this script's input and is not published beside it.
         cm.write_text_atomic(out / "index.html", page)
     except (OSError, ValueError) as exc:
         print(f"ERROR: cannot write {out}: {type(exc).__name__}: {exc}", file=sys.stderr)
