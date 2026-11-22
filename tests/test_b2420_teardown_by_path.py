@@ -299,3 +299,33 @@ def test_the_re_mark_creates_a_name_that_went_after_its_create_was_refused(
         monkeypatch.setattr(os, "open", refused_then_gone)
         held_dir.mark(dr_backup._LOCK_NAME)
     assert lock.is_file()
+
+
+def test_the_re_mark_makes_nothing_at_a_dangling_links_target(tmp_path: Path) -> None:
+    """A dangling file link planted at `.lock-held`. Red on Windows before the round-2 fix: the
+    `os.open` exclusive create followed it and made the file at the target, outside the directory.
+    Now the link is a name in use and is refused as not a plain file."""
+    staging = tmp_path / "mefor-backup-kept"
+    staging.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        os.symlink(outside / "made", staging / dr_backup._HELD_MARKER_NAME)
+    except OSError:
+        pytest.skip("this account cannot create a symbolic link here")
+    with dr_backup._HeldStagingDir(staging) as held_dir, pytest.raises(OSError):
+        held_dir.mark(dr_backup._HELD_MARKER_NAME)
+    assert sorted(p.name for p in outside.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 path rewriting is Windows-only")
+def test_a_candidate_whose_name_windows_rewrites_is_not_opened_as_another(win_tmp: Path) -> None:
+    """`mefor-backup-x.` opens as `mefor-backup-x` by its plain path; the held open refuses it
+    rather than read that other directory's lock and marker. The control: the other opens."""
+    os.mkdir(_verbatim(win_tmp, "mefor-backup-x."))
+    other = win_tmp / "mefor-backup-x"
+    other.mkdir()
+    with pytest.raises(OSError):
+        dr_backup._HeldStagingDir(win_tmp / "mefor-backup-x.")
+    with dr_backup._HeldStagingDir(other) as held_dir:
+        assert not held_dir.has(dr_backup._LOCK_NAME)

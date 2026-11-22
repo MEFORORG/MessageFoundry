@@ -2352,8 +2352,8 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> int:
     return os.open(entry.name, flags, dir_fd=dir_fd)
 
 
-#: ``O_NOFOLLOW`` where the platform has it, for the spare-marker read (:func:`_read_spare_marker`),
-#: its one user. Windows has none.
+#: ``O_NOFOLLOW`` where the platform has it, at least for the spare-marker read
+#: (:func:`_read_spare_marker`). Windows has none.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: ``O_NONBLOCK`` where the platform has it, for the spare-marker read too.
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
@@ -3176,6 +3176,23 @@ _READ_CONTROL = 0x00020000
 _GENERIC_WRITE = 0x40000000
 
 
+def _win_create_new(path: Path) -> None:
+    """Windows: create the empty file ``path``, opening any entry already there as itself, so a
+    link there, dangling or not, is a name in use (``FileExistsError``) and is never followed."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    kernel32 = _win_api()
+    handle = kernel32.CreateFileW(
+        str(path), _GENERIC_WRITE, _SHARE_ALL, None, 1, _FLAG_OPEN_REPARSE_POINT, None
+    )  # 1 is CREATE_NEW
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+            raise FileExistsError(errno.EEXIST, "a name in use")
+        raise ctypes.WinError(error)
+    kernel32.CloseHandle(handle)
+
+
 class _HeldStagingDir:
     """A staging directory opened as itself, through which the sweep reads its owner, opens its lock
     and tests its marker, and the teardown puts both back (BACKLOG #2420). So all of that reaches
@@ -3186,18 +3203,17 @@ class _HeldStagingDir:
     itself, refuses a link or a junction, and holds it, shared for reading and writing but not for
     delete, so it cannot be renamed or replaced while held; a name below it is opened by path.
     Used as a context manager, closed before any removal, since a held directory cannot be
-    removed.
+    removed. A name Windows opens as another object (:func:`_win_opens_another`) is refused.
 
-    What the Windows hold does not cover, at least: a held directory that is empty can still be
-    turned into a junction in place, as :func:`_win_held_walk` says, and a name below it then
-    reaches the junction's target; and a name Windows opens as another directory
-    (:func:`_win_opens_another`) is opened as that other one, which :func:`_teardown_staging`
-    then refuses to touch."""
+    What the Windows hold does not cover is listed once, in docs/PHI.md section 2's
+    ``mefor-backup-*`` / ``mefor-verify-*`` staging row."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         if sys.platform == "win32":
             # READ_CONTROL for the owner, FILE_READ_ATTRIBUTES for the tag.
+            if _win_opens_another(path):
+                raise _Unconfined("a name Windows opens as another object")
             handle = _win_create(
                 path,
                 _FILE_LIST_DIRECTORY | _READ_CONTROL | _FILE_READ_ATTRIBUTES,
@@ -3246,27 +3262,32 @@ class _HeldStagingDir:
         )
 
     def has(self, name: str) -> bool:
-        """Whether an entry named ``name`` is in the directory, a link included."""
+        """Whether an entry named ``name`` is in the directory, a link included; ``False`` when that
+        cannot be read."""
         if sys.platform == "win32":
             return os.path.lexists(self.path / name)
         try:
             os.stat(name, dir_fd=self.fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return False
+        except OSError:
+            return False  # as `os.path.lexists`, which the Windows arm uses, reads a fault
         return True
 
     def mark(self, name: str) -> None:
         """Create the empty file ``name`` unless an entry has that name; raise ``OSError`` when the
         entry there is not a plain file. The create is exclusive, so it never opens an existing name
-        and never follows a link planted there, on either platform. An entry that goes between the
-        refused create and its check is created once more."""
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        and never follows a link planted there, a dangling one included: on POSIX ``O_EXCL`` with
+        ``O_CREAT`` never follows a final link, and on Windows ``CREATE_NEW`` with
+        ``FILE_FLAG_OPEN_REPARSE_POINT`` takes the link itself as the name in use, where an
+        ``os.open`` create would make the file at a dangling link's target. An entry that goes
+        between the refused create and its check is created once more."""
         for attempt in (1, 2):
             try:
                 if sys.platform == "win32":
-                    os.close(os.open(self.path / name, flags, 0o600))
+                    _win_create_new(self.path / name)
                 else:
-                    os.close(os.open(name, flags | os.O_NOFOLLOW, 0o600, dir_fd=self.fd))
+                    os.close(
+                        os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.fd)
+                    )
                 return
             except FileExistsError:
                 pass
@@ -4304,7 +4325,8 @@ def _another_owner(path: Path) -> None:
 def _proven_abandoned(path: Path, owner: object) -> bool:
     """Whether the sweep may tear down the candidate ``path``, which holds a lock file: it has
     ``owner``, its lock can be taken, and it holds the marker. What it refuses is
-    logged, except a live run's lock and a missing lock or marker.
+    logged, except at least a live run's lock, a missing lock or marker, and a candidate gone by its
+    open.
 
     The owner is read by path first, so another account's directory is never opened and held at
     all, and then again from the directory opened as itself (:class:`_HeldStagingDir`), through
