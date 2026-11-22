@@ -4429,6 +4429,91 @@ def test_a_draft_publisher_refuses_while_the_variable_is_set_and_the_upload_did_
     assert not any("--draft=false" in c for c in calls), calls
 
 
+#: The draft publishers' refusal, as each step echoes it.
+_DRAFT_REFUSAL = re.compile(r'echo "(::error::\$GATE_NAME is \'true\'[^"\n]*)"')
+
+#: Clauses of that refusal which docs/SUPPLY-CHAIN.md, *The draft*, must carry too. Compared after
+#: :func:`_flat_text`, so the doc's backticks and line wraps do not count, and with the refusal's
+#: `$GATE_NAME` read as the doc's "the variable". A clause listed here and dropped from either copy,
+#: the organization prohibition among them, is named by the test below (vault BACKLOG #2975 item
+#: 16). The list is not every clause: the publisher re-run step, for one, is worded differently in
+#: the two copies and is not compared.
+_DRAFT_REFUSAL_CLAUSES = (
+    "holds its own copy of the variable, with a value that is not true in any letter case",
+    "a copy removed since",
+    "the remedies below clear it either way, so it need not be told apart",
+    "remove any copy from the pypi environment",
+    "re-runs the jobs after it",
+    "a re-run failed jobs reuses the upload",
+    "is queued, waiting or in progress",
+    "none can start before the restore",
+    "note whether",
+    "such as false",
+    "for this repository only",
+    "do not edit or delete an organization copy",
+    "other repositories may read",
+    "whatever its result, and before the next release",
+    "deleting it if",
+    "or that release skips its upload too and still goes public",
+    "within 30 days of a runs first attempt",
+)
+
+
+def _flat_text(text: str) -> str:
+    """``text`` in lower case, with quotes and backticks dropped and whitespace runs made one space."""
+    return " ".join(re.sub(r"[`'\"]", "", text).lower().split())
+
+
+def test_the_draft_refusal_is_one_text_and_the_doc_carries_each_clause() -> None:
+    """The refusal is kept by hand in three places: the two draft publishers' `::error::` strings
+    and docs/SUPPLY-CHAIN.md, *The draft* (vault BACKLOG #2975 item 16). The two strings must be
+    identical, and each clause in `_DRAFT_REFUSAL_CLAUSES` must be in both the string and the doc.
+
+    Mutation: edit one publisher's string, or drop a clause, such as the organization prohibition,
+    from the string or the doc. Red here."""
+    jobs = _jobs()
+    texts = []
+    for publisher in (_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB):
+        run = _executed_shell(str(_release_step(jobs[publisher], "--draft=false").get("run")))
+        found = _DRAFT_REFUSAL.findall(run)
+        assert len(found) == 1, f"{publisher}: expected one draft refusal, found {len(found)}"
+        texts.append(found[0])
+    assert texts[0] == texts[1], (
+        f"{_PUBLISH_JOB} and {_CONSOLE_PUBLISH_JOB} echo different refusals; they share one text"
+    )
+    doc = (_REPO / "docs" / "SUPPLY-CHAIN.md").read_text(encoding="utf-8")
+    start = doc.index("- **The draft.**")
+    section = _flat_text(doc[start : doc.index("- **The provenance gate.**", start)])
+    refusal = _flat_text(texts[0].replace("$GATE_NAME", "the variable"))
+    # A floor, so an emptied clause list cannot pass vacuously.
+    assert len(_DRAFT_REFUSAL_CLAUSES) >= 15, _DRAFT_REFUSAL_CLAUSES
+    missing = [
+        f"{clause!r} not in the {where}"
+        for clause in _DRAFT_REFUSAL_CLAUSES
+        for where, text in (("refusal", refusal), ("doc", section))
+        if clause not in text
+    ]
+    assert not missing, "\n".join(missing)
+
+
+@pytest.mark.parametrize("publisher", [_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB])
+def test_no_step_of_a_draft_publisher_is_gated_on_a_variable(publisher: str) -> None:
+    """The job-level walk, `_variable_gated_jobs`, reads no step's `if:` (vault BACKLOG #2975 item
+    12). A publisher step skipped by an unset variable leaves the release a draft on a green run,
+    so no step of either draft publisher may carry a variable gate. The planted gate is the
+    positive control.
+
+    Mutation: put `if: vars.PUBLISH_HARNESS == 'true'` on a draft publisher's step. Red here."""
+    jobs = copy.deepcopy(_jobs())
+    steps = [s for s in jobs[publisher]["steps"] if isinstance(s, dict)]
+    assert steps, f"{publisher} has no steps"
+    gated = [s.get("name") for s in steps if _is_variable_gated(s)]
+    assert not gated, f"{publisher} step(s) {gated} are gated on a variable; unset, they skip"
+    publish = _release_step(jobs[publisher], "--draft=false")
+    publish["if"] = "vars.PUBLISH_HARNESS == 'true'"
+    assert [s.get("name") for s in steps if _is_variable_gated(s)] == [publish.get("name")]
+
+
 # --- (14) every PyPI publish runs in a publish-only job that names `pypi` (vault BACKLOG #2631) ------
 #
 # The environment key sits on a whole job. Put on a job that also builds, an approval on the

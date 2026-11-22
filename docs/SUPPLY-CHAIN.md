@@ -162,7 +162,8 @@ Facts the labels leave out:
   are on PyPI by then. The refusal's text names two causes, a remedy with the upload and one
   without, but not which cause fired, and points here for the routes left past GitHub's re-run
   window. At least these two can fire, alone or together:
-  - The `pypi` environment holds its own copy of the variable, with a value other than `true`.
+  - The `pypi` environment holds its own copy of the variable, with a value that is not `true` in
+    any letter case.
     Look at that environment's variables in the repository settings to see whether it holds one
     now; a copy removed since the run cannot be seen there.
   - The build job read the variable before it was set, or the upload read it while it was unset
@@ -170,36 +171,40 @@ Facts the labels leave out:
     fires; the remedies below clear it either way, so it need not be told apart.
 
   To finish the release with the upload, remove any copy from the `pypi` environment, then re-run
-  the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag), which
-  re-runs the jobs after it, so the upload asks for the `pypi` approval again, and reads the
-  variable afresh in each, so it clears both. While the variable still reads `true`, a "Re-run
-  failed jobs" reuses the upload's outcome and is refused again.
+  the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag). That
+  re-runs the jobs after it, so the upload asks for the `pypi` approval again, and each of those
+  jobs reads the variable afresh, which clears both causes. On an engine tag the re-run upload
+  also downloads the `pypi-engine` artifact, which the `release` job uploaded and which is kept
+  for at most 30 days, so it fails once that artifact has expired. While the variable still reads
+  `true`, a "Re-run failed jobs" reuses the upload's outcome and is refused again.
 
   To finish it without the upload, first check that no other release run that reads the variable
-  is queued, waiting or in progress, and that none can start before the restore below. Note
-  whether the repository holds the variable and its value. Remove any copy from the `pypi`
-  environment, give the repository variable a value that is not `true` in any letter case, such
-  as `false`, and re-run the publisher. A repository variable takes precedence over an
-  organization variable of the same name, so this changes the value for this repository only. Do
-  not edit or delete an organization copy, which other repositories may read. Once that re-run
-  has finished, whatever its result, and before the next release, restore the repository variable
-  to the value you noted, deleting it if the repository had none, or that release skips its upload
-  too and still goes public.
+  is queued, waiting or in progress, and that none can start before the restore below. Do not edit
+  or delete an organization copy of the variable in any of the steps that follow, because other
+  repositories may read it. Note whether the repository holds the variable and its value. Remove
+  any copy from the `pypi` environment, give the repository variable a value that is not `true`
+  in any letter case, such as `false`, and re-run the publisher (`publish-github-release` on an
+  engine tag, `publish-github-release-webconsole` on a console tag). A repository variable takes
+  precedence over an organization variable of the same name, so this changes the value for this
+  repository only. Once that re-run has finished, whatever its result, and before the next
+  release, restore the repository variable to the value you noted, deleting it if the repository
+  had none, or that release skips its upload too and still goes public.
 
   GitHub allows a re-run only within 30 days of a run's first attempt, so past that no re-run
   finishes the release. When this refusal is what holds the draft, at least two routes are left:
   the publisher's own command run by hand, `gh release edit <tag> --draft=false --repo
   MEFORORG/MessageFoundry`, which publishes the draft without that upload; and a new version
-  under a new tag. Run by hand on a draft held for any other reason, such as a failed build job
-  or a refused approval, the same command publishes a release with an asset missing or a package
-  not on PyPI.
+  under a new tag. On either route, first remove any copy of the variable from the `pypi`
+  environment, or the next release can be refused the same way. Run by hand on a draft held for
+  any other reason, such as a failed build job or a refused approval, the same command publishes
+  a release with an asset missing or a package not on PyPI.
 - **The provenance gate.** The tagged commit must be on `main`, and for each required check, the
   latest run of every workflow and trigger that ran it on that commit must have passed. A red run
   after the merge blocks the tag even if the merge-queue run passed, and a green from another
   workflow or trigger does not clear it. To clear it, re-run the failed jobs of the workflow run the
   refusal names, or run that workflow on the same trigger again, then re-run the release. GitHub
-  re-runs a workflow run only within 30 days of it. A check still running is waited for. A check the server requires that never ran on the commit also
-  blocks it; tag a newer commit that ran it.
+  re-runs a workflow run only within 30 days of it. A check still running is waited for. A check
+  the server requires that never ran on the commit also blocks it; tag a newer commit that ran it.
 
 ## What we publish, per release
 
@@ -220,9 +225,10 @@ has no SBOM of its own.
 
 Apart from that, every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
 job in `release.yml` sets `attestations: true`. So the web console wheel (`messagefoundry-webconsole`)
-and the harness wheel get a PyPI-side attestation whenever their PyPI publish runs. Both of those
-publishes are gated on a repository variable. That is all they get: their release jobs have no
-Sigstore, SBOM or SLSA step.
+and the harness wheel get a PyPI-side attestation whenever their PyPI publish runs. Each of those
+publishes runs only when its variable, `PUBLISH_WEBCONSOLE` or `PUBLISH_HARNESS`, reads `true`;
+*The draft* above says what a copy in the `pypi` environment does. That is all they get: their
+release jobs have no Sigstore, SBOM or SLSA step.
 
 Additional CycloneDX SBOMs — the **VS Code extension** (npm) and the **container image** (Debian base +
 system libs + installed Python) — are produced by the daily/​on-demand `security.yml` workflow and
