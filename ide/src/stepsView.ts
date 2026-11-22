@@ -407,8 +407,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       // parse is non-null here (shouldFallBackToText returned fallback:false only for a real handler set).
       const handlers = buildHandlerViewModels(parse as LensParseResult, source);
       // ADR 0104 §2.3 P2 and ADR 0076 Amendment D: stash each element's message type (the field picker's
-      // scope) and role (the Router purity check) for THIS panel (a projection of THIS parse).
-      panelState.update(parse as LensParseResult);
+      // scope) and role (the Router purity check), and each row's kind and fan-out flags (the structural
+      // insert anchor, BACKLOG #5844), for THIS panel (a projection of THIS parse).
+      panelState.update(parse as LensParseResult, handlers);
       // Live values come from a SECOND `dryrun --trace` that reads the module FROM DISK, but the rows
       // above are projected from the LIVE buffer. While the buffer is dirty (an unsaved structural edit
       // shifted rows relative to disk — or any unsaved change made buffer != disk) the disk trace's line
@@ -806,15 +807,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         ) {
           // ADR 0104 fan-out "＋ dest": pick a destination, then add_destination via the SAME byte-stable
           // applyStructural path. The anchor's fan-out flags drive the insert position (isReturnRow).
-          const anchor = {
-            handler: m.handler,
-            lineStart: m.lineStart,
-            lineEnd: m.lineEnd,
-            expectSrc: typeof m.expectSrc === "string" ? m.expectSrc : undefined,
-            kind: (typeof m.kind === "string" ? m.kind : "send") as RowKind,
-            appended: m.appended === true,
-            scaffold: typeof m.scaffold === "string" ? m.scaffold : undefined,
-          };
+          const anchor = panelState.anchorFor(
+            { ...m, handler: m.handler, lineStart: m.lineStart, lineEnd: m.lineEnd },
+            "send",
+          );
           void pickDestination("Add destination", "Destination (fan out)").then((dest) => {
             if (dest !== undefined && dest !== "" && !disposed) {
               void applyStructural(buildAddDestinationRequest(anchor, dest));
@@ -880,16 +876,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // Insert a DEFAULT-param template at the currently SELECTED row (no InputBox prompts). The
           // position is either the explicit context-menu choice or derived from the anchor's kind (send →
           // before the return, else after) inside buildToolbarInsertRequest, which reuses the byte-stable
-          // `lens rewrite` path via applyStructural.
+          // `lens rewrite` path via applyStructural. The anchor carries the row's fan-out flags, so a
+          // derived position puts a mid-body append send before the new step and a footer after it (#5844).
           void applyStructural(
             buildToolbarInsertRequest(
-              {
-                handler: m.handler,
-                lineStart: m.lineStart,
-                lineEnd: m.lineEnd,
-                expectSrc: m.expectSrc,
-                kind: m.kind as RowKind,
-              },
+              panelState.anchorFor(
+                { ...m, handler: m.handler, lineStart: m.lineStart, lineEnd: m.lineEnd },
+                m.kind as RowKind,
+              ),
               m.action,
               m.position as "before" | "after" | undefined,
             ),
@@ -917,13 +911,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             );
             return;
           }
-          const anchor = {
-            handler: m.handler,
-            lineStart: m.lineStart,
-            lineEnd: m.lineEnd,
-            expectSrc: typeof m.expectSrc === "string" ? m.expectSrc : undefined,
-            kind: m.kind as RowKind,
-          };
+          // The anchor carries the row's fan-out flags, for a request that derives its position (#5844).
+          const anchor = panelState.anchorFor(
+            { ...m, handler: m.handler, lineStart: m.lineStart, lineEnd: m.lineEnd },
+            m.kind as RowKind,
+          );
           const position = m.position as "before" | "after" | undefined;
           if (item.prompts.length === 0) {
             void applyStructural(buildAddMenuRequest(item, anchor, {}, position));
@@ -969,17 +961,20 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // change; on a real change we show the "Pasted …" toast the webview supplied.
           const pasteText =
             typeof m.text === "string" ? m.text : "MessageFoundry: pasted the steps.";
+          // The page posts no fan-out flags with a paste, so the anchor takes them from this panel's
+          // projection: a block pasted at a mid-body append send lands after it, at a footer before (#5844).
+          const anchor = panelState.anchorFor(
+            { ...m, handler: m.handler, lineStart: m.lineStart, lineEnd: m.lineEnd },
+            m.kind as RowKind,
+          );
           void applyStructural(
-            buildPasteRequest(
-              {
-                handler: m.handler,
-                lineStart: m.lineStart,
-                lineEnd: m.lineEnd,
-                expectSrc: m.expectSrc,
-                kind: m.kind as RowKind,
-              },
-              { source: m.block, nesting: 0, kind: m.kind as RowKind, lineCount: 0, label: "" },
-            ),
+            buildPasteRequest(anchor, {
+              source: m.block,
+              nesting: 0,
+              kind: anchor.kind,
+              lineCount: 0,
+              label: "",
+            }),
           ).then((ok) => {
             if (ok && !disposed) {
               void vscode.window.showInformationMessage(pasteText);
