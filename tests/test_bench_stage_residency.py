@@ -49,7 +49,7 @@ def _message(mid: str, at: float, *, births: int, deaths: int, step: float = 0.0
     return events
 
 
-def _report(events: list[Event]) -> dict[str, Any]:
+def _report(events: list[Event], *, trim_tail_s: float = 0.0) -> dict[str, Any]:
     async def run() -> dict[str, Any]:
         async with aiosqlite.connect(":memory:") as db:
             await db.execute(
@@ -61,7 +61,7 @@ def _report(events: list[Event]) -> dict[str, Any]:
                 since=None,
                 until=None,
                 trim_head_s=0.0,
-                trim_tail_s=0.0,
+                trim_tail_s=trim_tail_s,
                 expect_t=None,
                 expect_d=None,
                 full_only=False,
@@ -127,8 +127,37 @@ def test_a_parity_mismatch_emits_none_rather_than_a_number(births: int, deaths: 
 
     assert concurrency["n_outbound_rows"] is None
     assert concurrency["n_outbound_parity"] == {"mismatched_messages": 1, "messages": 21}
-    # The message-level count has no such premise, so it must survive the refusal.
+    # The message-level count does not use the birth premise, so the refusal must not void it.
     assert concurrency["n_messages_in_flight"]["peak"] >= 1.0
+
+
+def test_a_redelivery_offsetting_an_undelivered_row_voids_the_figure() -> None:
+    """RED when: 8 births and 8 deaths over 7 destinations passes, with one row still alive."""
+    odd = _message("odd", 110.5, births=8, deaths=7)
+    odd.append(("odd", "delivered", 111.5, "OB_00"))
+
+    concurrency = _report(_ladder() + odd)["concurrency"]
+
+    assert concurrency["n_outbound_rows"] is None
+    assert concurrency["n_outbound_parity"]["mismatched_messages"] == 1
+
+
+def test_a_delivered_row_with_no_destination_voids_the_figure() -> None:
+    """RED when: parity counts a death that the death stream, which needs a destination, lacks."""
+    odd = _message("odd", 110.5, births=1, deaths=0)
+    odd.append(("odd", "delivered", 111.0, None))
+
+    assert _report(_ladder() + odd)["concurrency"]["n_outbound_rows"] is None
+
+
+def test_a_mismatch_received_after_the_trimmed_window_keeps_the_figure() -> None:
+    """RED when: a message wholly past ``hi`` erases a figure it contributes nothing to."""
+    clean = _report(_ladder(), trim_tail_s=5.0)["concurrency"]
+    edged = _report(_ladder() + _message("late", 118.5, births=1, deaths=0), trim_tail_s=5.0)
+
+    assert edged["concurrency"]["n_outbound_parity"]["mismatched_messages"] == 0
+    assert edged["concurrency"]["n_outbound_rows"] is not None
+    assert clean["n_outbound_rows"] is not None
 
 
 def test_a_message_with_no_transform_and_no_delivery_keeps_parity() -> None:

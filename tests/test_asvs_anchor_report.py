@@ -490,6 +490,73 @@ def test_an_anchored_file_that_cannot_be_read_is_an_instrument_failure(
     _assert_instrument_refusal(code, out, "PermissionError")
 
 
+def test_a_cited_file_that_cannot_be_examined_is_not_reported_missing(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a stat failure reads as "file missing", because ``is_file`` answers False on it."""
+    root, record = tree
+    real_stat = Path.stat
+
+    def _deny(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == "engine_module.py":
+            raise PermissionError(SENTINEL_ID)
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _deny)
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    _assert_instrument_refusal(code, out, "PermissionError")
+
+
+def test_a_directory_at_a_cited_path_is_still_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the arm above: not a regular file stays PATH_MISSING, not a refusal."""
+    root = tmp_path / "engine"
+    (root / "engine_module.py").mkdir(parents=True)
+    record = _scorecard(tmp_path / "record.toml")
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    assert code == EXIT_FINDINGS, out
+    assert "file missing     : 1" in out, out
+
+
+def test_a_refusal_with_no_usable_stderr_still_exits_2(
+    tree: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """RED when: the refusal's own write raises and the run exits 1, the findings code."""
+    root, _ = tree
+    monkeypatch.setattr(sys, "stderr", None)
+
+    assert main(["--scorecard", str(tmp_path / "absent.toml"), "--root", str(root)]) == 2
+
+
+def test_a_closed_stdout_pipe_exits_2_not_120(tree: tuple[Path, Path], tmp_path: Path) -> None:
+    """RED when: the failed flush fails again at interpreter exit, which CPython reports as 120."""
+    root, record = tree
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "asvs" / "anchor_report.py"),
+            "--scorecard",
+            str(record),
+            "--root",
+            str(root),
+        ],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert proc.stdout is not None
+    proc.stdout.close()
+
+    assert proc.wait(timeout=120) == EXIT_INSTRUMENT
+
+
 def test_a_console_that_cannot_encode_the_report_is_an_instrument_failure(tmp_path: Path) -> None:
     """RED when: a cp1252 stdout exits 1. A real interpreter, because the codec is the fault, and
     no ``-I``, which would make it ignore PYTHONIOENCODING. The root's name is what cp1252 lacks."""

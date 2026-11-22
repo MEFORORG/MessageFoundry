@@ -609,20 +609,25 @@ def _counting_n(births: list[float], deaths: list[float], lo: float, hi: float) 
     }
 
 
-def _outbound_parity(aggs: list[_Agg]) -> dict[str, int]:
+def _outbound_parity(aggs: list[_Agg], hi: float) -> dict[str, int]:
     """How many messages break the one-birth-one-death premise of ``n_outbound_rows``.
 
     All three stores write ONE ``transformed`` per handler handoff, with the destination count only
     in its ``detail``. Weighting births by that text would make this tool read a column its PHI note
     says it does not, so a message whose two counts differ voids the figure instead. An in-flight or
     dead-lettered message differs too: from these events it cannot be told from a handoff that
-    produced no row.
+    produced no row. ``retried`` voids it as well: a redelivery can offset a row that never delivered,
+    and a ``delivered`` with no destination is counted here but absent from the death stream.
+
+    Only messages received before ``hi`` count. A later one has no mark inside the window, so the
+    stop edge a tail trim exists to exclude cannot erase the rung's figure.
 
     NECESSARY, NOT SUFFICIENT. Handlers delivering 2 and 0 have two births and two deaths, so they
     pass here while the second birth is stamped at the wrong handoff.
     """
-    mismatched = sum(1 for m in aggs if m.n_transformed != m.n_delivered)
-    return {"mismatched_messages": mismatched, "messages": len(aggs)}
+    relevant = [m for m in aggs if m.received is None or m.received < hi]
+    mismatched = sum(1 for m in relevant if m.n_transformed != m.n_delivered or m.retried)
+    return {"mismatched_messages": mismatched, "messages": len(relevant)}
 
 
 async def _window_report(
@@ -690,8 +695,7 @@ async def _window_report(
         pop = pop[:limit]
 
     delivered_ts = [float(ts) for _, ts in lane_rows]
-    # The whole cohort, because the counting process below reads the whole cohort's streams.
-    parity = _outbound_parity(aggs)
+    parity = _outbound_parity(aggs, hi)
     n_out = (
         None if parity["mismatched_messages"] else _counting_n(transformed_ts, delivered_ts, lo, hi)
     )

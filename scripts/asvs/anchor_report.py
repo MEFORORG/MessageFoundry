@@ -56,7 +56,10 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import os
+import stat
 import subprocess  # nosec B404 - fixed argv, no shell; see _git
 import sys
 from collections import Counter
@@ -121,6 +124,22 @@ class AnchorOutcome:
 #: already lost it once. See :func:`_refuse_unreadable`.
 
 
+def _read_cited(target: Path) -> str | None:
+    """The cited file's text, or None when it is not there.
+
+    ``stat`` rather than ``Path.is_file``, which answers False on ANY stat failure and so would
+    report a file this run could not examine as a file that is missing. Only the two errors that
+    mean "not there" are None; any other reaches the guard in :func:`main`.
+    """
+    try:
+        mode = target.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(mode):
+        return None
+    return target.read_text(encoding="utf-8", errors="replace")
+
+
 def audit(cells: list[Cell], root: Path) -> list[AnchorOutcome]:
     """Resolve every anchor against ``root``, using the verifier's own locator.
 
@@ -135,11 +154,7 @@ def audit(cells: list[Cell], root: Path) -> list[AnchorOutcome]:
         for anchor in cell.evidence:
             target = root / anchor.path
             if target not in text_cache:
-                text_cache[target] = (
-                    target.read_text(encoding="utf-8", errors="replace")
-                    if target.is_file()
-                    else None
-                )
+                text_cache[target] = _read_cited(target)
             text = text_cache[target]
             if text is None:
                 out.append(AnchorOutcome(anchor.path, PATH_MISSING))
@@ -255,7 +270,9 @@ def _file_key(item: tuple[str, int]) -> tuple[int, str]:
 
 
 def _refuse(message: str) -> int:
-    sys.stderr.write(f"REFUSING: {message}\n")
+    # A stderr that cannot be written must not turn "could not measure" into another exit code.
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        sys.stderr.write(f"REFUSING: {message}\n")
     return EXIT_INSTRUMENT
 
 
@@ -411,11 +428,18 @@ def main(argv: list[str] | None = None) -> int:
         return _refuse_unfinished(exc)
 
 
+def _discard_unwritten_stdout() -> None:
+    # After a failed flush the buffer still holds the text, and the interpreter's own flush at exit
+    # would fail again and turn this exit code into 120. Pointing the descriptor at the null device
+    # is the recipe in the Python docs for SIGPIPE. Not in main(): it would close an in-process
+    # caller's stdout.
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+
+
 if __name__ == "__main__":
-    # A refusal prints paths, so it must survive a console that cannot encode them. Stdout stays
-    # strict on purpose: a report it cannot write is a refusal, never a report with holes in it.
-    # Done here, not in main(), so an in-process caller's stream is left alone; a replaced stream
-    # may have no `reconfigure`.
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(errors="backslashreplace")
-    raise SystemExit(main())
+    # Stdout stays strict on purpose: a report it cannot write is a refusal, never one with holes.
+    exit_code = main()
+    if exit_code == EXIT_INSTRUMENT:
+        _discard_unwritten_stdout()
+    raise SystemExit(exit_code)
