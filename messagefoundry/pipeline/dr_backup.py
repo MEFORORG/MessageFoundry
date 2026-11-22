@@ -101,7 +101,7 @@ from messagefoundry.store.crypto import (
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
-from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.store.schema_verify import SchemaMismatchError, is_schema_step_error
 from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.transports.file import (
     _FLAG_BACKUP_SEMANTICS,
@@ -4786,7 +4786,7 @@ def _full_open_check(
     # Whether the last `_walk` returned `_decrypt_check`'s own verdict, rather than one for a raise.
     walk_read: list[bool] = [False]
     # The last walk's `WalkVerdict.kind`, or None for one that raised or carries no kind.
-    walk_kind: list[str | None] = [None]
+    walk_kind: list[WalkKind | None] = [None]
 
     def _walk() -> tuple[str, str, int]:
         walk_read[0] = False
@@ -4865,7 +4865,7 @@ def _full_open_check(
                     else ""
                 )
                 # Redacted by `_incompatible_snapshot` under `_WALK_REASON_LIMIT`, not safe_text's
-                # 200-character default, which this sentence's prefix alone can pass.
+                # 200-character default, which the prefix and a reading's line together can pass.
                 walk = (
                     f"Before the open, the walk of the cells this build knows reported {walked[0]}"
                     f"{why}: {walked[1]}"
@@ -4906,10 +4906,10 @@ def _full_open_check(
 _INCOMPATIBLE_REASON_LIMIT = 600
 
 #: The most characters of the walk's sentence the incompatible-snapshot refusal quotes. Its parts
-#: are bounded where they are made: a cell's locator values at 64 characters each after their
-#: escape (`cipher_cells._shown`), and error text at safe_exc's 200. A reading's line then stays
-#: well inside this, verdict and reason words included, so the cut only stops a defect from
-#: making the sentence unbounded.
+#: are bounded where they are made: at least a cell's locator values, at 64 characters each after
+#: their escape (`cipher_cells._shown`), and error text at safe_exc's 200 plus its bound note. A
+#: reading's line, the foreign-key note included, then stays well inside this, verdict and reason
+#: words included, so the cut only stops a defect from making the sentence unbounded.
 _WALK_REASON_LIMIT = 2000
 
 #: How :func:`_decrypt_check` opens the reason for a decrypt the key service gave no verdict on.
@@ -4971,9 +4971,10 @@ WalkKind = Literal[
     "pass", "cell", "sqlite_schema", "sqlite", "interrupted", "outage", "key_mismatch"
 ]
 
-#: The kinds a walk under this build could reach only by reading another version's cells or
-#: schema differently, so the incompatible-snapshot refusal offers that reading for them alone.
-_MISREADABLE_KINDS: frozenset[str] = frozenset({"cell", "sqlite_schema"})
+#: The kinds a walk under this build can reach by reading another version's cells or schema
+#: differently, as well as by real damage, so the incompatible-snapshot refusal offers that reading
+#: for them alone. It is a possible cause there, never a finding that the cells are sound.
+_MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
 
 
 class WalkVerdict(tuple[str, str, int]):
@@ -4987,11 +4988,23 @@ class WalkVerdict(tuple[str, str, int]):
         verdict.kind = kind
         return verdict
 
+    def __getnewargs__(self) -> tuple[str, str, int, WalkKind]:
+        # So copy and pickle rebuild it with its kind; tuple's own supplies only the three items.
+        return (self[0], self[1], self[2], self.kind)
+
+    def __repr__(self) -> str:
+        return f"WalkVerdict({self[0]!r}, {self[1]!r}, {self[2]!r}, kind={self.kind!r})"
+
 
 def _sqlite_kind(exc: sqlite3.Error) -> WalkKind:
-    """``sqlite_schema`` for a statement the snapshot's schema cannot answer, else ``sqlite``."""
-    schema = str(exc).startswith(("no such table", "no such column"))
-    return "sqlite_schema" if isinstance(exc, sqlite3.OperationalError) and schema else "sqlite"
+    """``sqlite_schema`` where the store's own schema classifier (:func:`is_schema_step_error`)
+    calls the fault a wrong shape; ``cell`` for a TEXT value SQLite could not decode, which is that
+    cell's own content; else ``sqlite``."""
+    if is_schema_step_error(exc):
+        return "sqlite_schema"
+    if isinstance(exc, sqlite3.OperationalError) and str(exc).startswith("Could not decode to"):
+        return "cell"
+    return "sqlite"
 
 
 def _decrypt_check(

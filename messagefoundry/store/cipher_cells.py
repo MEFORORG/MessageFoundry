@@ -147,14 +147,24 @@ _LOCATOR_LIMIT = 64
 
 
 def _shown(value: object) -> str:
+    # Only as much of the value as can be shown is read: an escape makes one character up to ten
+    # (`\U000e0001`), so a value is escaped character by character and cut at the last whole
+    # escape that fits. A shown value is then at most the limit plus the elision mark, whatever it
+    # holds (BACKLOG #1719). A value with any non-printable character in that head is escaped
+    # throughout, its backslashes included, so the shown text reads back unambiguously.
     text = str(value)
-    if not text.isprintable():
-        text = text.encode("unicode_escape").decode("ascii")
-    # Cut after the escape, which can make one character ten (`\U000e0001`), so a shown value is
-    # at most the limit and the elision mark whatever it holds (BACKLOG #1719).
-    if len(text) > _LOCATOR_LIMIT:
-        text = text[:_LOCATOR_LIMIT] + "..."
-    return text
+    head = text[: _LOCATOR_LIMIT + 1]
+    if head.isprintable():
+        return head if len(text) <= _LOCATOR_LIMIT else head[:_LOCATOR_LIMIT] + "..."
+    shown: list[str] = []
+    width = 0
+    for ch in head:
+        piece = ch.encode("unicode_escape").decode("ascii")
+        if width + len(piece) > _LOCATOR_LIMIT:
+            return "".join(shown) + "..."
+        shown.append(piece)
+        width += len(piece)
+    return "".join(shown) if len(text) == len(head) else "".join(shown) + "..."
 
 
 _RESPONSE_KEY = ("message_id", "destination_name", "response_seq")

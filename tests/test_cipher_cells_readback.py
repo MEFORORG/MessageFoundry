@@ -2138,12 +2138,57 @@ def test_the_misread_rationale_follows_the_walks_kind(
 
 
 def test_a_sqlite_fault_is_a_schema_kind_only_when_the_schema_could_not_answer() -> None:
-    """``no such table`` or ``no such column`` is the snapshot's schema; a malformed image is not."""
-    assert dr_backup._sqlite_kind(sqlite3.OperationalError("no such column: c")) == "sqlite_schema"
-    assert dr_backup._sqlite_kind(sqlite3.OperationalError("no such table: t")) == "sqlite_schema"
+    """A fault the store's schema classifier calls a wrong shape is ``sqlite_schema``; a TEXT value
+    SQLite cannot decode is the cell's own content; a malformed image or a lock is neither."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE t (a TEXT)")
+        conn.execute("INSERT INTO t VALUES (CAST(x'ff' AS TEXT))")
+        faults: dict[str, sqlite3.Error] = {}
+        for name, sql in (("column", "SELECT nope FROM t"), ("table", "SELECT 1 FROM nope")):
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError as exc:
+                faults[name] = exc
+        try:
+            conn.execute("SELECT a FROM t").fetchall()
+        except sqlite3.OperationalError as exc:
+            faults["decode"] = exc
+    finally:
+        conn.close()
+    assert set(faults) == {"column", "table", "decode"}, faults
+    assert dr_backup._sqlite_kind(faults["column"]) == "sqlite_schema"
+    assert dr_backup._sqlite_kind(faults["table"]) == "sqlite_schema"
+    assert dr_backup._sqlite_kind(faults["decode"]) == "cell"
     malformed = sqlite3.DatabaseError("database disk image is malformed")
     assert dr_backup._sqlite_kind(malformed) == "sqlite"
     assert dr_backup._sqlite_kind(sqlite3.OperationalError("database is locked")) == "sqlite"
+
+
+def test_a_walk_verdict_keeps_its_kind_through_copy_and_pickle() -> None:
+    import copy
+    import pickle
+
+    verdict = dr_backup.WalkVerdict("FAIL", "messages.raw id=1 did not decrypt", 3, "cell")
+    for clone in (copy.copy(verdict), copy.deepcopy(verdict), pickle.loads(pickle.dumps(verdict))):
+        assert tuple(clone) == ("FAIL", "messages.raw id=1 did not decrypt", 3)
+        assert clone.kind == "cell"
+
+
+def test_a_shown_locator_is_bounded_and_cut_on_a_whole_escape() -> None:
+    """A locator value is shown at most 64 characters and the elision mark, escaped character by
+    character, so no escape is split and a huge value is never escaped whole."""
+    from messagefoundry.store.cipher_cells import _LOCATOR_LIMIT, _shown
+
+    for value in (chr(0xE0001) * 70, "\\" * 40 + "\x00", "a" * 65, chr(0xE0001) * 10**6):
+        shown = _shown(value)
+        assert len(shown) <= _LOCATOR_LIMIT + 3, (len(shown), shown[:80])
+        if not value[: _LOCATOR_LIMIT + 1].isprintable():
+            # Whole escapes only, so the shown text decodes back without an error.
+            shown.removesuffix("...").encode("ascii").decode("unicode_escape")
+    assert _shown("short id") == "short id"
+    assert _shown("a" * 64) == "a" * 64
+    assert _shown(chr(0xE0001)) == "\\U000e0001"
 
 
 def test_a_real_outage_and_a_real_cell_finding_carry_their_kind(
