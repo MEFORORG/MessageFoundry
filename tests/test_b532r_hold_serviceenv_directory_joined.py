@@ -118,6 +118,8 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
         f"MEFOR_VALUE_A=\nOTHER={_KEY_B64}",
         "MEFOR_VALUE_A=\nProgramFiles(x86)=C:\\x",
         "MEFOR_VALUE_A=\nOTHER=1\nsynthetic-other-line",
+        "MEFOR_VALUE_A=\nMEFOR_VALUE_B",
+        "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY==",
     ],
     ids=[
         "assignment",
@@ -126,16 +128,34 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
         "assignment-to-a-key",
         "assignment-with-parentheses",
         "lines-after-an-assignment",
+        "name-alone",
+        "blank-directory-line",
     ],
 )
 def test_a_name_with_no_content_of_its_own_is_only_deleted(entry: str) -> None:
     """The Lander's seventh hold on PR 3142, as corrected in its eighth round: a later line
     the reader reads as a variable of its own takes the lines after it, and a blank one adds
-    nothing, so the name has no content and the refusal says only to delete it."""
+    nothing, nor does a blank directory entry, so the name has no content and the refusal
+    says only to delete it."""
     refusal = service_env_refusal(_read([entry]))
     assert refusal is not None
     assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
     assert "Put " not in refusal and CREATE not in refusal and KEEP not in refusal
+    assert _KEY_B64[:43] not in refusal
+
+
+def test_a_refused_name_alone_after_an_empty_value_takes_the_key_after_it() -> None:
+    """A refused name written alone starts a variable of its own, so the key joined after it
+    is that name's, not the empty value's: nothing says to move a MEFOR_VALUE_* variable."""
+    refusal = service_env_refusal(
+        _read_pairs(
+            [(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, KEY_CLASS_NAMES[0]), (_EXTRA, "=" + _KEY_B64)]
+        )
+    )
+    assert refusal is not None
+    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    assert "Put each MEFOR_VALUE_* variable" not in refusal
+    assert _KEY_B64[:43] not in refusal
 
 
 @pytest.mark.parametrize(
@@ -149,6 +169,8 @@ def test_a_name_with_no_content_of_its_own_is_only_deleted(entry: str) -> None:
         [(_EXTRA, "MEFOR_VALUE_A=\nhunter2=")],
         [(_EXTRA, "MEFOR_VALUE_A=\n==")],
         [(_EXTRA, "MEFOR_VALUE_A=\nOTHER=")],
+        [(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "="), (_EXTRA, "Winter=2026!")],
+        [(_EXTRA, "X=1\nMEFOR_VALUE_A\nWinter=2026!")],
     ],
     ids=[
         "next-line",
@@ -159,6 +181,8 @@ def test_a_name_with_no_content_of_its_own_is_only_deleted(entry: str) -> None:
         "text-then-an-equals-sign",
         "equals-only-line",
         "name-with-nothing-after-it",
+        "name-alone-split-value",
+        "name-alone-in-one-string",
     ],
 )
 def test_a_value_that_starts_on_a_later_line_is_moved(pairs: list[tuple[str, str]]) -> None:
@@ -169,7 +193,8 @@ def test_a_value_that_starts_on_a_later_line_is_moved(pairs: list[tuple[str, str
     assert refusal is not None
     assert "Put each MEFOR_VALUE_* variable in the secrets directory" in refusal
     assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
-    assert "hunter2" not in refusal and "AAAA" not in refusal
+    assert "hunter2" not in refusal and "AAAA" not in refusal and "Winter" not in refusal
+    assert _KEY_B64[:43] not in refusal
 
 
 def test_a_name_empty_in_one_entry_and_joined_to_a_directory_in_another_moves_nothing() -> None:

@@ -637,6 +637,9 @@ class _Variable:
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
+    #: For the whole-string reading's variable only: the value the line reading gives the
+    #: string's first line, the rest of that line and the lines it takes. Remedy only.
+    line_value: str | None = field(default=None, repr=False)
 
 
 def _read_string(
@@ -732,7 +735,15 @@ def _read_string(
         ]
         counted = not (broken and _names(same_string))
         read.append(
-            _Variable(where, name, whole_value, line=first_line, broken=broken, counted=counted)
+            _Variable(
+                where,
+                name,
+                whole_value,
+                line=first_line,
+                broken=broken,
+                counted=counted,
+                line_value="\n".join(first_parts),
+            )
         )
         # Its value ends with the string, so it is the one the string ends on when no line of
         # the line reading starts a variable, as with ``MEFOR_VALUE_A<LF>=``, or
@@ -1076,21 +1087,17 @@ def read_service_env_posture(
 
 
 def _has_content(variable: _Variable) -> bool:
-    """Whether ``variable``'s value holds content (the Lander's eighth round on PR 3142): its
-    own line is not blank, or a later line is, before the first later line that starts a
-    variable of its own as the reader reads one (:func:`_line_start`). That line and the lines
-    after it are the other variable's. A blank later line adds nothing; any other, ``==`` among
-    them, is in the value the engine loads. ``#`` is nothing special to NSSM or to the engine,
-    which reads the value as it stands, so a line such as ``#x`` is content. Remedy only."""
-    own, *later = _LINE_BREAK.split(variable.value)
-    if own.strip():
-        return True
-    for line in later:
-        if _line_start(line) is not None:
-            return False
-        if line.strip():
-            return True
-    return False
+    """Whether ``variable``'s value holds content as the line reading reads it (the Lander's
+    eighth round on PR 3142): the rest of its own line and the later lines :func:`_read_string`
+    gives it, up to the next line that starts a variable, or, for the whole-string reading's
+    variable, its ``line_value``. A blank line adds nothing, nor does a directory entry
+    :func:`_directory_entry_value` takes, as a joined string of one adds nothing
+    (``directory_only``). Any other line is content, ``==`` among them. ``#`` is nothing special
+    to NSSM or to the engine, so a line such as ``#x`` is content. Remedy only."""
+    value = variable.value if variable.line_value is None else variable.line_value
+    return any(
+        line.strip() and _directory_entry_value(line) is None for line in _LINE_BREAK.split(value)
+    )
 
 
 def _every_kept(
@@ -1263,8 +1270,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry rather than "
                 "move it"
             )
-        # A value whose only content is a joined directory entry is empty in its own entry.
-        if posture.empty_value_names or any(v in only and v != _VALUE_PREFIX for v in values):
+        # A value whose only later lines or joined strings are blank or a directory entry
+        # (_has_content) is empty in its own entry, so a name Put skips is told what to do.
+        if posture.empty_value_names or any(
+            v in posture.contentless_value_names and v != _VALUE_PREFIX for v in values
+        ):
             parts.append(
                 "An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where an "
                 "empty override is really wanted, write it in the value file instead, since the "
