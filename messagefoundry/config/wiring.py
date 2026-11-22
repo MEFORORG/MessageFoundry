@@ -12001,8 +12001,8 @@ def _is_a_signal(exc: BaseException, path: Path) -> bool:
     put Python's back. What passes this can still be code, so :func:`_exec_module` logs the module.
 
     These reads can run a module's code: ``getsignal`` reads a handler's ``__class__``, a
-    traceback entry can be built by hand, and :func:`_in_dir` can log, which runs a log handler a
-    module added. This runs outside the loader's other guards, so what such
+    traceback entry can be built by hand, and :func:`_in_dir`'s log runs a log handler a module
+    added. This runs outside the loader's other guards, so what such
     a read raises would leave the loader as raised. A fault here means no, and the module is refused."""
     try:
         return (
@@ -12185,27 +12185,32 @@ def _in_dir(filename: str, directory: Path) -> bool:
     Only an absolute filename counts. The loader's modules record one (the import machinery makes the
     spec's path absolute, even for a config directory given as a relative path), while ``<string>``,
     ``<frozen ...>`` and any other relative name would resolve against the working directory, and so
-    match whenever the engine runs from the config directory."""
+    match whenever the engine runs from the config directory.
+
+    A folder that cannot be resolved is a no, logged at DEBUG (vault BACKLOG #3765, LF10). That log
+    can run a log handler a module added: an ``Exception`` it raises is dropped, and anything else
+    leaves this function, to the caller's guard, as from any other read that can run module code."""
     candidate = Path(filename)
     if not candidate.is_absolute():
         return False
+    unresolved: str
     try:
         # The folder, not the file, is resolved: a config file may be a symlink into another folder
         # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
         return candidate.parent.resolve() == directory
     except (OSError, ValueError) as exc:
-        # Logged at DEBUG rather than dropped (vault BACKLOG #3765, LF10): a "no" here can make a
-        # diagnostic name no file and no line. The class only, by _type_name: a file name is whatever
-        # string a module compiled its code under, or put on a SyntaxError, so it can be the module's
-        # own text. A module can have added a log handler, so the call can run its code; whatever
-        # that raises is dropped, as _exec_module drops it, so it cannot change this answer.
-        with suppress(BaseException):  # noqa: BLE001 - see the comment above
-            _logger.debug(
-                "config loader: a file name's folder could not be resolved (%s), so that file is "
-                "not taken as one in the config directory",
-                _type_name(exc),
-            )
-        return False
+        # The class only, by _type_name: a file name is whatever string a module compiled its code
+        # under, or put on a SyntaxError, so the error's text can be the module's own.
+        unresolved = _type_name(exc)
+    # Logged after the handler, so the error is not the current exception while a handler runs.
+    # A module's log handler must not change this answer.
+    with suppress(Exception):
+        _logger.debug(
+            "config loader: a file name's folder could not be resolved (%s), so that file is not "
+            "taken as one in the config directory",
+            unresolved,
+        )
+    return False
 
 
 def _textless_import_error(exc: ImportError) -> ImportError:
