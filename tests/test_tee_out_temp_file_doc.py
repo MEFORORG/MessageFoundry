@@ -65,4 +65,4 @@ def test_control_a_failed_write_whose_removal_works_leaves_none(
 def test_the_docstring_states_the_leftover() -> None:
     doc = " ".join((inspect.getdoc(tee_main._write_owner_only) or "").split())
     assert "leaves no temp file" not in doc
-    assert "unless that removal fails too" in doc
+    assert "At least a failed removal, a killed process or a crash leaves" in doc

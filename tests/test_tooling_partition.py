@@ -210,6 +210,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # It loads scripts/release/forbidden_members.py by path; that is the RULE it reads, not its
         # subject.
         "test_packaged_tree_denylist.py",
+        # Reads docs/PHI.md off disk and holds its re-encryption-on-write bullet to the section 2
+        # inventory (vault BACKLOG #1174). Its subject is the engine's own PHI record, edited on
+        # ENGINE pull requests, which do not trip the tooling path gate. Ambiguous, so it stays.
+        "test_phi_reencrypt_on_write_doc.py",
         # NOT engine source, so this entry widens the list's stated rule, as
         # test_conftest_name_collision_guard.py does and for the same reason. Its subject is the
         # test trees' log quiesce: it reads tests/conftest.py's ``_Baseline`` as pytest loaded it
@@ -261,6 +265,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
         # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #327).
         "test_security_txt_rfc9116.py",
+        # Reads docs/SECURITY.md off disk and keeps the passages outside the security-events
+        # feed's rule bullet pointing at it (vault BACKLOG #1151, #4776 item 3). Its subject is the
+        # engine's security record, edited on ENGINE pull requests. Ambiguous, so it stays.
+        "test_security_events_feed_doc_once.py",
         # LEFT THE MANIFEST (vault BACKLOG #3652). NOT engine source, so this entry widens the
         # list's stated rule, as test_conftest_name_collision_guard.py does. Its subject is the
         # server-DB store suites (tests/test_postgres_store.py, tests/test_sqlserver_store.py and

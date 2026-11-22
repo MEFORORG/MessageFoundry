@@ -17307,9 +17307,10 @@ class SqlServerStore:
         gives (BACKLOG #3023).
 
         LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
-        ROWLOCK`` before its session row, the order the whole-account sweeps read for this change
-        take them in. docs/SECURITY.md, *Limits of the session sweep*, is where those sweeps are
-        listed, with how each takes the account row and which sweeps take none. The re-key
+        ROWLOCK`` before its session row, the order in which the whole-account sweeps that take an
+        account row take them, at least those docs/SECURITY.md, *Limits of the session sweep*,
+        names. That section says how each takes the row, which sweeps take none, and which are
+        raced. The re-key
         moves the row to a new clustered key, and a sweep that met the row locked mid-move could
         find the old key gone and the new one out of its read, or deadlock with the re-key,
         depending on the plan. With the account row first, a re-key either commits before a sweep of
@@ -17319,8 +17320,7 @@ class SqlServerStore:
         read for this change that locks both rows takes the account row first, so the re-key
         closes no cycle with any of them. Read from the code; the race is replayed on the SQL
         Server leg by ``tests/_federated_unbind_store_contract.py``, against store calls only, and
-        not against the TOTP re-enrolment's. docs/SECURITY.md, *Limits of the session sweep*, says
-        which are raced and which are not."""
+        not against the TOTP re-enrolment's."""
 
         async def _link(cur: Any) -> None:
             retired_at = time.time() if now is None else now

@@ -628,9 +628,9 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
 
     A ``path`` naming nothing, on any platform -- no file and no link, not even a dangling one --
     is created as a NEW file that ``mkstemp`` creates exclusively at 0600 in the same directory,
-    flushed to disk, then renamed to ``path``. A failed write removes its temp file, unless that
-    removal fails too, which leaves the ``.<name>.*.tmp`` file beside ``path`` (vault BACKLOG
-    #3166, PR 2390 note 18). On Windows the
+    flushed to disk, then renamed to ``path``. A write that raises tries to remove its temp file. At least
+    a failed removal, a killed process or a crash leaves the ``.<name>.*.tmp`` file beside
+    ``path`` (vault BACKLOG #3166, PR 2390 note 18). On Windows the
     0600 mode means nothing and the new file takes its directory's access list. :mod:`tee.store`
     gives the capture DB an owner-only access list on open, but this writer does not; the tee
     imports nothing from ``messagefoundry``, so the engine's ``restricted_file`` is out of reach.

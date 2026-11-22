@@ -1453,9 +1453,9 @@ route and transform it (BACKLOG #1174).
   not what the code does (BACKLOG #1174).
 - **Re-encryption happens on write.** With a key set, the store cipher re-encrypts each column it
   covers the moment it is written back ([store/crypto.py](../messagefoundry/store/crypto.py)). Not
-  every column that can hold PHI is covered: at least the `state.key` and `reference.key` columns
-  stay plaintext at rest, and the [section 2 inventory](#2-where-phi-lives--data-at-rest-inventory)
-  says which columns are which. So the columns it covers do not linger in plaintext at rest, and the
+  every column that can hold PHI is covered: the
+  [section 2 inventory](#2-where-phi-lives--data-at-rest-inventory) says which columns are, and
+  which stay plaintext at rest. So the columns it covers do not linger in plaintext at rest, and the
   staged queue carries the message forward rather than holding it open. The decrypted body in
   process memory is never re-encrypted. It lives at least in the engine's heap, and under
   `[sandbox].mode = "subprocess"` in a per-inbound worker's too. It stays there as immutable Python
