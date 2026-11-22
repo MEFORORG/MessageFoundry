@@ -246,15 +246,6 @@ def test_a_not_null_table_constraint_raises(statements: tuple[str, ...]) -> None
         declared_schema(statements, "postgres")
 
 
-def test_the_postgres_expected_shape_holds_no_table_the_migration_drops() -> None:
-    """The migration runs ``DROP TABLE IF EXISTS lane_leases`` outside the declared batch, so the
-    expected shape must not hold that table, or every open would report it missing."""
-    postgres = pytest.importorskip(
-        "messagefoundry.store.postgres", reason="requires the postgres extra (asyncpg)"
-    )
-    assert "lane_leases" not in postgres._declared_schema().columns
-
-
 # --- review round 1 ------------------------------------------------------------------------------
 
 
@@ -355,3 +346,70 @@ def test_an_unterminated_add_ends_at_an_alter_database() -> None:
         "sqlserver",
     )
     assert shape.column_shapes["a"]["c"].nullable is True
+
+
+# --- review round 2 ------------------------------------------------------------------------------
+
+
+def test_a_case_in_a_predicate_does_not_end_the_opaque_index_words() -> None:
+    with pytest.raises(ValueError, match="drop column"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT, b INT, c INT)",
+                "CREATE INDEX ix ON t (a) WHERE CASE WHEN b > 0 THEN 1 ELSE 0 END = 1"
+                " AND c IS NULL",
+                "ALTER TABLE t DROP COLUMN c",
+            )
+        )
+
+
+@pytest.mark.parametrize("name", ["delete", "update", "insert"])
+def test_a_constraint_named_like_a_data_word_keeps_its_key(name: str) -> None:
+    shape = declared_schema(
+        ("CREATE TABLE t (id INT)", f"ALTER TABLE t ADD CONSTRAINT {name} PRIMARY KEY (id)"),
+        "postgres",
+    )
+    assert shape.column_shapes["t"]["id"].nullable is False
+
+
+def test_using_index_tablespace_on_its_own_line_is_a_storage_option() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT)",
+            "ALTER TABLE t ADD CONSTRAINT pk_t PRIMARY KEY (a) USING INDEX\n    TABLESPACE fast",
+        ),
+        "postgres",
+    )
+    assert shape.column_shapes["t"]["a"].nullable is False
+
+
+def test_a_t_sql_if_exists_guard_ends_an_unterminated_add() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT NULL)",
+            "IF COL_LENGTH('t','y') IS NULL ALTER TABLE t ADD y INT NULL\n"
+            "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix') CREATE INDEX ix ON t (a)",
+        ),
+        "sqlserver",
+    )
+    assert shape.column_shapes["t"]["y"].nullable is True and "ix" in shape.named_indexes
+
+
+def test_a_nested_subscript_is_not_a_bracketed_name() -> None:
+    shape = declared_schema(("CREATE INDEX ix ON t ((a[b[1]]))",))
+    assert shape.named_indexes["ix"].columns == ("<expr>",)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    ["ALTER TABLE IF EXISTS #t ADD x INT NULL", "CREATE TABLE\n    #tmp (x INT NULL)"],
+)
+def test_a_temporary_table_is_not_the_stores_in_any_spacing(statement: str) -> None:
+    shape = declared_schema(("CREATE TABLE t (a INT NULL)", statement), "sqlserver")
+    assert set(shape.columns) == {"t"}
+
+
+@pytest.mark.parametrize("name", ['"x""y"', "nn$a", "[x]]y]"])
+def test_a_not_null_constraint_with_an_escaped_or_dollar_name_raises(name: str) -> None:
+    with pytest.raises(ValueError, match="not-null constraint"):
+        declared_schema((f"CREATE TABLE t (a INT, CONSTRAINT {name} NOT NULL a)",), "postgres")

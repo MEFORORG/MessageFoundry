@@ -42,7 +42,7 @@ DDL the reader cannot place raises ``ValueError`` rather than being skipped or m
 not match, an ``ALTER TABLE`` with more than one clause or an action it does not know, a table rename,
 an ``ALTER INDEX``, a second ``CREATE TABLE`` of a table no ``DROP`` removed, a ``USING`` access
 method, a key column or expression carrying a collation, an operator class or a ``NULLS`` order, a key
-that opens with a cast of a column, a key built ``USING INDEX``, a SQL Server inline ``INDEX``, a
+that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server inline ``INDEX``, a
 ``NOT NULL`` table constraint, a ``DROP COLUMN`` of a column an expression, ``INCLUDE`` or predicate
 of an index on its table may name, other than one of its key columns, a column type or clause it does not know, a SQL Server column that
 leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--`` or ``/*`` inside a
@@ -123,7 +123,8 @@ _CREATE_INDEX = re.compile(
     re.I,
 )
 _ALTER_TABLE = re.compile(
-    rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?P<table>{_NAME})(?=\s)", re.I
+    rf"\bALTER\s+TABLE\s+(?!(?:IF\s+EXISTS\s+)?#)(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?P<table>{_NAME})(?=\s)",
+    re.I,
 )
 #: What may follow a DROP's last name: the statement's end, or a word that starts the next one. Any
 #: other text, such as ``DROP TABLE public . t``, leaves the strict pattern unmatched, so it raises.
@@ -161,10 +162,10 @@ _SP_RENAME = re.compile(
 #: patterns above miss is counted and refused rather than silently left unchecked. A ``#`` temporary
 #: table is not the store's, behind an ``IF [NOT] EXISTS`` guard too.
 _LOOSE: Final = (
-    (re.compile(r"\bCREATE\s+TABLE\s+(?!(?:IF\s+NOT\s+EXISTS\s+)?#)", re.I), _CREATE_TABLE),
+    (re.compile(r"\bCREATE\s+TABLE\s+(?!\s|(?:IF\s+NOT\s+EXISTS\s+)?#)", re.I), _CREATE_TABLE),
     (re.compile(r"\bCREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\b", re.I), _CREATE_INDEX),
-    (re.compile(r"\bALTER\s+TABLE\s+(?!(?:IF\s+EXISTS\s+)?#)", re.I), _ALTER_TABLE),
-    (re.compile(r"\bDROP\s+TABLE\s+(?!(?:IF\s+EXISTS\s+)?#)", re.I), _DROP_TABLE),
+    (re.compile(r"\bALTER\s+TABLE\s+(?!\s|(?:IF\s+EXISTS\s+)?#)", re.I), _ALTER_TABLE),
+    (re.compile(r"\bDROP\s+TABLE\s+(?!\s|(?:IF\s+EXISTS\s+)?#)", re.I), _DROP_TABLE),
     (re.compile(r"\bDROP\s+INDEX\b", re.I), _DROP_INDEX),
     (re.compile(r"\bsp_rename\b", re.I), _SP_RENAME),
 )
@@ -180,7 +181,7 @@ _NOT_A_COLUMN = frozenset(
 _TABLE_PRIMARY_KEY = re.compile(r"\bPRIMARY\s+KEY\s*(?:(?:NON)?CLUSTERED\s*)?\(", re.I)
 #: PostgreSQL's ``PRIMARY KEY`` or ``UNIQUE`` ``USING INDEX <name>``, which turns an existing index
 #: into the constraint. ``USING INDEX TABLESPACE`` is only a storage option.
-_USING_INDEX = re.compile(r"\bUSING\s+INDEX\s+(?!TABLESPACE\b)", re.I)
+_USING_INDEX = re.compile(r"\bUSING\s+INDEX\b(?!\s*TABLESPACE\b)", re.I)
 #: A key that opens with a cast of a column, ``a::text`` or ``CAST(a AS text)``. PostgreSQL stores
 #: a cast to the column's own type as the column, and any other as an expression, and the reader
 #: does not know which.
@@ -202,6 +203,8 @@ _STATEMENT_START = frozenset({"if", "begin", "end", "exec", "execute", "else", "
 #: Words that start a data statement, which a clause ends at unless ``ON`` precedes them (BACKLOG
 #: #5062: an ``ADD CONSTRAINT`` read on into the next statement took that statement's ``PRIMARY KEY``
 #: as its own).
+#: The words after which a data word is a name: a column's, a constraint's or a referenced table's.
+_NAME_BEFORE = frozenset({"on", "add", "column", "exists", "constraint", "references"})
 _DATA_STATEMENT = frozenset({"insert", "update", "delete", "merge", "select", "truncate"})
 #: What an ``ALTER`` or ``DROP`` that starts the next statement names, after the word itself.
 _DDL_OBJECT = re.compile(
@@ -340,7 +343,8 @@ def _quoted_end(text: str, i: int) -> int | None:
     """The index after the quoted run that opens at ``text[i]``: a ``'`` string, a ``"`` name or a
     SQL Server ``[...]`` name, in which a doubled close continues the run. ``None`` when ``text[i]``
     opens none. :func:`_balanced`, :func:`_top_level_items` and :func:`_clause` share it, so a
-    ``[a,b]`` or ``[end]`` reads as one name in each."""
+    ``[a,b]`` or ``[end]`` reads as one name in each. A ``[`` that holds another ``[``, or that no
+    ``]`` closes, is a PostgreSQL subscript, as in ``a[b[1]]``, and opens none."""
     ch = text[i]
     if ch not in "'\"[":
         return None
@@ -348,8 +352,10 @@ def _quoted_end(text: str, i: int) -> int | None:
     j = i + 1
     while (end := text.find(close, j)) >= 0:
         if not text.startswith(close * 2, end):
-            return end + 1
+            return None if ch == "[" and "[" in text[i + 1 : end] else end + 1
         j = end + 2
+    if ch == "[":
+        return None
     raise ValueError(f"unterminated quote in DDL near {text[i : i + 40]!r}")
 
 
@@ -431,7 +437,7 @@ def _clause(segment: str) -> str:
             lower = word.group(0).lower()
             after = segment[i + len(word.group(0)) :]
             if lower in _STATEMENT_START and not (
-                lower == "if" and re.match(r"\s+(?:NOT\s+)?EXISTS\b", after, re.I)
+                lower == "if" and re.match(r"\s+(?:NOT\s+)?EXISTS\b(?!\s*\()", after, re.I)
             ):
                 break
             # A data or DDL statement starts here too. ON DELETE and ON UPDATE are a foreign
@@ -439,7 +445,7 @@ def _clause(segment: str) -> str:
             # name; ALTER COLUMN and DROP COLUMN are the clause's own verbs.
             if (
                 lower == "create"
-                or (lower in _DATA_STATEMENT and prev not in ("on", "add", "column", "exists"))
+                or (lower in _DATA_STATEMENT and prev not in _NAME_BEFORE)
                 or (lower in ("alter", "drop") and _DDL_OBJECT.match(after))
             ):
                 break
@@ -448,6 +454,41 @@ def _clause(segment: str) -> str:
             continue
         i += 1
     return segment[:i].strip()
+
+
+def _statement_end(text: str, start: int) -> int:
+    """Where the statement that ``text[start:]`` continues ends: a top-level ``;``, an unmatched
+    ``)``, a word that starts the next statement, or the end. Unlike :func:`_clause` it reads on
+    through ``ELSE`` and ``END``, which a ``CASE`` in an index predicate holds, so it may read into a
+    following block; reading too far only adds words, which raises more, never fewer."""
+    depth, i = 0, start
+    while i < len(text):
+        if (end := _quoted_end(text, i)) is not None:
+            i = end
+            continue
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and ch == ";":
+            break
+        elif depth == 0 and (ch.isalpha() or ch == "_") and not text[i - 1].isalnum():
+            word = re.match(r"\w+", text[i:])
+            assert word is not None
+            lower = word.group(0).lower()
+            if (
+                lower in ("if", "begin", "exec", "execute", "declare", "go", "create")
+                or lower in _DATA_STATEMENT
+                or (lower in ("alter", "drop") and _DDL_OBJECT.match(text, i + len(lower)))
+            ):
+                break
+            i += len(lower)
+            continue
+        i += 1
+    return i
 
 
 # The types each catalog spells one way, keyed by every spelling the DDL may use. The live read
@@ -850,7 +891,11 @@ def _is_constraint(item: str, dialect: Dialect | None) -> bool:
     ``PERIOD`` and ``EXCLUDE`` when what follows is not their constraint's
     own shape, because each may also be a column's name. A ``NOT NULL`` table constraint raises:
     the reader does not apply it."""
-    if re.match(r'(?:CONSTRAINT\s+(?:"[^"]*"|\[[^\]]*\]|\w+)\s+)?NOT\s+NULL\b', item, re.I):
+    if re.match(
+        r'(?:CONSTRAINT\s+(?:"(?:[^"]|"")*"|\[(?:[^\]]|\]\])*\]|[\w$]+)\s+)?NOT\s+NULL\b',
+        item,
+        re.I,
+    ):
         # PostgreSQL 18's NOT NULL table constraint, perhaps NOT VALID.
         raise ValueError(f"a not-null constraint is not compared: {item[:120]!r}")
     words = [w.lower() for w in _TOKEN.findall(item)[:2]] + [""]
@@ -933,13 +978,8 @@ class _Reader:
         self.indexes[name] = shape
         self.opaque.pop(name, None)
         if include or shape.partial or any(k.startswith("<expr>") for k in shape.columns):
-            # To the statement's end, found as an ALTER clause's is: a predicate has no
-            # closing mark of its own.
-            try:
-                tail = _clause(text[end:])
-            except ValueError:  # a top-level comma: read on to the end, which only raises more
-                tail = text[end:]
-            definition = text[m.end() : end] + " " + tail
+            # To the statement's end: a predicate has no closing mark of its own.
+            definition = text[m.end() : _statement_end(text, end)]
             self.opaque[name] = frozenset(_ident(w) for w in _TOKEN.findall(definition))
 
     def _built(self, table: str, name: str, action: str) -> _Built:
