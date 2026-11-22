@@ -117,8 +117,11 @@ def _transit_setup(
     """A store over a real Transit cipher with a fake client, and a chain that cipher MACed."""
     cipher, built = _cipher()
     real = cipher.audit_mac_fn()
-    genesis = (AUDIT_KEY_EPOCH_ACTION, audit_genesis_detail(AUDIT_TRANSIT_KEY_ID))
-    rows = chained_rows([genesis] + [("act", str(n)) for n in range(length - 1)], mac=real)
+    actions: list[tuple[str, str | None]] = [
+        (AUDIT_KEY_EPOCH_ACTION, audit_genesis_detail(AUDIT_TRANSIT_KEY_ID))
+    ]
+    actions += [("act", str(n)) for n in range(length - 1)]
+    rows = chained_rows(actions, mac=real)
     gate = _GatedVerifier(real, loop)
     store = _store(rows, gate)
     store._cipher = cipher
@@ -129,10 +132,12 @@ def _transit_setup(
 def _one_worker(loop: asyncio.AbstractEventLoop) -> Iterator[None]:
     """A one-thread default executor, so a later submit runs only after the walk has finished. The
     loop is shared between tests, so it gets a fresh default executor afterwards."""
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        loop.set_default_executor(executor)
-        yield
-    loop.set_default_executor(ThreadPoolExecutor())
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            loop.set_default_executor(executor)
+            yield
+    finally:
+        loop.set_default_executor(ThreadPoolExecutor())
 
 
 async def _worker_done(loop: asyncio.AbstractEventLoop) -> None:
