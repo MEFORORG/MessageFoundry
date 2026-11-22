@@ -10700,8 +10700,9 @@ class AuthService:
         commits with the write (step 7), rolls the rename back and is logged rather than raised.
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
         has. It also lets a store fault on the ``held`` re-read skip the rename rather than raise
-        (BACKLOG #3070; the reason is at that read), and a seal refusal at the write be logged and
-        reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm). A
+        (BACKLOG #3070; the reason is at that read), and a Forged or Unverifiable seal refusal at the
+        write be logged and reported rather than raised (vault BACKLOG #3069 note T2; the reason
+        is at that arm); an Outage there is raised to the reconcile loop, as at the reads. A
         Vault transit answer at one of its checked reads still raises out of it; the reconcile loop
         absorbs an Unverifiable one (:meth:`_rename_read_seal_answer`, item 1) and stops its
         renames on an Outage.

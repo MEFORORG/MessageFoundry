@@ -6771,9 +6771,10 @@ def _seal_refusing_rename(
     return refused
 
 
-#: The three answers the store's write helper refuses a rename's write with (ADR 0217 (c) step 1),
-#: the phrase the ERROR line names it by, and the audit row its report writes (an Outage writes
-#: none).
+#: Two of the answers the store's write helper refuses a rename's write with (ADR 0217 (c) step 1),
+#: the phrase the ERROR line names it by, and the audit row its report writes. The third, an
+#: Outage, is raised to the reconcile loop, which stops the renames (vault BACKLOG #3069 item 1;
+#: test_an_outage_at_a_rename_stops_the_renames_and_keeps_the_revocation_alerts).
 _SEAL_REFUSALS = [
     pytest.param(
         lambda uid: RowSealError("user", uid),
@@ -6788,8 +6789,6 @@ _SEAL_REFUSALS = [
         id="unverifiable",
     ),
 ]
-#: An Outage at the write is not among them: it is raised to the reconcile loop, which stops the
-#: renames (vault BACKLOG #3069 item 1; the test after the outage-at-a-rename one).
 
 
 @pytest.mark.parametrize(("refusal", "phrase", "reported"), _SEAL_REFUSALS)
@@ -6800,11 +6799,11 @@ async def test_a_rename_whose_seal_is_refused_at_the_write_does_not_end_the_pass
     reported: str | None,
 ) -> None:
     """Vault BACKLOG #3069 note T2. The store refuses the first rename's write over its seal:
-    Forged, Unverifiable or Outage. The reconciler logs it at ERROR, reports it as an admin read
-    reports the same answer, and goes on, so the second account's rename still applies. No audit
-    write was refused, so the pass pages no ``audit_write_failed``. Forged pages
-    ``integrity_drift`` through the integrity alert; Unverifiable and Outage page through the
-    store's seal pager. Called the way the login path calls it, each refusal is raised."""
+    Forged or Unverifiable. The reconciler logs it at ERROR, reports it as an admin read reports
+    the same answer, and goes on, so the second account's rename still applies. No audit write was
+    refused, so the pass pages no ``audit_write_failed``. Forged pages ``integrity_drift`` through
+    the integrity alert; Unverifiable pages through the store's seal pager. Called the way the
+    login path calls it, each refusal is raised."""
     store, service, notifier = await _two_renamed_accounts()
     try:
         alerts: list[str] = []
@@ -6851,7 +6850,8 @@ async def test_a_rename_whose_seal_is_refused_at_the_write_does_not_end_the_pass
 # --- vault BACKLOG #3069 item 1: a Vault transit answer at the rename's reads ---------------------
 
 #: The two answers a checked read raises (a Forged record reads as ``refused`` instead). An
-#: Unverifiable answer skips that one rename; an Outage is paged once and ends the pass.
+#: Unverifiable answer skips that one rename; an Outage is paged once and stops the renames, and
+#: the pass still returns its plan.
 _READ_ANSWERS = [
     pytest.param(lambda: TransitSealUnverifiableError("user", 1, 2), id="unv"),
     pytest.param(TransitSealUnavailableError, id="outage"),
@@ -7073,6 +7073,28 @@ async def test_an_outage_at_a_rename_stops_the_renames_and_keeps_the_revocation_
         sink = _RevokedSink()
         _alert_reconcile_plan(plan, service, sink)
         assert sink.revoked == ["bob"], "the applied revocation lost its alert"
+    finally:
+        await store.close()
+
+
+async def test_a_sign_in_rename_raises_an_outage_at_the_write() -> None:
+    """Vault BACKLOG #3069 item 1. Called the way the login path calls it (``audit_soft`` off), an
+    Outage at the rename's write is raised, as the other seal answers are. RED when: the write arm
+    logs and goes on for a sign-in."""
+    store, service, _notifier = await _two_renamed_accounts()
+    try:
+        jdoe = await store.get_user_by_username("jdoe")
+        assert jdoe is not None
+        _seal_refusing_rename(store, jdoe.id, lambda _uid: TransitSealUnavailableError())
+        with pytest.raises(TransitSealUnavailableError):
+            await service._refresh_cached_username(
+                user_id=jdoe.id,
+                old_username="jdoe",
+                new_username="jdoe-new",
+                held=None,
+                from_plan=False,
+                audit_soft=False,
+            )
     finally:
         await store.close()
 
