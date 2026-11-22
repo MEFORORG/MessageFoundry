@@ -19,7 +19,8 @@ run the same bodies. ``fetch`` and ``raw`` run one query with ``?`` placeholders
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Awaitable, Callable, Iterator
+import dataclasses
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from typing import Any
 
 import pytest
@@ -63,14 +64,14 @@ def runner(store: Any) -> RegistryRunner:
     )
 
 
-async def captured(store: Any, *, control: str, now: float) -> str:
+async def captured(store: Any, *, control: str, now: float, reply: str = REPLY) -> str:
     """A delivered message whose captured reply owes a re-ingress to the loopback. Returns its id."""
     mid = await store.enqueue_message(
         channel_id="IB_REAL", raw=RAW, deliveries=[("OB_X", BODY)], control_id=control, now=now
     )
     [item] = await store.claim_ready(destination_name="OB_X", now=now)
     await store.complete_with_response(
-        item.id, body=REPLY, outcome="accepted", reingress_to=LOOP, now=now
+        item.id, body=reply, outcome="accepted", reingress_to=LOOP, now=now
     )
     return str(mid)
 
@@ -272,6 +273,105 @@ async def worker_read_outage_retries(store: Any, fetch: RawFetch, _raw: RawSql) 
     assert len(await children(fetch)) == 1
 
 
+#: A reply the HL7 loopback's peek refuses, so the worker holds a bounded view of it as well.
+REFUSED_REPLY = "SYNTHETIC-REFUSED-REPLY not an HL7 message"
+#: The control id the worker peeks out of ``REPLY``, a value derived from the reply body.
+REPLY_CONTROL_ID = "RSP1"
+
+
+def _holds(value: Any, needles: tuple[str, ...], depth: int = 4) -> bool:
+    """Whether ``value``, or a container or dataclass field inside it, holds one of ``needles``."""
+    if isinstance(value, str):
+        return any(needle in value for needle in needles)
+    if isinstance(value, bytes | bytearray):
+        return any(needle.encode() in value for needle in needles)
+    if depth == 0:
+        return False
+    if isinstance(value, Mapping):
+        return any(
+            _holds(k, needles, depth - 1) or _holds(v, needles, depth - 1) for k, v in value.items()
+        )
+    if isinstance(value, list | tuple | set | frozenset):
+        return any(_holds(v, needles, depth - 1) for v in value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(
+            _holds(getattr(value, f.name, None), needles, depth - 1)
+            for f in dataclasses.fields(value)
+        )
+    return False
+
+
+def _engine_frames_holding(
+    fault: BaseException, needles: tuple[str, ...]
+) -> tuple[list[str], list[str]]:
+    """The engine frames ``fault``'s traceback passes through, and those with a local holding one
+    of ``needles`` as ``function:local``. This module's own frames hold the reply by design."""
+    walked: list[str] = []
+    holding: list[str] = []
+    tb = fault.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        if frame.f_code.co_filename != __file__:
+            walked.append(frame.f_code.co_name)
+            holding += [
+                f"{frame.f_code.co_name}:{name}"
+                for name, value in frame.f_locals.items()
+                if _holds(value, needles)
+            ]
+        tb = tb.tb_next
+    return walked, holding
+
+
+def _fault_reaches_no_reply(which: str, *, reply: str = REPLY) -> ContractCase:
+    """A no-verdict fault at ``which`` leaves the step with no chain to the key-service error and
+    no traceback frame holding the reply or a value peeked from it. ``worker`` is the step's own
+    read; the others are the handoff's opens, after the step has read the reply."""
+
+    async def case(store: Any, fetch: RawFetch, raw: RawSql) -> None:
+        needles = (reply, REPLY_CONTROL_ID) if reply == REPLY else (reply,)
+        # CONTROL: the instrument finds the reply in the shapes the step holds it in.
+        assert _holds({"k": [reply]}, needles) and not _holds({"k": ["other"]}, needles)
+        mid = await captured(store, control="FR-HEAD", now=1.0, reply=reply)
+        item = await store.claim_next_fifo(LOOP, now=3.0, stage=Stage.RESPONSE.value)
+        assert item is not None and item.message_id == mid
+        if which == "metadata":
+            await _plant_metadata(store._cipher, raw, mid)
+        target = await _cell(fetch, "reply" if which == "worker" else which, mid)
+        step = runner(store)
+        real_handoff = store.ingress_handoff
+        with faulting_cipher(store) as fault:
+
+            def arm() -> None:
+                fault.target, fault.open_error = target, CipherUnavailableError("synthetic")
+
+            async def armed_handoff(**kwargs: Any) -> bool:
+                arm()  # after the step's own read, which opens the same reference and reply
+                produced: bool = await real_handoff(**kwargs)
+                return produced
+
+            if which == "worker":
+                arm()
+            store.ingress_handoff = armed_handoff
+            try:
+                with pytest.raises(QueueOpenFault) as caught:
+                    await step._process_response_item(LOOP, item)
+            finally:
+                del store.ingress_handoff
+            assert caught.value.__cause__ is None and caught.value.__context__ is None
+            walked, holding = _engine_frames_holding(caught.value, needles)
+            assert "_process_response_item" in walked  # the frame that read the reply was walked
+            assert holding == []
+            await _assert_token_live(store, fetch, mid)
+            # CONTROL: the same token re-ingresses once the fault clears.
+            fault.heal()
+            await step._process_response_item(LOOP, item)
+        assert len(await children(fetch)) == 1
+
+    suffix = "" if reply == REPLY else "_refused"
+    case.__name__ = f"fault_at_{which}{suffix}_reaches_no_reply"
+    return case
+
+
 async def seal_failure_stays_a_hard_stop(store: Any, fetch: RawFetch, _raw: RawSql) -> None:
     """The encrypt's invocation ceiling is a plain ``CipherError`` and is not contained."""
     mid, item = await _claimed_head(store)
@@ -332,7 +432,14 @@ HANDOFF_CASES: list[ContractCase] = [
     worker_read_outage_retries,
     seal_failure_stays_a_hard_stop,
     _open_fault_propagates("ref", CipherUnavailableError, QueueOpenFault),
-    _open_fault_propagates("reply", CipherUnavailableError),
-    _open_fault_propagates("metadata", CipherUnavailableError),
+    _open_fault_propagates("reply", CipherUnavailableError, QueueOpenFault),
+    _open_fault_propagates("metadata", CipherUnavailableError, QueueOpenFault),
     _open_fault_propagates("reply", AADComponentError),
+    _fault_reaches_no_reply("worker"),
+    _fault_reaches_no_reply("ref"),
+    _fault_reaches_no_reply("reply"),
+    _fault_reaches_no_reply("metadata"),
+    _fault_reaches_no_reply("ref", reply=REFUSED_REPLY),
+    _fault_reaches_no_reply("reply", reply=REFUSED_REPLY),
+    _fault_reaches_no_reply("metadata", reply=REFUSED_REPLY),
 ]

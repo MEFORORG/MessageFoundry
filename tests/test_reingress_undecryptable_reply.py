@@ -60,7 +60,7 @@ async def test_handoff_containment_contract(
     store: MessageStore, case: contract.ContractCase
 ) -> None:
     """BACKLOG #5727: a cell that fails to decrypt dead-letters the token; a key service with no
-    verdict, a fault in the engine's own code and a failed seal do not."""
+    verdict, an engine fault on the reply cell and a failed seal do not."""
     await case(store, _fetch(store), _raw(store))
 
 

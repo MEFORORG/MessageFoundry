@@ -9503,14 +9503,15 @@ class SqlServerStore:
                     )
 
                 # BACKLOG #5727, as on Postgres (#5689): a decrypt failure on a reply or origin cell
-                # dead-letters the token, unless a key service gave no verdict or the fault is in
-                # the engine's own code: those two propagate and the token is retried. A failure
-                # that dead-letters can still clear later, for example a key the store lacks, so
-                # the token keeps its reference and a replay can recover it. Only the decrypts are
-                # wrapped: the encrypt's invocation ceiling stays a hard stop.
+                # dead-letters the token. A failure that dead-letters can still clear later, for
+                # example a key the store lacks, so the token keeps its reference and a replay can
+                # recover it. A key service that gave no verdict leaves as a QueueOpenFault, raised
+                # outside the handler so it carries no chain to the raw key-service error, and the
+                # token is retried. An engine fault propagates from the reply cell. It need not
+                # from the others: an AADComponentError on a token reference or on origin metadata
+                # dead-letters the token as a corrupt cell. Only the decrypts are wrapped: the
+                # encrypt's invocation ceiling stays a hard stop.
                 async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
-                    if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):
-                        raise exc
                     log.warning(
                         "ingress_handoff: %s of work-row %s does not decrypt (%s); dead-lettering",
                         what,
@@ -9523,6 +9524,7 @@ class SqlServerStore:
                         f"re-ingress {what} undecryptable",
                     )
 
+                open_fault: QueueOpenFault | None = None
                 try:
                     body = (
                         self._cipher.decrypt(
@@ -9531,7 +9533,15 @@ class SqlServerStore:
                         or ""
                     )
                 except CipherError as exc:
-                    return await _dead_unopenable(exc, "reply", "ingress_handoff(reply-unopenable)")
+                    if isinstance(exc, PROGRAMMING_ERRORS):
+                        raise
+                    open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                    if open_fault is None:
+                        return await _dead_unopenable(
+                            exc, "reply", "ingress_handoff(reply-unopenable)"
+                        )
+                if open_fault is not None:
+                    raise open_fault
                 # (4) Correlation lineage from the origin's metadata (parse once).
                 await cur.execute(
                     "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -9559,9 +9569,16 @@ class SqlServerStore:
                         "re-ingress origin failed its integrity check",
                     )
                 except CipherError as exc:
-                    return await _dead_unopenable(
-                        exc, "origin metadata", "ingress_handoff(origin-unopenable)"
-                    )
+                    if isinstance(exc, PROGRAMMING_ERRORS):
+                        raise
+                    open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                    if open_fault is None:
+                        return await _dead_unopenable(
+                            exc, "origin metadata", "ingress_handoff(origin-unopenable)"
+                        )
+                if open_fault is not None:
+                    del body  # the opened reply must not sit in a frame this traceback reaches
+                    raise open_fault
                 loaded = json.loads(meta_json) if meta_json else {}
                 origin_meta = loaded if isinstance(loaded, dict) else {}
                 child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1

@@ -145,10 +145,14 @@ PROGRAMMING_ERRORS: Final = (AssertionError, AttributeError, LookupError, NameEr
 class QueueOpenFault(Exception):
     """A claimed queue row that could not be opened for a reason that is not the row (BACKLOG
     #5735): a key service that gave no verdict, a failed store read, or a failed dead-letter write.
-    Built by :func:`queue_open_fault` with no cause, context or traceback, so a handler that logs
-    it with ``exc_info`` prints neither the raw key-service error, which can echo a URL or a
-    request body (BACKLOG #2318), nor the claim's frames, which hold other rows' plaintext (BACKLOG
-    #6706)."""
+    Built by :func:`queue_open_fault` with no cause or context, so a handler that logs it with
+    ``exc_info`` does not print the raw key-service error, which can echo a URL or a request body
+    (BACKLOG #2318). A claim hands it on unraised, so it has no traceback into the claim's frames,
+    which hold other rows' plaintext (BACKLOG #6706). The re-ingress worker and handoff DO raise it
+    (BACKLOG #5727), so there it gains a traceback through the frames it leaves. The worker drops
+    the handoff's frames from that traceback and its own copies of the reply and the values peeked
+    from it. The worker and dispatcher frames left hold that lane's response tokens, whose payloads
+    are references to the reply rather than its body."""
 
 
 def queue_open_fault(exc: BaseException) -> QueueOpenFault:

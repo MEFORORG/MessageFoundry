@@ -6514,12 +6514,12 @@ class PostgresStore:
                     # dead-letters the token, so the loopback lane moves. A failure that
                     # dead-letters can still clear later, for example a key the store lacks, so the
                     # token keeps its reference and a replay can recover it. A key service that gave
-                    # no verdict says nothing about the cell, so its error propagates and the token
-                    # is retried.
+                    # no verdict says nothing about the cell: it leaves as a QueueOpenFault, raised
+                    # outside the handler so it carries no chain to the raw key-service error, and
+                    # the token is retried. An engine fault propagates from the reply cell. It need
+                    # not from the others: an AADComponentError on a token reference or on origin
+                    # metadata dead-letters the token as a corrupt cell.
                     async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
-                        # A fault in the engine's own code propagates too, as on a claim.
-                        if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):
-                            raise exc
                         log.warning(
                             "ingress_handoff: %s of work-row %s does not decrypt (%s);"
                             " dead-lettering",
@@ -6533,6 +6533,7 @@ class PostgresStore:
                             f"re-ingress {what} undecryptable",
                         )
 
+                    open_fault: QueueOpenFault | None = None
                     try:
                         body = (
                             self._dec(
@@ -6542,9 +6543,17 @@ class PostgresStore:
                             or ""
                         )
                     except CipherError as exc:
-                        return await _dead_unopenable(
-                            exc, "reply", "ingress_handoff(reply-unopenable)"
+                        if isinstance(exc, PROGRAMMING_ERRORS):
+                            raise
+                        open_fault = (
+                            queue_open_fault(exc) if is_transient_open_failure(exc) else None
                         )
+                        if open_fault is None:
+                            return await _dead_unopenable(
+                                exc, "reply", "ingress_handoff(reply-unopenable)"
+                            )
+                    if open_fault is not None:
+                        raise open_fault
                     mrow = await conn.fetchrow(
                         "SELECT channel_id, metadata FROM messages WHERE id=$1", origin_id
                     )
@@ -6571,9 +6580,18 @@ class PostgresStore:
                             "re-ingress origin failed its integrity check",
                         )
                     except CipherError as exc:
-                        return await _dead_unopenable(
-                            exc, "origin metadata", "ingress_handoff(origin-unopenable)"
+                        if isinstance(exc, PROGRAMMING_ERRORS):
+                            raise
+                        open_fault = (
+                            queue_open_fault(exc) if is_transient_open_failure(exc) else None
                         )
+                        if open_fault is None:
+                            return await _dead_unopenable(
+                                exc, "origin metadata", "ingress_handoff(origin-unopenable)"
+                            )
+                    if open_fault is not None:
+                        del body  # the opened reply must not sit in a frame this traceback reaches
+                        raise open_fault
                     refusal: str | None = None
                     if meta_json:
                         loaded, refusal = json_loads_or_refusal(meta_json)

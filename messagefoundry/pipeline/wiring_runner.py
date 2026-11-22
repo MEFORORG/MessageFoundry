@@ -13057,18 +13057,28 @@ class RegistryRunner:
                 refusal,
                 cipher=self.store.cipher(),
             )
-        produced = await self.store.ingress_handoff(
-            response_row_id=item.id,
-            loopback_channel_id=name,
-            correlation_depth_cap=self._max_correlation_depth,
-            control_id=control_id,
-            message_type=message_type,
-            summary=summary,
-            peek_failed=peek_failed,
-            peek_error=None if refused is None else refused.error,
-            refused_raw=None if refused is None else refused.raw,
-            refused_metadata=None if refused is None else refused.fields,
-        )
+        handoff_fault: QueueOpenFault | None = None
+        try:
+            produced = await self.store.ingress_handoff(
+                response_row_id=item.id,
+                loopback_channel_id=name,
+                correlation_depth_cap=self._max_correlation_depth,
+                control_id=control_id,
+                message_type=message_type,
+                summary=summary,
+                peek_failed=peek_failed,
+                peek_error=None if refused is None else refused.error,
+                refused_raw=None if refused is None else refused.raw,
+                refused_metadata=None if refused is None else refused.fields,
+            )
+        except QueueOpenFault as fault:
+            handoff_fault = fault
+        if handoff_fault is not None:
+            # BACKLOG #5727: the fault arm logs this fault with its traceback. Drop the handoff's
+            # frames, whose arguments carry values from the reply, and this frame's own copies,
+            # before it goes on. The token is still re-pended by the fault arm.
+            del body, control_id, summary, refused
+            raise handoff_fault.with_traceback(None)
         if produced:
             # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op
             # wake for a depth-capped / peek-failed token that produced no ingress row). B12 (ADR
