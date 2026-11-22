@@ -2264,23 +2264,53 @@ def _forged(source: str, filename: str) -> str:
     return f"exec(compile({source!r}, '<forged>', 'exec').replace(co_filename={filename!r}))\n"
 
 
+def _forged_compile(source: str, filename: str) -> str:
+    """Module code that compiles ``source`` under ``filename``, so a SyntaxError names that file."""
+    return f"compile({source!r}, {filename!r}, 'exec')\n"
+
+
 def test_a_folder_that_cannot_be_resolved_is_said_in_the_diagnostic(
     tmp_path: Path, unresolvable: str
 ) -> None:
-    # Main swallowed the failed resolve, so the diagnostic gave no sign the location could be short.
-    _write(
-        tmp_path, "feed.py", "x = 1\n" + _forged(f"raise RuntimeError({NEEDLE!r})", unresolvable)
-    )
+    # The raise is deeper than the line named, in a folder nobody could place: the line may be short.
+    body = "x = 1\n" + _forged(f"raise RuntimeError({NEEDLE!r})", unresolvable)
+    _write(tmp_path, "feed.py", body)
     (msg,) = _messages(tmp_path)
-    assert "RuntimeError at line 2, and the folder of at least one source file could not" in msg
+    assert f"RuntimeError at line 2{wiring._FOLDER_UNRESOLVED} (" in msg
     assert NEEDLE not in msg and _UNRESOLVABLE not in msg
+
+
+def test_a_syntax_error_in_a_folder_that_cannot_be_resolved_is_said_too(
+    tmp_path: Path, unresolvable: str
+) -> None:
+    _write(tmp_path, "feed.py", _forged_compile("x = (", unresolvable))
+    (msg,) = _messages(tmp_path)
+    assert wiring._FOLDER_UNRESOLVED in msg and _UNRESOLVABLE not in msg
+
+
+def test_an_unresolved_folder_above_the_named_line_is_not_said(
+    tmp_path: Path, unresolvable: str
+) -> None:
+    # The forged frame calls back into feed.py, whose raise is the deepest frame: nothing was missed.
+    body = f"def boom():\n    raise RuntimeError({NEEDLE!r})\n\n" + _forged("boom()", unresolvable)
+    _write(tmp_path, "feed.py", body)
+    (msg,) = _messages(tmp_path)
+    assert "RuntimeError at line 2 (" in msg
+    assert wiring._FOLDER_UNRESOLVED not in msg
+
+
+def test_a_folder_that_resolves_adds_no_note(tmp_path: Path) -> None:
+    _write(tmp_path, "feed.py", f"x = 1\nraise RuntimeError({NEEDLE!r})\n")
+    (msg,) = _messages(tmp_path)
+    assert "RuntimeError at line 2 (" in msg
+    assert wiring._FOLDER_UNRESOLVED not in msg
 
 
 @pytest.mark.usefixtures("sigint_raises")
 def test_an_interrupt_raised_in_a_folder_that_cannot_be_resolved_stops_the_load(
     tmp_path: Path, unresolvable: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # As on main: an unresolved folder is not the config dir, so the `raise` there proves nothing.
+    # A raise in a folder nobody could place cannot prove a config file raised it, so it is Ctrl-C.
     _write(tmp_path, "feed.py", _forged(f"raise KeyboardInterrupt({NEEDLE!r})", unresolvable))
     _assert_the_load_stops(tmp_path, caplog)
 
@@ -2294,3 +2324,7 @@ def test_an_optional_helper_failing_in_a_folder_that_cannot_be_resolved_is_still
     with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
         assert _messages(tmp_path) == []
     assert "is left to the ImportError guard" in caplog.text
+    # The detail recorded for that helper is what an unguarded import of it is refused with.
+    _write(tmp_path, "feed_b.py", "def g():\n    import _opt\n")
+    (msg,) = [m for m in _messages(tmp_path) if "feed_b" in m]
+    assert wiring._FOLDER_UNRESOLVED in msg and _UNRESOLVABLE not in msg

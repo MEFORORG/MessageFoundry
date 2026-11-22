@@ -12025,8 +12025,9 @@ def _module_failure(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
-    file and line it was raised from, and each identifier :func:`_failure_detail` can vouch for, but
-    never the exception's text (vault BACKLOG #3249).
+    file and line it was raised from, each identifier :func:`_failure_detail` can vouch for, and its
+    fixed note when a folder could not be resolved, but never the exception's text (vault BACKLOG
+    #3249).
 
     The text is author code's, or a library's quoting author data, and can carry any value the module
     held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
@@ -12085,7 +12086,7 @@ def _is_a_signal(exc: BaseException, path: Path) -> bool:
 
 def _raised_in_the_config_dir(exc: BaseException, path: Path) -> bool:
     file = raise_statement_file(exc)
-    # A folder that could not be resolved counts as outside, as it did when _in_dir said False.
+    # A raise in a folder that could not be resolved cannot prove a config file raised it.
     return file is not None and _in_dir(file, path.parent.resolve()) is True
 
 
@@ -12140,19 +12141,21 @@ def _failure_detail(
     The file is the deepest frame in the config directory, so a failing helper is named rather than
     the config module's import of it. A file name and a line number are layout, not data.
 
-    A file whose folder could not be resolved is not named, and the detail ends with
-    :data:`_FOLDER_UNRESOLVED` instead, so the location given may not be the deepest one. That is a
-    fixed sentence, not a log line: this runs while a helper's ImportError is judged, where a log
-    call would run a handler a module added (vault BACKLOG #3765, LF10)."""
+    A file whose folder could not be resolved (:func:`_in_dir`) is not named. When one is deeper
+    than the location named, or no location is named, the detail ends with
+    :data:`_FOLDER_UNRESOLVED`, because the location may then be short (vault BACKLOG #3765,
+    LF10)."""
     located: tuple[str, int] | None = None
     filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
     lineno = getattr(exc, "lineno", None)
-    unresolved = False
+    # The file a SyntaxError names is deeper than any frame, so it is never outweighed.
+    syntax_file_unresolved = False
     if isinstance(filename, str) and isinstance(lineno, int):
         in_dir = _in_dir(filename, config_dir)
-        unresolved = in_dir is None
+        syntax_file_unresolved = in_dir is None
         if in_dir is True:
             located = (filename, lineno)
+    deeper_unresolved = False
     if located is None:
         # One resolve per distinct file: a RecursionError walks about a thousand frames of one file.
         seen: dict[str, bool | None] = {}
@@ -12160,9 +12163,12 @@ def _failure_detail(
             name = frame.f_code.co_filename
             if name not in seen:
                 seen[name] = _in_dir(name, config_dir)
-                unresolved = unresolved or seen[name] is None
             if seen[name] is True:
                 located = (name, frame_line)
+                deeper_unresolved = False
+            elif seen[name] is None:
+                deeper_unresolved = True
+    unresolved = syntax_file_unresolved or deeper_unresolved
     detail = _type_name(exc)
     # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
     if located is None or not isinstance(located[1], int):
@@ -12261,10 +12267,9 @@ def _in_dir(filename: str, directory: Path) -> bool | None:
     """Whether ``filename`` sits directly in ``directory`` -- config modules and their helpers are
     siblings -- compared resolved, or ``None`` when its folder could not be resolved.
 
-    Both callers read ``None`` as no match, and the names are not compared as text instead: a module
-    can forge a code object's ``co_filename``. Nothing is logged here, because this runs while an
-    interrupt is judged (:func:`_is_a_signal`) and while a helper's ImportError is judged, and a log
-    call would run a handler a module added. :func:`_failure_detail` says so in its diagnostic.
+    ``None`` is not a match, and the names are not compared as text in its place. Nothing is logged
+    here: this runs while an interrupt is judged (:func:`_is_a_signal`), where a log call would run
+    a handler a module added, so :func:`_failure_detail` says it in its diagnostic instead.
 
     Only an absolute filename counts. The loader's modules record one (the import machinery makes the
     spec's path absolute, even for a config directory given as a relative path), while ``<string>``,
