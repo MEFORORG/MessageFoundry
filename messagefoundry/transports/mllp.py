@@ -31,6 +31,7 @@ import re
 import socket
 import ssl
 import time
+import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -2885,11 +2886,30 @@ class MLLPSource(SourceConnector):
         elif self._ssl.verify_mode is not ssl.CERT_REQUIRED:
             mode = IntakeAuth.TLS
         else:
-            # Lazy, as _sender_listed's: pki pulls in cryptography.
-            from messagefoundry.pki import peer_subject
-
-            subject = peer_subject(writer.get_extra_info("ssl_object"))
             mode = IntakeAuth.MTLS if self._client_subjects is None else IntakeAuth.MTLS_SUBJECTS
+            try:
+                # Lazy, as _sender_listed's: pki pulls in cryptography.
+                from messagefoundry.pki import peer_subject
+
+                subject = peer_subject(writer.get_extra_info("ssl_object"))
+            except Exception as exc:  # noqa: BLE001 -- the record is optional; the sender is not
+                # peer_subject already turns an unreadable certificate into None, so anything
+                # here is a defect. It is logged, and the sender main served is still served:
+                # an optional record must not cut it off. Its type and frames only, never its
+                # message, which could quote the certificate, and a subject can name a person.
+                frames = "; ".join(
+                    f"{frame.filename}:{frame.lineno} in {frame.name}"
+                    for frame in traceback.extract_tb(exc.__traceback__)
+                )
+                logger.error(
+                    "MLLP listener %s: reading the sender certificate's subject for the intake "
+                    "context failed with %s at %s; the connection's messages are stored without "
+                    "a subject",
+                    self._pacing_name,
+                    type(exc).__name__,
+                    frames,
+                )
+                subject = None
         return IntakeContext(
             transport="mllp",
             auth_mode=mode,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sqlite3
 import ssl
@@ -258,6 +259,44 @@ async def test_an_mllp_mtls_sender_is_named_by_its_certificate_not_its_address(
     assert not _IP_SHAPED.search(json.dumps(intake))
     assert intake["auth_mode"] == IntakeAuth.MTLS_SUBJECTS.value
     assert intake["cert_subject"] == f"CN={_PERSON}"
+
+
+async def test_a_defect_reading_the_subject_still_serves_the_sender(
+    tmp_path: Path,
+    store: MessageStore,
+    tls_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The intake record is optional, so an unexpected exception from ``peer_subject`` on a plain
+    mTLS listener must not cut off a sender origin/main served: the message is ACKed and stored
+    without a subject, and one ERROR line names the exception's type but not its message."""
+    import messagefoundry.pki as pki
+
+    def broken(_ssl_object: object) -> str | None:
+        raise RuntimeError(f"defect quoting {_PERSON}")
+
+    monkeypatch.setattr(pki, "peer_subject", broken)
+    named = _ca("Partner CA")
+    settings = _settings(tmp_path, [named[0]], None)  # mTLS, no tls_client_subjects
+    runner, ic = _runner(store, ConnectorType.MLLP, settings)
+    source = MLLPSource(Source(type=ConnectorType.MLLP, settings=settings, ack_mode=ic.ack_mode))
+    source.content_type = ic.content_type
+    await source.start(runner._make_handler(ic))
+    try:
+        with caplog.at_level(logging.ERROR):
+            reply, _ = await _exchange(source, _bundle(tmp_path, named), _ADT)
+    finally:
+        await source.stop()
+    assert b"MSA|AA|CTRL2607" in reply
+    rows = await store.list_messages(allowed_channels=None)
+    assert [r["status"] for r in rows] == [MessageStatus.RECEIVED.value]
+    assert await _intakes(store) == [{"transport": "mllp", "auth_mode": IntakeAuth.MTLS.value}]
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    line = errors[0].getMessage()
+    assert "RuntimeError" in line and "broken" in line
+    assert _PERSON not in line and errors[0].exc_info is None
 
 
 async def test_the_stored_context_holds_no_peer_address(
