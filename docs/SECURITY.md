@@ -2397,7 +2397,10 @@ the same permission set on the same method reds CI until it is listed here.
 > (`RegistryRunner.knows_outbound`, which counts a reload-dropped outbound still draining), a
 > name declared on both sides included, is withheld too, since a rule on it can match the outbound's events. Every
 > `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
-> its action names the outbound side. The alert-instance routes were left as they were, on
+> its action names the outbound side. So is every rule whose event type only an outbound raises,
+> a `"*"` rule included: `_ALERT_EVENT_SIDE` in `messagefoundry/api/app.py` records each type's
+> side, and an event type or action with no side recorded is withheld too. A type both sides
+> raise, and `any`, still show on a `"*"` rule. The alert-instance routes were left as they were, on
 > purpose. The batch Manager decided this on 2026-11-22. It read the owner's ruling as covering
 > rules and flagging, not instances. What the ack, resolve, suspend and resume routes admit is in their bullet under
 > *Single-route data rules*, below. Each rule it shows has a null `id`

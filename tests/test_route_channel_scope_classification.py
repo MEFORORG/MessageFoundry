@@ -177,7 +177,7 @@ ROUTES: dict[str, tuple[str, str]] = {
         SCOPED,
         "only rules whose every named connection is an in-scope name in inbound_names() that the"
         " runner does not also know as an outbound (a '*' connection names none), never a"
-        " restart_outbound rule, each with a null id",
+        " restart_outbound rule or an outbound-only event type, each with a null id",
     ),
     # --- dead letters and approvals -------------------------------------------------------------
     "GET /dead-letters": (SCOPED, "narrowed to the caller's channels"),

@@ -49,6 +49,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
@@ -1050,6 +1051,69 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
 
 #: Which namespace each alert control action restarts (BACKLOG #2528).
 _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
+
+#: Which side of the graph raises each alert event type, as its emitters do today (BACKLOG #3378):
+#: ``"outbound"`` only an outbound lane, ``"inbound"`` only an inbound, ``"both"`` an inbound or an
+#: outbound lane, ``"none"`` a key that names no connection. ``GET /alerts/rules`` withholds a rule of an ``"outbound"`` type, or of
+#: a type missing here, from a channel-scoped caller. A test pins this to
+#: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
+_ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        # RegistryRunner._note_lane_unhealthy and _note_lane_config_fault, outbound lanes only.
+        "connection_error": "outbound",
+        # _maybe_alert_stall reads the OUTBOUND stage; the in-flight watch passes no stall threshold
+        # to the inbound stages.
+        "message_stall": "outbound",
+        # Raised per stage, the inbound stages included, or by an inbound or an outbound stop.
+        "connection_stopped": "both",
+        "queue_buildup": "both",
+        "saturation": "both",
+        "lane_stuck": "both",
+        # Keyed by the inbound's name (config.settings).
+        "sandbox_worker_refused": "inbound",
+        **dict.fromkeys(
+            (
+                "storage_threshold",
+                "cert_expiry",
+                "secret_rotation",
+                "integrity_drift",
+                "gcm_invocations",
+                "update_available",
+                "backup_failed",
+                "store_privilege_warning",
+                "vault_privilege_warning",
+                "leadership_acquired",
+                "dr_activated",
+                "initial_credential_expiring",
+                "log_write_failed",
+                "log_forward_failed",
+                "approval_stale_requester",
+                "approval_too_early",
+                "approval_approver_provenance",
+                "administrator_granted",
+                "no_enabled_administrator",
+                "audit_write_failed",
+                "audit_offbox_copy_missing",
+                "ad_reconcile_aborted",
+                "ad_session_revoked",
+                "ad_reconcile_held",
+                "intake_paused",
+                "config_changed",
+                "crl_reload_refused",
+                "signin_failure_burst",
+                "access_denied_burst",
+                "body_view_burst",
+                "bulk_export",
+                "log_level_debug",
+                "posture_loosened",
+                "peer_refused_burst",
+                "remote_debug_refused",
+                "store_restored",
+            ),
+            "none",
+        ),
+    }
+)
 
 
 async def _alert_control_action(
@@ -10640,10 +10704,19 @@ def create_app(
                 return False
             if rule.control_target is not None and not reachable(rule.control_target):
                 return False
+            if not scoped:
+                return True
             # restart_outbound acts on an outbound whatever the graph holds, a name that is also an
-            # inbound and a "*" rule's firing connection included.
-            return not (
-                scoped and _CONTROL_ACTION_SIDE.get(rule.control_action or "") == "outbound"
+            # inbound and a "*" rule's firing connection included. An action or an event type with
+            # no side recorded is withheld too, so a new one fails closed.
+            if rule.control_action is not None and (
+                _CONTROL_ACTION_SIDE.get(rule.control_action, "outbound") == "outbound"
+            ):
+                return False
+            # An event type only an outbound raises makes the rule an outbound rule, a "*" one
+            # included. "any" matches every side, as connection_stopped does, so it shows.
+            return rule.event_type == "any" or (
+                _ALERT_EVENT_SIDE.get(rule.event_type, "outbound") != "outbound"
             )
 
         rules = [r for r in alerts.rules if visible(r)]

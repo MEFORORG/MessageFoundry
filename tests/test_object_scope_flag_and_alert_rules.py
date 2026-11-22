@@ -9,7 +9,7 @@
 * ``GET /alerts/rules`` returned every rule's ``connection`` and ``control_target``. It now withholds
   any rule that names a connection outside the caller's scope and, since BACKLOG #3378, any rule
   naming a name not in the loaded config's inbound_names() or that the runner also knows as an
-  outbound, and every ``restart_outbound`` rule.
+  outbound, every ``restart_outbound`` rule, and every rule of an outbound-only event type.
 
 NOT-DEPLOYED beta: each gap was one a first deployment would have carried, not a live exposure.
 """
@@ -337,7 +337,9 @@ async def test_alert_rules_withhold_a_name_on_both_sides(
     _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"), outbounds=("SHARED",))
     rules = AlertsSettings(
         rules=[
-            AlertRule(id="stall", event_type="message_stall", connection="SHARED"),
+            # A type both sides raise, so only the name decides (an outbound-only type is
+            # withheld on its own; see the next tests).
+            AlertRule(id="buildup", event_type="queue_buildup", connection="SHARED"),
             *(
                 AlertRule(
                     id=f"in-{action}",
@@ -375,6 +377,86 @@ async def test_alert_rules_withhold_a_name_on_both_sides(
             ("IB_A", "restart_inbound"),
             ("IB_A", None),
         ]
+
+
+def test_every_alert_event_type_and_control_action_has_a_side() -> None:
+    """BACKLOG #3378: ``GET /alerts/rules`` reads each rule's event type and action through these
+    maps, and withholds an unclassified one from a scoped caller. Pinning the key sets to the
+    settings' own sets makes a new type or action a red test here, not a silent withhold."""
+    from messagefoundry.config import settings
+
+    assert set(app_module._ALERT_EVENT_SIDE) == settings._ALERT_EVENT_TYPES
+    assert set(app_module._CONTROL_ACTION_SIDE) == settings._ALERT_CONTROL_ACTIONS
+    assert set(app_module._ALERT_EVENT_SIDE.values()) <= {"outbound", "inbound", "both", "none"}
+
+
+async def test_alert_rules_withhold_an_outbound_only_event_type(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3378 item 4: a rule whose event type only an outbound raises is an outbound rule, so
+    a scoped caller does not see it, a ``"*"`` rule or one on its own inbound alike. The control: a
+    ``"*"`` rule of a type both sides raise, and an ``"any"`` rule, show; an all-channels caller
+    reads every rule."""
+    _attach_graph(engine, monkeypatch)
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="stall", event_type="message_stall", connection="*"),
+            AlertRule(id="error", event_type="connection_error", connection="*"),
+            AlertRule(id="mine-stall", event_type="message_stall", connection="IB_A"),
+            AlertRule(id="buildup", event_type="queue_buildup", connection="*"),
+            AlertRule(id="any", connection="*"),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for username, expected in (
+            ("scoped", [("queue_buildup", "*"), ("any", "*")]),
+            ("wide", [(r.event_type, r.connection) for r in rules.rules]),
+        ):
+            r = await c.get("/alerts/rules", headers=await _login(c, username))
+            assert r.status_code == 200, r.text
+            got = [(x["event_type"], x["connection"]) for x in r.json()["rules"]]
+            assert got == expected, username
+
+
+async def test_alert_rules_withhold_an_unclassified_event_type_or_action(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3378: an event type or control action with no side recorded is withheld from a
+    scoped caller, so a new one fails closed until it is classified. The control: with both
+    classified, the same rules show."""
+    _attach_graph(engine, monkeypatch)
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="stopped", event_type="connection_stopped", connection="IB_A"),
+            AlertRule(
+                id="restart",
+                event_type="queue_buildup",
+                connection="IB_A",
+                control_action="restart_inbound",
+            ),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        h = await _login(c, "scoped")
+
+        async def shown() -> list[str]:
+            r = await c.get("/alerts/rules", headers=h)
+            assert r.status_code == 200, r.text
+            return [x["event_type"] for x in r.json()["rules"]]
+
+        assert await shown() == ["connection_stopped", "queue_buildup"]
+        monkeypatch.setattr(app_module, "_ALERT_EVENT_SIDE", {}, raising=False)
+        monkeypatch.setattr(app_module, "_CONTROL_ACTION_SIDE", {}, raising=False)
+        assert await shown() == []
 
 
 async def test_alert_rules_with_no_graph_show_a_scoped_caller_no_named_rule(
