@@ -2908,10 +2908,13 @@ def test_restore_secures_every_staged_file_before_its_first_byte(tmp_path, key_b
     config_dest = tmp_path / "bundle"
     seen: list[tuple[str, int]] = []
 
+    from messagefoundry.store import store as store_module
+
+    real_secure = store_module._secure_file
+
     def spy(path: Path, **_kw: object) -> None:
         seen.append((path.name, path.stat().st_size))
-
-    from messagefoundry.store import store as store_module
+        real_secure(path)  # a config member's lock is read back, so it must really land (#5618)
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(store_module, "_secure_file", spy)

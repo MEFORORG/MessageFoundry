@@ -53,7 +53,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO, NamedTuple, cast
@@ -6617,6 +6617,66 @@ def _restore_config_members(
         ) from exc
 
 
+def _make_config_parents(parent: Path, root: Path, written: list[Path] | None) -> None:
+    """Create ``parent`` and any missing directory above it, up to ``root``, one at a time, recording
+    each in ``written`` as it is created, so a failure part way down the chain leaves the rollback
+    every directory it made (BACKLOG #5618). A directory already there is not recorded. Raises
+    ``FileExistsError`` when a path on the chain is not a directory."""
+    # Top down, so a file on the chain is met by name: Windows reports a mkdir UNDER a file as a
+    # missing path, which would not read as the collision it is.
+    for directory in (*reversed(parent.parents), parent):
+        if directory == root or not directory.is_relative_to(root) or directory.is_dir():
+            continue
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            if not directory.is_dir():
+                raise
+            continue  # another process made it, so it is not this restore's to remove
+        if written is not None:
+            written.append(directory)
+
+
+def _config_lock_problem(path: Path, dir_grants: Sequence[str] | None) -> str | None:
+    """Why the restored config file ``path`` does not carry the lock just applied, or ``None``.
+
+    The lock functions log rather than raise, so this reads the result back. With ``dir_grants`` the
+    file must carry exactly those principals. Without them, on Windows it must carry one protected
+    full-control entry for this process's account, and on POSIX no group or other permission bit.
+    Anything that cannot be read is a problem: an unconfirmed lock is not a lock."""
+    from messagefoundry.store.store import (
+        _current_user_sid,
+        _is_windows,
+        _parse_sddl_dacl,
+        _read_dacl_sddl,
+        _trio_dacl_is_exact,
+    )
+
+    if not _is_windows():
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        return f"its mode is {mode:o}, open to group or others" if mode & 0o077 else None
+    sddl = _read_dacl_sddl(path, owner=True)
+    parsed = _parse_sddl_dacl(sddl) if sddl is not None else None
+    if parsed is None:
+        return "its access list could not be read"
+    if dir_grants is not None:
+        if _trio_dacl_is_exact(parsed, dir_grants):
+            return None
+        return "its access list or owner is not exactly the destination directory's grants"
+    account = _current_user_sid()
+    if account is None:
+        return "this process's account could not be read"
+    if (
+        parsed.protected
+        and len(parsed.aces) == 1
+        and parsed.aces[0][:3] == ("A", "", "FA")
+        # SDDL writes some accounts as an alias (`NS`, `LA`), which only Windows can expand.
+        and atomic_edit._canonical_sid(parsed.aces[0][3]) == account
+    ):
+        return None
+    return "its access list is not the one owner-only entry the lock writes"
+
+
 def _extract_config_members(
     tar_path: Path, config_dest: Path, *, written: list[Path] | None = None
 ) -> int:
@@ -6642,7 +6702,13 @@ def _extract_config_members(
     The per-member cap is not enough on its own here — N members each just under it would still fill the
     disk — so the bundle also carries an AGGREGATE byte ceiling and a member-count ceiling.
 
-    The restored bundle can carry secrets (``connections.toml``), so each file is locked to its owner.
+    On Windows a name :func:`~messagefoundry.parsing.sniff.windows_member_name_reason` refuses is
+    refused too, so a member cannot land as an alternate data stream of another (BACKLOG #5618).
+
+    The restored bundle can carry secrets (``connections.toml``), so each file is locked: to the
+    grants of a hardened ``config_dest`` (:func:`~messagefoundry.store.store._store_dir_grants`), so
+    the service account keeps its access, and otherwise to its owner. A lock that
+    :func:`_config_lock_problem` cannot confirm refuses the restore.
 
     **A hard-link member is restored, never skipped (vault BACKLOG #5233).** ``tar.add`` stores the
     second name of a hard-linked file as a link member (``LNKTYPE``) naming the first, and this loop
@@ -6659,9 +6725,15 @@ def _extract_config_members(
 
     An archive with no config member is a REFUSAL, not a quiet empty directory — see :func:`run_restore`.
     """
-    from messagefoundry.parsing.sniff import archive_member_name_reason
-    from messagefoundry.store.store import _secure_file
+    from messagefoundry.parsing.sniff import archive_member_name_reason, windows_member_name_reason
+    from messagefoundry.store.store import _secure_store_file, _store_dir_grants
 
+    # Read once, before the mkdir, from the nearest directory that exists: one made here only
+    # inherits and would read as not hardened. Unresolved, so a link on the way still reads as one.
+    grants_from = config_dest
+    while not grants_from.exists() and grants_from != grants_from.parent:
+        grants_from = grants_from.parent
+    dir_grants = _store_dir_grants(grants_from)
     config_dest.mkdir(parents=True, exist_ok=True)
     root = config_dest.resolve()
     landed = 0
@@ -6683,6 +6755,16 @@ def _extract_config_members(
             if reason is not None:
                 raise BackupError(
                     "restore", f"archive carries an unsafe config member name ({reason})"
+                )
+            # Only where this restore writes to Windows: the name is judged for this destination,
+            # and a POSIX host opens `aux.py` or `a:b` as the plain file it names.
+            reason = windows_member_name_reason(rel) if sys.platform == "win32" else None
+            if reason is not None:
+                # Named, because a real config file can have such a name.
+                raise BackupError(
+                    "restore",
+                    f"archive carries an unsafe config member name {member.name!r} on this "
+                    f"Windows host ({reason})",
                 )
             out = (root / rel).resolve()
             if not out.is_relative_to(root):  # backstop: the name gate is the primary control
@@ -6708,29 +6790,16 @@ def _extract_config_members(
             src = tar.extractfile(data)
             if src is None:
                 continue
-            # The directories this member's mkdir is about to CREATE, deepest first, read before the
-            # mkdir so the ledger holds exactly what it made and never a directory that was already
-            # there. The walk stops at the destination root; the second guard is belt-and-braces
-            # against a path whose parent is itself (a filesystem root), which the `is_relative_to`
-            # check above already rules out.
-            new_dirs: list[Path] = []
-            probe = out.parent
-            while probe != root and probe != probe.parent and not probe.exists():
-                new_dirs.append(probe)
-                probe = probe.parent
             # A forged archive can carry `config/a` as a regular file AND `config/a/b` under it. Both
-            # pass the name gate, and the second one's mkdir then re-raises FileExistsError because the
-            # existing path is not a directory -- uncaught all the way out to a CLI traceback.
+            # pass the name gate, and the mkdir then finds a path that is not a directory.
             try:
-                out.parent.mkdir(parents=True, exist_ok=True)
+                _make_config_parents(out.parent, root, written)
             except (FileExistsError, NotADirectoryError) as exc:
                 raise BackupError(
                     "restore",
                     f"archive carries a config member at {member.name} whose parent directory "
                     "collides with a member already extracted as a file",
                 ) from exc
-            if written is not None:
-                written.extend(reversed(new_dirs))  # shallowest first: creation order
             streamed = 0
             # EXCLUSIVE create, so a member can never land on a file that is already there. The
             # overlapping-destination refusal is the control for the case that made this reachable
@@ -6761,10 +6830,19 @@ def _extract_config_members(
             if written is not None:
                 written.append(out)
             with fh:
-                # Locked to its owner on the empty file, before the first byte: the bundle can carry
-                # secrets (connections.toml), and securing it after the stream would leave the write
-                # under the directory's inherited ACL on Windows for as long as the write takes.
-                _secure_file(out)
+                # Locked on the empty file, before the first byte: the bundle can carry secrets
+                # (connections.toml), and securing it after the stream would leave the write under
+                # the directory's inherited ACL on Windows for as long as the write takes. A miss
+                # refuses, and the caller's rollback removes the empty file.
+                _secure_store_file(out, dir_grants=dir_grants)
+                problem = _config_lock_problem(out, dir_grants)
+                if problem is not None:
+                    raise BackupError(
+                        "restore",
+                        f"could not lock the restored config member {member.name!r}: {problem}. "
+                        "Nothing of it was written; fix the destination's permissions and run the "
+                        "same command again",
+                    )
                 while True:
                     buf = src.read(1024 * 1024)
                     if not buf:

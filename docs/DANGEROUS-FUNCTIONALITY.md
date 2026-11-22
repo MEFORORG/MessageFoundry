@@ -904,8 +904,9 @@ or compression library:
   uncompressed tar, and both a member's declared size and the bytes actually read are capped. With
   `--config-to`, the restore writes the archive's config files under their own relative names. Each
   name must pass the archive-member safe-path check, `archive_member_name_reason`, and must resolve inside the destination.
-  The restore uses only that check: it does not run the Windows name check,
-  `windows_member_name_reason`.
+  On a Windows host each name must also pass the Windows name check, `windows_member_name_reason`,
+  which refuses at least a colon, so a member cannot land as an alternate data stream. A POSIX
+  restore does not run that check.
   A member-count cap and a total-size cap apply too. An encrypted backup must decrypt with a store
   key, and every block of it must authenticate, so a tampered one fails before anything is
   extracted. With a store key configured, a plaintext backup is refused; one restores only on a
