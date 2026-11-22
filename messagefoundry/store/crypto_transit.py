@@ -572,7 +572,7 @@ class _StoreToken:
     at a time and at most once per :data:`_TOKEN_REREAD_INTERVAL_S`. :attr:`value` is written before
     :attr:`epoch`, so a client recorded under the current epoch never holds an older token."""
 
-    __slots__ = ("_lock", "_next_read", "_reader", "epoch", "value")
+    __slots__ = ("_lock", "_next_read", "_reader", "_wait_until", "epoch", "value")
 
     def __init__(self, value: str) -> None:
         self.value = value
@@ -580,33 +580,38 @@ class _StoreToken:
         self._lock = threading.Lock()
         self._reader: threading.Thread | None = None
         self._next_read = 0.0
+        self._wait_until = 0.0
 
     def replaced_since(self, epoch: int) -> bool:
         """Whether a token newer than ``epoch`` is available, starting a re-read when one is due.
-        A worker thread waits up to :data:`_TOKEN_REREAD_WAIT_S` for the read. The event loop does
-        not wait: its call fails as it would have, and a later call uses what the read found."""
+        Worker threads share one wait of :data:`_TOKEN_REREAD_WAIT_S` per read, so a read that hangs
+        does not charge it to every 403. The event loop does not wait: its call fails as it would
+        have, and a later call uses what the read found."""
         with self._lock:
             if self.epoch != epoch:
                 return True
-            reader = self._reader
-            if reader is None:
-                now = time.monotonic()
-                if now < self._next_read:
-                    return False
-                self._next_read = now + _TOKEN_REREAD_INTERVAL_S
-                reader = threading.Thread(
-                    target=self._reread, name="transit-token-reread", daemon=True
-                )
-                self._reader = reader
-                try:
-                    reader.start()
-                except RuntimeError:  # no new thread, at least at interpreter shutdown
-                    self._reader = None
-                    return False
-        if _on_event_loop():
+            reader = self._reader or self._start_reread()
+            deadline = self._wait_until
+        if reader is None or _on_event_loop():
             return False
-        reader.join(_TOKEN_REREAD_WAIT_S)
+        reader.join(max(0.0, deadline - time.monotonic()))
         return self.epoch != epoch
+
+    def _start_reread(self) -> threading.Thread | None:
+        """The re-read thread, started now, or ``None`` inside the rate limit or when no thread can
+        start. The caller holds the lock, so the thread's own clean-up runs after this returns."""
+        now = time.monotonic()
+        if now < self._next_read:
+            return None
+        self._next_read = now + _TOKEN_REREAD_INTERVAL_S
+        self._wait_until = now + _TOKEN_REREAD_WAIT_S
+        reader = threading.Thread(target=self._reread, name="transit-token-reread", daemon=True)
+        try:
+            reader.start()
+        except RuntimeError:  # no new thread, at least at interpreter shutdown
+            return None
+        self._reader = reader
+        return reader
 
     def _reread(self) -> None:
         """Adopt the configured token if it changed. A read that fails keeps the current token, and
@@ -867,15 +872,6 @@ class TransitCipher(_UnmarkedPolicy):
             batch_input.append(item)
         return batch_input
 
-    def _batch_failure_flags(self, exc: Exception) -> tuple[bool, bool]:
-        """:func:`_classify_batch_failure`, a 403 read as a 400 when this cipher can replace its
-        token (BACKLOG #5609): the single requests after it may succeed on the new token, and that
-        says nothing about Transit's batch support, so batching stays on."""
-        unavailable, bad_request = _classify_batch_failure(exc)
-        return unavailable, bad_request or (
-            self._token_source is not None and is_vault_forbidden(exc)
-        )
-
     def _send_alone_from_now(self, op: str, why: str) -> None:
         if not self._batch_alone:
             _warn_quietly(
@@ -947,6 +943,7 @@ class TransitCipher(_UnmarkedPolicy):
         """One batch request of :meth:`decrypt_many`, every value ``mfenc:v3``: the results in
         its order."""
         sent = [(stored[len(_V3_PREFIX) :], aad) for stored, aad in batch]
+        epoch = self._token_epoch()
         try:
             # Outside the batch handler: a thread whose client could not be built never asked
             # Transit, so it must not read as Transit refusing the batch, which turns batching off.
@@ -968,7 +965,7 @@ class TransitCipher(_UnmarkedPolicy):
         except Exception as exc:
             # Only flags and a type name leave this handler (see _classify_batch_failure).
             failed, failure_type = True, type(exc).__name__
-            unavailable, bad_request = self._batch_failure_flags(exc)
+            unavailable, bad_request = _classify_batch_failure(exc)
         if unavailable:
             down = CipherUnavailableError(
                 f"Transit decrypt failed (key={self._key!r}): {failure_type}"
@@ -978,7 +975,8 @@ class TransitCipher(_UnmarkedPolicy):
         if failed or replies == UNECHOED:
             opened = self._decrypt_alone(batch)
             served = not any(isinstance(r, CipherError) and gave_no_verdict(r) for r in opened)
-            if served and not bad_request:
+            # A token replaced meanwhile explains the refusal, so it says nothing about batching.
+            if served and not bad_request and self._token_epoch() == epoch:
                 why = "refused" if failed else "did not echo the reference of"
                 self._send_alone_from_now("decrypt", why)
             return opened
@@ -1023,12 +1021,14 @@ class TransitCipher(_UnmarkedPolicy):
             if self._batch_alone or len(batch) == 1:
                 sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
                 continue
+            epoch = self._token_epoch()
             outcome = self._encrypt_batch(batch)
             if isinstance(outcome, list):
                 sealed.extend(outcome)
                 continue
             sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
-            if outcome is not None:
+            # A token replaced meanwhile explains the refusal, so it says nothing about batching.
+            if outcome is not None and self._token_epoch() == epoch:
                 self._send_alone_from_now("encrypt", outcome)
         return sealed
 
@@ -1055,7 +1055,7 @@ class TransitCipher(_UnmarkedPolicy):
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
             failed, failure_type = True, type(exc).__name__
-            unavailable, bad_request = self._batch_failure_flags(exc)
+            unavailable, bad_request = _classify_batch_failure(exc)
         if unavailable:
             raise CipherUnavailableError(
                 f"Transit encrypt failed (key={self._key!r}): {failure_type}"
@@ -1121,13 +1121,7 @@ class TransitCipher(_UnmarkedPolicy):
         as a break later, for example one a proxy or the wrong key answered."""
         inp = base64.b64encode(data).decode("ascii")
         try:
-            response: Any = self._transit_call(
-                self._client,
-                lambda c: c.secrets.transit.generate_hmac(
-                    name=self._audit_key, hash_input=inp, algorithm=AUDIT_TRANSIT_HASH_ALGO
-                ),
-            )
-            mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
+            mac = self._audit_key_hmac(inp)  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
             raise CipherError(
                 f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
@@ -1144,6 +1138,17 @@ class TransitCipher(_UnmarkedPolicy):
                 f"(key={self._audit_key!r})"
             )
         return mac
+
+    def _audit_key_hmac(self, hash_input: str) -> Any:
+        """Transit's raw ``hmac`` of base64 ``hash_input`` under the audit key's latest version.
+        Any failure propagates, for the caller to classify. Blocking."""
+        response: Any = self._transit_call(
+            self._client,
+            lambda c: c.secrets.transit.generate_hmac(
+                name=self._audit_key, hash_input=hash_input, algorithm=AUDIT_TRANSIT_HASH_ALGO
+            ),
+        )
+        return response["data"]["hmac"]
 
     def verify_audit_hmac(self, data: bytes, stored: str) -> bool:
         """Whether ``stored`` is Transit's HMAC of ``data`` under the audit key: Transit's own
@@ -1357,15 +1362,7 @@ class TransitCipher(_UnmarkedPolicy):
     def _probe_mac(self) -> object:
         """Transit's ``hmac`` over FIXED input under the audit key's latest version, raw. Fixed
         input keeps a row's own content from deciding a probe. Any failure propagates. Blocking."""
-        probe: Any = self._transit_call(
-            self._client,
-            lambda c: c.secrets.transit.generate_hmac(
-                name=self._audit_key,
-                hash_input=_VERSION_PROBE_INPUT,
-                algorithm=AUDIT_TRANSIT_HASH_ALGO,
-            ),
-        )
-        return probe["data"]["hmac"]
+        return self._audit_key_hmac(_VERSION_PROBE_INPUT)
 
     def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
         """Whether ``exc``, raised by an audit-MAC verify at ``key_version``, is Transit refusing
@@ -1473,13 +1470,7 @@ class TransitCipher(_UnmarkedPolicy):
         probe. Returns Transit's raw value; the sealer checks its shape. Any failure raises
         :class:`CipherError` naming the key and Vault's failure text, never the input."""
         try:
-            response: Any = self._transit_call(
-                self._client,
-                lambda c: c.secrets.transit.generate_hmac(
-                    name=self._audit_key, hash_input=hash_input, algorithm=AUDIT_TRANSIT_HASH_ALGO
-                ),
-            )
-            return response["data"]["hmac"]
+            return self._audit_key_hmac(hash_input)
         except Exception as exc:
             raise CipherError(
                 f"Transit row seal {what} failed (key={self._audit_key!r}): "

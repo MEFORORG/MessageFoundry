@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,35 @@ def vault(monkeypatch: pytest.MonkeyPatch) -> tuple[_Gate, list[str]]:
 
     monkeypatch.setattr(crypto_transit, "_build_client", build)
     return gate, built
+
+
+def _finish_reread(cipher: TransitCipher) -> None:
+    source = cipher._token_source
+    assert source is not None
+    reader = source._reader
+    if reader is not None:
+        reader.join(timeout=30)
+
+
+class _RefusesBatches:
+    """A Transit that answers 403 to a batch and serves single requests."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def _single(self, name: str, kwargs: dict[str, Any]) -> Any:
+        if "batch_input" in kwargs:
+            raise Forbidden("permission denied")
+        return getattr(self._inner, name)(**kwargs)
+
+    def encrypt_data(self, **kwargs: Any) -> Any:
+        return self._single("encrypt_data", kwargs)
+
+    def decrypt_data(self, **kwargs: Any) -> Any:
+        return self._single("decrypt_data", kwargs)
 
 
 def _expire_and_replace(monkeypatch: pytest.MonkeyPatch, gate: _Gate) -> None:
@@ -304,16 +334,55 @@ def test_a_batch_refused_on_the_event_loop_leaves_batching_on(
 
     async def on_loop() -> list[str | CipherError]:
         opened = cipher.decrypt_many(items)
-        source = cipher._token_source
-        assert source is not None
-        reader = source._reader
-        if reader is not None:
-            reader.join(timeout=30)
+        _finish_reread(cipher)
         return opened + cipher.decrypt_many(items)
 
     opened = asyncio.run(on_loop())
     assert opened[2:] == ["one", "two"]
     assert cipher._batch_alone is False
+
+
+@pytest.mark.parametrize("op", ["encrypt", "decrypt"])
+def test_a_batch_403_with_an_unchanged_token_still_turns_batching_off(
+    vault: tuple[_Gate, list[str]], op: str
+) -> None:
+    """A proxy or policy that refuses batches and serves single requests keeps today's latch."""
+    cipher = build_transit_cipher(StoreSettings())
+    items = [(cipher.encrypt(text, aad=_AAD), _AAD) for text in ("one", "two")]
+    client = cipher._client
+    client.secrets.transit = _RefusesBatches(client.secrets.transit)
+    if op == "encrypt":
+        cipher.encrypt_many([("one", _AAD), ("two", _AAD)])
+    else:
+        assert cipher.decrypt_many(items) == ["one", "two"]
+    assert cipher._batch_alone is True
+
+
+def test_a_hung_reread_charges_its_wait_once(
+    vault: tuple[_Gate, list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, _ = vault
+    monkeypatch.setattr(crypto_transit, "_TOKEN_REREAD_INTERVAL_S", 3600.0)
+    monkeypatch.setattr(crypto_transit, "_TOKEN_REREAD_WAIT_S", 1.0)
+    release = threading.Event()
+
+    def hung() -> str:
+        assert release.wait(timeout=30)
+        return store_vault_token()
+
+    monkeypatch.setattr(crypto_transit, "store_vault_token", hung)
+    cipher = build_transit_cipher(StoreSettings())
+    gate.valid = set()
+    try:
+        with pytest.raises(CipherError):
+            cipher.encrypt("synthetic", aad=_AAD)
+        started = time.monotonic()
+        with pytest.raises(CipherError):
+            cipher.encrypt("synthetic", aad=_AAD)
+        assert time.monotonic() - started < 0.5
+    finally:
+        release.set()
+        _finish_reread(cipher)
 
 
 def test_on_the_event_loop_the_reread_runs_off_it_and_the_next_call_recovers(
@@ -340,9 +409,7 @@ def test_on_the_event_loop_the_reread_runs_off_it_and_the_next_call_recovers(
     loop_thread = asyncio.run(on_loop())
     assert read_on and loop_thread not in read_on
     release.set()
-    reader = cipher._token_source._reader  # type: ignore[union-attr]
-    if reader is not None:
-        reader.join(timeout=30)
+    _finish_reread(cipher)
     assert cipher.encrypt("synthetic", aad=_AAD).startswith("mfenc:v3:")
 
 
