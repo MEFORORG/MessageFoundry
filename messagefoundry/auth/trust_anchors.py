@@ -250,9 +250,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     where the hold is stated; the code and messages that act on it point here.** What sets it: a
     refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
     device at the path among them, or an ACL or path that could not be read, since whoever
-    swapped the file can make its ACL unreadable. A file read the next check may not repeat sets
-    nothing (:func:`_transient_read_fault`): a file not there, as between the steps of some
-    renewals, or one the engine may not open, as while a scanner holds it. What it refuses: at least the new connects the
+    swapped the file can make its ACL unreadable. Two file read faults set nothing
+    (:func:`_transient_read_fault`): a file not there, as between the steps of some renewals, and
+    one the engine may not open, as while a scanner holds it. Any other read fault, such as a
+    network error on a share, sets the hold. What it refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -2907,8 +2908,8 @@ async def _preflight_one(
 
 
 def _transient_read_fault(exc: OSError | ValueError) -> bool:
-    """Whether reading an anchor failed in a way the next check may not repeat, so the store pin
-    sets no hold for it (module item 11): a file not there, as between the two steps of some
+    """Whether reading an anchor failed in one of the two ways that set no store pin hold
+    (module item 11), since the next check may not repeat them: a file not there, as between the two steps of some
     renewals, or one the engine may not open, which is also what a Windows sharing or lock
     violation arrives as. Not a pipe or device refused as not a regular file, and not a path the
     OS cannot take: those are verdicts."""
