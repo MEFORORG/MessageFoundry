@@ -12927,7 +12927,10 @@ class SqlServerStore:
                             await cur.execute(
                                 "DELETE FROM attachment_chunk WHERE attachment_id=?", (ref,)
                             )
-                    await self._commit(conn)
+                    if headers:
+                        await self._commit(conn)
+                    else:
+                        await self._commit_read(conn)
                     # Header-less groups (incomplete writes), in a second transaction so no header
                     # lock is held while waiting on an applock. A put holds its content address's
                     # applock until it commits header and chunks together, so a header re-read
@@ -12938,7 +12941,13 @@ class SqlServerStore:
                         " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
                     )
                     for ref in sorted(str(r[0]) for r in await cur.fetchall()):
-                        await self._applock(cur, f"mefor:attachment:{ref}")
+                        # No wait: a held applock means a put of this address is live, so the group
+                        # is not an orphan to judge now, and startup must not hang on it (a
+                        # command_timeout of 0 would make the default wait unbounded).
+                        try:
+                            await self._applock(cur, f"mefor:attachment:{ref}", timeout_ms=0)
+                        except _ApplockTimeout:
+                            continue
                         await cur.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
                         if await cur.fetchall():
                             continue
@@ -12953,6 +12962,8 @@ class SqlServerStore:
             except Exception:
                 # The transaction may hold applocks. After the cursor closes, as put_attachment.
                 await self._rollback_or_discard(conn)
+                if headers:  # the first transaction may have committed these before the failure
+                    log.warning("attachment sweep failed after %d refcount-0 deletes", headers)
                 raise
         reclaimed = headers + incomplete
         if reclaimed:

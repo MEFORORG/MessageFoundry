@@ -566,6 +566,57 @@ async def test_sweep_rechecks_an_orphan_under_the_put_applock() -> None:
     assert cur.log.index(("applock", locks[1])) < cur.log.index(("chunks", dead))
 
 
+async def test_sweep_skips_an_orphan_whose_put_is_live_without_waiting() -> None:
+    """A held applock is a live put: the sweep neither waits on it nor deletes its chunks."""
+    held, dead = "a" * 64, "d" * 64
+    timeouts: list[int] = []
+
+    class _Held(_SweepCursor):
+        async def execute(self, sql: str, params: Any = None) -> None:
+            await super().execute(sql, params)
+            if "sp_getapplock" in sql:
+                timeouts.append(params[1])
+                if held in str(params[0]):
+                    self._current = [(-1,)]
+
+    cur = _Held({}, {held, dead})
+    store, _ = _store(cur)
+    assert await store.sweep_orphan_attachments() == 1
+    assert cur.chunks == {held}
+    assert timeouts == [0, 0]
+
+
+class _PgReadConn:
+    def __init__(self, total: int, rows: list[dict[str, Any]]) -> None:
+        self._total = total
+        self._rows = rows
+
+    async def fetchval(self, sql: str, *args: Any) -> int:
+        return self._total
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        return self._rows
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [[], [{"seq": 0, "ciphertext": "abc"}]],
+    ids=["emptied", "truncated"],
+)
+async def test_postgres_read_raises_on_a_short_document(rows: list[dict[str, Any]]) -> None:
+    """Red before #5728: GC between the two reads returned a short document and no error."""
+    store: Any = PostgresStore.__new__(PostgresStore)
+    store._cipher = make_cipher(None)
+
+    @asynccontextmanager
+    async def _timed_acquire() -> AsyncIterator[_PgReadConn]:
+        yield _PgReadConn(5, rows)
+
+    store._timed_acquire = _timed_acquire
+    with pytest.raises(KeyError, match="incomplete"):
+        _ = [c async for c in store.read_attachment("a" * 64)]
+
+
 class _PgSweepConn:
     def __init__(self) -> None:
         self.statements: list[str] = []
