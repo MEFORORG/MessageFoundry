@@ -9,6 +9,7 @@ flow of each handoff and nothing about a live server's locking."""
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -43,8 +44,6 @@ BAD_CELLS = {
     "infinity-depth": '{"correlation_depth": Infinity}',
     "nan-depth": '{"correlation_depth": NaN}',
     "deep-nesting": "[" * 200_000,
-    # A nested root: at this depth the child's json.dumps can overflow, depending on the stack.
-    "deep-root": '{"correlation_root_id": ' + "[" * 15_600 + "]" * 15_600 + "}",
     # depth + 1 has 4301 digits, past int's string limit, so the child could not format it.
     "over-digit-limit-depth": '{"correlation_depth": ' + "9" * 4300 + "}",
 }
@@ -65,11 +64,29 @@ DELIVERED_CELLS = {
 _DELIVERED = pytest.mark.parametrize(
     "cell", list(DELIVERED_CELLS.values()), ids=list(DELIVERED_CELLS)
 )
+# The nesting at which the encoder overflows depends on the thread's stack size, so the overflow is
+# forced for this one root value rather than tuned to a depth that holds on one platform.
+_OVERFLOW_ROOT = ["overflows-the-encoder"]
+_OVERFLOW_ROOT_CELL = json.dumps({"correlation_root_id": _OVERFLOW_ROOT})
 # Over the cap the child is dropped before its metadata is serialized, so this root never wedges.
-_DEEP_ROOT_OVER_CAP = (
-    '{"correlation_depth": 8, "correlation_root_id": ' + "[" * 15_600 + "]" * 15_600 + "}"
+_OVERFLOW_ROOT_OVER_CAP = json.dumps(
+    {"correlation_depth": 8, "correlation_root_id": _OVERFLOW_ROOT}
 )
 _KEYLESS_CELL = "mfenc:v1:SYNTHCIPHERTEXT"
+
+
+@pytest.fixture
+def encoder_overflows_on_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_dumps = json.dumps
+
+    def dumps(obj: Any, *args: Any, **kwargs: Any) -> str:
+        if isinstance(obj, dict) and obj.get("correlation_root_id") == _OVERFLOW_ROOT:
+            raise RecursionError("synthetic encoder overflow")
+        return real_dumps(obj, *args, **kwargs)
+
+    monkeypatch.setattr(json, "dumps", dumps)
+
+
 _BAD = pytest.mark.parametrize("cell", list(BAD_CELLS.values()), ids=list(BAD_CELLS))
 _GOOD_CELL = '{"correlation_depth": 3, "correlation_id": "root"}'
 
@@ -161,11 +178,22 @@ async def test_sqlite_a_cell_main_delivers_still_delivers(
     assert len(list(await cur.fetchall())) == 1
 
 
-async def test_sqlite_deep_root_over_the_cap_is_dropped_as_on_main(
+@pytest.mark.usefixtures("encoder_overflows_on_root")
+async def test_sqlite_root_the_encoder_cannot_serialize_dead_letters(
     sqlite_store: MessageStore,
 ) -> None:
     mid, rtd = await _to_routed(sqlite_store)
-    await _set_cell(sqlite_store, mid, _DEEP_ROOT_OVER_CAP)
+    await _set_cell(sqlite_store, mid, _OVERFLOW_ROOT_CELL)
+    assert await _handoff(sqlite_store, mid, rtd.id) is False
+    assert await _queue_rows(sqlite_store, mid) == [(Stage.ROUTED.value, OutboxStatus.DEAD.value)]
+
+
+@pytest.mark.usefixtures("encoder_overflows_on_root")
+async def test_sqlite_overflowing_root_over_the_cap_is_dropped_as_on_main(
+    sqlite_store: MessageStore,
+) -> None:
+    mid, rtd = await _to_routed(sqlite_store)
+    await _set_cell(sqlite_store, mid, _OVERFLOW_ROOT_OVER_CAP)
     assert await _handoff(sqlite_store, mid, rtd.id) is True
     assert await _queue_rows(sqlite_store, mid) == [(Stage.OUTBOUND.value, OutboxStatus.DEAD.value)]
 
@@ -316,6 +344,13 @@ async def test_postgres_a_cell_main_delivers_still_delivers(cell: str) -> None:
     assert seen["dead"] == [] and len(seen["children"]) == 1
 
 
+@pytest.mark.usefixtures("encoder_overflows_on_root")
+async def test_postgres_root_the_encoder_cannot_serialize_dead_letters() -> None:
+    store, seen = _pg_store(_OVERFLOW_ROOT_CELL)
+    assert await store.transform_handoff(**_PG_KWARGS) is False
+    assert [row for row, _ in seen["dead"]] == ["rtd"] and seen["children"] == []
+
+
 async def test_postgres_key_outage_does_not_dead_letter(monkeypatch: pytest.MonkeyPatch) -> None:
     store, seen = _pg_store(_GOOD_CELL)
 
@@ -463,6 +498,18 @@ async def test_sqlserver_a_cell_main_delivers_still_delivers(cell: str) -> None:
     conn = _SsSyncConn(_SsSyncCursor(cell))
     assert store.transform_handoff_sync(conn, **_PG_KWARGS)[0] is True
     assert conn.rollbacks == 0
+
+
+@pytest.mark.usefixtures("encoder_overflows_on_root")
+async def test_sqlserver_root_the_encoder_cannot_serialize_dead_letters() -> None:
+    store, dead = _ss_store(_OVERFLOW_ROOT_CELL)
+    assert await store.transform_handoff(**_PG_KWARGS) is False
+    assert dead == ["rtd"]
+    conn = _SsSyncConn(_SsSyncCursor(_OVERFLOW_ROOT_CELL))
+    with pytest.raises(CellTagError) as info:
+        store.transform_handoff_sync(conn, **_PG_KWARGS)
+    _assert_clean_refusal(info.value)
+    assert conn.rollbacks == 1 and conn.commits == 0
 
 
 def test_sqlserver_valid_parent_decodes_unchanged() -> None:
