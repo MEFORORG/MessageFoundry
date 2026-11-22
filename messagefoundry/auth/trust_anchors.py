@@ -254,7 +254,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     this process's in-process baseline (:func:`release_store_pin_refusal`). A store call
     that needs one of those connects fails until then. A reload may not reach the pin's check: at
     least an earlier anchor's refusal ends the preflight first, and a reload route that makes a
-    store call before the check fails there once the pool has no connection left. A restart once
+    store call before the check fails there whenever that call needs a new connection, such as
+    when no pooled connection is free and the pool is below its size. A restart once
     the file is corrected lifts it too, since the refusal is held in memory. The store is not
     closed: the connections already in its pool can stay open, whichever server they reach, and
     the store goes on using them. At ``warn`` a new connect reads the file on disk then, as
@@ -1808,7 +1809,8 @@ def release_store_pin_refusal(spec: AnchorSpec, fingerprint: str) -> None:
     ``fingerprint`` is the pin those checks passed. Unless it equals this process's baseline
     (:data:`_STORE_PIN_FIRST_CHECKED`), the hold stays and an ERROR is logged once per hold: a
     swapped pin must not lift the hold its own refusal set by passing after, say, an ACL fix.
-    A renewal then takes a restart, as the off-hop warning says."""
+    A renewal then takes a restart, as the off-hop warning says. Where no baseline was held
+    before the check, the pin it passes becomes the baseline first, so it lifts the hold."""
     key = (spec.label, spec.path)
     if key not in _STORE_PIN_REFUSED:
         return
