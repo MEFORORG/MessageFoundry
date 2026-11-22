@@ -51,7 +51,7 @@ from messagefoundry.serviceenv import (
     service_env_loosenings,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import CREATE, REMOVE
+from tests._serviceenv_remedy import ADD_BACK, CREATE, REMOVE
 
 #: Synthetic stand-ins. Never a real key: the tests check that no value is kept, by searching for
 #: these strings in what the reading returns.
@@ -615,15 +615,47 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
 
 
 @pytest.mark.parametrize(
-    "entries",
+    ("entries", "adds_back"),
     [
-        ["MEFOR_STORE_PASSWORD=x"],
-        [f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"],
-        ["MEFOR_VALUE_PARTNER_HOST=example.test"],
-        ["MEFOR_STORE_ENCRYPTION_KEY=", "abc==", "MEFOR_AUTH_AD_BIND_PASSWORD=x"],
+        pytest.param(["MEFOR_VALUE_PARTNER_HOST=example.test"], True, id="value"),
+        pytest.param(["MEFOR_STORE_PASSWORD=x"], True, id="directory-secret"),
+        pytest.param(
+            ["MEFOR_VALUE_PARTNER_HOST=example.test", "MEFOR_SECRETS_DIRECTORY=C:/s"],
+            False,
+            id="directory-listed",
+        ),
+        pytest.param(
+            ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1"],
+            False,
+            id="directory-joined",
+        ),
+        pytest.param([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"], False, id="store-key"),
     ],
 )
-def test_the_remedy_names_no_list_string_or_command(entries: list[str]) -> None:
+def test_an_unnamed_directory_is_added_back_as_main_says(
+    entries: list[str], adds_back: bool
+) -> None:
+    """origin/main's step for a secrets directory that exists but the lists no longer name,
+    restored by the Lander's hold on PR 3142 (comment 7085002242): printed once, after the Put
+    step and before the removal, where the lists set no MEFOR_SECRETS_DIRECTORY and no string
+    joined to a value sets one. A store key alone goes to a key file and gets none."""
+    refusal = service_env_refusal(_service(entries))
+    assert refusal is not None
+    assert refusal.count(ADD_BACK) == (1 if adds_back else 0)
+    if adds_back:
+        assert refusal.index("Put ") < refusal.index(ADD_BACK) < refusal.index(REMOVE)
+
+
+@pytest.mark.parametrize(
+    ("entries", "adds_back"),
+    [
+        (["MEFOR_STORE_PASSWORD=x"], True),
+        ([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"], False),
+        (["MEFOR_VALUE_PARTNER_HOST=example.test"], True),
+        (["MEFOR_STORE_ENCRYPTION_KEY=", "abc==", "MEFOR_AUTH_AD_BIND_PASSWORD=x"], True),
+    ],
+)
+def test_the_remedy_names_no_list_string_or_command(entries: list[str], adds_back: bool) -> None:
     """The installer refuses an existing directory the service does not name, so the remedy
     sends nobody to a re-run. It says what to remove and points at SERVICE.md. It names no
     list, registry string or `nssm` command, since which of those applies depends on the host
@@ -633,6 +665,10 @@ def test_the_remedy_names_no_list_string_or_command(entries: list[str]) -> None:
     # The control: the finding before the remedy names the lists, so the probe can fire.
     assert "appenvironment" in refusal.lower()
     remedy = refusal.split("each value refused here. ", 1)[1]
+    # origin/main's add-back step, which names the list, nssm and the installer, is restored
+    # by the Lander's hold in comment 7085002242; the rest of the remedy still names none.
+    assert (ADD_BACK in remedy) is adds_back
+    remedy = remedy.replace(ADD_BACK, "")
     # Removal comes after every step that moves a value (the fourth hold, H1).
     tail = remedy[remedy.index(REMOVE) :]
     assert "protect-key" not in tail and "Put " not in tail
