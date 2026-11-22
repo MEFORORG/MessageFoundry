@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5888: the DR verify and restore resolve a read-only store key off the event loop.
+"""BACKLOG #5888: the DR restore-verify resolves a read-only store key off the event loop.
 
-Each resolved and decoded the key on the loop, so a slow key provider would have stalled the engine
+It resolved and decoded the key on the loop, so a slow key provider would have stalled the engine
 and, on a DR activation, kept the takeover timeout around ``run_restore_verify`` from firing. A
 provider whose resolve can write custody state stays on the loop, so an abort cannot land mid-write.
-The backup still resolves on the loop, as a hung hop there would stop backups with no failure row.
+``run_restore`` and the backup still resolve on the loop, as on main.
 Every key and provider here is synthetic, and no Vault server is started."""
 
 from __future__ import annotations
@@ -71,9 +71,7 @@ def _backup(tmp_path: Path, provider: str = "auto") -> Awaitable[object]:
 _ENTRY_POINTS = pytest.mark.parametrize(
     "call", [_verify, _restore, _backup], ids=["restore-verify", "restore", "backup"]
 )
-_HOP_ENTRY_POINTS = pytest.mark.parametrize(
-    "call", [_verify, _restore], ids=["restore-verify", "restore"]
-)
+_HOP_ENTRY_POINTS = pytest.mark.parametrize("call", [_verify], ids=["restore-verify"])
 _Call = Callable[..., Awaitable[object]]
 
 
@@ -246,15 +244,16 @@ async def test_a_read_only_provider_resolves_off_the_loop(
     assert provider.threads and threading.get_ident() not in provider.threads
 
 
+@pytest.mark.parametrize("call", [_restore, _backup], ids=["restore", "backup"])
 @pytest.mark.parametrize("name", ["auto", "env", "dpapi", "vault", "host", "synthetic-unknown"])
-async def test_the_backup_resolves_on_the_loop_as_main_does(
-    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_restore_and_backup_resolve_on_the_loop_as_main_does(
+    call: _Call, name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The row's remainder: a hop here needs a bounded wait wired to the backup failure row."""
+    """The row's remainder. A backup hop needs a bounded wait wired to its failure row."""
     provider = _Provider(raises=KeyProviderError("synthetic refusal"))
     _install(monkeypatch, provider)
     with pytest.raises(KeyProviderError):
-        await _backup(tmp_path, name)
+        await call(tmp_path, name)
     assert provider.threads == [threading.get_ident()]
 
 
