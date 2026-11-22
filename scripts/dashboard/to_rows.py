@@ -105,7 +105,7 @@ def notes(snap: Snapshot) -> dict[str, str]:
         "flow_health": "Open engine PRs right now.",
         "ci_main": f"Pass rate of ci.yml push runs on main, week {week}. Cancelled and skipped "
         "runs not counted.",
-        "asvs": f"Pass cells over cells not marked n/a. Measured at {asvs_pair(snap)}.",
+        "asvs": "Pass cells over cells not marked n/a.",
         "dependency_vulns": "Open Dependabot alerts on the engine.",
         "owner_waiting": "Open ledger rows with verdict owner-ruling. Open class C questions not "
         "counted yet.",

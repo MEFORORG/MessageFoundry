@@ -129,9 +129,9 @@ def test_metric_rows_contract() -> None:
     rows = _rows(_snapshot())
     for row in rows.values():
         assert set(row) == METRIC_KEYS
-    assert rows["asvs"]["note"].endswith(
-        "Measured at scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234."
-    )
+    # The headline row carries its pair in ref alone, so the tile never shows it twice.
+    assert rows["asvs"]["note"] == "Pass cells over cells not marked n/a."
+    assert rows["asvs"]["ref"] == "scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234"
     # Every ASVS count row carries the ref pair too.
     assert (
         rows["asvs.pass"]["note"]
@@ -171,7 +171,7 @@ def test_asvs_note_tolerates_missing_refs() -> None:
     snap = _snapshot()
     snap["metrics"][3]["detail"] = {"scorecard_ref": "", "provenance": ["# no ref here"]}
     want = "scorecard=vault-origin-main@unknown engine=unknown"
-    assert want in _rows(snap)["asvs"]["note"]
+    assert _rows(snap)["asvs"]["ref"] == want
 
 
 def test_series_rows() -> None:

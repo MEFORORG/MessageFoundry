@@ -130,7 +130,9 @@ try {
     New-Item -ItemType Directory -Path $tmp | Out-Null
     foreach ($repo in @($EngineRepo, $Vault)) {
         try {
-            Invoke-Git @('-C', $repo, 'fetch', '--quiet', '--no-tags', 'origin',
+            # A stalled transfer aborts after 60 s under 1 KB/s, not at the task's 30-minute kill.
+            Invoke-Git @('-C', $repo, '-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=60',
+                'fetch', '--quiet', '--no-tags', 'origin',
                 '+refs/heads/main:refs/remotes/origin/main') | Out-Null
         } catch {
             # The run goes on with the refs already there, but it ends red: stale numbers published

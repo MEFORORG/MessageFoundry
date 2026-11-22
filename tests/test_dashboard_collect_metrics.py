@@ -451,10 +451,10 @@ def test_ci_main_per_week(tmp_path: Path) -> None:
 
     m = cm.Metric("ci_main", "", "", "", "")
     cm.c_ci_main(_ctx(tmp_path, run, weeks=2, today="2026-11-18"), m)
-    assert m.value == 66.7
+    assert m.value == 66.6  # 2 of 3, rounded down so it never bands above its rate
     assert m.status == "bad"
     assert m.detail["open_ci_red_prs"] == 1
-    assert m.series == [{"week": "2026-W46", "value": 66.7}, {"week": "2026-W47", "value": None}]
+    assert m.series == [{"week": "2026-W46", "value": 66.6}, {"week": "2026-W47", "value": None}]
 
 
 def _census(**kw: Any) -> Any:
@@ -679,8 +679,25 @@ def test_sweep_removes_only_stale_prefixed_dirs(tmp_path: Path) -> None:
     long_ago = 1_000_000.0
     os.utime(old, (long_ago, long_ago))
     os.utime(other, (long_ago, long_ago))
-    cm.sweep_stale(tmp_path, "mf-metrics-")
+    assert cm.sweep_stale(tmp_path, "mf-metrics-") is True
     assert sorted(p.name for p in tmp_path.iterdir()) == ["keep", "mf-metrics-new"]
+
+
+def test_a_stale_dir_that_will_not_go_fails_the_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import os
+
+    old = tmp_path / "mf-metrics-old"
+    old.mkdir()
+    os.utime(old, (1_000_000.0, 1_000_000.0))
+    monkeypatch.setattr(cm, "remove_tree", lambda path: False)
+    assert cm.sweep_stale(tmp_path, "mf-metrics-") is False
+
+
+def test_child_runs_in_utf8_mode() -> None:
+    assert "PYTHONUTF8" not in cm.child_env()  # -I would ignore it
+    assert cm.run_child(["-c", "import sys; print(sys.flags.utf8_mode)"]).strip() == "1"
 
 
 # -- the vault read, with a fake archive ------------------------------------------------------------

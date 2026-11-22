@@ -22,8 +22,12 @@ points at a parent directory, reached only through an explicit ``--git-dir``.
 
 THE VAULT'S CODE RUNS IN A CHILD PROCESS. The ledger census is the vault's own
 ``scripts/docs/ledger_weekly_report.py``, archived from vault ``origin/main``. It runs through
-``_vault_census.py`` under ``python -I`` with an allowlisted environment that holds no token and no
-``GIT_*`` variable, never imported into this process. The vault commit it ran at is recorded.
+``_vault_census.py`` under ``python -I`` with an allowlisted environment that holds no token
+variable and no ``GIT_*`` variable, never imported into this process. The vault commit it ran at is
+recorded. That is NO SANDBOX: the child runs as the same user with ``PATH`` intact, so vault code
+could still run ``gh`` or ``git``, which read the user's stored credentials (keyring, ``hosts.yml``)
+and act as that user. What the scrub removes is only a token passed in the environment, and a
+``GIT_*`` variable steering git. The vault's ``main`` is trusted to that extent.
 
 STDOUT CARRIES NO RAW VALUE. The console summary is each metric's id, status and whether it holds
 an error; the values, the counts and the error text are only in the snapshot. A status is a banded
@@ -51,9 +55,10 @@ The final window week ends at ``--through``, for the ledger counts as for the Gi
 
 EXIT STATUS. 0 when every metric and every optional part was read. 3 when the snapshot WAS written
 but a metric carries an error or a detail carries a ``partial_error``, so a scheduled caller goes red
-on an outage rather than publishing nulls quietly, and also when the work directory could not be
-removed. 1 when nothing was written (a refused ``--out`` or work directory, a bad ``--weeks`` or
-``--through``); 2 is argparse's own usage error, and nothing was written either.
+on an outage rather than publishing nulls quietly, and also when the work directory, or a stale one
+from a killed run, could not be removed. 1 when nothing was written (a refused ``--out`` or work
+directory, ``--weeks`` outside 2 to 104, or a ``--through`` in the future); 2 is argparse's own
+usage error, a malformed date among them, and nothing was written either.
 
 Usage::
 
@@ -69,6 +74,7 @@ import datetime as dt
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -315,7 +321,9 @@ def ci_pass_series(runs: Sequence[dict[str, Any]], labels: Sequence[str]) -> lis
     out: list[dict[str, Any]] = []
     for w in labels:
         n = passed[w] + failed[w]
-        out.append({"week": w, "value": round(100.0 * passed[w] / n, 1) if n else None})
+        # Rounded DOWN to one decimal: the status is banded on this value, and 89.98 must not
+        # read as 90.0.
+        out.append({"week": w, "value": math.floor(1000.0 * passed[w] / n) / 10 if n else None})
     return out
 
 
@@ -412,7 +420,8 @@ def run_real_probe(argv: Sequence[str], cwd: Path | None = None) -> str:
 
 
 #: The environment the vault's census code runs under: what a Windows or POSIX Python needs to
-#: start, and nothing else. No token (GH_TOKEN, GITHUB_TOKEN), no GIT_* and no profile variable.
+#: start, and nothing else. No token variable (GH_TOKEN, GITHUB_TOKEN), no GIT_* and no profile
+#: variable. Not a sandbox: PATH stays, so gh and git, with their stored credentials, still run.
 _CHILD_ENV_KEEP = (
     "SYSTEMROOT",
     "SYSTEMDRIVE",
@@ -427,13 +436,16 @@ _CHILD_ENV_KEEP = (
 
 def child_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k.upper() in _CHILD_ENV_KEEP}
-    return {**env, "LC_ALL": "C", "PYTHONUTF8": "1"}
+    return {**env, "LC_ALL": "C"}
 
 
 def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:
     """Run the vault census driver: ``python -I`` under :func:`child_env`, from ``cwd`` (the
     archive root), so a relative write by the vault code never lands in the caller's work tree."""
-    return run_bytes([sys.executable, "-I", *argv], cwd, env=child_env()).decode("utf-8")
+    # -X utf8, not PYTHONUTF8: -I ignores every PYTHON* variable.
+    return run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=child_env()).decode(
+        "utf-8"
+    )
 
 
 def fetch_url(url: str) -> bytes:
@@ -782,7 +794,8 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
     # --through would give a PR opened after it a negative age.
     now = dt.datetime.now(dt.UTC)
     ages = [(now - parse_stamp(r["createdAt"])).total_seconds() / 86400 for r in rows]
-    oldest = round(max(ages), 1) if ages else None
+    oldest_raw = max(ages) if ages else None
+    oldest = None if oldest_raw is None else round(oldest_raw, 1)
     detail: dict[str, Any] = {
         "open_prs": len(rows),
         "oldest_open_days": oldest,
@@ -834,7 +847,8 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
         add_partial(detail, f"stall count: {type(exc).__name__}: {exc}")
     detail["state_as_of"] = "run time; --through does not apply to open PRs"
     m.value = len(rows)
-    m.status = status_flow(oldest, stalled)
+    # Banded on the raw age, so 7.04 days never rounds into the 7-day band.
+    m.status = status_flow(oldest_raw, stalled)
     m.detail = detail
 
 
@@ -922,7 +936,7 @@ def c_asvs(ctx: Context, m: Metric) -> None:
         raise CollectError("scorecard --status printed no 'cells' line")
     counts = parse_asvs_cells(cells)
     applicable = counts["total"] - counts.get("na", 0)
-    pass_pct = round(100.0 * counts.get("pass", 0) / applicable, 1) if applicable else None
+    pass_pct = 100.0 * counts.get("pass", 0) / applicable if applicable else None
     provenance = [ln for ln in lines if ln.startswith("#")]
     engine_ref = asvs_engine_ref(provenance)
     tool = (
@@ -938,8 +952,12 @@ def c_asvs(ctx: Context, m: Metric) -> None:
         # that tree from this commit, and says so.
         engine_ref = f"{ctx.archive_ref}+archive"
         tool = f"scripts/asvs/scorecard.py from a git archive of engine commit {ctx.archive_ref}"
-    m.value = pass_pct
+    m.value = None if pass_pct is None else round(pass_pct, 1)
+    # Banded on the raw rate, so a value just under a threshold never rounds up into it.
     m.status = status_pct(pass_pct, "asvs")
+    if pass_pct is None:
+        m.error = f"the scorecard has no applicable cell: {counts}"
+
     m.detail = {
         "counts": counts,
         "value_means": "pass cells over cells not marked na",
@@ -1356,15 +1374,19 @@ def remove_tree(path: Path) -> bool:
 STALE_SECONDS = 2 * 3600
 
 
-def sweep_stale(base: Path, prefix: str, now: float | None = None) -> None:
-    """Remove ``base/<prefix>*`` directories older than :data:`STALE_SECONDS`."""
+def sweep_stale(base: Path, prefix: str, now: float | None = None) -> bool:
+    """Remove ``base/<prefix>*`` directories older than :data:`STALE_SECONDS`. False when one that
+    should have gone is still there: it holds private vault files, so the caller fails the run."""
     cutoff = (time.time() if now is None else now) - STALE_SECONDS
+    ok = True
     for old in base.glob(f"{prefix}*"):
         try:
             if old.is_dir() and not old.is_symlink() and old.stat().st_mtime < cutoff:
-                remove_tree(old)
+                ok = remove_tree(old) and ok
         except OSError as exc:
             print(f"ERROR: could not sweep {old}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            ok = False
+    return ok
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1408,11 +1430,11 @@ def main(argv: list[str] | None = None) -> int:
         help="last day of the window (default: today, UTC)",
     )
     args = ap.parse_args(argv)
-    # At least two, so the window always holds one complete week for the weekly values.
     # Error text can quote a ledger line or a git message; a cp1252 console must not raise on it.
     for stream in (sys.stdout, sys.stderr):
         if isinstance(stream, io.TextIOWrapper):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    # At least two, so the window always holds one complete week for the weekly values.
     if not 2 <= args.weeks <= 104:
         print("ERROR: --weeks must be from 2 to 104", file=sys.stderr)
         return 1
@@ -1433,7 +1455,7 @@ def main(argv: list[str] | None = None) -> int:
     if reason is not None:
         print(f"ERROR: refusing work dir {base}: {reason}", file=sys.stderr)
         return 1
-    sweep_stale(base, "mf-metrics-")
+    swept = sweep_stale(base, "mf-metrics-")
     tmp = Path(tempfile.mkdtemp(prefix="mf-metrics-", dir=base))
     cleaned = False
     try:
@@ -1460,7 +1482,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{m.id}: status={m.status} read={flag}")
     # 3 when anything could not be read, after the snapshot is written: an outage goes red.
     partial = any(m.error or m.detail.get("partial_error") for m in metrics)
-    return 3 if partial or not cleaned else 0
+    return 3 if partial or not cleaned or not swept else 0
 
 
 if __name__ == "__main__":  # pragma: no cover
