@@ -1061,14 +1061,16 @@ class QueueStore(StoreLifecycle, Protocol):
         :class:`WorkerDeathOutcome` comes back."""
         ...
 
-    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
+    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> bool:
         """Force one outbox row terminal (``DEAD``) immediately — **fail-fast**, no retry consumed
         and no backoff. For deliveries that can never succeed as-is and must not hold the FIFO lane:
         a permanent partner reject (``AR``), an internal/code error under the error-and-continue
         policy, or an undecryptable payload. Replayable via the dead-letter API like any dead row.
         Contrast :meth:`mark_failed`, which reschedules with backoff (and only dead-letters once a
         finite ``max_attempts`` is exhausted). A row already ``done``, ``dead`` or ``cancelled`` is
-        left as it is (ADR 0157 Amendment D), and the call returns as it does for a vanished row."""
+        left as it is (ADR 0157 Amendment D). Returns whether this call wrote the row: ``False`` for
+        a resolved or vanished row, and for a write the H1 fence rolled back, so a caller logs or
+        alerts a dead-letter only on ``True``."""
         ...
 
     async def mark_batch_failed(
@@ -1096,11 +1098,12 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
-    ) -> None:
+    ) -> int:
         """Force N outbound rows terminal (``DEAD``) in one transaction — the batch counterpart of
         :meth:`dead_letter_now` (ADR 0082 ratified decision #1). A **permanent** envelope reject
         dead-letters all N together (atomic, no retry consumed); the operator replays the batch. A
-        member already ``done``, ``dead`` or ``cancelled`` keeps its state (ADR 0157 Amendment D)."""
+        member already ``done``, ``dead`` or ``cancelled`` keeps its state (ADR 0157 Amendment D).
+        Returns how many rows this call wrote: 0 when none was open, or the H1 fence rolled it back."""
         ...
 
     # --- recovery / replay ---------------------------------------------------

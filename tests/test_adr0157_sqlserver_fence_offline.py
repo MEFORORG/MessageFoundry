@@ -528,7 +528,7 @@ async def test_a_one_shot_iterable_still_resolves_every_member() -> None:
 
 async def test_every_single_row_resolve_is_fenced_and_returns_its_no_op_value() -> None:
     expected: dict[str, tuple[tuple[Any, ...], dict[str, Any], Any]] = {
-        "dead_letter_now": (("row-1", "boom"), {}, None),
+        "dead_letter_now": (("row-1", "boom"), {}, False),
         "complete_with_response": (("row-1",), {"body": "AA", "outcome": "ok"}, None),
         "ingress_handoff": (
             (),
@@ -646,7 +646,11 @@ class _RowCursor(_Cursor):
 
     async def fetchall(self) -> list[Any]:
         if self._last.startswith("SELECT id, message_id"):
-            return [(oid, f"m-{oid}", None if oid == "n" else "GONE") for oid in self.status]
+            # Reversed, so neither the id order nor the order returned is the seq order.
+            return [
+                (oid, f"m-{oid}", None if oid == "n" else "GONE", seq)
+                for seq, oid in reversed(list(enumerate(self.status)))
+            ]
         if self._last.startswith("UPDATE queue SET status"):
             oid = next((p for p in self._params if p in self.status), None)
             return [] if oid in self.misses else [(oid,)]
@@ -683,7 +687,7 @@ async def test_dead_now_reads_under_updlock_and_declines_a_resolved_row() -> Non
         store, released = _store(cur, conn, epoch=epoch)
         order = _recording(store)
 
-        await store.dead_letter_now("a", "late", now=1.0)
+        assert await store.dead_letter_now("a", "late", now=1.0) is False
 
         assert "WITH (UPDLOCK, ROWLOCK)" in cur.calls[0][0], epoch
         assert _updates(cur) == [] and order == [], epoch
@@ -697,9 +701,27 @@ async def test_a_fence_miss_on_an_open_row_still_fires_after_the_lock() -> None:
     store, released = _store(cur, conn, epoch=5)
     _recording(store)
 
-    await store.dead_letter_now("a", "late", now=1.0)
+    assert await store.dead_letter_now("a", "late", now=1.0) is False  # the fence, not a write
 
     assert released == [["a"]] and store.fenced_writes == 1 and conn.commits == 0
+
+
+async def test_dead_letters_report_what_they_wrote() -> None:
+    """BACKLOG #5724: the positive control for the declines and the fence, and the batch count."""
+    cur, conn = _RowCursor({"a": "inflight"}), _Conn()
+    store, _ = _store(cur, conn, epoch=None)
+    _recording(store)
+    assert await store.dead_letter_now("a", "late", now=1.0) is True
+
+    cur, conn = _RowCursor({"c": "inflight", "a": "done", "b": "pending"}), _Conn()
+    store, _ = _store(cur, conn, epoch=None)
+    _recording(store)
+    assert await store.dead_letter_batch(["c", "a", "b", "gone"], "late", now=1.0) == 2
+
+    cur, conn = _RowCursor({"a": "inflight"}, misses=frozenset({"a"})), _Conn()
+    store, _ = _store(cur, conn, epoch=5)
+    _recording(store)
+    assert await store.dead_letter_batch(["a"], "late", now=1.0) == 0  # the fence rolled it back
 
 
 async def test_a_batch_locks_in_the_callers_order_and_declines() -> None:
@@ -724,8 +746,9 @@ async def test_a_batch_locks_in_the_callers_order_and_declines() -> None:
 
 
 async def test_a_sweep_writes_before_the_finalize_lock_and_counts_only_its_changes() -> None:
-    """BACKLOG #5729. Updates in sorted id order, each with a status term and an OUTPUT clause; the
-    finalize lock after them, naming only rows changed; a NULL lane cannot raise in the log line."""
+    """BACKLOG #5729. The updates run in seq order (the fake returns rows in neither seq nor id
+    order), each with a status term and an OUTPUT clause; the finalize lock
+    after them, naming only rows changed; a NULL lane cannot raise in the log line."""
     cur, conn = (
         _RowCursor(
             {"c": "pending", "a": "inflight", "b": "pending", "n": "pending"},
@@ -738,15 +761,16 @@ async def test_a_sweep_writes_before_the_finalize_lock_and_counts_only_its_chang
 
     assert await store.dead_letter_missing_destinations({"OB1"}, now=1.0) == 3
 
+    assert ", seq FROM queue" in cur.calls[0][0]
     updates = _updates(cur)
-    assert [p[4] for _s, p in updates] == ["a", "b", "c", "n"]
+    assert [p[4] for _s, p in updates] == ["c", "a", "b", "n"]
     assert all(
         s.endswith(" OUTPUT inserted.id WHERE id=? AND status IN (?, ?)") for s, _p in updates
     )
     assert all(p[5:] == ("pending", "inflight") for _s, p in updates)
     assert order == [
-        "event:dead:m-a",
         "event:dead:m-c",
+        "event:dead:m-a",
         "event:dead:m-n",
         "finalize-lock:m-a,m-c,m-n",
         "finalize:m-a",

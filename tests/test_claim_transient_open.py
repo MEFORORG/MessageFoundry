@@ -612,10 +612,11 @@ class _FakeServer:
         self.dead_lettered: list[str] = []
         self.audited: list[str] = []
 
-    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
+    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> bool:
         if self.fail_with is not None:
             raise self.fail_with
         self.dead_lettered.append(outbox_id)
+        return True
 
     async def record_audit(self, action: str, **_kw: Any) -> None:
         self.audited.append(action)

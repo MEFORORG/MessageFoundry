@@ -1300,12 +1300,13 @@ class FailOutcome:
     prove a row is PENDING. It is ``None`` on every other path.
 
     ``dead`` is how many rows this call's DEAD write covered: on SQLite, the rows it wrote under the
-    single writer; on Postgres and SQL Server, the rows the transaction read present before an
+    single writer; on Postgres and SQL Server, the rows the transaction read still open before an
     unfenced write, whose row count those backends do not read. It is 0 on the retry branch, for a
-    vanished row or an empty batch, and for a final write the H1 epoch fence rolled back.
+    vanished or resolved row or an empty batch, and for a final write the H1 epoch fence rolled back.
 
     ``head_id`` and ``attempts`` name the row the store decided from, with the attempts it read
-    there: the one row, or a batch's first member still present. Both are ``None`` when no row was
+    there: the one row, or a batch's first member still open, or its first present if all are
+    resolved (ADR 0157 Amendment D). Both are ``None`` when no row was
     present, and on Postgres and SQL Server also when the H1 fence rolled back a DEAD write on a row
     that was present. They can differ from what the claim returned: a lease sweep can re-pend a row under a
     slow send, and a second claim then spends another attempt.
@@ -15165,7 +15166,8 @@ class MessageStore:
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
         (BACKLOG #2593), a corrupt cell included, whose audit row names its cause as corrupt
-        (BACKLOG #5884). Returns ``None`` then.
+        (BACKLOG #5884). Returns ``None`` then, and also for a row another writer has settled, which
+        is neither written nor reported (ADR 0157 Amendment D).
 
         A failure that says nothing about the row is returned instead, with nothing written
         (BACKLOG #5735): a key service that gave no verdict (:func:`is_transient_open_failure`) or
@@ -15176,11 +15178,10 @@ class MessageStore:
         (:meth:`_set_aside_claimed`)."""
         if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
             return queue_open_fault(exc)
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
         try:
-            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
+            wrote = await self.dead_letter_now(
+                row["id"], f"undecryptable payload: {exc}", _standalone=True
+            )
         except PROGRAMMING_ERRORS:
             raise
         except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
@@ -15194,6 +15195,11 @@ class MessageStore:
                     self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
+        if not wrote:  # ADR 0157 Amendment D: another writer settled the row, so nothing to report
+            return None
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row, error=exc)
         return None
@@ -15670,8 +15676,9 @@ class MessageStore:
         now: float | None = None,
         *,
         _standalone: bool = False,
-    ) -> None:
+    ) -> bool:
         """Force a row terminal (``DEAD``) immediately without consuming a retry — **fail-fast**.
+        Returns whether it wrote: ``False`` for a vanished or resolved row (ADR 0157 Amendment D).
 
         For a delivery that can never succeed as-is and must not hold the FIFO lane: a permanent
         partner reject (``AR``), an internal/code error under the error-and-continue policy, or an
@@ -15688,12 +15695,12 @@ class MessageStore:
         )  # PHI chokepoint (#120) — incl. the f"undecryptable payload: {exc}" callers
         now = time.time() if now is None else now
 
-        async def _body() -> None:
+        async def _body() -> bool:
             row = await self._row(outbox_id)
             # ADR 0157 Amendment D (BACKLOG #5724), as mark_failed's DEAD branch: a row already DONE,
             # DEAD or CANCELLED is left as it is. Read under the writer lock.
             if row is None or row["status"] in _RESOLVED_STATUSES:
-                raise _AbortMember(None)
+                raise _AbortMember(False)
             await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
                 (
@@ -15706,6 +15713,7 @@ class MessageStore:
             )
             await self._event(row["message_id"], "dead", row["destination_name"], error, now)
             await self._maybe_finalize_message(row["message_id"], now)
+            return True
 
         if _standalone:
             # Inline immediate commit (mirrors the disabled path) — never enrol in the committer.
@@ -15713,12 +15721,12 @@ class MessageStore:
             # _run_grouped would have left this arm with the `except Exception` shape it copied.
             try:
                 async with _writer_txn(self._db, self._lock):
-                    await _body()
+                    wrote = await _body()
                     await self._commit()
             except _AbortMember:
-                pass  # vanished row: _writer_txn rolled it back under the lock
-            return
-        await self._run_grouped(_body)
+                return False  # vanished or resolved: _writer_txn rolled it back under the lock
+            return wrote
+        return bool(await self._run_grouped(_body))
 
     async def record_worker_death(
         self, outbox_id: str, cap: int, error: str, now: float | None = None
@@ -16884,17 +16892,18 @@ class MessageStore:
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
-    ) -> None:
+    ) -> int:
         """Force N outbound rows terminal (``DEAD``) in ONE transaction — the batch counterpart of
         :meth:`dead_letter_now` (ADR 0082 ratified decision #1). A **permanent** partner reject (``AR``)
         of the envelope can never succeed as-is, so all N dead-letter together (atomic, no retry
         consumed), preserving the atomic-batch guarantee; the operator replays the dead-lettered batch.
         The finalizer runs once per distinct ``message_id``; a vanished or resolved member is skipped
-        (ADR 0157 Amendment D)."""
+        (ADR 0157 Amendment D). Returns the count of rows written."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
 
-        async def _body() -> None:
+        async def _body() -> int:
+            written = 0
             finalize: dict[str, None] = {}
             for outbox_id in outbox_ids:
                 row = await self._row(outbox_id)
@@ -16913,11 +16922,13 @@ class MessageStore:
                     ),
                 )
                 await self._event(row["message_id"], "dead", row["destination_name"], error, now)
+                written += 1
                 finalize[row["message_id"]] = None
             for message_id in sorted(finalize):  # H-8 canonical order (see below)
                 await self._maybe_finalize_message(message_id, now)
+            return written
 
-        await self._run_grouped(_body)
+        return int(await self._run_grouped(_body))
 
     @staticmethod
     def _lane_col(stage: str) -> str:

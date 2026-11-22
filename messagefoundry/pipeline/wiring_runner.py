@@ -844,8 +844,8 @@ def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: s
     row that always crashes. Ids and counts only, never the error text.
 
     The line counts and names from ``failed``, the store's report, not from the arm's own list of
-    rows. A batch takes one disposition from its first member still present, on that member's
-    attempts alone. docs/USER-GUIDE.md, *A lane stopped processing*, also says how to replay a
+    rows. A batch takes one disposition from its first member still open (the first present if all
+    are resolved, when nothing is written), on that member's attempts alone. docs/USER-GUIDE.md, *A lane stopped processing*, also says how to replay a
     dead row, by stage."""
     if not failed.dead:
         return
@@ -874,7 +874,7 @@ def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: s
     if len(messages) > _STOP_LINE_MAX_MESSAGES:
         named = f"the first {_STOP_LINE_MAX_MESSAGES}: {named}"
     log.warning(
-        "%s %r: batch row %s, the first one still present, had made %d attempt(s), at or past its "
+        "%s %r: batch row %s, the first one still open, had made %d attempt(s), at or past its "
         "retry cap, so the stop dead-lettered the batch instead of re-pending it, on that row's "
         "attempts alone; the store reports %d row(s) from %d message(s), %s; "
         + (
@@ -11702,19 +11702,20 @@ class RegistryRunner:
                 await self._stop_lane_retaining(name, [item.id], exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
-                await self.store.dead_letter_now(item.id, safe_exc(exc))
                 # BACKLOG #3043: this arm used to dead-letter with no log line at all. Class name
                 # and code only, never the text: see _RefusalLog for why, and for the throttle.
-                self._refusal_log.warning(
-                    name,
-                    exc,
-                    1,
-                    "delivery worker %r: outbox row %s (message %s) refused permanently; "
-                    "dead-lettered",
-                    name,
-                    item.id,
-                    item.message_id,
-                )
+                # No line when the store declined a row already resolved (BACKLOG #5724).
+                if await self.store.dead_letter_now(item.id, safe_exc(exc)):
+                    self._refusal_log.warning(
+                        name,
+                        exc,
+                        1,
+                        "delivery worker %r: outbox row %s (message %s) refused permanently; "
+                        "dead-lettered",
+                        name,
+                        item.id,
+                        item.message_id,
+                    )
                 # A configuration fault reaches here only under credential_fault_policy =
                 # "dead_letter", and every queued row meets it, so it alerts once for the lane.
                 # Read after the await: a reload that landed in it may be the fix.
@@ -11797,13 +11798,13 @@ class RegistryRunner:
                 )
                 self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
-            log.warning(
-                "delivery worker %r: internal error delivering %s (%s); dead-lettering",
-                name,
-                item.id,
-                type(exc).__name__,
-            )
-            await self.store.dead_letter_now(item.id, f"internal error: {safe_exc(exc)}")
+            if await self.store.dead_letter_now(item.id, f"internal error: {safe_exc(exc)}"):
+                log.warning(
+                    "delivery worker %r: internal error delivering %s (%s); dead-lettering",
+                    name,
+                    item.id,
+                    type(exc).__name__,
+                )
         else:
             # #46: a successful delivery means the lane is up — edge-trigger
             # connection_restored if it had been marked down (no-op otherwise). Not for a send
@@ -12219,19 +12220,22 @@ class RegistryRunner:
                 await self._stop_lane_retaining(name, ids, exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
-                await self.store.dead_letter_batch(ids, safe_exc(exc))
+                written = await self.store.dead_letter_batch(ids, safe_exc(exc))
                 # BACKLOG #3043, the batch twin of the single-row line. `ids` is never empty here:
                 # a send only happens with a member kept, and an earlier refusal keeps every id.
-                self._refusal_log.warning(
-                    name,
-                    exc,
-                    len(ids),
-                    "delivery worker %r: a batch of %d (head outbox row %s) refused permanently; "
-                    "dead-lettered",
-                    name,
-                    len(ids),
-                    ids[0],
-                )
+                # It counts the rows written, and is not logged when none was (BACKLOG #5724).
+                if written:
+                    self._refusal_log.warning(
+                        name,
+                        exc,
+                        written,
+                        "delivery worker %r: a batch of %d (head outbox row %s) refused "
+                        "permanently; %d dead-lettered",
+                        name,
+                        len(ids),
+                        ids[0],
+                        written,
+                    )
                 if self._config_fault_lane_down(name, connector, exc):  # as the single row
                     self._note_lane_config_fault(name, ids[0], exc)
             else:
@@ -12272,10 +12276,10 @@ class RegistryRunner:
         except Exception as exc:
             # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
             # fault. The per-connection policy decides: STOP halts the lane and alerts, and
-            # mark_batch_failed re-pends the batch, or dead-letters its members still present when
+            # mark_batch_failed re-pends the batch, or dead-letters its members still open when
             # the first of them has reached a finite cap, whatever the others' attempts (it skips a
-            # vanished member, and on the retry branch a terminal one); CONTINUE (default)
-            # dead-letters the members still present (bad data can never frame/deliver —
+            # vanished member and, on either branch, a resolved one); CONTINUE (default)
+            # dead-letters the members still open (bad data can never frame/deliver —
             # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
             # A fault one member's own step raised (its re-attach, its frame check, or the head's
             # parse) names that member by its outbox id, never its content, in the log, the stored
@@ -12309,17 +12313,19 @@ class RegistryRunner:
                 )
                 self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
-            log.warning(
-                "delivery worker %r: framing/internal error delivering a batch of %d (%s%s); "
-                "dead-lettering",
-                name,
-                len(ids),
-                type(exc).__name__,
-                member,
-            )
-            await self.store.dead_letter_batch(
+            written = await self.store.dead_letter_batch(
                 ids, _member_error(f"internal error: {safe_exc(exc)}", current)
             )
+            if written:  # counts the rows written; none is no dead-letter (BACKLOG #5724)
+                log.warning(
+                    "delivery worker %r: framing/internal error delivering a batch of %d (%s%s); "
+                    "dead-lettering %d",
+                    name,
+                    len(ids),
+                    type(exc).__name__,
+                    member,
+                    written,
+                )
         else:
             if gated:
                 # Every member, the refused ones too: none was resolved, and a re-run refuses them
@@ -12380,7 +12386,8 @@ class RegistryRunner:
         ``colliding-delimiters`` one has a header that cannot be written (BACKLOG #5972), and any other reads as
         refused by the frame check, with its code beside it."""
         for outbox_id, error, exc in refused:
-            await self.store.dead_letter_now(outbox_id, error)
+            if not await self.store.dead_letter_now(outbox_id, error):
+                continue  # already resolved: nothing was dead-lettered (BACKLOG #5724)
             # getattr and str, as _RefusalLog.warning reads it: a connector may raise a subclass
             # built without a code, or with one that is not a string, and neither may turn this
             # loop into an AttributeError or a TypeError after the dead-letter.
@@ -12577,9 +12584,9 @@ class RegistryRunner:
         incl. an unknown handler name) — the single source of truth for both the async ingress except
         block and the fused route branch (ADR 0071 B5 PR3; ADR 0057 STOP/CONTINUE). STOP: log + durably
         ``mark_failed`` the head + a ``connection_stopped`` alert + ``(STOPPED, None)``. CONTINUE
-        (default): log + ``dead_letter_now`` + ``(PROCESSED, None)``. Post-ACK, so no NAK; the log emits
-        the exception TYPE only (full detail goes to the secured store's ``last_error``, never the
-        general log — PHI). Byte-identical to the inlined except block it replaces."""
+        (default): ``dead_letter_now``, a log line if it wrote, ``(PROCESSED, None)``. Post-ACK, so no
+        NAK; the log emits the exception TYPE only (full detail goes to the secured store's
+        ``last_error``, never the general log — PHI)."""
         if self._internal_error_default is InternalErrorPolicy.STOP:
             log.error(
                 "router worker %r: router error on %s (%s); STOPPING ingest processing "
@@ -12599,13 +12606,13 @@ class RegistryRunner:
             )
             self._hold_for_operator(name, "inbound", Stage(item.stage))
             return _ItemOutcome.STOPPED, None
-        log.warning(
-            "router worker %r: router error on %s (%s); dead-lettering",
-            name,
-            item.id,
-            type(exc).__name__,
-        )
-        await self.store.dead_letter_now(item.id, f"router error: {safe_exc(exc)}")
+        if await self.store.dead_letter_now(item.id, f"router error: {safe_exc(exc)}"):
+            log.warning(
+                "router worker %r: router error on %s (%s); dead-lettering",
+                name,
+                item.id,
+                type(exc).__name__,
+            )
         return _ItemOutcome.PROCESSED, None
 
     async def _apply_transform_internal_error(
@@ -12614,8 +12621,7 @@ class RegistryRunner:
         """Apply the global ``internal_error`` policy to a **transform-phase CONTENT** fault (a handler
         raise, incl. an unknown outbound name) — the single source of truth for both the async routed
         except block and the fused transform branch (ADR 0071 B5 PR3). Same shape as
-        :meth:`_apply_router_internal_error` with the transform wording. Byte-identical to the inlined
-        except block it replaces."""
+        :meth:`_apply_router_internal_error` with the transform wording."""
         if self._internal_error_default is InternalErrorPolicy.STOP:
             log.error(
                 "transform worker %r: handler error on %s (%s); STOPPING transform "
@@ -12635,13 +12641,13 @@ class RegistryRunner:
             )
             self._hold_for_operator(name, "inbound", Stage(item.stage))
             return _ItemOutcome.STOPPED, None
-        log.warning(
-            "transform worker %r: handler error on %s (%s); dead-lettering",
-            name,
-            item.id,
-            type(exc).__name__,
-        )
-        await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
+        if await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}"):
+            log.warning(
+                "transform worker %r: handler error on %s (%s); dead-lettering",
+                name,
+                item.id,
+                type(exc).__name__,
+            )
         return _ItemOutcome.PROCESSED, None
 
     @_records_worker_death("router")
@@ -12686,15 +12692,15 @@ class RegistryRunner:
             # (no ceiling), unchanged.
             max_attempts = self._delivery_defaults.max_attempts
             if max_attempts is not None and item.attempts >= max_attempts:
-                log.warning(
-                    "router worker %r: inline item %s exhausted ingress attempts "
-                    "(%d >= %d); dead-lettering (poison-crash ceiling G6)",
-                    name,
-                    item.id,
-                    item.attempts,
-                    max_attempts,
-                )
-                await self.store.dead_letter_now(item.id, "ingress attempts exhausted")
+                if await self.store.dead_letter_now(item.id, "ingress attempts exhausted"):
+                    log.warning(
+                        "router worker %r: inline item %s exhausted ingress attempts "
+                        "(%d >= %d); dead-lettering (poison-crash ceiling G6)",
+                        name,
+                        item.id,
+                        item.attempts,
+                        max_attempts,
+                    )
                 return _ItemOutcome.PROCESSED, None
         # ADR 0071 B5 PR3 — fused route+handoff dispatch (SQL Server, pooled, flag on). Fuse
         # route_only (CONTENT) + route_handoff_sync (INFRA) into ONE worker hop, gated on the
@@ -13624,10 +13630,10 @@ class RegistryRunner:
         if prep.unreadable is not None:
             # BACKLOG #5708: the loopback's correlation fails the same way on every pass, so
             # dead-letter it (message ERROR, replayable) rather than re-pend it at the lane head.
-            log.warning(
-                "transform worker %r: %s for %s; dead-lettering", name, prep.unreadable, item.id
-            )
-            await self.store.dead_letter_now(item.id, str(prep.unreadable))
+            if await self.store.dead_letter_now(item.id, str(prep.unreadable)):
+                log.warning(
+                    "transform worker %r: %s for %s; dead-lettering", name, prep.unreadable, item.id
+                )
             return _ItemOutcome.PROCESSED, None
         if prep.inbound_gone or prep.missing_handler:
             # BACKLOG #5708: a possibly STALE decision. The concurrent batch path decides this in
@@ -13668,13 +13674,15 @@ class RegistryRunner:
             # of the startup dead_letter_missing_handlers sweep. Dead-lettering (vs reverting)
             # avoids a hot-loop on a permanently-missing handler and gives operator visibility.
             hname = item.handler_name
-            log.warning(
-                "transform worker %r: handler %r for %s is missing; dead-lettering",
-                name,
-                hname,
-                item.id,
-            )
-            await self.store.dead_letter_now(item.id, f"handler {hname!r} removed from registry")
+            if await self.store.dead_letter_now(
+                item.id, f"handler {hname!r} removed from registry"
+            ):
+                log.warning(
+                    "transform worker %r: handler %r for %s is missing; dead-lettering",
+                    name,
+                    hname,
+                    item.id,
+                )
             return _ItemOutcome.PROCESSED, None
         if prep.error is not None:
             # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no

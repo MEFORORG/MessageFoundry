@@ -1486,19 +1486,24 @@ order, the order `mark_batch_done` locks the same rows in. A sorted order here w
 it and could deadlock a late failure with the delivery it raced. **The head is the first member
 still open**, because a resolved row has left the batch: its attempts decide nothing and `head_id`
 does not name it. With every member resolved the head is the first present, nothing is written, and
-the DEAD branch reports `dead=0` with no retry time. `dead_letter_now` keeps its `None` return, so
-a caller cannot tell a decline from a landed write, as it already cannot for a vanished or fenced
-row.
+the DEAD branch reports `dead=0` with no retry time.
+
+**The callers can tell.** `dead_letter_now` returns whether it wrote and `dead_letter_batch` the
+count it wrote: `False` or 0 for a resolved or vanished row and for a write the fence rolled back.
+A caller logs a dead-letter, and `_dead_letter_unopenable` raises its integrity alert, only for a
+row actually written. A batch line counts the rows written. The reply worker's three calls in
+`_process_response_item` do not read the return yet.
 
 **What changed for the startup sweeps (#5729).** On Postgres and SQL Server the
 `dead_letter_missing_destinations`, `_handlers` and `_inbounds` sweeps select candidates unlocked,
-then run one UPDATE per row in sorted id order with `status IN (pending, inflight)`, reading the
-match from the command tag or `OUTPUT`. One statement per row rather than one set UPDATE, because each
+then run one UPDATE per row in `seq` order, the order a claimed batch reaches `mark_batch_done` in,
+so a sweep and a batch write take shared row locks in one order. Each UPDATE carries
+`status IN (pending, inflight)` and reads its match from the command tag or `OUTPUT`. One statement per row rather than one set UPDATE, because each
 row's `last_error` is sealed to its own id. Each changed row's event follows its UPDATE. The
 finalize locks and the finalize run after all the UPDATEs, only for rows actually changed, and the
 count returned and logged is those rows.
 
 **Why a status term is right here and wrong above.** C2 and C3 keep a status term off a *fenced*
-write, because its empty result must mean the fence fired. These sweeps carry no epoch fence
-(D11), so an empty result has only one possible meaning, and C2 and C3 are not contradicted.
+write, because its empty result must mean the fence fired. These sweeps carry no epoch fence,
+so an empty result has only one possible meaning, and C2 and C3 are not contradicted.
 Whether the sweeps should carry a fence is a separate question this amendment does not answer.

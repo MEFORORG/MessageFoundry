@@ -480,7 +480,7 @@ async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
     (line,) = said
     text = line.getMessage()
     if batch:
-        assert f"batch row {item.id}, the first one still present, had made 1 attempt(s)" in text
+        assert f"batch row {item.id}, the first one still open, had made 1 attempt(s)" in text
         assert "dead-lettered the batch instead of re-pending it, on that row's" in text
         assert f"the store reports 2 row(s) from 2 message(s), {mids[0]}, {mids[1]};" in text
         assert "each is an outbound row: replay them from the dead-letter queue" in text
@@ -672,7 +672,7 @@ async def test_a_stop_on_a_batch_dead_letters_members_below_the_cap(
     ]
     (line,) = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
     text = line.getMessage()
-    assert f"batch row {head.id}, the first one still present, had made 6 attempt(s)" in text
+    assert f"batch row {head.id}, the first one still open, had made 6 attempt(s)" in text
     assert "on that row's attempts alone; the store reports 2 row(s)" in text
 
 

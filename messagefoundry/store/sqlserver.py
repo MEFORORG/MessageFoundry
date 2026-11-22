@@ -19,7 +19,8 @@ H-8 LOCK ORDERING (multi-message finalizers). :meth:`_maybe_finalize` takes a pe
 lock, so any primitive that finalizes MORE THAN ONE message in a single transaction holds N of them
 at once and MUST acquire them in CANONICAL (sorted) message_id order — otherwise two such callers
 with overlapping id sets can take the same two locks in opposite orders and deadlock (SQL Server
-1205). ``cancel_queued`` and the dead-letter sweeps do this via :meth:`_lock_finalize_batch`;
+1205). ``cancel_queued`` does this up front via :meth:`_lock_finalize_batch`, and the dead-letter
+sweeps through the same helper after their row UPDATEs, which run in ``seq`` order (BACKLOG #5729);
 ``claim_fifo_heads``' H2 sorts its own. The ADR 0082 batch primitives (:meth:`mark_batch_done`,
 :meth:`mark_batch_failed`, :meth:`dead_letter_batch`) are ALSO multi-message finalizers — they
 originally iterated their finalize dict in *insertion* (caller ``outbox_ids``) order, which is a real
@@ -10017,16 +10018,16 @@ class SqlServerStore:
         event_names_lane: bool,
     ) -> list[Any]:
         """Dead-letter a startup sweep's orphans, commit, and return the lane names of the rows
-        changed. Each orphan is positional: ``(id, message_id, lane)``.
+        changed. Each orphan is positional: ``(id, message_id, lane, seq)``.
 
-        BACKLOG #5729, in the canonical lock order: row locks through the UPDATEs in sorted id order,
-        then the finalize applocks, then the finalize. The candidate SELECT takes no lock under RCSI,
+        BACKLOG #5729, in the canonical lock order: row locks through the UPDATEs in ``seq`` order,
+        the order the batch writers lock a claimed batch in, then the finalize applocks, then the finalize. The candidate SELECT takes no lock under RCSI,
         so each UPDATE carries a status term and a row settled since is skipped, event and finalize
         included. The match is the OUTPUT rowset, never ``cursor.rowcount``. These sweeps have no
         epoch fence, so that term cannot hide a fence miss (ADR 0157 Amendment D). One UPDATE per
         row, because each ``last_error`` is sealed to its own row id."""
         killed: list[tuple[str, Any]] = []
-        for row in sorted(orphans, key=lambda r: r[0]):
+        for row in sorted(orphans, key=lambda r: r[3]):
             await cur.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
                 " owner=NULL, lease_expires_at=NULL OUTPUT inserted.id"
@@ -10067,11 +10068,11 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT id, message_id, handler_name FROM queue"
+                    "SELECT id, message_id, handler_name, seq FROM queue"
                     " WHERE stage=? AND status IN (?, ?)",
                     (Stage.ROUTED.value, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
                 )
-                rows = await cur.fetchall()  # positional: (id, message_id, handler_name)
+                rows = await cur.fetchall()  # positional: (id, message_id, handler_name, seq)
                 orphans = [r for r in rows if r[2] not in valid_names]
                 if not orphans:
                     await self._commit(conn)
@@ -10107,7 +10108,7 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT id, message_id, channel_id FROM queue"
+                    "SELECT id, message_id, channel_id, seq FROM queue"
                     " WHERE stage IN (?, ?, ?) AND status IN (?, ?)",
                     (
                         Stage.INGRESS.value,
@@ -10117,7 +10118,7 @@ class SqlServerStore:
                         OutboxStatus.INFLIGHT.value,
                     ),
                 )
-                rows = await cur.fetchall()  # positional: (id, message_id, channel_id)
+                rows = await cur.fetchall()  # positional: (id, message_id, channel_id, seq)
                 orphans = [r for r in rows if r[2] not in valid_names]
                 if not orphans:
                     await self._commit(conn)
@@ -11143,7 +11144,8 @@ class SqlServerStore:
     ) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
         tag is also audited and alerted (BACKLOG #2593), a corrupt cell included, whose audit row
-        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then.
+        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then, and also for a row the
+        dead-letter did not write, which is not reported (ADR 0157 Amendment D).
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
         the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
@@ -11152,12 +11154,9 @@ class SqlServerStore:
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], str(exc))
         row = {**d, "stage": stage}
         try:
-            await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+            wrote = await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
         except PROGRAMMING_ERRORS:
             raise
         except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
@@ -11171,6 +11170,11 @@ class SqlServerStore:
                     self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
+        if not wrote:  # ADR 0157 Amendment D: settled by another writer, or fenced
+            return None
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], str(exc))
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row, error=exc)
         return None
@@ -12518,10 +12522,11 @@ class SqlServerStore:
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
-    ) -> None:
+    ) -> int:
         """Force N outbound rows terminal (``DEAD``) in one transaction — the batch counterpart of
         :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N
-        still open; a resolved member keeps its state, ADR 0157 Amendment D)."""
+        still open; a resolved member keeps its state, ADR 0157 Amendment D). Returns the count
+        written, 0 when the fence rejected the batch."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         # ADR 0157 C1: TERMINAL, once for the loop.
@@ -12529,6 +12534,7 @@ class SqlServerStore:
         all_ids = tuple(outbox_ids)  # a rejection re-pends ALL N, as in mark_batch_done
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                written = 0
                 finalize: dict[str, None] = {}
                 for outbox_id in all_ids:
                     # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed: caller's order.
@@ -12560,13 +12566,16 @@ class SqlServerStore:
                         checked=bool(guard),
                     )
                     await self._event(cur, message_id, "dead", destination_name, error, now)
+                    written += 1
                     finalize[message_id] = None
                 for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
+                return written
             except Exception:
                 await conn.rollback()
                 raise
+        return 0  # reached only when _fence_scope swallowed a rejected write (D1 re-pended)
 
     # --- recovery / replay ---------------------------------------------------
 
@@ -12965,7 +12974,7 @@ class SqlServerStore:
             )
         return reclaimed
 
-    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
+    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> bool:
         """Force one row terminal (``DEAD``) immediately — fail-fast, no retry consumed. See the
         :meth:`~messagefoundry.store.base.QueueStore.dead_letter_now` contract."""
         error = safe_text(
@@ -12988,7 +12997,7 @@ class SqlServerStore:
                 row = await cur.fetchone()
                 if row is None or row[2] in _RESOLVED_STATUSES:
                     await self._commit(conn)
-                    return
+                    return False
                 message_id, destination_name = row[0], row[1]
                 await self._exec_terminal(
                     cur,
@@ -13009,9 +13018,11 @@ class SqlServerStore:
                 await self._event(cur, message_id, "dead", destination_name, error, now)
                 await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
+                return True
             except Exception:
                 await conn.rollback()
                 raise
+        return False  # reached only when _fence_scope swallowed a rejected write (D1 re-pended)
 
     async def record_worker_death(
         self, outbox_id: str, cap: int, error: str, now: float | None = None
@@ -13132,11 +13143,11 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT id, message_id, destination_name FROM queue"
+                    "SELECT id, message_id, destination_name, seq FROM queue"
                     " WHERE stage=? AND status IN (?, ?)",
                     (Stage.OUTBOUND.value, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
                 )
-                rows = await cur.fetchall()  # positional: (id, message_id, destination_name)
+                rows = await cur.fetchall()  # positional: (id, message_id, destination_name, seq)
                 orphans = [r for r in rows if r[2] not in valid_names]
                 if not orphans:
                     await self._commit_read(conn)  # read-only release (M-6), uncounted (A1)

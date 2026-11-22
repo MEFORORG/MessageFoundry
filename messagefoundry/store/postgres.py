@@ -22,9 +22,10 @@ fencing yet — but per-message finalize, the audit chain, and schema init are s
 * **H-8** — :meth:`_maybe_finalize_message` ports the full multi-stage finalizer (not the simpler
   outbound-only one) and is serialized per ``message_id`` with a per-message advisory lock, so it
   re-counts on a fresh snapshot — no double-finalize; different ids never contend. A finalizer that
-  spans **more than one** message (``cancel_queued`` and the dead-letter sweeps) pre-acquires every
-  per-message lock up front in a **canonical (sorted) order** via :meth:`_lock_finalize_batch`, so two
-  such callers with overlapping message sets can't form a lock cycle (no multi-message deadlock).
+  spans **more than one** message takes every per-message lock in a **canonical (sorted) order** via
+  :meth:`_lock_finalize_batch`, so two such callers with overlapping message sets can't form a lock
+  cycle (no multi-message deadlock). ``cancel_queued`` takes them up front; the dead-letter sweeps
+  take them after their row UPDATEs, which run in ``seq`` order (BACKLOG #5729).
   **Every multi-message finalizer is bound by this rule, not just the two named above** — the ADR 0082
   batch primitives (:meth:`mark_batch_done`, :meth:`mark_batch_failed`, :meth:`dead_letter_batch`) each
   finalize N distinct ids in ONE txn and so MUST iterate in ``sorted()`` id order. They originally
@@ -5893,7 +5894,8 @@ class PostgresStore:
     async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
         tag is also audited and alerted (BACKLOG #2593), a corrupt cell included, whose audit row
-        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then.
+        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then, and also for a row the
+        dead-letter did not write, which is not reported (ADR 0157 Amendment D).
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
         the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
@@ -5902,11 +5904,8 @@ class PostgresStore:
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
         try:
-            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+            wrote = await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
         except PROGRAMMING_ERRORS:
             raise
         except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
@@ -5920,6 +5919,11 @@ class PostgresStore:
                     self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
+        if not wrote:  # ADR 0157 Amendment D: settled by another writer, or fenced
+            return None
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row, error=exc)
         return None
@@ -6007,9 +6011,10 @@ class PostgresStore:
             )
         return opened
 
-    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
+    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> bool:
         """Force one row terminal (``DEAD``) immediately — fail-fast, no retry consumed. Serializes
-        the finalize per message (H-8)."""
+        the finalize per message (H-8). Returns whether it wrote: ``False`` for a vanished or
+        resolved row (ADR 0157 Amendment D) and for a write the fence rolled back."""
         error = safe_text(
             error
         )  # PHI chokepoint (#120) — incl. the f"undecryptable payload: {exc}" callers
@@ -6027,7 +6032,7 @@ class PostgresStore:
                     outbox_id,
                 )
                 if row is None or row["status"] in _RESOLVED_STATUSES:
-                    return
+                    return False
                 await self._exec_terminal(
                     conn,
                     "dead_letter_now",
@@ -6046,11 +6051,12 @@ class PostgresStore:
                     conn, row["message_id"], "dead", row["destination_name"], error, now
                 )
                 await self._maybe_finalize_message(conn, row["message_id"], now)
+            return True
         except _FencedWrite as exc:
             # The sharpest of the terminal writes: a DEAD row is never re-claimed, so H2's
             # skip-and-complete cannot heal a false dead-letter the way it heals a false DONE.
             await self._after_fenced_write(exc)
-            return
+            return False
 
     async def record_worker_death(
         self, outbox_id: str, cap: int, error: str, now: float | None = None
@@ -7757,10 +7763,11 @@ class PostgresStore:
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
-    ) -> None:
+    ) -> int:
         """Force N outbound rows terminal (``DEAD``) in one transaction — the batch counterpart of
         :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N
-        still open; a resolved member keeps its state, ADR 0157 Amendment D)."""
+        still open; a resolved member keeps its state, ADR 0157 Amendment D). Returns the count
+        written, 0 when the fence rolled the transaction back."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(
@@ -7772,6 +7779,7 @@ class PostgresStore:
                 self._timed_acquire() as conn,
                 conn.transaction(isolation=_FINALIZE_ISOLATION),
             ):
+                written = 0
                 finalize: dict[str, None] = {}
                 for outbox_id in all_ids:
                     # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed: caller's order.
@@ -7799,12 +7807,14 @@ class PostgresStore:
                     await self._event(
                         conn, row["message_id"], "dead", row["destination_name"], error, now
                     )
+                    written += 1
                     finalize[row["message_id"]] = None
                 for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize_message(conn, message_id, now)
+            return written
         except _FencedWrite as exc:
             await self._after_fenced_write(exc)
-            return
+            return 0
 
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
@@ -8333,13 +8343,13 @@ class PostgresStore:
     ) -> list[Any]:
         """Dead-letter a startup sweep's orphans and return the lane names of the rows changed.
 
-        BACKLOG #5729, in the canonical lock order: row locks through the UPDATEs in sorted id order,
-        then the finalize locks, then the finalize. The candidate SELECT is unlocked, so each UPDATE
+        BACKLOG #5729, in the canonical lock order: row locks through the UPDATEs in ``seq`` order,
+        the order the batch writers lock a claimed batch in, then the finalize locks, then the finalize. The candidate SELECT is unlocked, so each UPDATE
         carries a status term and a row settled since is skipped, event and finalize included. These
         sweeps have no epoch fence, so that term cannot hide a fence miss (ADR 0157 Amendment D).
         One UPDATE per row, because each ``last_error`` is sealed to its own row id."""
         killed: list[tuple[str, Any]] = []
-        for row in sorted(orphans, key=lambda r: r["id"]):
+        for row in sorted(orphans, key=lambda r: r["seq"]):
             result = await conn.execute(
                 "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
                 " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status = ANY($6::text[])",
@@ -8371,7 +8381,7 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction(isolation=_FINALIZE_ISOLATION):
             rows = await conn.fetch(
-                "SELECT id, message_id, destination_name FROM queue"
+                "SELECT id, message_id, destination_name, seq FROM queue"
                 " WHERE stage=$1 AND status = ANY($2::text[])",
                 Stage.OUTBOUND.value,
                 [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
@@ -8400,7 +8410,7 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction(isolation=_FINALIZE_ISOLATION):
             rows = await conn.fetch(
-                "SELECT id, message_id, handler_name FROM queue"
+                "SELECT id, message_id, handler_name, seq FROM queue"
                 " WHERE stage=$1 AND status = ANY($2::text[])",
                 Stage.ROUTED.value,
                 [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
@@ -8432,7 +8442,7 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction(isolation=_FINALIZE_ISOLATION):
             rows = await conn.fetch(
-                "SELECT id, message_id, channel_id FROM queue"
+                "SELECT id, message_id, channel_id, seq FROM queue"
                 " WHERE stage = ANY($1::text[]) AND status = ANY($2::text[])",
                 [Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value],
                 [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],

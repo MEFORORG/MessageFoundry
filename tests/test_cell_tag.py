@@ -383,10 +383,11 @@ class _DeadLetterSink:
     async def record_audit(self, action: str, **_kwargs: object) -> None:
         self.audits.append(action)
 
-    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
+    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> bool:
         if self.fail:
             raise sqlite3.OperationalError("synthetic")
         self.dead.append(outbox_id)
+        return True
 
 
 @pytest.mark.usefixtures("fresh_audit_memo")

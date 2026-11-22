@@ -863,7 +863,7 @@ def audits_cell_tag[S: _AuditSink, **P, R](
 class CellTagSink(_AuditSink, Protocol):
     async def dead_letter_now(
         self, outbox_id: str, error: str, now: float | None = None
-    ) -> None: ...
+    ) -> bool: ...
 
 
 def dead_letters_on_cell_tag[S: CellTagSink, **P](

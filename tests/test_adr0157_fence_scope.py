@@ -396,8 +396,10 @@ class _PgConn:
                 "destination_name": None if oid == "n" else "GONE",
                 "handler_name": "GONE",
                 "channel_id": "GONE",
+                "seq": seq,
             }
-            for oid in self.status
+            # Reversed, so neither the id order nor the order returned is the seq order.
+            for seq, oid in reversed(list(enumerate(self.status)))
         ]
 
     async def execute(self, sql: str, *args: Any, **_kw: Any) -> str:
@@ -441,10 +443,19 @@ async def test_postgres_dead_now_reads_under_a_lock_and_declines_a_resolved_row(
     conn = _PgConn({"a": "done"})
     store, order = _pg_store(conn)
 
-    await store.dead_letter_now("a", "late", now=1.0)
+    assert await store.dead_letter_now("a", "late", now=1.0) is False
 
     assert conn.calls[0][0].endswith("FOR UPDATE")
     assert _pg_updates(conn) == [] and order == []
+
+
+async def test_postgres_dead_letters_report_what_they_wrote() -> None:
+    """BACKLOG #5724: the positive control for the decline above, and the batch count."""
+    store, _ = _pg_store(_PgConn({"a": "inflight"}))
+    assert await store.dead_letter_now("a", "late", now=1.0) is True
+
+    store, _ = _pg_store(_PgConn({"c": "inflight", "a": "done", "b": "pending"}))
+    assert await store.dead_letter_batch(["c", "a", "b", "gone"], "late", now=1.0) == 2
 
 
 async def test_postgres_batch_locks_in_the_callers_order_and_declines() -> None:
@@ -474,9 +485,10 @@ async def test_postgres_batch_locks_in_the_callers_order_and_declines() -> None:
 
 
 async def test_postgres_sweep_writes_before_the_finalize_lock_and_counts_only_its_changes() -> None:
-    """BACKLOG #5729. The UPDATEs run in sorted id order with a status term, the finalize lock comes
-    after them and names only the changed rows, a row settled meanwhile gets nothing, and a NULL lane
-    cannot raise in the log line after the commit."""
+    """BACKLOG #5729. The UPDATEs run in seq order (the fake returns rows in neither seq nor id
+    order), each with a status term. The finalize lock comes after them and
+    names only the changed rows, a row settled meanwhile gets nothing, and a NULL lane cannot raise
+    in the log line after the commit."""
     conn = _PgConn(
         {"c": "pending", "a": "inflight", "b": "pending", "n": "pending"},
         sweep_misses=frozenset({"b"}),
@@ -486,13 +498,14 @@ async def test_postgres_sweep_writes_before_the_finalize_lock_and_counts_only_it
     assert await store.dead_letter_missing_destinations({"OB1"}, now=1.0) == 3
 
     assert [s.split()[0] for s, _a in conn.calls][:1] == ["SELECT"]
+    assert ", seq FROM queue" in conn.calls[0][0]
     updates = [(s, a) for s, a in conn.calls if s.startswith("UPDATE")]
-    assert [a[4] for _s, a in updates] == ["a", "b", "c", "n"]
+    assert [a[4] for _s, a in updates] == ["c", "a", "b", "n"]
     assert all("AND status = ANY($6::text[])" in s for s, _a in updates)
     assert all(a[5] == ["pending", "inflight"] for _s, a in updates)
     assert order == [
-        "event:dead:m-a",
         "event:dead:m-c",
+        "event:dead:m-a",
         "event:dead:m-n",
         "finalize-lock:m-a,m-c,m-n",
         "finalize:m-a",

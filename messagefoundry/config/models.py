@@ -206,8 +206,9 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
     dead-letters it only when its attempts, counting the one that just failed, have reached a finite
     ``max_attempts``. This bounds a stop and re-arm loop on a row that always crashes. A batched
     outbound hands the whole batch to ``mark_batch_failed``, which decides from the first member
-    still present: when that member has reached the cap, the dead-letter takes every member still
-    present, whatever its own attempts. A WARNING says when a stop dead-letters, and names at most
+    still open, or the first present if all are resolved: when an open member decides and has
+    reached the cap, the dead-letter takes every member still open, whatever its own attempts. A
+    WARNING says when a stop dead-letters, and names at most
     10 of the affected messages.
 
     The delivery cap is the outbound's own ``retry`` policy's ``max_attempts`` when it has one

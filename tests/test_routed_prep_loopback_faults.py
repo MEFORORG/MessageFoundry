@@ -204,8 +204,9 @@ class _Recorder:
 def _spy_settlements(monkeypatch: pytest.MonkeyPatch, store: MessageStore) -> _Recorder:
     rec = _Recorder()
 
-    async def dead_letter_now(item_id: str, reason: str) -> None:
+    async def dead_letter_now(item_id: str, reason: str) -> bool:
         rec.dead.append((item_id, reason))
+        return True
 
     async def mark_failed(item_id: str, reason: str, policy: Any) -> FailOutcome:
         rec.failed.append((item_id, reason, policy))
