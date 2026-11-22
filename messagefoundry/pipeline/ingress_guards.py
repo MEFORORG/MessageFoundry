@@ -665,8 +665,7 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
 
 def _raise_if_marker_refused(peek: Peek, text: str) -> None:
     """Raise the ``ingest`` refusal where :func:`doc_ref_marker_refusal` refuses ``text``. It reads
-    the header too, so a read fault refuses as the listeners record one; neither reason names a
-    byte of the body."""
+    the header too, so a read fault is refused as well; neither reason names a byte of the body."""
     refused: str | None
     try:
         refused = doc_ref_marker_refusal(peek, text)
