@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import functools
 import hashlib
+import logging
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -57,6 +58,7 @@ from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from tests._log_absence import assert_no_records
 
 DEST = "OB_PARTNER"
 
@@ -941,24 +943,31 @@ def test_a_colliding_message_with_no_obx_document_is_refused_as_any_message_is(
     assert not isinstance(caught.value, CollidingDelimitersRefused)
 
 
-def test_the_retention_strip_leaves_a_body_it_cannot_write() -> None:
+def test_the_retention_strip_leaves_a_body_it_cannot_write(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A stored body whose short MSH-2 leaves its separators not distinct cannot be written, so the
     strip returns it unchanged, as its contract says, rather than raise, and reports it through
-    ``on_unwritable`` once (BACKLOG #5972)."""
+    ``on_unwritable`` once (BACKLOG #5972). The codec logs nothing itself."""
     from messagefoundry.parsing.binary import strip_documents
 
     calls: list[str] = []
-    for msh2 in ("^~&", "~"):
-        body = _hl7(_b64(2000), msh2=msh2)
-        assert strip_documents(
-            body, pruned_at=0.0, on_unwritable=functools.partial(calls.append, msh2)
-        ) == (body, 0, 0)
-    assert calls == ["^~&", "~"]
-    # The control: a readable body is stripped and reported as nothing.
-    body = _hl7(_b64(2000))
-    report = functools.partial(calls.append, "readable")
-    assert strip_documents(body, pruned_at=0.0, on_unwritable=report)[1] == 1
-    assert calls == ["^~&", "~"]
+    with caplog.at_level(logging.DEBUG):
+        for msh2 in ("^~&", "~"):
+            body = _hl7(_b64(2000), msh2=msh2)
+            assert strip_documents(
+                body, pruned_at=0.0, on_unwritable=functools.partial(calls.append, msh2)
+            ) == (body, 0, 0)
+        assert calls == ["^~&", "~"]
+        # The control: a readable body is stripped and reported as nothing.
+        body = _hl7(_b64(2000))
+        report = functools.partial(calls.append, "readable")
+        assert strip_documents(body, pruned_at=0.0, on_unwritable=report)[1] == 1
+        assert calls == ["^~&", "~"]
+        # Every logger created under the parsing package so far, probed inside the act's capture
+        # at its level (vault BACKLOG #3766 items 27 and 28): the codec module defines none of its
+        # own, so a probe of it alone proved nothing.
+        assert_no_records(caplog, "messagefoundry.parsing", lambda r: True, logging.DEBUG)
 
 
 def test_the_gate_reads_a_header_line_only_to_its_end() -> None:
