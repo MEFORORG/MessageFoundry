@@ -87,6 +87,7 @@ def test_a_fieldless_line_beside_a_dropped_result_fails_closed() -> None:
     result = dry_run(load_config(RESULTS_RELAY), raw)
     assert result.deliveries == []
     assert result.disposition.value == "error"
+    assert result.error is not None and "fieldless segment line" in result.error
 
 
 def test_a_cancelled_last_result_keeps_the_next_patients_pid_and_pv1() -> None:
