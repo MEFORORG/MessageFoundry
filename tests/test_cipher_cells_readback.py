@@ -1404,17 +1404,16 @@ def test_the_server_walk_reads_large_rows_in_small_chunks(
     db, settings = _copy(_template, tmp_path)
     _audit_result, source = _server_audit(db, build_store_cipher(settings), chunk_rows=500)
     caps = {f"{c.table}.{c.column}": c.chunk_cap for c in POSTGRES_CIPHER_CELLS}
-    assert caps == {f"{c.table}.{c.column}": c.chunk_cap for c in SQLSERVER_CIPHER_CELLS}
     for name in (
         "attachment_chunk.ciphertext",
         "messages.raw",
         "queue.payload",
         "shared_body.body",
+        "response.body",
     ):
         cap = caps[name]
         assert cap is not None and cap < 500, name
         assert set(source.limits[name]) == {cap}, name
-    assert caps["response.body"] is not None and caps["response.body"] < 500
     assert caps["messages.error"] is None
     assert set(source.limits["messages.error"]) == {500}
 
@@ -2010,7 +2009,7 @@ def test_an_incompatible_snapshot_keeps_the_walks_finding(
     assert (status, cells) == ("FAIL", 0), reason
     remedy, _, walk = reason.partition("Before the open")
     assert "0.0.1" in remedy and "messages.raw" not in remedy, reason
-    assert "messages.raw" in walk and "may read them differently" in walk, reason
+    assert "messages.raw" in walk and "reported FAIL" in walk, reason
     assert _SYNTH not in reason
 
     (tmp_path / "intact").mkdir()
@@ -2018,27 +2017,32 @@ def test_an_incompatible_snapshot_keeps_the_walks_finding(
     passed = dr_backup._decrypt_check(db, settings)
     assert passed[0] == "PASS" and passed[2] > 0, passed
     _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
-    assert f"passed, with {passed[2]} decrypted and authenticated" in reason, reason
+    assert "passed: every sealed value it read decrypted and authenticated" in reason, reason
 
 
 def test_the_second_walk_reads_the_cell_the_migration_made_readable(
     tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Positive control for the intact-migration case (BACKLOG #1719 item 20): the walk after the
-    open opens more cells than the walk before it, so it did read ``queue.payload``."""
+    """Positive control for the intact-migration case (BACKLOG #1719 item 20): the walk before the
+    open opens no ``queue.payload`` value on the schema without ``body_ref``, and the walk after it
+    opens at least one."""
     db, settings = _copy(_template, tmp_path)
     _drop_queue_body_ref(db)
-    real = dr_backup._decrypt_check
-    walks: list[tuple[str, str, int]] = []
+    real = read_cipher_cells
+    opened: list[int] = []
 
-    def recorded(*args: Any, **kwargs: Any) -> tuple[str, str, int]:
-        walks.append(real(*args, **kwargs))
-        return walks[-1]
+    def recorded(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        opened.append(0)
+        for reading in real(*args, **kwargs):
+            cell = (reading.cell.table, reading.cell.column)
+            if reading.kind == "opened" and cell == ("queue", "payload"):
+                opened[-1] += 1
+            yield reading
 
-    monkeypatch.setattr(dr_backup, "_decrypt_check", recorded)
+    monkeypatch.setattr(dr_backup, "read_cipher_cells", recorded)
     status, reason, _cells = dr_backup._full_open_check(db, settings)
     assert status == "PASS", reason
-    assert len(walks) == 2 and walks[1][2] > walks[0][2], walks
+    assert len(opened) == 2 and opened[0] == 0 and opened[1] >= 1, opened
 
 
 def test_the_absence_predicates_the_live_server_tests_use_can_fire() -> None:

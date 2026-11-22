@@ -4848,12 +4848,13 @@ def _full_open_check(
         # 3). One whose cipher build or connect failed read no cell, so it says nothing here.
         walk = None
         if walked_cells:
+            # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
             walk = (
-                f"Before the open, the walk of the cells this build knows passed, with {walked[2]}"
-                " decrypted and authenticated."
+                "Before the open, the walk of the cells this build knows passed: every sealed"
+                " value it read decrypted and authenticated."
                 if walked[0] == "PASS"
-                else "Before the open, the walk of the cells this build knows found, though this"
-                f" build may read them differently: {safe_text(walked[1]).rstrip('.')}."
+                else f"Before the open, the walk of the cells this build knows reported "
+                f"{walked[0]}: {safe_text(walked[1]).rstrip('.')}."
             )
         return "FAIL", _incompatible_snapshot(exc, engine_version, walk=walk), 0
     except StoreKeylessError as exc:
