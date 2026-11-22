@@ -178,9 +178,10 @@ _GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
 #: Under a stop budget (BACKLOG #3191, :class:`_StopBudget`): the least any budgeted wait is given,
 #: however little of the budget is left.
 _STOP_WAIT_FLOOR_SECONDS = 0.1
-#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so a slow
-#: supervisor cannot cut the remote-debug watch's last audit pass or the alert-state drain to the
-#: floor. tests/test_engine_stop_budget.py sums it against the engine's reserve.
+#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so the
+#: supervisor's wait alone does not cut the remote-debug watch's last audit pass or the alert-state
+#: drain to the floor. The unbudgeted steps between them can still spend it, and then those waits
+#: get the floor. tests/test_engine_stop_budget.py sums it against the engine's reserve.
 _STOP_WAIT_SHARE_SECONDS = 0.3
 #: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
 #: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
