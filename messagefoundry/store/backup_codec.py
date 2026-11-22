@@ -38,6 +38,12 @@ decoder requires it, so a truncation that drops the tail frame is detected as a 
 silently accepted. The frame counter is **monotonic from 0**, re-derived on decode, so a frame replayed
 out of order authenticates against the wrong counter and fails the tag.
 
+**The AAD binds a frame to its position and to the header bytes, not to one archive.** The header
+carries no per-archive value, so two archives whose headers are byte-identical share every frame's
+AAD. Archives written under the same DEK, store salt, chunk size and format version have identical
+headers. A frame taken from one of them authenticates at the same index in the other, so a splice
+of two such archives decrypts without error, frame for frame, into a mix of both plaintexts.
+
 **Every attacker-declared length is bounded BEFORE the read it drives.** ``hdrlen`` and each frame's
 ``ctlen`` are uint32 fields in a plaintext, as-yet-unauthenticated prefix, so a reader that hands them
 straight to ``read()`` allocates whatever an attacker put there — before key matching, and before any
@@ -122,7 +128,8 @@ _DEK_BYTES = 32  # AES-256 key length
 class BackupCodecError(Exception):
     """The ``.mfbak`` archive could not be processed: a bad magic/version/header, a malformed frame, or
     — the security-relevant case — a **failed AEAD tag** (corrupt/tampered/truncated archive, or the
-    wrong key). Fail-closed: call sites surface this as a ``FAIL`` restore-verify result + a
+    wrong key). A frame spliced in from an archive with a byte-identical header fails no tag; see
+    the module docstring. Fail-closed: call sites surface this as a ``FAIL`` restore-verify result + a
     ``backup_failed`` alert, never a silent pass-through (mirrors ``store/crypto.py``'s ``CipherError``)."""
 
 
@@ -191,7 +198,8 @@ def _aad(header_digest: bytes, frame_index: int, *, final: bool) -> bytes:
     """The per-frame AAD: ``header_sha256 ‖ frame_index(uint64) ‖ final_flag(uint8)``. Binds the header
     bytes (a changed header is refused before decrypt or fails the tag; see :func:`decrypt_stream`),
     the frame order (so a reorder/drop fails), and the terminator (so a tail-truncation fails as a
-    missing final frame)."""
+    missing final frame). It holds no per-archive value, so archives with byte-identical headers
+    share it frame for frame, and a frame from one authenticates at the same index in the other."""
     return header_digest + _U64.pack(frame_index) + (b"\x01" if final else b"\x00")
 
 
@@ -483,7 +491,9 @@ def decrypt_stream(
     """Decrypt the ``.mfbak`` stream ``src`` into the plaintext (tar) stream ``dst`` under ``key``,
     returning the parsed header. Re-derives the monotonic frame counter and requires the AAD-bound
     ``final`` terminator, so a reordered/dropped/truncated/appended chunk **fails the GCM tag**
-    (``BackupCodecError``). A changed header is refused or fails closed, at least: by
+    (``BackupCodecError``). A frame from another archive whose header is byte-identical
+    authenticates at the same index and is not refused; see the module docstring. A changed header
+    is refused or fails closed, at least: by
     :func:`read_header` before any decrypt when it is re-spelled, its ``alg`` is not AES-256-GCM,
     its ``format_version`` differs from the version byte, or its ``chunk_size`` is out of range;
     as a key mismatch when its ``key_id`` changed; by the frame-length bound when a lowered
