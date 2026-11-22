@@ -517,35 +517,26 @@ class Message:
 
         ``occurrence`` (1-based) removes only that one segment instead, numbered as :meth:`field`
         and :meth:`count_segments` number it, so a fieldless bare line is no occurrence. It returns
-        1, or 0 when that occurrence is absent, and leaves every other segment as it was."""
+        1, or 0 when that occurrence is absent, and leaves every other segment as it was. It raises
+        ``ValueError`` only when that occurrence is the leading header, so on a ``BHS``-led message
+        ``delete_segments("BHS")`` is refused while ``occurrence=2`` removes a later ``BHS``."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
-        if occurrence is not None and occurrence < 1:
-            raise ValueError("occurrence is 1-based (>= 1)")
-        leading = self._m["segments"][0]["id"] == segment_id
-        position = (
-            None
-            if occurrence is None
-            else _builtin_hl7.segment_index(self._m, segment_id, occurrence)
-        )
-        # The leading header's delimiters are the ones every line is read and written in
-        # (BACKLOG #5972): the delete-all form refuses it, and the occurrence form refuses only
-        # the occurrence that is that header, so a later BHS or FHS of the same id may go.
-        if (
-            segment_id in _builtin_hl7.HEADER_IDS
-            and leading
-            and (occurrence is None or position == 0)
-        ):
+        if occurrence is not None:
+            if occurrence < 1:
+                raise ValueError("occurrence is 1-based (>= 1)")
+            position = _builtin_hl7.segment_index(self._m, segment_id, occurrence)
+            if position is None:
+                return 0
+            # _delete_segment_at refuses position 0, the header that leads the message, so only
+            # that occurrence is refused and a later BHS or FHS of the same id may go.
+            self._delete_segment_at(position)
+            return 1
+        if segment_id in _builtin_hl7.HEADER_IDS and self._m["segments"][0]["id"] == segment_id:
             raise ValueError(
                 f"refusing to delete the {segment_id} header that leads the message, whose "
                 "delimiters every line is read and written in"
             )
-        if occurrence is not None:
-            if position is None:
-                return 0
-            self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
-            _builtin_hl7.delete_segment_at(self._m, position)
-            return 1
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         removed = 0
         ids = _builtin_hl7.segment_ids(self._m)
