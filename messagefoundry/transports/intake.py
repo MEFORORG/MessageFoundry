@@ -65,7 +65,10 @@ class IntakeContext:
 
     #: The source's transport, lower case, such as ``"mllp"``, ``"tcp"`` or ``"file"``.
     transport: str
-    #: The verified client certificate's subject, RFC 4514, when one was required and verified.
+    #: The verified client certificate's subject, RFC 4514, when one was required and verified;
+    #: read once per connection. An MLLP listener with ``tls_client_subjects`` refuses a TLS 1.2
+    #: renegotiation; one without it does not, so another certificate presented that way there is
+    #: not re-read.
     cert_subject: str | None = None
     #: How the peer was admitted; ``None`` for a poll source, which admits no peer.
     auth_mode: IntakeAuth | None = None
@@ -120,9 +123,9 @@ def intake_handler[R](handler: Callable[..., Awaitable[R]]) -> IntakeHandler[R]:
 async def deliver[R](
     handler: Callable[[bytes], Awaitable[R]], raw: bytes, intake: IntakeContext | None
 ) -> R:
-    """Call ``handler`` with ``raw``. An :class:`IntakeHandler`, which the runner starts every
-    source with, is always given ``intake=`` too, ``None`` included. Any other handler, such as a
-    test's one-argument fake, is called with the body alone."""
+    """Call ``handler`` with ``raw``. An :class:`IntakeHandler`, which the runner starts a source
+    with unless it declares ``wants_receipt``, is always given ``intake=`` too, ``None`` included.
+    Any other handler, such as a test's one-argument fake, is called with the body alone."""
     if isinstance(handler, IntakeHandler):
         result: R = await handler(raw, intake=intake)
         return result

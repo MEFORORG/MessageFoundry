@@ -730,10 +730,10 @@ def peer_subject(ssl_object: Any) -> str | None:
 
     It runs after the listener admitted the peer, and the subject only names the peer, it decides
     nothing, so a certificate that cannot be read stores the message without it rather than drop
-    it: ``ValueError`` (a handshake not done, or a leaf ``cryptography`` refuses) and
-    ``ssl.SSLError``. An ``ssl_object`` with no ``getpeercert`` reads as no certificate. Any other
-    exception is a defect and raises. A fault is logged by its type alone, since a subject can
-    name a person."""
+    it: ``ssl.SSLError``, and what ``cryptography`` raises for a certificate it cannot read, the
+    :data:`_UNREADABLE_CA` tuple, which holds ``ValueError`` (a handshake not done is one too).
+    An ``ssl_object`` with no ``getpeercert`` reads as no certificate. Any other exception is a
+    defect and raises. A fault is logged by its type alone, since a subject can name a person."""
     getpeercert = getattr(ssl_object, "getpeercert", None)
     if getpeercert is None:
         return None
@@ -743,7 +743,7 @@ def peer_subject(ssl_object: Any) -> str | None:
             return None
         # A SAN-only leaf has an empty subject, which names nobody, so it reads as none.
         return x509.load_der_x509_certificate(der).subject.rfc4514_string() or None
-    except (ValueError, ssl.SSLError) as exc:
+    except (*_UNREADABLE_CA, ssl.SSLError) as exc:  # the tuple is defined below; read at call
         _log.warning(
             "could not read a peer certificate's subject; the message is stored without it: %s",
             type(exc).__name__,

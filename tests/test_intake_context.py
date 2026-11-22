@@ -170,6 +170,11 @@ def test_peer_subject_raises_a_defect_and_reads_an_unreadable_certificate_as_non
 
     assert peer_subject(_Raises(ValueError("handshake not done"))) is None
     assert peer_subject(_Raises(ssl.SSLError("bad"))) is None
+    # Not a ValueError: cryptography raises it for a leaf version it cannot read, which OpenSSL
+    # may still have verified, so it must not close the admitted sender's connection.
+    from cryptography import x509 as _x509
+
+    assert peer_subject(_Raises(_x509.InvalidVersion("unknown version", 7))) is None
     assert peer_subject(object()) is None  # no getpeercert: no certificate
     assert peer_subject(None) is None
     with pytest.raises(RuntimeError):

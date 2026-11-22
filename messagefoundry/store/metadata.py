@@ -242,8 +242,8 @@ def decode_response_headers(headers_json: StoredJson, *, row_id: object = None) 
 #: future reader in the router, which nothing builds yet, would read the same value on a re-run,
 #: as the purity rule requires. A message the engine made from another one (a
 #: pass-through or loopback child, an operator resend or edit-and-resubmit) is written without it:
-#: no peer handed that body over, and its ``correlation_root_id`` leads back to the message that
-#: carries one. :func:`user_metadata` never returns it.
+#: no peer handed that body over, and its ``correlation_root_id`` leads back to the root message,
+#: which carries one where its source passed a context. :func:`user_metadata` never returns it.
 INTAKE_KEY: Final = "intake"
 
 
