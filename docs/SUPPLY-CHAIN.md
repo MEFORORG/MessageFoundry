@@ -118,8 +118,11 @@ flowchart TB
 **Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
 group's title names the workflow its boxes belong to. The job boxes outside a group are in
 `release.yml` too. The merge checks group shows at least the checks that bear on the package. A
-dotted arrow is a publish step that runs when its variable is set as a repository or
-organization variable; a copy on the `pypi` environment cannot turn it on. Here and below, a
+dotted arrow is a publish step gated on its variable, which must read `true` twice: outside the
+`pypi` environment, where a repository variable takes precedence over an organization variable
+of the same name, and inside it, where a copy on the environment takes precedence over both. So a
+copy on the `pypi` environment cannot turn the step on, and one whose value is not `true` turns it
+off, as *One approval per engine tag* below says. Here and below, a
 variable counts as set only when its value is `true`, in any case, since Actions compares strings
 ignoring case; any other value, `1` included, reads as unset.
 
