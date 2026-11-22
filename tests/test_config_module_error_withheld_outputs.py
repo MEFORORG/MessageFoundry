@@ -61,30 +61,43 @@ def test_an_unresolvable_folder_is_logged_by_class_only(
         raise OSError(NEEDLE)
 
     planted = str(tmp_path / NEEDLE / "feed.py")
+    caplog.set_level(logging.DEBUG, logger=wiring.__name__)
     monkeypatch.setattr(Path, "resolve", refuse)
-    with caplog.at_level(logging.DEBUG, logger=wiring.__name__):
-        assert wiring._in_dir(planted, tmp_path) is False
+    assert wiring._in_dir(planted, tmp_path) is False
+    monkeypatch.undo()
     (record,) = [r for r in caplog.records if "could not be resolved" in r.getMessage()]
     assert "OSError" in record.getMessage()
-    assert NEEDLE not in record.getMessage()
+    assert NEEDLE not in caplog.text
+    assert record.exc_info is None and record.stack_info is None
 
 
+@pytest.mark.parametrize("raised", [RuntimeError, SystemExit])
 def test_a_log_handler_that_raises_does_not_change_the_answer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raised: type[BaseException],
 ) -> None:
+    calls: list[str] = []
+
     class Raising(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
-            raise RuntimeError("handler")
+            calls.append(record.getMessage())
+            raise raised("handler")
 
     def refuse(self: Path, strict: bool = False) -> Path:
         raise OSError("resolve")
 
+    # set_level goes through Logger.setLevel, which clears the level cache both ways.
+    caplog.set_level(logging.DEBUG, logger=wiring.__name__)
     logger = logging.getLogger(wiring.__name__)
     handler = Raising(level=logging.DEBUG)
-    monkeypatch.setattr(logger, "level", logging.DEBUG)
     logger.addHandler(handler)
     try:
         monkeypatch.setattr(Path, "resolve", refuse)
         assert wiring._in_dir(str(tmp_path / "feed.py"), tmp_path) is False
     finally:
+        monkeypatch.undo()
         logger.removeHandler(handler)
+    # The handler ran, so the answer above held with its fault in the path.
+    assert len(calls) == 1

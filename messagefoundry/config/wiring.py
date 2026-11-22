@@ -12000,8 +12000,9 @@ def _is_a_signal(exc: BaseException, path: Path) -> bool:
     signal does, and the handler in force is read here, after the module ran, so a module can have
     put Python's back. What passes this can still be code, so :func:`_exec_module` logs the module.
 
-    These reads can run a module's code: ``getsignal`` reads a handler's ``__class__``, and a
-    traceback entry can be built by hand. This runs outside the loader's other guards, so what such
+    These reads can run a module's code: ``getsignal`` reads a handler's ``__class__``, a
+    traceback entry can be built by hand, and :func:`_in_dir` can log, which runs a log handler a
+    module added. This runs outside the loader's other guards, so what such
     a read raises would leave the loader as raised. A fault here means no, and the module is refused."""
     try:
         return (
@@ -12193,15 +12194,16 @@ def _in_dir(filename: str, directory: Path) -> bool:
         # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
         return candidate.parent.resolve() == directory
     except (OSError, ValueError) as exc:
-        # Logged, not silent (vault BACKLOG #3765, LF10): an unresolvable folder makes a diagnostic
-        # name no file and no line. The class only: a frame's file name is whatever string a module
-        # compiled its code under, so it can be the module's own text. A module can also have added
-        # a log handler, and what that raises must not change this answer.
-        with suppress(Exception):
+        # Logged at DEBUG rather than dropped (vault BACKLOG #3765, LF10): a "no" here can make a
+        # diagnostic name no file and no line. The class only, by _type_name: a file name is whatever
+        # string a module compiled its code under, or put on a SyntaxError, so it can be the module's
+        # own text. A module can have added a log handler, so the call can run its code; whatever
+        # that raises is dropped, as _exec_module drops it, so it cannot change this answer.
+        with suppress(BaseException):  # noqa: BLE001 - see the comment above
             _logger.debug(
-                "config diagnostic: a traceback file's folder could not be resolved (%s), so it "
-                "is not named as a config file",
-                type(exc).__name__,
+                "config loader: a file name's folder could not be resolved (%s), so that file is "
+                "not taken as one in the config directory",
+                _type_name(exc),
             )
         return False
 
