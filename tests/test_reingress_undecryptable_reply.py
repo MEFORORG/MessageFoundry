@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import CipherUnavailableError, generate_key, make_cipher
 from tests import _undecryptable_reply_contract as contract
 from tests._erased_reply_contract import LOOP, children, status_of
@@ -92,6 +92,12 @@ async def test_an_outage_re_pends_the_token_and_the_lane_resumes_in_order(
                     await asyncio.sleep(0.005)
             assert row["attempts"] == 0
             assert row["next_attempt_at"] > row["updated_at"]  # a backoff, not a hot re-claim
+            # A claim at a moment inside the head's backoff: the worker sleeps through that window,
+            # so only a direct claim shows that the backed-off head still blocks the row behind it.
+            assert (
+                await store.claim_next_fifo(LOOP, now=row["updated_at"], stage=Stage.RESPONSE.value)
+                is None
+            )
             assert (await contract.token_of(fetch, behind))["status"] == OutboxStatus.PENDING.value
             assert await children(fetch) == []
             assert not [e for e in await store.events_for(head) if e["event"] == "dead"]

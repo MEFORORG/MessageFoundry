@@ -12994,10 +12994,13 @@ class RegistryRunner:
                 # clear later, for example a key the store lacks, so the token keeps its reference
                 # and a replay can recover it. Each store's handoff contains its own decrypts the
                 # same way (BACKLOG #5689, #5727), and a key service with no verdict at any of them
-                # takes the fault arm. An engine fault propagates from the reply cell. On a token
-                # reference it dead-letters. On origin metadata it dead-letters where the cipher
-                # reads it as a corrupt cell, and propagates otherwise. The handoff's encrypt is
-                # not contained: its invocation ceiling is a deliberate hard stop.
+                # takes the fault arm. In the handoff, an engine fault propagates from the reply
+                # cell, dead-letters on a token reference, and on origin metadata dead-letters where
+                # the cipher reads it as a corrupt cell and propagates otherwise. The read above
+                # opens the same reference first: an engine fault it does not read as a tag failure
+                # re-raises there, so that token re-pends and never reaches the handoff. The
+                # handoff's encrypt is not contained: its invocation ceiling is a deliberate hard
+                # stop.
                 log.warning(
                     "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
                     name,
