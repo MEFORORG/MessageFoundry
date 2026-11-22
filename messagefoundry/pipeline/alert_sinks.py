@@ -962,8 +962,9 @@ def send_plain_email(
     msg = EmailMessage()
     # The Subject header refuses some lone surrogates as it is set, and set_content() and
     # add_alternative() encode with a bare str.encode(). Each raises a UnicodeEncodeError whose text
-    # names the character and whose `.object` is the whole value, and the notifier logs a failed
-    # send with exc_info. Keep only the type name, and raise outside the handler so neither chain
+    # names the character and whose `.object` is the whole value. The notifier logs a failed send
+    # by class only now, but send_plain_email has other callers, the security notifier among them.
+    # Keep only the type name, and raise outside the handler so neither chain
     # link holds that error (vault BACKLOG #3011). The subject and the body get separate arms, as
     # the Email destination's headers and body do, so the refusal names the right one.
     failure = ""

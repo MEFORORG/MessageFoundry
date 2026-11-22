@@ -281,7 +281,7 @@ def test_a_permanent_refusal_of_every_recipient_fails_the_alert_send_content_fre
 ) -> None:
     # Every recipient refused (vault BACKLOG #2884, #2924 step 5). RED on main: smtplib's own
     # SMTPRecipientsRefused, whose args hold each address and the relay's reply, reached the
-    # notifier, which logs a failed send with exc_info.
+    # notifier, which then logged a failed send with exc_info.
     refuse_every_recipient(wire, quit_ok=quit_ok)
     with pytest.raises(NegativeAckError) as caught:
         _send_to(wire.port, "engine@hospital.example", _PARTIAL_RECIPIENTS)
