@@ -943,16 +943,17 @@ async def test_engine_start_passes_the_chain_answer_and_holds_the_key(tmp_path: 
     assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
 
 
+@pytest.mark.parametrize("enforcement", [SecurityEnforcement.WARN, SecurityEnforcement.ENFORCE])
 async def test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_stamps(
-    tmp_path: Path,
+    tmp_path: Path, enforcement: SecurityEnforcement
 ) -> None:
-    """BACKLOG #4942's remainder, as the code stands. A ``serve`` start on a new key before any
-    ``rotate-key`` run, on a store with no keyed audit chain: the store is opened through
-    ``open_store`` with no ``before_first_write`` hook, as ``serve`` passes none (only
-    ``rotate-key`` passes one, BACKLOG #4936), and a real ``Engine.start`` runs the reconcile. Nothing tells this
-    start from a key changed by hand after a run, so it stamps the new key and opens no record.
-    Whether this order is to be refused or held, or left to the warning, is the row's open
-    decision; this test pins what the code does until it is made."""
+    """BACKLOG #4942's remainder. A ``serve`` start on a new key before any ``rotate-key`` run, on
+    a store with no keyed audit chain: the store is opened through ``open_store`` with no
+    ``before_first_write`` hook, as ``serve`` passes none (only ``rotate-key`` passes one, BACKLOG
+    #4936), and a real ``Engine.start`` runs the reconcile. Nothing tells this start from a key
+    changed by hand after a run, so it stamps the new key and opens no record. The row's decision
+    of 2026-11-22 keeps that, with PHI.md's warning against the order as the remedy (pinned in the
+    test after this one): the start is not refused or held, under either enforcement setting."""
     from messagefoundry.config.settings import EgressSettings, StoreSettings
     from messagefoundry.pipeline.engine import Engine
     from messagefoundry.store.base import open_store
@@ -969,7 +970,7 @@ async def test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_
         engine = Engine(
             store,
             secret_rotation_settings=SecretRotationSettings(),
-            security_enforcement=SecurityEnforcement.WARN,
+            security_enforcement=enforcement,
             egress_settings=EgressSettings(deny_by_default=False),
         )
     except BaseException:
@@ -983,3 +984,14 @@ async def test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
     assert rows[_DEK].last_rotated != _OLD_DATE
     assert ROTATION_RECORD_ID not in rows
+
+
+def test_phi_md_warns_against_a_start_before_the_first_run_on_a_store_with_no_keyed_chain() -> None:
+    """BACKLOG #4942: the start the test before this one lets stamp is answered by PHI.md's warning
+    alone, so the warning must stay. Whitespace is normalized, so a re-wrap does not break it."""
+    phi = Path(__file__).resolve().parents[1] / "docs" / "PHI.md"
+    text = " ".join(phi.read_text(encoding="utf-8").split())
+    assert (
+        "On such a store, do not start `serve` between setting a new key and running "
+        "`rotate-key`: that stamp stands however the run ends." in text
+    )
