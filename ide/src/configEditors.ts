@@ -28,9 +28,11 @@ import {
 import { Detail, codeSetFormHtml } from "./codeSetEditor";
 import {
   ConnectionListItem,
+  codeSetEditorUpsertArgs,
   codeSetNameFromPath,
+  isConfigDirCodeSetFile,
+  isConfigDirConnectionsFile,
   isReadOnlyCodeSet,
-  isUnderConfigDir,
   pickCurrentConnection,
   shouldPushDocumentChange,
 } from "./configEditorModel";
@@ -41,33 +43,43 @@ import {
 const SAVE_GUARD_RESET_MS = 1500;
 
 /**
- * F3 guard: if `document` is NOT under the configured config dir, reopen it in the plain text editor
- * (with a notice) and return true. Both providers read/write via the CLI's `--config <configDir>`, so
- * a same-named file elsewhere in the workspace (the selector globs are workspace-wide) would otherwise
- * be shown — and saved — as the config-dir file. Returns false (proceed with the custom editor) for the
- * canonical in-config-dir file, or when there is no workspace folder (a relative configDir can't be
- * resolved, and the CLI-backed editor is already inert there).
+ * F3 guard: if `document` is NOT the config-dir file the CLI edits (`isConfigDirFile`), reopen it in
+ * the plain text editor (with a notice) and return true. Both providers read/write via the CLI's
+ * `--config <configDir>`, so a same-named file elsewhere in the workspace (the selector globs are
+ * workspace-wide) would otherwise be shown — and saved — as the config-dir file. Returns false (proceed
+ * with the custom editor) for the canonical config-dir file, or when there is no workspace folder (a
+ * relative configDir can't be resolved, and the CLI-backed editor is already inert there).
  */
-function reopenAsTextIfOutsideConfigDir(
+function reopenAsTextIfNotConfigDirFile(
   document: vscode.TextDocument,
   panel: vscode.WebviewPanel,
-  label: string,
+  expected: string,
+  isConfigDirFile: (fsPath: string, ws: string, dir: string) => boolean,
 ): boolean {
   const ws = workspaceDir();
-  if (!ws || isUnderConfigDir(document.uri.fsPath, ws, configDir())) {
+  if (!ws || isConfigDirFile(document.uri.fsPath, ws, configDir())) {
     return false;
   }
+  const notice = `This file is not ${expected} under the configured config dir (messagefoundry.configDir)`;
   void vscode.window.showInformationMessage(
-    `MessageFoundry: this ${label} is outside the configured config dir (messagefoundry.configDir) — ` +
-      "opening it as text. The form only edits the config-dir file.",
+    `MessageFoundry: ${notice}, so it opens as text. The form edits only that file.`,
   );
   // Reopen the same resource with the built-in text editor (viewType "default"), replacing this panel.
   void vscode.commands.executeCommand("vscode.openWith", document.uri, "default");
   // Leave a static notice in the about-to-be-replaced webview in case the reopen is slow.
   panel.webview.html =
     "<!DOCTYPE html><body style=\"font-family:sans-serif;padding:1rem\">" +
-    "This file is outside the configured MessageFoundry config dir; opening it as text…</body>";
+    `${notice}; opening it as text…</body>`;
   return true;
+}
+
+/** The refusal to post when a save would write some other file than the tab's: the writer's config
+ *  dir, read at save time, may differ from the reader's the tab was opened against. */
+function wrongTargetError(document: vscode.TextDocument, dir: string): string {
+  return (
+    `the configured config dir (${dir}) no longer holds the file this tab shows ` +
+    `(${document.uri.fsPath}), so nothing was written. Reopen the file.`
+  );
 }
 
 // ---- connections.toml → the connection form (one file, many connections + a picker) -----------------
@@ -82,7 +94,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
     panel: vscode.WebviewPanel,
     _token: vscode.CancellationToken,
   ): void {
-    if (reopenAsTextIfOutsideConfigDir(document, panel, "connections.toml")) {
+    if (reopenAsTextIfNotConfigDirFile(document, panel, "the connections.toml", isConfigDirConnectionsFile)) {
       return; // F3: not the config-dir file — fell back to the text editor
     }
     panel.webview.options = { enableScripts: true };
@@ -208,6 +220,10 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           if (target === undefined) {
             return;
           }
+          if (!isConfigDirConnectionsFile(document.uri.fsPath, ws, target.configDir)) {
+            postToWebview(panel.webview, { command: "error", message: wrongTargetError(document, target.configDir) });
+            return;
+          }
           let fresh: ConnObj[];
           try {
             fresh = await runJson<ConnObj[]>(["connection", "list", "--config", target.configDir], ws);
@@ -242,6 +258,10 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
         } else if (m?.command === "delete" && m.name) {
           const target = writerConfigTarget();
           if (target === undefined) {
+            return;
+          }
+          if (!isConfigDirConnectionsFile(document.uri.fsPath, ws, target.configDir)) {
+            postToWebview(panel.webview, { command: "error", message: wrongTargetError(document, target.configDir) });
             return;
           }
           if (m.name !== renderedName) {
@@ -308,8 +328,8 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
     panel: vscode.WebviewPanel,
     _token: vscode.CancellationToken,
   ): void {
-    if (reopenAsTextIfOutsideConfigDir(document, panel, "code-set file")) {
-      return; // F3: not under the config dir — fell back to the text editor
+    if (reopenAsTextIfNotConfigDirFile(document, panel, "a code-set file in the codesets folder", isConfigDirCodeSetFile)) {
+      return; // F3: not a code-set file the CLI edits — fell back to the text editor
     }
     panel.webview.options = { enableScripts: true };
     const name = codeSetNameFromPath(document.fileName);
@@ -317,6 +337,9 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
     let savingFromWebview = false;
     let guardTimer: ReturnType<typeof setTimeout> | undefined;
     let lastRendered: string | undefined;
+    // What the grid now shown was rendered with, for the save-time refusals (codeSetEditorUpsertArgs).
+    let renderedReadonly = readonly;
+    let renderedUnloaded = false;
     // The webview↔document loop guard (F5) — see the connections provider above for the rationale.
     const clearGuard = (): void => {
       savingFromWebview = false;
@@ -353,7 +376,11 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           existing = [];
         }
       }
-      panel.webview.html = codeSetFormHtml(panel.webview, detail, readonly || detail?.format === "toml", existing);
+      renderedReadonly = readonly || detail?.format === "toml";
+      // A failed show on a file with content means the grid is the empty fallback, not the file.
+      renderedUnloaded = showError !== undefined && document.getText().trim() !== "";
+      // An unloaded grid is shown read-only too, so nobody types rows that the save would refuse.
+      panel.webview.html = codeSetFormHtml(panel.webview, detail, renderedReadonly || renderedUnloaded, existing);
       lastRendered = document.getText();
       if (showError && detail && detail.rows.length === 1) {
         // Only surface the load error when we truly fell back to an empty grid (not a populated one).
@@ -374,9 +401,23 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           if (dir === undefined) {
             return;
           }
+          if (!isConfigDirCodeSetFile(document.uri.fsPath, ws, dir)) {
+            postToWebview(panel.webview, { command: "error", message: wrongTargetError(document, dir) });
+            return;
+          }
+          const upsert = codeSetEditorUpsertArgs(
+            dir,
+            name,
+            { readonly: renderedReadonly, unloaded: renderedUnloaded },
+            m.detail,
+          );
+          if ("error" in upsert) {
+            postToWebview(panel.webview, { command: "error", message: upsert.error });
+            return;
+          }
           markSaving();
           try {
-            await runJson(["codeset", "upsert", "--config", dir, "--data", JSON.stringify(m.detail)], ws);
+            await runJson(upsert.args, ws);
           } catch (e) {
             clearGuard();
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
@@ -385,8 +426,15 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           await render();
           void vscode.window.showInformationMessage(`MessageFoundry: saved code set ${m.detail.name}.`);
         } else if (m?.command === "delete" && m.name) {
+          if (m.name !== name) {
+            return; // names some other code set than this tab's file; only the tab's own is removable here
+          }
           const dir = writerPathSetting("configDir");
           if (dir === undefined) {
+            return;
+          }
+          if (!isConfigDirCodeSetFile(document.uri.fsPath, ws, dir)) {
+            postToWebview(panel.webview, { command: "error", message: wrongTargetError(document, dir) });
             return;
           }
           const confirm = await vscode.window.showWarningMessage(

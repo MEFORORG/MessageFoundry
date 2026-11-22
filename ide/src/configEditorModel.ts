@@ -4,6 +4,7 @@
 // from its file path, deciding whether it opens read-only in the grid, and the small guard that stops
 // the webview↔document update loop. Separated from configEditors.ts so this mapping is unit-testable
 // node-side (no Extension Host). No vscode, no I/O.
+import * as path from "node:path";
 
 /**
  * The bare code-set name for a file path — its basename without the .csv/.toml extension. A code set
@@ -19,6 +20,43 @@ export function codeSetNameFromPath(fsPath: string): string {
  *  and the grid only ever writes CSV, so it is view-only (edit the TOML by hand). */
 export function isReadOnlyCodeSet(fsPath: string): boolean {
   return /\.toml$/i.test(fsPath);
+}
+
+/**
+ * The `codeset upsert` argv for a save from the code-set custom editor, or the error to show instead.
+ * The editor IS the opened file, so every save is an edit of that file's stem: it passes `--name
+ * <stem>`, which the CLI reads as edit intent (`create = --name is None`, #240). Without it the CLI
+ * took each save as a create and refused it as a collision with the file being edited (BACKLOG
+ * #5834). Refused here, before any write: a read-only code set; a file whose content never loaded
+ * into the grid (`codeset show` failed on a non-empty file, so the grid is the empty fallback, and an
+ * edit would replace rows nobody saw); and a posted name other than the stem, which would write some
+ * other file than the one the tab shows. The caller must also hold that the tab IS
+ * `<configDir>/codesets/<stem>.csv` ({@link isConfigDirCodeSetFile}), since the CLI writes that path.
+ */
+export function codeSetEditorUpsertArgs(
+  configDir: string,
+  stem: string,
+  state: { readonly: boolean; unloaded: boolean },
+  detail: { name: string },
+): { args: string[] } | { error: string } {
+  if (state.readonly) {
+    return { error: `code set ${stem} is read-only here (a .toml code set); edit the TOML as text.` };
+  }
+  if (state.unloaded) {
+    return {
+      error:
+        `code set ${stem} did not load into the grid, so saving would replace its rows with the empty ` +
+        "grid (nothing was written). Fix the file as text, then reopen it here.",
+    };
+  }
+  if (detail.name !== stem) {
+    return {
+      error:
+        `this tab edits code set ${stem}, but the grid posted the name ${JSON.stringify(detail.name)} ` +
+        "(nothing was written). Rename a code set from the Translation Tables tree.",
+    };
+  }
+  return { args: ["codeset", "upsert", "--config", configDir, "--data", JSON.stringify(detail), "--name", stem] };
 }
 
 /**
@@ -45,27 +83,63 @@ export function shouldPushDocumentChange(opts: {
 }
 
 /**
- * Whether the opened `documentFsPath` lives under the extension's configured config dir. The custom
- * editors read/write via the CLI's `--config <configDir>`, so they only faithfully represent a file
- * that is actually the config-dir's own connections.toml or a codesets CSV. A same-named file elsewhere
- * in the workspace (the selector globs match by filename across the whole workspace) would otherwise be
- * shown — and saved — as the config-dir file. When this returns false the provider falls back to the
- * plain text editor instead of silently editing a different file.
- *
- * `configDir` may be workspace-relative (the default `samples/config`) or absolute; relative is
- * resolved against `workspaceDir`. Path comparison is separator- and case-insensitive so it holds for
- * Windows (`\\`, case-insensitive) and POSIX paths alike.
+ * The path of `documentFsPath` inside the configured config dir, as segments, or undefined when it is
+ * outside. `configDir` may be workspace-relative (the default `samples/config`, or `./samples/config`,
+ * `.`) or absolute, a root such as `/` included; relative is resolved against `workspaceDir`, and dot
+ * segments on both sides are resolved before comparing. Case is folded, so the segments come back
+ * lower-cased, only on `win32` and `darwin`, whose default filesystems are case-insensitive; elsewhere
+ * a wrong-cased path names a different file, so it is outside (BACKLOG #5832). Folding misses at least
+ * a case-sensitive volume or directory on those two platforms. `platform` defaults to the host's; it
+ * is a parameter so tests pin each rule on any runner.
  */
-export function isUnderConfigDir(
+function configDirSegments(
   documentFsPath: string,
   workspaceDir: string,
   configDir: string,
+  platform: NodeJS.Platform,
+): string[] | undefined {
+  const p = platform === "win32" ? path.win32 : path.posix;
+  const caseInsensitive = platform === "win32" || platform === "darwin";
+  const fold = (s: string): string => (caseInsensitive ? s.toLowerCase() : s);
+  const rel = p.relative(fold(p.resolve(workspaceDir, configDir)), fold(p.resolve(documentFsPath)));
+  // `relative` is "" for the dir itself, absolute across Windows drives, and starts with a `..`
+  // SEGMENT when outside -- not merely those characters, so a child dir named "..x" is still inside.
+  if (p.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${p.sep}`)) {
+    return undefined;
+  }
+  return rel === "" ? [] : rel.split(p.sep);
+}
+
+/**
+ * Whether `documentFsPath` IS the config dir's own `connections.toml` ({@link configDirSegments} says
+ * how the two paths are resolved and compared). The custom editors read and
+ * write via the CLI's `--config <configDir>`, so they faithfully represent only the exact file the CLI
+ * edits. The selector globs match by file name across the whole workspace, so a same-named file
+ * elsewhere, or nested deeper under the config dir, would otherwise be shown and saved as the config
+ * dir's file. When this returns false the provider falls back to the plain text editor.
+ */
+export function isConfigDirConnectionsFile(
+  documentFsPath: string,
+  workspaceDir: string,
+  configDir: string,
+  platform: NodeJS.Platform = process.platform,
 ): boolean {
-  const norm = (p: string): string => p.replace(/[\\/]+/g, "/").replace(/\/+$/, "");
-  const isAbsolute = (p: string): boolean => /^[/\\]/.test(p) || /^[a-zA-Z]:[/\\]/.test(p);
-  const base = norm(isAbsolute(configDir) ? configDir : `${workspaceDir}/${configDir}`).toLowerCase();
-  const file = norm(documentFsPath).toLowerCase();
-  return file === base || file.startsWith(`${base}/`);
+  const segs = configDirSegments(documentFsPath, workspaceDir, configDir, platform);
+  return segs?.length === 1 && segs[0] === "connections.toml";
+}
+
+/** Whether `documentFsPath` IS a code-set file the CLI edits, `<configDir>/codesets/<stem>.csv|.toml`
+ *  ({@link isConfigDirConnectionsFile} says why the exact path matters). */
+export function isConfigDirCodeSetFile(
+  documentFsPath: string,
+  workspaceDir: string,
+  configDir: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const segs = configDirSegments(documentFsPath, workspaceDir, configDir, platform);
+  // No /i: the segments are already folded where the filesystem folds, and elsewhere the CLI looks up
+  // only the lower-case extensions.
+  return segs?.length === 2 && segs[0] === "codesets" && /\.(csv|toml)$/.test(segs[1]);
 }
 
 /** A connection summary the connections customEditor lists (name/direction/transport) — the fields it
