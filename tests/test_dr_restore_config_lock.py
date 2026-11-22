@@ -68,10 +68,10 @@ def test_a_hard_link_member_with_a_colon_is_refused(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX opens a colon name as itself")
 def test_a_posix_restore_still_lands_a_colon_name(tmp_path: Path) -> None:
-    tar = _tar(tmp_path / "bundle.tar", [("config/a:b.toml", b"x"), ("config/s:t/c.toml", b"y")])
+    tar = _tar(tmp_path / "bundle.tar", [("config/ab:c.toml", b"x"), ("config/st:u/c.toml", b"y")])
     assert dr_backup._restore_config_members(tar, tmp_path / "bundle") == 2
-    assert (tmp_path / "bundle" / "a:b.toml").read_bytes() == b"x"
-    assert (tmp_path / "bundle" / "s:t" / "c.toml").read_bytes() == b"y"
+    assert (tmp_path / "bundle" / "ab:c.toml").read_bytes() == b"x"
+    assert (tmp_path / "bundle" / "st:u" / "c.toml").read_bytes() == b"y"
 
 
 @pytest.mark.parametrize("rel", ["aux.py", "con.toml", "com1.txt", "sub/aux.py"])

@@ -6681,10 +6681,11 @@ def _extract_config_members(
                 )
             rel = member.name[len(_CONFIG_PREFIX) :]
             reason = archive_member_name_reason(rel)
-            # The shared gate refuses a colon only at index 1, and NTFS reads one anywhere else as
-            # a data stream: `a.toml:evil` would land hidden inside the restored `a.toml`. Only the
-            # colon, and only on this host: a POSIX file may legally carry one, and refusing the
-            # other Windows name shapes here would fail a recovery of bundles that back up fine.
+            # The shared gate refuses a colon only as a drive prefix (an ASCII letter, then a colon
+            # at index 1), and NTFS reads any other as a data stream: `a.toml:evil` would land
+            # hidden inside the restored `a.toml`. Only the colon, and only on this host: POSIX
+            # opens a name the gate admits, such as `ab:c.toml`, as itself, and refusing the other
+            # Windows name shapes here would fail a recovery of bundles that back up fine.
             if reason is None and sys.platform == "win32" and ":" in rel:
                 reason = f"{member.name!r} contains a colon, which Windows reads as a data stream"
             if reason is not None:
@@ -6730,8 +6731,9 @@ def _extract_config_members(
             # existing path is not a directory -- uncaught all the way out to a CLI traceback.
             try:
                 # The nearest existing ancestor first: a mkdir beneath a file reads as
-                # FileNotFoundError on Windows, which is not the collision it is.
-                if not probe.is_dir():
+                # FileNotFoundError on Windows, which is not the collision it is. A regular file
+                # only: a device such as `nul` is no extracted member, so the OS reports that.
+                if probe.is_file():
                     raise FileExistsError(probe)
                 # One level at a time, each recorded as it is made, so a failure part way down the
                 # chain (a component too long for the filesystem) leaves nothing unrecorded to trip
