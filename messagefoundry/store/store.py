@@ -16337,6 +16337,7 @@ class MessageStore:
                 await self._commit()
                 return True
 
+            ref_fault: QueueOpenFault | None = None
             try:
                 ref = open_queue_cell(self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
@@ -16352,14 +16353,19 @@ class MessageStore:
                     REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
                 )
             except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
-                if is_transient_open_failure(exc):  # BACKLOG #5727: no verdict on the cell
-                    raise queue_open_fault(exc) from None  # never the raw key-service error
-                # A corrupt/undecryptable work-row reference (DB corruption, a key the store lacks)
-                # can NEVER be re-ingressed. Mirrors the depth-cap branch (a different
-                # unrecoverable-token case).
-                return await _consume_dead(
-                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
-                )
+                # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so the
+                # fault carries no chain to the raw key-service error.
+                ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                if ref_fault is None:
+                    # A corrupt/undecryptable work-row reference (DB corruption, a key the store
+                    # lacks) cannot be re-ingressed as it stands; a replay can retry it once the
+                    # cause is fixed. Mirrors the depth-cap branch.
+                    return await _consume_dead(
+                        "re-ingress work-row reference is corrupt/unparseable",
+                        "re-ingress ref corrupt",
+                    )
+            if ref_fault is not None:
+                raise ref_fault
             # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
             #    means retention erased it (BACKLOG #1560). A PENDING or INFLIGHT token keeps its
             #    message purge-ineligible, and a DEAD one is blanked with its reply. But on a server

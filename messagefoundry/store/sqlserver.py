@@ -9447,6 +9447,7 @@ class SqlServerStore:
                     return True
 
                 # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
+                ref_fault: QueueOpenFault | None = None
                 try:
                     ref = open_queue_cell(self._cipher, work_row) or ""
                     origin_msg_id, dest, seq_s = ref.split("\x1f")
@@ -9463,13 +9464,17 @@ class SqlServerStore:
                         "re-ingress work-row failed its integrity check",
                     )
                 except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
-                    if is_transient_open_failure(exc):  # BACKLOG #5727: no verdict on the cell
-                        raise queue_open_fault(exc) from None  # never the raw key-service error
-                    return await _consume_dead(
-                        "ingress_handoff(corrupt-ref)",
-                        "re-ingress work-row reference is corrupt/unparseable",
-                        "re-ingress ref corrupt",
-                    )
+                    # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so
+                    # the fault carries no chain to the raw key-service error.
+                    ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                    if ref_fault is None:
+                        return await _consume_dead(
+                            "ingress_handoff(corrupt-ref)",
+                            "re-ingress work-row reference is corrupt/unparseable",
+                            "re-ingress ref corrupt",
+                        )
+                if ref_fault is not None:
+                    raise ref_fault
                 # (3) Read the immutable artifact body.
                 await cur.execute(
                     "SELECT body FROM response"

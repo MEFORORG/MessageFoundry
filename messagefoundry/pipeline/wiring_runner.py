@@ -277,6 +277,7 @@ from messagefoundry.store.crypto import (
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.queue_tag import (
     PROGRAMMING_ERRORS,
+    QueueOpenFault,
     QueueTagError,
     is_transient_open_failure,
     queue_open_fault,
@@ -12961,6 +12962,7 @@ class RegistryRunner:
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
         # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree. A
         # refused (peek_failed) child is the exception: it stores this read's bounded view instead.
+        read_fault: QueueOpenFault | None = None
         try:
             body = await self.store.response_body_for_work_row(item.id) or ""
         except QueueTagError:
@@ -12982,25 +12984,29 @@ class RegistryRunner:
             # goes STOPPED after infra_fault_stop_after such faults, its token left pending.
             if isinstance(exc, PROGRAMMING_ERRORS):
                 raise
-            if is_transient_open_failure(exc):
-                # Without the raw key-service error, which can echo a URL or body (BACKLOG #2318).
-                raise queue_open_fault(exc) from None
-            # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
-            # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
-            # does an unopenable payload; the token keeps its reference for a replay. The handoff
-            # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
-            # any CipherError the handoff raises still takes the fault arm. Each store's handoff
-            # contains its own decrypt failures that are verdicts on a cell (BACKLOG #5689, #5727).
-            log.warning(
-                "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
-                name,
-                item.id,
-                type(exc).__name__,
-            )
-            await self.store.dead_letter_now(
-                item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
-            )
-            return _ItemOutcome.PROCESSED, None
+            # Raised below, outside this handler, so the fault carries no chain to the raw
+            # key-service error, which can echo a URL or a body (BACKLOG #2318).
+            read_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+            if read_fault is None:
+                # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
+                # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a
+                # claim does an unopenable payload; the token keeps its reference for a replay. The
+                # handoff below is not wrapped: its encrypt's invocation ceiling is a deliberate
+                # hard stop, so any CipherError the handoff raises still takes the fault arm. Each
+                # store's handoff contains its own decrypt failures that are verdicts on a cell
+                # (BACKLOG #5689, #5727).
+                log.warning(
+                    "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
+                    name,
+                    item.id,
+                    type(exc).__name__,
+                )
+                await self.store.dead_letter_now(
+                    item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
+                )
+                return _ItemOutcome.PROCESSED, None
+        if read_fault is not None:
+            raise read_fault
         unstorable = _unstorable_reply(body)
         if unstorable is not None:
             # BACKLOG #5616: a reply holding a lone surrogate. The guards' head sniff raised on one in

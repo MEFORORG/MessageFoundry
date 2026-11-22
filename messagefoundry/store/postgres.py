@@ -6451,6 +6451,7 @@ class PostgresStore:
                         await self._maybe_finalize_message(conn, origin_id, now)
                         return True
 
+                    ref_fault: QueueOpenFault | None = None
                     try:
                         ref = open_queue_cell(self._cipher, wr) or ""
                         origin_msg_id, dest, seq_s = ref.split("\x1f")
@@ -6467,15 +6468,21 @@ class PostgresStore:
                             "re-ingress work-row failed its integrity check",
                         )
                     except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
-                        if is_transient_open_failure(exc):  # BACKLOG #5727: no verdict on the cell
-                            raise queue_open_fault(exc) from None  # never the raw key-service error
-                        # A corrupt/undecryptable work-row reference can never be re-ingressed.
-                        # Mirrors the SQLite branch and the depth-cap branch.
-                        return await _consume_dead(
-                            "ingress_handoff(corrupt-ref)",
-                            "re-ingress work-row reference is corrupt/unparseable",
-                            "re-ingress ref corrupt",
+                        # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler,
+                        # so the fault carries no chain to the raw key-service error.
+                        ref_fault = (
+                            queue_open_fault(exc) if is_transient_open_failure(exc) else None
                         )
+                        if ref_fault is None:
+                            # A corrupt/undecryptable work-row reference cannot be re-ingressed as
+                            # it stands. Mirrors the SQLite branch and the depth-cap branch.
+                            return await _consume_dead(
+                                "ingress_handoff(corrupt-ref)",
+                                "re-ingress work-row reference is corrupt/unparseable",
+                                "re-ingress ref corrupt",
+                            )
+                    if ref_fault is not None:
+                        raise ref_fault
                     art = await conn.fetchrow(
                         "SELECT body FROM response"
                         " WHERE message_id=$1 AND destination_name=$2 AND response_seq=$3",

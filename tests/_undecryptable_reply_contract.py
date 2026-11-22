@@ -245,7 +245,7 @@ def _open_fault_propagates(
             with pytest.raises(raised or error) as caught:
                 await _handoff(store, item.id, LOOP)
             if raised is not None:  # the raw key-service error must not reach the fault log
-                assert caught.value.__cause__ is None and caught.value.__suppress_context__
+                assert caught.value.__cause__ is None and caught.value.__context__ is None
             await _assert_token_live(store, fetch, mid)
             # CONTROL: the same token hands off once the fault clears, so it was the fault.
             fault.heal()
@@ -265,7 +265,7 @@ async def worker_read_outage_retries(store: Any, fetch: RawFetch, _raw: RawSql) 
         fault.target, fault.open_error = target, CipherUnavailableError("synthetic")
         with pytest.raises(QueueOpenFault) as caught:
             await step._process_response_item(LOOP, item)
-        assert caught.value.__cause__ is None and caught.value.__suppress_context__
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
         await _assert_token_live(store, fetch, mid)
         fault.heal()
         await step._process_response_item(LOOP, item)
