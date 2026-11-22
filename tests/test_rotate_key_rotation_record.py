@@ -952,8 +952,10 @@ async def test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_
     ``before_first_write`` hook, as ``serve`` passes none (only ``rotate-key`` passes one, BACKLOG
     #4936), and a real ``Engine.start`` runs the reconcile. Nothing tells this start from a key
     changed by hand after a run, so it stamps the new key and opens no record. The row's decision
-    of 2026-11-22 keeps that, with PHI.md's warning against the order as the remedy (pinned in the
-    test after this one): ``Engine.start`` neither refuses nor holds it, under either enforcement
+    of 2026-11-22 (d20261122T111306998-a53d58) keeps that, with PHI.md's warning against the order
+    as the remedy, pinned by
+    ``test_phi_md_warns_against_a_start_before_the_first_run_on_a_store_with_no_keyed_chain``:
+    ``Engine.start`` neither refuses nor holds it, under either enforcement
     setting. The seed's stamp is long overdue, so under ``ENFORCE`` a hold that kept the prior
     stamp would refuse this start. This covers ``Engine.start`` only, not the gates ``serve`` runs
     before it."""
@@ -990,14 +992,22 @@ async def test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_
 
 
 def test_phi_md_warns_against_a_start_before_the_first_run_on_a_store_with_no_keyed_chain() -> None:
-    """BACKLOG #4942: the start the test before this one lets stamp is answered by PHI.md's warning
-    alone, so the warning must stay. Whitespace is normalized, so a re-wrap does not break it."""
+    """BACKLOG #4942: the start that
+    ``test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_stamps`` lets stamp is
+    answered by PHI.md's warning alone, so the warning must stay. Whitespace is normalized, so a
+    re-wrap does not break it."""
     phi = Path(__file__).resolve().parents[1] / "docs" / "PHI.md"
     text = " ".join(phi.read_text(encoding="utf-8").split())
     # Both sentences, together: the warning's "such a store" means the one the first names.
-    assert (
+    warning = (
         "A key changed with no record still stamps on a store with no keyed chain to ask, such as "
         "one whose audit rows open with no genesis row naming its key, so there a stamp proves "
         "only a changed key. On such a store, do not start `serve` between setting a new key and "
-        "running `rotate-key`: that stamp stands however the run ends." in text
+        "running `rotate-key`: that stamp stands however the run ends."
+    )
+    assert warning in text, (
+        "docs/PHI.md no longer carries the BACKLOG #4942 warning against a serve start before the "
+        "first rotate-key on a store with no keyed chain. The code keeps that start by decision, "
+        "answered by this warning alone: restore it, or update this pin and the engine test's "
+        "docstring together."
     )
