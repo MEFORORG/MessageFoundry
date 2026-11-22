@@ -2413,7 +2413,9 @@ the same permission set on the same method reds CI until it is listed here.
 > writes. The console's alerts page does not poll, which `test_ui_object_scope.py` pins; a page
 > that polled would need the row coalesced. The counts are a disclosure in their own right. A
 > scoped caller that holds `audit:read`, such as an Auditor, reads in `GET /audit` how many rules
-> lie outside its scope. A `logs:view` holder reads them in the ERROR line a lost row leaves.
+> it was not shown. That count includes at least rules outside its scope, rules withheld by the
+> inbound and `restart_outbound` tests above, and, with no graph loaded, every rule that names a
+> connection, so it is not a count of rules outside the scope alone. A `logs:view` holder reads them in the ERROR line a lost row leaves.
 > Without either, one extra write's latency can show that some rule was withheld. It cannot show
 > which rules or how many. Why it is not
 > `auth.channel_denied` is in `_audit_alert_rules_withheld` in
