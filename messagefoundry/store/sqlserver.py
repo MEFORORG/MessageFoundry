@@ -13791,6 +13791,8 @@ class SqlServerStore:
             where.insert(1, "channel_id=?")
             params.insert(1, channel_id)
         top = "TOP (1) " if top_only else ""
+        # ORDER BY is legal in the CTE only beside TOP, and only the head needs an order.
+        order = " ORDER BY seq" if top_only else ""
         # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -13799,23 +13801,23 @@ class SqlServerStore:
                     # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
                     # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
                     # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
-                    # #2754).
+                    # #2754). One guarded write (BACKLOG #5732): the CTE's PENDING term decides which rows
+                    # are cancelled, and OUTPUT reports only those. Not a bare UPDATE TOP, which has no
+                    # ORDER BY.
                     await cur.execute(
-                        f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
-                        " ORDER BY seq",
-                        tuple(params),
+                        f"WITH head AS (SELECT {top}id, message_id, seq, status, updated_at"
+                        f" FROM queue WHERE {' AND '.join(where)}{order})"
+                        " UPDATE head SET status=?, updated_at=?"
+                        " OUTPUT inserted.id, inserted.message_id, inserted.seq",
+                        (*params, OutboxStatus.CANCELLED.value, now),
                     )
-                    rows = [(r[0], r[1]) for r in await cur.fetchall()]
+                    # OUTPUT promises no order; the events keep the queue's.
+                    rows = [(r[0], r[1]) for r in sorted(await cur.fetchall(), key=lambda r: r[2])]
                     if not rows:
                         await self._append_operator_audit(cur, written, audit, 0)
                         await self._commit(conn)
                         return 0
                     ids = [r[0] for r in rows]
-                    placeholders = ",".join("?" * len(ids))
-                    await cur.execute(
-                        f"UPDATE queue SET status=?, updated_at=? WHERE id IN ({placeholders})",
-                        (OutboxStatus.CANCELLED.value, now, *ids),
-                    )
                     for _id, message_id in rows:
                         await self._event(
                             cur, message_id, "cancelled", destination_name, "manual purge", now

@@ -8973,37 +8973,35 @@ class PostgresStore:
         # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
         # younger rows behind it, so that key would pick a healthy younger row and leave the
         # backing-off head blocking the lane (vault BACKLOG #2754).
-        query = (
-            "SELECT id, message_id FROM queue"
-            " WHERE stage=$4 AND destination_name=$1 AND status=$2"
-            " AND ($3::text IS NULL OR channel_id=$3)"
-            " ORDER BY seq"
+        lane = (
+            "stage=$4 AND destination_name=$1 AND status=$2 AND ($3::text IS NULL OR channel_id=$3)"
         )
-        if top_only:
-            query += " LIMIT 1"
+        # One guarded write (BACKLOG #5732): READ COMMITTED re-checks ``status`` on a row a concurrent
+        # claim changed, so that row is skipped and not counted. A claimed head returns no row rather
+        # than sliding to the next one, which the operator did not pick.
+        target = f"id=(SELECT id FROM queue WHERE {lane} ORDER BY seq LIMIT 1) AND status=$2"
         # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
         async with (
             AuditedWrite(now) as written,
             self._timed_acquire() as conn,
             conn.transaction(isolation=_FINALIZE_ISOLATION),
         ):
-            rows = await conn.fetch(
-                query,
+            returned = await conn.fetch(
+                f"UPDATE queue SET status=$5, updated_at=$6 WHERE {target if top_only else lane}"
+                " RETURNING id, message_id, seq",
                 destination_name,
                 OutboxStatus.PENDING.value,
                 channel_id,
                 Stage.OUTBOUND.value,
-            )
-            if not rows:
-                await self._append_operator_audit(conn, written, audit, 0)
-                return 0
-            ids = [r["id"] for r in rows]
-            await conn.execute(
-                "UPDATE queue SET status=$1, updated_at=$2 WHERE id = ANY($3::text[])",
                 OutboxStatus.CANCELLED.value,
                 now,
-                ids,
             )
+            if not returned:
+                await self._append_operator_audit(conn, written, audit, 0)
+                return 0
+            # RETURNING promises no order; the events keep the queue's.
+            rows = sorted(returned, key=lambda r: r["seq"])
+            ids = [r["id"] for r in rows]
             for r in rows:
                 await self._event(
                     conn,

@@ -17927,7 +17927,10 @@ class MessageStore:
         with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
         audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
-        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
+        # BEGIN IMMEDIATE: the SELECT names the rows that get events and finalize, so an engine shard
+        # in another process must not claim one before the UPDATE (BACKLOG #5732). Not ``UPDATE ...
+        # RETURNING``, which needs SQLite 3.35, newer than some system libraries a Linux Python links.
+        async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock, immediate=True):
             # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
             # ix_queue_fifo_out_seq in rowid order; only outbound rows carry a destination_name anyway.
             where = ["stage=?", "destination_name=?", "status=?"]
@@ -17947,25 +17950,38 @@ class MessageStore:
             if top_only:
                 query += " LIMIT 1"
             cur = await self._db.execute(query, tuple(params))
-            rows = await cur.fetchall()
+            rows = list(await cur.fetchall())
             if not rows:
-                await self._commit_operator_noop(written, audit, 0)
+                # BEGIN IMMEDIATE left a transaction open, so a purge with no audit row must close
+                # it without a commit, which would count a transaction that wrote nothing.
+                noop_audits = operator_audits(audit, 0)
+                if noop_audits:
+                    written.add(noop_audits, await self._append_audits(noop_audits, now=now))
+                    await self._commit()
+                else:
+                    await self._db.rollback()
                 return 0
-            ids = [r["id"] for r in rows]
-            placeholders = ",".join("?" * len(ids))
-            await self._db.execute(
-                f"UPDATE queue SET status=?, updated_at=? WHERE id IN ({placeholders})",
-                (OutboxStatus.CANCELLED.value, now, *ids),
+            # The lane predicate rather than an id list, so a deep queue cannot exceed SQLite's
+            # bound-variable limit; every form keeps the PENDING term.
+            target, target_params = (
+                ("id=? AND status=?", (rows[0]["id"], OutboxStatus.PENDING.value))
+                if top_only
+                else (" AND ".join(where), tuple(params))
             )
+            upd = await self._db.execute(
+                f"UPDATE queue SET status=?, updated_at=? WHERE {target}",
+                (OutboxStatus.CANCELLED.value, now, *target_params),
+            )
+            cancelled = upd.rowcount
             for r in rows:
                 await self._event(
                     r["message_id"], "cancelled", destination_name, "manual purge", now
                 )
             for message_id in {r["message_id"] for r in rows}:
                 await self._maybe_finalize_message(message_id, now)
-            await self._append_operator_audit(written, audit, len(ids))
+            await self._append_operator_audit(written, audit, cancelled)
             await self._commit()
-            return len(ids)
+            return cancelled
 
     # --- read helpers (for API / console / tests) ----------------------------
 
