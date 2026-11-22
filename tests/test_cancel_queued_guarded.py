@@ -3,7 +3,8 @@
 """``cancel_queued`` writes CANCELLED only over a row that is still PENDING (BACKLOG #5732).
 
 SQLite runs for real. Postgres and SQL Server run against recording fakes, so these tests pin the
-statement each one sends and how it counts; only the hosted legs prove the server's behaviour.
+statement each one sends and how it counts. Nothing here, and no hosted test, drives a concurrent
+claim against a real Postgres or SQL Server, so the race on those two is argued, not measured.
 """
 
 from __future__ import annotations
@@ -34,17 +35,16 @@ async def _status(store: MessageStore, message_id: str) -> str:
 
 
 def _intercept_lane_select(store: MessageStore, after_select: Any) -> None:
-    """Run ``after_select`` once, right after cancel's lane SELECT and before its UPDATE."""
+    """Run ``after_select`` once, after the lane SELECT was fetched and just before the UPDATE."""
     real = store._db.execute
     fired = False
 
     async def execute(sql: str, *args: Any) -> Any:
         nonlocal fired
-        result = await real(sql, *args)
-        if not fired and sql.startswith("SELECT id, message_id FROM queue"):
+        if not fired and sql.startswith("UPDATE queue SET status=?, updated_at=?"):
             fired = True
             await after_select(real)
-        return result
+        return await real(sql, *args)
 
     store._db.execute = execute  # type: ignore[method-assign,assignment]
 
@@ -203,27 +203,44 @@ def _sqlserver_fake(returned: list[tuple[str, str, int]]) -> tuple[SqlServerStor
 async def test_sqlserver_one_guarded_update_and_counts_only_output_rows(
     top_only: bool, channel_id: str | None
 ) -> None:
-    ms, cur = _sqlserver_fake([("q2", "m2", 2), ("q1", "m1", 1)])
+    output = [("q2", "m2", 2), ("q1", "m1", 1)]
+    ms, cur = _sqlserver_fake(output)
+    if top_only:
+        cur.fetchall.side_effect = [[("q1",)], output]
     n = await ms.cancel_queued(channel_id, "d", top_only=top_only, now=5.0, audit=no_purge_audit)
     assert n == 2
-    cur.execute.assert_awaited_once()
+    assert cur.execute.await_count == (2 if top_only else 1)
     sql, params = cur.execute.await_args.args
-    assert sql.startswith("WITH head AS (SELECT ")
-    assert "UPDATE head SET status=?, updated_at=? OUTPUT inserted.id" in sql
-    assert "status=?" in sql.split(") UPDATE head", 1)[0]
-    assert ("TOP (1)" in sql) is top_only
-    assert ("ORDER BY seq" in sql) is top_only
-    assert "UPDLOCK" not in sql and "READPAST" not in sql
-    # Positional binding: the lane's values, then the SET values, in text order.
-    assert params[-3:] == (OutboxStatus.PENDING.value, OutboxStatus.CANCELLED.value, 5.0)
-    assert (channel_id in params) is (channel_id is not None)
+    assert sql.startswith("UPDATE queue SET status=?, updated_at=? OUTPUT inserted.id")
+    assert "TOP" not in sql and "UPDLOCK" not in sql and "READPAST" not in sql
+    assert params[:2] == (OutboxStatus.CANCELLED.value, 5.0)
+    if top_only:
+        # The head's id is fixed first, so a claimed head cannot slide to the next row.
+        head_sql = cur.execute.await_args_list[0].args[0]
+        assert head_sql.startswith("SELECT TOP (1) id FROM queue") and "ORDER BY seq" in head_sql
+        assert sql.endswith(" WHERE id=? AND status=?")
+        assert params[2:] == ("q1", OutboxStatus.PENDING.value)
+    else:
+        assert "status=?" in sql.split(" WHERE ", 1)[1]
+        assert params[-1] == OutboxStatus.PENDING.value
+        assert (channel_id in params) is (channel_id is not None)
     assert [c.args[1] for c in ms._event.await_args_list] == ["m1", "m2"]  # type: ignore[attr-defined]
     ms._lock_finalize_batch.assert_awaited_once()  # type: ignore[attr-defined]
 
 
-async def test_sqlserver_lost_race_audits_zero() -> None:
-    ms, _cur = _sqlserver_fake([])
+async def test_sqlserver_claimed_head_returns_zero_and_does_not_slide() -> None:
+    ms, cur = _sqlserver_fake([])
+    cur.fetchall.side_effect = [[("q1",)], []]
     assert await ms.cancel_queued(None, "d", top_only=True, now=5.0, audit=no_purge_audit) == 0
+    assert cur.execute.await_count == 2
+    assert cur.execute.await_args.args[1][2] == "q1"
     ms._event.assert_not_awaited()  # type: ignore[attr-defined]
     assert ms._append_operator_audit.await_args.args[3] == 0  # type: ignore[attr-defined]
     ms._commit.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+async def test_sqlserver_empty_lane_top_only_sends_no_update() -> None:
+    ms, cur = _sqlserver_fake([])
+    assert await ms.cancel_queued(None, "d", top_only=True, now=5.0, audit=no_purge_audit) == 0
+    cur.execute.assert_awaited_once()
+    assert ms._append_operator_audit.await_args.args[3] == 0  # type: ignore[attr-defined]

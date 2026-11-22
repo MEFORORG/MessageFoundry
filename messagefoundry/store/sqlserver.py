@@ -13790,9 +13790,7 @@ class SqlServerStore:
         if channel_id is not None:
             where.insert(1, "channel_id=?")
             params.insert(1, channel_id)
-        top = "TOP (1) " if top_only else ""
-        # ORDER BY is legal in the CTE only beside TOP, and only the head needs an order.
-        order = " ORDER BY seq" if top_only else ""
+        lane = " AND ".join(where)
         # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -13801,18 +13799,30 @@ class SqlServerStore:
                     # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
                     # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
                     # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
-                    # #2754). One guarded write (BACKLOG #5732): the CTE's PENDING term decides which rows
-                    # are cancelled, and OUTPUT reports only those. Not a bare UPDATE TOP, which has no
-                    # ORDER BY.
-                    await cur.execute(
-                        f"WITH head AS (SELECT {top}id, message_id, seq, status, updated_at"
-                        f" FROM queue WHERE {' AND '.join(where)}{order})"
-                        " UPDATE head SET status=?, updated_at=?"
-                        " OUTPUT inserted.id, inserted.message_id, inserted.seq",
-                        (*params, OutboxStatus.CANCELLED.value, now),
-                    )
-                    # OUTPUT promises no order; the events keep the queue's.
-                    message_ids = [r[1] for r in sorted(await cur.fetchall(), key=lambda r: r[2])]
+                    # #2754). The head's id is fixed BEFORE the write: a TOP (1) CTE carrying the PENDING
+                    # term would wait on a head being claimed, then pass over it and cancel the next
+                    # row, which the operator did not pick (BACKLOG #5732).
+                    target, bound = lane, tuple(params)
+                    if top_only:
+                        await cur.execute(
+                            f"SELECT TOP (1) id FROM queue WHERE {lane} ORDER BY seq", bound
+                        )
+                        heads = await cur.fetchall()
+                        target = "id=? AND status=?"
+                        bound = (heads[0][0], OutboxStatus.PENDING.value) if heads else ()
+                    message_ids: list[str] = []
+                    if bound:
+                        # One guarded write: its PENDING term decides which rows are cancelled, and
+                        # OUTPUT reports only those, in no promised order; the events keep the queue's.
+                        await cur.execute(
+                            "UPDATE queue SET status=?, updated_at=?"
+                            " OUTPUT inserted.id, inserted.message_id, inserted.seq"
+                            f" WHERE {target}",
+                            (OutboxStatus.CANCELLED.value, now, *bound),
+                        )
+                        message_ids = [
+                            r[1] for r in sorted(await cur.fetchall(), key=lambda r: r[2])
+                        ]
                     if not message_ids:
                         await self._append_operator_audit(cur, written, audit, 0)
                         await self._commit(conn)
