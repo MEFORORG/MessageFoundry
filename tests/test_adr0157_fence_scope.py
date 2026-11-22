@@ -399,13 +399,9 @@ class _PgConn:
             for oid in self.status
         ]
 
-    async def fetchval(self, sql: str, *args: Any) -> Any:
-        self.calls.append((sql, args))
-        return None if args[4] in self.sweep_misses else args[4]
-
     async def execute(self, sql: str, *args: Any, **_kw: Any) -> str:
         self.calls.append((sql, args))
-        return "UPDATE 1"
+        return "UPDATE 0" if args[4] in self.sweep_misses else "UPDATE 1"
 
 
 def _pg_store(conn: _PgConn) -> tuple[PostgresStore, list[str]]:

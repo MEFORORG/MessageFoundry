@@ -1482,7 +1482,9 @@ INFLIGHT or PENDING row is still written.
 because a set read's lock order on SQL Server is the plan's and not its `ORDER BY`. The writes keep
 the caller's order. **A resolved head still decides the batch's disposition**, from its attempts,
 and `head_id` still names it, as on the retry branch; only its write is declined. So a batch whose
-delivered head is at the cap dead-letters its open members. A batch with every member resolved
+delivered head is at the cap dead-letters its open members, even a member whose own attempts are
+below the cap, and a resolved head below the cap re-pends a member already at it. This keeps the
+disposition rule as it was and is a known cost. A batch with every member resolved
 writes nothing and reports `dead=0` with no retry time. `dead_letter_now` keeps its `None` return,
 so a caller cannot tell a decline from a landed write, as it already cannot for a vanished or
 fenced row; it re-reads nothing from it.

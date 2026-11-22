@@ -6022,7 +6022,10 @@ class PostgresStore:
             ):
                 # ADR 0157 Amendment D (BACKLOG #5724), as mark_failed: read under the row lock and
                 # decline a resolved row here, so a miss on the UPDATE is still the fence alone.
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id)
+                row = await conn.fetchrow(
+                    "SELECT message_id, destination_name, status FROM queue WHERE id=$1 FOR UPDATE",
+                    outbox_id,
+                )
                 if row is None or row["status"] in _RESOLVED_STATUSES:
                     return
                 await self._exec_terminal(
@@ -7662,7 +7665,11 @@ class PostgresStore:
                 # and keep the caller's order for the head and the writes.
                 handed = tuple(outbox_ids)  # walked twice: the lock order, then the caller's order
                 locked = {
-                    oid: await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", oid)
+                    oid: await conn.fetchrow(
+                        "SELECT message_id, destination_name, attempts, status"
+                        " FROM queue WHERE id=$1 FOR UPDATE",
+                        oid,
+                    )
                     for oid in sorted(set(handed))
                 }
                 present = [(oid, locked[oid]) for oid in handed if locked[oid] is not None]
@@ -7755,7 +7762,7 @@ class PostgresStore:
         guard, guard_args = self._resolve_guard(
             6
         )  # ADR 0157 C1 — TERMINAL, once for the whole loop
-        all_ids = tuple(outbox_ids)  # walked three times below, and a fence re-pends all N
+        all_ids = tuple(outbox_ids)  # walked twice below, and a fence re-pends all N
         try:
             async with (
                 self._timed_acquire() as conn,
@@ -7763,7 +7770,11 @@ class PostgresStore:
             ):
                 # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed.
                 locked = {
-                    oid: await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", oid)
+                    oid: await conn.fetchrow(
+                        "SELECT message_id, destination_name, status"
+                        " FROM queue WHERE id=$1 FOR UPDATE",
+                        oid,
+                    )
                     for oid in sorted(set(all_ids))
                 }
                 finalize: dict[str, None] = {}
@@ -8329,10 +8340,9 @@ class PostgresStore:
         One UPDATE per row, because each ``last_error`` is sealed to its own row id."""
         killed: list[tuple[str, Any]] = []
         for row in sorted(orphans, key=lambda r: r["id"]):
-            hit = await conn.fetchval(
+            result = await conn.execute(
                 "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status = ANY($6::text[])"
-                " RETURNING id",
+                " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status = ANY($6::text[])",
                 OutboxStatus.DEAD.value,
                 now,
                 self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
@@ -8340,7 +8350,7 @@ class PostgresStore:
                 row["id"],
                 [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
             )
-            if hit is None:
+            if _rowcount(result) == 0:
                 continue
             await self._event(
                 conn, row["message_id"], "dead", row[lane] if event_names_lane else None, error, now
