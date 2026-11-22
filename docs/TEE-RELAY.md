@@ -76,10 +76,11 @@ transformed/routed output against Corepoint's — without MEFOR delivering to re
   (`AE`/`AR`) **does not propagate back to Epic** — Epic sees the relay, not Corepoint. That's why the
   relay **logs every NAK** (see below). Corepoint still NAKs internally; transport failures are surfaced
   via the fail-closed shutdown.
-* **Fail-closed.** On a Corepoint **transport** failure (unreachable, after `--corepoint-attempts` quick
-  retries), the relay **stops accepting on Listener A and drops live Epic connections** so Epic sees the
-  outage and queues/retries on its side. It does **not** exit (so it can't crash-loop against a down
-  Corepoint) — **restart it once Corepoint is healthy.** A message in flight at the instant of the failure
+* **Fail-closed.** On a Corepoint **transport** failure (unreachable on every one of the
+  `--corepoint-attempts` tries, which count the first try, so `1` means no retry), the relay **stops
+  accepting on Listener A and drops live Epic connections** so Epic sees the outage and queues/retries
+  on its side. It does **not** exit (so it can't crash-loop against a down Corepoint) — **restart it
+  once Corepoint is healthy.** A message in flight at the instant of the failure
   may be `AA`'d-but-undelivered; the shutdown bounds further loss and Epic's resend/queue covers the rest.
   (This is a simple fail-closed relay, **not** durable store-and-forward — by design.)
 * **Shadow leg is decoupled.** The MEFOR copy goes through a bounded in-memory queue drained by its own
@@ -110,9 +111,10 @@ python -m tee run --listen-epic :6661 --corepoint corehost:5000 --mefor meforhos
 python -m tee naks --db ./tee.db
 ```
 
-Useful flags: `--corepoint-attempts` / `--corepoint-retry-delay` (quick retries before tripping
-fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame-size DoS cap),
-`--mefor-queue-max` (shadow buffer bound), `--capture-bodies` (persist full bodies — **test data only**),
+Useful flags: `--corepoint-attempts` / `--corepoint-retry-delay` (tries before tripping fail-closed,
+counting the first, so `1` means no retry; a positive integer), `--connect-timeout` / `--send-timeout`,
+`--max-frame-bytes` (frame-size DoS cap), `--mefor-queue-max` (shadow buffer bound, a positive
+integer), `--capture-bodies` (persist full bodies — **test data only**),
 `-y/--yes` (skip the test-data-only confirmation for an unattended/service start), `--log-level`,
 `--stop-grace` (default 30 seconds). On shutdown the relay stops ACKing new messages, then gives
 messages it has already ACKed up to the grace to finish their Corepoint and MEFOR legs, then gives
