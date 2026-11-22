@@ -28,6 +28,7 @@ import {
 import { Detail, codeSetFormHtml } from "./codeSetEditor";
 import {
   ConnectionListItem,
+  codeSetEditorUpsertArgs,
   codeSetNameFromPath,
   isReadOnlyCodeSet,
   isUnderConfigDir,
@@ -374,9 +375,14 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           if (dir === undefined) {
             return;
           }
+          const upsert = codeSetEditorUpsertArgs(dir, name, readonly, m.detail);
+          if ("error" in upsert) {
+            postToWebview(panel.webview, { command: "error", message: upsert.error });
+            return;
+          }
           markSaving();
           try {
-            await runJson(["codeset", "upsert", "--config", dir, "--data", JSON.stringify(m.detail)], ws);
+            await runJson(upsert.args, ws);
           } catch (e) {
             clearGuard();
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });

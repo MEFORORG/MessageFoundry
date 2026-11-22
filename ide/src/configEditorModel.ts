@@ -23,6 +23,33 @@ export function isReadOnlyCodeSet(fsPath: string): boolean {
 }
 
 /**
+ * The `codeset upsert` argv for a save from the code-set custom editor, or the error to show instead.
+ * The editor IS the opened file, so every save is an edit of that file's stem: it passes `--name
+ * <stem>`, which the CLI reads as edit intent (`create = --name is None`, #240). Without it the CLI
+ * took each save as a create and refused it as a collision with the file being edited (BACKLOG
+ * #5834). A posted name other than the stem, or a save of a read-only code set, is refused here,
+ * since either would write some other file than the one the tab shows.
+ */
+export function codeSetEditorUpsertArgs(
+  configDir: string,
+  stem: string,
+  readonly: boolean,
+  detail: { name: string },
+): { args: string[] } | { error: string } {
+  if (readonly) {
+    return { error: `code set ${stem} is read-only here (a .toml code set); edit the TOML as text.` };
+  }
+  if (detail.name !== stem) {
+    return {
+      error:
+        `this tab edits code set ${stem}, but the grid posted the name ${JSON.stringify(detail.name)} ` +
+        "(nothing was written). Rename a code set from the Translation Tables tree.",
+    };
+  }
+  return { args: ["codeset", "upsert", "--config", configDir, "--data", JSON.stringify(detail), "--name", stem] };
+}
+
+/**
  * The webview↔document loop guard. The provider writes the file by shelling the CLI; that on-disk
  * write makes VS Code fire onDidChangeTextDocument for the SAME document, which would otherwise re-push
  * content into the webview and clobber it. `shouldPushDocumentChange` returns false for the change the
