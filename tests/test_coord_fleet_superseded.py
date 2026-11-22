@@ -84,7 +84,9 @@ class Fleet:
         )
         return proc.stdout.strip()
 
-    def seat(self, box: str, session: str, as_of: str | None) -> None:
+    def seat(
+        self, box: str, session: str, as_of: str | None, *, omit_key: bool = False, **extra: Any
+    ) -> None:
         rec: dict[str, Any] = {
             "schema": 1,
             "lifecycle": "open",
@@ -100,16 +102,19 @@ class Fleet:
         }
         if as_of is not None:
             rec["asOf"] = as_of
+        rec.update(extra)
+        if omit_key:
+            del rec["sessionKey"]
         d = self.seats / box
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{session}.json").write_text(json.dumps(rec), encoding="utf-8")
 
-    def live(self, session: str) -> None:
+    def live(self, session: str, cwd: str | None = None) -> None:
         """Register a session on this test's own pid, so the real fence reads it LIVE."""
         rec = {
             "pid": os.getpid(),
             "sessionId": f"{session}-0000-0000-0000-000000000000",
-            "cwd": self.top,
+            "cwd": cwd or self.top,
             "startedAt": int(time.time() * 1000),
             "kind": "interactive",
             "entrypoint": "claude-desktop",
@@ -225,15 +230,67 @@ def test_a_crashed_session_with_a_frozen_legacy_copy_stays_respawnable(
     assert got[(fleet.new_box, "sess-e")] == "INTERRUPTED"
 
 
-def test_a_frozen_copy_does_not_supersede_another_session(fleet: Fleet) -> None:
-    """Written last, the copy would otherwise leave all three crashed records unrespawnable."""
+def test_a_newer_frozen_copy_makes_its_session_the_last_occupant(fleet: Fleet) -> None:
+    """The session wrote last, so its new-box record is the tree's one respawnable row."""
     fleet.seat(fleet.new_box, "sess-a", _ago(7200))
     fleet.seat(fleet.new_box, "sess-b", _ago(3600))
     fleet.seat(fleet.legacy_box, "sess-a", _ago(10))
     got = fleet.states()
-    assert got[(fleet.new_box, "sess-a")] == "SUPERSEDED"
+    assert got[(fleet.new_box, "sess-a")] == "INTERRUPTED"
     assert got[(fleet.legacy_box, "sess-a")] == "SUPERSEDED"
-    assert got[(fleet.new_box, "sess-b")] == "INTERRUPTED"
+    assert got[(fleet.new_box, "sess-b")] == "SUPERSEDED"
+
+
+def test_a_session_closed_through_a_newer_legacy_copy_is_not_respawnable(fleet: Fleet) -> None:
+    fleet.seat(fleet.new_box, "sess-e", _ago(7200))
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(60), lifecycle="closed")
+    got = fleet.states()
+    assert got[(fleet.new_box, "sess-e")] == "CLOSED"
+    assert got[(fleet.legacy_box, "sess-e")] == "CLOSED"
+
+
+def test_a_session_handed_through_a_newer_legacy_copy_shows_once(fleet: Fleet) -> None:
+    fleet.seat(fleet.new_box, "sess-e", _ago(7200))
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(60), lifecycle="handed")
+    got = fleet.states()
+    assert got[(fleet.new_box, "sess-e")] == "HANDED"
+    assert got[(fleet.legacy_box, "sess-e")] == "SUPERSEDED"
+
+
+def test_the_shared_nosid_key_freezes_nothing(fleet: Fleet) -> None:
+    """Every writer with no session id uses this key, so two such records may be two sessions."""
+    fleet.seat(fleet.new_box, "nosid", _ago(7200))
+    fleet.seat(fleet.new_box, "sess-c", _ago(3600))
+    fleet.seat(fleet.legacy_box, "nosid", _ago(10))
+    got = fleet.states()
+    assert got[(fleet.new_box, "sess-c")] == "SUPERSEDED"
+    assert got[(fleet.legacy_box, "nosid")] == "INTERRUPTED"
+
+
+def test_a_legacy_copy_with_no_session_key_is_still_frozen(fleet: Fleet) -> None:
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(3600), omit_key=True)
+    fleet.seat(fleet.new_box, "sess-e", _ago(10))
+    fleet.live("sess-e")
+    got = fleet.states()
+    assert got[(fleet.legacy_box, "")] == "SUPERSEDED"
+    assert got[(fleet.new_box, "sess-e")] == "RUNNING"
+
+
+def test_a_live_session_that_left_the_tree_is_superseded(fleet: Fleet, tmp_path: Path) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    fleet.seat(fleet.new_box, "sess-old", _ago(3600))
+    fleet.seat(fleet.new_box, "sess-new", _ago(10))
+    fleet.live("sess-old", cwd=str(elsewhere))
+    assert fleet.states()[(fleet.new_box, "sess-old")] == "SUPERSEDED"
+
+
+def test_a_stamp_with_no_offset_orders_as_utc(fleet: Fleet) -> None:
+    fleet.seat(fleet.new_box, "sess-old", _ago(3600).removesuffix("Z"))
+    fleet.seat(fleet.new_box, "sess-new", _ago(60))
+    got = fleet.states()
+    assert got[(fleet.new_box, "sess-old")] == "SUPERSEDED"
+    assert got[(fleet.new_box, "sess-new")] == "INTERRUPTED"
 
 
 def test_another_sessions_live_legacy_record_is_not_frozen(fleet: Fleet) -> None:

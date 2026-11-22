@@ -428,7 +428,12 @@ $now = [DateTime]::UtcNow
 function Get-RecordInstantUtc($iso) {
     if (-not $iso) { return $null }
     try {
-        if ($iso -is [DateTime]) { return $iso.ToUniversalTime() }
+        if ($iso -is [DateTime]) {
+            # A stamp with no offset parses to Kind=Unspecified, and ToUniversalTime would read it as
+            # local. UTC, as the string branch below assumes.
+            if ($iso.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($iso, [DateTimeKind]::Utc) }
+            return $iso.ToUniversalTime()
+        }
         return [DateTimeOffset]::Parse([string]$iso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal).UtcDateTime
     } catch { return $null }
 }
@@ -460,19 +465,32 @@ foreach ($r in $records) {
     $sk = [string](Get-RecordField $r.Rec 'sessionKey')
     $r | Add-Member -NotePropertyName Tree -NotePropertyValue $tree -Force
     $r | Add-Member -NotePropertyName SessionKey -NotePropertyValue $sk -Force
-    $r | Add-Member -NotePropertyName AsOfUtc -NotePropertyValue (Get-RecordInstantUtc (Get-RecordField $r.Rec 'asOf')) -Force
+    $asOfUtc = Get-RecordInstantUtc (Get-RecordField $r.Rec 'asOf')
+    $r | Add-Member -NotePropertyName AsOfUtc -NotePropertyValue $asOfUtc -Force
+    # The session's latest instant and lifecycle; a newer legacy copy overrides them below.
+    $r | Add-Member -NotePropertyName OrderUtc -NotePropertyValue $asOfUtc -Force
+    $r | Add-Member -NotePropertyName LifecycleRec -NotePropertyValue $r.Rec -Force
+    # A record is filed under its session key, so the file stem names a record missing the field.
+    # 'nosid' is shared by every writer with no session id, so it identifies no one session.
+    $identity = if ($sk) { $sk } else { [IO.Path]::GetFileNameWithoutExtension($r.File) }
+    $r | Add-Member -NotePropertyName SessionIdentity -NotePropertyValue $(if ($identity -cne 'nosid') { "$tree|$identity" }) -Force
 }
-# Legacy-box records whose OWN SESSION has a record in the new box. No writer reaches them now, so
-# the pointer census below skips them: the seat repairs its pointer in the new record. A different
-# session's legacy record is still counted, because -ClearHandoff can still reach it.
+# Legacy-box records whose OWN SESSION has a record in the new box. The pointer census below skips
+# them: the seat repairs its pointer in the new record. An older seat.ps1 may still write one, so
+# the new-box record takes the instant and lifecycle of a newer copy. A different session's legacy
+# record is still counted, because -ClearHandoff can still reach it.
 $frozenLegacy = @{}
-$newBoxSessions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+$newBoxRecords = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 foreach ($r in $records) {
-    if ($r.SessionKey -and $r.Box -ceq $r.Tree) { [void]$newBoxSessions.Add("$($r.Tree)|$($r.SessionKey)") }
+    if ($r.SessionIdentity -and $r.Box -ceq $r.Tree) { $newBoxRecords[$r.SessionIdentity] = $r }
 }
 foreach ($r in $records) {
-    if ($r.SessionKey -and $r.Box -cne $r.Tree -and $newBoxSessions.Contains("$($r.Tree)|$($r.SessionKey)")) {
-        $frozenLegacy[$r.File] = $true
+    if (-not $r.SessionIdentity -or $r.Box -ceq $r.Tree -or -not $newBoxRecords.ContainsKey($r.SessionIdentity)) { continue }
+    $frozenLegacy[$r.File] = $true
+    $current = $newBoxRecords[$r.SessionIdentity]
+    if ($null -ne $r.AsOfUtc -and ($null -eq $current.AsOfUtc -or $r.AsOfUtc -gt $current.AsOfUtc)) {
+        $current.OrderUtc = $r.AsOfUtc
+        $current.LifecycleRec = $r.Rec
     }
 }
 
@@ -499,6 +517,8 @@ foreach ($r in $records) {
     # The fence is this PC's session registry, so it is never asked about another PC's record.
     $isHere = Test-CoordRecordIsHere $rec
     $fence = if ($isHere) { 'UNKNOWN' } else { 'NOT-CHECKABLE-HERE' }
+    # The fence matches on session id alone, so a live session may have left this record's worktree.
+    $liveInTree = $false
     if ($incomplete) {
         if ($isHere) { $fence = 'UNREADABLE' }
         $incompleteRecords += $r.File
@@ -512,20 +532,28 @@ foreach ($r in $records) {
         # The removal paths' unbounded start skew (remove.ps1, prune-merged.ps1 and the nightly removal
         # pass [int]::MaxValue to Get-WorktreeOccupancy), so a session the removal fence reads LIVE
         # never reads STALE, and so INTERRUPTED, here.
-        try { $fence = (Get-SessionLiveness -SessionId $sid -Worktree $wt -StartSkewMinutes ([int]::MaxValue)).State }
+        try {
+            $liveness = Get-SessionLiveness -SessionId $sid -Worktree $wt -StartSkewMinutes ([int]::MaxValue)
+            $fence = $liveness.State
+            if ($fence -eq 'LIVE') {
+                $holder = Get-ContainingRepoWorktree (Get-NormPath ([string](Get-RecordField $liveness.Record 'cwd')))
+                $liveInTree = [bool]$holder -and $holder -ceq (Get-NormPath $wt)
+            }
+        }
         catch {
             $fence = 'UNREADABLE'
             $lookupFailures += "$($r.File): $($_.Exception.GetType().Name) $($_.Exception.Message)"
         }
     }
 
-    $lifecycle = if ($null -ne (Get-RecordField $rec 'lifecycle')) { [string](Get-RecordField $rec 'lifecycle') } else { 'open' }
-    $ageH = Get-AgeHours $r.AsOfUtc
+    $lifecycleValue = Get-RecordField $r.LifecycleRec 'lifecycle'
+    $lifecycle = if ($null -ne $lifecycleValue) { [string]$lifecycleValue } else { 'open' }
+    $ageH = Get-AgeHours $r.OrderUtc
 
     # SUPERSEDED: a newer record of the same tree (above). Without the tree, a session that crossed
     # the box-key change reads as two seats. A frozen legacy copy is superseded outright, whichever
-    # is newer, because the new box is the one the writer keeps. It supersedes nothing itself, or a
-    # crashed tree could be left with no row to respawn.
+    # is newer; its new-box record speaks for the session at the later of their two instants, so the
+    # copy itself supersedes nothing.
     # The compare reads instants, not Get-AgeHours's 0.1 h buckets (BACKLOG #5872). asOf has
     # one-second resolution, so an exact tie supersedes neither: breaking it could hide a crashed
     # seat from the respawn population.
@@ -534,7 +562,7 @@ foreach ($r in $records) {
         if ($o.File -eq $r.File) { continue }
         if ($o.Tree -cne $r.Tree) { continue }
         if ($frozenLegacy.ContainsKey($o.File)) { continue }
-        if ($null -ne $o.AsOfUtc -and $null -ne $r.AsOfUtc -and $o.AsOfUtc -gt $r.AsOfUtc) { $superseded = $true }
+        if ($null -ne $o.OrderUtc -and $null -ne $r.OrderUtc -and $o.OrderUtc -gt $r.OrderUtc) { $superseded = $true }
     }
 
     $state = switch ($true) {
@@ -542,14 +570,14 @@ foreach ($r in $records) {
         # Ahead of HANDED, which respawn.ps1 respawns, and of ON <HOST>, which -Chip still briefs: an
         # incomplete record names no checkout to brief.
         { $incomplete }                                { 'POSSIBLY RUNNING'; break }
-        { $lifecycle -eq 'handed' }                    { 'HANDED'; break }
-        # Ahead of LIVE: the fence reads one session for both of its records, and only the new-box
-        # record may show it as RUNNING, or one session shows twice.
+        # Ahead of HANDED and LIVE: both of a session's records would read alike, and only the new-box
+        # record may speak for it, or one session shows twice.
         { $frozenLegacy.ContainsKey($r.File) }         { 'SUPERSEDED'; break }
-        # Ahead of an ordinary SUPERSEDED: a newer record in this tree does not end a live session.
-        { $fence -eq 'LIVE' }                          { 'RUNNING'; break }
-        { $superseded }                                { 'SUPERSEDED'; break }
+        { $lifecycle -eq 'handed' }                    { 'HANDED'; break }
+        # A newer record in this tree does not end a session still live in this tree.
+        { $superseded -and -not $liveInTree }          { 'SUPERSEDED'; break }
         { -not $isHere }                               { "ON $((Get-CoordRecordHost $rec).ToUpperInvariant())"; break }
+        { $fence -eq 'LIVE' }                          { 'RUNNING'; break }
         { $fence -in @('UNVERIFIED', 'UNREADABLE') }   { 'POSSIBLY RUNNING'; break }
         { -not $fenceAvailable }                       { 'UNKNOWN-NO-FENCE'; break }
         default                                        { 'INTERRUPTED' }
