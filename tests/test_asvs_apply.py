@@ -3626,37 +3626,40 @@ def test_an_anchor_repair_omitting_prose_keeps_the_live_value(
     assert after["evidence"][0]["line"] == 11, "the repair itself did not land"
 
 
-@pytest.mark.parametrize("live_line", ['residual = ""', 'residual = ["a", "b"]', "residual = 7"])
-def test_an_anchor_repair_carries_a_live_residual_at_its_own_type(
-    tmp_path: Path, live_line: str
+@pytest.mark.parametrize(
+    ("field", "old", "new"),
+    [
+        ("residual", 'residual = "a control exists but ships off"', 'residual = ""'),
+        ("reviewed_by", _FIX_LINE, 'reviewed_by = ""\n'),
+    ],
+)
+def test_an_anchor_repair_keeps_a_live_empty_value(
+    tmp_path: Path, field: str, old: str, new: str
 ) -> None:
-    """`toml_str` coerces, and the type guard exempts ordered fields because of it, so a carry
-    through it would rewrite a non-string value as its repr with nothing refusing."""
+    """A repair preserves an empty field rather than dropping it or inventing a value."""
     rec = _record(tmp_path)
-    text = FIXTURE.replace('residual = "a control exists but ships off"', live_line)
-    rec.write_text(text, encoding="utf-8")
-    before = _cell_after_apply(rec)["residual"]
-    repair = _repair_omitting("residual")
+    rec.write_text(FIXTURE.replace(old, new, 1), encoding="utf-8")
+    repair = _repair_omitting(field)
     rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
     assert rc == 0
-    after = _cell_after_apply(rec)["residual"]
-    assert type(after) is type(before) and after == before
+    assert _cell_after_apply(rec)[field] == ""
 
 
-def test_an_anchor_repair_refuses_a_carry_toml_cannot_round_trip(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("value", ["7", '["a", "b"]', "2026-01-01"])
+def test_an_anchor_repair_will_not_carry_a_residual_the_loader_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str
 ) -> None:
-    """A TOML date has no emission here and would come back a string. Ordered fields are exempt
-    from the type guard, so only the carry's own check stands between that and the record."""
+    """Carried, it would put new anchors on a cell the next load refuses, and a TOML date would
+    also come back a string under a type guard that exempts ordered fields."""
     rec = _record(tmp_path)
-    text = FIXTURE.replace('residual = "a control exists but ships off"', "residual = 2026-01-01")
+    text = FIXTURE.replace('residual = "a control exists but ships off"', f"residual = {value}", 1)
     rec.write_text(text, encoding="utf-8")
     before = rec.read_bytes()
     repair = _repair_omitting("residual")
     rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
     assert rc == 1
     assert rec.read_bytes() == before
-    assert "would CHANGE carried field(s) ['residual']" in capsys.readouterr().out
+    assert "so a repair cannot carry it" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("field", ["residual", "reviewed_by"])
@@ -3743,14 +3746,17 @@ def test_an_anchor_repair_of_a_closed_cell_may_omit_reviewed_by(tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
-    "live_line",
+    ("live_line", "refusal"),
     [
-        'reviewed_by = { reviewer = "fixture", ref = "not-a-sha", date = "unrecorded" }',
-        'reviewed_by = ["x"]',
+        (
+            'reviewed_by = { reviewer = "fixture", ref = "not-a-sha", date = "unrecorded" }',
+            "reviewed_by.ref",
+        ),
+        ('reviewed_by = ["x"]', "so a repair cannot carry it"),
     ],
 )
 def test_an_anchor_repair_will_not_carry_a_reviewed_by_the_loader_refuses(
-    tmp_path: Path, live_line: str
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], live_line: str, refusal: str
 ) -> None:
     rec = _record(tmp_path)
     rec.write_text(FIXTURE.replace(_FIX_LINE, live_line + "\n", 1), encoding="utf-8")
@@ -3759,6 +3765,7 @@ def test_an_anchor_repair_will_not_carry_a_reviewed_by_the_loader_refuses(
     rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
     assert rc == 1
     assert rec.read_bytes() == before
+    assert refusal in capsys.readouterr().out
 
 
 def test_a_carried_reviewed_by_table_is_written_in_canonical_order(tmp_path: Path) -> None:
