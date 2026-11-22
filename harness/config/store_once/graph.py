@@ -10,7 +10,10 @@ store-once-deliver-many.
 This graph fans out via **one** handler returning ``list[Send]`` of the **identical** body to N
 destinations — a single ``transform_handoff`` with N deliveries — which is exactly the shape that
 triggers L2b: the body is content-addressed and written **once** to ``shared_body``, referenced by N
-``queue.body_ref`` rows (instead of N inline copies). Serve it for §7 **J1/S7.1** (store-once
+``queue.body_ref`` rows (instead of N inline copies).
+
+Prerequisite: the harness wheel or an editable install of this repo. Under ``-P``, a bare checkout with
+only the engine wheel fails on the ``harness`` import below. Serve it for §7 **J1/S7.1** (store-once
 functional) and **J9/S7.6** (write-amplification)::
 
     MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_SINK_PORT=2700 \

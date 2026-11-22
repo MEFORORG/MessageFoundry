@@ -30,14 +30,20 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO_ROOT / "harness" / "config"
 _GRAPHS = ["load", "estate", "shardcert"]
 
+# Only the finder below raises with this text, so a control can tell its refusal from any other
+# missing module.
+_BLOCKED = "harness refused by the engine-only finder"
+
 # The engine-only install, simulated: `harness` cannot be imported, whatever the .pth says.
-_CHILD = """
+_CHILD = (
+    f"BLOCKED = {_BLOCKED!r}\n"
+    + """
 import importlib.abc, sys
 
 class _NoHarness(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path=None, target=None):
         if name == "harness" or name.startswith("harness."):
-            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            raise ModuleNotFoundError(BLOCKED, name=name)
         return None
 
 sys.meta_path.insert(0, _NoHarness())
@@ -47,6 +53,7 @@ from messagefoundry.config.wiring import load_config
 registry = load_config(sys.argv[1])
 print("inbounds", len(registry.inbound))
 """
+)
 
 
 def _load_engine_only(config: Path, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -83,10 +90,18 @@ def test_control_the_block_reaches_a_graphs_import(tmp_path: Path) -> None:
     # If this starts passing the load, the block has stopped working and the test above proves nothing.
     config = tmp_path / "needs_harness"
     config.mkdir()
-    (config / "graph.py").write_text("import harness\n", encoding="utf-8")
+    # The graph reports what it caught, because the loader's own error need not carry the message.
+    (config / "graph.py").write_text(
+        "try:\n"
+        "    import harness\n"
+        "except ModuleNotFoundError as exc:\n"
+        "    print(f'caught {exc.name}: {exc}', flush=True)\n"
+        "    raise\n",
+        encoding="utf-8",
+    )
     done = _load_engine_only(config, tmp_path)
     assert done.returncode != 0
-    assert "ModuleNotFoundError" in done.stderr
+    assert f"caught harness: {_BLOCKED}" in done.stdout, done.stdout + done.stderr
 
 
 def _parsed_def(path: Path, name: str) -> str:

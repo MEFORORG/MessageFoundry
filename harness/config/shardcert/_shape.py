@@ -348,7 +348,7 @@ class ShardCertShape:
     def destination_index(self, msg: Message | RawMessage) -> int:
         """PARTITIONED: the ONE destination this message is routed to — ``splitmix64(seq) % dests``, where
         ``seq`` is the dense monotonic sequence number the harness sender stamps into MSH-10 as
-        ``SC<12 digits>`` (:data:`~harness.load.ids.SHARDCERT_IDS`).
+        ``SC<12 digits>``, decoded here by this module's :data:`SHARDCERT_IDS`, a copy of the senders' parser.
 
         **The MIX is load-bearing — a bare ``seq % dests`` is a DEFECT, not a simplification.** The sender's
         connection round-robin is keyed on the SAME counter: :func:`harness.load.shardcert._drive_load` does

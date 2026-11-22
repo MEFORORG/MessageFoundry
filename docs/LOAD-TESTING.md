@@ -180,13 +180,13 @@ commits. Compare it with `txn/msg (engine, poller removed)`, not with the raw fi
 | `MEFOR_LOAD_FANOUT` | 20 | sink destinations per ADT message (write-amplification) |
 | `MEFOR_LOAD_RESULTS_FANOUT` | 4 | destinations per results/other message |
 | `MEFOR_LOAD_TRANSFORM` | `edit` | `cheap` (pass-through) / `edit` (field rewrites) / `slow` (CPU spin) |
-| `MEFOR_LOAD_TRANSFORM_MS` | 1.0 | CPU spin per transform when `slow` (finds the transform-cost ceiling). At most 60000; a larger or non-finite value refuses to load |
+| `MEFOR_LOAD_TRANSFORM_MS` | 1.0 | CPU spin per transform when `slow` (finds the transform-cost ceiling). At most 60000 per transform, not per message: a message spins once per destination handler. A larger or non-finite value refuses to load |
 | `MEFOR_LOAD_SINK_HOST` / `_SINK_PORT` / `_SINK_PORTS` | 127.0.0.1 / 2700 / 1 | where every destination delivers |
 | `MEFOR_LOAD_ADT_PORT` / `_RESULTS_PORT` / `_OTHER_PORT` | 2600 / 2601 / 2602 | inbound hub ports |
 
-`slow` is a deliberate busy-loop (not a sleep): it models CPU-bound transform contention on the single
-event loop, which is how you find the per-core transform ceiling (the research finding that
-transformation, not framing, dominates throughput).
+`slow` is a deliberate busy-loop (not a sleep). Transforms run off the event loop, so it keeps a worker
+thread busy and contends for the GIL, which is how you find the per-core transform ceiling (the
+research finding that transformation, not framing, dominates throughput).
 
 ## Profiles
 

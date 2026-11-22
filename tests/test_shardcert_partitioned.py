@@ -501,10 +501,10 @@ def test_router_propagates_the_fail_loud(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_the_senders_share_one_control_id_scheme() -> None:
     # The prefix is now a SENDER↔ROUTER contract (the graph decodes what the sender stamps) across PROCESS
     # boundaries. It used to be re-spelled as `ControlIds(prefix="SC")` in FIVE places (four senders + the
-    # shape); change four of the five and the router raises on every message, voiding the whole run. There is
-    # now ONE definition (harness.load.ids.SHARDCERT_IDS), which the senders import. The graph's _shape
-    # holds a parser copy so it loads without the harness package (BACKLOG #5854), and
-    # tests/test_harness_graph_engine_only.py holds that copy equal to this definition.
+    # shape); change four of the five and the router raises on every message, voiding the whole run. There
+    # are now TWO: harness.load.ids.SHARDCERT_IDS, which the senders import, and the parser copy in the
+    # graph's _shape, so the graph loads without the harness package (BACKLOG #5854).
+    # tests/test_harness_graph_engine_only.py holds the two equal.
     from harness.config.shardcert import _shape as router_shape
 
     src = (_REPO_ROOT / "harness/load/shardcert.py").read_text(encoding="utf-8")

@@ -49,8 +49,9 @@ EDIT = "edit"  # representative whole-field rewrites via the Message model
 SLOW = "slow"  # edit + a deterministic CPU spin, to find the transform-cost ceiling on one core
 _TRANSFORMS = frozenset({CHEAP, EDIT, SLOW})
 
-# One minute per transform. The spin runs on the event loop once per destination handler, so this
-# bounds the stall rather than preventing one; without it a huge value hangs like inf (BACKLOG #5851).
+# One minute per transform, not per message: a message spins once per destination handler, so its
+# total can reach this times its fan-out. Without the cap, a huge value would tie up a worker thread
+# as inf does (BACKLOG #5851).
 _MAX_TRANSFORM_MS = 60_000.0
 
 #: ``max_connections_per_host=NO_PER_HOST_CAP`` turns the shipped per-peer connection cap off on a
@@ -168,9 +169,10 @@ def load_shape() -> Shape:
 
 
 def _spin(ms: float) -> None:
-    """Busy-loop for ``ms`` milliseconds — a CPU-bound transform on the event loop, *not* a sleep, so
-    it models single-core transform contention (the durable-write wall is hit at the store; this finds
-    the *transform* ceiling). Deterministic and side-effect-free, so a re-run is equivalent."""
+    """Busy-loop for ``ms`` milliseconds — a CPU-bound transform, *not* a sleep. ``transform_one`` runs
+    off the event loop, so this keeps a worker thread busy and contends for the GIL, which models
+    transform CPU contention (the durable-write wall is hit at the store; this finds the *transform*
+    ceiling). Deterministic and side-effect-free, so a re-run is equivalent."""
     if ms <= 0.0:
         return
     deadline = time.perf_counter() + ms / 1000.0

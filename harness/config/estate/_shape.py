@@ -90,7 +90,8 @@ def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> 
         value = float(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number, got {raw!r}") from exc
-    if value < minimum or value > maximum:
+    # Written as one positive range test because nan fails it, where `value < minimum` would not.
+    if not minimum <= value <= maximum:
         raise ValueError(f"{name} must be within [{minimum}, {maximum}], got {value}")
     return value
 
