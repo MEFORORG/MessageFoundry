@@ -306,12 +306,32 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
         return False, True
 
 
+#: The six ASCII whitespace characters :func:`_plaintext` removes, and no other character.
+_B64_WHITESPACE = " \t\n\r\f\v"
+
+
 def _plaintext(value: object) -> str | None:
-    """Transit's base64 ``plaintext`` as text, or ``None`` when it is not base64 of UTF-8. Never
-    raises, so no error carries the decrypted bytes (BACKLOG #2085)."""
-    # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a value that is not text.
-    with contextlib.suppress(ValueError, TypeError):
-        return base64.b64decode(value).decode("utf-8")  # type: ignore[arg-type]
+    """Transit's base64 ``plaintext`` as text, with :data:`_B64_WHITESPACE` removed first, so a
+    reply that a hop rewrapped opens as it does unwrapped, with one exception (BACKLOG #5964): a
+    reply of whitespace alone is refused even if the sealed value was empty, which differs from
+    the earlier non-strict decode. ``None`` for at least that reply, a value that is not a
+    ``str``, any other character outside the alphabet, bad padding, or bytes that are not UTF-8.
+    The empty string opens as itself, and non-zero trailing bits in the last character are still
+    accepted. A decode failure returns
+    ``None`` rather than raising, so its error cannot carry the decrypted bytes (BACKLOG #2085);
+    only ``ValueError`` is caught, so a ``MemoryError`` still propagates."""
+    if not isinstance(value, str):
+        return None
+    # binascii.Error and UnicodeDecodeError are ValueErrors.
+    # validate=True: the default drops characters outside the alphabet, so "!!!!" would open as "".
+    with contextlib.suppress(ValueError):
+        compact = value
+        # Checked first so a reply with no whitespace skips the translate.
+        if any(c in value for c in _B64_WHITESPACE):
+            compact = value.translate(str.maketrans("", "", _B64_WHITESPACE))
+            if not compact:
+                return None
+        return base64.b64decode(compact, validate=True).decode("utf-8")
     return None
 
 
