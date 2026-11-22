@@ -115,6 +115,7 @@ from messagefoundry.transports.file import (
     _fd_for,
     _file_id,
     _handle_final_path,
+    _kernel32,
     _os_handle,
     _Replaced,
     _Unconfined,
@@ -3192,6 +3193,18 @@ def _win_create_new(path: Path) -> None:
     kernel32.CloseHandle(handle)
 
 
+class _StandardInfo(ctypes.Structure):
+    """``FILE_STANDARD_INFO``."""
+
+    _fields_ = (
+        ("allocation_size", ctypes.c_int64),
+        ("end_of_file", ctypes.c_int64),
+        ("number_of_links", ctypes.c_uint32),
+        ("delete_pending", ctypes.c_ubyte),
+        ("directory", ctypes.c_ubyte),
+    )
+
+
 class _HeldStagingDir:
     """A staging directory opened as itself, through which the sweep reads its owner, opens its lock
     and tests its marker, and the teardown puts both back (BACKLOG #2420). Used as a context
@@ -3252,6 +3265,20 @@ class _HeldStagingDir:
         if self.fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self.fd)
+
+    def delete_pending(self) -> bool:
+        """Windows: whether the open directory is being deleted, as when a sibling engine shard
+        removed it while it was open here; a volume without POSIX delete semantics then refuses a
+        name below it with access denied rather than "not found". ``False`` elsewhere, and when
+        that cannot be read."""
+        if sys.platform != "win32" or self.fd is None:
+            return False
+        info = _StandardInfo()
+        if not _kernel32().GetFileInformationByHandleEx(
+            _os_handle(self.fd), 1, ctypes.byref(info), ctypes.sizeof(info)
+        ):  # 1 is FileStandardInfo
+            return False
+        return bool(info.delete_pending)
 
     def owner(self) -> object | None:
         """The directory's owner, read from the open directory (:func:`_owner_of_fd`), or by path
@@ -4381,6 +4408,8 @@ def _proven_abandoned(path: Path, owner: object) -> bool:
         except FileNotFoundError:
             return False  # no lock file: no proof either way
         except OSError as exc:
+            if held_dir.delete_pending():
+                return False  # removed while open here: gone, as with no lock file
             # A directory with this account's owner whose lock file this account still cannot
             # open, or one planted there as a link; another owner's directory never reaches here,
             # since the owner is checked first. Said, not skipped silently.

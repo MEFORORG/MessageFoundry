@@ -387,3 +387,40 @@ def test_without_o_path_a_directory_it_cannot_read_is_still_swept_by_path(
         assert dr_backup._proven_abandoned(candidate, owner) is True
     finally:
         candidate.chmod(0o700)
+
+
+@pytest.mark.parametrize("pending", [True, False])
+def test_a_lock_refused_because_its_directory_is_being_deleted_is_not_logged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pending: bool,
+) -> None:
+    """A sibling engine shard removes its live directory while the sweep has it open, on a volume
+    without POSIX delete semantics, so the lock open is refused with access denied. Stand-ins for
+    that refusal and for the delete-pending read: not measured on such a volume here. Red at
+    18beb68ceed: that was logged as a lock this account cannot open, where origin/main, holding no
+    directory open, found nothing. The control, `pending=False`: a real refusal is still logged."""
+    root = tmp_path / "root"
+    candidate = _abandoned(root)
+    owner = dr_backup._owner_of(candidate)
+    assert owner is not None
+
+    def refused(self: object) -> int:
+        raise PermissionError(13, "synthetic refusal")
+
+    monkeypatch.setattr(dr_backup._HeldStagingDir, "open_lock", refused)
+    monkeypatch.setattr(dr_backup._HeldStagingDir, "delete_pending", lambda self: pending)
+    with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
+        assert dr_backup._proven_abandoned(candidate, owner) is False
+    logged = any("cannot open the lock" in r.getMessage() for r in caplog.records)
+    assert logged is not pending
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="FILE_STANDARD_INFO is Windows-only")
+def test_a_directory_not_being_deleted_reads_as_not_delete_pending(tmp_path: Path) -> None:
+    """The delete-pending read on a live directory: it reads, and says not pending."""
+    staging = tmp_path / "mefor-backup-live"
+    staging.mkdir()
+    with dr_backup._HeldStagingDir(staging) as held_dir:
+        assert held_dir.delete_pending() is False
