@@ -626,6 +626,15 @@ def test_guard_answers_a_fault_in_the_parse_as_a_parse_refusal(
         admit_resubmitted_body(ADT, _ic(ContentType.HL7V2))
     assert exc.value.phase == "parse"
     assert exc.value.reason == "parse error: peek read failed (LookupError)"
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    # The direct path (no inbound) answers the same fault the same way, for a body the gate opens on.
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+
+    with pytest.raises(IngressGuardError) as direct:
+        admit_resubmitted_body(ADT + f"NTE|1||{DOC_REF_MARKER}x\r", None)
+    assert direct.value.phase == "parse"
+    assert direct.value.reason == "parse error: peek read failed (LookupError)"
+    assert direct.value.__cause__ is None and direct.value.__context__ is None
 
 
 def test_guard_answers_a_fault_in_the_marker_read_as_an_ingest_refusal(

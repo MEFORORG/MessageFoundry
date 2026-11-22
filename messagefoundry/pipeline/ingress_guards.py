@@ -741,9 +741,12 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         direct_peek: Peek | None = None
         try:
             direct_peek = Peek.parse(raw, max_bytes=DEFAULT_MAX_MESSAGE_BYTES)
-        except HL7PeekError as exc:
+        except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
             if exc.parser_fault:
                 faulted = f"parse error: {safe_exc(exc)}"
+        except PEEK_READ_FAULTS as exc:
+            # As on the re-route path: a parse refusal naming its type, not an error unaudited.
+            faulted = f"parse error: peek read failed ({type(exc).__name__})"
         if faulted is not None:
             raise IngressGuardError(faulted, phase="parse")
         if direct_peek is not None:
@@ -760,10 +763,12 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             raise IngressGuardError(over_cap, phase="parse")
         try:
             message = Message.parse(raw)
-        except HL7PeekError as exc:
+        except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
             if not exc.parser_fault:
                 return raw
             faulted = f"parse error: {safe_exc(exc)}"
+        except PEEK_READ_FAULTS as exc:
+            faulted = f"parse error: peek read failed ({type(exc).__name__})"
         if faulted is not None:
             raise IngressGuardError(faulted, phase="parse")
         try:
