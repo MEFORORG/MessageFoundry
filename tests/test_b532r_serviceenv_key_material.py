@@ -183,7 +183,7 @@ _END = '. [security].enforcement = "warn" does not change this refusal'
 )
 def test_a_joined_directory_string_is_removed_with_the_value(entries: list[str]) -> None:
     """A ``MEFOR_SECRETS_DIRECTORY`` string joined below an empty store key may hold the key, so
-    the remedy says to remove what the value runs on into, whatever it holds (the Lander's
+    the remedy says to remove what the value runs on into, but for a path alone (the Lander's
     second hold on PR 3142, H3). It names no list or string to do it in (the third hold, H1)."""
     posture = _read(entries)
     assert posture.listed_keys == (_KEY,), posture.listed
@@ -231,7 +231,8 @@ def test_a_path_alone_joined_into_an_empty_key_beside_a_secret_is_kept() -> None
     )
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert refusal.endswith(f"{CREATE}. {REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    assert refusal.index(CREATE) < refusal.index("Put MEFOR_AUTH_AD_BIND_PASSWORD")
     assert refusal.index("Put MEFOR_AUTH_AD_BIND_PASSWORD in the secrets directory") < (
         refusal.index(REMOVE)
     )
@@ -286,7 +287,7 @@ def test_a_directory_named_on_its_own_gets_no_create_guidance() -> None:
 
 def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -> None:
     """A refused variable on a later line of the directory's own string: the remedy says to
-    remove that variable with its value, and names no string to remove (the third hold, H1)."""
+    remove that variable, and names no string to remove (the third hold, H1)."""
     posture = _read(["MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD=", "abc"])
     assert posture.value_runs_on
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed

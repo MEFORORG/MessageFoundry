@@ -633,7 +633,9 @@ def test_the_remedy_names_no_list_string_or_command(entries: list[str]) -> None:
     # The control: the finding before the remedy names the lists, so the probe can fire.
     assert "appenvironment" in refusal.lower()
     remedy = refusal.split("each value refused here. ", 1)[1]
-    assert REMOVE in remedy
+    # Removal comes after every step that moves a value (the fourth hold, H1).
+    tail = remedy[remedy.index(REMOVE) :]
+    assert "protect-key" not in tail and "Put " not in tail
     for named in ("appenvironment", "nssm", "string", "install-service.ps1"):
         assert named not in remedy.lower(), named
 

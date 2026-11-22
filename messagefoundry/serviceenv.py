@@ -1107,6 +1107,18 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             'store encryption key at rest"'
         )
     if others or values:
+        # The installer refuses an existing directory the service does not name, so this points
+        # only at how one is created, only where a non-empty setting goes to one, and before the
+        # step that moves it there (the third hold's H2, the fourth hold's H1 and H3).
+        moves = others or any(
+            v not in posture.empty_value_names and v != _VALUE_PREFIX for v in values
+        )
+        if _DIRECTORY_VARIABLE not in posture.listed and moves:
+            steps.append(
+                'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
+                'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
+                "says how it is created"
+            )
         put = [", ".join(others)] if others else []
         if values:
             put.append("each MEFOR_VALUE_* variable")
@@ -1151,16 +1163,6 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             )
             cite += ' and "[environments]"'
         steps.append(f"{step}. {cite}")
-        moved = [v for v in values if v not in posture.empty_value_names and v != _VALUE_PREFIX]
-        if _DIRECTORY_VARIABLE not in posture.listed and (others or moved):
-            # The installer refuses an existing directory the service does not name, so this
-            # points only at how one is created, and only where a non-empty setting goes to one
-            # (the third hold's H2, the fourth hold's H3).
-            steps.append(
-                'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
-                'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
-                "says how it is created"
-            )
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
     # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).
     steps.append(

@@ -5,7 +5,7 @@
 
 The join stays: the string still continues the empty value, and every input that refused before
 still refuses. Since the Lander's third hold on PR 3142 the remedy names no list, registry string
-or command: it says to remove each refused variable with its value and what a value runs on
+or command: it says to remove each refused variable and what a value runs on
 into, and points at docs/SERVICE.md. An OIDC key empty on its own line runs on and refuses
 (round-2 finding 1).
 Synthetic values only.
