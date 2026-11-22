@@ -830,14 +830,14 @@ class WebhookTransport:
         # (bandit B310). The URL is operator-configured, but an https-only check is cheap
         # defense-in-depth so a typo'd or hostile config can't turn an alert POST into a local-file
         # read. With the scheme provably https here, the Request nosec is justified.
-        refuse_unbuildable_webhook_url(self.url, self.allowed_hosts)
+        url = refuse_unbuildable_webhook_url(self.url, self.allowed_hosts)
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
         # onto the wire — the fan-out pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
         payload = {k: v for k, v in event.items() if not k.startswith("_")}
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme guarded to https above
-            self.url,
+            url,  # the value the screen judged, as its contract says
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",

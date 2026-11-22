@@ -27,11 +27,11 @@ __all__ = [
     "refuse_unbuildable_webhook_url",
 ]
 
-#: What is stripped from each end before the checks: the characters both readers strip.
+#: What is stripped from each end before the checks: the ASCII whitespace ``str.strip()`` removes.
 #: ``urlsplit`` strips C0 controls and space from the front only, and drops every tab, CR and LF;
-#: urllib's dial strips what ``str.strip()`` strips from both ends, which is wider and includes
-#: non-ASCII spaces. Only their common part is stripped, so a value either reader would read
-#: differently is refused rather than read two ways.
+#: urllib's dial strips what ``str.strip()`` strips from both ends, which also takes non-ASCII
+#: whitespace. A value that still has whitespace at either end after this strip is refused, since
+#: urlsplit would keep it in the host it judges while the dial removed it.
 _STRIPPED_BY_BOTH = "".join(c for c in map(chr, range(0x21)) if c.isspace())
 
 _SETTING = "[alerts].webhook_url"
@@ -79,7 +79,8 @@ def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> st
     names a part of the URL, and it raises outside urlsplit's own handler, whose text quotes the
     netloc. At least these are refused, in this order:
 
-    * a control character or lone surrogate inside the value, after :data:`_STRIPPED_BY_BOTH` is
+    * whitespace left at either end, and a control character or lone surrogate inside the value,
+      after :data:`_STRIPPED_BY_BOTH` is
       stripped from each end (``urlsplit`` drops a tab, CR or LF, so the scheme it read need not
       be the one urllib dials);
     * a credential in the URL, or a URL that does not parse (``refuse_url_credentials``);
@@ -92,6 +93,11 @@ def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> st
       operator config and the sole header is a fixed ``Content-Type``.
     """
     candidate = url.strip(_STRIPPED_BY_BOTH)
+    if candidate != candidate.strip():
+        raise ValueError(
+            f"{_SETTING} starts or ends with a non-ASCII space; the value is not repeated here, "
+            "since its path can carry the webhook's token"
+        )
     if has_control_char(candidate) or has_lone_surrogate(candidate):
         raise ValueError(
             f"{_SETTING} holds a control character or an unpaired surrogate; the value is not "

@@ -6,6 +6,7 @@
   over-length URL; the load check and the build call one function for those checks. A command
   that loads settings, such as `provision-admin`, now stops on such a URL; before,
   `provision-admin` dropped an http webhook with a WARNING and ran. These refusals do not repeat
-  the URL, whose path can carry the webhook's token. The static-credential report now lists
+  the URL, whose path can carry the webhook's token; the allowlist refusal names the host as the
+  URL spells it. The static-credential report now lists
   `settings:alerts.webhook` as a static credential rather than as none (vault BACKLOG #3533 items
   14 and 24).

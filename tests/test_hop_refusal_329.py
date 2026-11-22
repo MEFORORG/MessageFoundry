@@ -198,6 +198,9 @@ _REFUSED_WEBHOOK_URLS = [
     # reads no scheme: refused at load as at the build.
     pytest.param(f"\xa0https://hooks.example/{_WEBHOOK_TOKEN}", (), id="nbsp"),
     pytest.param(f"\u3000https://hooks.example/{_WEBHOOK_TOKEN}", (), id="ideographic-space"),
+    # At the end, urlsplit keeps it in the host it judges and the dial strips it.
+    pytest.param("https://localhost\u2003", ("localhost",), id="trailing-em-space"),
+    pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\x85", (), id="trailing-nel"),
     # Whitespace both readers strip is stripped, so an http URL inside it is still refused.
     pytest.param(f" http://hooks.example/{_WEBHOOK_TOKEN}\n", (), id="space-http"),
     pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}", ("other.example",), id="off-allowlist"),
