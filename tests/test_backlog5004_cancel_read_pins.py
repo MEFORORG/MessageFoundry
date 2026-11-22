@@ -83,8 +83,11 @@ def test_an_ordinary_exception_in_flight_reads_as_no_cancel(exc: BaseException) 
 
 
 def test_a_handled_exception_no_longer_reads_as_in_flight() -> None:
-    """A call site that handled its exception before the release (the login role probe does) is on
-    the ordinary path: the handled cancel is gone from ``sys.exc_info()`` once its handler ends."""
+    """Once a handler ends, its exception is gone from ``sys.exc_info()``, so a release after it
+    reads no cancel. The login role probe relies on this for an ``Exception`` it handles before its
+    ordinary release; on a cancel it releases inside its ``except BaseException`` instead, where the
+    cancel is still in flight, and re-raises. The cancel handled here only stands in for the state
+    after a handler ends; the census below flags a cancel handled before a release."""
     try:
         raise asyncio.CancelledError
     except asyncio.CancelledError:
