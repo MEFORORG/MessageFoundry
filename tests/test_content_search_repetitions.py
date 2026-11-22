@@ -253,6 +253,43 @@ def test_empty_repetitions_are_not_split_into_a_retained_tree() -> None:
     assert _values(raw, "OBX-5.1") == ["x"]
 
 
+@pytest.mark.parametrize("later", ["~", "^", "&", "~~", "^~&", "&^~^"])
+def test_a_later_delimiter_only_occurrence_is_not_present(later: str) -> None:
+    raw = _body("OBX|1|ST|A||", f"OBX|2|ST|B||{later}")
+    assert _matches(raw, "OBX-5") is False
+    assert _matches(raw, "OBX-5", later) is False
+
+
+@pytest.mark.parametrize("later", ["x", "~x", "^x", "x&", "\\T\\", "~\\"])
+def test_a_later_occurrence_with_content_is_present(later: str) -> None:
+    assert _matches(_body("OBX|1|ST|A||", f"OBX|2|ST|B||{later}"), "OBX-5") is True
+
+
+@pytest.mark.parametrize("first", ["~", "^", "&", "~~", "^~&"])
+def test_a_delimiter_only_first_occurrence_reads_as_peek_field_does(first: str) -> None:
+    """``origin/main`` calls this value present, and the first occurrence's result does not move."""
+    raw = _body(f"OBX|1|ST|A||{first}", "OBX|2|ST|B||")
+    assert Peek.parse(raw).field("OBX-5") == first
+    assert _matches(raw, "OBX-5") is True
+    assert _matches(raw, "OBX-5", first) is True
+
+
+def test_a_later_header_keeps_its_delimiter_fields() -> None:
+    assert _values(_body("MSH|^~|S2"), "MSH-2") == ["^~\\&", "^~"]
+
+
+def test_a_stray_escape_still_stops_the_repetition_walk() -> None:
+    """Pins the open under-report the docstring states, so a change to it is a decision."""
+    raw = _body("PID|1||AAA~BBB~C:\\DIR")
+    assert _values(raw, "PID-3.1") == ["AAA"]
+    assert _matches(raw, "PID-3.1", "BBB") is False
+
+
+def test_a_header_like_line_still_stops_the_walk() -> None:
+    """Pins the other open under-report the docstring states."""
+    assert _values(_body("PID|1||Y", "BHSZ|note", "PID|1||Z"), "PID-3") == ["Y"]
+
+
 def test_the_walk_leaves_no_component_cache_on_the_parsed_message() -> None:
     raw = _body("OBX|1|ST|A||x~y", "OBX|2|ST|B||p~q")
     message = Peek.parse(raw).message

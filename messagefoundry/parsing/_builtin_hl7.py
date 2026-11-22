@@ -595,11 +595,19 @@ def field_values(
     repetition the path runs past, or that ``extract_field`` raises on, yields nothing, as
     ``Peek.field`` reads such a value as absent, and the walk goes on.
 
-    Some shapes are not widened, because the parse would misread them, and read as ``Peek.field``
-    does. A repetition character shared with another separator, or a split that leaves an escape
-    sequence open, does not mark a repetition, so only the first is read. The parse splits every line
-    on the first header's separators, so the walk stops at a later header declaring others; when the
-    first occurrence lies past such a header, only its first value is read.
+    A later occurrence's whole-field text made only of the message's component, repetition and
+    sub-component separators holds no value and yields nothing. The first occurrence yields what
+    ``Peek.field`` reads, even when that text is only separators.
+
+    Some shapes are not widened, because the parse could misread them, and read as ``Peek.field``
+    does. A repetition character shared with another separator does not mark a repetition, so only
+    the first is read. A split leaving an odd count of escape characters in any piece may have cut
+    an escape sequence, so only the first is read there too. That also catches a stray escape:
+    ``AAA~BBB~C:\\DIR`` holds three real repetitions and the walk reads only ``AAA``. The parse
+    splits every line on the first header's separators, so the walk stops at a later header declaring
+    others; when the first occurrence lies past such a header, only its first value is read. A
+    malformed header-like line such as ``BHSZ|note`` counts as such a header. So a search can still
+    under-report past a stray escape or a header-like line.
 
     ``extract_field`` finds an occurrence by scanning from the top, so calling it with each
     ``occurrence`` would be quadratic in segments. It is called here on a one-segment view instead,
@@ -618,6 +626,7 @@ def field_values(
             crossed = True
         if seg["id"] != seg_id or _is_fieldless(msg, index):
             continue
+        later = seen
         seen = True
         _ensure_split(msg, index)
         fields = seg["fields"]
@@ -626,6 +635,13 @@ def field_values(
                 return
             continue
         text = _field_text(fields[fld])
+        if (
+            later
+            and comp is None
+            and not is_delimiter_field(seg_id, fld)
+            and not text.strip(comp_sep + rep_sep + sub_sep)
+        ):
+            continue
         parts = [text]
         if comp is not None and not (shared_rep or crossed or is_delimiter_field(seg_id, fld)):
             split = text.split(rep_sep)

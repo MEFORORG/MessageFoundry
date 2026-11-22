@@ -87,8 +87,9 @@ decrypt**, over a **bounded** candidate set:
    *Amended (BACKLOG #5883):* `Peek.parse` still gates the body, but the field-path match now reads
    `_builtin_hl7.field_values`, which applies `Peek.field`'s semantics to **every occurrence of the
    segment and every repetition of the field**, so a value past the first is not under-reported.
-   Shapes the parse would misread (colliding separators, a later header declaring others) are not
-   widened; that function's docstring names them.
+   Shapes the parse could misread (colliding separators, a split leaving an escape open, a later
+   header declaring others) are not widened; that function's docstring gives the rule. A stray
+   escape or a malformed header-like line also stops the walk, so a search can still under-report.
    Because decrypt is CPU work (AES-GCM) and `Peek` parses HL7, the scan runs **off the asyncio event
    loop** via `asyncio.to_thread` (the `db_lookup` / `WebhookTransport` off-loop pattern), so a long
    search never stalls the listener/router/transform tasks ([CLAUDE.md](../../CLAUDE.md) §6).
