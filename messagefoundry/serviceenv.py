@@ -1274,15 +1274,16 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             "entries it runs on into with it, or the value stays in the registry key"
         )
     if (
-        (moving_others or moving_values)
+        (others or values)
         and _DIRECTORY_VARIABLE not in posture.listed
         and not posture.directory_path_joined
     ):
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
         # the value it is joined to unless the step below keeps it, so only a kept one makes
-        # "add it back" false (the Lander's ruling on handback 7085947392, F1). A refusal
-        # that moves nothing needs no directory.
+        # "add it back" false (the Lander's ruling on handback 7085947392, F1). Every
+        # refused name counts, moved or not, since a name whose only value is a joined path
+        # entry the fail-closed rule does not keep still takes that entry with it (U1).
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.

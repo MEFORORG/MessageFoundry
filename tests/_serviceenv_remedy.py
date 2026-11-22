@@ -28,9 +28,9 @@ KEEP = (
     "entry"
 )
 
-#: Printed, as origin/main prints it, where a setting moves to the secrets directory, the lists
-#: name none, and no joined path entry is kept (the Lander's hold on PR 3142, comment
-#: 7085002242; the Lander's ruling on handback 7085947392, F1).
+#: Printed, as origin/main prints it, where a refusal names more than key-class names, the
+#: lists name no secrets directory, and no joined path entry is kept (the Lander's hold on PR
+#: 3142, comment 7085002242; the Lander's ruling on handback 7085947392, F1).
 ADD_BACK = (
     "The service's lists set no MEFOR_SECRETS_DIRECTORY. Where install-service.ps1 already "
     "made the secrets directory, add MEFOR_SECRETS_DIRECTORY naming that existing path back to "

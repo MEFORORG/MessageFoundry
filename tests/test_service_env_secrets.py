@@ -663,8 +663,8 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
 ) -> None:
     """origin/main's step for a secrets directory that exists but the lists no longer name,
     restored by the Lander's hold on PR 3142 (comment 7085002242): printed once, after the Put
-    step and the removal, where a setting moves, the lists set no MEFOR_SECRETS_DIRECTORY and
-    the remedy keeps no joined path entry. A store key alone goes to a key file and gets none."""
+    step and the removal, where the lists set no MEFOR_SECRETS_DIRECTORY and the remedy keeps
+    no joined path entry. A store key alone goes to a key file and gets none."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     assert refusal.count(ADD_BACK) == (1 if adds_back else 0)

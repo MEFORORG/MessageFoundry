@@ -68,10 +68,12 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     # directory entry, so a MEFOR_VALUE_* name joined to it is moved.
     moved = refused.startswith("MEFOR_VALUE_") and " " in directory
     assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
-    # A moved name needs a directory the lists do not set once the joined string goes, so the
-    # remedy says to add one back (the Lander's ruling on handback 7085947392, F1).
-    assert refusal.count(ADD_BACK) == (1 if moved else 0)
-    if moved:
+    # The lists set no directory once the joined string goes, so the remedy says to add one
+    # back (the Lander's ruling on handback 7085947392, F1). A store key alone gets no
+    # secrets-directory step at all.
+    adds_back = refused.startswith("MEFOR_VALUE_")
+    assert refusal.count(ADD_BACK) == (1 if adds_back else 0)
+    if adds_back:
         assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
         refused.startswith("MEFOR_VALUE_") and " " not in directory
@@ -87,7 +89,7 @@ def test_the_bare_prefix_joined_to_the_directory_is_deleted() -> None:
     assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
     # Its only value is the directory entry, so nothing goes to the directory (comment
     # 7085002242).
-    assert CREATE not in refusal and "Put " not in refusal and ADD_BACK not in refusal
+    assert CREATE not in refusal and "Put " not in refusal
 
 
 @pytest.mark.parametrize(
@@ -256,6 +258,27 @@ def test_a_value_name_alone_joined_to_a_directory_path_keeps_the_path_entry() ->
         )
     ]
     assert order == sorted(order)
+
+
+def test_a_path_the_fail_closed_rule_does_not_keep_is_added_back() -> None:
+    """U1: the store password's only value is a joined path entry, which moves nothing, but the
+    store key beside it runs on into other text, so the fail-closed rule keeps no entry. The
+    run-on sentence then removes the path, and the remedy says to add the directory back."""
+    refusal = service_env_refusal(
+        _read(
+            [
+                "MEFOR_STORE_PASSWORD=",
+                "mefor_secrets_directory=C:\\d",
+                "MEFOR_STORE_ENCRYPTION_KEY=",
+                "synthetic-run-on",
+            ]
+        )
+    )
+    assert refusal is not None
+    assert KEEP not in refusal and "Put " not in refusal
+    assert refusal.count(ADD_BACK) == 1
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
+    assert "synthetic-run-on" not in refusal
 
 
 def test_an_empty_value_beside_a_listed_directory_path_is_still_moved() -> None:
