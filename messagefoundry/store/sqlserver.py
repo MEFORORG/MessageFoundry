@@ -1399,26 +1399,34 @@ def _finalize_from_message_status(mrows: Sequence[Any]) -> tuple[str, str | None
 
 
 def _parent_meta_from_row(
-    pmeta_json: str | None, *, message_id: str, channel_id: str, encrypts: bool
+    pmeta_json: str | None,
+    *,
+    message_id: str,
+    channel_id: str,
+    encrypts: bool,
+    correlation_depth_cap: int,
 ) -> dict[str, Any]:
     """Decode a PT parent's ``metadata`` (already decrypted) into a dict for depth computation —
-    absent -> ``{}`` (depth 0). A cell the depth read cannot use raises
-    :class:`UnreadableParentMetadataError`, so the handoff dead-letters it (BACKLOG #5758). Shared
-    by the async + sync transform twins so the lineage parse can never drift."""
+    absent / valid non-object -> ``{}`` (depth 0). A cell that would make the child's own depth,
+    format or encode step raise is refused with :class:`UnreadableParentMetadataError`, so the
+    handoff dead-letters it (BACKLOG #5758). Shared by the async + sync transform twins so the
+    lineage parse can never drift."""
     if not pmeta_json:
         return {}
-    loaded: Any = None
+    parent_meta: dict[str, Any] = {}
+    unreadable = False
     try:
         loaded = json.loads(pmeta_json)
         if isinstance(loaded, dict):
-            # str(): the child formats depth + 1, past int's digit limit a ValueError.
-            str(int(loaded.get("correlation_depth", 0) or 0) + 1)
-            # The child re-encodes this root, and a nested one can overflow that.
-            if not isinstance(loaded.get("correlation_root_id") or "", str):
-                loaded = None
+            child_depth = int(loaded.get("correlation_depth", 0) or 0) + 1
+            str(child_depth)  # the child's cap branch formats it
+            if child_depth <= correlation_depth_cap:  # else no child is encoded
+                root = loaded.get("correlation_root_id") or message_id
+                _passthrough_child_meta(message_id, root, child_depth)
+            parent_meta = loaded
     except (ValueError, TypeError, OverflowError, RecursionError):
-        loaded = None
-    if not isinstance(loaded, dict):
+        unreadable = True
+    if unreadable:
         # A keyless open hands an mfenc: cell back unchanged: the engine's fault, so the runner
         # re-pends the row rather than dead-lettering it.
         if pmeta_json.startswith(_ENC_MARKER_PREFIX) and not encrypts:
@@ -1431,7 +1439,7 @@ def _parent_meta_from_row(
         err = UnreadableParentMetadataError("messages", "metadata", message_id, channel_id)
         log.warning("%s; the handoff was refused", str(err))
         raise err
-    return loaded
+    return parent_meta
 
 
 def _close_sync_cursor(cur: Any) -> None:
@@ -8033,6 +8041,7 @@ class SqlServerStore:
                         message_id=message_id,
                         channel_id=msg_channel,
                         encrypts=self._cipher.encrypts,
+                        correlation_depth_cap=correlation_depth_cap,
                     )
                     inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
@@ -8249,6 +8258,7 @@ class SqlServerStore:
                     message_id=message_id,
                     channel_id=msg_channel,
                     encrypts=self._cipher.encrypts,
+                    correlation_depth_cap=correlation_depth_cap,
                 )
                 inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:

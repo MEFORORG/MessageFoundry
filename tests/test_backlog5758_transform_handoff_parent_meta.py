@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store import postgres as pg
 from messagefoundry.store import sqlserver as ss
@@ -37,8 +38,6 @@ _SENTINEL = "SYNTHSENTINEL"
 
 BAD_CELLS = {
     "malformed-json": '{"correlation_depth": "' + _SENTINEL,
-    "non-dict": f'["{_SENTINEL}"]',
-    "json-null": "null",
     "non-numeric-depth": f'{{"correlation_depth": "{_SENTINEL}"}}',
     "list-depth": '{"correlation_depth": [1]}',
     "infinity-depth": '{"correlation_depth": Infinity}',
@@ -46,10 +45,30 @@ BAD_CELLS = {
     "deep-nesting": "[" * 200_000,
     # A nested root: at this depth the child's json.dumps can overflow, depending on the stack.
     "deep-root": '{"correlation_root_id": ' + "[" * 15_600 + "]" * 15_600 + "}",
-    "non-string-root": '{"correlation_root_id": {"k": 1}}',
     # depth + 1 has 4301 digits, past int's string limit, so the child could not format it.
     "over-digit-limit-depth": '{"correlation_depth": ' + "9" * 4300 + "}",
 }
+# Every one of these delivers on origin/main, so refusing it would be a regression: this row closes
+# a wedge and nothing else.
+DELIVERED_CELLS = {
+    "null": "null",
+    "true": "true",
+    "false": "false",
+    "number": "42",
+    "infinity-scalar": "Infinity",
+    "string": '"text"',
+    "list": "[1, 2]",
+    "empty-list": "[]",
+    "shallow-non-string-root": '{"correlation_root_id": {"k": 1}}',
+    "number-root": '{"correlation_root_id": 7}',
+}
+_DELIVERED = pytest.mark.parametrize(
+    "cell", list(DELIVERED_CELLS.values()), ids=list(DELIVERED_CELLS)
+)
+# Over the cap the child is dropped before its metadata is serialized, so this root never wedges.
+_DEEP_ROOT_OVER_CAP = (
+    '{"correlation_depth": 8, "correlation_root_id": ' + "[" * 15_600 + "]" * 15_600 + "}"
+)
 _KEYLESS_CELL = "mfenc:v1:SYNTHCIPHERTEXT"
 _BAD = pytest.mark.parametrize("cell", list(BAD_CELLS.values()), ids=list(BAD_CELLS))
 _GOOD_CELL = '{"correlation_depth": 3, "correlation_id": "root"}'
@@ -128,6 +147,27 @@ async def test_sqlite_valid_parent_still_produces_its_child(sqlite_store: Messag
     cur = await sqlite_store._db.execute("SELECT metadata FROM messages WHERE id<>?", (mid,))
     rows = list(await cur.fetchall())
     assert len(rows) == 1 and '"correlation_depth": 4' in str(rows[0][0])
+
+
+@_DELIVERED
+async def test_sqlite_a_cell_main_delivers_still_delivers(
+    sqlite_store: MessageStore, cell: str
+) -> None:
+    mid, rtd = await _to_routed(sqlite_store)
+    await _set_cell(sqlite_store, mid, cell)
+    assert await _handoff(sqlite_store, mid, rtd.id) is True
+    assert await _queue_rows(sqlite_store, mid) == [(Stage.OUTBOUND.value, OutboxStatus.DONE.value)]
+    cur = await sqlite_store._db.execute("SELECT id FROM messages WHERE id<>?", (mid,))
+    assert len(list(await cur.fetchall())) == 1
+
+
+async def test_sqlite_deep_root_over_the_cap_is_dropped_as_on_main(
+    sqlite_store: MessageStore,
+) -> None:
+    mid, rtd = await _to_routed(sqlite_store)
+    await _set_cell(sqlite_store, mid, _DEEP_ROOT_OVER_CAP)
+    assert await _handoff(sqlite_store, mid, rtd.id) is True
+    assert await _queue_rows(sqlite_store, mid) == [(Stage.OUTBOUND.value, OutboxStatus.DEAD.value)]
 
 
 async def test_sqlite_key_outage_still_holds_the_lane(
@@ -269,6 +309,13 @@ async def test_postgres_valid_parent_reaches_its_child() -> None:
     assert seen["children"][0]["correlation_depth"] == 3
 
 
+@_DELIVERED
+async def test_postgres_a_cell_main_delivers_still_delivers(cell: str) -> None:
+    store, seen = _pg_store(cell)
+    assert await store.transform_handoff(**_PG_KWARGS) is True
+    assert seen["dead"] == [] and len(seen["children"]) == 1
+
+
 async def test_postgres_key_outage_does_not_dead_letter(monkeypatch: pytest.MonkeyPatch) -> None:
     store, seen = _pg_store(_GOOD_CELL)
 
@@ -364,6 +411,7 @@ def _ss_row(sql: str, cell: str | None) -> Any:
 def _ss_store(cell: str | None) -> tuple[Any, list[str]]:
     store: Any = object.__new__(SqlServerStore)
     dead: list[str] = []
+    store._settings = StoreSettings(command_timeout=30)
     store._cipher = IdentityCipher()
     store._state_cache = {}
     store._message_events = "all"
@@ -407,8 +455,23 @@ def test_sqlserver_sync_raises_the_contained_family_and_rolls_back(cell: str) ->
     assert conn.rollbacks == 1 and conn.commits == 0
 
 
+@_DELIVERED
+async def test_sqlserver_a_cell_main_delivers_still_delivers(cell: str) -> None:
+    store, dead = _ss_store(cell)
+    assert await store.transform_handoff(**_PG_KWARGS) is True
+    assert dead == []
+    conn = _SsSyncConn(_SsSyncCursor(cell))
+    assert store.transform_handoff_sync(conn, **_PG_KWARGS)[0] is True
+    assert conn.rollbacks == 0
+
+
 def test_sqlserver_valid_parent_decodes_unchanged() -> None:
-    where: dict[str, Any] = {"message_id": "m", "channel_id": "IB", "encrypts": False}
+    where: dict[str, Any] = {
+        "message_id": "m",
+        "channel_id": "IB",
+        "encrypts": False,
+        "correlation_depth_cap": 8,
+    }
     assert ss._parent_meta_from_row(_GOOD_CELL, **where) == {
         "correlation_depth": 3,
         "correlation_id": "root",

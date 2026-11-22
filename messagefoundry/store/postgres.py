@@ -5124,21 +5124,29 @@ class PostgresStore:
                 if pt_deliveries:
                     parent_meta: dict[str, Any] = {}
                     if pmeta_json:
-                        # BACKLOG #5758: a cell the depth read below cannot use is content, so it
-                        # dead-letters. Raised outside the except: json's error holds the whole cell.
-                        loaded: Any = None
+                        # BACKLOG #5758: refuse only a cell that would make the child's own reads
+                        # raise, by running them; a valid non-object still reads as no lineage.
+                        # Raised outside the except: json's error holds the whole cell.
+                        unreadable = False
                         try:
                             loaded = json.loads(pmeta_json)
                             if isinstance(loaded, dict):
-                                # str(): the child formats depth + 1; past int's digit limit that
-                                # is a ValueError.
-                                str(int(loaded.get("correlation_depth", 0) or 0) + 1)
-                                # The child re-encodes this root; a nested one can overflow that.
-                                if not isinstance(loaded.get("correlation_root_id") or "", str):
-                                    loaded = None
+                                child_depth = int(loaded.get("correlation_depth", 0) or 0) + 1
+                                str(child_depth)  # the child's cap branch formats it
+                                if child_depth <= correlation_depth_cap:  # else no child is encoded
+                                    json.dumps(
+                                        {
+                                            "correlation_id": message_id,
+                                            "correlation_root_id": loaded.get("correlation_root_id")
+                                            or message_id,
+                                            "correlation_depth": child_depth,
+                                            "passthrough_from": message_id,
+                                        }
+                                    )
+                                parent_meta = loaded
                         except (ValueError, TypeError, OverflowError, RecursionError):
-                            loaded = None
-                        if not isinstance(loaded, dict):
+                            unreadable = True
+                        if unreadable:
                             # A keyless open hands an mfenc: cell back unchanged: the engine's
                             # fault, so the runner re-pends the row rather than dead-lettering it.
                             if (
@@ -5156,7 +5164,6 @@ class PostgresStore:
                             )
                             log.warning("%s; the handoff was refused", str(err))
                             raise err
-                        parent_meta = loaded
                     inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_pg(
