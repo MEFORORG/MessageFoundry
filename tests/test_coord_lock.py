@@ -111,11 +111,12 @@ def acquire(
             f"Start-Sleep -Milliseconds 10 }}; "
         )
     if attempted is not None:
-        # Marks the first real create attempt, which the barrier alone cannot place.
+        # Marks a create that was really denied, which the barrier alone cannot place.
         gate += (
             "$realOpen = ${function:Open-CoordLockFile}; "
             "function Open-CoordLockFile([string]$Path) { "
-            f"[IO.File]::WriteAllText('{attempted}', ''); & $realOpen $Path }}; "
+            "try { & $realOpen $Path } catch [UnauthorizedAccessException] { "
+            f"[IO.File]::WriteAllText('{attempted}', ''); throw }} }}; "
         )
     enter = leave = ""
     if witness is not None:
@@ -350,8 +351,8 @@ def _delete_pending(lock: Path, release: Path) -> Iterator[None]:
 def test_a_delete_pending_lock_is_waited_out(repo: Path, tmp_path: Path) -> None:
     """The name clears when the last handle closes, so this is a wait and not a failure.
 
-    The name is released only after the claimant has really attempted the create, so the attempt
-    is inside the pending window however long its start-up took.
+    The name is released only after the claimant's create has really been denied, so this cannot
+    pass without running the delete-pending branch.
     """
     barrier = tmp_path / "barrier"
     barrier.mkdir()
@@ -367,7 +368,7 @@ def test_a_delete_pending_lock_is_waited_out(repo: Path, tmp_path: Path) -> None
             time.sleep(0.02)
         (barrier / "go").write_text("", encoding="utf-8")
         while not attempted.exists():
-            assert time.monotonic() < deadline, "the claimant never attempted the create"
+            assert time.monotonic() < deadline, "the claimant was never denied"
             time.sleep(0.02)
         release.write_text("", encoding="utf-8")
         proc = claim.result()
@@ -389,14 +390,21 @@ def test_a_delete_pending_lock_that_outlasts_the_wait_names_no_false_holder(
 def test_a_genuine_denial_fails_at_once_and_names_no_holder(repo: Path) -> None:
     """A directory at the lock path raises the same exception as delete-pending and never clears."""
     _lock_file(repo).mkdir()
-    started = time.monotonic()
-    proc = acquire(repo, timeout=45)
-    elapsed = time.monotonic() - started
+    counter = repo / "open-attempts.txt"
+    script = (
+        f". '{LOCK}'\n"
+        "$realOpen = ${function:Open-CoordLockFile}\n"
+        "function Open-CoordLockFile([string]$Path) { "
+        f"[IO.File]::AppendAllText('{counter}', 'x'); & $realOpen $Path }}\n"
+        f"$l = Enter-CoordLock -Name 't' -TimeoutSeconds 45 -Repo '{repo}'; Write-Output 'ACQUIRED'"
+    )
+    proc = _pwsh(script)
     assert "ACQUIRED" not in proc.stdout
     assert "access" in proc.stderr.lower(), proc.stderr
     assert "held by" not in proc.stderr, proc.stderr
     assert "Timed out" not in proc.stderr, proc.stderr
-    assert elapsed < 30, f"spun for {elapsed:.1f}s on a denial that cannot clear"
+    assert counter.read_text(encoding="utf-8") == "x", "retried a denial that cannot clear"
+    assert "directory" in proc.stderr.lower(), proc.stderr
 
 
 def test_lock_is_shared_between_the_primary_and_its_worktrees(repo: Path, tmp_path: Path) -> None:

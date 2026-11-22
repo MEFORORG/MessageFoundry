@@ -394,38 +394,35 @@ function Add-HistoryLine([string]$Line) {
 # the worktrees of the repository it was asked about, and -AsWorktree can record a holder in another
 # one, so a single probe of $repo would answer "nobody there" for a holder it never looked at. The
 # cache is keyed by git common dir so one repository's failed probe cannot stand in for another's.
-$script:OccupancyProbedRepos = @{}   # common dirs already probed, whether or not the probe answered
-# Normalised worktree path -> the probe's object, or $false when that probe was unavailable. Only a
-# worktree the answer actually lists gets an entry, so zero occupants is never read for a path the
-# probe did not cover. It also spares a git spawn per holder: -List can walk hundreds of claims.
-$script:OccupancyByWorktree = @{}
+# Common dir -> $false when the probe was unavailable, else the answer plus the worktrees it lists.
+# The common dir comes from the holder's own .git pointer, which costs no git process: -List can walk
+# hundreds of claims. A path alone is not a safe key, because a stale listing in one repository can
+# name a path that is now a worktree of another.
+$script:OccupancyProbes = @{}
 
 function Get-OccupancyForHolder([string]$HeldPath) {
     try {
         if (-not (Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)) { return $false }
-        $heldNorm = ConvertTo-Norm $HeldPath
-        if ($script:OccupancyByWorktree.ContainsKey($heldNorm)) { return $script:OccupancyByWorktree[$heldNorm] }
-        $key = Get-RepoCommonDir $HeldPath
-        if (-not $key -or $script:OccupancyProbedRepos.ContainsKey($key)) {
-            $script:OccupancyByWorktree[$heldNorm] = $false
-            return $false
+        $key = Get-OwningGitCommonDir $HeldPath
+        if (-not $key) { return $false }
+        if (-not $script:OccupancyProbes.ContainsKey($key)) {
+            # Recorded first, so a probe that throws is not re-run for every holder here.
+            $script:OccupancyProbes[$key] = $false
+            $occ = Get-WorktreeOccupancy -Repo $HeldPath
+            # `Available` false means the fence could not be built -- an unplaceable record, no repo.
+            # Treat that exactly like a failed probe.
+            if ($occ -and $occ.Available) {
+                $listed = @{}
+                foreach ($w in @($occ.Worktrees)) { $listed[(ConvertTo-Norm $w.Path)] = $true }
+                $script:OccupancyProbes[$key] = [pscustomobject]@{ Answer = $occ; Listed = $listed }
+            }
         }
-        # Recorded first, so a probe that throws is not re-run for every holder in this repository.
-        $script:OccupancyProbedRepos[$key] = $true
-        $occ = Get-WorktreeOccupancy -Repo $HeldPath
-        # `Available` false means the fence could not be built -- an unplaceable record, no repo.
-        # Treat that exactly like a failed probe.
-        $answer = if ($occ -and $occ.Available) { $occ } else { $false }
-        foreach ($w in @($occ.Worktrees)) {
-            if ($w) { $script:OccupancyByWorktree[(ConvertTo-Norm $w.Path)] = $answer }
-        }
-        if (-not $script:OccupancyByWorktree.ContainsKey($heldNorm)) { $script:OccupancyByWorktree[$heldNorm] = $false }
-        return $script:OccupancyByWorktree[$heldNorm]
-    }
-    catch {
-        if ($heldNorm) { $script:OccupancyByWorktree[$heldNorm] = $false }
+        $probe = $script:OccupancyProbes[$key]
+        # Zero occupants means something only for a worktree the answer actually lists.
+        if ($probe -and $probe.Listed.ContainsKey((ConvertTo-Norm $HeldPath))) { return $probe.Answer }
         return $false
     }
+    catch { return $false }
 }
 
 function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
@@ -449,7 +446,7 @@ function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
                 }
                 return [pscustomobject]@{ State = 'occupied'; QuietHours = $quiet; Occupants = $who.Count }
             }
-            # PROBE UNAVAILABLE -> `present`, which keeps its PRE-#1348 meaning exactly: the path is
+            # PROBE UNAVAILABLE, OR ITS ANSWER DOES NOT LIST THIS PATH -> `present`, which keeps its PRE-#1348 meaning exactly: the path is
             # there and that is all this function knows. It still refuses.
             #
             # THIS SPLIT IS A BUG FIX, NOT A TIDY-UP. The first version of #1348 returned `present`
@@ -835,7 +832,7 @@ function Show-List {
                     $age = "  [held ${hrs}h; LIVE SESSION in the holder, last committed $($live.QuietHours)h ago]"
                     if ($live.QuietHours -ge 12) { $age += " -- QUIET but OCCUPIED, ask before releasing" }
                 }
-                # The probe could not run -- no Claude config root, or it failed. Says what it knows
+                # The probe gave no answer for this path -- no Claude config root, it failed, or it does not list the path. Says what it knows
                 # and no more: the path is there. It must NOT claim a session it never looked for.
                 'present' {
                     $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe gave no answer for this path]"

@@ -53,8 +53,8 @@ function Enter-CoordLock {
         # every worktree AND the primary checkout resolve to the same lock.
         [string]$Repo
     )
-    # A caller's SilentlyContinue would otherwise suppress the throws below and run on into the block
-    # that owns and deletes the lock file.
+    # Load-bearing. Under a caller's SilentlyContinue, or with no enclosing try, a failed .NET call
+    # would not stop this function: it would run on into the block that owns and deletes the lock file.
     $ErrorActionPreference = 'Stop'
     $gitArgs = @()
     if ($Repo) { $gitArgs = @("-C", $Repo) }
@@ -77,26 +77,30 @@ function Enter-CoordLock {
             # NTFS raises this, not IOException, for a name in delete-pending (measured on Windows
             # 10.0.26300, NTFS, with the legacy disposition; a plain File.Delete there frees the name at
             # once). A real denial raises it too. Pending shows as a file that is still there, and it
-            # clears when the last handle closes, so it earns a short bounded wait. A directory at the
-            # path can never clear and fails at once. Either way this reports the denial: the text in
-            # a file being deleted names no holder.
+            # clears when the last handle closes, so it earns a bounded wait. The bound is short because
+            # a real denial on an existing file looks the same. No file gets 1 s, for a delete that
+            # finished between the two reads. A directory can never clear and fails at once. Each
+            # path reports the denial: the text in a file being deleted names no holder.
             $now = $clock.Elapsed.TotalSeconds
             if ($null -eq $deniedAt) { $deniedAt = $now }
-            $canClear = -not (Test-Path -LiteralPath $lock -PathType Container)
-            if ($canClear -and $now -le $TimeoutSeconds -and ($now - $deniedAt) -lt 5) {
+            $isDirectory = Test-Path -LiteralPath $lock -PathType Container
+            $window = if ($isDirectory) { 0 } elseif (Test-Path -LiteralPath $lock -PathType Leaf) { 5 } else { 1 }
+            if ($now -le $TimeoutSeconds -and ($now - $deniedAt) -lt $window) {
                 Start-Sleep -Milliseconds 50
                 continue
             }
+            $advice = if ($isDirectory) { "A directory is at the lock path. Remove it." }
+            else { "The file may still be pending deletion, so retry. If this repeats, check its permissions." }
             throw (
                 "Enter-CoordLock: access denied creating the '$safe' lock at '$lock'.`n" +
-                "  The file may still be pending deletion, so retry; if this repeats, check that path`n" +
-                "  and its permissions.`n" +
+                "  $advice`n" +
                 "  $($_.Exception.Message)")
         } catch [System.IO.IOException] {
             # Only a name that is taken is contention. Disk full, a missing directory or an over-long
             # path would otherwise spin to the timeout and be reported as a wedged holder.
             $io = if ($_.Exception.InnerException) { $_.Exception.InnerException } else { $_.Exception }
-            if (($io.HResult -band 0xFFFF) -notin 0x50, 0x20) { throw }  # FILE_EXISTS, SHARING_VIOLATION
+            # Windows codes only (FILE_EXISTS, SHARING_VIOLATION). Elsewhere HResult carries an errno.
+            if ($env:OS -eq 'Windows_NT' -and ($io.HResult -band 0xFFFF) -notin 0x50, 0x20) { throw }
             $deniedAt = $null
             if ($clock.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
                 $held = "(unreadable)"
@@ -112,9 +116,8 @@ function Enter-CoordLock {
             Start-Sleep -Milliseconds 200
             continue
         } catch {
-            # Any other create failure. Without this clause a .NET method failure is only
-            # statement-terminating, so execution would fall through to the block below, which owns
-            # and deletes the lock file: it would delete a file this call never created.
+            # Not redundant with Stop above. Measured: with this clause removed, a failed create fell
+            # through to the block below, which owns and deletes the lock file.
             throw
         }
 
@@ -131,9 +134,8 @@ function Enter-CoordLock {
             $fs.Dispose()
             $recorded = $true
         } catch {
-            # Not decoration. A .NET method failure is statement-terminating, so under a bare
-            # try/finally execution continues past the finally and this would return a lock it had
-            # just deleted. Measured: the caller printed ACQUIRED.
+            # Not redundant with Stop above. Measured: with this clause removed, a failed write ran
+            # the cleanup and then returned the deleted lock, and the caller printed ACQUIRED.
             throw
         } finally {
             if (-not $recorded) {
