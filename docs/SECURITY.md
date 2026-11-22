@@ -8494,7 +8494,8 @@ HTTP 408 or 504 on both asks of a row's verify, in the walk only.
 **Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under
 that version then reads as a break, `audit-verify` exits 1, and the attestation counts as none. The
-audit key is the data key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` names another. So raising the data
+audit key is the data key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` is set to the name of a different
+Transit key; set empty, or to the data key's own name, it is still the data key. So raising the data
 key's `min_decryption_version` breaks the chain too; ADR 0193's 2026-11-11 amendment says which
 floor applies and what that rests on. Rotating is safe; retiring is not. The break text names both
 causes, a planted version and a retired one.

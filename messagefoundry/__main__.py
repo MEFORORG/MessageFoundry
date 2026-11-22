@@ -12556,8 +12556,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "min_decryption_version above a version stops the values sealed under it from "
             "decrypting. Raising the audit key's min_decryption_version above a version breaks "
             "the audit chain at every row MACed under it; the audit key is the data key unless "
-            "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
-            "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
+            "MEFOR_STORE_TRANSIT_AUDIT_KEY is set to the name of a different Transit key, and set "
+            "empty or to the data key's own name it is still the data key. Trimming a version off "
+            "either key does the same to what it sealed or MACed, and the engine cannot undo it; "
+            "a restore from a Transit key backup or a Vault snapshot taken before the trim may "
+            "bring the version back. docs/SECURITY.md, under "
             f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
             "does to the attestation. Nothing was changed.",
             file=sys.stderr,
