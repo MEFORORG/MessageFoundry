@@ -10193,11 +10193,22 @@ class AuthService:
             # row, so renaming first would put two different names on one account's records for one
             # pass -- reachable whenever an account is renamed and role-demoted in the same pass.
             # Both reads see the pre-rename name this way, and the rename still lands on this pass.
+            try:
+                held = await self._load_user_by_username(refresh.new_username)
+            except (TransitSealUnverifiableError, TransitSealUnavailableError) as exc:
+                await self._rename_read_seal_answer(
+                    exc,
+                    user_id=refresh.user_id,
+                    new_username=refresh.new_username,
+                    read_name="read of the new name's holder",
+                    holder_of=refresh.new_username,
+                )
+                continue
             await self._refresh_cached_username(
                 user_id=refresh.user_id,
                 old_username=refresh.old_username,
                 new_username=refresh.new_username,
-                held=await self._load_user_by_username(refresh.new_username),
+                held=held,
                 from_plan=True,
                 # BACKLOG #3018: a refused audit write here must not skip the renames after it.
                 audit_soft=True,
@@ -10599,6 +10610,59 @@ class AuthService:
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"
 
+    async def _rename_read_seal_answer(
+        self,
+        exc: TransitSealUnverifiableError | TransitSealUnavailableError,
+        *,
+        user_id: str,
+        new_username: str,
+        read_name: str,
+        holder_of: str | None,
+    ) -> None:
+        """Answer a Vault transit answer met at one of a reconciler rename's checked reads: the
+        record it read could not be verified (Unverifiable), or Transit did not answer (Outage)
+        (vault BACKLOG #3069 item 1). The caller then skips that one rename, as the write's seal
+        arm in :meth:`_refresh_cached_username` does (note T2): a raise would end the pass and every
+        rename after it. Nothing was written. A Forged record is not raised by these reads; it comes
+        back refused, for the caller to handle as it already does.
+
+        Logged at ERROR, then reported as that arm reports it: an Outage on the seal pager, an
+        Unverifiable record under its own account id. ``holder_of`` is ``None`` when the read was
+        of ``user_id``'s own record; otherwise it is the name whose holder was read, and that
+        holder's id is read again, unchecked (:meth:`_username_holder_id`), only to name it in the
+        report. When that read finds no row, or fails, the ERROR line is the only report."""
+        outage = isinstance(exc, TransitSealUnavailableError)
+        _log.error(
+            "directory reconcile: account %s (renaming to %s): Vault transit %s the integrity seal "
+            "of the record the rename's %s read, so the rename was not applied; the pass goes on, "
+            "and the seal answer is reported through its seal path (vault BACKLOG #3069)",
+            user_id,
+            scrub_log_argument(new_username),
+            "did not answer for" if outage else "could not verify",
+            read_name,
+        )
+        if isinstance(exc, TransitSealUnavailableError):
+            self._user_seal_outage("rename")
+            return
+        subject = user_id if holder_of is None else await self._username_holder_id(holder_of)
+        if subject is not None:
+            await self._user_seal_unverifiable(subject, exc)
+
+    async def _username_holder_id(self, username: str) -> str | None:
+        """The id of the row holding ``username``, sealed or not, or ``None`` when no row holds it
+        or the read is refused (logged). An id question like :meth:`_username_held`: only the id
+        leaves it, to name an Unverifiable holder in :meth:`_rename_read_seal_answer`'s report."""
+        try:
+            raw = await read_user_or_unreadable(self._store.get_user_by_username(username))
+        except _session_write_errors() as exc:
+            _log.warning(
+                "directory reconcile: re-reading the holder of a new directory name to report its "
+                "record raised %s, so the report names no account (vault BACKLOG #3069)",
+                type(exc).__name__,
+            )
+            return None
+        return None if raw is None else raw.id
+
     async def _refresh_cached_username(
         self,
         *,
@@ -10624,7 +10688,9 @@ class AuthService:
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
         has. It also lets a store fault on the ``held`` re-read skip the rename rather than raise
         (BACKLOG #3070; the reason is at that read), and a seal refusal at the write be logged and
-        reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm).
+        reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm), as is
+        a Vault transit answer at its own pre-read and the holder re-read
+        (:meth:`_rename_read_seal_answer`, item 1).
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -10804,7 +10870,19 @@ class AuthService:
             )
             return True
 
-        found = await self._lookup_user(user_id)
+        try:
+            found = await self._lookup_user(user_id)
+        except (TransitSealUnverifiableError, TransitSealUnavailableError) as exc:
+            if not audit_soft:
+                raise
+            await self._rename_read_seal_answer(
+                exc,
+                user_id=user_id,
+                new_username=new_username,
+                read_name="pre-read of its own record",
+                holder_of=None,
+            )
+            return
         before = found.user
         if before is None:
             if await _own_row_refused(found):
@@ -10894,6 +10972,17 @@ class AuthService:
             # built at construction when the reconciler runs, so no driver is imported here.
             try:
                 current = await self._lookup_by_username(new_username)
+            except (TransitSealUnverifiableError, TransitSealUnavailableError) as exc:
+                if not audit_soft:
+                    raise
+                await self._rename_read_seal_answer(
+                    exc,
+                    user_id=user_id,
+                    new_username=new_username,
+                    read_name="re-read of the new name's holder",
+                    holder_of=new_username,
+                )
+                return
             except _session_write_errors() as exc:
                 if not audit_soft:
                     raise

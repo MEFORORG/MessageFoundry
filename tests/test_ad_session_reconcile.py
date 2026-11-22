@@ -76,6 +76,7 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     RowSealUnverifiableError,
     TransitSealUnavailableError,
+    TransitSealUnverifiableError,
 )
 from messagefoundry.store.store import (
     _REVOKE_CARRY,
@@ -6846,6 +6847,168 @@ async def test_a_rename_whose_seal_is_refused_at_the_write_does_not_end_the_pass
                 from_plan=False,
                 audit_soft=False,
             )
+    finally:
+        await store.close()
+
+
+# --- vault BACKLOG #3069 item 1: a Vault transit answer at the rename's reads ---------------------
+
+#: The two answers a checked read raises (a Forged record reads as ``refused`` instead), the phrase
+#: the ERROR line names it by, and whether it writes the Unverifiable audit row (an Outage writes
+#: none and pages the seal pager).
+_READ_ANSWERS = [
+    pytest.param(
+        lambda: TransitSealUnverifiableError("user", 1, 2), "could not verify", True, id="unverif"
+    ),
+    pytest.param(TransitSealUnavailableError, "did not answer", False, id="outage"),
+]
+
+
+def _seal_answer_at_next_check(service: AuthService, answer: Callable[[], Exception]) -> list[bool]:
+    """Make the next ``_verified`` call on a record raise ``answer()`` once the returned list is
+    armed (``armed.append(True)``); it disarms itself as it raises."""
+    real = service._verified
+    armed: list[bool] = []
+
+    async def verified(user: UserRecord | None) -> Any:
+        if armed and user is not None:
+            armed.clear()
+            raise answer()
+        return await real(user)
+
+    service._verified = verified  # type: ignore[method-assign]
+    return armed
+
+
+@pytest.mark.parametrize("read", ["pre-read", "holder"])
+@pytest.mark.parametrize(("answer", "phrase", "audited"), _READ_ANSWERS)
+async def test_a_transit_answer_at_a_rename_read_does_not_end_the_pass(
+    caplog: pytest.LogCaptureFixture,
+    read: str,
+    answer: Callable[[], Exception],
+    phrase: str,
+    audited: bool,
+) -> None:
+    """Vault BACKLOG #3069 item 1. Vault transit could not verify, or did not answer for, the
+    record one of ``jdoe``'s rename reads checked: its own pre-read, or the loop's read of the row
+    holding its new name. The reconciler logs it at ERROR, reports it as the write's seal arm does
+    (note T2), skips that rename and goes on, so ``asmith``'s rename still applies. RED when: the
+    answer escapes the pass. Called the way the login path calls it, the pre-read's answer is
+    raised."""
+    store, service, notifier = await _two_renamed_accounts()
+    try:
+        pages: list[str] = []
+        store.seal_pager().arm(lambda subject, reason: pages.append(subject))
+        jdoe = await store.get_user_by_username("jdoe")
+        asmith = await store.get_user_by_username("asmith")
+        assert jdoe is not None and asmith is not None
+        armed = _seal_answer_at_next_check(service, answer)
+        reached: list[str] = []
+        real_by_id = store.get_user
+        real_by_name = store.get_user_by_username
+        real_refresh = service._refresh_cached_username
+        renaming: list[str] = []
+
+        async def by_id(user_id: str) -> UserRecord | None:
+            if read == "pre-read" and renaming == [jdoe.id] and user_id == jdoe.id and not reached:
+                reached.append(read)
+                armed.append(True)
+            return await real_by_id(user_id)
+
+        async def by_name(username: str) -> UserRecord | None:
+            if read == "holder" and username == "jdoe-new":
+                # A row holds the new name, so the loop's read of it checks a record.
+                if not renaming and not reached:
+                    reached.append(read)
+                    armed.append(True)
+                return await real_by_id(asmith.id)
+            return await real_by_name(username)
+
+        async def refresh(**kwargs: Any) -> None:
+            renaming.append(kwargs["user_id"])
+            try:
+                await real_refresh(**kwargs)
+            finally:
+                renaming.clear()
+
+        store.get_user = by_id  # type: ignore[method-assign]
+        store.get_user_by_username = by_name  # type: ignore[method-assign]
+        service._refresh_cached_username = refresh  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+        assert reached == [read], "the read was not reached"
+        assert plan.aborted is None and len(plan.renames) == 2
+        assert await real_by_name("asmith-new") is not None, "the other rename was skipped"
+        still = await real_by_id(jdoe.id)
+        assert still is not None and still.username == "jdoe"
+        assert _logged_at_error(caplog, f"account {jdoe.id} (renaming to jdoe-new)", phrase)
+        rows = await store.list_audit(action=AUTHORITY_SEAL_UNVERIFIABLE_ACTION)
+        if audited:
+            # Named for the record the read checked: the holder's, or jdoe's own.
+            named = asmith.id if read == "holder" else jdoe.id
+            assert [json.loads(r["detail"])["user_id"] for r in rows] == [named]
+        else:
+            assert rows == [] and pages, "the Outage did not page through the seal pager"
+        told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert told == ["asmith-new"]
+
+        if read == "pre-read":
+            armed.append(True)
+            with pytest.raises(type(answer())):
+                await real_refresh(
+                    user_id=jdoe.id,
+                    old_username="jdoe",
+                    new_username="jdoe-new",
+                    held=None,
+                    from_plan=False,
+                    audit_soft=False,
+                )
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(("answer", "phrase", "audited"), _READ_ANSWERS)
+async def test_a_transit_answer_at_the_holder_re_read_skips_the_rename(
+    caplog: pytest.LogCaptureFixture,
+    answer: Callable[[], Exception],
+    phrase: str,
+    audited: bool,
+) -> None:
+    """Vault BACKLOG #3069 item 1, the third checked read: the holder of the new name re-read
+    after the pre-read, when the caller's read named another row. On the reconciler's path a
+    Transit answer there skips the rename, logged at ERROR, instead of raising."""
+    store, service, _notifier = await _two_renamed_accounts()
+    try:
+        store.seal_pager().arm(lambda subject, reason: None)
+        jdoe = await store.get_user_by_username("jdoe")
+        asmith = await service._load_user_by_username("asmith")
+        assert jdoe is not None and asmith is not None
+        armed = _seal_answer_at_next_check(service, answer)
+        real_by_name = store.get_user_by_username
+
+        async def by_name(username: str) -> UserRecord | None:
+            if username == "jdoe-new":
+                armed.append(True)
+                return await store.get_user(asmith.id)
+            return await real_by_name(username)
+
+        store.get_user_by_username = by_name  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            await service._refresh_cached_username(
+                user_id=jdoe.id,
+                old_username="jdoe",
+                new_username="jdoe-new",
+                held=asmith,
+                from_plan=True,
+                audit_soft=True,
+            )
+        still = await store.get_user(jdoe.id)
+        assert still is not None and still.username == "jdoe"
+        assert _logged_at_error(caplog, "re-read of the new name's holder", phrase)
+        rows = await store.list_audit(action=AUTHORITY_SEAL_UNVERIFIABLE_ACTION)
+        assert [json.loads(r["detail"])["user_id"] for r in rows] == (
+            [asmith.id] if audited else []
+        )
     finally:
         await store.close()
 
