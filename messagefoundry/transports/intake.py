@@ -58,7 +58,7 @@ class IntakeContext:
     """Who handed the engine one body, as the source saw it.
 
     It holds no peer address or port, by the owner's ruling of 2026-11-22 ("No IP in metadata"):
-    the peer's address stays in the connection-event log, under
+    the connection-event log, where capture is on, is where a peer address is kept, under
     ``[retention].connection_event_retention_hours``. A listen source fills how it admitted the
     peer; a poll source has no peer and fills :attr:`source` with where it read the body. A
     ``None`` field is left out of the stored record; what ``None`` means is on each field."""

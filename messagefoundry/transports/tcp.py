@@ -680,8 +680,8 @@ class TcpSource(SourceConnector):
                     receive_timeout=self.receive_timeout,
                 )
                 peer = writer.get_extra_info("peername")  # fixed for the connection
-                # Vault BACKLOG #2607: who sent this connection's messages, read once. Raw TCP has
-                # no TLS (ADR 0153 decision 4), so the address and port are all it can name.
+                # Vault BACKLOG #2607: how this connection was admitted, read once. Raw TCP has
+                # no TLS (ADR 0153 decision 4), so the listener and auth mode are all it records.
                 intake = socket_intake(
                     writer,
                     transport="tcp",

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The intake context: a stored message names the peer that sent it (vault BACKLOG #2607).
+"""The intake context: a stored message records how its sender was admitted (vault BACKLOG #2607).
 
 Before this, ``InboundHandler`` took the body and nothing else, so a stored message carried no
 address, port or certificate subject; only the connection-event log named a peer, with no message
@@ -191,7 +191,7 @@ async def test_an_mllp_mtls_sender_is_named_by_its_certificate_not_its_address(
     (intake,) = await _intakes(store)
     assert intake is not None
     assert intake["transport"] == "mllp"
-    # Owner ruling 2026-11-22, "No IP in metadata": the peer's address stays in connection events.
+    # Owner ruling 2026-11-22, "No IP in metadata": the stored context holds no peer address.
     assert "peer_host" not in intake and "peer_port" not in intake
     assert intake["listener"] == f"127.0.0.1:{port}"
     assert intake["auth_mode"] == IntakeAuth.MTLS_SUBJECTS.value
@@ -303,7 +303,7 @@ async def test_a_message_the_engine_makes_from_another_carries_no_intake_key(
     store: MessageStore,
 ) -> None:
     """INTAKE_KEY's statement, for edit-and-resubmit: the child keeps lineage only, and its
-    ``correlation_root_id`` leads back to the message that names the peer."""
+    ``correlation_root_id`` leads back to the message that carries the context."""
     from tests._store_audit import no_operator_audit
 
     ctx = IntakeContext(transport="mllp", listener="192.0.2.1:2575", auth_mode=IntakeAuth.NONE)
@@ -317,5 +317,5 @@ async def test_a_message_the_engine_makes_from_another_carries_no_intake_key(
     child = json.loads(await store.message_metadata_json(out.new_message_id) or "{}")
     assert INTAKE_KEY not in child
     assert child["correlation_root_id"] == origin
-    # Control: the origin still names its peer.
+    # Control: the origin still carries its context.
     assert intake_of(await store.message_metadata_json(origin)) == ctx.fields()

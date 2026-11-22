@@ -2875,8 +2875,9 @@ class MLLPSource(SourceConnector):
             logger.warning("MLLP intake audit emit failed: %s", safe_exc(exc))
 
     def _intake(self, writer: asyncio.StreamWriter) -> IntakeContext:
-        """The intake context of an admitted connection (vault BACKLOG #2607): its address and
-        port, the accepting socket, and how its sender was admitted. A client certificate is
+        """The intake context of an admitted connection (vault BACKLOG #2607): the engine's
+        accepting socket and how its sender was admitted, with no peer address (owner ruling
+        2026-11-22). A client certificate is
         required only where ``tls_ca_file`` set ``CERT_REQUIRED``, so only then is its subject
         read; with ``tls_client_subjects`` on, reaching here means it was listed."""
         subject: str | None = None
