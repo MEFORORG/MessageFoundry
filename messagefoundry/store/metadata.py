@@ -4,8 +4,9 @@
 
 The ``messages.metadata`` column is a single encrypted JSON object per message. It carries two kinds of
 key: engine-internal keys (ADR 0013 correlation lineage — ``correlation_id`` / ``correlation_root_id`` /
-``correlation_depth`` / ``passthrough_from`` / ``reingress_of_seq``) and, under a reserved ``"user"``
-sub-key, the operator/handler-attached bag written by :class:`~messagefoundry.config.wiring.SetMeta`.
+``correlation_depth`` / ``passthrough_from`` / ``reingress_of_seq``), the intake context under the
+reserved :data:`INTAKE_KEY` (vault BACKLOG #2607), and, under a reserved ``"user"`` sub-key, the
+operator/handler-attached bag written by :class:`~messagefoundry.config.wiring.SetMeta`.
 
 These two functions are the ONLY places that shape that split, shared by every store backend (so the
 merge can never drift across SQLite / Postgres / SQL Server) and by the API (so the internal keys never
@@ -231,6 +232,30 @@ def decode_response_headers(headers_json: StoredJson, *, row_id: object = None) 
     before calling."""
     loaded = _load_object(headers_json, too_deep_raises=False, row_id=row_id)
     return {k: v for k, v in loaded.items() if isinstance(v, str)}
+
+
+#: The reserved engine-internal key holding the intake context a source handed over with the body
+#: (vault BACKLOG #2607): the peer's address and port, the verified certificate subject, the listener
+#: and how the peer was admitted, or a poll source's path. Written once, in the ingress transaction,
+#: so a re-run of the router reads the same value. A message the engine made from another one (a
+#: pass-through or loopback child, an operator resend or edit-and-resubmit) is written without it:
+#: no peer handed that body over, and its ``correlation_root_id`` leads back to the message that
+#: carries one. :func:`user_metadata` never returns it.
+INTAKE_KEY: Final = "intake"
+
+
+def intake_metadata_json(fields: Mapping[str, Any] | None) -> str | None:
+    """The metadata JSON a freshly received message starts with: ``fields`` under
+    :data:`INTAKE_KEY`, or ``None`` when there is no context, so the cell stays ``NULL`` as before."""
+    if not fields:
+        return None
+    return json.dumps({INTAKE_KEY: dict(fields)})
+
+
+def intake_of(metadata_json: StoredJson, *, row_id: object = None) -> dict[str, Any] | None:
+    """The intake context stored in a message's decrypted metadata JSON, or ``None`` when it has none."""
+    intake = _load_object(metadata_json, row_id=row_id).get(INTAKE_KEY)
+    return dict(intake) if isinstance(intake, dict) and intake else None
 
 
 def merge_user_metadata(

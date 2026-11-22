@@ -274,7 +274,7 @@ from messagefoundry.store.crypto import (
     StoreKeylessError,
     gave_no_verdict,
 )
-from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.metadata import intake_metadata_json, user_metadata
 from messagefoundry.store.queue_tag import QueueTagError
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import (
@@ -313,6 +313,7 @@ from messagefoundry.transports.egress import warn_url_query_credentials_before_b
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import reply_seconds
+from messagefoundry.transports.intake import IntakeContext, intake_handler
 from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
@@ -10032,11 +10033,13 @@ class RegistryRunner:
         # before ACKing (ACK-on-receipt) — it no longer routes, so it needs no registry snapshot.
         # Routing happens later in the router worker against the LIVE registry, so a message ingested
         # before a reload is routed under the new graph (the staged model decouples intake from
-        # routing). The inbound name is fixed for this source.
-        async def on_message(raw: bytes) -> str | None:
-            return await self._handle_inbound(ic, raw)
+        # routing). The inbound name is fixed for this source. A source that knows its peer hands
+        # the intake context over with the body (vault BACKLOG #2607, transports/intake.py); one
+        # that does not calls this with the body alone.
+        async def on_message(raw: bytes, intake: IntakeContext | None = None) -> str | None:
+            return await self._handle_inbound(ic, raw, intake)
 
-        return on_message
+        return intake_handler(on_message)
 
     def _make_unlisted_sender_refusal(self, ic: InboundConnection) -> InboundHandler:
         # BACKLOG #4907: the source's `refuse_unlisted_sender` seam, bound to this inbound.
@@ -10480,8 +10483,16 @@ class RegistryRunner:
         finally:
             self._stream_inflight_bytes -= size
 
-    async def _handle_inbound(self, ic: InboundConnection, raw: bytes) -> str | None:
+    async def _handle_inbound(
+        self, ic: InboundConnection, raw: bytes, intake: IntakeContext | None = None
+    ) -> str | None:
+        """Decode, guard and parse one body, commit it to the ingress stage, and return the wire
+        reply. ``intake`` is the source's intake context, written into the message's metadata in
+        the ingress transaction (vault BACKLOG #2607), so the stored message names the peer that
+        sent it; a refusal recorded before ingress does not carry it."""
         ack_mode = ic.ack_mode
+        # Built once, before any commit, so every ingress path below writes the same cell.
+        metadata = intake_metadata_json(intake.fields() if intake is not None else None)
         reply = ack_mode is not AckMode.NONE
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
@@ -10515,6 +10526,7 @@ class RegistryRunner:
                 message_type=ic.content_type.value,
                 source_type=src,
                 summary=None,
+                metadata=metadata,
             )
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return None
@@ -10628,6 +10640,7 @@ class RegistryRunner:
                 message_type=ic.content_type.value,
                 source_type=src,
                 summary=None,
+                metadata=metadata,
             )
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return None
@@ -10848,6 +10861,7 @@ class RegistryRunner:
             message_type=fields.message_type,
             source_type=src,
             summary=fields.summary,
+            metadata=metadata,
             attachment_refs=attachment_refs or None,
         )
         self._wake_lane(
