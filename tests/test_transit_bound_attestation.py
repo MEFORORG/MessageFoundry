@@ -319,8 +319,8 @@ async def test_rotating_the_transit_key_keeps_the_attestation(
     _use_fake(monkeypatch, transit)
     db = tmp_path / "rotating.db"
     store = await _transit_store(db)
-    await _attest(store)
     try:
+        await _attest(store)
         # The chain as written, before the key moves (BACKLOG #2720 closing step 4's before half).
         before_ok, before_msg = await store.verify_audit_chain()
     finally:

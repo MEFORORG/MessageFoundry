@@ -318,9 +318,9 @@ class _EndedUnread:
 
 @dataclass(frozen=True, slots=True)
 class _SignInRoleSync:
-    """What :meth:`AuthService._sync_sign_in_roles` wrote (vault BACKLOG #3085). Everything after
-    the write is computed from this. ``previous`` is the set the write replaced, except when the
-    roles were found already at the target, where it is the set the sign-in first read."""
+    """What :meth:`AuthService._sync_sign_in_roles` wrote (vault BACKLOG #3085). The sign-in's
+    revoke, notice and Administrator checks read ``previous``: the set the write replaced, except
+    when the roles were found already at the target, where it is the set the sign-in first read."""
 
     #: The roles the write replaced; or, found already at the target, the roles first read.
     previous: frozenset[str]
@@ -8785,9 +8785,10 @@ class AuthService:
             # #5624), not reported as a binding change. NOT THE SAME AS THAT CHECK IN ONE WAY:
             # the role, scope and profile sync above already ran, so a directory role change this
             # sign-in wrote in this window is applied and audited, and it ends the account's
-            # other sessions. Roles another writer had already moved to this sign-in's set,
-            # from a set it first read otherwise, also ended those sessions, with no write and
-            # no row of this sign-in's own (``_SignInRoleSync``, vault BACKLOG #3085).
+            # other sessions. When another writer had already moved the roles to this sign-in's
+            # set, and the set this sign-in first read was a different one, those sessions were
+            # ended too, with no write and no row of this sign-in's own (``_SignInRoleSync``,
+            # vault BACKLOG #3085).
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
             elif federated:

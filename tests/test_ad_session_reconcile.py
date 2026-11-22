@@ -7449,8 +7449,9 @@ async def test_a_fault_reading_the_evidence_reports_and_still_writes_the_row(
 @pytest.mark.parametrize("reason", ["directory_undetermined", "directory_object_id_missing"])
 async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet(reason: str) -> None:
     """The 2026-10-17 ruling names disabled and absent only. An undetermined account's revocation
-    that ends no session keeps the 2026-10-16 rule: audited, no notice, no alert. So does an
-    unkeyed account's, ``directory_object_id_missing`` (vault BACKLOG #3750 item 19)."""
+    that ends no session keeps the 2026-10-16 rule: audited, no notice, no alert. So does one for
+    the reason ``directory_object_id_missing`` (vault BACKLOG #3750 item 19). The account driven
+    holds a directory id either way; only the revocation's reason differs."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         notifier = _CapturingNotifier()

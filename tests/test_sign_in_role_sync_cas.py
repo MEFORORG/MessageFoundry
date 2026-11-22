@@ -9,7 +9,7 @@ both legs that share ``_complete_ad_login``: the Kerberos mint and the OIDC (fed
 - a write in between is what the sign-in replaces: the audit row, the revoke and the
   Administrator-loss report are computed from it, not from the stale read;
 - a write in between that already holds the sign-in's directory roles is success: the sign-in
-  writes nothing more, but still ends the other sessions, as main did;
+  writes nothing more, but still ends the other sessions, as the plain write did;
 - two lost compare-and-sets refuse the sign-in closed, with a ``role_sync_contended`` row, and
   leave what the other writer wrote.
 
@@ -171,8 +171,8 @@ async def test_a_write_in_between_that_holds_the_directory_roles_is_success(
 ) -> None:
     """The other writer already wrote the directory's ``viewer``. The sign-in's compare-and-set on
     ``operator`` loses, reads ``viewer`` back, and writes nothing more and no row. It still ends
-    the other sessions, as main did, computed from the ``operator`` it first read, so a revoke
-    the other writer failed cannot leave stale sessions live (Manager ruling on #3085).
+    the other sessions, as the plain write did, computed from the ``operator`` it first read, so a
+    revoke the other writer failed cannot leave stale sessions live (Manager ruling on #3085).
 
     RED on main: the sign-in wrote ``viewer`` again and recorded ``operator`` to ``viewer`` for a
     change it did not make."""
