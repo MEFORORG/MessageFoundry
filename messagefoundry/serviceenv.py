@@ -905,13 +905,15 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
 
 
 def _directory_entry_value(entry: str) -> str | None:
-    """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with no
-    blank around the name, and the value is no key (:func:`_is_key_value`,
-    :func:`_holds_key_run`); else None. The remedy alone reads it, to tell a joined directory
-    path from key material."""
-    if _LINE_BREAK.search(entry):
+    """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with
+    only blanks or line breaks after it and no blank around the name, and the value is no key
+    (:func:`_is_key_value`, :func:`_holds_key_run`); else None. The engine strips the value it
+    reads, so what trails it does not matter. The remedy alone reads it, to tell a joined
+    directory path from key material."""
+    line = entry.rstrip()
+    if _LINE_BREAK.search(line):
         return None
-    written, equals, value = entry.partition("=")
+    written, equals, value = line.partition("=")
     if not equals or written.upper() != _DIRECTORY_VARIABLE:
         return None
     return None if _is_key_value(value) or _holds_key_run(value) else value

@@ -223,6 +223,20 @@ def test_a_path_alone_joined_into_an_empty_key_is_kept() -> None:
     assert "protect-key" not in refusal
 
 
+@pytest.mark.parametrize(
+    "entry", ["mefor_secrets_directory=C:\\d\r\n", " mefor_secrets_directory=C:\\d"]
+)
+def test_only_an_entry_the_engine_reads_as_the_directory_is_kept(entry: str) -> None:
+    """A line break after the path is stripped as the engine strips the value, so the entry is
+    still kept. A blank before the name makes it another variable, so the key is protected and
+    nothing says to keep the entry."""
+    refusal = service_env_refusal(_read([f"{_KEY}=", entry]))
+    assert refusal is not None
+    kept = not entry.startswith(" ")
+    assert (KEEP in refusal) is kept
+    assert ("protect-key" in refusal) is not kept
+
+
 def test_a_path_alone_joined_into_an_empty_key_beside_a_secret_is_kept() -> None:
     """The same shape beside a secret the directory takes: the secret goes to the directory and
     the path entry stays, so the keep sentence ends the remedy and contradicts nothing before."""
