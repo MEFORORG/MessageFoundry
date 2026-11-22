@@ -656,8 +656,9 @@ def _link_finding_problem(finding: ChainFinding) -> str:
     if not finding.insecure:
         return f"{subject} could not be judged: {finding.reason}"
     return (
-        f"{subject} can be changed by an account other than the engine's own and the host's "
-        f"administrators, so where the file is depends on it: {finding.reason}"
+        f"{subject} can be changed by an account this check does not trust, which on Windows "
+        "includes LOCAL SERVICE and NETWORK SERVICE even when the engine runs as one, so where "
+        f"the file is depends on it: {finding.reason}"
     )
 
 

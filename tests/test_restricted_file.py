@@ -788,7 +788,10 @@ def test_a_junction_only_system_administrators_or_the_engine_can_change_passes()
 def test_a_junction_a_broad_group_can_change_is_refused() -> None:
     writable_link = WinSecurity(_SYSTEM, ((_ALLOW, 0, 0x00000002, _USERS),))  # FILE_WRITE_DATA
     problem = str(_link_problem(link=writable_link, holder=_SYSTEMS, path="C:\\data\\linked\\k"))
-    assert "a junction or link on its path can be changed by an account other than" in problem
+    assert (
+        "a junction or link on its path can be changed by an account this check does not trust"
+        in problem
+    )
     assert f"({_USERS})" in problem
     deletable = WinSecurity(_SYSTEM, ((_ALLOW, 0, 0x00000040, _USERS),))  # FILE_DELETE_CHILD
     problem = str(_link_problem(link=_SYSTEMS, holder=deletable, path="C:\\data\\linked\\k"))
@@ -2615,7 +2618,7 @@ def test_the_generated_key_remedy_names_the_store_dir_with_commands_on_posix_onl
     remedy = cli._generated_tls_key_remedy(Path("/srv/mefor data"))
     assert "[store].path" not in remedy
     # An owner refusal (vault BACKLOG #5657) is fixed by a new pair, not by a narrower access list.
-    assert "names who owns it, delete it and its certificate" in remedy
+    assert 'is not restricted: it is owned by"), delete it and its certificate' in remedy
     if platform == "win32":
         assert "chmod" not in remedy and "chown" not in remedy
         # The Windows check judges the store directory too (vault BACKLOG #5657).

@@ -65,7 +65,9 @@ _PEM_MARKER: Final = "-----BEGIN"
 #: The remedy for a key file an operator supplied.
 KEY_FILE_REMEDY: Final = (
     "Restrict it to the account the engine runs as, as a file rather than a link, with no junction "
-    "or link above it that another account can change (Windows: in a directory no broad group "
+    "or link above it that an account other than SYSTEM, Administrators, root or the engine's own "
+    "can change, a LOCAL SERVICE or NETWORK SERVICE engine's own not counting (Windows: in a "
+    "directory no broad group "
     "may delete a file in or change the access list of; POSIX: a file that account owns, in a "
     "directory that account "
     "or root owns and only it may write, or that has the sticky bit; for a key kept behind a link, "
