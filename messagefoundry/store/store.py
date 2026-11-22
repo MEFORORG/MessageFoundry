@@ -2099,16 +2099,14 @@ def _force_failed_open_release(
         )
 
 
-def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
+def _read_stop_outcome(future: asyncio.Future[Any], *, after: str = "a failed store open") -> None:
     """Retrieve a forced ``stop()``'s outcome so the loop never logs it as never retrieved; a
     failure there is logged by class (vault BACKLOG #3054)."""
     if future.cancelled():
         return
     failure = future.exception()
     if failure is not None:
-        log.warning(
-            "stopping a connection after a failed store open failed (%s)", type(failure).__name__
-        )
+        log.warning("stopping a connection after %s failed (%s)", after, type(failure).__name__)
 
 
 #: Set on a connection once it has been force-stopped. Its worker may be wedged, and aiosqlite's
@@ -2120,7 +2118,7 @@ def _was_force_stopped(conn: aiosqlite.Connection) -> bool:
     return getattr(conn, _FORCE_STOPPED_ATTR, False) is True
 
 
-def _stop_unawaited(conn: aiosqlite.Connection) -> None:
+def _stop_unawaited(conn: aiosqlite.Connection, *, after: str = "a failed store open") -> None:
     """``conn.stop()``, with its future's outcome read when it resolves (BACKLOG #5720). Once only:
     a repeat would queue a second stop on a worker that is wedged or gone (BACKLOG #5668)."""
     if _was_force_stopped(conn):
@@ -2128,7 +2126,7 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
     future = conn.stop()
     setattr(conn, _FORCE_STOPPED_ATTR, True)
     if future is not None:
-        future.add_done_callback(_read_stop_outcome)
+        future.add_done_callback(functools.partial(_read_stop_outcome, after=after))
 
 
 def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
@@ -13845,10 +13843,13 @@ class MessageStore:
         failure: Exception | None = None
         try:
             if steps.cancelled:
+                after = "a cancelled store close"
                 raw = getattr(conn, "_connection", None)
                 if raw is not None:
-                    _force_failed_open_release(raw.interrupt)
-                _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+                    _force_failed_open_release(raw.interrupt, after=after)
+                _force_failed_open_release(
+                    functools.partial(_stop_unawaited, conn, after=after), after=after
+                )
             else:
                 await conn.close()
         except asyncio.CancelledError as exc:
@@ -15652,8 +15653,8 @@ class MessageStore:
         """Read-only lane discovery (ADR 0066 §3.6; see the base protocol for the full contract):
         every lane with >=1 PENDING row at ``stage``, paired with its HEAD row's (rowid-min pending
         row's) ``next_attempt_at`` — head-of-line-aware by construction. ``DISTINCT`` + per-lane head
-        sub-select in ONE statement on a pooled reader (BACKLOG #5673), so a sweep neither holds the
-        write lock nor pays one round trip per lane; no writes, no commit needed."""
+        sub-select under the write lock (the universe is registry-bounded); no writes, no commit
+        needed (mirrors the single claim's read-only early return)."""
         lane_col = (
             "channel_id"
             if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
@@ -15664,17 +15665,24 @@ class MessageStore:
         if after is not None:
             where += f" AND {lane_col} > ?"  # resume-after-lane cursor (ascending lane order)
             params.append(after)
-        async with self._read() as db:
-            cur = await db.execute(
-                f"SELECT d.lane AS lane, (SELECT h.next_attempt_at FROM queue h"
-                f" WHERE h.stage=? AND h.{lane_col}=d.lane AND h.status=?"
-                " ORDER BY h.rowid LIMIT 1) AS head_at"
-                f" FROM (SELECT DISTINCT {lane_col} AS lane FROM queue WHERE {where}"
-                " ORDER BY lane LIMIT ?) d WHERE d.lane IS NOT NULL ORDER BY d.lane",
-                (stage, OutboxStatus.PENDING.value, *params, limit),
+        out: list[tuple[str, float]] = []
+        async with self._lock:
+            cur = await self._db.execute(
+                f"SELECT DISTINCT {lane_col} AS lane FROM queue WHERE {where}"
+                " ORDER BY lane LIMIT ?",
+                (*params, limit),
             )
-            rows = await cur.fetchall()
-        return [(r["lane"], r["head_at"]) for r in rows]
+            lane_rows = await cur.fetchall()
+            for lr in lane_rows:
+                cur = await self._db.execute(
+                    f"SELECT next_attempt_at FROM queue WHERE stage=? AND {lane_col}=? AND status=?"
+                    " ORDER BY rowid LIMIT 1",
+                    (stage, lr["lane"], OutboxStatus.PENDING.value),
+                )
+                head = await cur.fetchone()
+                if head is not None:
+                    out.append((lr["lane"], head["next_attempt_at"]))
+        return out
 
     async def release_claimed(self, ids: Sequence[str], now: float | None = None) -> None:
         """Return never-dispatched INFLIGHT rows to ``pending``, undoing exactly the claim's

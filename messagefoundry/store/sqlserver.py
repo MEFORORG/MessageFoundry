@@ -6008,10 +6008,16 @@ class SqlServerStore:
         await steps.run(self._settle_at_close(), "the AES-GCM settlement")
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
         # opened, so it never affects the async path). ADR 0071 B5.
-        try:
-            self.close_sync_handoff_pool()
-        except Exception as exc:  # noqa: BLE001 — absorb re-raises it unless a cancel is held
-            steps.absorb(exc)
+        if steps.cancelled:
+            # Off the loop: a pyodbc close on a dead server blocks, and the bound could not fire.
+            await steps.run(
+                asyncio.to_thread(self.close_sync_handoff_pool), "the sync handoff pools"
+            )
+        else:
+            try:
+                self.close_sync_handoff_pool()
+            except Exception as exc:  # noqa: BLE001 — absorb re-raises it unless a cancel is held
+                steps.absorb(exc)
         # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op when the
         # prepared path never opened one).
         await steps.run(self._close_claim_holders(), "the claim holders")

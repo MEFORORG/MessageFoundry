@@ -469,6 +469,98 @@ async def test_sqlserver_sync_pool_failure_leaves_before_the_unbounded_pool_wait
     assert (pool.closed, pool.waited, executor.shutdowns) == (0, 0, 0)
 
 
+async def test_sqlserver_blocking_sync_pool_close_does_not_stall_a_cancelled_close() -> None:
+    """A pyodbc close on a dead server blocks; on the loop it would stop the bound from firing."""
+    pool, executor = _FakePool(), _FakeExecutor()
+    store, _calls = _sqlserver(pool, executor)
+    ticks = 0
+    during: list[int] = []
+    closed_on: list[threading.Thread] = []
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    def blocking_close() -> None:
+        closed_on.append(threading.current_thread())
+        before = ticks
+        threading.Event().wait(0.3)
+        during.append(ticks - before)
+
+    store.close_sync_handoff_pool = blocking_close
+    beat = asyncio.ensure_future(heartbeat())
+    try:
+        await _cancel_at(store._close_handles, _parking_settle(store))
+    finally:
+        beat.cancel()
+    assert closed_on and closed_on[0] is not threading.current_thread()
+    assert during and during[0] > 0
+    assert (pool.closed, pool.waited, executor.shutdowns) == (1, 1, 1)
+
+
+async def test_sqlserver_sync_pool_close_wedged_past_the_bound_does_not_hold_the_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("messagefoundry.store.close_steps.CANCELLED_CLOSE_GRACE_SECONDS", 0.05)
+    pool, executor = _FakePool(), _FakeExecutor()
+    store, _calls = _sqlserver(pool, executor)
+    release = threading.Event()
+    store.close_sync_handoff_pool = lambda: release.wait(5)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        await _cancel_at(store._close_handles, _parking_settle(store))
+        elapsed = loop.time() - started
+    finally:
+        release.set()
+    # On the loop the close would run the fake's whole 5 s, because the bound could not fire.
+    assert elapsed < 3
+    assert (pool.closed, pool.waited, executor.shutdowns) == (1, 1, 1)
+
+
+async def test_sqlserver_uncancelled_close_keeps_the_sync_pool_close_on_the_loop() -> None:
+    pool, executor = _FakePool(), _FakeExecutor()
+    store, _calls = _sqlserver(pool, executor)
+    closed_on: list[threading.Thread] = []
+
+    async def settle(*_: object, **__: object) -> None:
+        return None
+
+    store.checkpoint_cipher_invocations = settle
+    store.close_sync_handoff_pool = lambda: closed_on.append(threading.current_thread())
+    await store._close_handles()
+    assert closed_on == [threading.current_thread()]
+
+
+async def test_a_cancelled_close_names_itself_in_its_forced_release_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    class _Raw:
+        def interrupt(self) -> None:
+            raise OSError("synthetic at C:/secret/path")
+
+    class _Conn:
+        _connection = _Raw()
+        _thread = None
+
+        def stop(self) -> asyncio.Future[None]:
+            return future
+
+    steps = CloseSteps()
+    steps.hold(asyncio.CancelledError())
+    await MessageStore._close_connection(_Conn(), steps)  # type: ignore[arg-type]
+    future.set_exception(OSError("worker gone at C:/secret/path"))
+    await asyncio.sleep(0)
+    assert "forcing the release after a cancelled store close also failed (OSError)" in caplog.text
+    assert "stopping a connection after a cancelled store close failed (OSError)" in caplog.text
+    assert "failed store open" not in caplog.text
+    assert "secret" not in caplog.text
+
+
 async def test_postgres_cancelled_settlement_still_closes_the_pool() -> None:
     store: Any = object.__new__(PostgresStore)
     pool = _FakeAsyncPool()
