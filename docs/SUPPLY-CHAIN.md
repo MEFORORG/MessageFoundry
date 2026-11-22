@@ -149,7 +149,8 @@ Facts the labels leave out:
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
 - **One approval per engine tag.** The toolkit, engine and harness uploads are steps of one
   `publish-pypi` job, so one approval of the `pypi` environment covers all three. The harness
-  upload runs only when the `PUBLISH_HARNESS` repository or organization variable is set.
+  upload runs only when the `PUBLISH_HARNESS` variable reads `true`; *The draft* below says what
+  a copy in the `pypi` environment does.
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
   too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
   that is the toolkit and the engine only. A separate job publishes it last, so no

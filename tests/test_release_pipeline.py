@@ -1205,7 +1205,8 @@ def _posix_tool_env() -> dict[str, str]:
 
 
 #: The timeout for a short subprocess here: a bash run of an extracted step, or a one-line probe.
-#: It catches a hang. It does not measure speed: nothing in this file reads a duration.
+#: It bounds a hang where nothing else does first. It does not measure speed: nothing in this file
+#: reads a duration.
 #:
 #: WHY IT STAYS AT 60 S (BACKLOG #3633 item 2). That row records one overrun: on engine PR 2327's
 #: run 38674972250, `over-long-body[console]` took 84.5 s in notes.sh on windows-2025, and that
@@ -1213,10 +1214,12 @@ def _posix_tool_env() -> dict[str, str]:
 #: Windows 11 dev box the test took about 1.6 s (measured 2026-11-21). Nothing here was measured on
 #: a windows-2025 runner. Raising this alone would not help. The CI test legs run pytest with a
 #: per-test `--timeout`, its matrix `pytest_timeout` in ci.yml: 60 s on ubuntu, 120 s on Windows.
-#: With `--timeout-method=thread`, pytest-timeout ends the whole worker process when that fires,
-#: rather than failing the one test with this call's output. So on ubuntu a value above 60 s is
-#: never reached, and on Windows one above 120 s trades a named failure for a dead worker. Allowing
-#: a longer stall needs the per-test cap raised too, for these tests or for the leg.
+#: That cap covers the whole test, its setup and every call in it, and with
+#: `--timeout-method=thread` pytest-timeout ends the whole worker process when it fires, rather
+#: than failing the one test with this call's output. So on ubuntu the cap fires before this
+#: timeout can, and on Windows a test that makes two such calls, as `over-long-body` does, can
+#: reach the cap first even at this value. Allowing a longer stall needs the per-test cap raised, for
+#: these tests or for the leg; this value would follow it.
 _HANG_TIMEOUT_S = 60
 
 
@@ -2123,17 +2126,20 @@ def _step_flags(script: str) -> tuple[str, ...]:
     Read from the workflow by the script's own text, so an execution test runs a smoke or a tag
     guard under the flags the step really uses (BACKLOG #1583). Before this, ``_run_smoke``
     hardcoded ``-I``, so the intact checkout the acceptance keeps present could never answer: a
-    step that dropped ``-I`` would have left every execution test here green. Two steps may carry
-    the same script, the engine's and the toolkit's tag guards for one, so the flags of every copy
-    must agree, or no single answer exists.
+    step that dropped ``-I`` would have left every execution test here green. If two steps ever
+    feed the same script, the flags of every copy must agree, or no single answer exists.
+
+    Both sides are read through :func:`_executed_shell`, so a comment quoting an invocation is not
+    taken for one, and a script extracted with or without its comment lines matches either way.
     """
+    want = _executed_shell(script)
     found = {
         tuple(m.group("flags").split())
         for job in _jobs().values()
         for step in (job.get("steps") or [])
         if isinstance(step, dict)
-        for m in _STDIN_HEREDOC.finditer(str(step.get("run") or ""))
-        if m.group("body") == script
+        for m in _STDIN_HEREDOC.finditer(_executed_shell(str(step.get("run") or "")) + "\n")
+        if m.group("body") == want
     }
     assert len(found) == 1, (
         f"expected the script to be fed to exactly one interpreter flag list in release.yml, found "
@@ -2162,10 +2168,14 @@ def _run_smoke(
     ``args`` follow the ``-``, as ``python -I - "$built" "$want"`` passes them to a tag guard.
     """
     argv = [str(exe), *(_step_flags(script) if flags is None else flags), "-", *args]
+    # release.yml sets neither, and either one changes what a flagless control can reach:
+    # PYTHONSAFEPATH keeps the cwd off sys.path, PYTHONPATH adds another tree to it.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONSAFEPATH", "PYTHONPATH")}
     proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
         argv,
         input=script.encode("utf-8"),
         cwd=str(workdir),
+        env=env,
         capture_output=True,
         timeout=120,
     )
@@ -2212,7 +2222,8 @@ def test_a_wheel_smoke_accepts_a_correctly_built_wheel(
         purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, _SMOKE_VERSION)
     )
 
-    rc, stdout, out = _run_smoke(exe, script, _intact_checkout(tmp_path / "checkout", pkg))
+    work = _intact_checkout(tmp_path / "checkout", pkg)
+    rc, stdout, out = _run_smoke(exe, script, work)
     assert rc == 0, (
         f"{job}'s smoke REJECTED a well-formed install, so every rejection below is measuring a "
         f"broken harness rather than the smoke.\n{out}"
@@ -2232,7 +2243,6 @@ def test_a_wheel_smoke_accepts_a_correctly_built_wheel(
     # THE INTACT CHECKOUT IS LIVE (BACKLOG #1583's acceptance). The run above used the step's own
     # flags, so its pass shows those flags keep the checkout out only if the checkout would
     # otherwise get in. The same run without them must be refused for exactly that reason.
-    work = tmp_path / "checkout"
     rc, _stdout, out = _run_smoke(exe, script, work, flags=())
     assert rc != 0 and "OUTSIDE the smoke venv" in out, (
         f"without the step's flags ({' '.join(_step_flags(script)) or 'none'}) the intact checkout "
@@ -4434,10 +4444,11 @@ _DRAFT_REFUSAL = re.compile(r'echo "(::error::\$GATE_NAME is \'true\'[^"\n]*)"')
 
 #: Clauses of that refusal which docs/SUPPLY-CHAIN.md, *The draft*, must carry too. Compared after
 #: :func:`_flat_text`, so the doc's backticks and line wraps do not count, and with the refusal's
-#: `$GATE_NAME` read as the doc's "the variable". A clause listed here and dropped from either copy,
-#: the organization prohibition among them, is named by the test below (vault BACKLOG #2975 item
-#: 16). The list is not every clause: the publisher re-run step, for one, is worded differently in
-#: the two copies and is not compared.
+#: `$GATE_NAME` read as the doc's "the variable". The test below names a clause listed here once it
+#: is gone from either copy, the organization prohibition among them (vault BACKLOG #2975 item 16).
+#: Each is matched anywhere in the copy, so a clause the doc carries twice, such as "remove any
+#: copy from the pypi environment", is named only once both are gone. The list is not every clause:
+#: the publisher re-run step, for one, is worded differently in the two copies and is not compared.
 _DRAFT_REFUSAL_CLAUSES = (
     "holds its own copy of the variable, with a value that is not true in any letter case",
     "a copy removed since",
@@ -4496,6 +4507,10 @@ def test_the_draft_refusal_is_one_text_and_the_doc_carries_each_clause() -> None
     assert not missing, "\n".join(missing)
 
 
+#: A context a step-level `if:` can read a variable through, directly or by way of an `env:` entry.
+_STEP_GATE = re.compile(r"\b(?:vars|needs|env|steps)\b", flags=re.IGNORECASE)
+
+
 @pytest.mark.parametrize("publisher", [_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB])
 def test_no_step_of_a_draft_publisher_is_gated_on_a_variable(publisher: str) -> None:
     """The job-level walk, `_variable_gated_jobs`, reads no step's `if:` (vault BACKLOG #2975 item
@@ -4507,11 +4522,17 @@ def test_no_step_of_a_draft_publisher_is_gated_on_a_variable(publisher: str) -> 
     jobs = copy.deepcopy(_jobs())
     steps = [s for s in jobs[publisher]["steps"] if isinstance(s, dict)]
     assert steps, f"{publisher} has no steps"
-    gated = [s.get("name") for s in steps if _is_variable_gated(s)]
-    assert not gated, f"{publisher} step(s) {gated} are gated on a variable; unset, they skip"
+
+    def gated() -> list[object]:
+        # Wider than the job-level pattern: a step's `if:` can also read `env` and `steps`, and
+        # either can carry a variable in from the job's or an earlier step's `env:`.
+        return [s.get("name") for s in steps if _STEP_GATE.search(str(s.get("if") or ""))]
+
+    assert not gated(), f"{publisher} step(s) {gated()} are gated on a variable; unset, they skip"
     publish = _release_step(jobs[publisher], "--draft=false")
-    publish["if"] = "vars.PUBLISH_HARNESS == 'true'"
-    assert [s.get("name") for s in steps if _is_variable_gated(s)] == [publish.get("name")]
+    for planted in ("vars.PUBLISH_HARNESS == 'true'", "env.GATE == 'true'"):
+        publish["if"] = planted
+        assert gated() == [publish.get("name")], planted
 
 
 # --- (14) every PyPI publish runs in a publish-only job that names `pypi` (vault BACKLOG #2631) ------
