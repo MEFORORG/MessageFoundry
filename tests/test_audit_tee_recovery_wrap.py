@@ -104,8 +104,9 @@ def test_a_nested_wrap_is_withheld_and_the_rest_of_the_detail_kept() -> None:
 @pytest.mark.parametrize(
     "detail",
     [
-        # A name, a reason or text that only quotes the field name is left alone, so a typed name
-        # cannot blank a row's copy.
+        # A name, a reason or text that only quotes the field name, and parses cleanly, is left
+        # alone. A typed value that also faults the parse, or a detail over the window, can still
+        # be withheld whole.
         json.dumps({"username": "svc_recovery_wrap", "roles": ["Administrator"]}),
         json.dumps({"error": "no recovery_wrap"}),
         "not JSON: recovery_wrap",
