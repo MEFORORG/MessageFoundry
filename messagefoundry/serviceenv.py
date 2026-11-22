@@ -171,6 +171,9 @@ class ServiceEnvPosture:
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it and not to add one back. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
+    #: Whether a refused value runs on into a string whose first non-blank line sets
+    #: ``MEFOR_SECRETS_DIRECTORY``, so the run-on step removes it. The remedy alone reads this.
+    directory_run_on: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -629,6 +632,10 @@ class _Variable:
     directory_only: bool = False
     #: Whether it runs on into such an entry that sets the directory to a path. Remedy only.
     keeps_directory: bool = False
+    #: Whether it runs on, and a string after its own in the joined group sets
+    #: ``MEFOR_SECRETS_DIRECTORY`` on its first non-blank line (:func:`_sets_directory`).
+    #: Remedy only.
+    takes_directory: bool = False
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
@@ -886,12 +893,14 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         only_after = [True] * (len(strings) + 1)
         any_after = [False] * (len(strings) + 1)
         path_after = [False] * (len(strings) + 1)
+        set_after = [False] * (len(strings) + 1)
         for i in range(len(strings) - 1, -1, -1):
             only_after[i], any_after[i], path_after[i] = (
                 only_after[i + 1],
                 any_after[i + 1],
                 path_after[i + 1],
             )
+            set_after[i] = set_after[i + 1] or _sets_directory(strings[i])
             if not _still_blank(strings[i]):
                 path = _directory_entry_value(strings[i])
                 only_after[i] = only_after[i] and path is not None
@@ -912,9 +921,18 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     runs_on=ran_on,
                     directory_only=ran_on and any_after[index + 1] and only_after[index + 1],
                     keeps_directory=ran_on and path_after[index + 1],
+                    takes_directory=ran_on and set_after[index + 1],
                 )
             )
     return read
+
+
+def _sets_directory(entry: str) -> bool:
+    """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
+    regard to case, as Windows compares names."""
+    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
+    written, equals, _rest = first.partition("=")
+    return bool(equals) and written.strip().upper() == _DIRECTORY_VARIABLE
 
 
 def _directory_entry_value(entry: str) -> str | None:
@@ -1062,6 +1080,7 @@ def read_service_env_posture(
         # entry may hold key material, so nothing says to keep any entry (sixth hold, H1).
         directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
         and all(v.directory_only for v in variables if v.runs_on and _names([v])),
+        directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
     )
 
 
@@ -1274,16 +1293,17 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             "entries it runs on into with it, or the value stays in the registry key"
         )
     if (
-        (others or values)
+        (others or values or posture.directory_run_on)
         and _DIRECTORY_VARIABLE not in posture.listed
         and not posture.directory_path_joined
     ):
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
         # the value it is joined to unless the step below keeps it, so only a kept one makes
-        # "add it back" false (the Lander's ruling on handback 7085947392, F1). Every
-        # refused name counts, moved or not, since a name whose only value is a joined path
-        # entry the fail-closed rule does not keep still takes that entry with it (U1).
+        # "add it back" false (the Lander's ruling on handback 7085947392, F1). A refused
+        # name outside the key class may need the directory, and the run-on step may remove
+        # a directory string even for a store key alone (the Lander's ruling on comment
+        # 7087145957, F1 on H3's terms).
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.

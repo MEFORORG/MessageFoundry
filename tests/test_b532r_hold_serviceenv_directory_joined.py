@@ -69,12 +69,10 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     moved = refused.startswith("MEFOR_VALUE_") and " " in directory
     assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
     # The lists set no directory once the joined string goes, so the remedy says to add one
-    # back (the Lander's ruling on handback 7085947392, F1). A store key alone gets no
-    # secrets-directory step at all.
-    adds_back = refused.startswith("MEFOR_VALUE_")
-    assert refusal.count(ADD_BACK) == (1 if adds_back else 0)
-    if adds_back:
-        assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
+    # back (the Lander's ruling on handback 7085947392, F1), for a store key alone too
+    # (the Lander's ruling on comment 7087145957, F1 on H3's terms).
+    assert refusal.count(ADD_BACK) == 1
+    assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
         refused.startswith("MEFOR_VALUE_") and " " not in directory
     )
@@ -279,6 +277,28 @@ def test_a_path_the_fail_closed_rule_does_not_keep_is_added_back() -> None:
     assert refusal.count(ADD_BACK) == 1
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
     assert "synthetic-run-on" not in refusal
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param([f"{KEY_CLASS_NAMES[0]}=", "MEFOR_SECRETS_DIRECTORY=="], id="key-alone"),
+        # The directory string is the second the value takes: U6.
+        pytest.param(
+            [f"{KEY_CLASS_NAMES[0]}=", "MEFOR_VALUE_A", "MEFOR_SECRETS_DIRECTORY=="],
+            id="key-then-name-alone",
+        ),
+    ],
+)
+def test_a_store_key_alone_run_on_into_the_directory_is_added_back(entries: list[str]) -> None:
+    """The Lander's ruling on comment 7087145957, F1 on H3's terms: only a store key is refused,
+    but the run-on step removes the directory string its value runs on into, so the remedy says
+    to add the directory back, after the run-on sentence, and nothing says to keep the string."""
+    refusal = service_env_refusal(_read(entries))
+    assert refusal is not None
+    assert CREATE not in refusal and KEEP not in refusal
+    assert refusal.count(ADD_BACK) == 1
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
 
 
 def test_an_empty_value_beside_a_listed_directory_path_is_still_moved() -> None:
