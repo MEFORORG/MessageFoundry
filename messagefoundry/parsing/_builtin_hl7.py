@@ -595,45 +595,61 @@ def field_values(
     repetition the path runs past, or that ``extract_field`` raises on, yields nothing, as
     ``Peek.field`` reads such a value as absent, and the walk goes on.
 
-    Two shapes are not widened, because the parse would misread them. A repetition character shared
-    with the component or sub-component separator does not mark a repetition, so only the first is
-    read. The parse splits every line on the first header's separators, so once an occurrence has
-    been read the walk stops at a later header declaring other separators.
+    Some shapes are not widened, because the parse would misread them, and read as ``Peek.field``
+    does. A repetition character shared with another separator, or a split that leaves an escape
+    sequence open, does not mark a repetition, so only the first is read. The parse splits every line
+    on the first header's separators, so the walk stops at a later header declaring others; when the
+    first occurrence lies past such a header, only its first value is read.
 
     ``extract_field`` finds an occurrence by scanning from the top, so calling it with each
-    ``occurrence`` would be quadratic in segments. It is called here on a one-segment view of each
-    occurrence instead, and the walk is linear in the message. The view holds its own field list, so
-    the component split it caches is freed with it rather than kept for every occurrence. A blank
-    line is not an occurrence and raises nothing here; a ``Peek``-parsed message holds none.
+    ``occurrence`` would be quadratic in segments. It is called here on a one-segment view instead,
+    holding one repetition at a time, so the walk is linear in the message and keeps no component
+    split of a field. An empty repetition is skipped unsplit. A blank line is not an occurrence and
+    raises nothing here; a ``Peek``-parsed message holds none.
     """
     seps = msg["seps"]
-    shared_rep = seps[2] in (seps[1], seps[3])
-    seen = False
+    _field_sep, comp_sep, rep_sep, sub_sep, esc = seps
+    shared_rep = rep_sep in (comp_sep, sub_sep, esc)
+    seen = crossed = False
     for index, seg in enumerate(msg["segments"]):
-        if seen and seg["id"] in HEADER_IDS and _extract_separators(header_line_head(seg)) != seps:
-            return
+        if index and seg["id"] in HEADER_IDS and _extract_separators(header_line_head(seg)) != seps:
+            if seen:
+                return
+            crossed = True
         if seg["id"] != seg_id or _is_fieldless(msg, index):
             continue
         seen = True
         _ensure_split(msg, index)
         fields = seg["fields"]
         if fld >= len(fields):
+            if crossed:
+                return
             continue
+        text = _field_text(fields[fld])
+        parts = [text]
+        if comp is not None and not (shared_rep or crossed or is_delimiter_field(seg_id, fld)):
+            split = text.split(rep_sep)
+            if esc not in text or not any(part.count(esc) % 2 for part in split):
+                parts = split
+        held: list[str | FieldEntry] = list(fields)
         view: ParsedMessage = {
             "_lazy": {},
-            "segments": [{"id": seg_id, "fields": list(fields)}],
+            "segments": [{"id": seg_id, "fields": held}],
             "raw": None,
             "seps": seps,
         }
-        whole = comp is None or shared_rep or is_delimiter_field(seg_id, fld)
-        count = 1 if whole else len(_componentize(view, 0, fld, seps)["reps"])
-        for repetition in range(1, count + 1):
+        for part in parts:
+            if not part:
+                continue
+            held[fld] = part
             try:
-                value = extract_field(view, seg_id, fld, comp, sub, repetition=repetition)
+                value = extract_field(view, seg_id, fld, comp, sub)
             except (IndexError, ValueError):
                 continue
             if value is not None:
                 yield value
+        if crossed:
+            return
 
 
 def extract_part(

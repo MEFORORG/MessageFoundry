@@ -212,6 +212,47 @@ def test_a_first_occurrence_past_a_differing_header_is_still_read() -> None:
     assert _matches(raw, "PID-3", "Y") is True
 
 
+@pytest.mark.parametrize(
+    ("header", "field", "invented"),
+    [
+        ("MSH|^\\\\&|S|F", "A\\T\\B", "B"),  # repetition and escape are one character
+        ("MSH|^\\|S|F", "A\\T\\B", "B"),  # the same, from the default escape
+        ("MSH|^R\\&|S|F", "A\\R\\B", "B"),  # the repetition is a letter inside an escape
+    ],
+)
+def test_a_split_through_an_escape_is_not_walked(header: str, field: str, invented: str) -> None:
+    raw = f"{header}\rPID|1||{field}\r"
+    assert _values(raw, "PID-3.1") == [Peek.parse(raw).field("PID-3.1")]
+    assert _matches(raw, "PID-3.1", invented) is False
+
+
+def test_a_balanced_escape_does_not_stop_the_repetition_walk() -> None:
+    assert _values(_body("PID|1||A\\T\\B~C"), "PID-3.1") == ["A&B", "C"]
+
+
+@pytest.mark.parametrize(
+    ("header", "field"), [("MSH$^~\\&$OTHER", "Y~Z"), ("MSH$~^\\&$OTHER", "Y~Z")]
+)
+def test_past_a_differing_header_only_the_first_value_is_read(header: str, field: str) -> None:
+    raw = _body(header, f"PID|1||{field}", "PID|1||W")
+    assert _values(raw, "PID-3.1") == [Peek.parse(raw).field("PID-3.1")] == ["Y"]
+    assert _matches(raw, "PID-3.1", "Z") is False
+    assert _matches(raw, "PID-3.1", "W") is False
+
+
+def test_a_short_first_occurrence_past_a_differing_header_reads_nothing_later() -> None:
+    raw = _body("MSH$^~\\&$OTHER", "OBX|1", "OBX|2|ST|A||later")
+    assert Peek.parse(raw).field("OBX-5") is None
+    assert _values(raw, "OBX-5") == []
+
+
+def test_empty_repetitions_are_not_split_into_a_retained_tree() -> None:
+    """A later field of empty repetitions yields nothing, at the cost of one flat split."""
+    raw = _body("OBX|1|ST|A||x", "OBX|2|ST|B||" + "~" * 200_000)
+    assert _walk_cost(raw, "OBX-5.1") < 2_000_000
+    assert _values(raw, "OBX-5.1") == ["x"]
+
+
 def test_the_walk_leaves_no_component_cache_on_the_parsed_message() -> None:
     raw = _body("OBX|1|ST|A||x~y", "OBX|2|ST|B||p~q")
     message = Peek.parse(raw).message

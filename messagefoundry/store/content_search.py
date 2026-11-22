@@ -52,7 +52,9 @@ class SearchSpec:
       ``raw`` across **every occurrence of the segment and every repetition of the field** (BACKLOG
       #5883); matches when any value contains ``field_value`` (case-insensitive), or — when
       ``field_value`` is ``None`` — when any value is **present/non-empty**. A whole-field path reads
-      each occurrence's structural text, repetition delimiters included.
+      each occurrence's structural text, repetition delimiters included. Shapes the parse would
+      misread are not widened, so a no-match there is not proof of absence; ``field_values`` in
+      ``parsing/_builtin_hl7.py`` names them.
     """
 
     substring: str | None
@@ -213,7 +215,8 @@ def row_matches(spec: SearchSpec, *, raw: str | None, summary: str | None) -> bo
 
     Pure (no I/O, no cipher). Parsing a non-HL7 / unparseable ``raw`` for a field-path query is treated
     as **no match** (tolerant — a malformed body simply doesn't satisfy ``PID-3``), never an error that
-    aborts the scan. A field-path query tests every segment occurrence and field repetition."""
+    aborts the scan. A field-path query tests each segment occurrence and field repetition that
+    ``field_values`` can read reliably."""
     if spec.substring is not None:
         needle = spec.substring.casefold()
         if spec.target in (SearchTarget.RAW, SearchTarget.BOTH) and raw is not None:  # noqa: SIM102
