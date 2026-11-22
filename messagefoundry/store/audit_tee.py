@@ -341,11 +341,8 @@ def _finished(key: str, written: str, scrubbed: str) -> str:
     if settled == written and shown == written:  # escapes only lengthen, so nothing was escaped
         return written
     member = json.dumps({key: written}, ensure_ascii=False)
-    words = _line_words(shown)
-    for reading in dict.fromkeys(sink_readings(member)):
-        bar = _line_words(reading)
-        if not all(seen <= limit for seen, limit in zip(words, bar, strict=True)):
-            return _FIELD_REDACTED
+    if not all(_shows_no_more(shown, _line_words(r)) for r in dict.fromkeys(sink_readings(member))):
+        return _FIELD_REDACTED
     return settled
 
 
@@ -356,11 +353,12 @@ def _finished_detail(detail: str) -> str:
     head, note = safe_text_bound(detail)
     bounded = safe_text(head) + note
     kept = _scrub_field(detail, detail=True)
-    # Judged before safe_text bounds it: the bound's own "(+N chars)" is not text of the value.
-    scrubbed = _finished("detail", head, head if kept is detail else kept)
-    final = None
-    if scrubbed != _FIELD_REDACTED:
-        final = _settled(bounded if scrubbed == head else _bounded_detail(scrubbed, note, bounded))
+    # Judged against the bounded text, the only text that can ship: text past the bound neither
+    # reaches the line nor decides whether its head does.
+    candidate = bounded if kept is detail else _bounded_detail(kept, note, bounded)
+    final: str | None = _finished("detail", bounded, candidate)
+    if final == _FIELD_REDACTED:
+        final = None
     if final is None:
         return _bounded_detail(_FIELD_REDACTED, note, bounded)
     if _parses(bounded) and not _parses(final):
@@ -380,9 +378,12 @@ def _tee_line(record: dict[str, object]) -> FinishedAuditLine:
         excess = len(line) - _REDACT_WINDOW
         if excess <= 0:
             return line
-        key = max(_TEXT_FIELDS, key=lambda k: len(str(fields[k] or "")))
+        # By length on the line, where one control can take six characters.
+        spelled = {k: len(FinishedAuditLine(json.dumps(fields[k]))) for k in _TEXT_FIELDS}
+        key = max(spelled, key=lambda k: spelled[k])
         value = str(fields[key] or "")
-        cut = clamp_untrusted(value, window=max(len(value) - excess, 0))
+        keep = len(value) * max(spelled[key] - excess, 0) // spelled[key]
+        cut = clamp_untrusted(value, window=keep)
         fields[key] = cut if len(cut) < len(value) else _FIELD_REDACTED
     hidden = {k: _FIELD_REDACTED for k in _TEXT_FIELDS if record[k] is not None}
     return FinishedAuditLine(json.dumps({**record, **hidden}, ensure_ascii=False))
@@ -440,8 +441,8 @@ def emit_audit_tee(
     them as making the audit log unmodifiable.
 
     ``client`` (ADR 0150) is the caller's network address, or ``None`` for an engine-internal write. It
-    is forwarded verbatim unless it holds a C0 control, which the field scrub below can rewrite or
-    hide as ``[redacted]`` — it is an infrastructure identifier, not message content, and the whole point
+    is forwarded verbatim unless the field scrub below finds text to redact in it, which it can
+    rewrite or hide as ``[redacted]`` — it is an infrastructure identifier, not message content, and the whole point
     of the off-box copy is that attribution survives a host/DB compromise, which it cannot do if the
     "from where" is dropped on the way out. It is emitted as a discrete field (never folded into
     ``detail``) so a SIEM can index it without parsing the redacted blob.
@@ -493,7 +494,8 @@ def emit_audit_tee(
 
     **Fields are read one at a time.** A pattern that would have needed text from two fields of
     the line no longer sees them together, so a value split across two fields is not redacted as
-    one. The line is bounded by :func:`_tee_line`. A reader that re-redacts the stored line as
+    one. The line is bounded by :func:`_tee_line`. A field other than ``detail`` whose JSON
+    spelling passes the redaction window ships whole as ``[redacted]``. A reader that re-redacts the stored line as
     text, such as ``GET /logs/tail`` or a support bundle, is outside this guarantee.
 
     Best-effort: a logging failure must never fail the audit write (already committed), so it is

@@ -1463,6 +1463,41 @@ def test_a_record_over_the_window_is_bounded_and_still_whole(capsys) -> None:
     assert all(parsed[k].startswith("word word") for k in ("actor", "channel_id", "client"))
 
 
+def test_a_long_credential_does_not_pull_later_text_inside_the_detail_bound() -> None:
+    """Review round 1: scrubbing before the 200-character bound shortened the head, so an
+    identifier the bound used to drop shipped. The bound is taken first. Synthetic value."""
+    from messagefoundry.redaction import safe_text
+
+    detail = "password=" + "s" * 240 + " ZQ4242SMITH acct 991"
+    assert "ZQ4242SMITH" not in safe_text(detail)  # the control: the bound drops it
+    assert "ZQ4242SMITH" not in audit_tee._finished_detail(detail)
+
+
+@pytest.mark.parametrize("tail", ["code=\tDoe", '&pwd="\n&'])
+def test_text_past_the_detail_bound_does_not_blank_its_head(tail: str) -> None:
+    """Review round 1: the bar read text that never ships, and hid a clean head. Synthetic."""
+    detail = "the operator restarted the listener " * 15 + tail
+    assert audit_tee._finished_detail(detail).startswith("the operator restarted")
+
+
+def test_a_long_quoted_detail_keeps_its_head() -> None:
+    """Review round 1: a detail whose JSON spelling passed the window lost its tail from the bar
+    and shipped whole as the placeholder. Synthetic value."""
+    assert audit_tee._finished_detail('see "quoted" text ' * 6000).startswith('see "quoted"')
+
+
+def test_the_line_bound_cuts_the_field_that_overflows_it(capsys) -> None:
+    """Review round 1: the cut chose by raw length, so a plain actor was blanked for a client of
+    controls that is six times longer on the line. Synthetic values."""
+    actor = "word " * 4200
+    # Spaces in it, because the clamp cuts at whitespace and drops an unbroken token whole.
+    client = (chr(0x7F) * 9 + " ") * 1500
+    (line,) = _tee_lines([{"actor": actor, "client": client}], capsys)
+    parsed = json.loads(line.split("messagefoundry.audit: ", 1)[1])
+    assert parsed["actor"] == actor
+    assert parsed["client"].startswith(chr(0x7F))
+
+
 def test_an_empty_detail_ships_as_empty_not_null(audit_capture) -> None:
     """S01-91's reading: the chain's MAC tells ``""`` from ``None``, so the copy must too."""
     for detail, expected in (("", ""), (None, None)):
