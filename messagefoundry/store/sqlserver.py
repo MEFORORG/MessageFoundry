@@ -1549,9 +1549,10 @@ class StorePinConnectRefused(RuntimeError):
     """A new store connection refused before it dialled, because a settings check at ``enforce``
     refused the SQL Server ``[store].ssl_root_cert`` pin and no check has passed it since (vault
     BACKLOG #3714 step 11, :func:`refuse_connect_after_pin_refusal`). It is not a
-    :class:`~messagefoundry.config.tls_policy.StoreTlsRefused`: it is raised while the store runs,
-    not by the store open, so a handler of that refusal does not read it as a gate refusing a
-    start. A caller sees it as it sees any other failed connect."""
+    :class:`~messagefoundry.config.tls_policy.StoreTlsRefused`, so a handler of that refusal does
+    not read it as a start gate refusing. It is raised mostly while the store runs, but a store
+    open whose own pin check did not lift the refusal, such as one at a posture that does not
+    enforce, can raise it too, from its pool's first connect."""
 
 
 class _SyncHandoffPool:
