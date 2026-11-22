@@ -25,6 +25,7 @@ import pytest
 
 import messagefoundry.store.sqlserver as sqlserver_module
 from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
+from messagefoundry.store.crypto import make_cipher
 from messagefoundry.store.sqlserver import SqlServerStore, _SyncHandoffPool
 
 # --- #5663: the sync handoff pool -------------------------------------------------------------
@@ -445,3 +446,51 @@ async def test_a_failed_alter_cursor_open_reaches_the_alters_handler(
     # The control: a peer that turned RCSI on lets the open go on, as on main.
     _install(monkeypatch, alters_fail=False, alter_cursor_fails=True, later_row=(1, 1))
     await SqlServerStore._ensure_database_options(_settings())
+
+
+# --- #5667: the ingress incref reads OUTPUT -----------------------------------------------------
+
+
+class _IncrefCursor(_NocountCursor):
+    """Finds every attachment the incref names; every other statement has an empty rowset."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.params: list[Any] = []
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        await super().execute(sql, params)
+        self.params.append(params)
+        if sql == sqlserver_module._SQL_INCREF_ATTACHMENT:
+            self._current = [(params[1],)]
+
+
+def _ingress_store(cur: _NocountCursor) -> tuple[SqlServerStore, list[int]]:
+    store, commits = _store(cur)
+    store._cipher = make_cipher(None)
+    store._message_events = "all"
+    store.body_copies = 0
+    return store, commits
+
+
+async def test_ingress_of_a_missing_attachment_raises_under_nocount() -> None:
+    """Red before #5667: ``rowcount`` of -1 is truthy, so the link to a missing row committed."""
+    cur = _NocountCursor([])  # no rowset for any statement: the incref's OUTPUT is empty
+    store, commits = _ingress_store(cur)
+    with pytest.raises(KeyError):
+        await store.enqueue_ingress(channel_id="c", raw="MSH|", attachment_refs=["f" * 64])
+    assert sqlserver_module._SQL_INCREF_ATTACHMENT in cur.executed
+    assert commits == [], "a message linked to a missing attachment must not commit"
+    assert not any("message_attachment" in sql for sql in cur.executed)
+
+
+async def test_ingress_increfs_inside_its_own_transaction() -> None:
+    """The incref runs on the ingress cursor, so one commit carries the row, incref and link."""
+    ref = "a" * 64
+    cur = _IncrefCursor()
+    store, commits = _ingress_store(cur)
+    await store.enqueue_ingress(channel_id="c", raw="MSH|", attachment_refs=[ref])
+    assert commits == [1]
+    at = cur.executed.index(sqlserver_module._SQL_INCREF_ATTACHMENT)
+    assert cur.params[at] == (1, ref)
+    assert "INSERT INTO message_attachment" in cur.executed[at + 1]

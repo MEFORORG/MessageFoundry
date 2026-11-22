@@ -7635,10 +7635,10 @@ class SqlServerStore:
                     # (the enclosing transaction rolls back → no ACK). `refs` is de-duplicated, so the
                     # message_attachment PK never conflicts and the refcount is bumped once per distinct ref.
                     for ref in refs:
-                        await cur.execute(
-                            "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
-                        )
-                        if not cur.rowcount:
+                        # Read from OUTPUT: under a session-wide SET NOCOUNT ON, rowcount is a truthy
+                        # -1 and a missing ref would commit a dangling link (BACKLOG #5667).
+                        await cur.execute(_SQL_INCREF_ATTACHMENT, (1, ref))
+                        if await cur.fetchone() is None:
                             raise KeyError(f"attachment {ref!r} not found for ingress incref")
                         await cur.execute(
                             "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
