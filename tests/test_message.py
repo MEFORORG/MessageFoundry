@@ -253,6 +253,169 @@ def test_add_segment_refuses_a_header_segment(header: str) -> None:
     assert m.encode() == before
 
 
+# --- reads and writes use the delimiters the parser read (BACKLOG #5972) ------
+
+#: Messages the parser accepts whose delimiters do not come from four MSH-2 characters: a short
+#: MSH-2 (the parser fills the missing ones as ``^ ~ \\ &``), and a BHS- or FHS-led message with
+#: no MSH, whose separators come from the batch or file header.
+_PARSER_FILLED = {
+    "short-msh-2": "MSH|^~|A|B|C|D|20260101||ADT^A01|M1|P|2.5\rPID|1||111^^^X~222^^^Y||DOE^JANE\r",
+    "bhs-led": "BHS|^~\\&|A|B\rPID|1||111^^^X~222^^^Y||DOE^JANE\r",
+    "fhs-led": "FHS|^~\\&|A|B\rPID|1||111^^^X~222^^^Y||DOE^JANE\r",
+}
+
+
+@pytest.mark.parametrize("raw", list(_PARSER_FILLED.values()), ids=list(_PARSER_FILLED))
+def test_a_read_uses_the_delimiters_the_parser_read(raw: str) -> None:
+    """BACKLOG #5972: every ``Message`` read used to raise on these, though the parser had already
+    split them and ``Peek.field`` (the Router's read) read them. The two reads now agree."""
+    m = Message.parse(raw)
+    assert m._encoding_chars() == ("|", "^", "~", "\\", "&")
+    assert m["PID-3.1"] == "111"
+    assert m.repetitions("PID-3.1") == ["111", "222"]
+    assert m.field("PID-3", repetition=2) == "222^^^Y"
+    assert m["PID-5.2"] == "JANE"
+    if raw.startswith("MSH"):
+        assert Peek.parse(raw).field("PID-3.1") == m["PID-3.1"]
+
+
+@pytest.mark.parametrize("raw", list(_PARSER_FILLED.values()), ids=list(_PARSER_FILLED))
+def test_a_write_uses_the_delimiters_the_parser_read(raw: str) -> None:
+    """A component write escapes by the delimiters every line is split on, so it round-trips."""
+    m = Message.parse(raw)
+    m.set("PID-5.1", "O^Brien&Co")
+    m.add_repetition("PID-3", "333^^^Z")
+    m.add_segment("NTE|1||note")
+    again = Message.parse(m.encode())
+    assert again["PID-5.1"] == "O^Brien&Co"
+    assert again["PID-5.2"] == "JANE"
+    assert again.repetitions("PID-3.1") == ["111", "222", "333"]
+    assert again["NTE-3"] == "note"
+
+
+@pytest.mark.parametrize(
+    ("raw", "header"),
+    [
+        (_PARSER_FILLED["short-msh-2"], "MSH"),
+        (_PARSER_FILLED["bhs-led"], "BHS"),
+        (_PARSER_FILLED["fhs-led"], "FHS"),
+    ],
+)
+def test_a_parser_filled_header_still_refuses_a_delimiter_change(raw: str, header: str) -> None:
+    """The write half of BACKLOG #5972 holds on these too: fields 1 and 2 of the leading header
+    take only what they already read, and a passthrough copy is still accepted."""
+    m = Message.parse(raw)
+    before = m.encode()
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set(f"{header}-1", "#")
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set(f"{header}-2", "#~\\&")
+    m.set(f"{header}-2", m[f"{header}-2"] or "")
+    assert m.encode() == before
+
+
+def test_an_inner_msh_naming_other_delimiters_does_not_steer_a_write() -> None:
+    """A batch is split on its first line's delimiters, so a write escapes by those, not by an
+    inner MSH-2 that names ``#`` as the component separator: escaping by the MSH let a ``^`` in
+    the value through raw, where the split read it as structure (BACKLOG #5972)."""
+    m = Message.parse("BHS|^~\\&|A\rMSH|#~\\&|A|B\rPID|1||X^Y\r")
+    assert m["PID-3.1"] == "X"
+    m.set("PID-3.1", "A^B")
+    again = Message.parse(m.encode())
+    assert again["PID-3.1"] == "A^B"
+    assert again["PID-3.2"] == "Y"
+
+
+#: Short MSH-2s whose filled default is already another of their separators: ``^`` is the field
+#: separator and the default component one; ``~`` is the declared component separator and the
+#: default repetition one; ``&`` is the declared escape and the default subcomponent separator.
+_COLLIDING = (
+    "MSH^^A^B^C^D^20260101^^ADT^A01^M1^P^2.5\rPID^1^^111^^DOE\r",
+    "MSH|~|A|B\rPID|1||111\r",
+    "MSH|^~&|A|B\rPID|1||111\r",
+    # A short MSH-2 that repeats a character itself: "~" is the repetition separator and the
+    # escape (round-3 review finding 1).
+    "MSH|^~~|A|B\rPID|1||111\r",
+)
+
+
+@pytest.mark.parametrize("raw", _COLLIDING)
+def test_a_filled_default_that_is_already_a_separator_reads_but_is_not_written(raw: str) -> None:
+    """A short MSH-2 whose filled default is already another separator makes two structures one
+    character, so a value joined on one would read back as the other. The parse accepts it, as
+    ``Peek.parse`` does, so a read, a route and an ACK see what the sender sent; every ``Message``
+    write that would join on those separators refuses it (BACKLOG #5972)."""
+    assert Peek.parse(raw).field("PID-1") == "1"
+    m = Message.parse(raw)
+    assert m.field("PID-1") == "1"
+    assert m.encode() == raw
+    for write in (
+        lambda: m.set("PID-5.2", "JANE"),
+        lambda: m.set_data("PID-5", "JANE"),
+        lambda: m.set("PID-5", "JANE"),
+        lambda: m.set("MSH-2", m.field("MSH-2") or ""),
+        lambda: m.add_repetition("PID-3", "222"),
+        lambda: m.add_segment("NTE|1"),
+    ):
+        with pytest.raises(ValueError, match="a default filled in for one"):
+            write()
+    assert m.encode() == raw
+    # The control: a short MSH-2 whose filled defaults are new characters is written.
+    plain = Message.parse(_PARSER_FILLED["short-msh-2"])
+    plain.set("PID-5.2", "JOHN")
+    assert Message.parse(plain.encode())["PID-5.2"] == "JOHN"
+
+
+def test_a_short_msh_2_may_be_completed_to_the_characters_the_parser_filled() -> None:
+    """The header can be made to declare the delimiters the body is written in; any other
+    completion would move one, and stays refused."""
+    m = Message.parse(_PARSER_FILLED["short-msh-2"])
+    # The refusal names the completion it would have taken (R2-8 of the round-2 review).
+    with pytest.raises(ValueError, match="holds the message's delimiters.*complete it to"):
+        m.set("MSH-2", "^~#&")
+    m.set("MSH-2", "^~\\&")
+    again = Message.parse(m.encode())
+    assert again["MSH-2"] == "^~\\&"
+    assert again.repetitions("PID-3.1") == ["111", "222"]
+
+
+def test_a_refused_group_rebuild_changes_nothing() -> None:
+    """A rebuild cleared the group before its first append raised, so on a message that refuses
+    every write the order lost its observations (BACKLOG #5972)."""
+    m = Message.parse("MSH|^~&|A|B\rOBR|1\rOBX|1|TX|||keep\r")
+    before = m.encode()
+    with pytest.raises(ValueError, match="a default filled in for one"):
+        m.groups()[0].rebuild(["OBX|2|TX|||new"])
+    assert m.encode() == before
+
+
+def test_a_refused_group_delete_changes_nothing() -> None:
+    """R2-4 of the round-2 review: a ``groups("BHS")`` group of a BHS-led message opens with the
+    leading header, which the positional delete refuses, but ``delete`` removed every later row
+    before it reached that one and raised. Every row is now checked first (BACKLOG #5972)."""
+    m = Message.parse("BHS|^~\\&|A\rMSH|^~\\&|A|B\rPID|1\rOBX|1\r")
+    before = m.encode()
+    with pytest.raises(ValueError, match="refusing to delete the BHS header that leads"):
+        m.groups("BHS")[0].delete()
+    assert m.encode() == before
+    # The control: a group that does not hold the header still deletes.
+    obr = Message.parse("MSH|^~\\&|A|B\rOBR|1\rOBX|1\rOBR|2\rOBX|2\r")
+    assert obr.groups()[0].delete() == 2
+
+
+@pytest.mark.parametrize("header", ["BHS", "FHS"])
+def test_the_leading_batch_header_cannot_be_deleted(header: str) -> None:
+    """Every line is read and written in the leading header's delimiters, so deleting it would
+    leave the message led by a line that names others (BACKLOG #5972). A later one may go."""
+    m = Message.parse(f"{header}|#~\\&|A\rMSH|^~\\&|A|B\rPID|1||X#Y\r")
+    before = m.encode()
+    with pytest.raises(ValueError, match=f"refusing to delete the {header} header"):
+        m.delete_segments(header)
+    assert m.encode() == before
+    batch = Message.parse("FHS|^~\\&|A\rBHS|^~\\&|A\rMSH|^~\\&|A|B\rPID|1\r")
+    assert batch.delete_segments("BHS") == 1
+
+
 # --- field repetitions (H-9) -------------------------------------------------
 
 

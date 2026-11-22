@@ -308,6 +308,8 @@ ul.tree .tval { color: var(--ink); white-space: pre-wrap; word-break: break-word
 .gedge { stroke: var(--line); stroke-width: 1.5px; }
 .gedge-declared, .gedge-literal { stroke: var(--muted); }
 .gedge-heuristic { stroke: var(--muted); stroke-dasharray: 4 3; opacity: 0.7; }
+/* A back-edge (reingress_to into its loopback, or a pass-through Send) is a routed path, so no fill. */
+.gedge-back { fill: none; }
 /* Trend chart: axes + up-to-6 overlaid series (colour classes reused by the legend swatches). */
 .trendchart .axis { stroke: var(--line); stroke-width: 1px; }
 .trendchart .axislabel { fill: var(--muted); font-size: 11px; }

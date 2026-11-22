@@ -201,11 +201,22 @@ def test_delete_segments_occurrence_skips_a_fieldless_line_like_count_segments()
     assert msg.count_segments("OBX") == 0
 
 
-def test_delete_segments_occurrence_reaches_a_leading_batch_header() -> None:
-    # Index 0 is an FHS here, not MSH; the delete-all form removes it, so this form must too.
+def test_delete_segments_occurrence_refuses_the_leading_batch_header() -> None:
+    # Index 0 is an FHS here, not MSH. The delete-all form refuses the header that leads the
+    # message (BACKLOG #5972), so this form refuses that occurrence too and changes nothing.
     msg = Message.parse("FHS|^~\\&|A\rBHS|^~\\&|A\rMSH|^~\\&|A|B|C|D|20260101||ORU^R01|1|P|2.5.1")
-    assert msg.delete_segments("FHS", occurrence=1) == 1
-    assert msg.segments()[0] == "BHS"
+    with pytest.raises(ValueError, match="leads the message"):
+        msg.delete_segments("FHS", occurrence=1)
+    assert msg.segments()[:2] == ["FHS", "BHS"]
+
+
+def test_delete_segments_occurrence_removes_a_later_header_of_the_leading_id() -> None:
+    # Only the occurrence that IS the leading header is refused; a later BHS of the same id goes.
+    msg = Message.parse(
+        "BHS|^~\\&|A\rMSH|^~\\&|A|B|C|D|20260101||ORU^R01|1|P|2.5.1\rBHS|^~\\&|B\rBTS|1"
+    )
+    assert msg.delete_segments("BHS", occurrence=2) == 1
+    assert msg.segments() == ["BHS", "MSH", "BTS"]
 
 
 def test_an_obx_before_the_first_obr_is_renumbered_too() -> None:
