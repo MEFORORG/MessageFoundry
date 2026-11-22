@@ -84,6 +84,18 @@ function Format-Age {
     return "$([math]::Round($Span.TotalDays, 1)) days old"
 }
 
+function Get-RecordText {
+    # One field of a parsed record as text, '' when the record has no such field or is not an object.
+    # A plain `$record.field` THROWS under strict mode on a missing field or a null record, and the
+    # throw lands in the outer catch, which exits 0 with no output: one empty file among the seats or
+    # allocations would cost this session its whole restore (BACKLOG #5865).
+    param($Record, [string]$Name)
+    if ($null -eq $Record) { return '' }
+    $property = $Record.PSObject.Properties[$Name]
+    if (-not $property) { return '' }
+    return [string]$property.Value
+}
+
 # ---- scope: a compaction restart, and nothing else --------------------------------------------
 # Read before any other work, so the common case (a cold start) costs one JSON parse and exits.
 $hookSource = ''
@@ -145,6 +157,9 @@ if (-not (Get-Command Read-CoordText -ErrorAction SilentlyContinue)) {
     function Read-CoordText([string]$Path) { Get-Content -LiteralPath $Path -Raw -ErrorAction Stop }
 }
 
+# Outside the try, so the catch below can still print what was gathered before a throw.
+$lines = @()
+$banner = "[precompact] Restoring what this compaction is about to drop.`n"
 try {
     $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
@@ -155,8 +170,6 @@ try {
     if (-not $top) { exit 0 }
     $top = $top.Trim()
     $topNorm = ($top -replace '/', '\').TrimEnd('\')
-
-    $lines = @()
 
     # seats/ and alloc/ live on the SHARED root (docs/COORD-SHARED-ROOT.md). One probe answers both,
     # since the resolver puts every shared kind on one root. A root that does not answer drops only
@@ -196,7 +209,7 @@ try {
                  Sort-Object LastWriteTimeUtc -Descending
         foreach ($f in $cands) {
             try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
-            $wt = [string]$j.worktree
+            $wt = Get-RecordText $j 'worktree'
             if (-not $wt) { continue }
             if (($wt -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
             # Another PC can hold a worktree at the same path. Its record is that PC's seat, not this
@@ -214,12 +227,16 @@ try {
     }
 
     if ($declared) {
+        # A goal with no seat is a real record: `seat.ps1 -Declare -Goal` without -Seat writes one. It
+        # is still the newest stated intent, so it is restored with the seat marked as missing.
+        $declSeat = Get-RecordText $declared 'seat'
+        if (-not $declSeat) { $declSeat = '(none recorded)' }
         # A worktree OUTLIVES the session that declared in it -- directories here get re-used, and a
         # record matched on path alone can be a previous occupant's intent wearing this tree's name.
         # Restoring that as if it were current is worse than restoring nothing, because a stale goal
         # is actionable and reads as authoritative. The branch is the discriminator the fleet already
         # uses for exactly this ("the directory was re-used"), so check it before trusting the goal.
-        $declBranch = if ($declared.PSObject.Properties['branch']) { [string]$declared.branch } else { '' }
+        $declBranch = Get-RecordText $declared 'branch'
         $stale = $declBranch -and $branchNow -and ($declBranch -ne $branchNow)
 
         $age = ''
@@ -249,11 +266,11 @@ try {
             $lines += "It was declared on branch '$declBranch'$age; this session is on '$branchNow'."
             $lines += "Worktrees get re-used, so treat the following as a previous occupant's intent"
             $lines += "and re-declare rather than adopting it:"
-            $lines += "    seat: $($declared.seat)"
+            $lines += "    seat: $declSeat"
             $lines += "    goal: $($declared.goal)"
             $lines += '    pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"'
         } else {
-            $lines += "SEAT: $($declared.seat)"
+            $lines += "SEAT: $declSeat"
             $lines += "GOAL: $($declared.goal)"
             if ($declared.PSObject.Properties['done'] -and $declared.done) { $lines += "DONE WHEN: $($declared.done)" }
             if ($declared.PSObject.Properties['outOfScope'] -and $declared.outOfScope) { $lines += "OUT OF SCOPE: $($declared.outOfScope)" }
@@ -272,11 +289,12 @@ try {
     # worktree is removed, and after a compaction nobody in the session remembers holding one.
     $allocDir = if ($sharedRoot) { Join-Path $sharedRoot 'alloc' } else { $null }
     $held = @()
+    $unreadable = @()
     if ($sharedError) { $lines += ''; $lines += "LEDGER NUMBERS: not checked, the shared root did not answer." }
     if ($allocDir -and (Test-Path -LiteralPath $allocDir)) {
         foreach ($f in (Get-ChildItem -LiteralPath $allocDir -Recurse -Filter '*.json' -File -EA SilentlyContinue)) {
             try { $a = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
-            $aw = [string]$a.worktree
+            $aw = Get-RecordText $a 'worktree'
             if (-not $aw) { continue }
             # Another machine's allocation names a path on that machine's disk, so the same path here
             # is a different tree and the number is not this one's to lose. No `host` is this machine.
@@ -285,7 +303,11 @@ try {
             # each other (...-cfbf59 and ...-cfbf59-connscale-ci-claim), so a prefix test claims another
             # tree's numbers as your own.
             if (($aw -replace '/', '\').TrimEnd('\') -ne $topNorm) { continue }
-            $held += "#$($a.number) ($($a.kind)) $($a.title)"
+            # THE FILENAME IS THE NUMBER, as alloc.ps1 records, and the body's `number` field is not, so
+            # a body that lost the field still names its number. A file naming this tree with no
+            # number in its name may still be a held allocation, so it is reported, never skipped.
+            if ($f.BaseName -notmatch '^\d+$') { $unreadable += $f.FullName; continue }
+            $held += "#$($f.BaseName) ($($f.Directory.Name)) $(Get-RecordText $a 'title')"
         }
     }
     if ($held.Count -gt 0) {
@@ -293,6 +315,12 @@ try {
         $lines += "LEDGER NUMBERS THIS WORKTREE HOLDS -- these burn permanently if the tree is removed"
         $lines += "with raw git rather than scripts/worktree/remove.ps1:"
         foreach ($h in $held) { $lines += "    $h" }
+    }
+    if ($unreadable.Count -gt 0) {
+        $lines += ''
+        $lines += "UNREADABLE LEDGER RECORD -- names this worktree but its filename is no number, so it may"
+        $lines += "be a held allocation. Read it before removing this tree:"
+        foreach ($u in $unreadable) { $lines += "    $u" }
     }
 
     # ---- is the work safe ------------------------------------------------------------------
@@ -307,11 +335,17 @@ try {
     # PLAIN TEXT ON STDOUT, which is what SessionStart adds to context. See the header for the
     # envelope that used to be here and why the harness threw all of it away. [Console]::Out.Write
     # rather than Write-Output, so nothing reformats or wraps the lines on the way out.
-    [Console]::Out.Write(
-        "[precompact] Restoring what this compaction is about to drop.`n" + ($lines -join "`n")
-    )
+    [Console]::Out.Write($banner + ($lines -join "`n"))
     exit 0
 } catch {
-    # Deliberately swallowed. This hook never fails a turn.
+    # This hook never fails a turn, but a throw must not discard what was already gathered: that
+    # total loss is BACKLOG #5865. The inner try keeps a failed write from failing the turn.
+    try {
+        if ($lines.Count -gt 0) {
+            $lines += ''
+            $lines += "RESTORE INCOMPLETE: this hook stopped early ($($_.Exception.Message))."
+            [Console]::Out.Write($banner + ($lines -join "`n"))
+        }
+    } catch { }
     exit 0
 }

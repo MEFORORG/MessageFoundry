@@ -44,9 +44,11 @@ returns nothing over a correct tree is the same observation as a detector that i
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -440,9 +442,9 @@ def test_the_hook_reads_the_record_seat_ps1_actually_writes(repo: Worktree) -> N
 def test_a_held_ledger_number_is_reported(repo: Worktree) -> None:
     """The one restored fact with a permanent cost attached: an unfiled number burns with the tree."""
     _declaration(repo)
-    alloc = repo.common / "mefor-coord" / "alloc"
+    alloc = repo.common / "mefor-coord" / "alloc" / "adr"
     alloc.mkdir(parents=True, exist_ok=True)
-    (alloc / "a.json").write_text(
+    (alloc / "4242.json").write_text(
         json.dumps(
             {"number": 4242, "kind": "adr", "title": "a held allocation", "worktree": repo.top}
         ),
@@ -470,6 +472,141 @@ def test_a_declaration_from_another_branch_is_flagged_rather_than_adopted(repo: 
     out = run_hook(repo, _COMPACT_RESTART)
     assert "NOT YOURS" in out, f"a previous occupant's goal was restored as current: {out}"
     assert "a-previous-occupant" in out, "the branch that discriminates them must be named"
+
+
+# ------------------------------------------------------------- one bad record among good ones
+
+# BACKLOG #5865: under strict mode each of these threw to the outer catch, which exits 0 with no
+# output, so one bad file cost the seat, the goal and the held numbers.
+_BAD_BODIES = {
+    "zero-byte": "",
+    "empty-object": "{}",
+    "json-null": "null",
+    "empty-array": "[]",
+    "bare-number": "5",
+}
+# These only reach the unguarded reads when the record names this worktree.
+_BAD_FOR_THIS_TREE: dict[str, dict[str, str]] = {
+    "worktree-only": {},
+    "goal-without-seat": {"goal": "BAD-RECORD-GOAL"},
+}
+# A goal with no seat is excluded under seats/ because it is a real record that rightly wins there;
+# test_a_newer_goal_with_no_seat_is_restored pins that.
+_BAD_CASES = [
+    (kind, shape)
+    for kind in ("seats", "alloc")
+    for shape in (*_BAD_BODIES, *_BAD_FOR_THIS_TREE)
+    if (kind, shape) != ("seats", "goal-without-seat")
+]
+_UNREADABLE_ALLOC = "UNREADABLE LEDGER RECORD"
+
+
+def _good_allocation(repo: Worktree) -> None:
+    alloc = repo.common / "mefor-coord" / "alloc" / "adr"
+    alloc.mkdir(parents=True, exist_ok=True)
+    (alloc / "4242.json").write_text(
+        json.dumps({"number": 4242, "kind": "adr", "title": "a held one", "worktree": repo.top}),
+        encoding="utf-8",
+    )
+
+
+def _plant_newest(directory: Path, name: str, body: str) -> Path:
+    """Write `body` with a modified time ahead of every other record, so it is read first."""
+    directory.mkdir(parents=True, exist_ok=True)
+    planted = directory / name
+    planted.write_text(body, encoding="utf-8")
+    ahead = time.time() + 60
+    os.utime(planted, (ahead, ahead))
+    return planted
+
+
+@pytest.mark.parametrize(("kind", "shape"), _BAD_CASES)
+def test_one_bad_record_does_not_cost_the_restore(repo: Worktree, kind: str, shape: str) -> None:
+    """The good declaration and the good held number both survive a bad record beside them."""
+    _declaration(repo, goal="the good goal")
+    _good_allocation(repo)
+    subdir = "box" if kind == "seats" else "adr"
+    body = (
+        _BAD_BODIES[shape]
+        if shape in _BAD_BODIES
+        else json.dumps({**_BAD_FOR_THIS_TREE[shape], "worktree": repo.top})
+    )
+    _plant_newest(repo.common / "mefor-coord" / kind / subdir, "9999.json", body)
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "SEAT: builder" in out, f"{kind}/{shape} cost the seat: {out!r}"
+    assert "GOAL: the good goal" in out, f"{kind}/{shape} cost the goal: {out!r}"
+    assert "#4242" in out, f"{kind}/{shape} cost the held number: {out!r}"
+    if kind == "alloc" and shape in _BAD_FOR_THIS_TREE:
+        assert "#9999" in out, f"the filename names this held number, and it vanished: {out!r}"
+
+
+@pytest.mark.parametrize("fields", [{}, {"number": 5}], ids=["no-number", "body-number"])
+def test_a_record_of_this_tree_with_no_numeric_filename_is_reported(
+    repo: Worktree, fields: dict[str, int]
+) -> None:
+    """The filename is the number (alloc.ps1), so a body's number does not make this one readable."""
+    _declaration(repo)
+    planted = _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "notes.json",
+        json.dumps({**fields, "worktree": repo.top}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert _UNREADABLE_ALLOC in out, f"a record this tree may hold vanished: {out!r}"
+    assert planted.name in out, f"the line does not name the file to read: {out!r}"
+
+
+def test_another_worktrees_unreadable_allocation_is_not_reported(repo: Worktree) -> None:
+    """The control for the test above: it is about THIS tree's records, not every bad file."""
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "notes.json",
+        json.dumps({"worktree": repo.top + "-sibling"}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "GOAL:" in out, out
+    assert _UNREADABLE_ALLOC not in out, f"another tree's record was claimed: {out!r}"
+
+
+def test_a_newer_goal_with_no_seat_is_restored(repo: Worktree) -> None:
+    """`seat.ps1 -Declare -Goal` without -Seat writes this, so it is the newest stated intent."""
+    _declaration(repo, goal="an older goal")
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "newer.json",
+        json.dumps({"goal": "a goal with no seat", "worktree": repo.top}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "GOAL: a goal with no seat" in out, out
+    assert "SEAT: (none recorded)" in out, out
+    assert "an older goal" not in out, out
+
+
+def test_a_later_throw_keeps_what_was_already_gathered(repo: Worktree, tmp_path: Path) -> None:
+    """Any throw past the guarded reads must degrade the restore, never empty it."""
+    planted = tmp_path / "scripts" / "hooks" / HOOK.name
+    planted.parent.mkdir(parents=True)
+    marker = "    # ---- is the work safe"
+    source = HOOK.read_text(encoding="utf-8")
+    assert marker in source
+    planted.write_text(source.replace(marker, f"    throw 'planted'\n{marker}"), encoding="utf-8")
+    (tmp_path / "scripts" / "coord").mkdir()
+    shutil.copy2(HOOK.parents[1] / "coord" / "coord-root.ps1", tmp_path / "scripts" / "coord")
+    _declaration(repo, goal="survive a later throw")
+
+    out = run_hook(repo, _COMPACT_RESTART, script=planted)
+
+    assert "GOAL: survive a later throw" in out, out
+    assert "RESTORE INCOMPLETE" in out, out
 
 
 # ----------------------------------------------------------------------------- the reported age
