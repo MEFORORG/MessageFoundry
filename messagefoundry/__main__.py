@@ -3027,6 +3027,11 @@ def _missing_service_config_refused(service_config: str | None, *, fleet: str = 
     return True
 
 
+#: The logging format of a ``[security]`` loosening line ``supervise`` and the remote-debugging
+#: refusal write, for a ``(name, text)`` entry (vault BACKLOG #3795 item 15).
+_SECURITY_LINE = "[security] %s: %s. See docs/SECURITY-LOOSENING.md."
+
+
 def _remote_debug_audit(
     settings: ServiceSettings, posture: RemoteDebugPosture, *, enforcing: bool, what: str
 ) -> str | None:
@@ -3065,9 +3070,7 @@ def _remote_debug_refused(
     # would not say that the engine's hook did not answer. The relaunch the refusal names turns
     # the interface off, and would leave what stopped the hook unreported.
     if not posture.guard_installed and (unguarded := remote_debug_loosening(posture)) is not None:
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *unguarded
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *unguarded)
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True
 
@@ -6023,15 +6026,11 @@ def _supervise(args: argparse.Namespace) -> int:
     remote_debug = remote_debug_loosening(remote_debug_reading)
     if remote_debug is not None:
         security_lines.append(remote_debug)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *remote_debug)
     if settings.security.allow_remote_debugging:
         accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
         security_lines.append(accepted)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *accepted
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *accepted)
     # Vault BACKLOG #2626 step 3: the settings-file and value-file check each engine shard's
     # `serve` makes next, at the same place among its gates. Without it here, a file another
     # account can write would refuse every engine shard, and the supervisor would only restart
@@ -6048,9 +6047,7 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     for startup_entry in startup_loosenings(startup):
         security_lines.append(startup_entry)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *startup_entry
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *startup_entry)
 
     # Vault BACKLOG #2595: the service-environment check each engine shard's `serve` makes. A
     # shard reads the same NSSM service as the supervisor, since that service is an ancestor of
@@ -6073,9 +6070,7 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     for service_env_entry in service_env_loosenings(service_env):
         security_lines.append(service_env_entry)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *service_env_entry
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *service_env_entry)
 
     # BACKLOG #2356: the two credential gates `serve` makes next, in its order. The
     # managed-identity gate, because the renewal below
@@ -6205,9 +6200,7 @@ def _supervise(args: argparse.Namespace) -> int:
             _write_start_audit([f"{fleet_audit} (Logged again for the off-box forwarder.)"])
         for security_line in security_lines:
             logging.getLogger(__name__).warning(
-                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
-                "forwarder.)",
-                *security_line,
+                f"{_SECURITY_LINE} (Logged again for the off-box forwarder.)", *security_line
             )
 
     try:

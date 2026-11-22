@@ -2453,7 +2453,8 @@ count is above `0` (vault BACKLOG #2613).
   the engine's own process. `supervise` logs one WARNING for the supervisor process once its
   start has passed its remote-debugging gate, so a fleet refused at an earlier gate logs none.
   Where that gate refuses, `serve` and `supervise` log `remote_debug_unguarded` if the hook did not
-  answer, and nothing for `remote_debug_enabled`. `supervise` logs the line a second time once its off-box log forwarder is installed, so the collector's
+  answer, and nothing for `remote_debug_enabled`. Under `supervise` that line goes to standard
+  output, before the refusal, which goes to standard error. `supervise` logs the line a second time once its off-box log forwarder is installed, so the collector's
   copy has it. No API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
