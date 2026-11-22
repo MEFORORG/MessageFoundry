@@ -671,9 +671,7 @@ class BackupRunner:
         self._ensure_destination(dest_dir)
 
         # The key SOURCE is the existing store DEK (ADR 0019). Resolve it the same way open_store does.
-        # Off the loop for a read-only provider, which can dial a Vault that does not answer. See
-        # `_key_hop` (BACKLOG #5888).
-        key = await _key_hop(self._store_settings, self._resolve_key)
+        key = self._resolve_key()
         if key is None and not s.allow_unencrypted:
             # Fail-closed: a no-key instance refuses to write a cleartext archive unless the explicit,
             # audited [backup].allow_unencrypted escape is set (parallel to [store].allow_unencrypted_phi).
@@ -4523,9 +4521,12 @@ async def _key_hop[**P, T](
 ) -> T:
     """``resolve(...)``, in its own thread hop for a read-only provider and on the loop for any
     other, so a timeout cannot abandon THIS resolve in the middle of a custody write (BACKLOG
-    #5888). A full verify opens the snapshot in its worker thread and can resolve the key again
-    there; this does not cover that. On the loop it blocks the engine, and no timeout can fire, for
-    as long as the provider takes.
+    #5888). On the loop it blocks the engine, and no timeout can fire, for as long as the provider
+    takes. This covers the restore and verify keyring only: ``_do_backup`` still resolves on the
+    loop, because no existing timeout could bound a hop there and a hung pass would stop backups
+    with no failure row. A full verify's snapshot open is not covered either. A limit older than
+    this hop: ``host`` custody read through settings naming a staging path, with no secrets
+    directory set, raises ``HostCustodyMissing``, so a full verify there would likely fail.
 
     A caller's timeout cannot stop the thread. One left behind runs until the provider returns,
     which nothing here bounds, and holds process exit until then; its value is dropped."""

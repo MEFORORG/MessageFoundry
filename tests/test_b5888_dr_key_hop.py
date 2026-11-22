@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5888: the DR backup, verify and restore resolve a read-only store key off the event loop.
+"""BACKLOG #5888: the DR verify and restore resolve a read-only store key off the event loop.
 
 Each resolved and decoded the key on the loop, so a slow key provider would have stalled the engine
 and, on a DR activation, kept the takeover timeout around ``run_restore_verify`` from firing. A
 provider whose resolve can write custody state stays on the loop, so an abort cannot land mid-write.
+The backup still resolves on the loop, as a hung hop there would stop backups with no failure row.
 Every key and provider here is synthetic, and no Vault server is started."""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import sys
 import threading
 import time
@@ -71,6 +71,9 @@ def _backup(tmp_path: Path, provider: str = "auto") -> Awaitable[object]:
 _ENTRY_POINTS = pytest.mark.parametrize(
     "call", [_verify, _restore, _backup], ids=["restore-verify", "restore", "backup"]
 )
+_HOP_ENTRY_POINTS = pytest.mark.parametrize(
+    "call", [_verify, _restore], ids=["restore-verify", "restore"]
+)
 _Call = Callable[..., Awaitable[object]]
 
 
@@ -120,7 +123,7 @@ def held(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Provider]:
         assert not provider.entered.is_set() or provider.left.wait(_HOLD_SECONDS)
 
 
-@_ENTRY_POINTS
+@_HOP_ENTRY_POINTS
 async def test_the_loop_stays_live_while_the_key_provider_blocks(
     call: _Call, tmp_path: Path, held: _Provider
 ) -> None:
@@ -195,7 +198,7 @@ async def test_each_key_error_reaches_the_caller_unchanged(
     assert error.__cause__ is None and error.__context__ is None
 
 
-@_ENTRY_POINTS
+@_HOP_ENTRY_POINTS
 async def test_a_key_that_does_not_decode_refuses_off_the_loop(
     call: _Call, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -231,7 +234,7 @@ async def test_the_blocking_step_runs_only_after_the_key_hop_and_gets_its_keys(
 # --- which providers take the hop -------------------------------------------------------------
 
 
-@_ENTRY_POINTS
+@_HOP_ENTRY_POINTS
 @pytest.mark.parametrize("name", ["auto", "env", "dpapi", "vault"])
 async def test_a_read_only_provider_resolves_off_the_loop(
     call: _Call, name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -243,7 +246,19 @@ async def test_a_read_only_provider_resolves_off_the_loop(
     assert provider.threads and threading.get_ident() not in provider.threads
 
 
-@_ENTRY_POINTS
+@pytest.mark.parametrize("name", ["auto", "env", "dpapi", "vault", "host", "synthetic-unknown"])
+async def test_the_backup_resolves_on_the_loop_as_main_does(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row's remainder: a hop here needs a bounded wait wired to the backup failure row."""
+    provider = _Provider(raises=KeyProviderError("synthetic refusal"))
+    _install(monkeypatch, provider)
+    with pytest.raises(KeyProviderError):
+        await _backup(tmp_path, name)
+    assert provider.threads == [threading.get_ident()]
+
+
+@_HOP_ENTRY_POINTS
 @pytest.mark.parametrize("name", ["host", "synthetic-unknown"])
 async def test_a_writing_or_unknown_provider_resolves_on_the_loop(
     call: _Call, name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -267,7 +282,10 @@ async def test_an_abort_is_not_followed_by_a_custody_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The real host provider and a real synthetic handoff. Red before the rule: the abort returned
-    with the handoff in place, and the abandoned thread then wrote the host file and deleted it."""
+    with the handoff in place, and the abandoned thread then wrote the host file and deleted it.
+
+    The timer expires during the on-loop resolve and fires at the first yield after it, the verify
+    hop, which the stand-in holds open. So the conversion is complete when the abort arrives."""
     for name in (
         "MEFOR_STORE_ENCRYPTION_KEY",
         "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
@@ -295,16 +313,21 @@ async def test_an_abort_is_not_followed_by_a_custody_write(
     def files() -> tuple[bool, bool]:
         return handoff.exists(), host.exists()
 
+    def slow_verify(**_kwargs: object) -> object:
+        time.sleep(0.5)
+        return None
+
     monkeypatch.setattr(custody_host, "_convert_handoff", slow_convert)
+    monkeypatch.setattr(dr_backup, "_verify_archive_blocking", slow_verify)
     settings = StoreSettings(path=str(tmp_path / "store.db")).model_copy(
         update={"key_provider": "host"}
     )
-    with contextlib.suppress(TimeoutError):
+    with pytest.raises(TimeoutError):
         await asyncio.wait_for(
             dr_backup.run_restore_verify(str(tmp_path / "none.mfbak"), store_settings=settings),
             timeout=0.1,
         )
     at_abort = files()
-    assert finished.wait(_HOLD_SECONDS)
-    assert files() == at_abort, "a custody file changed after the caller had aborted"
+    assert at_abort == (False, True), "the conversion had not completed when the abort arrived"
+    assert finished.is_set()
     assert threads == [threading.get_ident()]
