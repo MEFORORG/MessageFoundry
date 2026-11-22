@@ -1545,13 +1545,14 @@ class SyncHandoffUnavailable(RuntimeError):
     (PR2/PR3) catches this as 'fusion unavailable' and falls back to the async handoff path."""
 
 
-class StorePinConnectRefused(RuntimeError):
+class StorePinConnectRefused(Exception):
     """A new store connection refused before it dialled, because a settings check at ``enforce``
     refused the SQL Server ``[store].ssl_root_cert`` pin, while that hold stands (vault BACKLOG
-    #3714 step 11, :func:`refuse_connect_after_pin_refusal`; trust anchors module item 11). It is
-    not a
-    :class:`~messagefoundry.config.tls_policy.StoreTlsRefused`, so a handler of that refusal does
-    not read it as a start gate refusing. It is raised mostly while the store runs, but a store
+    #3714 step 11, :func:`refuse_connect_after_pin_refusal`; trust anchors module item 11).
+
+    It is not a :class:`~messagefoundry.config.tls_policy.StoreTlsRefused`, so a handler of that
+    refusal does not read it as a start gate refusing, nor a ``RuntimeError``, which callers of an
+    executor read as a shut-down executor. It is raised mostly while the store runs, but a store
     open whose own pin check did not lift the hold can raise it too."""
 
 
@@ -3365,8 +3366,9 @@ def _refuse_connect(spec: AnchorSpec) -> None:
     if refusal is not None:
         raise StorePinConnectRefused(
             f"[store].ssl_root_cert {spec.path!r}: a new store connection was refused, because a "
-            f"settings check at enforce refused the pin and the hold stands (item 11 of the "
-            f"messagefoundry.auth.trust_anchors module docstring): {refusal}"
+            "settings check at enforce refused the pin and the hold stands; the ERROR logged "
+            "when it started gives the refusal, and item 11 of the "
+            "messagefoundry.auth.trust_anchors module docstring says what lifts it"
         )
 
 

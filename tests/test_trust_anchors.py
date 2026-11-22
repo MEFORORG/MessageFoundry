@@ -74,6 +74,7 @@ def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "_STORE_CONTENT_RECORDED", {}, raising=False)
     monkeypatch.setattr(ta, "_STORE_PIN_FIRST_CHECKED", {}, raising=False)
     monkeypatch.setattr(ta, "_STORE_PIN_REFUSED", {}, raising=False)
+    monkeypatch.setattr(ta, "_STORE_PIN_RELEASE_REFUSED", set(), raising=False)
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:

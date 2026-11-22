@@ -227,6 +227,57 @@ async def test_a_pin_that_cannot_be_read_sets_no_hold(
     refuse_connect_after_pin_refusal(settings)
 
 
+async def test_a_pipe_or_device_at_the_pin_path_sets_the_hold(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pipe or device swapped in for the pin is refused as not a regular file, an ``OSError``
+    that is a verdict, not a read the next check may not repeat, so it holds new connects shut.
+    Red under: every ``OSError`` exempted from the hold (head 3ee826a4d6a)."""
+    settings = _settings(_pin(tmp_path))
+
+    def not_regular(_spec: Any) -> Any:
+        raise OSError(22, "not a regular file")
+
+    monkeypatch.setattr(ta, "evaluate_anchor", not_regular)
+    with pytest.raises(TrustAnchorError):
+        await run_anchor_preflight(_specs(settings), store, enforcing=True)
+    with pytest.raises(StorePinConnectRefused):
+        refuse_connect_after_pin_refusal(settings)
+
+
+async def test_an_acl_that_could_not_be_read_sets_no_hold(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ACL read that came back indeterminate, such as an ``icacls`` timeout, still refuses at
+    ``enforce``, but it is a read fault, not a verdict, so no hold. Red under: the hold set for
+    every refusal at enforce."""
+    settings = _settings(_pin(tmp_path))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    with pytest.raises(TrustAnchorError):
+        await run_anchor_preflight(_specs(settings), store, enforcing=True)
+    refuse_connect_after_pin_refusal(settings)
+
+
+async def test_in_serve_order_a_corrected_acl_lifts_the_hold(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order ``serve`` runs: the store open sets the baseline, a reload refuses the unchanged
+    pin for its ACL, and a reload after the ACL fix lifts the hold, since the bytes still match.
+    Red under: a release compared with anything but the baseline the open set."""
+    pin = _pin(tmp_path)
+    settings = _settings(pin)
+    check_pinned_certificate(settings)  # the store open: sets the baseline
+    owner_only = {"ok": False}
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: owner_only["ok"])
+    with pytest.raises(TrustAnchorError):
+        await run_anchor_preflight(_specs(settings), store, enforcing=True)
+    with pytest.raises(StorePinConnectRefused):
+        refuse_connect_after_pin_refusal(settings)
+    owner_only["ok"] = True
+    await run_anchor_preflight(_specs(settings), store, enforcing=True)
+    refuse_connect_after_pin_refusal(settings)
+
+
 async def test_the_store_open_database_options_connects_are_refused_under_a_hold(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

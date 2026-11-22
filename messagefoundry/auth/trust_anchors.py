@@ -248,9 +248,11 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     reload, and at ``enforce`` it also stops new store connects** in the engine process that ran
     the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). **This paragraph is
     where the hold is stated; the code and messages that act on it point here.** What sets it: a
-    refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path. A file
-    that cannot be read sets nothing, since the next check may read it, such as after a renewal
-    by rename or while a scanner holds the file. What it refuses: at least the new connects the
+    refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
+    device at the path among them. A read the next check may not repeat sets nothing
+    (:func:`_transient_read_fault`): a file not there, as between the steps of some renewals, one
+    the engine may not open, or one a scanner holds. Nor does an ACL or path that could not be
+    read, such as when ``icacls`` times out. What it refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -264,7 +266,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     it too, since the hold is held in memory. A reload may not reach the pin's check: at least an
     earlier anchor's refusal ends the preflight first, and a reload route that makes a store call
     before the check fails there whenever that call needs a new connection, such as when no
-    pooled connection is free and the pool is below its size. The store is not
+    pooled connection is free and the pool is below its size. Once no pooled connection is left,
+    as after a server restart or a failover, each such call needs one, so only a restart lifts
+    the hold. The store is not
     closed: the connections already in its pool can stay open, whichever server they reach, and
     the store goes on using them. At ``warn`` a new connect reads the file on disk then, as
     above. So where the refusal follows a swap, correcting the file does not by itself end the
@@ -2898,11 +2902,24 @@ async def _preflight_one(
     except TrustAnchorError as refusal:
         if refusal.setting is None:
             refusal.setting = spec.setting
-        # Step 11 (module item 11): a file that could not be read is no verdict on it, as for
-        # a MemoryError, so it sets no hold. _unreadable_anchor raises from the OSError.
-        if spec.server_pin and enforcing and not isinstance(refusal.__cause__, OSError):
-            hold_store_pin_refused(spec, str(refusal))
         raise
+
+
+#: The Windows errors a scanner or backup holding the file returns: a sharing violation and a
+#: lock violation. Read with the POSIX ones in :func:`_transient_read_fault`.
+_WINDOWS_TRANSIENT_READ_ERRORS = frozenset({32, 33})
+
+
+def _transient_read_fault(exc: OSError | ValueError) -> bool:
+    """Whether reading an anchor failed in a way the next check may not repeat, so the store pin
+    sets no hold for it (module item 11): a file not there, as between the two steps of some
+    renewals, one the engine may not open, or one another process holds. Not a pipe or device
+    refused as not a regular file, and not a path the OS cannot take: those are verdicts."""
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return True
+    if isinstance(exc, OSError):
+        return getattr(exc, "winerror", None) in _WINDOWS_TRANSIENT_READ_ERRORS
+    return False
 
 
 async def _preflight_checks(
@@ -2930,7 +2947,10 @@ async def _preflight_checks(
             except TrustAnchorError as exc:
                 shape_error = exc
     except (OSError, ValueError) as exc:
-        raise _unreadable_anchor(spec, exc) from exc
+        unreadable = _unreadable_anchor(spec, exc)
+        if spec.server_pin and enforcing and not _transient_read_fault(exc):
+            hold_store_pin_refused(spec, str(unreadable))  # step 11, module item 11
+        raise unreadable from exc
     except MemoryError:
         # A resource fault, not a verdict on the file: no row and no refusal, so the next check
         # tries again (vault BACKLOG #4203).
@@ -2987,6 +3007,11 @@ async def _preflight_checks(
             raise shape_error
     except TrustAnchorError as refusal:
         refusal.unaudited = store_fault is not None
+        # Step 11, module item 11: a verdict on the content, the ACL or the path holds new store
+        # connects shut; an ACL or path that could not be read alone does not.
+        verdict_refused = shape_error is not None or False in (verdict.acl_ok, verdict.path_ok)
+        if spec.server_pin and enforcing and verdict_refused:
+            hold_store_pin_refused(spec, str(refusal))
         raise
     if spec.server_pin:
         note_store_pin_checked(spec, verdict.fingerprint)  # the file passed (step 9)
