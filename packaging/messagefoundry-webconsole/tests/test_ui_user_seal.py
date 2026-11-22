@@ -275,10 +275,10 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     failure: Exception,
 ) -> None:
     """The password reset lands through the engine's own checks, then the page that hands over the
-    one-time credential names the account. That name is read through the checked read; when it
-    refuses or fails in any other way, the page names the id and the credential is still shown,
-    since it was issued. The failure is stood in for at the service's checked reader, after the
-    reset's own read."""
+    one-time credential names the account. That name is read through the checked read; on a
+    refusal ``_shown_name`` takes (its docstring states which), the page names the id and the
+    credential is still shown, since it was issued. The failure is stood in for at the service's
+    checked reader, after the reset's own read."""
     engine, _path = keyed
     caplog.set_level(logging.DEBUG, logger="messagefoundry_webconsole.routes.admin")
     service, _alerts, intact, victim = await _setup(engine)

@@ -1700,9 +1700,9 @@ only when the checked read refuses the record for its seal.
 after a password reset, a factor reset or an enrolment code has already been issued read the
 account's name the same way. Which refusals of that read still show what was issued, naming the
 account by its id, and what each logs, is stated once, in the docstring of `_shown_name` in
-[`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py). A
-failure is reported
-per account and rate-limited, in each engine process: only the first refusal of an account in
+[`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
+The checked read's own seal-failure report, separate from those lines, is per account and
+rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
 inside that interval, from any of these routes or any other reader of the same account in that
