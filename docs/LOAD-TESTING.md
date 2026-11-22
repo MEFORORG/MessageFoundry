@@ -184,9 +184,10 @@ commits. Compare it with `txn/msg (engine, poller removed)`, not with the raw fi
 | `MEFOR_LOAD_SINK_HOST` / `_SINK_PORT` / `_SINK_PORTS` | 127.0.0.1 / 2700 / 1 | where every destination delivers |
 | `MEFOR_LOAD_ADT_PORT` / `_RESULTS_PORT` / `_OTHER_PORT` | 2600 / 2601 / 2602 | inbound hub ports |
 
-`slow` is a deliberate busy-loop (not a sleep). Transforms run off the event loop, so it keeps a worker
-thread busy and contends for the GIL, which is how you find the per-core transform ceiling (the
-research finding that transformation, not framing, dominates throughput).
+`slow` is a deliberate busy-loop (not a sleep). Transforms run off the event loop, so without a
+`[sandbox]` worker process it keeps a worker thread busy and contends for the GIL, which is how you
+find the per-core transform ceiling (the research finding that transformation, not framing, dominates
+throughput). In a sandbox worker process the Handler does not share the engine's GIL.
 
 ## Profiles
 

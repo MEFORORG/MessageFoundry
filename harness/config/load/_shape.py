@@ -170,9 +170,10 @@ def load_shape() -> Shape:
 
 def _spin(ms: float) -> None:
     """Busy-loop for ``ms`` milliseconds — a CPU-bound transform, *not* a sleep. ``transform_one`` runs
-    off the event loop, so this keeps a worker thread busy and contends for the GIL, which models
-    transform CPU contention (the durable-write wall is hit at the store; this finds the *transform*
-    ceiling). Deterministic and side-effect-free, so a re-run is equivalent."""
+    off the event loop, so without a ``[sandbox]`` worker process this keeps a worker thread busy and
+    contends for the GIL, which models transform CPU contention (the durable-write wall is hit at the
+    store; this finds the *transform* ceiling). In a sandbox worker process the Handler does not share
+    the engine's GIL. Deterministic and side-effect-free, so a re-run is equivalent."""
     if ms <= 0.0:
         return
     deadline = time.perf_counter() + ms / 1000.0
