@@ -86,17 +86,18 @@ def _attach(eng: Engine) -> tuple[_DrainRecorder, _CrlRecorder, _WatchRecorder]:
 
 
 async def test_a_hung_graph_supervisor_is_cut_inside_the_stop_budget(tmp_path: Path) -> None:
-    """On main the supervisor got a fixed 10 s whatever the stop had left, so a hung reconcile alone
-    took the stop past NSSM's window. The bound here leaves slack for the steps the budget does not
-    hold, which is still far short of 10 s."""
+    """Before BACKLOG #3191 the supervisor got a fixed 10 s whatever the stop had left, so a hung
+    reconcile alone took the stop past NSSM's window. The gate is closed and idle, as the managed
+    lifespan leaves it, so the supervisor gets a share of the budget, not the floor."""
     eng = await _engine(tmp_path)
+    await eng.drain_config_writes(0.0)
     supervisor = asyncio.ensure_future(_hangs())
     eng._graph_supervisor = supervisor
     began = time.monotonic()
     await _stop(eng, budget_seconds=2.5)
     took = time.monotonic() - began
     assert supervisor.cancelled()
-    assert took < 6.0, took
+    assert 0.5 < took < 4.0, took
 
 
 async def test_under_a_budget_the_budgeted_waits_are_shortened_to_fit(tmp_path: Path) -> None:
@@ -111,13 +112,14 @@ async def test_under_a_budget_the_budgeted_waits_are_shortened_to_fit(tmp_path: 
     assert crl_wait is not None and watch_deadline is not None
     close = engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
     floor = engine_module._STOP_WAIT_FLOOR_SECONDS
+    share = engine_module._STOP_WAIT_SHARE_SECONDS
     # The gate is open, so the full config-write drain is kept back for.
-    watch_kept = close + floor + engine_module._CONFIG_WRITE_DRAIN_SECONDS
+    watch_kept = close + share + engine_module._CONFIG_WRITE_DRAIN_SECONDS
     # Past what is kept, the CRL wait is at its floor: the budget is all spoken for.
     assert crl_wait == pytest.approx(floor)
     assert watch_deadline == pytest.approx(began + 2.0 - watch_kept, abs=0.05)
     # The stand-ins return at once, so the drain sees nearly the whole budget left.
-    assert 2.0 - close - 0.2 <= drain_wait <= 2.0 - close
+    assert 2.0 - close - 0.5 <= drain_wait <= 2.0 - close
 
 
 async def test_a_closed_idle_config_gate_keeps_nothing_back_for_its_drain(tmp_path: Path) -> None:
@@ -130,11 +132,11 @@ async def test_a_closed_idle_config_gate_keeps_nothing_back_for_its_drain(tmp_pa
     [crl_wait] = crl.timeouts
     kept = (
         engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
-        + engine_module._STOP_WAIT_FLOOR_SECONDS
-        + 2 * remote_debug_watch.STOP_FLOOR_SECONDS
+        + 2 * engine_module._STOP_WAIT_SHARE_SECONDS
+        + remote_debug_watch.STOP_FLOOR_SECONDS
     )
     assert crl_wait is not None
-    assert 2.0 - kept - 0.2 <= crl_wait <= 2.0 - kept
+    assert 2.0 - kept - 0.5 <= crl_wait <= 2.0 - kept
 
 
 async def test_a_budget_with_room_leaves_every_fixed_bound_as_it_was(tmp_path: Path) -> None:
@@ -172,14 +174,15 @@ def test_the_time_kept_after_the_supervisor_fits_the_engine_reserve() -> None:
     kept = (
         engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
         + engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
-        + 2 * engine_module._STOP_WAIT_FLOOR_SECONDS
-        + 2 * remote_debug_watch.STOP_FLOOR_SECONDS
+        + 3 * engine_module._STOP_WAIT_SHARE_SECONDS
+        + remote_debug_watch.STOP_FLOOR_SECONDS
     )
     assert kept + engine_module._STOP_WAIT_FLOOR_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS
 
 
 async def test_the_managed_lifespan_hands_engine_stop_its_bound() -> None:
-    """On main the step called engine.stop() with nothing, so no wait inside it knew the window."""
+    """Before BACKLOG #3191 the step called engine.stop() with nothing, so no wait inside it
+    knew the window."""
     seen: list[float | None] = []
 
     async def _fake_stop(*, budget_seconds: float | None = None) -> None:

@@ -178,6 +178,10 @@ _GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
 #: Under a stop budget (BACKLOG #3191, :class:`_StopBudget`): the least any budgeted wait is given,
 #: however little of the budget is left.
 _STOP_WAIT_FLOOR_SECONDS = 0.1
+#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so a slow
+#: supervisor cannot cut the remote-debug watch's last audit pass or the alert-state drain to the
+#: floor. tests/test_engine_stop_budget.py sums it against the engine's reserve.
+_STOP_WAIT_SHARE_SECONDS = 0.3
 #: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
 #: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
 _STOP_CLOSE_ALLOWANCE_SECONDS = 0.5
@@ -191,8 +195,11 @@ class _StopBudget:
     bound. Under one, a wait gets the shorter of its fixed bound and what is left of the budget once
     the time kept for the steps after it is taken out, and never less than
     :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is less. So a wait is shortened only
-    when its fixed bound would run into what the later steps are kept. A budgeted wait that runs out ends as it does at its fixed
-    bound. The other stop steps are not budgeted, so they can still run past the budget."""
+    when its fixed bound would run into the time kept for the later steps. The budget ends the
+    wait, not what follows it: a wait that runs out cancels what it waited for, as at its fixed
+    bound, and the supervisor's and the CRL runner's waits then wait for that cancel to land
+    with no bound, as before. The other stop steps are not budgeted, so they can still run past
+    the budget."""
 
     def __init__(self, seconds: float | None) -> None:
         self._deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
@@ -4262,10 +4269,9 @@ class Engine:
         log.info("engine stopping")
         self._stopping = True
         budget = _StopBudget(budget_seconds)
-        # Kept back, at each budgeted wait, for the waits after it and the store's close: the
-        # budgeted ones at their floor, and the config-write drain at the bound it will use, or
-        # nothing when the gate is closed and no write is running. The remote-debug watch's stop
-        # makes two waits, each with its own floor.
+        # Kept back, at each budgeted wait, for the waits after it and the store's close: each
+        # later budgeted wait its share, the watch's cancel wait its floor, and the config-write
+        # drain the bound it will use, or nothing when the gate is closed and no write runs.
         if self._config_writes_closed and not self._config_writes:
             config_kept = 0.0
         elif self._config_writes_closed:
@@ -4273,9 +4279,9 @@ class Engine:
         else:
             config_kept = _CONFIG_WRITE_DRAIN_SECONDS
         alert_kept = _STOP_CLOSE_ALLOWANCE_SECONDS
-        watch_kept = alert_kept + _STOP_WAIT_FLOOR_SECONDS + config_kept
-        crl_kept = watch_kept + 2 * STOP_FLOOR_SECONDS
-        supervisor_kept = crl_kept + _STOP_WAIT_FLOOR_SECONDS
+        watch_kept = alert_kept + _STOP_WAIT_SHARE_SECONDS + config_kept
+        crl_kept = watch_kept + _STOP_WAIT_SHARE_SECONDS + STOP_FLOOR_SECONDS
+        supervisor_kept = crl_kept + _STOP_WAIT_SHARE_SECONDS
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a

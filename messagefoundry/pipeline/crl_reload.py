@@ -1307,9 +1307,9 @@ class CrlReloadRunner:
         return self._stop_timeout
 
     async def stop(self, *, timeout: float | None = None) -> None:
-        """Signal the loop and await its exit, for at most ``timeout``, or ``stop_timeout_seconds``
-        when it is None (idempotent). engine.stop() passes a shorter one under its budget (BACKLOG
-        #3191).
+        """Signal the loop and wait up to ``timeout``, or ``stop_timeout_seconds`` when it is None,
+        for its exit, then cancel a pass still running and wait for the cancel to land (idempotent).
+        engine.stop() passes a shorter timeout under its budget (BACKLOG #3191).
 
         A pass in flight gets that long to finish, so it does not go on loading CRLs after the engine
         stopped. A pass that takes longer, such as a read hung on a network share, is abandoned: the

@@ -1438,8 +1438,8 @@ _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
 #: The share of that budget kept back for engine.stop(). Reserved, never a bound: the stop is not cut
 #: short, because it ends in store.close(), and a store left open keeps a non-daemon worker thread
 #: alive, which is the hang BACKLOG #2087 fixed. The stop is handed the step's bound as its budget,
-#: which holds the waits ``pipeline.engine._StopBudget`` names inside it; its other steps are not
-#: held to it.
+#: which shortens the waits ``pipeline.engine._StopBudget`` names, as that class says; its other
+#: steps are not held to it.
 _ENGINE_STOP_RESERVE_SECONDS: Final = 3.0
 #: The part of a step's bound handed to the step's own graceful wait, so that wait ends, and cancels
 #: what it owns, before the teardown cuts the step.
