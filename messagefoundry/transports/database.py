@@ -120,7 +120,12 @@ from messagefoundry.odbc_call_gate import (
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.redaction import prints_a_codec_error, safe_exc, safe_text
+from messagefoundry.redaction import (
+    prints_a_codec_error,
+    raised_by_a_driver,
+    safe_exc,
+    safe_text,
+)
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
@@ -2715,12 +2720,25 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     )
 
 
+#: A SQLSTATE as SQL defines one: five characters, each a digit or an uppercase Latin letter.
+#: Lowercase is refused, so a word such as ``OSError('reset')``'s or a codec name such as
+#: ``ascii`` does not read as one (vault BACKLOG #1661, added items 1 and 2).
+_SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
+
+
 def _sqlstate(exc: BaseException) -> str | None:
     """The 5-character SQLSTATE a DB driver error carries in ``args[0]`` (pyodbc/aioodbc), or ``None``
     if ``exc`` isn't shaped like a DB error — letting a genuine bug propagate as an internal error
-    rather than being misread as a transport failure."""
+    rather than being misread as a transport failure.
+
+    Never for a ``UnicodeError``, whose first argument is the codec name. Only text of the SQLSTATE
+    alphabet (:data:`_SQLSTATE_RE`) counts. That is a bound on the misread, not a test of who
+    raised ``exc``: a non-driver error whose ``args[0]`` is five uppercase letters or digits still
+    reads as one."""
+    if isinstance(exc, UnicodeError):
+        return None
     args = getattr(exc, "args", ())
-    if args and isinstance(args[0], str) and len(args[0]) == 5 and args[0].isalnum():
+    if args and isinstance(args[0], str) and _SQLSTATE_RE.fullmatch(args[0]):
         return args[0]
     return None
 
@@ -2730,11 +2748,11 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     error: asyncpg's ``sqlstate`` attribute, else :func:`_sqlstate`'s ``args[0]``.
 
     Never for a ``UnicodeError`` or an exception that holds one. ``UnicodeEncodeError``'s first
-    argument is the codec name, and ``ascii`` is five alphanumerics, so it would read as one."""
+    argument is the codec name, which is not a SQLSTATE however it is spelled."""
     if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
         return None
     state = getattr(exc, "sqlstate", None)
-    if isinstance(state, str) and len(state) == 5 and state.isalnum():
+    if isinstance(state, str) and _SQLSTATE_RE.fullmatch(state):
         return state
     return _sqlstate(exc)
 
@@ -2763,26 +2781,11 @@ def _connection_lost(exc: BaseException | None) -> bool:
     return False
 
 
-#: Driver packages whose errors :func:`_raised_by_a_driver` counts though the package has no DB-API
-#: ``apilevel``: asyncpg, the PostgreSQL store's driver, whose handler-failure arm meets it.
-_NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
-
-
-def _raised_by_a_driver(exc: BaseException) -> bool:
-    """Whether ``exc``'s class, or a class it inherits, is a database driver's: from a module, or
-    a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
-    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
-    builtin exception a driver raises does not count, though its cause chain is withheld under a
-    driver error that holds it (:func:`_redacted_copy`)."""
-    for kind in type(exc).__mro__:
-        parts = kind.__module__.split(".")
-        if parts[0] in _NON_DBAPI_DRIVERS:
-            return True
-        for depth in range(1, len(parts) + 1):
-            module = sys.modules.get(".".join(parts[:depth]))
-            if getattr(module, "apilevel", None) == "2.0":
-                return True
-    return False
+#: :func:`~messagefoundry.redaction.raised_by_a_driver`, the one test of a driver's error that
+#: this module and the log chain's traceback both read (vault BACKLOG #1661, added item 3). A
+#: builtin exception a driver raises does not count, though its cause chain is withheld under a
+#: driver error that holds it (:func:`_redacted_copy`).
+_raised_by_a_driver = raised_by_a_driver
 
 
 #: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
