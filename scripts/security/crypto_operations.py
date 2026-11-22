@@ -62,12 +62,14 @@ seen:
   a line, and a misread lexer blanks it. At least these misread a literal: regex-versus-division
   decided from the previous token only (a TypeScript ``x! / y``, a ``)`` before a regex), a quoted
   string ended at a newline, and a U+2028 or U+2029 inside a string, which is folded to a newline;
-* for the TypeScript/JavaScript arms' per-token verdict (BACKLOG #5578): the lexer does not model a
-  template literal's ``${}`` holes. A template nested inside a hole flips its string parity, so
-  template text after it can read as code, and a mention there is confirmed as if it were a call.
-  Code inside a hole reads as template text, so a real call in a hole that the per-line view does
+* for the TypeScript/JavaScript arms' per-token verdict (BACKLOG #5578): a lexer match is
+  confirmed only where both scans behind ``js_lexer.strict_verdicts`` call it code, so a misread
+  only one scan makes cannot confirm a mention. A misread both make, such as a quoted string
+  misread from an apostrophe that swallows a template's backtick, still makes template text after
+  it read as code, and a mention there is confirmed as if it were a call. The first scan reads
+  code inside a ``${}`` hole as template text, so a real call in a hole that the per-line view does
   not also see is marked ``(not code)``, and so is a real call the per-line view skips inside any
-  region the lexer misreads as a literal (the misreads listed above). The per-line view's own false
+  region either scan misreads as a literal (the misreads listed above). The per-line view's own false
   positives (at least a trailing comment or a mention inside a quoted string) are confirmed as
   before #5578.
   A cipher-string word's mark follows the file's admission rule, not the word's own position, so
@@ -75,7 +77,9 @@ seen:
 * for the scope-aware Python reading (BACKLOG #5578), at least: a PEP 695 type-parameter scope
   (names in it resolve to nothing), a walrus in a comprehension, and a ``match`` capture are not
   modelled as bindings. A call only the scope-aware reading gives is not reported, because the
-  gate reports the union reading's tokens and only judges them;
+  gate reports the union reading's tokens and only judges them. An import a PEP 562
+  ``__getattr__`` serves is an export only in the shapes ``_hook_exports`` reads, so one served
+  in any other shape is marked out of scope though PEP 562 may serve it;
 * A union token is confirmed by its callee before ``[`` file-wide, so an out-of-scope label
   variant of a callee confirmed in scope elsewhere in the same file stays confirmed; per-site
   judgment would close it.
@@ -585,6 +589,146 @@ def scoped_bindings(
     return resolved, module_reach, {k: list(v) for k, v in module.imports.items()}
 
 
+#: The attribute names a PEP 562 hook may still serve at one point of its body:
+#: ``(True, excluded)`` is every name but ``excluded``, ``(False, names)`` is ``names`` alone.
+_Admitted = tuple[bool, frozenset[str]]
+
+
+def _bound_names(node: ast.AST) -> set[str]:
+    """Every name ``node`` binds anywhere inside it, nested scopes included, so the reading that
+    uses it errs toward forgetting an import rather than keeping one."""
+    out: set[str] = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
+            out.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+        elif isinstance(n, ast.alias):
+            out.add((n.asname or n.name).split(".", 1)[0])
+        elif isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and n.name:
+            out.add(n.name)
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            out.add(n.rest)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            out.update(n.names)
+        elif isinstance(n, ast.arg):
+            out.add(n.arg)
+    return out
+
+
+def _literal_test(test: ast.expr, param: str) -> frozenset[str] | None:
+    """The names ``param == "x"`` or ``param in ("x", "y")`` admits, or ``None`` for any other
+    test."""
+    if not (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and isinstance(test.left, ast.Name)
+        and test.left.id == param
+    ):
+        return None
+    op, right = test.ops[0], test.comparators[0]
+    if isinstance(op, ast.Eq) and isinstance(right, ast.Constant) and isinstance(right.value, str):
+        return frozenset({right.value})
+    if isinstance(op, ast.In) and isinstance(right, (ast.Tuple, ast.List, ast.Set)):
+        values = [
+            e.value for e in right.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)
+        ]
+        if right.elts and len(values) == len(right.elts):
+            return frozenset(values)
+    return None
+
+
+def _pep562_hook(tree: ast.Module) -> ast.FunctionDef | None:
+    """The module's PEP 562 ``__getattr__`` when it has a shape :func:`_hook_exports` reads: the
+    last module-level binding of the name, a plain undecorated ``def`` directly in the module body,
+    not rebound after it, with exactly one positional parameter and no ``yield``, ``global`` or
+    ``nonlocal`` in it. Any other shape gives ``None``."""
+    defs = [
+        i
+        for i, stmt in enumerate(tree.body)
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "__getattr__"
+    ]
+    if not defs:
+        return None
+    hook = tree.body[defs[-1]]
+    if not isinstance(hook, ast.FunctionDef) or hook.decorator_list:
+        return None
+    if any("__getattr__" in _bound_names(stmt) for stmt in tree.body[defs[-1] + 1 :]):
+        return None
+    if any(isinstance(n, ast.Global) and "__getattr__" in n.names for n in ast.walk(tree)):
+        return None
+    args = hook.args
+    if len(args.posonlyargs + args.args) != 1 or args.vararg or args.kwarg or args.kwonlyargs:
+        return None
+    if any(
+        isinstance(n, (ast.Yield, ast.YieldFrom, ast.Global, ast.Nonlocal)) for n in ast.walk(hook)
+    ):
+        return None
+    return hook
+
+
+def _hook_exports(tree: ast.Module, mod: str, is_init: bool) -> dict[str, list[str]]:
+    """The imports a module's PEP 562 ``__getattr__`` (:func:`_pep562_hook`) serves as attributes
+    of the module, for the scope-aware exports (BACKLOG #5578).
+
+    The body is read in order, tracking which attribute names can still reach each point. An
+    ``if`` testing the parameter as :func:`_literal_test` reads it narrows its body to those names,
+    and when that body ends in a ``return`` or ``raise`` and has no ``else``, it narrows what
+    follows to every other name. ``return X`` serves ``X`` only when ``X`` is a bare name bound by
+    an import earlier on the same path, not rebound since, and ``"X"`` can still reach it. Any
+    other read or rebinding of the parameter, any other ``if``, a star import, and any statement
+    holding a ``return`` other than these ends the reading: nothing after it is served."""
+    hook = _pep562_hook(tree)
+    if hook is None:
+        return {}
+    param = (hook.args.posonlyargs + hook.args.args)[0].arg
+    out: dict[str, list[str]] = {}
+
+    def block(stmts: list[ast.stmt], admitted: _Admitted, imports: dict[str, list[str]]) -> None:
+        imports = dict(imports)
+        for stmt in stmts:
+            if isinstance(stmt, ast.Return):
+                value = stmt.value
+                if isinstance(value, ast.Name) and value.id in imports:
+                    every, names = admitted
+                    if (value.id not in names) if every else (value.id in names):
+                        for target in imports[value.id]:
+                            _bind(out, value.id, target)
+                return
+            if isinstance(stmt, ast.Raise):
+                return
+            if isinstance(stmt, ast.If):
+                lits = _literal_test(stmt.test, param)
+                if lits is None:
+                    return
+                every, names = admitted
+                block(stmt.body, (False, lits - names if every else names & lits), imports)
+                rest: _Admitted = (True, names | lits) if every else (False, names - lits)
+                if stmt.orelse:
+                    block(stmt.orelse, rest, imports)
+                    return
+                if not isinstance(stmt.body[-1], (ast.Return, ast.Raise)):
+                    return
+                admitted = rest
+                continue
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                pairs = _import_bindings(stmt, mod, is_init)
+                if any(a.name == "*" for a in stmt.names) or any(p == param for p, _ in pairs):
+                    return
+                for local, target in pairs:
+                    imports[local] = [target]
+                continue
+            bound = _bound_names(stmt)
+            reads = any(isinstance(n, ast.Name) and n.id == param for n in ast.walk(stmt))
+            if reads or param in bound or any(isinstance(n, ast.Return) for n in ast.walk(stmt)):
+                return
+            for name in bound:
+                imports.pop(name, None)
+
+    block(hook.body, (True, frozenset()), {})
+    return out
+
+
 def dotted(
     expr: ast.expr, aliases: dict[str, list[str]], mod: str, local_defs: set[str]
 ) -> list[str]:
@@ -623,7 +767,8 @@ class ParsedModule:
     aliases: dict[str, list[str]]
     local_defs: set[str]
     functions: set[str]
-    #: The scope-aware reading (BACKLOG #5578); :func:`scoped_bindings` says what each holds.
+    #: The scope-aware reading (BACKLOG #5578); :func:`scoped_bindings` says what each holds, and
+    #: ``module_aliases`` also holds :func:`_hook_exports`.
     scope_names: dict[int, list[str]] = field(default_factory=dict)
     module_reach: set[int] = field(default_factory=set)
     module_aliases: dict[str, list[str]] = field(default_factory=dict)
@@ -646,7 +791,8 @@ class ParsedModule:
     @property
     def exports(self) -> dict[str, list[str]]:
         """The import bindings another module reaches through this one: every one for the union
-        reading, the module-scope ones for the scope-aware reading."""
+        reading, and for the scope-aware reading the module-scope ones plus those
+        :func:`_hook_exports` reads from a PEP 562 ``__getattr__``."""
         return self.module_aliases if self.scope_aware else self.aliases
 
 
@@ -660,6 +806,9 @@ def _parse(relpath: str, source: str) -> ParsedModule:
     }
     classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
     scope_names, module_reach, module_aliases = scoped_bindings(tree, mod, is_init)
+    for local, targets in _hook_exports(tree, mod, is_init).items():
+        for target in targets:
+            _bind(module_aliases, local, target)
     return ParsedModule(
         path=relpath,
         mod=mod,
