@@ -190,6 +190,23 @@ def test_invalid_transform_mode_fails_loud(monkeypatch: pytest.MonkeyPatch) -> N
         load_config(_CONFIG)
 
 
+@pytest.mark.parametrize("value", ["inf", "-inf", "Infinity", "nan", "NaN", "60000.5", "1e300"])
+def test_unusable_transform_ms_fails_loud(
+    value: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # inf would spin forever, nan would skip the spin, and a huge finite value spins just as long.
+    monkeypatch.setenv("MEFOR_LOAD_TRANSFORM_MS", value)
+    with pytest.raises(ValueError, match="ValueError in _shape.py"):
+        load_config(_CONFIG)
+    assert "MEFOR_LOAD_TRANSFORM_MS" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["0", "1.5", "60000"])
+def test_usable_transform_ms_loads(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEFOR_LOAD_TRANSFORM_MS", value)
+    assert load_config(_CONFIG).inbound
+
+
 # --- "don't bake Corepoint in" denylist guard --------------------------------
 
 

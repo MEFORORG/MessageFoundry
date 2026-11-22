@@ -11,19 +11,31 @@ stop-at-ceiling (the throughput-SUSTAIN signal — non-drain/loss or an intake s
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from harness.load import shardcert
 from harness.load.shardcert import (
     RungFidelity,
+    ShardCertLadderReport,
     ShardCertReport,
     ShardCertStepRecord,
     parse_rate_ladder,
     run_shardcert_ladder,
 )
-from harness.load.shardcert_ladder import ClaimTiming, aggregate_claim_timing
+from harness.load.shardcert_ladder import (
+    ClaimTiming,
+    ConsolidatedLadderReport,
+    LadderRung,
+    RungOutcome,
+    aggregate_claim_timing,
+    build_rung_outcome,
+)
+from tests.test_shardcert_failclosed_verdicts import _clean_gate, _consolidated, _drive, _sustained
 
 
 def _step(
@@ -1140,6 +1152,272 @@ def test_step_record_fidelity_is_fail_closed_when_sent_is_unrecorded() -> None:
     )
     assert rec.sent == -1
     assert rec.fidelity is RungFidelity.UNKNOWN
+
+
+def test_fidelity_note_for_a_zero_offered_rung_is_the_unknown_note() -> None:
+    # BACKLOG #5861: a zero-offered rung classifies UNKNOWN, and its note must say so rather than
+    # divide by the zero that made it UNKNOWN.
+    fidelity = shardcert.rung_fidelity(sent=0, acked=0, offered=0)
+    assert fidelity is RungFidelity.UNKNOWN
+    note = shardcert.fidelity_note(fidelity, sent=0, acked=0, offered=0)
+    assert note is not None and note.startswith("FIDELITY UNKNOWN")
+
+
+@pytest.mark.parametrize(
+    "fidelity",
+    [f for f in RungFidelity if f not in (RungFidelity.ADMISSIBLE, RungFidelity.UNKNOWN)],
+)
+def test_fidelity_note_names_every_measured_void_verdict(fidelity: RungFidelity) -> None:
+    # The note's tail is the UNKNOWN text, so a verdict with no branch of its own would claim its
+    # recorded inputs "were not recorded". This fails for such a verdict.
+    note = shardcert.fidelity_note(fidelity, sent=90, acked=90, offered=100)
+    assert note is not None and not note.startswith("FIDELITY UNKNOWN")
+
+
+@pytest.mark.parametrize("fidelity", list(RungFidelity))
+def test_fidelity_note_never_divides_by_a_zero_offered(fidelity: RungFidelity) -> None:
+    # BACKLOG #5861: the guard is on the input, so no verdict can reach a division at offered 0. The
+    # counts WERE recorded there, so the note must not say they were not.
+    note = shardcert.fidelity_note(fidelity, sent=0, acked=0, offered=0)
+    assert note is not None and "planned zero messages" in note
+    assert "not recorded" not in note
+
+
+def test_fidelity_note_still_says_unrecorded_for_a_sentinel_offered() -> None:
+    note = shardcert.fidelity_note(RungFidelity.UNKNOWN, sent=-1, acked=-1, offered=-1)
+    assert note is not None and "not recorded" in note
+
+
+_ZERO_RATE = 0.005  # at a 60 s hold this plans 0.3 messages, which rounds to none
+
+
+def _two_box_zero(*, is_soak: bool = False, lane_inversions: int = 0) -> RungOutcome:
+    drive = replace(_drive(_ZERO_RATE), lanes_observed=0, lane_inversions=lane_inversions)
+    assert drive.offered == 0
+    rung = LadderRung(
+        index=1,
+        ingress_rate=_ZERO_RATE,
+        hold_seconds=60.0,
+        drain_timeout=150.0,
+        is_soak=is_soak,
+    )
+    return build_rung_outcome(rung, drive, _clean_gate(), None)
+
+
+def _colocated_zero(**over: object) -> ShardCertStepRecord:
+    report = _report(
+        **{
+            "offered": 0,
+            "sent": 0,
+            "acked": 0,
+            "achieved_intake": 0,
+            "delivered_distinct": 0,
+            "sink_received": 0,
+            "engine_done": 0,
+            "lanes_observed": 0,
+            **over,
+        }
+    )
+    return ShardCertStepRecord.from_report(_ZERO_RATE, report, hold_seconds=60.0)
+
+
+def _colocated_run(
+    monkeypatch: pytest.MonkeyPatch, plan: dict[float, ShardCertStepRecord]
+) -> ShardCertLadderReport:
+    async def fake_step(*, rate: float, **_kw: object) -> ShardCertStepRecord:
+        return plan[rate]
+
+    monkeypatch.setattr(shardcert, "_run_ladder_step", fake_step)
+    return asyncio.run(shardcert.run_shardcert_ladder(rates=list(plan)))
+
+
+def test_two_box_control_rung_still_passes() -> None:
+    control = _sustained(0, 16.0)
+    assert control.fidelity_admissible
+    lad = _consolidated([control])
+    assert (lad.exit_code, lad.result_label) == (0, "PASS")
+
+
+@pytest.mark.parametrize("with_control", [False, True])
+def test_two_box_zero_offered_climb_rung_is_setup_degraded(with_control: bool) -> None:
+    # BACKLOG #5861: this rung reads FROZEN_TAIL with UNKNOWN fidelity, and no setup term saw it: exit 0.
+    climb = [*([_sustained(0, 16.0)] if with_control else []), _two_box_zero()]
+    lad = _consolidated(climb)
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+    assert "planned zero messages" in lad.render()
+
+
+def test_two_box_zero_offered_rung_that_paced_one_message_is_setup_degraded() -> None:
+    # The pacer emits on its first tick, so the real shape of a rounded-to-zero rung is one message on
+    # one lane. It reads SUSTAINED, and the lane bar must not turn that into an engine FAIL.
+    drive = replace(
+        _drive(_ZERO_RATE),
+        sent=1,
+        acked=1,
+        sink_received=4,
+        engine_done=4,
+        lanes_observed=1,
+    )
+    rung = LadderRung(index=1, ingress_rate=_ZERO_RATE, hold_seconds=60.0, drain_timeout=150.0)
+    out = build_rung_outcome(rung, drive, _clean_gate(), None)
+    assert out.offered == 0 and out.verdict.value == "sustained"
+    lad = _consolidated([_sustained(0, 16.0), out])
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+
+
+def test_colocated_zero_offered_rung_that_paced_one_message_is_setup_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paced = _colocated_zero(
+        sent=1,
+        acked=1,
+        achieved_intake=1,
+        delivered_distinct=1,
+        sink_received=1,
+        engine_done=1,
+        lanes_observed=1,
+    )
+    assert paced.no_loss is True
+    lad = _colocated_run(monkeypatch, {20.0: paced})
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+    assert lad.ceiling_void_reason == "zero_offered"
+
+
+def test_colocated_zero_offered_rung_that_lost_its_paced_message_still_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lost = _colocated_zero(
+        sent=1, acked=1, achieved_intake=1, lanes_observed=1, acked_not_delivered=1
+    )
+    assert lost.no_loss is False
+    lad = _colocated_run(monkeypatch, {20.0: lost})
+    assert (lad.exit_code, lad.result_label) == (1, "FAIL")
+
+
+def test_two_box_zero_offered_soak_is_setup_degraded() -> None:
+    lad = _consolidated([_sustained(0, 16.0)], soak=_two_box_zero(is_soak=True))
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+
+
+def test_two_box_zero_offered_rung_does_not_hide_a_real_break() -> None:
+    lad = _consolidated([_sustained(0, 16.0), _two_box_zero(lane_inversions=1)])
+    assert (lad.exit_code, lad.result_label) == (1, "FAIL")
+
+
+def _serialized_ceiling(lad: ConsolidatedLadderReport) -> dict[str, Any]:
+    ceiling = json.loads(json.dumps(lad.to_json_dict()))["ceiling"]
+    assert isinstance(ceiling, dict)
+    return ceiling
+
+
+@pytest.mark.parametrize("zero_on", ["climb", "soak"])
+def test_two_box_zero_offered_run_publishes_no_ceiling(zero_on: str) -> None:
+    # BACKLOG #5861: the RESULT line disowned this run while the JSON still read admissible=true with a
+    # pinned rate from the healthy rung beside it. Every quotable figure must be withheld.
+    held = _sustained(0, 16.0)
+    lad = (
+        _consolidated([held, _two_box_zero()])
+        if zero_on == "climb"
+        else _consolidated([held], soak=_two_box_zero(is_soak=True))
+    )
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+    ceiling = _serialized_ceiling(lad)
+    assert ceiling["admissible"] is False
+    for key in (
+        "pinned_ingress_rate",
+        "pinned_accepted_ingress_rate",
+        "pinned_outbound_rate",
+        "pinned_measured_delivered_rate_per_s",
+        "accepted_events_per_s",
+        "accepted_vs_offered_ratio",
+        "sustained_events_per_s",
+        "publishable_events_per_s",
+        "publishable_accepted_events_per_s",
+    ):
+        assert ceiling[key] is None, key
+    for key in (
+        "bracketed",
+        "clears_target_events",
+        "clears_target_events_accepted",
+        "clears_target_events_publishable",
+        "clears_target_events_accepted_publishable",
+    ):
+        assert ceiling[key] is False, key
+    rendered = lad.render()
+    assert "pinned sustainable ceiling" not in rendered
+    assert "no rung sustained" not in rendered  # one did; its figure is withheld, not absent
+    assert "withheld" in rendered
+
+
+def test_two_box_withheld_ceiling_keeps_the_held_rungs_pool() -> None:
+    # Withholding the figure must not move the pool diagnostic onto the rung that carried no load.
+    base = _sustained(0, 16.0)
+    zero = replace(_two_box_zero(), pool=base.pool)
+    held = replace(base, pool=replace(base.pool, requested=base.pool.requested + 1))
+    assert zero.pool.measured and held.pool != zero.pool
+    lad = _consolidated([zero, held])
+    assert lad.pinned_rung is None
+    assert lad.store_pool == held.pool
+
+
+def test_two_box_run_with_no_zero_offered_rung_keeps_its_ceiling() -> None:
+    held = _sustained(0, 16.0)
+    assert held.sustainable_ingress_rate is not None
+    lad = _consolidated([held])
+    assert (lad.exit_code, lad.result_label) == (0, "PASS")
+    ceiling = _serialized_ceiling(lad)
+    assert ceiling["admissible"] is True
+    assert ceiling["pinned_ingress_rate"] == round(held.sustainable_ingress_rate, 3)
+    assert ceiling["sustained_events_per_s"] is not None
+    assert "pinned sustainable ceiling" in lad.render()
+
+
+def test_colocated_control_rung_still_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    control = ShardCertStepRecord.from_report(10.0, _report(), hold_seconds=60.0)
+    lad = _colocated_run(monkeypatch, {10.0: control})
+    assert (lad.exit_code, lad.result_label) == (0, "PASS")
+
+
+@pytest.mark.parametrize("lossless", [True, False])
+def test_colocated_zero_offered_rung_is_setup_degraded(
+    monkeypatch: pytest.MonkeyPatch, lossless: bool
+) -> None:
+    # BACKLOG #5861: this rung read as an engine correctness FAIL (exit 1). `lossless=False` drives the
+    # ceiling branch and `True` the non-ceiling one, so both routes through the climb are covered.
+    control = ShardCertStepRecord.from_report(10.0, _report(), hold_seconds=60.0)
+    zero = _colocated_zero(drained=lossless)
+    assert zero.no_loss is lossless
+    lad = _colocated_run(monkeypatch, {10.0: control, 20.0: zero, 30.0: control})
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+    assert len(lad.records) == 2  # the climb stops at the rung that offered nothing
+    rendered = lad.render()
+    assert "planned zero messages" in rendered
+    assert "broke correctness" not in rendered and "not recorded" not in rendered
+
+
+def test_colocated_zero_offered_record_is_degraded_without_the_climb() -> None:
+    # The verdict itself fails closed, so a report assembled by any other route cannot read PASS.
+    lad = ShardCertLadderReport(records=[_colocated_zero()])
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        {"lane_inversions": 1},
+        {"lane_inversions": 1, "drained": False},
+        {"dead_total": 2},
+        {"stranded_nonterminal": 1},
+    ],
+)
+def test_colocated_zero_offered_rung_does_not_hide_a_real_break(
+    monkeypatch: pytest.MonkeyPatch, fault: dict[str, object]
+) -> None:
+    lad = _colocated_run(monkeypatch, {20.0: _colocated_zero(**fault)})
+    assert (lad.exit_code, lad.result_label) == (1, "FAIL")
+    rendered = lad.render()
+    assert "planned zero messages, so they" not in rendered and "fix the rig" not in rendered
+    assert "broke correctness" in rendered
 
 
 def test_step_record_carries_sent_across_from_the_report() -> None:

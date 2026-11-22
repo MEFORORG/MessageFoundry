@@ -118,6 +118,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # The same writer as test_asvs_apply.py, so it stays where that file stays (BACKLOG #5455).
         "test_asvs_apply_header_splice.py",
         "test_asvs_residual_lint.py",
+        # Loads scripts/bench/stage_residency.py by path, and that tool imports
+        # messagefoundry.config.settings and messagefoundry.store.base at module scope. An ENGINE diff
+        # to either can break it and does not trip the tooling path gate.
+        "test_bench_stage_residency.py",
         # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an
         # ENGINE pull request -- that is where every entry is written -- and does not trip the tooling
         # job's path gate, so listed as tooling this would face nothing on the change that breaks it.
@@ -636,6 +640,16 @@ def test_the_engine_importer_check_fires_on_a_planted_entry(tmp_path: Path) -> N
     )
     stays = frozenset({"test_reads_source.py", "test_imports_engine.py"})
     assert _engine_importers(tmp_path, stays) == ["test_imports_engine.py"]
+
+
+def test_the_residency_tool_test_stays_on_the_engine_legs() -> None:
+    """RED when: the test of a tool that imports the engine moves back to the tooling tier.
+
+    It loads the tool by path, so ``_ENGINE_IMPORT`` does not see that import in the test file.
+    """
+    tool = (_ROOT / "scripts" / "bench" / "stage_residency.py").read_text(encoding="utf-8")
+    assert _ENGINE_IMPORT.search(tool), "the premise: the tool imports the engine"
+    assert "test_bench_stage_residency.py" in _STAYS_WITHOUT_IMPORTING
 
 
 def test_the_two_lists_are_disjoint() -> None:

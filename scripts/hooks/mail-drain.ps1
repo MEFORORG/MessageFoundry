@@ -113,7 +113,7 @@
     sentences: mail delivered, mail deferred by the caps, mail truncated, a body withheld, mail
     expired, mail unreadable, a filename this channel did not mint, a claim lost to a sibling drain,
     a claim stranded by a dead claimer, box empty, mail waiting in the box of a worktree the session
-    moved into, and mail suppressed by the OFF switch. The defect
+    moved into, and mail suppressed by the OFF switch (on stderr at Stop, so it wakes nothing). The defect
     being designed against is on record in announce-session.ps1 -- a hook that was wired, fired,
     resolved nothing and exited 0 for weeks, byte-identical to a healthy hook with nothing to do. A
     channel whose output never changes cannot be told apart from one that is dead.
@@ -378,6 +378,15 @@ function Write-Injection {
         try { (Get-Item -LiteralPath $script:MovedBoxStamp -EA Stop).LastWriteTime = Get-Date } catch { }
         $script:MovedBoxStamp = ''
     }
+}
+
+function Write-StateNotice {
+    # A notice about the channel's state rather than about mail. Output at Stop re-wakes the model, so
+    # there it goes to stderr, which wakes nothing. THE MODEL DOES NOT RECEIVE STDERR from a hook that
+    # exits 0: that line is for whoever reads the hook's output, and the model hears at SessionStart.
+    param([bool]$Consuming, [string]$Event, [string]$Text)
+    if ($Consuming) { try { [Console]::Error.WriteLine($Text) } catch { } }
+    else { Write-Injection -Event $Event -Text $Text }
 }
 
 function Get-Clean {
@@ -666,6 +675,83 @@ function Write-MailReceipt {
     Set-Content -LiteralPath $Path -Value ($receipt | ConvertTo-Json -Depth 5) -Encoding ascii -ErrorAction Stop
 }
 
+function ConvertTo-MailExpiryUtc {
+    # THE ONE READER OF expiresUtc, returning a UTC DateTime, or $null for missing or unreadable.
+    #
+    # NEVER GO THROUGH [string]. ConvertFrom-Json has already turned an ISO stamp into a DateTime:
+    # Kind Utc for a Z stamp, Local for an offset, Unspecified for neither. [string] on that prints
+    # month-first with the Kind and the offset gone, so re-parsing it misread day-first cultures and
+    # treated a Local wall clock as UTC (BACKLOG #5864).
+    #
+    # A string that reaches here is one the JSON reader did not recognise. ConvertTo-MailIsoStamp
+    # admits only the forms with one possible reading, so the current culture never decides a date.
+    # Anything else is unreadable, and Test-MailExpired applies the receiver's floor. A stamp with no
+    # zone is UTC, which is what the field's name says.
+    param($Value)
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc) }
+        return $Value.ToUniversalTime()
+    }
+    if ($Value -isnot [string]) { return $null }
+    $iso = ConvertTo-MailIsoStamp $Value.Trim()
+    if (-not $iso) { return $null }
+    $parsed = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($iso, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $parsed.UtcDateTime }
+    return $null
+}
+
+function ConvertTo-MailIsoStamp {
+    # An expiry string rewritten year-first, or $null where it has no single reading. Admitted: ISO,
+    # year-first, a numeric date whose day and month cannot be swapped (one part above 12, or both
+    # equal), and an English month name, each with a four-digit year and an optional clock.
+    # '03/04/2026' is refused because it names two dates, and a two-digit year because it names many.
+    # CultureInvariant matters: under tr-TR, IgnoreCase would not match an I against an i.
+    param([string]$Text)
+    $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
+    $clock = '(?:[T\s]\s*(?<clock>[0-9]{1,2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:\s*[ap]m)?' +
+        '(?:\s*(?:z|utc|gmt|[+-][0-9]{2}(?::?[0-9]{2})?))?))?\z'
+    # The weekday is kept for the parser, which refuses one that contradicts the date.
+    $weekday = '(?:(?<wd>mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?),?\s+)?'
+    $mon = '(?<mon>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|' +
+        'sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+    # The invariant parser takes Z and GMT but not UTC, so all three leave here as Z. The space stays,
+    # because it refuses 'PMZ'.
+    $join = {
+        param([string]$Date, $Hit)
+        if (-not $Hit.Groups['clock'].Success) { return $Date }
+        "$Date $([regex]::Replace($Hit.Groups['clock'].Value, '\s*(?:utc|gmt|z)\z', ' Z', $options))"
+    }
+
+    $hit = [regex]::Match($Text, "\A(?<date>[0-9]{4}(?<s>[/.-])[0-9]{1,2}\k<s>[0-9]{1,2})$clock", $options)
+    if ($hit.Success) { return & $join ($hit.Groups['date'].Value -replace '[/.]', '-') $hit }
+
+    $hit = [regex]::Match($Text, "\A(?<a>[0-9]{1,2})(?<s>[/.-])(?<b>[0-9]{1,2})\k<s>(?<y>[0-9]{4})$clock", $options)
+    if ($hit.Success) {
+        $a = [int]$hit.Groups['a'].Value
+        $b = [int]$hit.Groups['b'].Value
+        if ($a -le 12 -and $b -le 12 -and $a -ne $b) { return $null }
+        $month, $day = if ($a -gt 12) { $b, $a } else { $a, $b }
+        return & $join "$($hit.Groups['y'].Value)-$month-$day" $hit
+    }
+
+    $hit = [regex]::Match($Text, "\A$weekday(?:$mon\s+(?<d>[0-9]{1,2}),?|(?<d>[0-9]{1,2})\s+$mon,?)\s+(?<y>[0-9]{4})$clock", $options)
+    if (-not $hit.Success) { return $null }
+    # Three letters, because the parser does not know 'Sept'.
+    $named = "$($hit.Groups['d'].Value) $($hit.Groups['mon'].Value.Substring(0, 3)) $($hit.Groups['y'].Value)"
+    if ($hit.Groups['wd'].Success) { $named = "$($hit.Groups['wd'].Value), $named" }
+    return & $join $named $hit
+}
+
+function Test-MailExpired {
+    # THE ONE EXPIRY DECISION, so the moved-box count cannot disagree with the delivery loop. A stated
+    # expiry wins in either direction; only a missing or unreadable one falls to the receiver's floor.
+    param($Message, [DateTime]$LastWriteUtc, [DateTime]$NowUtc)
+    $exp = ConvertTo-MailExpiryUtc $Message.expiresUtc
+    if ($null -ne $exp) { return $exp -lt $NowUtc }
+    return $LastWriteUtc -lt $NowUtc.AddDays(-$RETAIN_DAYS)
+}
+
 function Get-LiveMessageStems {
     # EVERY STEM THAT STILL HAS A MESSAGE FILE SOMEWHERE, read in one pass over every box, and read
     # BEFORE anything is deleted. It is the keep set for the receipt sweep, and reading it first is
@@ -882,8 +968,7 @@ try {
     if ($mr.Error) {
         $note = "[mefor-mail] SHARED ROOT UNAVAILABLE as of $([DateTime]::UtcNow.ToString('o')): " +
             "$(Get-Clean $mr.Error 300). NOTHING WAS READ. This is not an empty box."
-        if ($consuming) { try { [Console]::Error.WriteLine($note) } catch { } }
-        else { Write-Injection -Event $eventName -Text $note }
+        Write-StateNotice -Consuming $consuming -Event $eventName -Text $note
         exit 0
     }
     # The coordination root is named in its own variable because the receipt sweep's citation guard
@@ -897,7 +982,8 @@ try {
 
     # --- Kill switch. Reaches ALREADY-RUNNING sessions, unlike an env var, which is the point.
     if (Test-Path -LiteralPath (Join-Path $root 'OFF')) {
-        Write-Injection -Event $eventName -Text (
+        # Said at every drain while the switch is up, so at Stop it must not wake (BACKLOG #5863).
+        Write-StateNotice -Consuming $consuming -Event $eventName -Text (
             "[mefor-mail] SUPPRESSED as of ${asOf}: the OFF switch is present at mefor-coord/mail/OFF. " +
             "Mail is still being queued and is NOT lost; it is not being shown. Remove that file to resume."
         )
@@ -968,14 +1054,18 @@ try {
                             $parts = Split-MailFileName -Name $f.Name
                             if (-not $parts) { continue }
                             $m = $null
+                            # Get-Content fails at once on a locked file. This is an advisory scan of a
+                            # box this drain does not read, so it must not spend Read-CoordText's retries.
                             try { $m = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
-                            $exp = [DateTime]::MinValue
-                            if ($m.expiresUtc -and [DateTime]::TryParse([string]$m.expiresUtc, [Globalization.CultureInfo]::InvariantCulture,
-                                    [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$exp) -and $exp -lt $nowUtc) { continue }
+                            # The delivery loop's two tests, so what is counted is what it would show.
+                            if ($m -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                            if (Test-MailExpired -Message $m -LastWriteUtc $f.LastWriteTimeUtc -NowUtc $nowUtc) { continue }
                             $to = if ($m.to -and $m.to.sessionId) { [string]$m.to.sessionId } else { '' }
                             if ($to -and $to -ne $sessionId) { continue }
                             $parts.Stem
                         })
+                    # One message per stem, as the delivery loop counts them.
+                    $waiting = @($waiting | Sort-Object -Unique)
                     if ($waiting.Count -gt 0) {
                         $newest = ($waiting | Sort-Object -Descending | Select-Object -First 1)
                         $stampDir = Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-mail-moved'
@@ -1442,15 +1532,7 @@ try {
         # THE FLOOR APPLIES ONLY WHERE THE FIELD IS MISSING OR UNREADABLE. Applying it to a message that
         # states a longer TTL would silently overrule an explicit instruction from the sender, which is
         # a different and worse failure than the one being closed.
-        $expiredNow = $false
-        $exp = [DateTime]::MinValue
-        if ($m.expiresUtc -and [DateTime]::TryParse([string]$m.expiresUtc, [ref]$exp)) {
-            $expiredNow = $exp -lt [DateTime]::UtcNow
-        }
-        else {
-            $expiredNow = $f.LastWriteTimeUtc -lt $cutoff
-        }
-        if ($expiredNow) {
+        if (Test-MailExpired -Message $m -LastWriteUtc $f.LastWriteTimeUtc -NowUtc ([DateTime]::UtcNow)) {
             # Two drains can be inside this box at once -- two sessions sharing a worktree, or one
             # session's Stop overlapping another's SessionStart -- and a shared destination is the
             # arm that was measured to return success for every racer. A lost sweep must NOT

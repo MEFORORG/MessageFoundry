@@ -32,6 +32,15 @@
     the hold, the more likely a crash leaves a lock nobody can safely break.
 #>
 
+# The exclusive create, on its own so a test can substitute a stream whose write or close fails.
+function Open-CoordLockFile([string]$Path) {
+    return [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+}
+
 # Returns the lock's path, to be passed back to Exit-CoordLock.
 function Enter-CoordLock {
     [CmdletBinding()]
@@ -44,34 +53,72 @@ function Enter-CoordLock {
         # every worktree AND the primary checkout resolve to the same lock.
         [string]$Repo
     )
+    # git is judged by its exit code alone. Continue, not a caller's Stop: under Windows PowerShell 5.1
+    # a redirected stderr line from a SUCCESSFUL git call is a terminating error under Stop. Under
+    # pwsh, Continue also keeps a caller's $PSNativeCommandUseErrorActionPreference from turning a
+    # failed git call into a raw error ahead of the check below.
+    $ErrorActionPreference = 'Continue'
     $gitArgs = @()
     if ($Repo) { $gitArgs = @("-C", $Repo) }
     $common = (& git @gitArgs rev-parse --path-format=absolute --git-common-dir 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $common) { throw "Enter-CoordLock: not inside a git repository." }
 
+    # Load-bearing from here on. Under a caller's SilentlyContinue, or with no enclosing try, a failed
+    # .NET call would not stop this function: it would run on into the block that owns and deletes the
+    # lock file.
+    $ErrorActionPreference = 'Stop'
     $dir = Join-Path $common.Trim() "mefor-coord/locks"
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $safe = ($Name.Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
     if (-not $safe) { throw "Enter-CoordLock: name '$Name' reduces to nothing usable." }
     $lock = Join-Path $dir "$safe.lock"
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    # Monotonic, so a clock or daylight-saving step cannot stretch or collapse either bound.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $deniedAt = $null
+    $absentAt = $null
     while ($true) {
         try {
-            $fs = [System.IO.File]::Open(
-                $lock,
-                [System.IO.FileMode]::CreateNew,
-                [System.IO.FileAccess]::Write,
-                [System.IO.FileShare]::None)
-            try {
-                # Recorded so a wedged lock names its holder instead of being an anonymous mystery.
-                $who = [System.Text.Encoding]::UTF8.GetBytes(
-                    "pid=$PID host=$env:COMPUTERNAME at=$((Get-Date).ToString('o'))")
-                $fs.Write($who, 0, $who.Length)
-            } finally { $fs.Dispose() }
-            return $lock
+            $fs = Open-CoordLockFile $lock
+        } catch [System.UnauthorizedAccessException] {
+            # NTFS raises this, not IOException, for a name in delete-pending (measured on Windows
+            # 10.0.26300, NTFS, with the legacy disposition; a plain File.Delete there frees the name at
+            # once). A real denial raises it too. Pending shows as a file that is still there, and it
+            # clears when the last handle closes, so it earns a bounded wait. The bound is short because
+            # a real denial on an existing file looks the same: 5 s from the first denial. A name seen
+            # empty always gets one more try, because a delete may have finished between the two reads,
+            # and then 1 s from when it was first seen empty, inside the same 5 s. A directory can never
+            # clear and fails at once. Each path reports the denial: the text in a file being deleted
+            # names no holder.
+            $now = $clock.Elapsed.TotalSeconds
+            if ($null -eq $deniedAt) { $deniedAt = $now }
+            $isDirectory = Test-Path -LiteralPath $lock -PathType Container
+            $isFile = Test-Path -LiteralPath $lock -PathType Leaf
+            $inWindow = ($now - $deniedAt) -lt 5 -and $now -le $TimeoutSeconds
+            $retry = if ($isDirectory) { $false }
+            elseif ($isFile) { $absentAt = $null; $inWindow }
+            elseif ($null -eq $absentAt) { $absentAt = $now; $true }
+            else { $inWindow -and ($now - $absentAt) -lt 1 }
+            if ($retry) {
+                Start-Sleep -Milliseconds 50
+                continue
+            }
+            $advice = if ($isDirectory) { "A directory is at the lock path. Remove it." }
+            elseif ($isFile) { "The file may still be pending deletion, so retry. If this repeats, check its permissions." }
+            else { "No file is at the lock path, so check the permissions on its directory." }
+            throw (
+                "Enter-CoordLock: access denied creating the '$safe' lock at '$lock'.`n" +
+                "  $advice`n" +
+                "  $($_.Exception.Message)")
         } catch [System.IO.IOException] {
-            if ((Get-Date) -gt $deadline) {
+            # Only a name that is taken is contention. Disk full, a missing directory or an over-long
+            # path would otherwise spin to the timeout and be reported as a wedged holder.
+            $io = if ($_.Exception.InnerException) { $_.Exception.InnerException } else { $_.Exception }
+            # Windows codes only (FILE_EXISTS, SHARING_VIOLATION). Elsewhere HResult carries an errno.
+            if ($env:OS -eq 'Windows_NT' -and ($io.HResult -band 0xFFFF) -notin 0x50, 0x20) { throw }
+            $deniedAt = $null
+            $absentAt = $null
+            if ($clock.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
                 $held = "(unreadable)"
                 try { $held = (Get-Content -LiteralPath $lock -Raw -EA Stop).Trim() } catch { }
                 throw (
@@ -83,7 +130,37 @@ function Enter-CoordLock {
                     "      Remove-Item -LiteralPath '$lock'")
             }
             Start-Sleep -Milliseconds 200
+            continue
+        } catch {
+            # Not redundant with Stop above. Measured: with this clause removed, a failed create fell
+            # through to the block below, which owns and deletes the lock file.
+            throw
         }
+
+        # The create succeeded, so this call owns the file. Outside the catches above on purpose: a
+        # failed write caught there would retry against the file this call just made, spin to the
+        # timeout, and leave a lock that wedges every later caller.
+        $recorded = $false
+        try {
+            # Recorded so a wedged lock names its holder instead of being an anonymous mystery.
+            $who = [System.Text.Encoding]::UTF8.GetBytes(
+                "pid=$PID host=$env:COMPUTERNAME at=$((Get-Date).ToString('o'))")
+            $fs.Write($who, 0, $who.Length)
+            # Inside the guard because FileStream buffers: a full disk can surface only here.
+            $fs.Dispose()
+            $recorded = $true
+        } catch {
+            # Not redundant with Stop above. Measured: with this clause removed, a failed write ran
+            # the cleanup and then returned the deleted lock, and the caller printed ACQUIRED.
+            throw
+        } finally {
+            if (-not $recorded) {
+                try { $fs.Dispose() } catch { Write-Verbose "lock stream close failed: $_" }
+                try { [System.IO.File]::Delete($lock) }
+                catch { Write-Warning "Could not remove the '$safe' lock this call created. Remove it by hand: $lock" }
+            }
+        }
+        return $lock
     }
 }
 

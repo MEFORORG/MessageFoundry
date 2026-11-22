@@ -44,9 +44,11 @@ returns nothing over a correct tree is the same observation as a detector that i
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -243,6 +245,8 @@ def test_the_output_is_plain_text_and_not_a_rejected_envelope(repo: Worktree) ->
     out = run_hook(repo, _COMPACT_RESTART)
 
     assert out.strip(), "the hook said nothing on a compaction restart; that is the whole defect"
+    # The catch now prints what it gathered, so non-empty alone no longer detects a throw.
+    assert "RESTORE INCOMPLETE" not in out, f"the normal path threw: {out}"
     event = _hook_envelope_event(out)
     assert event is None, (
         f"the hook emitted a hook-output envelope naming {event!r}. Exit-0 stdout is added to "
@@ -379,6 +383,16 @@ def test_an_unreadable_payload_fails_open(
     assert out.strip(), f"the hook went silent on {why}, which is the fail-CLOSED direction"
 
 
+def _planted_hook(tmp_path: Path, source: str) -> Path:
+    """`source` as the hook, beside the shared-root resolver and without config-roots.ps1."""
+    planted = tmp_path / "scripts" / "hooks" / HOOK.name
+    planted.parent.mkdir(parents=True)
+    planted.write_text(source, encoding="utf-8")
+    (tmp_path / "scripts" / "coord").mkdir()
+    shutil.copy2(HOOK.parents[1] / "coord" / "coord-root.ps1", tmp_path / "scripts" / "coord")
+    return planted
+
+
 def test_a_missing_shared_library_costs_the_age_and_not_the_reprime(
     repo: Worktree, tmp_path: Path
 ) -> None:
@@ -390,13 +404,9 @@ def test_a_missing_shared_library_costs_the_age_and_not_the_reprime(
     vanished in silence. Running a COPY of the script from a directory with no sibling `coord/` is
     what reproduces a missing library without touching the real tree.
     """
-    planted = tmp_path / "scripts" / "hooks" / HOOK.name
-    planted.parent.mkdir(parents=True)
-    shutil.copy2(HOOK, planted)
     # The resolver comes along, so this arm still measures what it was written for: the UTC helper's
     # absence. A missing resolver is a different, deliberate skip (docs/COORD-SHARED-ROOT.md).
-    (tmp_path / "scripts" / "coord").mkdir()
-    shutil.copy2(HOOK.parents[1] / "coord" / "coord-root.ps1", tmp_path / "scripts" / "coord")
+    planted = _planted_hook(tmp_path, HOOK.read_text(encoding="utf-8"))
     assert not (tmp_path / "scripts" / "coord" / "config-roots.ps1").exists(), (
         "the library must be unreachable"
     )
@@ -440,14 +450,7 @@ def test_the_hook_reads_the_record_seat_ps1_actually_writes(repo: Worktree) -> N
 def test_a_held_ledger_number_is_reported(repo: Worktree) -> None:
     """The one restored fact with a permanent cost attached: an unfiled number burns with the tree."""
     _declaration(repo)
-    alloc = repo.common / "mefor-coord" / "alloc"
-    alloc.mkdir(parents=True, exist_ok=True)
-    (alloc / "a.json").write_text(
-        json.dumps(
-            {"number": 4242, "kind": "adr", "title": "a held allocation", "worktree": repo.top}
-        ),
-        encoding="utf-8",
-    )
+    _good_allocation(repo, title="a held allocation")
 
     out = run_hook(repo, _COMPACT_RESTART)
     assert "#4242" in out, f"the held ledger number was not restored: {out}"
@@ -470,6 +473,416 @@ def test_a_declaration_from_another_branch_is_flagged_rather_than_adopted(repo: 
     out = run_hook(repo, _COMPACT_RESTART)
     assert "NOT YOURS" in out, f"a previous occupant's goal was restored as current: {out}"
     assert "a-previous-occupant" in out, "the branch that discriminates them must be named"
+
+
+# ------------------------------------------------------------- one bad record among good ones
+
+# BACKLOG #5865: under strict mode each of these threw to the outer catch, which exits 0 with no
+# output, so one bad file cost the seat, the goal and the held numbers.
+_BAD_BODIES = {
+    "zero-byte": "",
+    "empty-object": "{}",
+    "json-null": "null",
+    "empty-array": "[]",
+    "bare-number": "5",
+}
+# These only reach the unguarded reads when the record names this worktree.
+_BAD_FOR_THIS_TREE: dict[str, dict[str, str]] = {
+    "worktree-only": {},
+    "goal-without-seat": {"goal": "BAD-RECORD-GOAL"},
+}
+# The allocation reader never reads `goal`, so that shape would only repeat worktree-only there.
+_BAD_CASES = [
+    (kind, shape)
+    for kind in ("seats", "alloc")
+    for shape in (*_BAD_BODIES, *_BAD_FOR_THIS_TREE)
+    if (kind, shape) != ("alloc", "goal-without-seat")
+]
+_UNREADABLE_ALLOC = "UNREADABLE LEDGER RECORD"
+_UNATTRIBUTED_ALLOC = "LEDGER RECORDS NOT ATTRIBUTED"
+
+
+def _good_allocation(repo: Worktree, title: str = "a held one") -> None:
+    alloc = repo.common / "mefor-coord" / "alloc" / "adr"
+    alloc.mkdir(parents=True, exist_ok=True)
+    (alloc / "4242.json").write_text(
+        json.dumps({"number": 4242, "kind": "adr", "title": title, "worktree": repo.top}),
+        encoding="utf-8",
+    )
+
+
+def _plant_newest(directory: Path, name: str, body: str) -> Path:
+    """Write `body` with a modified time ahead of every other record, so it is read first."""
+    directory.mkdir(parents=True, exist_ok=True)
+    planted = directory / name
+    planted.write_text(body, encoding="utf-8")
+    ahead = time.time() + 60
+    os.utime(planted, (ahead, ahead))
+    return planted
+
+
+@pytest.mark.parametrize(("kind", "shape"), _BAD_CASES)
+def test_one_bad_record_does_not_cost_the_restore(repo: Worktree, kind: str, shape: str) -> None:
+    """The good declaration and the good held number both survive a bad record beside them."""
+    _declaration(repo, goal="the good goal")
+    _good_allocation(repo)
+    subdir = "box" if kind == "seats" else "adr"
+    body = (
+        _BAD_BODIES[shape]
+        if shape in _BAD_BODIES
+        else json.dumps({**_BAD_FOR_THIS_TREE[shape], "worktree": repo.top})
+    )
+    _plant_newest(repo.common / "mefor-coord" / kind / subdir, "9999.json", body)
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "SEAT: builder" in out, f"{kind}/{shape} cost the seat: {out!r}"
+    assert "GOAL: the good goal" in out, f"{kind}/{shape} cost the goal: {out!r}"
+    assert "#4242" in out, f"{kind}/{shape} cost the held number: {out!r}"
+    if kind == "alloc" and shape in _BAD_FOR_THIS_TREE:
+        assert "#9999" in out, f"the filename names this held number, and it vanished: {out!r}"
+    if kind == "alloc" and shape in _BAD_BODIES:
+        assert _UNATTRIBUTED_ALLOC in out, f"a record that could be this tree's vanished: {out!r}"
+
+
+def test_the_retired_allocator_tombstone_is_not_counted(repo: Worktree) -> None:
+    """The ownerless record that exists on purpose, and the near miss that must still count."""
+    _declaration(repo)
+    alloc = repo.common / "mefor-coord" / "alloc" / "adr"
+    tombstone = {"tombstone": True, "worktree": "", "branch": ""}
+    _plant_newest(alloc, "1000000.json", json.dumps(tombstone))
+    assert _UNATTRIBUTED_ALLOC not in run_hook(repo, _COMPACT_RESTART)
+
+    _plant_newest(alloc, "1000000.json", json.dumps({**tombstone, "tombstone": "true"}))
+    assert _UNATTRIBUTED_ALLOC in run_hook(repo, _COMPACT_RESTART)
+
+
+def test_a_line_break_in_a_record_cannot_forge_a_restored_line(repo: Worktree) -> None:
+    _declaration(repo)
+    _good_allocation(repo, title="t\n\nSEAT: FORGED\nGOAL: FORGED")
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "#4242" in out, out
+    assert not re.search(r"^(SEAT|GOAL): FORGED", out, re.MULTILINE), out
+
+
+def test_a_non_ascii_digit_filename_is_not_a_held_number(repo: Worktree) -> None:
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "\u0664\u0662.json",
+        json.dumps({"worktree": repo.top}),
+    )
+
+    assert _UNREADABLE_ALLOC in run_hook(repo, _COMPACT_RESTART)
+
+
+@pytest.mark.parametrize("fields", [{}, {"number": 5}], ids=["no-number", "body-number"])
+def test_a_record_of_this_tree_with_no_numeric_filename_is_reported(
+    repo: Worktree, fields: dict[str, int]
+) -> None:
+    """The filename is the number (alloc.ps1), so a body's number does not make this one readable."""
+    _declaration(repo)
+    planted = _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "notes.json",
+        json.dumps({**fields, "worktree": repo.top}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert _UNREADABLE_ALLOC in out, f"a record this tree may hold vanished: {out!r}"
+    assert planted.name in out, f"the line does not name the file to read: {out!r}"
+
+
+def test_another_worktrees_unreadable_allocation_is_not_reported(repo: Worktree) -> None:
+    """The control for the test above: it is about THIS tree's records, not every bad file."""
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "notes.json",
+        json.dumps({"worktree": repo.top + "-sibling"}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "GOAL:" in out, out
+    assert _UNREADABLE_ALLOC not in out, f"another tree's record was claimed: {out!r}"
+
+
+def test_a_newer_goal_with_no_seat_is_restored(repo: Worktree) -> None:
+    """`seat.ps1 -Declare -Goal` without -Seat writes this, so it is the newest stated intent."""
+    _declaration(repo, goal="an older goal")
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "newer.json",
+        json.dumps(
+            {"seat": None, "goal": "a goal with no seat", "branch": _BRANCH, "worktree": repo.top}
+        ),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "GOAL: a goal with no seat" in out, out
+    assert "SEAT: (none recorded)" in out, out
+    assert "an older goal" not in out, out
+
+
+@pytest.mark.parametrize("goal", ["   ", "\n", 5, {"k": 1}], ids=["blank", "newline", "int", "obj"])
+def test_a_damaged_goal_does_not_displace_a_good_declaration(repo: Worktree, goal: object) -> None:
+    _declaration(repo, goal="the good goal")
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "newer.json",
+        json.dumps({"seat": "builder", "goal": goal, "branch": _BRANCH, "worktree": repo.top}),
+    )
+
+    assert "GOAL: the good goal" in run_hook(repo, _COMPACT_RESTART)
+
+
+@pytest.mark.parametrize("worktree", [5, True, {"p": "x"}], ids=["int", "bool", "object"])
+def test_a_non_string_worktree_is_counted_not_lost(repo: Worktree, worktree: object) -> None:
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "7001.json",
+        json.dumps({"worktree": worktree}),
+    )
+
+    assert _UNATTRIBUTED_ALLOC in run_hook(repo, _COMPACT_RESTART)
+
+
+@pytest.mark.parametrize("extra", ["\u200b", "\u200d", "\x01"], ids=["zwsp", "zwj", "control"])
+def test_a_path_differing_by_an_ignorable_character_is_another_tree(
+    repo: Worktree, extra: str
+) -> None:
+    """A culture-sensitive compare ignores these characters, so it would call the paths equal."""
+    _declaration(repo, goal="the good goal")
+    other = repo.top + extra
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "7004.json",
+        json.dumps({"worktree": other}),
+    )
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "newer.json",
+        json.dumps({"seat": "builder", "goal": "ANOTHER-TREE", "worktree": other}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "#7004" not in out, out
+    assert "ANOTHER-TREE" not in out, out
+    assert "GOAL: the good goal" in out, out
+
+
+def test_the_identity_compare_keeps_case_and_separator_folding(repo: Worktree) -> None:
+    """The control for the test above: an ordinal compare must not start refusing this tree."""
+    same = repo.top.swapcase().replace("/", "\\") + "\\"
+    _declaration(repo, goal="the good goal")
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "7006.json",
+        json.dumps({"worktree": same}),
+    )
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "newer.json",
+        json.dumps({"seat": "builder", "goal": "same tree", "branch": _BRANCH, "worktree": same}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "#7006" in out, out
+    assert "GOAL: same tree" in out, out
+
+
+@pytest.mark.parametrize(
+    "goal",
+    ["2026-11-22T10:00:00Z", "2026-11-22T10:00:00+05:00", "2026-11-22T10:00:00"],
+    ids=["utc", "offset", "no-zone"],
+)
+def test_a_goal_that_parses_as_a_date_is_restored_as_written(repo: Worktree, goal: str) -> None:
+    """ConvertFrom-Json turns this text into a [datetime], and it is still the stated goal."""
+    _declaration(repo, goal=goal)
+
+    assert f"GOAL: {goal}\n" in run_hook(repo, _COMPACT_RESTART)
+
+
+@pytest.mark.parametrize(
+    ("fields", "shown"),
+    [
+        ({"goal": "a goal with no seat key"}, "a goal with no seat key"),
+        ({"goal": "2026-11-22T10:00:00Z"}, "2026-11-22T10:00:00Z"),
+        ({"seat": "builder", "goal": 5}, "5"),
+        ({"seat": "builder", "goal": "   "}, None),
+        ({}, None),
+    ],
+    ids=["seatless", "seatless-date", "non-string", "blank", "worktree-only"],
+)
+def test_only_damaged_records_are_not_reported_as_never_declared(
+    repo: Worktree, fields: dict[str, object], shown: str | None
+) -> None:
+    """A damaged record is not the never-declared case, and any goal it holds is still shown."""
+    planted = _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "damaged.json",
+        json.dumps({**fields, "worktree": repo.top}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "SEAT: not declared" not in out, out
+    assert "never asked" not in out, out
+    assert "DAMAGED" in out, out
+    assert planted.name in out, f"the line does not name the file to read: {out!r}"
+    assert "seat.ps1 -Declare" in out, out
+    if shown is not None:
+        assert shown in out, f"a goal the record holds was lost: {out!r}"
+
+
+def test_a_newer_damaged_goal_is_shown_beside_an_older_declaration(repo: Worktree) -> None:
+    """The record is newest, so its goal may supersede the good one and must not vanish."""
+    _declaration(repo, goal="an older good goal")
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "damaged.json",
+        json.dumps({"goal": "a newer damaged goal", "worktree": repo.top}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "GOAL: an older good goal" in out, out
+    assert "UNVERIFIED: a newer damaged goal" in out, out
+    assert not re.search(r"^GOAL: a newer damaged goal", out, re.MULTILINE), out
+
+
+@pytest.mark.parametrize("body", ["", '{"seat":"builder","goal":"torn'], ids=["empty", "torn"])
+def test_an_unreadable_seat_record_is_not_called_never_declared(repo: Worktree, body: str) -> None:
+    """It could be this tree's, so the hook cannot say that nothing on disk carries a goal."""
+    _plant_newest(repo.common / "mefor-coord" / "seats" / "box", "torn.json", body)
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "Nothing on disk carries a goal" not in out, out
+    assert "1 seat record(s) cannot be read" in out, out
+    assert "seat.ps1 -Declare" in out, out
+
+
+def test_a_seat_record_with_a_null_goal_is_still_never_declared(repo: Worktree) -> None:
+    """The control: seat.ps1 writes this shape before any declaration, so it is not damage."""
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "heartbeat.json",
+        json.dumps({"seat": None, "goal": None, "worktree": repo.top}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "SEAT: not declared" in out, out
+    assert "DAMAGED" not in out, out
+
+
+def test_a_one_element_array_allocation_is_not_a_held_number(repo: Worktree) -> None:
+    """remove.ps1 reads this as 'is not one JSON object', so it must not read as a normal hold."""
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "7005.json",
+        json.dumps([{"worktree": repo.top, "title": "wrapped"}]),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "#7005" not in out, out
+    assert _UNATTRIBUTED_ALLOC in out, out
+
+
+def test_a_throwing_ledger_renderer_keeps_the_held_numbers(repo: Worktree, tmp_path: Path) -> None:
+    """The block never printed, so the raw facts and the caveat must both still reach context."""
+    marker = "function Get-LedgerLines {\n"
+    source = HOOK.read_text(encoding="utf-8")
+    assert source.count(marker) == 1
+    planted = _planted_hook(tmp_path, source.replace(marker, f"{marker}    throw 'planted'\n"))
+    _declaration(repo)
+    _good_allocation(repo)
+    alloc = repo.common / "mefor-coord" / "alloc" / "adr"
+    _plant_newest(alloc, "notes.json", json.dumps({"worktree": repo.top}))
+    _plant_newest(alloc, "7007.json", "{not json")
+
+    out = run_hook(repo, _COMPACT_RESTART, script=planted)
+
+    assert "#4242" in out, out
+    assert "notes.json" in out, out
+    assert _UNATTRIBUTED_ALLOC in out, out
+    assert "LEDGER NUMBERS: not fully checked" in out, out
+    assert "RESTORE INCOMPLETE" in out, out
+
+
+def test_another_hosts_blank_worktree_record_is_not_counted(repo: Worktree) -> None:
+    _declaration(repo)
+    _plant_newest(
+        repo.common / "mefor-coord" / "alloc" / "adr",
+        "7003.json",
+        json.dumps({"worktree": "", "host": "OTHERPC"}),
+    )
+
+    assert _UNATTRIBUTED_ALLOC not in run_hook(repo, _COMPACT_RESTART)
+
+
+def test_a_throw_before_the_ledger_scan_says_it_was_not_checked(
+    repo: Worktree, tmp_path: Path
+) -> None:
+    marker = "\n    if ($declared) {"
+    source = HOOK.read_text(encoding="utf-8")
+    assert source.count(marker) == 1
+    planted = _planted_hook(tmp_path, source.replace(marker, f"\n    throw 'planted'{marker}"))
+    _declaration(repo)
+
+    assert "LEDGER NUMBERS: not fully checked" in run_hook(repo, _COMPACT_RESTART, script=planted)
+
+
+def test_a_throwing_ledger_helper_does_not_empty_the_catch(repo: Worktree, tmp_path: Path) -> None:
+    """The helper the catch itself calls can be the one that threw on the main path."""
+    marker = "function Get-LedgerLines {\n"
+    source = HOOK.read_text(encoding="utf-8")
+    assert source.count(marker) == 1
+    planted = _planted_hook(tmp_path, source.replace(marker, f"{marker}    throw 'planted'\n"))
+    _declaration(repo, goal="survive a helper throw")
+
+    out = run_hook(repo, _COMPACT_RESTART, script=planted)
+
+    assert "GOAL: survive a helper throw" in out, out
+    assert "RESTORE INCOMPLETE" in out, out
+    assert f"BRANCH: {_BRANCH}" in out, out
+
+
+@pytest.mark.parametrize(
+    ("marker", "goal_gathered", "number_gathered"),
+    [
+        ("\n    if ($declared) {", False, False),
+        ("\n    $lines += @(Get-LedgerLines $held $unreadable", True, True),
+    ],
+    ids=["before-the-first-line", "after-the-allocation-loop"],
+)
+def test_a_throw_keeps_what_was_already_gathered(
+    repo: Worktree, tmp_path: Path, marker: str, goal_gathered: bool, number_gathered: bool
+) -> None:
+    """Any throw past the guarded reads must degrade the restore, never empty it."""
+    source = HOOK.read_text(encoding="utf-8")
+    assert source.count(marker) == 1
+    planted = _planted_hook(tmp_path, source.replace(marker, f"\n    throw 'planted'{marker}"))
+    _declaration(repo, goal="survive a throw")
+    _good_allocation(repo)
+
+    out = run_hook(repo, _COMPACT_RESTART, script=planted)
+
+    assert "RESTORE INCOMPLETE" in out, out
+    assert f"BRANCH: {_BRANCH}" in out, out
+    assert ("GOAL: survive a throw" in out) is goal_gathered, out
+    assert ("#4242" in out) is number_gathered, out
 
 
 # ----------------------------------------------------------------------------- the reported age
