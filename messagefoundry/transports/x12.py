@@ -68,7 +68,7 @@ from messagefoundry.transports.base import (
     wait_for_intake,
 )
 from messagefoundry.transports.framing import (
-    REPLY_REPLACED_REASON,
+    ReplyReplacements,
     declared_encoding,
     encode_reply_reporting,
 )
@@ -771,6 +771,7 @@ class X12Source(SourceConnector):
         # Names this connection in a pacing report (BACKLOG #290) and in the reply-encoding warnings
         # (BACKLOG #5958).
         self._pacing_name = config.name or ""
+        self._reply_replacements = ReplyReplacements()  # BACKLOG #5799
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors TcpSource/MLLPSource.
         sa = s.get("source_ip_allowlist")
@@ -1072,12 +1073,10 @@ class X12Source(SourceConnector):
                                         break
                                     continue
                                 writer.write(wire)  # unframed: the interchange is the frame
-                                if replaced:
-                                    # BACKLOG #5799, as the MLLP listener records it.
+                                if replaced and (note := self._reply_replacements.note()):
+                                    # BACKLOG #5799, throttled as the MLLP listener throttles it.
                                     await self._emit_event(
-                                        "reply_replaced",
-                                        peer_host=peer_host,
-                                        reason=REPLY_REPLACED_REASON,
+                                        "reply_replaced", peer_host=peer_host, reason=note
                                     )
                                 await self._drain_reply(writer)
                         if failed:

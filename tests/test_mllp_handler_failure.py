@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
@@ -647,18 +648,19 @@ async def test_a_reply_a_narrow_charset_cannot_hold_is_still_sent() -> None:
     assert "framing_error" not in cap.kinds(), cap.kinds()
 
 
-async def test_each_reply_a_narrow_charset_altered_writes_a_reply_replaced_event(
+async def test_a_burst_of_altered_replies_writes_one_throttled_reply_replaced_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # BACKLOG #5799 item 1: the replacement's WARNING is logged once per connection per process, so
-    # without an event the second altered ACK left no record at all. Each altered reply now writes
-    # one `reply_replaced` event with a fixed reason; a clean reply writes none. Red on the code
-    # before: the event list holds no `reply_replaced`.
+    # without an event the second altered ACK left no record at all. The event is throttled per
+    # listener, so a burst inside one window writes one event, not one per message, which could
+    # fill the runner's bounded event queue and crowd other kinds out. Red on the code before: no
+    # `reply_replaced`; red with an unthrottled event: twenty of them.
     monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
     cap = _Capture()
     source = _mllp(encoding="ascii")
     source.on_connection_event = cap
-    texts = iter(["café", "plain", "naïve"])
+    texts = iter(["café", "plain"] + ["naïve"] * 19)
 
     async def narrow(raw: bytes) -> str:
         return build_ack(raw, code="AA", text=next(texts))
@@ -666,7 +668,7 @@ async def test_each_reply_a_narrow_charset_altered_writes_a_reply_replaced_event
     await source.start(narrow)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
-        for _ in range(3):
+        for _ in range(21):
             writer.write(frame(_ADT))
             await writer.drain()
             await _read_reply(reader)
@@ -675,9 +677,27 @@ async def test_each_reply_a_narrow_charset_altered_writes_a_reply_replaced_event
     finally:
         await asyncio.wait_for(source.stop(), timeout=5.0)
     replaced = [e for e in cap.events if e[0] == "reply_replaced"]
-    assert len(replaced) == 2, cap.events
-    assert all(reason == framing_mod.REPLY_REPLACED_REASON for _, _, reason in replaced)
-    assert all(host is not None for _, host, _ in replaced)
+    assert len(replaced) == 1, cap.events
+    assert replaced[0][1] is not None and replaced[0][2] is not None
+    assert replaced[0][2].startswith("1 reply(ies) since the last report")
+    assert "naïve" not in replaced[0][2] and "ascii" not in replaced[0][2]
+
+
+def test_the_reply_replaced_throttle_reports_the_count_once_the_window_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5799 item 1: the first at once, then at most one per window, carrying the count of
+    # replaced replies since the last report.
+    clock = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    throttle = framing_mod.ReplyReplacements()
+    first = throttle.note()
+    assert first is not None and first.startswith("1 reply(ies)")
+    assert [throttle.note() for _ in range(500)] == [None] * 500
+    clock[0] += framing_mod.REPLY_REPLACED_EVENT_SECONDS
+    later = throttle.note()
+    assert later is not None and later.startswith("501 reply(ies)")
+    assert throttle.note() is None
 
 
 async def test_a_handler_fault_nak_the_charset_altered_writes_a_reply_replaced_event(

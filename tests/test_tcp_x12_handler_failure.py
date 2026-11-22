@@ -394,7 +394,8 @@ async def test_a_reply_a_narrow_charset_cannot_hold_is_still_sent(
     # BACKLOG #5799 item 1: the altered reply is recorded as an event, not only in the warn-once
     # log line. Red on the code before: no `reply_replaced` in the events.
     replaced = [e for e in events if e[0] == "reply_replaced"]
-    assert [reason for _, _, reason in replaced] == [framing_mod.REPLY_REPLACED_REASON], name
+    assert len(replaced) == 1, name
+    assert str(replaced[0][2]).startswith("1 reply(ies) since the last report"), name
 
 
 async def test_an_x12_reply_in_an_unusable_charset_name_is_sent_in_utf8(
@@ -482,8 +483,8 @@ async def test_x12_a_reply_its_charset_cannot_hold_is_replaced_and_sent(
         events = await _drive(source, _ThenEof(EDI * 2), writer, handler=narrow_reply)
     assert seen == [EDI] * 2
     assert writer.written == [b"synthetic reply ?"] * 2
-    # One `reply_replaced` per altered reply (BACKLOG #5799 item 1).
-    assert _kinds(events) == ["established", "reply_replaced", "reply_replaced", "closed"]
+    # One `reply_replaced` for both altered replies: the event is throttled (BACKLOG #5799 item 1).
+    assert _kinds(events) == ["established", "reply_replaced", "closed"]
     assert_capture_sees(caplog, "messagefoundry.transports.x12")
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 

@@ -14,6 +14,7 @@ senders and ACK writers use too.
 from __future__ import annotations
 
 import logging
+import time
 
 from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.framing import (
@@ -36,7 +37,8 @@ from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 __all__ = [
     "FRAMING_CODE",
     "MULTIPLE_MESSAGES_CODE",
-    "REPLY_REPLACED_REASON",
+    "REPLY_REPLACED_EVENT_SECONDS",
+    "ReplyReplacements",
     "FrameError",
     "FrameByteFault",
     "FramePayloadError",
@@ -72,16 +74,43 @@ FRAMING_CODE = "framing"
 _reply_fallback_logged: set[str] = set()
 
 #: The listeners whose reply-character replacement has been logged, once per connection for the
-#: same reason (BACKLOG #5799): a narrow charset meets the same characters on every message. Each
-#: replaced reply still writes a ``reply_replaced`` connection event, through the listeners that call
-#: :func:`frame_reply_reporting` or :func:`encode_reply_reporting`.
+#: same reason (BACKLOG #5799): a narrow charset meets the same characters on every message. The
+#: MLLP, raw-TCP and X12 listeners also send a ``reply_replaced`` connection event, which
+#: :class:`ReplyReplacements` throttles; it is stored only when connection events are captured.
 _reply_replacement_logged: set[str] = set()
 
-#: The ``reason`` of a ``reply_replaced`` connection event. Fixed text: it names neither the charset
-#: setting nor any part of the reply, which echoes the message.
-REPLY_REPLACED_REASON = (
-    "the reply held characters the inbound charset cannot encode, and each was replaced"
-)
+#: The shortest gap between two ``reply_replaced`` events from one listener, the same window as the
+#: ``tls_handshake_failed`` throttle.
+REPLY_REPLACED_EVENT_SECONDS = 60.0
+
+
+class ReplyReplacements:
+    """One listener's throttle for its ``reply_replaced`` connection events (BACKLOG #5799).
+
+    A narrow charset meets the same characters on every message, so one event per replaced reply
+    would grow with message volume and could crowd other kinds out of the runner's bounded event
+    queue. The first replaced reply is reported at once; after that, at most one report per
+    :data:`REPLY_REPLACED_EVENT_SECONDS`, made by the first replaced reply past the window and
+    carrying the count since the last report. Unlike the ``tls_handshake_failed`` throttle there is
+    no trailing report: replies counted after the last report are not reported until another reply
+    is replaced past the window, and not at all if none is. The reason is a count and fixed text,
+    never the charset setting or any part of the reply. Runs on the listener's event loop."""
+
+    def __init__(self) -> None:
+        self._unreported = 0
+        self._reported_at: float | None = None
+
+    def note(self) -> str | None:
+        """Count one replaced reply, and return the reason of the event due now, if one is."""
+        self._unreported += 1
+        now = time.monotonic()
+        if self._reported_at is not None and now - self._reported_at < REPLY_REPLACED_EVENT_SECONDS:
+            return None
+        count, self._unreported, self._reported_at = self._unreported, 0, now
+        return (
+            f"{count} reply(ies) since the last report held characters the inbound charset "
+            "cannot encode, and each was replaced"
+        )
 
 
 def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:

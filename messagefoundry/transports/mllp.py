@@ -130,7 +130,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.base import cap_setting as _cap_setting
 from messagefoundry.transports.framing import (
     MLLP_CODEC,
-    REPLY_REPLACED_REASON,
+    ReplyReplacements,
     check_frame_bytes,
     declared_encoding,
     frame_for_delivery,
@@ -2373,6 +2373,7 @@ class MLLPSource(SourceConnector):
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
+        self._reply_replacements = ReplyReplacements()  # BACKLOG #5799
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
         # is not listed is refused before anything reads its socket -- with TLS on, that is before
         # the handshake, on every loop (BACKLOG #1606; see _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no
@@ -2996,6 +2997,12 @@ class MLLPSource(SourceConnector):
                 logger.warning("MLLP server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
+    async def _note_reply_replaced(self, peer_host: str | None) -> None:
+        """Count one replaced reply, and send the throttled ``reply_replaced`` event if one is due."""
+        reason = self._reply_replacements.note()
+        if reason is not None:
+            await self._emit_event("reply_replaced", peer_host=peer_host, reason=reason)
+
     async def _emit_event(
         self, kind: str, *, peer_host: str | None = None, reason: str | None = None
     ) -> None:
@@ -3137,9 +3144,7 @@ class MLLPSource(SourceConnector):
         )
         await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
         if framed is not None and framed[1]:
-            await self._emit_event(
-                "reply_replaced", peer_host=peer_host, reason=REPLY_REPLACED_REASON
-            )
+            await self._note_reply_replaced(peer_host)
         return owed, nak
 
     async def _on_client(
@@ -3326,15 +3331,10 @@ class MLLPSource(SourceConnector):
                                 )
                                 writer.write(wire)
                                 if replaced:
-                                    # BACKLOG #5799: the log line is once per connection; the
-                                    # event is sent for each reply whose characters the charset
-                                    # forced a replacement of. A frame byte turned into a space
-                                    # is not one of those, and writes only its warning.
-                                    await self._emit_event(
-                                        "reply_replaced",
-                                        peer_host=peer_host,
-                                        reason=REPLY_REPLACED_REASON,
-                                    )
+                                    # BACKLOG #5799: a reply whose characters the charset forced
+                                    # a replacement of, throttled per listener. A frame byte
+                                    # turned into a space is not one, and writes only its warning.
+                                    await self._note_reply_replaced(peer_host)
                                 await self._drain_ack(writer)
                         if unlisted and decoded:
                             # BACKLOG #4907: every frame this read completed was recorded above,
