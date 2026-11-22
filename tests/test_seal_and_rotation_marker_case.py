@@ -241,14 +241,20 @@ async def test_a_refused_secret_under_an_active_key_seal_is_counted(tmp_path: Pa
     assert _user_cell(path, "u-active") == stale
 
 
-async def test_a_tagged_cell_with_a_null_id_aborts_the_rotation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("row_id", [None, ""])
+async def test_a_tagged_cell_with_a_null_or_empty_id_aborts_the_rotation(
+    tmp_path: Path, row_id: str | None
+) -> None:
     path = tmp_path / "r.db"
     key = generate_key()
     await (await MessageStore.open(path, cipher=make_cipher(key))).close()
     with sqlite3.connect(path) as db:
         columns = db.execute("PRAGMA table_info(search_presets)").fetchall()
-        required = {c[1]: ("x" if "TEXT" in c[2] else 0) for c in columns if c[3] and not c[5]}
+        required: dict[str, str | int | None] = {
+            c[1]: ("x" if "TEXT" in c[2] else 0) for c in columns if c[3] and not c[5]
+        }
         required["criteria"] = "synthetic-unrotated"
+        required["id"] = row_id
         names = ", ".join(required)
         marks = ", ".join("?" for _ in required)
         db.execute(

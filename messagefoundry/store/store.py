@@ -13179,16 +13179,17 @@ class MessageStore:
         matches the marker filter."""
         total = skipped = 0
         after = ""
-        # The page filter below never selects a NULL id, so such a cell would stay under a prior
-        # key while the rotation reports success (BACKLOG #5506).
+        # The page filter below never selects a NULL or empty id, so such a cell would stay under a
+        # prior key while the rotation reports success (BACKLOG #5506).
         cur = await self._db.execute(
-            f"SELECT 1 FROM {table} WHERE id IS NULL AND {self._rotation_scan(column)} LIMIT 1",
+            f"SELECT 1 FROM {table} WHERE (id IS NULL OR id = '')"
+            f" AND {self._rotation_scan(column)} LIMIT 1",
             (active_like,),
         )
         if await cur.fetchone() is not None:
             raise CipherError(
-                f"cipher column {table}.{column}: a row with a NULL id cannot be rotated; repair"
-                " or remove that row and retry"
+                f"cipher column {table}.{column}: a row with a NULL or empty id cannot be rotated;"
+                " repair or remove that row and retry"
             )
         while True:
             cur = await self._db.execute(
