@@ -600,7 +600,6 @@ def field_values(
     occurrence instead, and the walk is linear in the message. A blank line is not an occurrence and
     raises nothing here; a ``Peek``-parsed message holds none.
     """
-    rep_sep = msg["seps"][2]
     for index, seg in enumerate(msg["segments"]):
         if seg["id"] != seg_id or _is_fieldless(msg, index):
             continue
@@ -609,7 +608,7 @@ def field_values(
         if fld >= len(fields):
             continue
         whole = comp is None or is_delimiter_field(seg_id, fld)
-        count = 1 if whole else _field_text(fields[fld]).count(rep_sep) + 1
+        count = 1 if whole else len(_componentize(msg, index, fld, msg["seps"])["reps"])
         view: ParsedMessage = {
             "_lazy": {},
             "segments": [seg],

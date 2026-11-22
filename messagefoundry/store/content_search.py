@@ -233,8 +233,8 @@ def row_matches(spec: SearchSpec, *, raw: str | None, summary: str | None) -> bo
     except HL7PeekError:
         return False  # unparseable body can't satisfy a field-path predicate
     wanted = None if spec.field_value is None else spec.field_value.casefold()
-    for value in field_values(message, seg, fld, comp, sub):
-        # No wanted value is a presence test: any non-empty value satisfies it.
-        if wanted is None or wanted in value.casefold():
-            return True
-    return False
+    # No wanted value is a presence test: any non-empty value satisfies it.
+    return any(
+        wanted is None or wanted in value.casefold()
+        for value in field_values(message, seg, fld, comp, sub)
+    )
