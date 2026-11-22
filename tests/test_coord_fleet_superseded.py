@@ -389,6 +389,68 @@ def test_a_close_survives_a_full_tie_between_legacy_copies(fleet: Fleet) -> None
     assert fleet.states()[(fleet.new_box, "sess-e")] == "CLOSED"
 
 
+def test_a_restamp_with_a_stale_declaration_does_not_speak(fleet: Fleet) -> None:
+    fleet.seat(fleet.new_box, "sess-e", _ago(600), seat="manager", goal="new", declaredAt=_ago(600))
+    fleet.seat(
+        fleet.legacy_box, "sess-e", _ago(10), seat="builder", goal="old", declaredAt=_ago(7200)
+    )
+    row = fleet.rows()[(fleet.new_box, "sess-e")]
+    assert (row["State"], row["Seat"]) == ("INTERRUPTED", "manager")
+
+
+def test_a_handed_restamp_does_not_reopen_a_later_close(fleet: Fleet) -> None:
+    fleet.seat(fleet.new_box, "sess-e", _ago(600), lifecycle="closed", lifecycleAt=_ago(600))
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(10), lifecycle="handed", lifecycleAt=_ago(7200))
+    assert fleet.states()[(fleet.new_box, "sess-e")] == "CLOSED"
+
+
+def test_a_real_handback_speaks_without_the_goal(fleet: Fleet, tmp_path: Path) -> None:
+    doc = tmp_path / "handoff.md"
+    doc.write_text("h", encoding="utf-8")
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600), goal="the goal")
+    fleet.seat(
+        fleet.legacy_box,
+        "sess-e",
+        _ago(10),
+        lifecycle="handed",
+        goal=None,
+        handoff={"path": str(doc), "bytes": 1},
+    )
+    row = fleet.rows()[(fleet.new_box, "sess-e")]
+    assert (row["State"], row["HandoffPath"]) == ("HANDED", str(doc))
+
+
+def test_a_close_with_no_session_id_still_closes_the_session(fleet: Fleet) -> None:
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600))
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(10), lifecycle="closed", sessionId=None)
+    got = fleet.states()
+    assert got[(fleet.new_box, "sess-e")] == "CLOSED"
+    assert got[(fleet.legacy_box, "sess-e")] == "CLOSED"
+
+
+@pytest.mark.parametrize(
+    ("new_lifecycle", "copy_lifecycle"),
+    [("handed", "closed"), ("closed", "handed")],
+    ids=["copy-closed", "new-closed"],
+)
+def test_a_full_tie_of_handed_and_closed_reads_closed(
+    fleet: Fleet, new_lifecycle: str, copy_lifecycle: str
+) -> None:
+    stamp = _ago(30)
+    fleet.seat(fleet.new_box, "sess-e", stamp, writes=4, lifecycle=new_lifecycle)
+    fleet.seat(fleet.legacy_box, "sess-e", stamp, writes=4, lifecycle=copy_lifecycle)
+    assert fleet.states()[(fleet.new_box, "sess-e")] == "CLOSED"
+
+
+def test_a_refused_restamp_of_a_closed_session_supersedes_no_other_seat(fleet: Fleet) -> None:
+    fleet.seat(fleet.new_box, "sess-a", _ago(7200), lifecycle="closed")
+    fleet.seat(fleet.new_box, "sess-b", _ago(3600))
+    fleet.seat(fleet.legacy_box, "sess-a", _ago(10))
+    got = fleet.states()
+    assert got[(fleet.new_box, "sess-a")] == "CLOSED"
+    assert got[(fleet.new_box, "sess-b")] == "INTERRUPTED"
+
+
 def test_a_complete_copy_speaks_for_a_new_box_record_with_no_worktree(fleet: Fleet) -> None:
     fleet.seat(fleet.legacy_box, "sess-e", _ago(10), seat="manager")
     fleet.seat(fleet.new_box, "sess-e", _ago(3600), worktree=None)

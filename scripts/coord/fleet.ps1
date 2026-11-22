@@ -496,31 +496,53 @@ function Get-RecordLifecycle($Rec) {
     if ($null -ne $value) { return [string]$value }
     return 'open'
 }
-# At, then Writes, as seat.ps1 orders them. seat.ps1 leaves a full tie unordered, so an explicit close
-# or handback is what survives one.
+function Get-LifecycleRank($Rec) {
+    switch (Get-RecordLifecycle $Rec) { 'closed' { return 2 } 'handed' { return 1 } default { return 0 } }
+}
+# At, then Writes, as seat.ps1 orders them. seat.ps1 leaves a full tie unordered, so the further
+# lifecycle survives one: closed, then handed, then open.
 function Compare-RecordWrite($A, $B) {
     $byInstant = $A.WriteAt.CompareTo($B.WriteAt)
     if ($byInstant -ne 0) { return $byInstant }
     $byWrites = $A.Writes.CompareTo($B.Writes)
     if ($byWrites -ne 0) { return $byWrites }
-    return ((Get-RecordLifecycle $A.Rec) -ne 'open').CompareTo((Get-RecordLifecycle $B.Rec) -ne 'open')
+    return (Get-LifecycleRank $A.Rec).CompareTo((Get-LifecycleRank $B.Rec))
+}
+# Is the first stamp strictly older than the second? A missing or unreadable stamp orders nothing.
+function Test-StampOlder($First, $Second) {
+    $a = Get-RecordInstantUtc $First
+    $b = Get-RecordInstantUtc $Second
+    return ($null -ne $a -and $null -ne $b -and $a -lt $b)
 }
 function Test-LegacyCopySpeaks($Copy, $NewBox) {
-    # Nothing here can fence or brief from a copy naming no session or no worktree.
-    if (-not [string](Get-RecordField $Copy.Rec 'sessionId') -or -not [string](Get-RecordField $Copy.Rec 'worktree')) { return $false }
     if ((Compare-RecordWrite $Copy $NewBox) -le 0) { return $false }
     $copyLifecycle = Get-RecordLifecycle $Copy.Rec
-    if ($copyLifecycle -eq 'closed') { return $true }
+    $newLifecycle = Get-RecordLifecycle $NewBox.Rec
+    $copyAt = Get-RecordField $Copy.Rec 'lifecycleAt'
+    $newAt = Get-RecordField $NewBox.Rec 'lifecycleAt'
+    # A close ends the session even from a copy too incomplete to fence, unless a later handback
+    # in the new-box record followed it.
+    if ($copyLifecycle -eq 'closed') { return (-not ($newLifecycle -eq 'handed' -and (Test-StampOlder $copyAt $newAt))) }
+    # A re-stamp keeps its old lifecycleAt, so a handback over a close must prove it came later.
+    if ($copyLifecycle -eq 'handed' -and $newLifecycle -eq 'closed' -and -not (Test-StampOlder $newAt $copyAt)) { return $false }
+    # Nothing here can fence or brief from a copy naming no session.
+    if (-not [string](Get-RecordField $Copy.Rec 'sessionId')) { return $false }
     # No writer reopens a session, so an open copy beside a closed or handed record is a re-stamp.
-    if ($copyLifecycle -eq 'open' -and (Get-RecordLifecycle $NewBox.Rec) -ne 'open') { return $false }
+    if ($copyLifecycle -eq 'open' -and $newLifecycle -ne 'open') { return $false }
     # The same re-stamp can lack what the session declared through the new writer. Without a seat a
-    # crashed session drops off the respawn roster, and without a pointer its handoff is lost.
-    foreach ($field in @('seat', 'goal', 'done', 'outOfScope', 'predecessor', 'notes')) {
+    # crashed session drops off the respawn roster, and without a pointer its handoff is lost. A real
+    # handback still speaks without the other declared fields, because its pointer is what matters.
+    $declared = if ($copyLifecycle -eq 'handed') { @('seat') } else { @('seat', 'goal', 'done', 'outOfScope', 'predecessor', 'notes') }
+    foreach ($field in $declared) {
         if ((Get-RecordField $NewBox.Rec $field) -and -not (Get-RecordField $Copy.Rec $field)) { return $false }
     }
-    $newPointer = [string](Get-RecordField (Get-RecordField $NewBox.Rec 'handoff') 'path')
-    $copyPointer = [string](Get-RecordField (Get-RecordField $Copy.Rec 'handoff') 'path')
-    return (-not $newPointer -or $copyPointer)
+    $newHandoff = Get-RecordField $NewBox.Rec 'handoff'
+    $copyHandoff = Get-RecordField $Copy.Rec 'handoff'
+    if ([string](Get-RecordField $newHandoff 'path') -and -not [string](Get-RecordField $copyHandoff 'path')) { return $false }
+    if ($copyLifecycle -eq 'handed') { return $true }
+    # An open re-stamp can also carry declarations the new writer has since replaced.
+    if (Test-StampOlder (Get-RecordField $Copy.Rec 'declaredAt') (Get-RecordField $NewBox.Rec 'declaredAt')) { return $false }
+    return (-not (Test-StampOlder (Get-RecordField $copyHandoff 'pointedAt') (Get-RecordField $newHandoff 'pointedAt')))
 }
 $frozenLegacy = @{}
 $newBoxRecords = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
@@ -531,10 +553,12 @@ foreach ($r in $records) {
     if (-not $r.SessionIdentity -or $r.Box -ceq $r.Tree -or -not $newBoxRecords.ContainsKey($r.SessionIdentity)) { continue }
     $frozenLegacy[$r.File] = $true
     $current = $newBoxRecords[$r.SessionIdentity]
-    if ($null -ne $r.AsOfUtc -and ($null -eq $current.OrderUtc -or $r.AsOfUtc -gt $current.OrderUtc)) {
+    $speaks = Test-LegacyCopySpeaks $r $current
+    # A refused re-stamp of a closed or handed session is not activity, so it supersedes no other seat.
+    if (($speaks -or (Get-RecordLifecycle $current.Rec) -eq 'open') -and $null -ne $r.AsOfUtc -and ($null -eq $current.OrderUtc -or $r.AsOfUtc -gt $current.OrderUtc)) {
         $current.OrderUtc = $r.AsOfUtc
     }
-    if (-not (Test-LegacyCopySpeaks $r $current)) { continue }
+    if (-not $speaks) { continue }
     # Among copies that may speak the newest does, however they happen to be listed. An exact tie
     # goes to the lower path, so two runs over one directory cannot pick differently.
     $held = $current.Voice
