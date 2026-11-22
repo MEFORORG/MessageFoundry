@@ -464,18 +464,25 @@ async def _foreign_object(db: aiosqlite.Connection, cause: str) -> tuple[str, st
 
     The name is matched against the live file's views and triggers, never cut out of the text: the
     text may add a suffix after the name, and a quoted name may hold a colon. A SQLite error while
-    telling falls back to ``None``, the plain remedy."""
+    telling falls back to ``None``, the plain remedy.
+
+    SQLite writes "error in view V: ..." or, on its re-check after the change, "error in view V
+    after drop column: ...". So when several names fit, as ``vv`` and ``vv after`` both fit "error
+    in view vv after drop column: ...", one whose remainder starts with the colon wins, then one
+    whose remainder starts with " after ", then any other; among names of one rank the longest wins.
+    The longest alone would name ``vv after`` there, which is not the cause."""
     try:
         async with db.execute(_FOREIGN_OBJECTS_SQL) as cur:
             objects = [(str(kind), str(name)) for kind, name in await cur.fetchall()]
-        named = []
+        named: list[tuple[int, str, str]] = []
         for kind, name in objects:
             rest = cause.removeprefix(f"error in {kind} {name}")
             if rest != cause and rest[:1] in (":", " "):
-                named.append((kind, name))
+                rank = 0 if rest.startswith(":") else 1 if rest.startswith(" after ") else 2
+                named.append((rank, kind, name))
         if not named:
             return None
-        kind, name = max(named, key=lambda o: len(o[1]))
+        _, kind, name = min(named, key=lambda o: (o[0], -len(o[2])))
         if kind == "view" and name.lower() in await _names_this_build_creates():
             return None
     except sqlite3.Error as exc:

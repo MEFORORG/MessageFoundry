@@ -597,6 +597,63 @@ async def test_the_foreign_object_is_matched_against_the_file(
         assert await _foreign_object(db, cause) == found
 
 
+@pytest.mark.parametrize(
+    ("cause_view", "reads", "statement", "expected_cause"),
+    [
+        pytest.param(
+            "vv",
+            "c FROM t",
+            "ALTER TABLE t DROP COLUMN c",
+            "error in view vv after drop column: no such column: c",
+            id="vv-after-the-change",
+        ),
+        pytest.param(
+            "vv after",
+            "c FROM t",
+            "ALTER TABLE t DROP COLUMN c",
+            "error in view vv after after drop column: no such column: c",
+            id="vv-after-after-the-change",
+        ),
+        pytest.param(
+            "vv",
+            "missing FROM t",
+            "ALTER TABLE t RENAME TO t2",
+            "error in view vv: no such column: missing",
+            id="vv-before-the-change",
+        ),
+        pytest.param(
+            "vv after",
+            "missing FROM t",
+            "ALTER TABLE t RENAME TO t2",
+            "error in view vv after: no such column: missing",
+            id="vv-after-before-the-change",
+        ),
+    ],
+)
+async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
+    tmp_path: Path, cause_view: str, reads: str, statement: str, expected_cause: str
+) -> None:
+    # Views "vv" and "vv after" both fit "error in view vv after ...", so the longest name alone
+    # would tell the operator to drop "vv after" when "vv" stopped the change. Each cause is
+    # SQLite's own text. A view already broken fails SQLite's first check, with no suffix; a view
+    # the change breaks fails its re-check after the change, with the "after drop column" suffix.
+    from messagefoundry.store.schema_verify import _foreign_object
+
+    path = tmp_path / "prefix.db"
+    _sql(path, "CREATE TABLE t (a, c)", "CREATE TABLE u (c)")
+    for view in ("vv", "vv after"):
+        _sql(path, f'CREATE VIEW "{view}" AS SELECT {reads if view == cause_view else "c FROM u"}')
+    conn = sqlite3.connect(path)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as info:
+            conn.execute(statement)
+    finally:
+        conn.close()
+    assert str(info.value) == expected_cause
+    async with _connected(path) as db:
+        assert await _foreign_object(db, expected_cause) == ("view", cause_view)
+
+
 # --- BACKLOG #6720 item 1: a foreign view using an unloaded function or collation ----------------
 
 
