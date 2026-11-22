@@ -2032,8 +2032,8 @@ class FhirLookupExecutor:
         from messagefoundry.transports.smart import token_provider_from_settings
 
         # BACKLOG #5911: every lookup's static url and headers are screened before any lookup is
-        # built, so a refused build leaves no hop-gate crossing record from a lookup the loop below
-        # built before it (#5529).
+        # built, so a build this screen refuses leaves no hop-gate crossing record from a lookup
+        # built before it; a refusal later in the loop below still can (#5529).
         screened = {
             cname: self._screened_static_request(cname, raw) for cname, raw in connections.items()
         }
