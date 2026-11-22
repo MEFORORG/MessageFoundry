@@ -1144,11 +1144,12 @@ per tier which of those its code provides, and an operator carries the rest
     frozen `mfenc:v1` writer, and the AAD is then computed and ignored.**
   - *`.mfbak` archives* — **a separate streaming codec, NOT the store cipher**
     ([store/backup_codec.py](../messagefoundry/store/backup_codec.py), whose own docstring says the
-    cipher *mechanism* is net-new): chunked AES-256-GCM under the store DEK resolved directly by
-    `resolve_active_key`, with a per-chunk AAD of
+    cipher *mechanism* is net-new): chunked AES-256-GCM keyed from the store DEK resolved directly by
+    `resolve_active_key` (when the header carries a salt, under the store data sub-key derived from
+    the DEK and that salt, ADR 0196), with a per-chunk AAD of
     `header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)` — **not** a per-cell AAD. It carries no
-    per-archive value, so a frame from another archive with a byte-identical header authenticates at the
-    same index; the codec's module docstring says which archives share a header. The archive's
+    per-archive value, so frames splice between archives that share a header; the codec's module
+    docstring says which do and what a splice can do. The archive's
     own seal is keyed by `resolve_active_key` and not `build_store_cipher`, so `cipher_provider =
     vault_transit` **never applies to sealing or unsealing a `.mfbak`**. It DOES apply one frame
     further in, and the distinction is the archive versus the cells inside it: `full_restore_verify`
