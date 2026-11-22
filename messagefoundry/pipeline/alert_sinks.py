@@ -824,8 +824,8 @@ class WebhookTransport:
         revocation_attested_reason: str | None = None,
     ) -> None:
         # https is the only scheme (ASVS 12.2.1). A plaintext http:// target is refused with no
-        # escape, in every posture (vault BACKLOG #3533 item 5): every POST carries the path token
-        # the webhook service issues, the hop's credential, as every AI broker call carries its key.
+        # escape, in every posture (vault BACKLOG #3533 item 5): the URL can carry the hop's
+        # credential as a path token.
         # Until then MEFOR_ALLOW_INSECURE_TLS released it at [security].enforcement = warn.
         #
         # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
@@ -2982,13 +2982,10 @@ def notifier_from_settings(
         # secret-store read for it, and a store that is down cannot hide the relay's refusal. The
         # build repeats it. The webhook reads no secret, so its check stays in its build.
         _refuse_off_allowlist_smtp_host(alerts.email_smtp_host, alerts.smtp_allowed_hosts)
-    smtp_password = resolve_connector_secret(
-        secret_provider,
-        ref=alerts.email_password_secret,
-        literal=alerts.email_password,
-        label="[alerts].email_password",
-    )
     transports: list[AlertTransport] = []
+    # The webhook is built before the SMTP password is read (vault BACKLOG #3533 item 18), so a
+    # secret store that is down cannot hide the webhook's own refusals, the cleartext http one
+    # among them.
     if alerts.webhook_url:
         transports.append(
             WebhookTransport(
@@ -3001,6 +2998,12 @@ def notifier_from_settings(
                 revocation_attested_reason=alerts.webhook_tls_revocation_attested_reason,
             )
         )
+    smtp_password = resolve_connector_secret(
+        secret_provider,
+        ref=alerts.email_password_secret,
+        literal=alerts.email_password,
+        label="[alerts].email_password",
+    )
     if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
         transports.append(
             EmailTransport(

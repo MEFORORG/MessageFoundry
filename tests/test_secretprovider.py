@@ -370,8 +370,9 @@ def test_secret_provider_is_runtime_checkable() -> None:
 # The AD LDAP consumer has a fail-closed-through-the-real-consumer test
 # (test_ldap_authenticator_unresolvable_reference_fails_closed); these give the two SMTP consumers
 # the same coverage. Both notifier_from_settings and security_notifier_from_settings call
-# resolve_connector_secret first, so a bad [alerts].email_password_secret reference must propagate
-# SecretProviderError BEFORE any transport is built (no blank-credential sink). No production change.
+# resolve_connector_secret before any EmailTransport is built, so a bad
+# [alerts].email_password_secret reference must propagate SecretProviderError (no blank-credential
+# sink). No production change.
 
 
 def test_notifier_unresolvable_reference_fails_closed() -> None:
@@ -395,6 +396,24 @@ def test_security_notifier_unresolvable_reference_fails_closed() -> None:
             _smtp_settings(email_password_secret="mefor/smtp#password"), secret_provider=provider
         )
     assert provider.calls == ["mefor/smtp#password"]
+
+
+def test_notifier_webhook_refusal_is_not_hidden_by_a_secret_store_outage() -> None:
+    # Vault BACKLOG #3533 item 18: the webhook is built before the SMTP password is read, so a store
+    # that cannot resolve the reference does not hide the cleartext webhook's refusal.
+    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+
+    provider = _FakeProvider({})
+    with pytest.raises(ValueError, match="cleartext http"):
+        notifier_from_settings(
+            _smtp_settings(
+                email_password_secret="mefor/smtp#password",
+                webhook_url="http://hooks.example/x",
+            ),
+            secret_provider=provider,
+            posture=_NOT_ENFORCING,
+        )
+    assert provider.calls == []
 
 
 def test_notifiers_reference_without_provider_fail_closed() -> None:
