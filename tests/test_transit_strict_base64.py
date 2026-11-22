@@ -2,9 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A Transit ``plaintext`` that is not strict base64 is refused as that value's own error (BACKLOG
 #5964). Non-strict decoding drops characters outside the alphabet, so ``!!!!`` would have opened as
-an empty cell and a stray character would have opened as a value Transit never returned. Which
-class such a reply should carry is left open on the row, so these tests pin the plain
-:class:`CipherError` it has today. Synthetic data only."""
+an empty cell and a stray character would have opened as a value Transit never returned. These
+tests pin the plain :class:`CipherError` such a reply has today; they do not decide whether it
+should instead read as an outage. Synthetic data only."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from messagefoundry.store import crypto
 from messagefoundry.store.crypto import CipherError, cell_aad, gave_no_verdict
 from tests.test_transit_batch import _BatchTransit, _cipher, _sealed
 
-#: Replies that are not strict base64. A non-strict decode opens all but the last as a value.
+#: Replies that are not strict base64. A non-strict decode opens every one of them as a value.
 _NOT_STRICT = {
     "only-non-alphabet": "!!!!",
     "url-safe-alphabet": "-_-_",
@@ -28,7 +28,10 @@ _NOT_STRICT = {
     "leading-space": " dmFsdWU=",
     "trailing-newline": "dmFsdWU=\n",
     "embedded-newline": "dmFs\ndWU=",
-    "data-after-padding": "dmFsdWU=dmFs",
+    "only-padding": "====",
+    "excess-padding": "QQ===",
+    "padding-after-full-group": "QUJD=",
+    "data-after-padding": "QQ==QQ==",
 }
 #: Valid base64 of bytes that are not UTF-8.
 _NOT_UTF8 = base64.b64encode(b"synthetic \xff").decode("ascii")
