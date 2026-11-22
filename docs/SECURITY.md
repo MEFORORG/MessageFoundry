@@ -1693,19 +1693,19 @@ record checked against its integrity seal: `GET /users`, `GET /users/{user_id}/p
 `PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`;
 and, in the web console (BACKLOG #5559), at least the pages the next sentences name. `GET /ui/users`
 answers 200 and lists a failing account by its id alone; to a caller holding `users:manage` it
-offers that account's delete, through a confirmation page that names the id alone and is shown
-only when the checked read refuses the record for its seal.
+offers that account's delete, through a confirmation page that names the id alone.
 `GET /ui/users/{user_id}`, `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
 account's name the same way. What those pages show and log when that read fails is stated in the
 docstring of `_shown_name` in
 [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
-The checked read's seal-failure report is per account and
-rate-limited, in each engine process: only the first refusal of an account in
-each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) for its record failing
-its integrity check writes the `integrity.authority_seal_failed` audit row and raises the
-`integrity_drift` alert. Each engine
+A failure is reported
+per account and rate-limited, in each engine process: only the first refusal of an account in
+each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
+the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
+inside that interval, from any of these routes or any other reader of the same account in that
+process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
@@ -1735,11 +1735,12 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-answered the same way, but reported under
+answered the same way, a 423 or listed as failed, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
-its own. A Vault transit Outage on any account these reads check lists nothing, pages
-`authority-seal-transit` and writes no audit row, and, except on the pages that read the name
-through `_shown_name`, answers 503 with `Retry-After`.
+its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
+lists nothing, pages `authority-seal-transit` and writes no audit row.
+At least the pages that read the name through `_shown_name` catch a 423 or a 503 from that read
+and answer 200, and `GET /ui/users/{user_id}/delete-confirm` does the same for a 423.
 
 A custom role save checks the role name (BACKLOG #5785) after its gate. Where
 `[auth].require_action_step_up` is on, the default, and the save would end the caller's own
@@ -2082,7 +2083,7 @@ the console routes with a rule of their own.
 | `GET` | `/ui/users/{user_id}` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/channel-scope` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/delete` | `users:manage` | `require_ui_step_up` |
-| `GET` | `/ui/users/{user_id}/delete-confirm` | `users:manage` | `require_ui_step_up`; shown only for a record that fails its seal (BACKLOG #5559) |
+| `GET` | `/ui/users/{user_id}/delete-confirm` | `users:manage` | `require_ui_step_up`; see *What an admin user read reports* (BACKLOG #5559) |
 | `GET` | `/ui/users/{user_id}/federated-identity` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/federated-identity/link` | `users:manage` | `require_ui_step_up_action` (action `admin_federated_identity`) |
 | `POST` | `/ui/users/{user_id}/federated-identity/unlink` | `users:manage` | `require_ui_step_up_action` (action `admin_federated_identity`) |
