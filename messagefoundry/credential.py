@@ -119,15 +119,9 @@ def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
     ASVS 11.2.4 (BACKLOG #1167): ``==`` stops at the first differing character. This is for values
     such as a session token hash, a credential-id hash or a config fingerprint, not for a presented
     credential, which is :func:`constant_time_match`'s job. It differs from that function in two
-    ways, both on purpose: two empty values ARE equal here, and nothing is digested first. The
-    compare takes time independent of content only when the two inputs are the same length; a
-    length mismatch is visible in the timing, so a caller whose inputs vary in length also shows
-    each value's length. At least these callers compare values of varying length:
-    ``_same_totp_columns`` in ``auth/service.py``, whose cells on a keyless store are the TOTP
-    secret itself; the passkey user-handle check of ``handle`` against ``user.id.encode()``; and
-    the ended-session check of ``ended.ref`` against ``presented[:12]``. A passkey-set digest
-    (``store.passkey_digest``) is ``""`` for an account with no passkeys, so its compare shows
-    whether the digest is empty.
+    ways, both on purpose: two empty values ARE equal here, and nothing is digested first.
+    ``hmac.compare_digest``'s time does not depend on the content of either input, but it does
+    depend on the length of ``b``, so a caller shows the length of whatever it passes as ``b``.
 
     Total: ``surrogatepass`` encodes any ``str`` CPython can hold, so a caller's string can never
     raise ``TypeError`` out of the compare, and two distinct strings never map to the same bytes.
