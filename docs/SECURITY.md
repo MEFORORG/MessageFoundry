@@ -1698,8 +1698,8 @@ only when the checked read refuses the record for its seal.
 `GET /ui/users/{user_id}`, `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
-account's name the same way. Which refusals of that read still show what was issued, naming the
-account by its id, and what each logs, is stated once, in the docstring of `_shown_name` in
+account's name the same way. That a failure of that read, a defect included, still shows what
+was issued, naming the account by its id, and what each case logs, is stated once, in the docstring of `_shown_name` in
 [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py); a
 defect there is logged at ERROR without its message.
 The checked read's own seal-failure report, separate from those lines, is per account and
