@@ -106,7 +106,7 @@ import { buildSegmentScope, sampleSegments } from "./hl7scope";
 import { pickHl7Path, type PickScope } from "./hl7Picker";
 import { nonce } from "./cspNonce";
 import { STARTUP_BANNERS } from "./webviewMessaging";
-import { StepsPanelProjection, type HandlerType } from "./stepsPanel";
+import { StepsPanelProjection, type AnchorMessage, type HandlerType } from "./stepsPanel";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
 const RERENDER_DEBOUNCE_MS = 250;
@@ -807,10 +807,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         ) {
           // ADR 0104 fan-out "＋ dest": pick a destination, then add_destination via the SAME byte-stable
           // applyStructural path. The anchor's fan-out flags drive the insert position (isReturnRow).
-          const anchor = panelState.anchorFor(
-            { ...m, handler: m.handler, lineStart: m.lineStart, lineEnd: m.lineEnd },
-            "send",
-          );
+          const anchor = panelState.anchorFor(m as AnchorMessage, "send");
           void pickDestination("Add destination", "Destination (fan out)").then((dest) => {
             if (dest !== undefined && dest !== "" && !disposed) {
               void applyStructural(buildAddDestinationRequest(anchor, dest));
@@ -880,10 +877,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // derived position puts a mid-body append send before the new step and a footer after it (#5844).
           void applyStructural(
             buildToolbarInsertRequest(
-              panelState.anchorFor(
-                { ...m, handler: m.handler, lineStart: m.lineStart, lineEnd: m.lineEnd },
-                m.kind as RowKind,
-              ),
+              panelState.anchorFor(m as AnchorMessage, m.kind as RowKind),
               m.action,
               m.position as "before" | "after" | undefined,
             ),
@@ -912,10 +906,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             return;
           }
           // The anchor carries the row's fan-out flags, for a request that derives its position (#5844).
-          const anchor = panelState.anchorFor(
-            { ...m, handler: m.handler, lineStart: m.lineStart, lineEnd: m.lineEnd },
-            m.kind as RowKind,
-          );
+          const anchor = panelState.anchorFor(m as AnchorMessage, m.kind as RowKind);
           const position = m.position as "before" | "after" | undefined;
           if (item.prompts.length === 0) {
             void applyStructural(buildAddMenuRequest(item, anchor, {}, position));
@@ -963,10 +954,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             typeof m.text === "string" ? m.text : "MessageFoundry: pasted the steps.";
           // The page posts no fan-out flags with a paste, so the anchor takes them from this panel's
           // projection: a block pasted at a mid-body append send lands after it, at a footer before (#5844).
-          const anchor = panelState.anchorFor(
-            { ...m, handler: m.handler, lineStart: m.lineStart, lineEnd: m.lineEnd },
-            m.kind as RowKind,
-          );
+          const anchor = panelState.anchorFor(m as AnchorMessage, m.kind as RowKind);
           void applyStructural(
             buildPasteRequest(anchor, {
               source: m.block,

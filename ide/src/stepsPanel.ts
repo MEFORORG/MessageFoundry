@@ -4,7 +4,7 @@
 // Steps panel, so anything a panel's render() derives from ITS parse must live with that panel, never on
 // the provider: two open Steps editors would otherwise read each other's projection (BACKLOG #5843).
 // Kept free of `vscode` so the unit suite can load it.
-import type { HandlerViewModel, LensParseResult, RowKind } from "./stepsModel";
+import type { HandlerViewModel, LensParseResult, RowKind, RowViewModel } from "./stepsModel";
 
 /** A handler's recognized message type, for the HL7 field picker's scope (ADR 0104 section 2.3 P2). */
 export interface HandlerType {
@@ -34,12 +34,7 @@ export interface AnchorMessage {
   scaffold?: unknown;
 }
 
-interface ProjectedRow {
-  kind: RowKind;
-  expectSrc?: string;
-  appended?: boolean;
-  scaffold?: string;
-}
+type ProjectedRow = Pick<RowViewModel, "kind" | "expectSrc" | "appended" | "scaffold">;
 
 const rowKey = (handler: string, lineStart: number, lineEnd: number): string =>
   `${handler}\u0000${lineStart}\u0000${lineEnd}`;
@@ -65,12 +60,8 @@ export class StepsPanelProjection {
     this.rows = new Map();
     for (const h of handlers) {
       for (const r of h.rows) {
-        this.rows.set(rowKey(h.handler, r.lineStart, r.lineEnd), {
-          kind: r.kind,
-          expectSrc: r.expectSrc,
-          appended: r.appended,
-          scaffold: r.scaffold,
-        });
+        const { kind, expectSrc, appended, scaffold } = r;
+        this.rows.set(rowKey(h.handler, r.lineStart, r.lineEnd), { kind, expectSrc, appended, scaffold });
       }
     }
   }
@@ -96,22 +87,22 @@ export class StepsPanelProjection {
   anchorFor(m: AnchorMessage, fallbackKind: RowKind): StructuralAnchor {
     const expectSrc = typeof m.expectSrc === "string" ? m.expectSrc : undefined;
     const row = this.rows.get(rowKey(m.handler, m.lineStart, m.lineEnd));
-    const anchor: StructuralAnchor = {
+    const flags =
+      row !== undefined && (expectSrc === undefined || row.expectSrc === expectSrc)
+        ? row
+        : {
+            kind: typeof m.kind === "string" ? (m.kind as RowKind) : fallbackKind,
+            appended: m.appended === true,
+            scaffold: typeof m.scaffold === "string" ? m.scaffold : undefined,
+          };
+    return {
       handler: m.handler,
       lineStart: m.lineStart,
       lineEnd: m.lineEnd,
       expectSrc,
-      kind: fallbackKind,
+      kind: flags.kind,
+      appended: flags.appended === true,
+      scaffold: flags.scaffold,
     };
-    if (row !== undefined && (expectSrc === undefined || row.expectSrc === expectSrc)) {
-      anchor.kind = row.kind;
-      anchor.appended = row.appended === true;
-      anchor.scaffold = row.scaffold;
-    } else {
-      anchor.kind = typeof m.kind === "string" ? (m.kind as RowKind) : fallbackKind;
-      anchor.appended = m.appended === true;
-      anchor.scaffold = typeof m.scaffold === "string" ? m.scaffold : undefined;
-    }
-    return anchor;
   }
 }
