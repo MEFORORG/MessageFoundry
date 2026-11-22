@@ -1204,6 +1204,25 @@ def _posix_tool_env() -> dict[str, str]:
     return env
 
 
+#: The timeout for a short subprocess here: a bash run of an extracted step, or a one-line probe.
+#: It does not measure speed: nothing in this file reads a duration. On Windows it does not bound
+#: a grandchild that still holds the pipes.
+#:
+#: WHY IT STAYS AT 60 S (BACKLOG #3633 item 2). That row records one overrun: on engine PR 2327's
+#: run 38674972250, `over-long-body[console]` took 84.5 s in notes.sh on windows-2025, and that
+#: PR's CI triage comment reports the same tree passing on windows-2022 in the same run. On a
+#: Windows 11 dev box the test took about 1.6 s (measured 2026-11-21). Nothing here was measured on
+#: a windows-2025 runner. Raising this alone would not help. The CI test legs run pytest with a
+#: per-test `--timeout`, its matrix `pytest_timeout` in ci.yml: 60 s on ubuntu, 120 s on Windows.
+#: That cap covers the whole test, its setup and every call in it, and with
+#: `--timeout-method=thread` pytest-timeout ends the whole worker process when it fires, rather
+#: than failing the one test with this call's output. So on ubuntu the cap fires before this
+#: timeout can, and on Windows a test that makes two such calls, as `over-long-body` does, can
+#: reach the cap first even at this value. Allowing a longer stall needs the per-test cap raised, for
+#: these tests or for the leg; this value would follow it.
+_HANG_TIMEOUT_S = 60
+
+
 def _run_leak_gate(bash: str, workdir: Path, script: Path, env: dict[str, str]) -> tuple[int, str]:
     """Run the extracted step from ``workdir`` the way the runner would; return (rc, combined output).
 
@@ -1221,7 +1240,7 @@ def _run_leak_gate(bash: str, workdir: Path, script: Path, env: dict[str, str]) 
         cwd=str(workdir),
         env=env,
         capture_output=True,
-        timeout=60,
+        timeout=_HANG_TIMEOUT_S,
     )
     return proc.returncode, (proc.stdout + proc.stderr).decode("utf-8", "replace")
 
@@ -2089,12 +2108,68 @@ def _clone_venv(template: Path, root: Path) -> tuple[Path, Path]:
     return exe, Path(purelib)
 
 
+#: A heredoc fed to an interpreter on stdin, as every release smoke and tag guard is fed:
+#: ``<path>python <flags> - [args] <<'TAG'``, the body, then ``TAG`` alone at column 0 of the
+#: dedented ``run:`` block. ``flags`` stops at the first word that is not a dash flag, so a flag
+#: that takes a value (``-X utf8``) makes the invocation unreadable here rather than misread.
+_STDIN_HEREDOC = re.compile(
+    r"\S*python[0-9.]*(?P<flags>(?:[ \t]+-[A-Za-z]+)*)[ \t]+-(?=[ \t])[^\n]*<<'(?P<tag>[A-Z]+)'\n"
+    r"(?P<body>.*?)\n(?P=tag)\n",
+    re.S,
+)
+
+#: Any such heredoc, whatever its invocation, so :func:`_step_flags` can count the copies it read.
+_ANY_HEREDOC = re.compile(r"<<'(?P<tag>[A-Z]+)'\n(?P<body>.*?)\n(?P=tag)\n", re.S)
+
+
+@functools.cache
+def _step_flags(script: str) -> tuple[str, ...]:
+    """The interpreter flags release.yml passes the interpreter that ``script`` is fed to.
+
+    Read from the workflow by the script's own text, so an execution test runs a smoke or a tag
+    guard under the flags the step really uses (BACKLOG #1583). Before this, ``_run_smoke``
+    hardcoded ``-I``, so the intact checkout the acceptance keeps present could never answer: a
+    step that dropped ``-I`` would have left every execution test here green. If two steps ever
+    feed the same script, the flags of every copy must agree, or no single answer exists.
+
+    Both sides are read through :func:`_executed_shell`, so a comment quoting an invocation is not
+    taken for one, and a script extracted with or without its comment lines matches either way.
+    Every heredoc carrying the script must have a readable invocation, so a copy whose header this
+    cannot parse fails here rather than dropping out of the comparison.
+    """
+    want = _executed_shell(script)
+    shells = [
+        _executed_shell(str(step.get("run") or "")) + "\n"
+        for job in _jobs().values()
+        for step in (job.get("steps") or [])
+        if isinstance(step, dict)
+    ]
+    headers = [
+        tuple(m.group("flags").split())
+        for shell in shells
+        for m in _STDIN_HEREDOC.finditer(shell)
+        if m.group("body") == want
+    ]
+    copies = sum(m.group("body") == want for shell in shells for m in _ANY_HEREDOC.finditer(shell))
+    assert len(headers) == copies, (
+        f"release.yml carries the script in {copies} heredoc(s) but {len(headers)} invocation(s) "
+        f"could be read; an unreadable one would run under flags nothing here checks"
+    )
+    found = set(headers)
+    assert len(found) == 1, (
+        f"expected the script to be fed to exactly one interpreter flag list in release.yml, found "
+        f"{sorted(found)}: either no step feeds it on stdin any more, or two copies are run "
+        f"under different flags"
+    )
+    return next(iter(found))
+
+
 def _run_smoke(
     exe: Path,
     script: str,
     workdir: Path,
     *,
-    isolated: bool = True,
+    flags: Sequence[str] | None = None,
     args: Sequence[str] = (),
 ) -> tuple[int, str, str]:
     """Run ``script`` the way the step does; return (rc, stdout, combined output).
@@ -2103,15 +2178,19 @@ def _run_smoke(
     ``built=$(...)`` and everything else the script says goes to stderr, so a diagnostic that leaked
     onto stdout would silently become the version the release compares against the tag.
 
-    ``-I`` matches the workflow. The one caller that drops it is the checkout-shadow control, which
-    exists to prove the in-venv assertion fires rather than that the flag is spelled right.
+    ``flags`` defaults to the step's own, read by :func:`_step_flags`. A caller passes other flags
+    only as a control, to show what the same run does without the step's isolation.
     ``args`` follow the ``-``, as ``python -I - "$built" "$want"`` passes them to a tag guard.
     """
-    argv = [str(exe), *(["-I"] if isolated else []), "-", *args]
+    argv = [str(exe), *(_step_flags(script) if flags is None else flags), "-", *args]
+    # release.yml sets neither, and either one changes what a flagless control can reach:
+    # PYTHONSAFEPATH keeps the cwd off sys.path, PYTHONPATH adds another tree to it.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONSAFEPATH", "PYTHONPATH")}
     proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
         argv,
         input=script.encode("utf-8"),
         cwd=str(workdir),
+        env=env,
         capture_output=True,
         timeout=120,
     )
@@ -2158,7 +2237,8 @@ def test_a_wheel_smoke_accepts_a_correctly_built_wheel(
         purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, _SMOKE_VERSION)
     )
 
-    rc, stdout, out = _run_smoke(exe, script, _intact_checkout(tmp_path / "checkout", pkg))
+    work = _intact_checkout(tmp_path / "checkout", pkg)
+    rc, stdout, out = _run_smoke(exe, script, work)
     assert rc == 0, (
         f"{job}'s smoke REJECTED a well-formed install, so every rejection below is measuring a "
         f"broken harness rather than the smoke.\n{out}"
@@ -2174,6 +2254,15 @@ def test_a_wheel_smoke_accepts_a_correctly_built_wheel(
         f"{job}'s smoke passed without reporting how much of the package tree it found.\n{out}"
     )
     assert _SHADOW_VERSION not in out, f"the intact checkout answered {job}'s smoke.\n{out}"
+
+    # THE INTACT CHECKOUT IS LIVE (BACKLOG #1583's acceptance). The run above used the step's own
+    # flags, so its pass shows those flags keep the checkout out only if the checkout would
+    # otherwise get in. The same run without them must be refused for exactly that reason.
+    rc, _stdout, out = _run_smoke(exe, script, work, flags=())
+    assert rc != 0 and "OUTSIDE the smoke venv" in out, (
+        f"without the step's flags ({' '.join(_step_flags(script)) or 'none'}) the intact checkout "
+        f"did not reach {job}'s smoke, so the pass above does not show the flags keep it out.\n{out}"
+    )
 
 
 def _no_package_tree(purelib: Path, dist: str, pkg: str) -> None:
@@ -2288,7 +2377,7 @@ def test_a_wheel_smoke_refuses_a_module_resolved_outside_the_smoke_venv(
     for rel, text in _good_package(pkg, "9.9.9").items():
         (shadow / pkg / rel).write_text(text, encoding="utf-8")
 
-    rc, _stdout, out = _run_smoke(exe, script, shadow, isolated=False)
+    rc, _stdout, out = _run_smoke(exe, script, shadow, flags=())
     assert rc != 0, (
         f"{job}'s smoke accepted a module resolved from the CHECKOUT instead of the smoke venv — it "
         f"would report on the source tree and never open the wheel.\n{out}"
@@ -3168,6 +3257,7 @@ def _run_probe(
     """
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
+    env.pop("PYTHONSAFEPATH", None)  # it keeps the cwd off sys.path, so the bare arm would fail
     if pythonpath is not None:
         env["PYTHONPATH"] = str(pythonpath)
     return subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
@@ -3179,7 +3269,7 @@ def _run_probe(
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=_HANG_TIMEOUT_S,
         check=False,
     )
 
@@ -3809,7 +3899,11 @@ def _run_notes_prefix(tmp_path: Path, case: str, changelog: str, *, bounded: boo
     env["GITHUB_REPOSITORY"] = "MEFORORG/MessageFoundry"
     bash = require_bash(tmp_path, env)
     proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
-        [bash, "-e", str(script)], cwd=str(work), env=env, capture_output=True, timeout=60
+        [bash, "-e", str(script)],
+        cwd=str(work),
+        env=env,
+        capture_output=True,
+        timeout=_HANG_TIMEOUT_S,
     )
     out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
     assert proc.returncode == 0, (
@@ -4359,6 +4453,104 @@ def test_a_draft_publisher_refuses_while_the_variable_is_set_and_the_upload_did_
     rc, out, calls = _run_release_step(tmp_path / "published", prefix, "published", extra_env=env)
     assert rc == 0, f"a published release failed the job:\n{out}"
     assert not any("--draft=false" in c for c in calls), calls
+
+
+#: The draft publishers' refusal, as each step echoes it.
+_DRAFT_REFUSAL = re.compile(r'echo "(::error::\$GATE_NAME is \'true\'[^"\n]*)"')
+
+#: Clauses of that refusal which docs/SUPPLY-CHAIN.md, *The draft*, must carry too. Compared after
+#: :func:`_flat_text`, so the doc's backticks and line wraps do not count, and with the refusal's
+#: `$GATE_NAME` read as the doc's "the variable". The test below names a clause listed here once it
+#: is gone from either copy, the organization prohibition among them (vault BACKLOG #2975 item 16).
+#: Each is matched anywhere in the copy, so a clause the doc carries twice, such as "remove any
+#: copy from the pypi environment", is named only once both are gone. The list is not every clause:
+#: the publisher re-run step, for one, is worded differently in the two copies and is not compared.
+_DRAFT_REFUSAL_CLAUSES = (
+    "holds its own copy of the variable, with a value that is not true in any letter case",
+    "a copy removed since",
+    "the remedies below clear it either way, so it need not be told apart",
+    "remove any copy from the pypi environment",
+    "re-runs the jobs after it",
+    "a re-run failed jobs reuses the upload",
+    "is queued, waiting or in progress",
+    "none can start before the restore",
+    "note whether",
+    "such as false",
+    "for this repository only",
+    "do not edit or delete an organization copy",
+    "other repositories may read",
+    "whatever its result, and before the next release",
+    "deleting it if",
+    "or that release skips its upload too and still goes public",
+    "within 30 days of a runs first attempt",
+)
+
+
+def _flat_text(text: str) -> str:
+    """``text`` in lower case, with quotes and backticks dropped and whitespace runs made one space."""
+    return " ".join(re.sub(r"[`'\"]", "", text).lower().split())
+
+
+def test_the_draft_refusal_is_one_text_and_the_doc_carries_each_clause() -> None:
+    """The refusal is kept by hand in three places: the two draft publishers' `::error::` strings
+    and docs/SUPPLY-CHAIN.md, *The draft* (vault BACKLOG #2975 item 16). The two strings must be
+    identical, and each clause in `_DRAFT_REFUSAL_CLAUSES` must be in both the string and the doc.
+
+    Mutation: edit one publisher's string, or drop a clause, such as the organization prohibition,
+    from the string or the doc. Red here."""
+    jobs = _jobs()
+    texts = []
+    for publisher in (_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB):
+        run = _executed_shell(str(_release_step(jobs[publisher], "--draft=false").get("run")))
+        found = _DRAFT_REFUSAL.findall(run)
+        assert len(found) == 1, f"{publisher}: expected one draft refusal, found {len(found)}"
+        texts.append(found[0])
+    assert texts[0] == texts[1], (
+        f"{_PUBLISH_JOB} and {_CONSOLE_PUBLISH_JOB} echo different refusals; they share one text"
+    )
+    doc = (_REPO / "docs" / "SUPPLY-CHAIN.md").read_text(encoding="utf-8")
+    start = doc.index("- **The draft.**")
+    section = _flat_text(doc[start : doc.index("- **The provenance gate.**", start)])
+    refusal = _flat_text(texts[0].replace("$GATE_NAME", "the variable"))
+    # A floor, so an emptied clause list cannot pass vacuously.
+    assert len(_DRAFT_REFUSAL_CLAUSES) >= 15, _DRAFT_REFUSAL_CLAUSES
+    missing = [
+        f"{clause!r} not in the {where}"
+        for clause in _DRAFT_REFUSAL_CLAUSES
+        for where, text in (("refusal", refusal), ("doc", section))
+        if clause not in text
+    ]
+    assert not missing, "\n".join(missing)
+
+
+#: The job-level pattern plus the contexts only a step-level `if:` adds: `env` and `steps`, either of
+#: which can carry a variable in from an `env:` entry, and `inputs`, which is empty on a tag push.
+#: Wide on purpose: a `steps.` condition that reads no variable is flagged too.
+_STEP_GATE = re.compile(
+    rf"{_VARIABLE_GATE.pattern}|\b(?:env|steps|inputs)\b", flags=_VARIABLE_GATE.flags
+)
+
+
+@pytest.mark.parametrize("publisher", [_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB])
+def test_no_step_of_a_draft_publisher_is_gated_on_a_variable(publisher: str) -> None:
+    """The job-level walk, `_variable_gated_jobs`, reads no step's `if:` (vault BACKLOG #2975 item
+    12). A publisher step skipped by an unset variable leaves the release a draft on a green run,
+    so no step of either draft publisher may carry a variable gate. The planted gate is the
+    positive control.
+
+    Mutation: put `if: vars.PUBLISH_HARNESS == 'true'` on a draft publisher's step. Red here."""
+    job = copy.deepcopy(_jobs()[publisher])
+    steps = [s for s in job["steps"] if isinstance(s, dict)]
+    assert steps, f"{publisher} has no steps"
+
+    def gated() -> list[object]:
+        return [s.get("name") for s in steps if _STEP_GATE.search(str(s.get("if") or ""))]
+
+    assert not gated(), f"{publisher} step(s) {gated()} are gated on a variable; unset, they skip"
+    publish = _release_step(job, "--draft=false")
+    for planted in ("vars.PUBLISH_HARNESS == 'true'", "env.GATE == 'true'", "inputs.go"):
+        publish["if"] = planted
+        assert gated() == [publish.get("name")], planted
 
 
 # --- (14) every PyPI publish runs in a publish-only job that names `pypi` (vault BACKLOG #2631) ------
