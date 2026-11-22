@@ -499,15 +499,31 @@ class Message:
             raise ValueError(f"index {index} out of range (1..{seg_count}); index 1 is after MSH")
         _builtin_hl7.add_segment_line(self._m, segment_id, tokens, index)
 
-    def delete_segments(self, segment_id: str) -> int:
-        """Remove every segment with ``segment_id`` and return how many were removed.
+    def delete_segments(self, segment_id: str, *, occurrence: int | None = None) -> int:
+        """Remove every segment with ``segment_id``, or only its ``occurrence``-th, and return how
+        many were removed.
 
         Deleting ``MSH`` is refused — the message must keep its header. Common for clearing a
         repeating block (e.g. ``delete_segments("ODS")``) before rebuilding it with
         :meth:`add_segment`. A fieldless bare line of that id is removed and counted too, though
-        :meth:`count_segments` skips it, so a delete leaves no stray bare line behind."""
+        :meth:`count_segments` skips it, so a delete leaves no stray bare line behind.
+
+        ``occurrence`` (1-based) removes only that one segment instead, numbered as :meth:`field`
+        and :meth:`count_segments` number it, so a fieldless bare line is no occurrence. It returns
+        1, or 0 when that occurrence is absent, and leaves every other segment as it was."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
+        if occurrence is not None:
+            if occurrence < 1:
+                raise ValueError("occurrence is 1-based (>= 1)")
+            position = _builtin_hl7.segment_index(self._m, segment_id, occurrence)
+            if position is None:
+                return 0
+            self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
+            # The raw delete, not _delete_segment_at: that one refuses index 0, which here is an
+            # FHS or BHS the delete-all form removes too.
+            _builtin_hl7.delete_segment_at(self._m, position)
+            return 1
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         removed = 0
         ids = _builtin_hl7.segment_ids(self._m)
