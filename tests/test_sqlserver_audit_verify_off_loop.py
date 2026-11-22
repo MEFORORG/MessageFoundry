@@ -2,9 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SQL Server ``verify_audit_chain`` walks the chain off the event loop (BACKLOG #5741).
 
-Each row MAC can be a blocking Transit round trip, so a walk on the loop would stall every listener
-and worker for its whole length. The rows are still read whole, and that memory load is the row's
-open remainder, so nothing here says the walk is bounded.
+Each row MAC can be a blocking Transit round trip, so a walk on the loop would stall that loop for
+its whole length, during engine start or an ``audit-verify`` run. Only the walk moves: the rows are
+still read whole and built on the loop, so nothing here says the verify is bounded.
 
 Offline: the store has no connection and its ``_fetchall`` serves synthetic rows. What only the
 hosted SQL Server leg can prove is the real query.
@@ -66,9 +66,10 @@ def _facts(verdict: AuditVerdict) -> tuple[Any, ...]:
 async def test_a_slow_mac_does_not_block_the_event_loop() -> None:
     """Each MAC waits on a callback only the loop can run, so a walk on the loop times out."""
     loop = asyncio.get_running_loop()
-    released = threading.Event()
 
     def gated_mac(data: bytes, /) -> str:
+        # A fresh event per call: a shared one, once set, would prove nothing for later rows.
+        released = threading.Event()
         loop.call_soon_threadsafe(released.set)
         assert released.wait(_LOOP_PROOF_TIMEOUT_SECONDS), "the walk blocked the event loop"
         return stub_transit_mac(data)
