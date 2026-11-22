@@ -1827,7 +1827,10 @@ def test_the_retention_strip_reports_an_unreadable_skip_to_its_caller(
         batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
         assert strip_documents(batch, pruned_at=0.0, on_unreadable=report) == (batch, 0, 0)
         assert calls == ["unreadable", "unreadable"]
-    assert_capture_sees(caplog, "messagefoundry.parsing.binary")
+        # The loggers the parsing package defines, probed inside the act's capture at its level
+        # (vault BACKLOG #3766 items 27 and 28): the codec module defines none of its own.
+        for name in ("messagefoundry.parsing.peek", "messagefoundry.parsing.validate"):
+            assert_capture_sees(caplog, name, logging.DEBUG)
     assert [r for r in caplog.records if r.name.startswith("messagefoundry.parsing")] == []
 
 

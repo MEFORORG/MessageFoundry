@@ -16,6 +16,7 @@ through that logger, or that it reached the line that would have logged.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import pytest
 
@@ -36,3 +37,39 @@ def assert_capture_sees(
         f"{log.name!r}, so an absence check over that logger would pass on nothing"
     )
     caplog.records.remove(probes[0])
+
+
+def assert_no_records(
+    caplog: pytest.LogCaptureFixture,
+    logger: str | logging.Logger,
+    pred: Callable[[logging.LogRecord], bool],
+    level: int = logging.WARNING,
+) -> None:
+    """Fail when a captured record from ``logger`` or a child of it matches ``pred``, after
+    :func:`assert_capture_sees` has shown the capture sees ``logger`` at ``level``, so the probe and
+    the absence check name one logger (vault BACKLOG #3766 item 36)."""
+    log = logger if isinstance(logger, logging.Logger) else logging.getLogger(logger)
+    assert_capture_sees(caplog, log, level)
+    hits = [
+        r.getMessage()
+        for r in caplog.records
+        if (r.name == log.name or r.name.startswith(f"{log.name}.")) and pred(r)
+    ]
+    assert hits == [], f"{len(hits)} record(s) from {log.name!r} matched: " + "; ".join(hits)
+
+
+def assert_capture_sees_tree(
+    caplog: pytest.LogCaptureFixture, root: str, level: int = logging.WARNING
+) -> None:
+    """:func:`assert_capture_sees` for ``root`` and for each logger created under it so far.
+
+    A probe of ``root`` alone does not show that a child's records reach the capture: a child with
+    ``propagate=False``, or a disabled one, would hide them (vault BACKLOG #3766 item 29). A child
+    created after this call is not probed."""
+    names = [
+        name
+        for name, node in list(logging.Logger.manager.loggerDict.items())
+        if isinstance(node, logging.Logger) and (name == root or name.startswith(f"{root}."))
+    ]
+    for name in sorted({root, *names}):
+        assert_capture_sees(caplog, name, level)

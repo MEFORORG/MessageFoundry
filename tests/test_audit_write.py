@@ -52,8 +52,9 @@ def test_a_written_row_returns_true_and_logs_nothing(caplog: pytest.LogCaptureFi
         assert asyncio.run(
             write_audit_soft(_ok, log=_LOG, message="lost %s", args=("row",), defects=())
         )
+        # Inside the act's capture, at its level (vault BACKLOG #3766 item 28).
+        assert_capture_sees(caplog, _LOG, logging.DEBUG)
     # Only this logger: asyncio.run may log its selector at DEBUG, depending on the root level.
-    assert_capture_sees(caplog, _LOG)
     assert [r for r in caplog.records if r.name == _LOG.name] == []
 
 
