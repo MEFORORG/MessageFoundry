@@ -48,7 +48,13 @@ from messagefoundry.logging_setup import (
     scrub_log_text,
     sink_readings,
 )
-from messagefoundry.redaction import _REDACTED, clamp_untrusted, safe_text, safe_text_bound
+from messagefoundry.redaction import (
+    _REDACT_WINDOW,
+    _REDACTED,
+    clamp_untrusted,
+    safe_text,
+    safe_text_bound,
+)
 
 __all__ = [
     "AuditObserver",
@@ -136,9 +142,14 @@ def _withhold_detail(detail: str | None) -> str | None:
     no engine writer writes the wrap in any of those. Any other fault, such as a nest too deep to
     read or an integer too long to parse, ships the text being read as
     :data:`_DETAIL_WITHHELD_WHOLE`, since the value may still be in it: the whole detail, or, for
-    a fault in a JSON text held in a string value, that value. It is logged once per process."""
+    a fault in a JSON text held in a string value, that value. It is logged once per process. A
+    detail longer than the redaction window, :data:`~messagefoundry.redaction._REDACT_WINDOW`, that
+    holds a withheld field's name is not parsed, and ships whole as withheld."""
     if not detail or not _names_a_withheld_field(detail):
         return detail
+    if len(detail) > _REDACT_WINDOW:
+        # Bound the work as the other passes are: a longer detail naming a field is not parsed.
+        return _DETAIL_WITHHELD_WHOLE
     changed = False
 
     def hook(obj: dict[str, object]) -> dict[str, object]:
@@ -601,7 +612,10 @@ def emit_audit_tee(
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
     # The line copies the row's detail with any withheld field's value replaced, before any other
     # pass reads it; the observers below are passed the row's own.
-    tee_detail = _withhold_detail(detail)
+    try:
+        tee_detail = _withhold_detail(detail)
+    except Exception:  # noqa: BLE001 - its fault warning can raise; the row is already committed
+        tee_detail = _DETAIL_WITHHELD_WHOLE
     # safe_text(head) + note is safe_text(tee_detail); the note is kept for a scrubbed detail.
     head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
     old_detail = safe_text(head) + note

@@ -24,7 +24,7 @@ from math import nan as NAN
 
 import pytest
 
-from messagefoundry.redaction import safe_text
+from messagefoundry.redaction import _REDACT_WINDOW, safe_text
 from messagefoundry.store import audit_tee
 from messagefoundry.store import store as store_module
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -147,7 +147,8 @@ def test_a_json_text_held_in_a_string_is_withheld_too(detail: str) -> None:
 @pytest.mark.parametrize(
     "detail",
     [
-        "[" * 100_000 + f'{{"recovery_wrap": "{_WRAP.hex()}"}}' + "]" * 100_000,
+        # Inside the redaction window, so it is parsed, and too deep to read.
+        "[" * 30_000 + f'{{"recovery_wrap": "{_WRAP.hex()}"}}' + "]" * 30_000,
         f'{{"recovery_wrap": "{_WRAP.hex()}", "n": {"1" * 5000}}}',
     ],
     ids=["too-deep-to-read", "an-integer-too-long-to-parse"],
@@ -161,6 +162,34 @@ def test_a_fault_while_withholding_withholds_the_whole_detail(
     assert _WRAP.hex() not in line
     assert json.loads(json.loads(line)["detail"]) == {"withheld": "<withheld>"}
     assert any("could not withhold" in r.getMessage() for r in caplog.records)
+
+
+def test_a_detail_over_the_window_that_names_the_field_ships_whole_unparsed(monkeypatch) -> None:
+    """The parse is held to the redaction window the tee's other passes use."""
+    detail = json.dumps({"recovery_wrap": _WRAP.hex(), "pad": "x" * _REDACT_WINDOW})
+    loads: list[str] = []
+
+    def counting(text: str, **_kwargs: object) -> object:
+        loads.append(text)
+        return {}
+
+    monkeypatch.setattr(json, "loads", counting)
+    assert audit_tee._withhold_detail(detail) == audit_tee._DETAIL_WITHHELD_WHOLE
+    assert loads == []
+
+
+def test_a_fault_in_the_withholding_warning_does_not_escape_the_tee(monkeypatch) -> None:
+    """The row is committed before the tee runs, so no logging fault may reach its caller."""
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("a log filter failed")
+
+    monkeypatch.setattr(audit_tee, "_WITHHOLD_FAULT_LOGGED", False)
+    monkeypatch.setattr(audit_tee.log, "warning", broken)
+    deep = "[" * 30_000 + f'{{"recovery_wrap": "{_WRAP.hex()}"}}' + "]" * 30_000
+    (line,) = _tee(deep)
+    assert _WRAP.hex() not in line
+    assert json.loads(json.loads(line)["detail"]) == {"withheld": "<withheld>"}
 
 
 def test_an_observer_is_passed_the_rows_own_detail(monkeypatch) -> None:
