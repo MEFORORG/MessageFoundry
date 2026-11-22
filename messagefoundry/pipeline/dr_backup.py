@@ -110,6 +110,7 @@ from messagefoundry.transports.file import (
     _WIN_UNSUPPORTED,
     _attribute_tag,
     _fd_for,
+    _file_id,
     _handle_final_path,
     _os_handle,
     _Replaced,
@@ -1963,11 +1964,18 @@ def _clear_readonly_and_retry(func: Callable[..., object], path: str, exc: BaseE
     ``TemporaryDirectory`` did and a plain ``rmtree`` does not. Only an unlink or rmdir is retried,
     and never through a link; anything else re-raises, so ``rmtree`` fails rather than skipping a
     subtree it could not read. A sharing violation is also a ``PermissionError``: its retry raises
-    again, and the caller's own schedule takes over."""
+    again, and the caller's own schedule takes over.
+
+    Windows only. POSIX re-raises: its retry would change the entry's mode and remove it by its full
+    path, which follows a directory above it that was swapped for a link, while ``rmtree`` itself
+    removes relative to directory descriptors there. A POSIX unlink or rmdir is refused by the mode
+    of the directory holding the entry, which a change to the entry's own mode does not lift
+    (BACKLOG #2420)."""
     if isinstance(exc, FileNotFoundError):
         return
     if (
-        not isinstance(exc, PermissionError)
+        sys.platform != "win32"
+        or not isinstance(exc, PermissionError)
         or func not in (os.unlink, os.remove, os.rmdir)
         or os.path.islink(path)
     ):
@@ -1978,14 +1986,25 @@ def _clear_readonly_and_retry(func: Callable[..., object], path: str, exc: BaseE
 
 def _remove_tree(path: Path) -> bool:
     """Remove ``path`` and everything in it. ``True`` only when it is gone, including when it
-    already was: a clean return from ``rmtree`` is checked rather than trusted."""
+    already was: a clean return from ``rmtree`` is checked rather than trusted.
+
+    On Windows it removes through the verbatim path (:func:`_win_verbatim`), so each name below
+    ``path`` is opened exactly as listed. By the plain path Win32 rewrites a name such as ``sub.`` to
+    ``sub``, and a junction planted at ``sub`` then took the removal outside ``path`` (BACKLOG #2420).
+    A path whose verbatim form cannot be made is not removed."""
+    target: str | Path = path
+    if sys.platform == "win32":
+        try:
+            target = _win_verbatim(path)
+        except (OSError, ValueError):
+            return False
     try:
-        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+        shutil.rmtree(target, onexc=_clear_readonly_and_retry)
     except FileNotFoundError:
         pass
     except OSError:
         return False
-    return not os.path.lexists(path)
+    return not os.path.lexists(target)
 
 
 def _fd_walk(
@@ -2070,7 +2089,8 @@ def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = N
       as another object (:func:`_win_opens_another`) is reported.
 
     A listed file that is gone from its name before it is opened is reported, never read as nothing to
-    empty: a rename leaves its bytes under another name.
+    empty: a rename leaves its bytes under another name. So is one whose name, by its open, names
+    another file than the one its screen found there.
 
     What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
     ``mefor-verify-*`` staging row."""
@@ -2200,8 +2220,9 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> s
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
 
     ``dir_fd`` is its directory's descriptor on POSIX; ``here`` is that directory's final path on
-    Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a hard
-    link without opening it; the check that decides is the one on the open handle.
+    Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first skips a link or a hard link
+    without opening it, and names the file the open handle must be; the type and link checks that
+    decide are the ones on the open handle.
 
     A name that is gone at the ``lstat`` or the open is reported, not read as nothing to empty: it
     was listed, so it was renamed or removed since, and a rename leaves the file full under a name
@@ -2250,7 +2271,12 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> s
         # Checked on the handle that truncates: POSIX's only check, and on Windows the reopened
         # handle of a file a filter serves (the handle opened as itself was checked before that,
         # inside test included, and the reopen must be that same file).
-        _vet_for_truncate(fd)
+        opened = _vet_for_truncate(fd)
+        # And it must be the file screened above: a file renamed away after its screen, with a new
+        # one made under its name, would otherwise have the new one emptied and the directory
+        # reported clean while the renamed one keeps its bytes (BACKLOG #2420).
+        if _file_id(opened) != _file_id(st):
+            raise _Replaced("not the file screened")
         os.ftruncate(fd, 0)
     except OSError as exc:
         return _not_truncated(name, exc)
@@ -2322,10 +2348,10 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> int:
     return os.open(entry.name, flags, dir_fd=dir_fd)
 
 
-#: ``O_NOFOLLOW`` where the platform has it: the sweep's lock open and the teardown's re-mark refuse a
-#: lock file or marker planted as a link. Windows has none, and follows one there.
+#: ``O_NOFOLLOW`` where the platform has it, at least for the spare-marker read
+#: (:func:`_read_spare_marker`). Windows has none.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-#: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
+#: ``O_NONBLOCK`` where the platform has it, for the spare-marker read too.
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 #: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
 #: read at least by :func:`_owner_of`, :func:`_names_another_path` and :func:`_stat_names_another_path`.
@@ -2337,19 +2363,22 @@ _WIN_NAME_SURROGATE = _NAME_SURROGATE
 # confines its drops with, so one copy of that code serves both (BACKLOG #4992).
 
 
-def _vet_for_truncate(fd: int) -> None:
+def _vet_for_truncate(fd: int) -> os.stat_result:
     """Refuse, on the open file, what the fail-safe never truncates: something that is not a regular
     file, or a file with a second link.
 
     On Windows :func:`_win_open_file` calls this on the file opened as itself, before it lets a
     filter serve a reparse point that names no path, and the screen before that open is
     :func:`_win_lstat`, not ``os.lstat`` (BACKLOG #4992). What still reaches a filter first is
-    listed in docs/PHI.md section 2's ``mefor-backup-*`` / ``mefor-verify-*`` staging row."""
+    listed in docs/PHI.md section 2's ``mefor-backup-*`` / ``mefor-verify-*`` staging row.
+
+    Returns the file's ``fstat``, for a caller's identity check."""
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise _Unconfined("not a regular file")
     if st.st_nlink > 1:
         raise _HardLinked("a second link")
+    return st
 
 
 def _win_final_path(handle: int) -> str:
@@ -3138,6 +3167,149 @@ def _unlock_and_close(fd: int) -> None:
         os.close(fd)
 
 
+#: The Win32 access right :func:`_win_create_new` asks for.
+_GENERIC_WRITE = 0x40000000
+
+
+def _win_create_new(path: Path) -> None:
+    """Windows: create the empty file ``path``, opening any entry already there as itself, so a
+    link there, dangling or not, is a name in use (``FileExistsError``) and is never followed."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    kernel32 = _win_api()
+    handle = kernel32.CreateFileW(
+        str(path), _GENERIC_WRITE, _SHARE_ALL, None, 1, _FLAG_OPEN_REPARSE_POINT, None
+    )  # 1 is CREATE_NEW
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+            raise FileExistsError(errno.EEXIST, "a name in use")
+        raise ctypes.WinError(error)
+    kernel32.CloseHandle(handle)
+
+
+class _HeldStagingDir:
+    """A staging directory through which the sweep reads its owner, opens its lock and tests its
+    marker, and the teardown puts both back (BACKLOG #2420). Used as a context manager.
+
+    POSIX opens it with ``O_NOFOLLOW`` and goes relative to that descriptor, so a directory swapped
+    for a link has neither its lock opened nor its marks made in the link's target. Where the
+    platform has no ``O_PATH`` and the read-only open that stands in for it is refused for want of
+    read permission, it goes by path instead, as the opens it replaced did, so such a directory is
+    still swept and re-marked.
+
+    Windows opens nothing here and goes by path, as the opens it replaced did; only its re-mark
+    differs, by an exclusive create (:meth:`mark`).
+
+    What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
+    ``mefor-verify-*`` staging row."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        #: None where the directory goes by path (Windows, and POSIX as said above).
+        self.fd: int | None = None
+        if sys.platform != "win32":
+            flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            o_path = getattr(os, "O_PATH", None)
+            if o_path is not None:
+                # Linux: needs only search permission, as the by-path opens it replaced did.
+                self.fd = os.open(path, o_path | flags)
+            else:
+                try:
+                    self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | flags)
+                except PermissionError:
+                    self.fd = None  # by path, as before (see the class docstring)
+
+    def __enter__(self) -> _HeldStagingDir:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError as exc:  # never raised over the caller's own outcome
+                log.warning("DR staging: could not close a staging directory: %s", safe_exc(exc))
+
+    def owner(self) -> object | None:
+        """The directory's owner, read from the open directory (:func:`_owner_of_fd`), or by path
+        (:func:`_owner_of`) where it goes by path."""
+        if self.fd is None:
+            return _owner_of(self.path)
+        return _owner_of_fd(self.fd, self.path)
+
+    def open_lock(self) -> int:
+        """Open the lock file for reading and writing and return a descriptor. ``O_NONBLOCK``
+        where the platform has it, so a FIFO planted there does not hold the sweep; ``O_NOFOLLOW``
+        where it has that, which Windows does not."""
+        if sys.platform == "win32" or self.fd is None:
+            return os.open(
+                self.path / _LOCK_NAME,
+                os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK,
+            )
+        return os.open(
+            _LOCK_NAME,
+            os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=self.fd,
+        )
+
+    def has(self, name: str) -> bool:
+        """Whether an entry named ``name`` is in the directory, a link included; ``False`` when that
+        cannot be read."""
+        if self.fd is None:
+            return os.path.lexists(self.path / name)
+        try:
+            os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except OSError:
+            return False  # as `os.path.lexists`, which the by-path arm uses, reads a fault
+        return True
+
+    def mark(self, name: str) -> None:
+        """Create the empty file ``name`` unless an entry has that name.
+
+        On Windows, and on POSIX where the directory is open, the create is exclusive, so it never
+        follows a link planted at that name, a dangling one included: on POSIX ``O_EXCL`` with
+        ``O_CREAT`` never follows a final link, and on Windows ``CREATE_NEW`` with
+        ``FILE_FLAG_OPEN_REPARSE_POINT`` takes the link itself as the name in use, where an
+        ``os.open`` create would make the file at a dangling link's target. Where that create finds
+        the name taken, the entry there is checked (on Windows by :func:`_win_lstat`, which opens it
+        as itself for its attributes), and ``OSError`` is raised when it is not a plain file.
+        Windows still reaches that name by path. An entry that goes between the refused create and
+        its check is created once more.
+
+        Where POSIX goes by path, the open is the one it replaced: ``O_CREAT`` with ``O_NOFOLLOW``
+        and ``O_NONBLOCK``, by path, which opens an entry already there and checks nothing more."""
+        if sys.platform != "win32" and self.fd is None:
+            flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
+            os.close(os.open(self.path / name, flags, 0o600))
+            return
+        for attempt in (1, 2):
+            try:
+                if sys.platform == "win32":
+                    _win_create_new(self.path / name)
+                else:
+                    os.close(
+                        os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.fd)
+                    )
+                return
+            except FileExistsError:
+                pass
+            try:
+                if sys.platform == "win32":
+                    st, tag = _win_lstat(self.path / name)
+                    plain = stat.S_ISREG(st.st_mode) and not tag & _WIN_NAME_SURROGATE
+                else:
+                    plain = stat.S_ISREG(
+                        os.stat(name, dir_fd=self.fd, follow_symlinks=False).st_mode
+                    )
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise
+                continue
+            if not plain:
+                raise OSError(errno.EEXIST, f"{name} is there, but is not a plain file")
+            return
+
+
 class _Staging:
     """One staging directory and the lock that proves it is live. Released exactly once.
 
@@ -3311,12 +3483,12 @@ def _teardown_staging(
             ", ".join(unrecorded),
         )
     else:
-        # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
-        # otherwise hold this thread in the open until a reader came, which may be never.
-        flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
+        # Through `_HeldStagingDir`, which says where it goes by path; a link or a FIFO planted at
+        # either name is never opened (BACKLOG #2420).
         try:
-            for name in (_LOCK_NAME, _HELD_MARKER_NAME):
-                os.close(os.open(path / name, flags, 0o600))
+            with _HeldStagingDir(path) as held_dir:
+                for name in (_LOCK_NAME, _HELD_MARKER_NAME):
+                    held_dir.mark(name)
         except OSError as exc:
             log.warning(
                 "DR staging directory %s survived its teardown and could not be marked for the next "
@@ -4129,45 +4301,8 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         # security-descriptor read, so a temp dir full of other programs' leftovers stays cheap.
         if not os.path.lexists(path / _LOCK_NAME):
             continue
-        if _owner_of(path) != owner:
-            # Not this account's, or an owner that could not be read: another account's run, such as
-            # an administrator's interactive one, or a plant. Said, not skipped silently.
-            log.warning(
-                "DR staging: staging directory %s has another owner, so the sweep leaves it", path
-            )
+        if not _proven_abandoned(path, owner):
             continue
-        try:
-            # `_O_NONBLOCK` as the re-mark has it: a FIFO planted at the lock must not hold the sweep.
-            fd = os.open(
-                path / _LOCK_NAME,
-                os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK,
-            )
-        except FileNotFoundError:
-            continue  # no lock file: no proof either way
-        except OSError as exc:
-            # A directory with this account's owner whose lock file this account still cannot open;
-            # another owner's directory never reaches here, since the owner is checked first. Said,
-            # not skipped silently.
-            log.warning(
-                "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
-                path,
-                safe_exc(exc),
-            )
-            continue
-        try:
-            if not file_lock.lock_exclusive(fd, wait=False):
-                continue  # a live run holds it
-            if not os.path.lexists(path / _HELD_MARKER_NAME):
-                continue  # locked by nobody, but no marker: not proven abandoned
-        except OSError as exc:
-            log.warning(
-                "DR staging: could not test the lock of staging directory %s: %s",
-                path,
-                safe_exc(exc),
-            )
-            continue
-        finally:
-            _unlock_and_close(fd)
         leftover = _teardown_staging(path)
         if leftover is not None:
             log.error("DR staging: an abandoned staging directory survived the sweep: %s", leftover)
@@ -4181,6 +4316,70 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
             swept += 1
             log.info("DR staging: removed abandoned staging directory %s", path)
     return swept
+
+
+def _another_owner(path: Path) -> None:
+    # Not this account's, or an owner that could not be read: another account's run, such as an
+    # administrator's interactive one, or a plant. Said, not skipped silently.
+    log.warning("DR staging: staging directory %s has another owner, so the sweep leaves it", path)
+
+
+def _proven_abandoned(path: Path, owner: object) -> bool:
+    """Whether the sweep may tear down the candidate ``path``, which holds a lock file: it has
+    ``owner``, its lock can be taken, and it holds the marker. What it refuses is
+    logged, except at least a live run's lock, a missing lock or marker, and a candidate gone by its
+    open.
+
+    The owner is read by path first, so another account's directory is never opened at all. Where
+    :class:`_HeldStagingDir` has the directory open, the owner is read again from it, and that
+    read decides; where it goes by path, the first read is the only one, as before. What that class
+    leaves to a path is said there (BACKLOG #2420)."""
+    if _owner_of(path) != owner:
+        _another_owner(path)
+        return False
+    try:
+        held_dir = _HeldStagingDir(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning(
+            "DR staging: cannot open staging directory %s as itself, so the sweep leaves it: %s",
+            path,
+            safe_exc(exc),
+        )
+        return False
+    with held_dir:
+        if held_dir.fd is not None and held_dir.owner() != owner:
+            _another_owner(path)
+            return False
+        try:
+            fd = held_dir.open_lock()
+        except FileNotFoundError:
+            return False  # no lock file: no proof either way
+        except OSError as exc:
+            # A directory with this account's owner whose lock file this account still cannot
+            # open, or on POSIX one planted there as a link; another owner's directory never
+            # reaches here, since the owner is checked first. Said, not skipped silently.
+            log.warning(
+                "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
+                path,
+                safe_exc(exc),
+            )
+            return False
+        try:
+            if not file_lock.lock_exclusive(fd, wait=False):
+                return False  # a live run holds it
+            # Locked by nobody, but no marker: not proven abandoned.
+            return held_dir.has(_HELD_MARKER_NAME)
+        except OSError as exc:
+            log.warning(
+                "DR staging: could not test the lock of staging directory %s: %s",
+                path,
+                safe_exc(exc),
+            )
+            return False
+        finally:
+            _unlock_and_close(fd)
 
 
 def _verify_in_staging(
