@@ -6502,8 +6502,8 @@ def _refuse_colliding_config_members(
                             "the archive's config bundle carries a member that Windows resolves "
                             "to or under a path this restore would publish for the store "
                             f"({dest_store_path}), so it could replace or corrupt the restored "
-                            "database. Nothing was extracted. Choose a --config-to directory that "
-                            "does not contain the --to path",
+                            "database. Nothing was extracted. The archive's own member name is the "
+                            "problem, so treat the archive as suspect",
                         )
                 if not exact:
                     continue

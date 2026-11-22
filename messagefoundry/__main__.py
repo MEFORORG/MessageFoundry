@@ -1255,8 +1255,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--to",
         default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
-        "except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
+        "is unrecoverable, so an existing file (or SQLite -wal/-shm/-journal sidecar) is refused. "
+        "Required, except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
         "whose bundle --config-to restores alone",
     )
     restore.add_argument(
