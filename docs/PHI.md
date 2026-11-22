@@ -808,7 +808,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    genesis row, refuses under every key, a new one included, and the record stays open. A newest
    range under a key that is not configured is not one of these, though `audit-verify` reports it
    too: put that key back in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and re-run. Where a run that
-   opened the record meets a refusal for good, it names at least two ways out:
+   opened the record meets a refusal for good, it names the dedicated way out (owner ruling
+   2026-11-04): re-run `rotate-key` with the same keys and `--close-without-roll "<reason>"`. A run
+   that then re-seals the data with no skip writes a `store.rotation_closed_without_roll` audit row
+   carrying the reason, stamps the key's rotation date and closes the record. It rolls nothing, the
+   chain still does not verify, the run still exits 1, and the prior key stays needed to verify the
+   rows it MACed. The refusal also names at least two other ways out:
    `[secret_rotation].store_key_last_rotated`, set to the date of a run that re-sealed the data with
    no skip, and `[secret_rotation].enforce_store_key_expiry = false`, which lifts only the start
    refusal and is a named security loosening.
