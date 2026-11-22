@@ -4852,8 +4852,8 @@ def _full_open_check(
             # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
             if walked[0] != "PASS":
                 walk = (
-                    f"Before the open, the walk of the cells this build knows reported {walked[0]},"
-                    " which may be only this build reading another version's cells differently: "
+                    f"Before the open, the walk of the cells this build knows reported {walked[0]}"
+                    " (the remedy leads because this build can misread another version's cells): "
                     f"{safe_text(walked[1])}"
                 )
             elif walked[2]:
