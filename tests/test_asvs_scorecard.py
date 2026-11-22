@@ -2806,9 +2806,9 @@ def test_prove_absences_screen_reads_a_decorator_name_in_its_own_scope(tmp_path:
 
 
 def test_prove_absences_screen_keeps_builtins_after_a_star_import(tmp_path: Path) -> None:
-    """A ``from m import *`` is read as rebinding the names already bound, not ``property``: an
-    honest getter override stays accepted, and dropping ``@property`` stays refused. Found by review
-    of this item, where a star import turned builtins off."""
+    """A ``from m import *`` is read as rebinding the names already bound, not ``property``: a
+    getter override stays accepted, and dropping ``@property`` stays refused. Found by review of
+    this item, where a star import turned builtins off."""
     prop = (
         "from os import *\n\nclass C:\n    @property\n    def x(self): ...\n"
         "    @x.setter\n    def x(self, v): ...\n"
@@ -2852,6 +2852,45 @@ def test_prove_absences_screen_reads_both_overload_spellings_as_one(tmp_path: Pa
     target = "from typing_extensions import overload\n\n@overload\ndef f(a: int): ...\n"
     mutation = "from typing import overload\n\n@overload\ndef f(a: int): ...\n"
     assert _screen(mutation, target, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_a_partial_run_of_the_target_as_live(tmp_path: Path) -> None:
+    """A ``with`` body an ``__exit__`` may cut short, a loop broken mid-body, and a compound
+    statement interrupted inside a ``try`` each leave an earlier definition live, so a copy of it
+    is accepted, as the pre-change screen accepted it. Each was refused by the second check before
+    the target was read with its prefixes. The control in each case: a wrong-arity copy is still
+    refused."""
+    suppressed = (
+        "import contextlib\ndef f(a): ...\n"
+        "with contextlib.suppress(ImportError):\n    import fastthing\n    def f(a, b): ...\n"
+    )
+    broken = "for x in r:\n    def f(a): ...\n    if x:\n        break\n    def f(a, b): ...\n"
+    interrupted = (
+        "try:\n    if X:\n        def f(a): ...\n        import missing\n        def f(a, b): ...\n"
+        "except ImportError:\n    pass\n"
+    )
+    for target in (suppressed, broken, interrupted):
+        assert _screen("def f(a): ...\n", target, tmp_path) == [], target
+        assert _refused("def f(): ...\n", target, tmp_path), target
+    # The first check compares the last module-level def, as the pre-change screen did, so in
+    # `suppressed` only the copy of f(a) is accepted.
+    for target in (broken, interrupted):
+        assert _screen("def f(a, b): ...\n", target, tmp_path) == [], target
+
+
+def test_prove_absences_screen_reads_nested_loop_elses_in_linear_time(tmp_path: Path) -> None:
+    """Each loop's ``else`` is read once, so loop-elses nested 18 deep do not cost 2**18 reads."""
+    depth = 18
+    target = (
+        "".join(
+            f"{'    ' * i}for _ in r:\n{'    ' * (i + 1)}pass\n{'    ' * i}else:\n"
+            for i in range(depth)
+        )
+        + f"{'    ' * depth}def f(a): ...\n"
+    )
+    started = time.monotonic()
+    assert _refused("def f(): ...\n", target, tmp_path)
+    assert time.monotonic() - started < 5
 
 
 def test_signature_fields_name_every_signature_value() -> None:

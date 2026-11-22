@@ -2744,22 +2744,50 @@ def _is_accessor(node: _FunctionNode, state: _ScopeState, reading: _Reading) -> 
     )
 
 
+def _has_break(body: list[ast.stmt]) -> bool:
+    """Whether `body` holds a ``break`` of its own loop, not one of a nested loop."""
+    stack = list(body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Break):
+            return True
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            stack.extend(node.orelse)  # a break in a nested loop's else ends THIS loop
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for name in ("body", "orelse", "finalbody"):
+            stack.extend(getattr(node, name, ()))
+        stack.extend(s for h in getattr(node, "handlers", ()) for s in h.body)
+        stack.extend(s for c in getattr(node, "cases", ()) for s in c.body)
+    return False
+
+
 def _run_block(
     body: list[ast.stmt],
     state: _ScopeState,
     reading: _Reading,
     outer: _ScopeState | None = None,
+    *,
+    generous: bool = False,
+    sink: list[_ScopeState] | None = None,
 ) -> _ScopeState:
     """`state` after `body` runs, one statement at a time, as the second check of
     :func:`_screen_mutation` reads it.
 
     In sequence a later ``def`` or ``class`` replaces an earlier one. Each alternative of a compound
     statement leaves its own definitions possible: both arms of an ``if``; a ``try``'s body with its
-    ``else``, and each handler after any prefix of the body, then its ``finally``; a loop that runs its body and ``else``,
-    breaks after its body, or skips to its ``else``; each ``match`` case, or none. An ``if
-    TYPE_CHECKING:`` body never runs, so only its ``else`` counts, and the reverse for ``if not
-    TYPE_CHECKING:``. A ``with`` body always runs. A property accessor def does not replace the
-    property (:func:`_is_accessor`). A decorator is resolved at the point its ``def`` runs.
+    ``else``, and each handler after a prefix of the body, then its ``finally``; a loop that breaks
+    after its body, or runs or skips its body and then runs its ``else``; each ``match`` case, or
+    none. An ``if TYPE_CHECKING:`` body is read as never running, so only its ``else`` counts, and
+    the reverse for ``if not TYPE_CHECKING:``. A property accessor def does not replace the property
+    (:func:`_is_accessor`). A decorator is resolved at the point its ``def`` runs.
+
+    The TARGET is read `generous`ly, since more live alternatives there can only remove refusals:
+    each prefix of a ``with`` body, of a loop body that holds a ``break``, and of a ``try`` body,
+    at any depth inside it, is a live alternative too. The mutation is read without them: a ``with``
+    body is read as running whole, and a handler follows only a prefix of the ``try`` body's own
+    statements. `sink`, when given, collects the state before each statement read, at any depth.
 
     A class body is read when its ``class`` statement runs, in a scope of its own that starts from
     the enclosing module scope's bindings (`outer`, or `state` at module level). A function body is
@@ -2768,14 +2796,28 @@ def _run_block(
     """
     state = state.copy()
     for node in body:
-        state = _run_stmt(node, state, reading, outer)
+        if sink is not None:
+            sink.append(state.copy())
+        state = _run_stmt(node, state, reading, outer, generous=generous, sink=sink)
     return state
 
 
 def _run_stmt(
-    node: ast.stmt, state: _ScopeState, reading: _Reading, outer: _ScopeState | None
+    node: ast.stmt,
+    state: _ScopeState,
+    reading: _Reading,
+    outer: _ScopeState | None,
+    *,
+    generous: bool = False,
+    sink: list[_ScopeState] | None = None,
 ) -> _ScopeState:
     """:func:`_run_block` for one statement. May update `state` in place; returns the result."""
+
+    def run(
+        block: list[ast.stmt], start: _ScopeState, into: list[_ScopeState] | None = sink
+    ) -> _ScopeState:
+        return _run_block(block, start, reading, outer, generous=generous, sink=into)
+
     _bind_walrus(node, state)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         reading.decorators[node] = tuple(
@@ -2791,7 +2833,7 @@ def _run_stmt(
         if isinstance(node, ast.ClassDef):
             module = outer if outer is not None else state
             fresh = _ScopeState(bindings=dict(module.bindings))
-            reading.classes[node] = _run_block(node.body, fresh, reading, module)
+            reading.classes[node] = _run_block(node.body, fresh, reading, module, generous=generous)
         elif _is_accessor(node, state, reading):
             return state
         state.defs[node.name] = (node,)
@@ -2835,49 +2877,56 @@ def _run_stmt(
                 state.bind(name)
     elif isinstance(node, ast.If):
         if _is_type_checking(node.test):
-            return _run_block(node.orelse, state, reading, outer)
+            return run(node.orelse, state)
         if (
             isinstance(node.test, ast.UnaryOp)
             and isinstance(node.test.op, ast.Not)
             and _is_type_checking(node.test.operand)
         ):
-            return _run_block(node.body, state, reading, outer)
-        return _merge(
-            [
-                _run_block(node.body, state, reading, outer),
-                _run_block(node.orelse, state, reading, outer),
-            ]
-        )
+            return run(node.body, state)
+        return _merge([run(node.body, state), run(node.orelse, state)])
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         for item in node.items:
             if item.optional_vars is not None:
                 for name in _target_names(item.optional_vars):
                     state.bind(name)
-        return _run_block(node.body, state, reading, outer)
+        if not generous:
+            return run(node.body, state)
+        cut: list[_ScopeState] = []
+        whole = run(node.body, state, cut)
+        if sink is not None:
+            sink.extend(cut)
+        return _merge([whole, *cut])  # an __exit__ that suppresses ends the body at any prefix
     elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
         if not isinstance(node, ast.While):
             for name in _target_names(node.target):
                 state.bind(name)
-        ran = _run_block(node.body, state, reading, outer)
-        return _merge(
-            [
-                ran,
-                _run_block(node.orelse, ran, reading, outer),
-                _run_block(node.orelse, state, reading, outer),
-            ]
-        )
+        cut = []
+        ran = run(node.body, state, cut if generous else sink)
+        if generous and sink is not None:
+            sink.extend(cut)
+        broke = cut if generous and _has_break(node.body) else []
+        # The else is read ONCE, from the merged entry states, so nested loop-elses cost linearly.
+        return _merge([ran, *broke, run(node.orelse, _merge([ran, state]))])
     elif isinstance(node, (ast.Try, ast.TryStar)):
-        prefixes = [state]
-        for stmt in node.body:
-            prefixes.append(_run_stmt(stmt, prefixes[-1].copy(), reading, outer))
-        alternatives = [_run_block(node.orelse, prefixes[-1], reading, outer)]
+        if generous:
+            cut = []
+            whole = run(node.body, state, cut)
+            prefixes = [*cut, whole]
+            if sink is not None:
+                sink.extend(cut)
+        else:
+            prefixes = [state]
+            for stmt in node.body:
+                prefixes.append(_run_stmt(stmt, prefixes[-1].copy(), reading, outer))
+        alternatives = [run(node.orelse, prefixes[-1])]
         partial = _merge(prefixes)
         for handler in node.handlers:
             caught = partial.copy()
             if handler.name:
                 caught.bind(handler.name)
-            alternatives.append(_run_block(handler.body, caught, reading, outer))
-        return _run_block(node.finalbody, _merge(alternatives), reading, outer)
+            alternatives.append(run(handler.body, caught))
+        return run(node.finalbody, _merge(alternatives))
     elif isinstance(node, ast.Match):
         cases = []
         for case in node.cases:
@@ -2886,7 +2935,7 @@ def _run_stmt(
                 matched.bind(name)
             if case.guard is not None:
                 _bind_walrus_in(case.guard, matched)
-            cases.append(_run_block(case.body, matched, reading, outer))
+            cases.append(run(case.body, matched))
         return _merge([*cases, state])
     return state
 
@@ -3062,7 +3111,7 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
     reading = _Reading()
     walked: tuple[_ScopeState, _ScopeState] | None
     try:
-        live = _run_block(source.body, _ScopeState(), reading)
+        live = _run_block(source.body, _ScopeState(), reading, generous=True)
         walked = live, _run_block(mutation.body, live, reading)
     except RecursionError:
         # Nesting deeper than the interpreter's stack (a long ``elif`` chain). The second check only
