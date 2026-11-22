@@ -2,7 +2,7 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
 
-import { contextMenuEnablement, resolveInsertAnchor } from "../../stepsModel";
+import { resolveInsertAnchor } from "../../stepsModel";
 import { dropRows, loadPage, withControls, type DomNode } from "./b622-g09-steps-page";
 
 // BACKLOG #5839: an insert AFTER an if/elif/else/for header was requested directly after the header
@@ -85,16 +85,16 @@ suite("b622 #5839 — insert after a control header lands as the block's first s
     assert.strictEqual(resolveInsertAnchor(rows, 2, "after")?.anchor.lineStart, 4);
   });
 
-  test("Insert before is greyed on an elif/else header, in the model and in the webview", () => {
-    assert.strictEqual(
-      contextMenuEnablement({ kind: "control", control: "else" }, { canMoveUp: false, canMoveDown: false }).insertBefore,
-      false,
-    );
+  test("Insert before an else header offers only Comment, which cannot split the if-chain", () => {
     const page = loadPage(withControls());
+    const before = (id: string): DomNode =>
+      page.menuItem(`.ctx-submenu[data-for="before"] .ctx-item[data-item-id="${id}"]`);
     page.rightClick(page.row(4));
-    assert.strictEqual(page.menuItem('.ctx-parent[data-sub="before"]').disabled, true);
-    page.rightClick(page.row(2));
     assert.strictEqual(page.menuItem('.ctx-parent[data-sub="before"]').disabled, false);
+    assert.strictEqual(before("comment").disabled, false, "a Comment above else: is accepted");
+    assert.strictEqual(before("set_field").disabled, true, "a statement above else: is not");
+    page.rightClick(page.row(2));
+    assert.strictEqual(before("set_field").disabled, false, "before an if header it is offered");
   });
 
   test("webview: an Else clause insert on an if header keeps the header as its anchor", () => {

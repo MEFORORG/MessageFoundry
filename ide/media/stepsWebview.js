@@ -903,13 +903,10 @@
           // terminal RETURN / scaffold footer / Router route row (data-is-return, so dead code after the
           // return) but ALLOWED on a mid-body append
           // send (ADR 0104); Delete only on an editable action/lookup/send row; ↑/↓ per walk.
-          // Insert BEFORE an elif/else header is greyed: it would land at the clause keyword's indent and
-          // split the if-chain, which the engine refuses.
-          const control = el.dataset.control;
-          const continuation = kind === 'control' && (control === 'elif' || control === 'else');
           for (const p of insertParents) {
-            setDisabled(p, p.dataset.sub === 'after' ? isReturn : continuation);
+            setDisabled(p, p.dataset.sub === 'after' && isReturn);
           }
+          const control = el.dataset.control;
           // Mirror isRowMutable: note + route join the editable kinds, and a PRAGMA note is read-only
           // (the engine refuses set_params/delete_row/move_row on one, ADR 0076 A.4).
           const mutable =
@@ -926,10 +923,14 @@
           // menu offers routing constructs only and the engine's refusal is never met as an error toast.
           // The menu is shared by every row, so each item's state is set afresh on every open, enabling
           // what this row allows as well as greying what it does not (BACKLOG #5842).
+          // A statement inserted BEFORE an elif/else header would land at the clause keyword's indent and
+          // split the if-chain, which the engine refuses; a Comment there is accepted, so only it stays.
           const isIfChain = kind === 'control' && (control === 'if' || control === 'elif');
+          const continuation = kind === 'control' && (control === 'elif' || control === 'else');
           const rowRole = el.dataset.role || 'handler';
           for (const c of menu.querySelectorAll('.ctx-item[data-item-id]')) {
-            setDisabled(c, (c.dataset.anchor === 'if_chain' && !isIfChain) || !inRole(c, rowRole));
+            setDisabled(c, (c.dataset.anchor === 'if_chain' && !isIfChain) || !inRole(c, rowRole) ||
+              (continuation && c.dataset.position === 'before' && c.dataset.itemId !== 'comment'));
           }
           // Mirror isRowMovable: a code row (and an elif/else header) is NOT movable, even though walkMove
           // finds an adjacent slot for it (it is draggable only as a drag-interception marker). Gate the

@@ -2019,14 +2019,13 @@ export function contextMenuEnablement(
     filtered?: boolean;
     pragma?: boolean;
     action?: string;
-    control?: string;
   },
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
   return {
-    // Insert BEFORE an elif/else header would land at the clause keyword's indent and split the
-    // if-chain, which the engine refuses; every other row takes it.
-    insertBefore: !(row.kind === "control" && (row.control === "elif" || row.control === "else")),
+    // On an elif/else header the webview greys the items in it that would split the if-chain, all but
+    // Comment, which the engine writes above the clause; the submenu itself stays available.
+    insertBefore: true,
     // Insert AFTER is suppressed on a terminal return (a returned send OR the `return sends` footer) — a
     // step after it is dead code — but ALLOWED on a mid-body `sends.append(...)` (ADR 0104), which is a
     // normal step, not a return. A Router's `route` row is a return ({@link isReturnRow}).
