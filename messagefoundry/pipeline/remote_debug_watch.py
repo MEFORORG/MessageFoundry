@@ -94,9 +94,11 @@ ALERT_SUBJECT = "remote_debug:refused"
 CHECK_INTERVAL_SECONDS = 30.0
 #: How long :meth:`RemoteDebugRefusalWatch.stop` waits for the last pass before it cancels it.
 _STOP_SECONDS = 5.0
+#: Under a deadline, the least each of :meth:`RemoteDebugRefusalWatch.stop`'s two waits is given.
+STOP_FLOOR_SECONDS = 0.1
 #: How long the pass waits for one audit row before it cancels the write. The cancel can take
-#: longer to finish. A later pass retries the row. At stop, the shorter :data:`_STOP_SECONDS`
-#: bound in :meth:`RemoteDebugRefusalWatch.stop` cuts in first, and no later pass retries.
+#: longer to finish. A later pass retries the row. At stop, the shorter bound in
+#: :meth:`RemoteDebugRefusalWatch.stop` cuts in first, and no later pass retries.
 _ROW_SECONDS = CHECK_INTERVAL_SECONDS
 
 
@@ -142,18 +144,21 @@ class RemoteDebugRefusalWatch:
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
 
-    @staticmethod
-    def stop_seconds() -> float:
-        """The bound of each of :meth:`stop`'s two waits when it is handed none."""
-        return _STOP_SECONDS
-
-    async def stop(self, *, timeout: float | None = None) -> None:
+    async def stop(self, *, deadline: float | None = None) -> None:
         """Signal the loop, let it make its last pass, and await its exit (idempotent).
 
-        ``timeout`` bounds each of the two waits, the pass's and the cancel's, in place of
-        :data:`_STOP_SECONDS`; engine.stop() passes a shorter one under its budget (BACKLOG
-        #3191)."""
-        wait = _STOP_SECONDS if timeout is None else timeout
+        Each of the two waits, the pass's and the cancel's, is bounded by :data:`_STOP_SECONDS`.
+        ``deadline``, an event-loop time engine.stop() passes under its budget (BACKLOG #3191),
+        also ends each wait by then, keeping :data:`STOP_FLOOR_SECONDS` of it for the cancel's
+        wait, and never gives a wait less than that floor."""
+        loop = asyncio.get_running_loop()
+
+        def _bound(kept: float) -> float:
+            if deadline is None:
+                return _STOP_SECONDS
+            left = deadline - loop.time() - kept
+            return min(_STOP_SECONDS, max(STOP_FLOOR_SECONDS, left))
+
         self._stop.set()
         task, self._task = self._task, None
         if task is None:
@@ -161,6 +166,7 @@ class RemoteDebugRefusalWatch:
         # ``wait``, not ``wait_for``: a loop task that something else cancelled must not make
         # this call look cancelled, which would end the engine's stop before it closed the store.
         try:
+            wait = _bound(STOP_FLOOR_SECONDS)
             done, _pending = await asyncio.wait({task}, timeout=wait)
         except asyncio.CancelledError:
             task.cancel()
@@ -169,7 +175,7 @@ class RemoteDebugRefusalWatch:
             task.cancel()
             # Bounded too: a driver call can take as long to unwind a cancel as it took to hang,
             # and the engine's stop must still reach the store's close.
-            await asyncio.wait({task}, timeout=wait)
+            await asyncio.wait({task}, timeout=_bound(0.0))
             log.warning(
                 "remote-debug refusal watch: the last pass did not finish in %.2f s and was "
                 "cancelled, so a refusal since the pass before it may have no audit row",

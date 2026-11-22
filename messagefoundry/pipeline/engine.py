@@ -90,7 +90,7 @@ from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, RefusedBodyPolicy
-from messagefoundry.pipeline.remote_debug_watch import RemoteDebugRefusalWatch
+from messagefoundry.pipeline.remote_debug_watch import STOP_FLOOR_SECONDS, RemoteDebugRefusalWatch
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
@@ -190,8 +190,8 @@ class _StopBudget:
     remote-debug refusal watch's stop and the alert-state drain. With no budget each keeps its fixed
     bound. Under one, a wait gets the shorter of its fixed bound and what is left of the budget once
     the time kept for the steps after it is taken out, and never less than
-    :data:`_STOP_WAIT_FLOOR_SECONDS`. So a wait is shortened only when its fixed bound would run
-    into what the later steps are kept. A budgeted wait that runs out ends as it does at its fixed
+    :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is less. So a wait is shortened only
+    when its fixed bound would run into what the later steps are kept. A budgeted wait that runs out ends as it does at its fixed
     bound. The other stop steps are not budgeted, so they can still run past the budget."""
 
     def __init__(self, seconds: float | None) -> None:
@@ -203,7 +203,12 @@ class _StopBudget:
         if self._deadline is None:
             return fixed
         left = self._deadline - asyncio.get_running_loop().time() - kept
-        return max(_STOP_WAIT_FLOOR_SECONDS, min(fixed, left))
+        return min(fixed, max(_STOP_WAIT_FLOOR_SECONDS, left))
+
+    def deadline(self, *, kept: float) -> float | None:
+        """The event-loop time a wait that splits its own share must end by, with ``kept``
+        seconds held back for the steps after it; None with no budget."""
+        return None if self._deadline is None else self._deadline - kept
 
 
 #: How long a connection flag toggle waits for the lock, then again for the store (BACKLOG #2623). A
@@ -4258,11 +4263,18 @@ class Engine:
         self._stopping = True
         budget = _StopBudget(budget_seconds)
         # Kept back, at each budgeted wait, for the waits after it and the store's close: the
-        # budgeted ones at their floor, the late config-write drain at its fixed bound. The
-        # remote-debug watch's stop makes two waits, which share its one budgeted bound.
+        # budgeted ones at their floor, and the config-write drain at the bound it will use, or
+        # nothing when the gate is closed and no write is running. The remote-debug watch's stop
+        # makes two waits, each with its own floor.
+        if self._config_writes_closed and not self._config_writes:
+            config_kept = 0.0
+        elif self._config_writes_closed:
+            config_kept = _CONFIG_WRITE_LATE_DRAIN_SECONDS
+        else:
+            config_kept = _CONFIG_WRITE_DRAIN_SECONDS
         alert_kept = _STOP_CLOSE_ALLOWANCE_SECONDS
-        watch_kept = alert_kept + _STOP_WAIT_FLOOR_SECONDS + _CONFIG_WRITE_LATE_DRAIN_SECONDS
-        crl_kept = watch_kept + _STOP_WAIT_FLOOR_SECONDS
+        watch_kept = alert_kept + _STOP_WAIT_FLOOR_SECONDS + config_kept
+        crl_kept = watch_kept + 2 * STOP_FLOOR_SECONDS
         supervisor_kept = crl_kept + _STOP_WAIT_FLOOR_SECONDS
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
@@ -4353,9 +4365,7 @@ class Engine:
             # reported by the watch's last pass. That pass may write an audit row and raise an alert,
             # so it runs while the store is open, and ahead of the alert-state drain at the end.
             if self._remote_debug_watch is not None:
-                watch = self._remote_debug_watch
-                total = budget.wait(2 * watch.stop_seconds(), kept=watch_kept)
-                await watch.stop(timeout=total / 2)
+                await self._remote_debug_watch.stop(deadline=budget.deadline(kept=watch_kept))
                 self._remote_debug_watch = None
             # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
             # unused remainder of this process's reserved block and unhooks the refill signal, so anything
