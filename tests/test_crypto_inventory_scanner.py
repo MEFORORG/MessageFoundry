@@ -1323,6 +1323,17 @@ def test_the_plant_is_invisible_to_the_pre_2020_scanner(
     del patterns["suite"], patterns["cipher_string"], patterns["minDHSize"]
     patterns["ciphers"] = (re.compile(gate._B + r"ciphers\s*:" + gate._LIT), "tls_context")
     monkeypatch.setattr(gate, "NON_PYTHON_OPERATION_PATTERNS", patterns)
+    # The reconstruction has no ``suite`` pattern, so the lexer-verdict control's planted suite
+    # sources (BACKLOG #5578) are not part of it either.
+    monkeypatch.setattr(
+        gate,
+        "_VERDICT_SELF_TEST_OPERATIONS",
+        {
+            src: views
+            for src, views in gate._VERDICT_SELF_TEST_OPERATIONS.items()
+            if not any(t.startswith("tls_context:suite[") for t in views[0])
+        },
+    )
     rel = "ide/src/engineClient.ts"
     old_row = frozenset({"tls_context:minVersion", "tls_context:ciphers"})
     monkeypatch.setattr(gate, "NON_PYTHON_OPERATION_INVENTORY", {rel: old_row})
@@ -2001,3 +2012,316 @@ def test_an_out_of_scope_tls_value_is_still_marked() -> None:
             "tls_context:.verify_mode = CERT_NONE (out of scope)",
         }
     )
+
+
+# --- BACKLOG #5578 added items 2, 3, 6, 7 and 8 ------------------------------------------------------
+
+_HOOK_IMPORT = "    from messagefoundry.sec.impl import seal\n"
+
+
+def _hook_caller_tokens(init_source: str) -> frozenset[str]:
+    """The judged tokens of a caller that reaches ``sec.seal`` through ``init_source``."""
+    gate = _gate()
+    ops = gate.crypto_operations
+    sources = {
+        "messagefoundry/sec/__init__.py": init_source,
+        "messagefoundry/sec/impl.py": "import hashlib\n\n\ndef seal(b):\n    return hashlib.sha256(b)\n",
+        "messagefoundry/caller.py": "from messagefoundry import sec\n\n\ndef f(b):\n    return sec.seal(b)\n",
+    }
+    modules = ops.parse_sources(sources)
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert found["messagefoundry/caller.py"] == frozenset({"hash:via messagefoundry.sec.impl"})
+    judged: frozenset[str] = gate.judge_operations(modules, found)["messagefoundry/caller.py"]
+    return judged
+
+
+@pytest.mark.parametrize(
+    "init_source",
+    [
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    return seal\n", id="unguarded"
+        ),
+        pytest.param(
+            "def __getattr__(name):\n    if name == 'seal':\n    "
+            + _HOOK_IMPORT
+            + "        return seal\n    raise AttributeError(name)\n",
+            id="eq-seal-guard",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n    if name in ('seal', 'old'):\n    "
+            + _HOOK_IMPORT
+            + "        return seal\n    raise AttributeError(name)\n",
+            id="in-tuple-guard",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n    if name == 'a':\n        from messagefoundry.sec.impl"
+            " import a\n        return a\n" + _HOOK_IMPORT + "    return seal\n",
+            id="fall-through-after-another-names-return",
+        ),
+    ],
+)
+def test_a_pep562_hook_export_reaches_the_scope_aware_reading(init_source: str) -> None:
+    # Added item 3: an import a package's PEP 562 ``__getattr__`` serves was dropped from the
+    # scope-aware exports, so a genuine call through it was marked out of scope on origin/main.
+    assert _hook_caller_tokens(init_source) == frozenset({"hash:via messagefoundry.sec.impl"})
+
+
+_OUT = frozenset({"hash:via messagefoundry.sec.impl (out of scope)"})
+
+
+@pytest.mark.parametrize(
+    "init_source",
+    [
+        pytest.param(
+            "def __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    if name != 'legacy':\n        raise AttributeError(name)\n    return seal\n",
+            id="ne-legacy-raise",
+        ),
+        pytest.param("def __getattr__(*a):\n" + _HOOK_IMPORT + "    return seal\n", id="star-args"),
+        pytest.param(
+            "def __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    key = name.lower()\n    if key != 'legacy':\n        raise AttributeError(name)\n"
+            "    return seal\n",
+            id="key-from-param",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    _OK[name]\n    return seal\n",
+            id="subscript-lookup",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    v = seal\n    return v\n",
+            id="return-through-a-variable",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    match name:\n        case 'seal':\n            return seal\n",
+            id="return-under-match",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n    try:\n    "
+            + _HOOK_IMPORT
+            + "        return seal\n    except ImportError:\n        raise AttributeError(name)\n",
+            id="return-under-try",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    return wrap(seal)\n", id="wrapped"
+        ),
+        pytest.param(
+            "def __getattr__(name):\n    if name == 'x':\n    "
+            + _HOOK_IMPORT
+            + "        return seal\n    raise AttributeError(name)\n",
+            id="eq-other-name-guard",
+        ),
+        pytest.param(
+            "async def __getattr__(name):\n" + _HOOK_IMPORT + "    return seal\n", id="async"
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    yield seal\n    return seal\n",
+            id="generator",
+        ),
+        pytest.param(
+            "import functools\n\n\n@functools.cache\ndef __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    return seal\n",
+            id="decorated",
+        ),
+        pytest.param(
+            "if True:\n\n    def __getattr__(name):\n    " + _HOOK_IMPORT + "        return seal\n",
+            id="hook-under-an-if",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    return seal\n\n\n"
+            "def other(name):\n    raise AttributeError(name)\n\n\n__getattr__ = other\n",
+            id="hook-rebound-later",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    name = 'seal'\n    return seal\n",
+            id="param-reassigned",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n    if name == 'other':\n    "
+            + _HOOK_IMPORT
+            + "        raise AttributeError(name)\n    return seal\n",
+            id="import-in-a-sibling-branch",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    seal = other\n    return seal\n",
+            id="rebound-before-the-return",
+        ),
+        pytest.param(
+            "class C:\n    def __getattr__(self, name):\n    "
+            + _HOOK_IMPORT
+            + "        return seal\n",
+            id="class-level-getattr",
+        ),
+        pytest.param("def loader(name):\n" + _HOOK_IMPORT + "    return seal\n", id="not-the-hook"),
+        pytest.param(
+            "def seal(b):\n    return b\n\n\ndef __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    return seal\n",
+            id="module-level-def-of-the-name",
+        ),
+        pytest.param(
+            "seal = None\n\n\ndef __getattr__(name):\n" + _HOOK_IMPORT + "    return seal\n",
+            id="module-level-assignment-of-the-name",
+        ),
+        pytest.param(
+            "from messagefoundry.compat import *\n\n\ndef __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    return seal\n",
+            id="module-level-star-import",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    while True:\n        raise AttributeError\n    return seal\n",
+            id="raise-in-a-loop-before-the-return",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    abort()\n    return seal\n",
+            id="call-before-the-return",
+        ),
+    ],
+)
+def test_a_pep562_hook_shape_the_reading_does_not_follow_stays_out_of_scope(
+    init_source: str,
+) -> None:
+    # As on origin/main: every shape the hook reading does not follow exports nothing.
+    assert _hook_caller_tokens(init_source) == _OUT
+
+
+def test_a_long_elif_chain_in_a_pep562_hook_does_not_crash_the_reading() -> None:
+    arms = "".join(
+        f"    elif name == 'n{k}':\n        from x import n{k}\n        return n{k}\n"
+        for k in range(1500)
+    )
+    source = "def __getattr__(name):\n    if name == 'a':\n        raise AttributeError(name)\n"
+    init = (
+        source
+        + arms
+        + _HOOK_IMPORT.replace("    ", "    else:\n        ", 1)
+        + "        return seal\n"
+    )
+    assert _hook_caller_tokens(init) == frozenset({"hash:via messagefoundry.sec.impl"})
+
+
+@pytest.mark.parametrize(
+    ("text", "confirmed"),
+    [
+        pytest.param(
+            "const z = x! / y; const help = `\n * createHash('md5')\n`;\n",
+            False,
+            id="division-misread-swallows-a-templates-backtick",
+        ),
+        pytest.param("const d = x\n  * createHash('md5')\n", True, id="control-continuation-call"),
+        pytest.param(
+            "const t = `a\n * ${createHash('md5')}\n`;\n", False, id="control-call-in-a-hole"
+        ),
+        pytest.param(
+            "const t = `x ${\"}\"} y\n * createHash('md5')\n`;\n",
+            False,
+            id="control-mention-after-a-quoted-brace-in-a-hole",
+        ),
+    ],
+)
+def test_the_template_scan_can_only_withhold_a_verdict(text: str, confirmed: bool) -> None:
+    # Added item 2: a division read as an unclosed regex swallowed a template's opening backtick,
+    # so the template's later lines read as code and a mention there was confirmed on origin/main.
+    found, verified = _gate().non_python_operation_token_views(text)
+    token = "hash:createHash[md5]"
+    assert token in found
+    assert (token in verified) is confirmed, (found, verified)
+
+
+def test_strict_verdicts_confirm_only_what_both_scans_confirm() -> None:
+    from scripts.security import js_lexer
+
+    kinds = (js_lexer.CODE, js_lexer.LITERAL, js_lexer.CONTINUED, js_lexer.COMMENT)
+    for a in kinds:
+        for b in kinds:
+            got = js_lexer.strict_verdicts(a, b)
+            for accept in ((js_lexer.CODE,), (js_lexer.CODE, js_lexer.LITERAL)):
+                assert (got in accept) == (a in accept and b in accept), (a, b, got)
+
+
+def test_blank_js_comments_keeps_its_text() -> None:
+    # Added item 8: blank_js_comments no longer builds verdicts; its text is classify_js's.
+    from scripts.security import js_lexer
+
+    for text in (
+        "a = 'q' /* c */ + `t\n*` // d\n",
+        "const z = x! / y; const t = `\n// in\n`;\n",
+        "const t = `${a ? '`' : ''}`;\n// c\n",
+    ):
+        assert js_lexer.blank_js_comments(text) == js_lexer.classify_js(text)[0]
+
+
+def test_a_patched_weak_pattern_table_reaches_the_randomness_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Added item 6: the tables were merged once at import, so a patched table never reached the
+    # arm on origin/main.
+    gate = _gate()
+    monkeypatch.setattr(
+        gate, "WEAK_RANDOMNESS_PATTERNS", {"plantedDraw": re.compile(r"\bplantedDraw\(")}
+    )
+    repo = _ts_repo(tmp_path, {"ide/src/planted.ts": "const n = plantedDraw();\n"})
+    violations, _ = gate.check_non_python_randomness(repo)
+    assert any("WEAK randomness source ['plantedDraw']" in v for v in violations), violations
+
+
+def test_a_weak_draw_read_as_text_still_fails_and_names_the_reword_remedy(tmp_path: Path) -> None:
+    gate = _gate()
+    repo = _ts_repo(
+        tmp_path, {"ide/src/planted.ts": "export const help = `\n * never call Math.random()\n`;\n"}
+    )
+    weak = [v for v in gate.check_non_python_randomness(repo)[0] if "WEAK randomness" in v]
+    assert len(weak) == 1 and "Math.random (not code)" in weak[0] and "reword" in weak[0], weak
+    repo = _ts_repo(tmp_path / "b", {"ide/src/planted.ts": "const n = Math.random();\n"})
+    weak = [v for v in gate.check_non_python_randomness(repo)[0] if "WEAK randomness" in v]
+    assert len(weak) == 1 and "(not code)" not in weak[0] and "reword" not in weak[0], weak
+
+
+def test_the_lexer_verdict_positive_control_covers_the_in_literal_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Added item 7: no planted source exercised the suite/cipher-string path on origin/main.
+    gate = _gate()
+    assert gate.lexer_verdict_self_test("operations") == []
+    monkeypatch.setattr(gate, "_LITERAL_PATTERNS", frozenset())
+    assert gate.lexer_verdict_self_test("operations")
+
+
+def test_the_lexer_verdict_positive_control_reds_when_the_template_scan_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate()
+    real = gate.js_lexer.template_verdicts
+
+    def every_character_is_code(source: str) -> str:
+        return "".join(c if c == "\n" else gate.js_lexer.CODE for c in real(source))
+
+    monkeypatch.setattr(gate.js_lexer, "template_verdicts", every_character_is_code)
+    assert gate.lexer_verdict_self_test("randomness")
+    assert gate.lexer_verdict_self_test("operations")
+
+
+def test_list_operations_prints_each_sites_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Added item 7: --list-operations printed no verdict on origin/main.
+    gate = _gate()
+    package = tmp_path / "selftest"
+    package.mkdir()
+    (package / "scoped.py").write_text(
+        gate._SELF_TEST_SOURCES[gate._SELF_TEST_SCOPED_PATH], encoding="utf-8"
+    )
+    gate.main(["--package", str(package), "--list-operations"])
+    lines = capsys.readouterr().out.splitlines()
+    md5 = [line for line in lines if "(hashlib.md5)" in line]
+    sha1 = [line for line in lines if "(hashlib.sha1)" in line]
+    assert md5 and not md5[0].endswith(gate.OUT_OF_SCOPE), lines
+    assert sha1 and sha1[0].endswith(gate.OUT_OF_SCOPE), lines
