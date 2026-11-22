@@ -6787,13 +6787,9 @@ _SEAL_REFUSALS = [
         AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
         id="unverifiable",
     ),
-    pytest.param(
-        lambda _uid: TransitSealUnavailableError(),
-        "did not answer",
-        None,
-        id="outage",
-    ),
 ]
+#: An Outage at the write is not among them: it is raised to the reconcile loop, which stops the
+#: renames (vault BACKLOG #3069 item 1; the test after the outage-at-a-rename one).
 
 
 @pytest.mark.parametrize(("refusal", "phrase", "reported"), _SEAL_REFUSALS)
@@ -7021,16 +7017,16 @@ class _RevokedSink(LoggingAlertSink):
         self.revoked.append(name)
 
 
-@pytest.mark.parametrize("where", ["read", "write-then-read"])
+@pytest.mark.parametrize("where", ["read", "write"])
 async def test_an_outage_at_a_rename_stops_the_renames_and_keeps_the_revocation_alerts(
     where: str,
 ) -> None:
     """Vault BACKLOG #3069 item 1, Manager decisions 2026-11-22. An Outage at the first rename's
     read stops the rename loop, but the pass returns its plan, so ``bob``'s applied revocation
     still raises its ``ad_session_revoked`` alert, and the Outage is paged exactly once. With
-    ``write-then-read`` the first rename's write meets the Outage (note T2, which goes on) and the
-    second rename's read meets it again: still one page for the pass. RED when: the Outage raises
-    out of the pass (no plan, no alert), or one outage pages twice."""
+    ``write`` the first rename's write meets the Outage instead, and the loop stops the same way.
+    RED when: the Outage raises out of the pass (no plan, no alert), a rename after it is applied,
+    or it pages more than once."""
     from messagefoundry.api.app import _alert_reconcile_plan
 
     store, service, pages = await _renames_beside_a_revocation()
@@ -7041,15 +7037,13 @@ async def test_an_outage_at_a_rename_stops_the_renames_and_keeps_the_revocation_
 
         async def rename(user_id: str, username: str, **kwargs: Any) -> bool:
             renamed.append(username)
-            if where == "write-then-read" and len(renamed) == 1:
+            if where == "write" and len(renamed) == 1:
                 raise TransitSealUnavailableError()
             return await real_rename(user_id, username, **kwargs)
 
         async def verified(user: UserRecord | None) -> Any:
-            # One checked read is refused once the renames begin: the first rename's for
-            # ``read``, the second's (after the write met the outage) for ``write-then-read``.
-            due = renamed if where == "write-then-read" else [True]
-            if renaming and due and user is not None and not refused:
+            # With ``read``, the first checked read once the renames begin is refused.
+            if where == "read" and renaming and user is not None and not refused:
                 refused.append(user.id)
                 raise TransitSealUnavailableError()
             return await real_verified(user)
@@ -7069,7 +7063,8 @@ async def test_an_outage_at_a_rename_stops_the_renames_and_keeps_the_revocation_
 
         plan = await service.reconcile_directory_sessions()
 
-        assert refused, "no checked read met the outage"
+        assert refused or where == "write", "no checked read met the outage"
+        assert len(renamed) == (1 if where == "write" else 0), "a rename ran past the outage"
         assert plan.aborted is None
         assert [r.username for r in plan.revocations] == ["bob"]
         assert len(pages) == 1, f"one outage paged {len(pages)} times"
