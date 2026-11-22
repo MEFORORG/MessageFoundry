@@ -131,7 +131,9 @@ also scrubs the message time and the sending and receiving facility in the MSH h
 **What was deliberately preserved:** the five segments in order, their field counts, and the CRLF
 line endings with no final line ending. In the header, the sending and receiving applications, the
 message type, the control id and the version are kept. So are the identifiers' assigning
-authorities and type codes, and the coded procedure. The same limits as above apply.
+authorities and type codes. The procedure is kept on purpose: `PR1-3`, the code with its text,
+because ADR 0030 keeps the PR1 codes, and `PR1-4`, a free-text description, because its one
+generic word was reviewed and names no person, place or date. The same limits as above apply.
 
 **What the scrub changed beyond identifier values**, at least:
 
