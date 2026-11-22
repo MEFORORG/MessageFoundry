@@ -285,6 +285,41 @@ async def test_a_cancel_of_the_crl_runner_stop_caller_propagates() -> None:
         await asyncio.gather(pass_task, return_exceptions=True)
 
 
+async def test_a_cancel_of_engine_stop_during_the_crl_stop_still_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CRL runner now raises a cancel of its caller, and engine.stop() calls it before its
+    guarded teardown. The stop holds that cancel until the store has closed, then raises it."""
+    eng = await _engine(tmp_path)
+    release = asyncio.Event()
+    runner = CrlReloadRunner(stop_timeout_seconds=30.0)
+    pass_task = asyncio.ensure_future(_unwinds_slowly(release))
+    runner._task = pass_task
+    eng._crl_reload_runner = runner
+    closed: list[bool] = []
+    real_close = eng.store.close
+
+    async def _close() -> None:
+        closed.append(True)
+        await real_close()
+
+    monkeypatch.setattr(eng.store, "close", _close)
+    stopping = asyncio.ensure_future(eng.stop(budget_seconds=3.0))
+    try:
+        await _until_cancel_requested(pass_task)
+        await asyncio.sleep(0.05)
+        assert not stopping.done()
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        assert closed == [True]
+    finally:
+        release.set()
+        await asyncio.gather(pass_task, return_exceptions=True)
+        if not closed:
+            await real_close()
+
+
 async def test_the_crl_runner_stop_does_not_raise_its_own_cancel_of_the_pass() -> None:
     """The control: the stop's own cancel of a pass that outran the timeout is not raised, however
     long the cancel takes to land."""
@@ -328,12 +363,16 @@ async def test_the_watch_warning_says_a_pass_whose_cancel_landed_was_cancelled(
     task = asyncio.ensure_future(_hangs())
     watch._task = task
     deadline = remote_debug_watch.StopDeadline(asyncio.get_running_loop().time() + 0.3)
-    with caplog.at_level(logging.WARNING, logger=remote_debug_watch.__name__):
-        await watch.stop(deadline=deadline)
-    assert task.cancelled()
-    [record] = [r for r in caplog.records if "remote-debug refusal watch" in r.getMessage()]
-    assert "was cancelled" in record.getMessage()
-    assert "may still be running" not in record.getMessage()
+    try:
+        with caplog.at_level(logging.WARNING, logger=remote_debug_watch.__name__):
+            await watch.stop(deadline=deadline)
+        assert task.cancelled()
+        [record] = [r for r in caplog.records if "remote-debug refusal watch" in r.getMessage()]
+        assert "was cancelled" in record.getMessage()
+        assert "may still be running" not in record.getMessage()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_the_watch_deadline_and_the_crl_timeout_are_typed_apart() -> None:

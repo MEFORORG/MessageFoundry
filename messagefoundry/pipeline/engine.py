@@ -197,14 +197,14 @@ class _StopBudget:
     """What each of :meth:`Engine.stop`'s budgeted waits may spend (BACKLOG #3191).
 
     The budgeted waits are the CRL reload runner's stop, the remote-debug refusal watch's stop and
-    the alert-state drain. With no budget each keeps its fixed bound. Under one, a wait gets the shorter of its fixed bound and what is left of the budget once
-    the time kept for the steps after it is taken out, and never less than
-    :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is less. So a wait is shortened only
-    when its fixed bound would run into the time kept for the later steps. The budget ends the
-    wait, not what follows it: a wait that runs out does what it does at its fixed bound. The CRL
-    runner's wait then cancels the pass it waited for and waits for that cancel to land with no
-    bound, as before. The graph supervisor's wait and the other stop steps are not budgeted, so
-    they can still run past the budget."""
+    the alert-state drain. With no budget each keeps its fixed bound. Under one, a wait gets the
+    shorter of its fixed bound and what is left of the budget once the time kept for the steps after
+    it is taken out, and never less than :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is
+    less. So a wait is shortened only when its fixed bound would run into the time kept for the
+    later steps. The budget ends the wait, not what follows it: a wait that runs out does what it
+    does at its fixed bound. The CRL runner's wait then cancels the pass it waited for and waits for
+    that cancel to land with no bound, as before. The graph supervisor's wait and the other stop
+    steps are not budgeted, so they can still run past the budget."""
 
     def __init__(self, seconds: float | None) -> None:
         self._deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
@@ -4315,9 +4315,15 @@ class Engine:
             await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
             await self._cert_expiry_runner.stop()
+        crl_cancelled = False
         if self._crl_reload_runner is not None:
             crl = self._crl_reload_runner
-            await crl.stop(timeout=budget.wait(crl.stop_timeout_seconds, kept=crl_kept))
+            try:
+                await crl.stop(timeout=budget.wait(crl.stop_timeout_seconds, kept=crl_kept))
+            except asyncio.CancelledError:
+                # The runner cancels its pass and raises a cancel of this stop. Held, as the
+                # monitor's is below, so the graph still stops and the store closes.
+                crl_cancelled = True
             self._crl_reload_runner = None
         if self._log_forward_watch is not None:
             await self._log_forward_watch.stop()
@@ -4361,7 +4367,7 @@ class Engine:
         # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
         # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
         # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
-        cancelled = monitor_cancelled
+        cancelled = monitor_cancelled or crl_cancelled
         failure: BaseException | None = None
         try:
             # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
