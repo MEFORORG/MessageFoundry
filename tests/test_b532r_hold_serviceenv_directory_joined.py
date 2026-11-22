@@ -55,14 +55,15 @@ def _read(entries: list[str]) -> ServiceEnvPosture:
 
 _REWRITE = (
     "At least one string in the service's lists sets MEFOR_SECRETS_DIRECTORY on its first "
-    "non-blank line and is read here as part of the empty value of the variable in the string "
+    "non-blank line and is read here as part of the empty value of a variable in a string "
     "above it. NSSM may instead read it as a variable of its own, so this reading does not take "
     "it as naming the secrets directory. Remove each such string, whatever it holds, since it "
     "may hold that value, and do not keep it as the directory's entry. Where the service has a "
     "secrets directory, or a step below puts a setting in one, the lists must then hold exactly "
     "one MEFOR_SECRETS_DIRECTORY entry, written as MEFOR_SECRETS_DIRECTORY=<path> on its own, "
     "naming the secrets directory by its path: where the strings removed leave none, write it "
-    "again among the entries you pass back, and where they leave more than one, remove the rest, "
+    "again in AppEnvironmentExtra, beside its other entries, and where they leave more than one, "
+    "remove the rest, "
     "before any re-run of the installer"
 )
 _PASS_BACK = (

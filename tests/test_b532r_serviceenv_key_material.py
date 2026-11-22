@@ -227,8 +227,8 @@ def test_a_joined_directory_string_keeps_the_create_or_add_back_guidance() -> No
     assert refusal is not None and posture.directory_joined
     _assert_written_again(refusal)
     assert (
-        "where the strings removed leave none, write it again among the entries you pass back"
-        in refusal
+        "where the strings removed leave none, write it again in AppEnvironmentExtra, beside its "
+        "other entries" in refusal
     )
     assert "where they leave more than one, remove the rest" in refusal
     assert _CREATE in refusal
@@ -249,6 +249,18 @@ def test_a_directory_string_joined_past_a_name_alone_beside_a_secret_is_not_set_
     refusal = service_env_refusal(posture)
     assert refusal is not None and posture.directory_joined
     _assert_written_again(refusal)
+
+
+def test_a_directory_set_first_in_a_joined_groups_first_string_is_not_joined() -> None:
+    """Only a string after the first of a joined group is joined into a value above it. A
+    directory set on the first line of the group's own first string is the service's entry,
+    and the refusal must not say to remove it (H3)."""
+    posture = _read(["MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD=", "abc"])
+    assert posture.value_runs_on and not posture.directory_joined
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert _REWRITE not in refusal
 
 
 @pytest.mark.parametrize("prefix", ["", "MEFOR_AI_ENVIRONMENT=prod\n"], ids=["line", "later-line"])

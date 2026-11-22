@@ -165,7 +165,7 @@ class ServiceEnvPosture:
     #: its registry value, so the refusal can say to remove those strings too.
     value_runs_on: bool = False
     #: Whether a string joined into a value above it sets ``MEFOR_SECRETS_DIRECTORY`` on its first
-    #: line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether or not
+    #: non-blank line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether or not
     #: :func:`_names` keeps the variable it was joined to.
     #: NSSM may read that string as its own variable, so the refusal must not say the lists set no
     #: secrets directory. It may also hold the value, so wherever the remedy touches the lists'
@@ -873,7 +873,7 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         # ``\r\n`` between strings: a string ending in a lone ``\r`` then still ends a line of
         # its own, so each line keeps the number ``starts`` gives it.
         joined, _ends = _read_string(where, "\r\n".join(strings), own_lines=starts[1] - 1)
-        # Every string after the first is read into a value above it, so one that sets the
+        # Every string after the first is joined to a value above it, so one that sets the
         # directory first is a joined directory string, whichever variable's value took it: a
         # name written alone between them may carry the join on (Lander's hold on PR 3142, H3).
         holds = any(_sets_directory_first(string) for string in strings[1:])
@@ -1141,15 +1141,15 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     if posture.directory_joined and (posture.value_runs_on or others or values):
         steps.append(
             f"At least one string in the service's lists sets {_DIRECTORY_VARIABLE} on its first "
-            "non-blank line and is read here as part of the empty value of the variable in the "
+            "non-blank line and is read here as part of the empty value of a variable in a "
             "string above it. NSSM may instead read it as a variable of its own, so this reading "
             "does not take it as naming the secrets directory. Remove each such string, whatever "
             "it holds, since it may hold that value, and do not keep it as the directory's entry. "
             "Where the service has a secrets directory, or a step below puts a setting in one, "
             f"the lists must then hold exactly one {_DIRECTORY_VARIABLE} entry, written as "
             f"{_DIRECTORY_VARIABLE}=<path> on its own, naming the secrets directory by its path: "
-            "where the strings removed leave none, write it again among the entries you pass "
-            "back, and where they leave more than one, remove the rest, before any re-run of the "
+            "where the strings removed leave none, write it again in AppEnvironmentExtra, beside "
+            "its other entries, and where they leave more than one, remove the rest, before any re-run of the "
             "installer, which refuses an existing directory the service does not name. `nssm "
             "set` replaces a whole list, so read it first with `nssm get`, running the service's "
             "own nssm.exe by its full path, and pass back every entry but those refused above "
@@ -1213,7 +1213,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         steps.append(f"{step}. {cite}")
         if _DIRECTORY_VARIABLE not in posture.listed and not posture.directory_joined:
             # A joined directory string is covered by its own step above, which says to remove it
-            # and write the directory's entry again, so this step would only repeat it.
+            # and write the directory's entry again in AppEnvironmentExtra, so this step would only
+            # repeat it.
             # Two routes, because install-service.ps1 refuses an existing directory the service
             # does not name: an operator whose later `nssm set` dropped the variable must not be
             # sent to the installer, which would say to remove the directory holding the files.
