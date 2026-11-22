@@ -684,8 +684,8 @@ becomes the bottleneck.
   database. A config-only pass with no config file to archive, such as one over an empty config dir, fails instead of writing an archive, so that pass does not take the retention slot of a good one; on a PostgreSQL or SQL Server store, `[backup].enabled = true` with `[backup].config_only_on_server_db = true` and `[backup].include_config = false` is refused when the settings load ([`CONFIGURATION.md`](CONFIGURATION.md) `[backup]` lists at least what each refuses).
 
 **Restore an archive.** `messagefoundry restore <archive> --to <new store path>` verifies the archive,
-decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal` /
-`-shm` sidecar) — point `--to` at a clean path and move the old store aside yourself. Add
+decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal`,
+`-shm` or `-journal` sidecar) — point `--to` at a clean path and move the old store aside yourself. Add
 `--config-to <dir>` to restore the config bundle alongside it. A config-only archive carries no store,
 so restore its config bundle with `messagefoundry restore <archive> --config-to <dir>` and no `--to`;
 an archive that carries a store is refused that way. Check the archive without writing anything
