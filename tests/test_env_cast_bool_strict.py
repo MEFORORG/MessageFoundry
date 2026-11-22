@@ -82,7 +82,9 @@ def test_an_env_ref_built_directly_with_the_builtin_bool_is_held_to_the_same_rea
 
 
 def test_a_cast_other_than_the_builtin_bool_is_left_alone() -> None:
-    assert env("port", cast=int).cast is int
+    # The builtin int is swapped too, for its own strict cast (vault BACKLOG #1650,
+    # tests/test_env_cast_int_strict.py); float and a callable of the author's own stay as given.
+    assert env("rate", cast=float).cast is float
     assert env("host").cast is None
 
 

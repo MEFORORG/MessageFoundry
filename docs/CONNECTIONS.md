@@ -163,8 +163,8 @@ transport = "mllp"
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
   digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
-  #1650). That read sees what a `cast` left, so `cast = "int"` has already read `true` as 1 and cut
-  a fraction. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
+  #1650). That read sees what a `cast` left, so `cast = "int"` is strict too: it refuses a bool and
+  a number that is not whole, where the builtin `int` read `true` as 1 and cut a fraction. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin
   of `6661` (BACKLOG #5915). `allowed_db` also compares the SQL Server preset's `port` setting as
   a number when its check runs, but on `dialect="generic"` it refuses a `PORT` keyword with a
