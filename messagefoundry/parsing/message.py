@@ -509,10 +509,7 @@ class Message:
 
         ``occurrence`` (1-based) removes only that one segment instead, numbered as :meth:`field`
         and :meth:`count_segments` number it, so a fieldless bare line is no occurrence. It returns
-        1, or 0 when that occurrence is absent. Every other segment keeps its fields and its place,
-        so dropping one ``OBX`` leaves its siblings under the ``OBR`` they came with. Walk a
-        :meth:`count_segments` loop back to front when deleting, so no occurrence still to visit
-        shifts."""
+        1, or 0 when that occurrence is absent, and leaves every other segment as it was."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
         if occurrence is not None:
@@ -521,8 +518,7 @@ class Message:
             position = _builtin_hl7.segment_index(self._m, segment_id, occurrence)
             if position is None:
                 return 0
-            self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
-            _builtin_hl7.delete_segment_at(self._m, position)
+            self._delete_segment_at(position)
             return 1
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         removed = 0

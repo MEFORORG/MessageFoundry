@@ -21,7 +21,7 @@ names/endpoints (via `env()`), the real code sets, and the real transform.
 | **Repeating fields** | `repetitions("PID-3")` + `field(..., repetition=k)` to find the MR identifier; whole-field write to collapse the list |
 | **Repeating segments** | `count_segments("OBX")` + `field(..., occurrence=i)` to read each OBX, walked back to front; `delete_segments("OBX", occurrence=i)` drops a cancelled one and `set("OBX-3.1", ..., occurrence=i)` remaps a code in place, so every other field, component, escape and the OBX-to-OBR grouping survive; `groups("OBR")` renumbers OBX-1 within each order |
 | Fan-out | handler returns a list of `Send`s (EHR + file archive) |
-| Separators | read from MSH-1/MSH-2 (`_separators`), never hardcoded |
+| Separators | never needed: every edit goes through the parsed model, so no delimiter is hardcoded or joined by hand |
 
 ## Run / verify
 
