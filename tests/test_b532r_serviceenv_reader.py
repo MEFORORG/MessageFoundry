@@ -412,7 +412,7 @@ def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_abo
     posture = _read(posture_items)
     assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
     # A secret of its own makes the refusal speak; the remedy then reads the directory as set.
-    # Without the directory item, the same refusal says the lists set none: the control.
+    # Without the directory item, the same refusal says no entry names it: the control.
     secret = "MEFOR_AUTH_OIDC_CLIENT_SECRET=synthetic"
     refusal = service_env_refusal(_read([*posture_items, secret]))
     assert refusal is not None

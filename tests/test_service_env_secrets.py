@@ -614,19 +614,26 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
     assert refusal is not None and NO_DIRECTORY not in refusal
 
 
-def test_the_missing_directory_hint_names_no_list_string_or_command() -> None:
-    """The installer refuses an existing directory the service does not name, so the hint sends
-    nobody to a re-run. The remedy says what to remove and points at SERVICE.md for how, and
-    where none exists, how the directory is made. It names no list, registry string or `nssm`
-    command, since which of those applies depends on the host (the Lander's third hold on PR
-    3142, H1)."""
-    refusal = service_env_refusal(_service(["MEFOR_STORE_PASSWORD=x"]))
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ["MEFOR_STORE_PASSWORD=x"],
+        [f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"],
+        ["MEFOR_VALUE_PARTNER_HOST=example.test"],
+        ["MEFOR_STORE_ENCRYPTION_KEY=", "abc==", "MEFOR_AUTH_AD_BIND_PASSWORD=x"],
+    ],
+)
+def test_the_remedy_names_no_list_string_or_command(entries: list[str]) -> None:
+    """The installer refuses an existing directory the service does not name, so the remedy
+    sends nobody to a re-run. It says what to remove and points at SERVICE.md. It names no
+    list, registry string or `nssm` command, since which of those applies depends on the host
+    (the Lander's third hold on PR 3142, H1)."""
+    refusal = service_env_refusal(_service(entries))
     assert refusal is not None
-    assert REMOVE in refusal and NO_DIRECTORY in refusal
     remedy = refusal.split("each value refused here. ", 1)[1]
     assert remedy.startswith(REMOVE)
-    for named in ("AppEnvironment", "nssm", "registry string", "install-service.ps1"):
-        assert named not in remedy, named
+    for named in ("appenvironment", "nssm", "string", "install-service.ps1"):
+        assert named not in remedy.lower(), named
 
 
 def test_a_store_key_and_another_secret_in_the_nssm_list_name_both_remedies() -> None:

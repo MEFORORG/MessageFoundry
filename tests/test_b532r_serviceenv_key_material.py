@@ -198,8 +198,10 @@ def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directo
     secret the directory takes, with no entry read as naming it, it says how one is created."""
     key_alone = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
     assert key_alone is not None
-    assert "DPAPI-protected key file" in key_alone
-    assert NO_DIRECTORY not in key_alone
+    remedy = key_alone.split("each value refused here. ", 1)[1]
+    # Nothing says to keep the joined string, or names the directory at all (second hold, H3).
+    assert remedy.startswith(f"{REMOVE}. {RUNS_ON}. Keep the store key in a DPAPI-protected")
+    assert "MEFOR_SECRETS_DIRECTORY" not in remedy
     beside = service_env_refusal(
         _read([f"{_KEY}=", _DIRECTORY_KEY, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
     )
@@ -225,6 +227,7 @@ def test_a_directory_set_first_in_the_strings_own_first_line_is_left_named() -> 
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert REMOVE in refusal and RUNS_ON in refusal and NO_DIRECTORY not in refusal
+    assert "string" not in refusal.split("each value refused here. ", 1)[1]
 
 
 @pytest.mark.parametrize("prefix", ["", "MEFOR_AI_ENVIRONMENT=prod\n"], ids=["line", "later-line"])

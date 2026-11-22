@@ -1100,16 +1100,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     # Only what is true whatever the lists hold: the variables, that they go, and the doc that
     # says how, naming no list, string or command (the Lander's third hold on PR 3142, H1).
     steps = [
-        "Remove each refused variable, with its value, from the service's environment, leaving "
-        f"exactly one {_DIRECTORY_VARIABLE} entry, written as {_DIRECTORY_VARIABLE}=<path> on "
-        "its own, where the service has a secrets directory. docs/SERVICE.md, "
-        '"Start / stop / status", says how to change that environment'
+        "Remove each refused variable, with its value, from the service's environment. See "
+        'docs/SERVICE.md, "Start / stop / status"'
     ]
     if posture.value_runs_on:
         # Removing the name alone would leave the value, which then refuses nothing.
         steps.append(
-            "The value of at least one of them runs on into the entries after it, so remove "
-            "those with it, or the value stays in the registry key"
+            "At least one refused variable's value runs on past its own entry, so remove the "
+            "entries it runs on into with it, or the value stays in the registry key"
         )
     if keys:
         steps.append(
@@ -1165,13 +1163,12 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             cite += ' and "[environments]"'
         steps.append(f"{step}. {cite}")
         if _DIRECTORY_VARIABLE not in posture.listed:
-            # Only where a setting goes to the directory and no entry is read as naming it, so
-            # a refusal about a store key alone sends the operator nowhere near one (H2).
+            # Only where a setting goes to the directory and no entry is read as naming it (H2).
             steps.append(
                 f"No {_DIRECTORY_VARIABLE} entry is read here as naming the secrets directory. "
-                'Where none exists yet, the bullet "The other secrets: a secrets directory" '
-                'under docs/SERVICE.md, "Protect the store encryption key at rest", says how the '
-                "directory is created"
+                'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
+                'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
+                "says how it is created"
             )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value refused "

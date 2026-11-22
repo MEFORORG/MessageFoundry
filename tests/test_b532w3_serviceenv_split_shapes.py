@@ -336,7 +336,7 @@ def test_an_ordinary_comma_led_value_on_a_later_line_is_still_its_own_variable()
 def test_an_empty_directory_above_an_ordinary_line_still_reads_as_unset(line: str) -> None:
     """A regression an earlier repair of this item made: the directory's name is no secret, so
     a later line ends its empty value under the plain line rule, and the remedy still
-    says the lists set no directory."""
+    says no entry names the directory."""
     posture = _read([f"MEFOR_SECRETS_DIRECTORY=\n{line}", "MEFOR_VALUE_A=1"])
     assert posture.listed == ("MEFOR_VALUE_A",), line
     refusal = service_env_refusal(posture)
