@@ -486,6 +486,33 @@ function Get-PoolEpoch {
 # Git-derived facts. Every one is a fact with a time, never a verdict.
 # ---------------------------------------------------------------------------------------------
 
+function Read-GitStatusZ {
+    # `git status --porcelain -z`, verbatim, or $null when git failed. NEVER throws, like Invoke-Git.
+    # A Process rather than `& git` because -z paths are raw UTF-8, and `&` would decode them with
+    # the console's code page and record a non-ASCII name as mojibake.
+    param([string]$Dir)
+    $proc = $null
+    try {
+        # Resolved through PATH first: a bare 'git' here would let CreateProcess search the current
+        # directory, so a git.exe in the worktree being recorded could run.
+        $gitExe = (Get-Command git -CommandType Application -EA Stop | Select-Object -First 1).Source
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($gitExe)
+        foreach ($a in @('-C', $Dir, 'status', '--porcelain', '-z')) { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        # Drained asynchronously so a full stderr pipe cannot deadlock the stdout read.
+        $proc.BeginErrorReadLine()
+        $out = $proc.StandardOutput.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { return $null }
+        return $out
+    } catch { return $null }
+    finally { if ($proc) { $proc.Dispose() } }
+}
+
 function Get-GitFacts {
     param([string]$Wt)
 
@@ -527,11 +554,21 @@ function Get-GitFacts {
     # than reporting the gap.
     $trackedPaths = @()
     $untrackedPaths = @()
-    $st = Invoke-Git -Dir $Wt -GitArgs @('status', '--porcelain')
+    #
+    # NOT THROUGH Invoke-Git, whose Trim would eat the leading space of a first ` M` entry and shift
+    # the column-3 slice one character into the path (BACKLOG #5874). -z also gives each path
+    # unquoted, so a space or a non-ASCII letter is recorded as the file's real name.
+    $st = Read-GitStatusZ -Dir $Wt
     if ($st) {
-        foreach ($line in ($st -split "`n" | Where-Object { $_ })) {
-            $p = $line.Substring(3)
-            if ($line.StartsWith('??')) { $untrackedPaths += $p } else { $trackedPaths += $p }
+        $entries = $st.Split([char]0)
+        for ($i = 0; $i -lt $entries.Count; $i++) {
+            $entry = $entries[$i]
+            if ($entry.Length -lt 4) { continue }
+            $p = $entry.Substring(3)
+            if ($entry.StartsWith('??')) { $untrackedPaths += $p } else { $trackedPaths += $p }
+            # A rename or copy is `XY new`, then its source as a token of its own. One change, so
+            # one path: the new name, which is where the content now is.
+            if ($entry.Substring(0, 2) -cmatch '[RC]') { $i++ }
         }
     }
 
@@ -574,19 +611,41 @@ function Get-GitFacts {
 # So every claim and allocation carries an ATTRIBUTION rather than being silently included or
 # silently dropped. Dropping would be worse: an inherited allocation still sits in this worktree and
 # a human may still need to deal with it. The reader renders the two groups separately.
+#
+# STAMPS STAY TYPED UNTIL THEY ARE COMPARED (BACKLOG #5875). ConvertFrom-Json turns an ISO stamp into
+# a [datetime] whose Kind holds the zone, and a [string] cast then drops it: a UTC wall clock came
+# back as local time, hours off. -DateKind String would avoid that but needs pwsh 7.5, and on an
+# older one the readers' `catch { continue }` would silently drop every record, so this reads the
+# Kind instead, which works on any version.
+function ConvertTo-StampInstant {
+    # The instant a stamp names, or $null when it names none. A stamp with no zone is $null rather
+    # than assumed local, because the shared root is read from PCs in different zones.
+    param($Value)
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return $null }
+        return [DateTimeOffset]::new($Value.ToUniversalTime())
+    }
+    $text = [string]$Value
+    if ($text -notmatch '(Z|[+-]\d{2}:?\d{2})\s*\z') { return $null }
+    $parsed = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($text, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        return $parsed
+    }
+    return $null
+}
+
 function Get-Attribution {
-    param([string]$At, [string]$EpisodeStart)
-    if (-not $At -or -not $EpisodeStart) { return 'unknown' }
-    try {
-        if ([DateTimeOffset]::Parse($At).ToUniversalTime() -ge [DateTimeOffset]::Parse($EpisodeStart).ToUniversalTime()) {
-            return 'this-episode'
-        }
-        return 'worktree-inherited'
-    } catch { return 'unknown' }
+    # Deliberately untyped: a [string] parameter would coerce a [datetime] before this body runs.
+    param($At, $EpisodeStart)
+    $atInstant = ConvertTo-StampInstant $At
+    $startInstant = ConvertTo-StampInstant $EpisodeStart
+    if ($null -eq $atInstant -or $null -eq $startInstant) { return 'unknown' }
+    if ($atInstant -ge $startInstant) { return 'this-episode' }
+    return 'worktree-inherited'
 }
 
 function Get-ClaimsFor {
-    param([string]$Dir, [string]$Wt, [string]$EpisodeStart)
+    param([string]$Dir, [string]$Wt, $EpisodeStart)
     # Claims are claim.ps1's to write. This reads them and attributes by holder worktree only.
     $out = @()
     if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return $out }
@@ -607,8 +666,9 @@ function Get-ClaimsFor {
         $hnorm = $holder.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
         if ($hnorm -ne $norm) { continue }
         $at = $null
-        foreach ($n in @('claimedAt', 'at', 'created')) {
-            if ($j.PSObject.Properties.Name -contains $n) { $at = [string]$j.$n; break }
+        # `claimed` is the field claim.ps1 writes; the others are older or foreign shapes.
+        foreach ($n in @('claimed', 'claimedAt', 'at', 'created')) {
+            if ($j.PSObject.Properties.Name -contains $n) { $at = $j.$n; break }
         }
         $out += [ordered]@{
             key         = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
@@ -620,7 +680,7 @@ function Get-ClaimsFor {
 }
 
 function Get-AllocationsFor {
-    param([string]$Dir, [string]$Wt, [string]$EpisodeStart)
+    param([string]$Dir, [string]$Wt, $EpisodeStart)
     $out = @()
     if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return $out }
     $dir = $Dir
@@ -638,7 +698,7 @@ function Get-AllocationsFor {
             if ((($aw.TrimEnd('\', '/').ToLowerInvariant()) -replace '/', '\') -ne $norm) { continue }
             $at = $null
             foreach ($n in @('claimed', 'allocatedAt', 'at')) {
-                if ($j.PSObject.Properties.Name -contains $n) { $at = [string]$j.$n; break }
+                if ($j.PSObject.Properties.Name -contains $n) { $at = $j.$n; break }
             }
             $out += [ordered]@{
                 kind          = $kindDir.Name
@@ -1225,11 +1285,20 @@ try {
 
     # Resolved ONCE, before the record is built, so the record and the warning cannot disagree.
     # Whichever label this invocation is actually about: a declaration wins, a derived label fills a
-    # vacuum, and on a plain -Record pass there is no new label and the verdict is 'none'.
+    # vacuum, and on a plain -Record pass there is no new label, so the prior verdict is carried
+    # (BACKLOG #5876). `seat` itself is carried on that same condition, so the two stay paired.
+    #
+    # CARRIED, NOT RE-RESOLVED, because the resolver's objection would print on every hook pass. The
+    # cost: a carried verdict is the roster's answer WHEN THE LABEL WAS RESOLVED, and it goes stale
+    # if the roster changes afterwards, until the seat next declares.
     $labelUnderTest = if ($Declare -and $Seat) { $Seat }
                       elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { $DerivedSeat }
                       else { $null }
     $seatRoster = Resolve-SeatAgainstRoster -Label $labelUnderTest
+    if (-not $labelUnderTest) {
+        $seatRoster.Canonical = Prior 'seatCanonical' $seatRoster.Canonical
+        $seatRoster.Verdict = Prior 'seatRosterVerdict' $seatRoster.Verdict
+    }
 
     # Capped by the COLLAPSED length (BACKLOG #5764): the raw length overran a collapsed string.
     $collapsedNotes = if ($Notes) { $Notes -replace '\s+', ' ' } else { '' }
@@ -1261,18 +1330,16 @@ try {
         configRootLabel  = $cr.Label
         configRootSource = $cr.Source
         poolEpoch        = Get-PoolEpoch -SeatsDir $script:SeatsDir
-        # The roster's verdict on whatever label this invocation recorded. ADDITIVE: `seat` below
-        # still carries the verbatim label, because every existing reader keys on it.
+        # The roster's verdict on the label in `seat`, as of when that label was resolved. ADDITIVE:
+        # `seat` below still carries the verbatim label, because every existing reader keys on it.
         seatCanonical     = $seatRoster.Canonical
         seatRosterVerdict = $seatRoster.Verdict
         # A DERIVED label never overwrites a DECLARED one, and never claims to be one. The order
         # here is the whole rule: declared wins, derived fills only a vacuum, prior survives both.
-        seat             = if ($Declare -and $Seat) { $Seat }
-                           elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { $DerivedSeat }
-                           else { Prior 'seat' $null }
-        seatSource       = if ($Declare -and $Seat) { 'declared' }
-                           elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { 'derived:caller' }
-                           else { Prior 'seatSource' $null }
+        seat             = if ($labelUnderTest) { $labelUnderTest } else { Prior 'seat' $null }
+        seatSource       = if (-not $labelUnderTest) { Prior 'seatSource' $null }
+                           elseif ($Declare -and $Seat) { 'declared' }
+                           else { 'derived:caller' }
         # Only a declaration is dated as one. A derived seat leaves this null on purpose, so
         # "somebody said what this seat is for" stays answerable from the record alone.
         declaredAt       = if ($Declare -and $Seat) { $now } else { Prior 'declaredAt' $null }
