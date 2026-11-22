@@ -4,8 +4,9 @@
 (vault BACKLOG #5394), whether or not the variable it is joined to is refused.
 
 The join stays: the string still continues the empty value, and every input that refused before
-still refuses. What changes is the remedy, which must neither tell the operator to remove the
-directory's entry with a run-on value, nor say the lists set no secrets directory. An OIDC key
+still refuses. What changes is the remedy, which must not say the lists set no secrets directory.
+Since the Lander's second hold on PR 3142 (H3) it says to remove the joined string, whatever it
+holds, since it may hold the value, and to write the directory's entry again on its own. An OIDC key
 empty on its own line was once dropped by ``_names`` as a path when it ran on; it is now kept
 (round-2 finding 1), and the remedy pins that relied on the drop build the posture directly.
 Synthetic values only.
@@ -52,15 +53,15 @@ def _read(entries: list[str]) -> ServiceEnvPosture:
     return _read_pairs([(_EXTRA, e) for e in entries])
 
 
-_KEEP = (
+_REWRITE = (
     "At least one string in the service's lists sets MEFOR_SECRETS_DIRECTORY on its first "
     "non-blank line and is read here as part of the empty value of the variable in the string "
     "above it. NSSM may instead read it as a variable of its own, so this reading does not take "
-    "it as naming "
-    "the secrets directory. Keep one MEFOR_SECRETS_DIRECTORY entry in the service's lists, "
-    "written as MEFOR_SECRETS_DIRECTORY=<path> naming the secrets directory by its path, and "
-    "remove any other entry that sets MEFOR_SECRETS_DIRECTORY, before any re-run of the "
-    "installer"
+    "it as naming the secrets directory. Remove each such string, whatever it holds, since it "
+    "may hold that value, and do not keep it as the directory's entry. The lists must then hold "
+    "exactly one MEFOR_SECRETS_DIRECTORY entry, written as MEFOR_SECRETS_DIRECTORY=<path> on its "
+    "own, naming the secrets directory by its path: write it again where a removed string was "
+    "the only one, before any re-run of the installer"
 )
 _PASS_BACK = (
     "and pass back every entry but those refused above and the strings this step and any step "
@@ -69,36 +70,34 @@ _PASS_BACK = (
 _NO_DIRECTORY = "The service's lists set no MEFOR_SECRETS_DIRECTORY"
 _ADD_BACK = "add MEFOR_SECRETS_DIRECTORY naming that existing path back"
 _REMOVE_ALL = "so remove those strings with it, or the value stays"
-_KEEPS_ONE = (
-    "The value stays in the registry key until those strings are removed, so remove each of "
-    "them, but for any that sets MEFOR_SECRETS_DIRECTORY, which the next step covers"
-)
+_KEPT = "Keep one MEFOR_SECRETS_DIRECTORY entry"
+_SPARED = "but for any that sets MEFOR_SECRETS_DIRECTORY"
 
 
-def _assert_kept_once(refusal: str) -> None:
-    assert _KEEP in refusal
-    assert refusal.count("Keep one MEFOR_SECRETS_DIRECTORY entry") == 1
-    keep_at = refusal.index(_KEEP)
-    assert _PASS_BACK in refusal[keep_at:]
+def _assert_rewritten_once(refusal: str) -> None:
+    """One directory step, which never says to keep or spare the joined string."""
+    assert refusal.count(_REWRITE) == 1
+    rewrite_at = refusal.index(_REWRITE)
+    assert _PASS_BACK in refusal[rewrite_at:]
     assert _NO_DIRECTORY not in refusal
     assert _ADD_BACK not in refusal
-    assert _REMOVE_ALL not in refusal
+    assert _KEPT not in refusal and _SPARED not in refusal
 
 
 @pytest.mark.parametrize("directory", ["MEFOR_SECRETS_DIRECTORY==", "mefor_secrets_directory =="])
 @pytest.mark.parametrize("refused", [f"{KEY_CLASS_NAMES[0]}=", "MEFOR_VALUE_A="])
-def test_a_joined_directory_entry_is_kept_by_the_remedy(refused: str, directory: str) -> None:
+def test_a_joined_directory_entry_is_written_again(refused: str, directory: str) -> None:
     posture = _read([refused, directory])
     refusal = service_env_refusal(posture)
     assert refusal is not None  # the join is not narrowed: this still refuses
     assert posture.value_runs_on and posture.directory_joined
-    _assert_kept_once(refusal)
-    # The run-on step names its exception in the same sentence, ahead of the step that keeps it.
-    assert _KEEPS_ONE in refusal
-    assert refusal.index(_KEEPS_ONE) < refusal.index(_KEEP)
+    _assert_rewritten_once(refusal)
+    # The run-on step removes every string it runs on into, directory strings among them.
+    assert _REMOVE_ALL in refusal
+    assert refusal.index(_REMOVE_ALL) < refusal.index(_REWRITE)
 
 
-def test_a_directory_set_elsewhere_too_is_kept_once() -> None:
+def test_a_directory_set_elsewhere_too_is_written_once() -> None:
     posture = _read_pairs(
         [
             (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\synthetic-secrets"),
@@ -109,14 +108,14 @@ def test_a_directory_set_elsewhere_too_is_kept_once() -> None:
     refusal = service_env_refusal(posture)
     assert refusal is not None and posture.directory_joined
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
-    _assert_kept_once(refusal)
+    _assert_rewritten_once(refusal)
 
 
 def test_a_directory_joined_to_an_empty_pem_key_still_counts_as_set() -> None:
     """The Lander's input on 88a9f83: the directory string joined to an OIDC key is still an item
     NSSM may read as the directory. So the lists do set it, and the remedy must not say they set
     none or to add it back. The key, empty on its own line, now refuses and runs on (round-2
-    finding 1), so the run-on step carries the directory's exception."""
+    finding 1), so the run-on step removes the directory string with it."""
     posture = _read_pairs(
         [
             (_EXTRA, "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY="),
@@ -128,8 +127,8 @@ def test_a_directory_joined_to_an_empty_pem_key_still_counts_as_set() -> None:
     assert posture.directory_joined and posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    _assert_kept_once(refusal)
-    assert _KEEPS_ONE in refusal
+    _assert_rewritten_once(refusal)
+    assert _REMOVE_ALL in refusal
 
 
 def _joined_beside(*listed: str) -> ServiceEnvPosture:
@@ -146,10 +145,10 @@ def _joined_beside(*listed: str) -> ServiceEnvPosture:
 
 def test_a_directory_joined_to_a_dropped_variable_still_counts_as_set() -> None:
     """The remedy half of the pin above, for a joined directory with nothing refused running on:
-    the lists do set it, and there is no run-on step to carry an exception."""
+    the lists do set it, and there is no run-on step."""
     refusal = service_env_refusal(_joined_beside("MEFOR_VALUE_B"))
     assert refusal is not None
-    _assert_kept_once(refusal)
+    _assert_rewritten_once(refusal)
     assert "its value runs on into" not in refusal
 
 
@@ -167,9 +166,9 @@ def test_a_run_on_and_a_join_from_different_variables_do_not_claim_the_strings_h
     assert posture.value_runs_on and posture.directory_joined
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert "but for any that sets MEFOR_SECRETS_DIRECTORY" in refusal
+    assert _REMOVE_ALL in refusal
     assert "but for one MEFOR_SECRETS_DIRECTORY entry" not in refusal
-    _assert_kept_once(refusal)
+    _assert_rewritten_once(refusal)
 
 
 def test_a_join_beside_a_store_key_alone_adds_no_directory_step() -> None:
@@ -179,7 +178,7 @@ def test_a_join_beside_a_store_key_alone_adds_no_directory_step() -> None:
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert "DPAPI-protected key file" in refusal
-    assert "Keep one MEFOR_SECRETS_DIRECTORY entry" not in refusal
+    assert _REWRITE not in refusal
     assert _NO_DIRECTORY not in refusal
 
 
@@ -194,4 +193,4 @@ def test_with_no_directory_joined_the_old_remedies_stand() -> None:
     refusal = service_env_refusal(run_on)
     assert refusal is not None
     assert "so remove those strings with it" in refusal
-    assert "Keep one MEFOR_SECRETS_DIRECTORY entry" not in refusal
+    assert _REWRITE not in refusal
