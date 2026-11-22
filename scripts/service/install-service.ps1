@@ -1156,17 +1156,25 @@ function Get-SettingsKeyProvider {
     $tail = '\s*(?:#.*)?$'
     $table = ""
     $found = $null
+    $inString = $false
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
         $line = $line.TrimStart([char]0xFEFF)
+        # A line inside a multi-line string is never a header or a key; an odd count of
+        # triple quotes opens or closes one.
+        $wasInString = $inString
+        if (([regex]::Matches($line, '"""|''''''').Count % 2) -eq 1) { $inString = -not $inString }
+        if ($wasInString -or $inString) { continue }
         if ($line -cmatch '^\s*\[\[') { $table = "[[]]"; continue }
-        if ($line -cmatch ('^\s*\[(?<t>[^\]]*)\]' + $tail)) {
+        # A header names a table by bare or quoted keys, so an array element such as ["a", "b"]
+        # is not one.
+        if ($line -cmatch ('^\s*\[(?<t>[A-Za-z0-9_.\-"'' ]+)\]' + $tail)) {
             $table = $Matches.t -creplace '[\s"'']', ''
             continue
         }
         # A [store] line; a top-level dotted key; a top-level one-line inline table.
         if (($table -ceq "store" -and $line -cmatch ('^\s*' + $key + '\s*=\s*' + $value + $tail)) -or
             ($table -ceq "" -and $line -cmatch ('^\s*' + $store + '\s*(?:\.\s*' + $key + '\s*=\s*' +
-                $value + $tail + '|=\s*\{(?:[^{]*[,\s])?' + $key + '\s*=\s*' + $value + ')'))) {
+                $value + $tail + '|=\s*\{(?:(?:[^{}"''#]|"[^"\\]*"|''[^'']*'')*[,\s])?' + $key + '\s*=\s*' + $value + ')'))) {
             $found = $Matches.v
         }
     }
@@ -2835,10 +2843,10 @@ if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Le
 }
 
 # --- key custody: [store].key_provider = 'host' (vault BACKLOG #3411, S3 slice B3c) --------------------
-# The service's own environment overrides the settings file, as it does at start, so on a rerun a
-# MEFOR_STORE_KEY_PROVIDER already registered for the service is what counts. Refused before
-# anything acts. Get-SettingsKeyProvider says what it reads, and why the engine's own refusal at
-# start does not rest on it.
+# On a rerun, a MEFOR_STORE_KEY_PROVIDER in the service's NSSM environment (AppEnvironmentExtra)
+# wins over the settings file, as an environment variable does at start. No other environment is
+# read here, the machine's included. Refused before anything acts. Get-SettingsKeyProvider says
+# what it reads, and why the engine's own refusal at start does not rest on it.
 $RegisteredKeyProvider = Get-RegisteredEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_STORE_KEY_PROVIDER"
 $HostCustody = if ($null -ne $RegisteredKeyProvider) { $RegisteredKeyProvider -ceq "host" }
                else { (Get-SettingsKeyProvider -Path $ServiceConfig) -ceq "host" }
@@ -2848,10 +2856,11 @@ if ($HostCustody) {
         $namedBy = if ($null -ne $RegisteredKeyProvider) {
             "the service's own environment sets MEFOR_STORE_KEY_PROVIDER=host"
         } else { "the settings file '$ServiceConfig' names [store].key_provider = 'host'" }
+        $remedy = if ($ServiceAccount) { "Pass a -ServiceAccount of the service's own, or leave it and -AllowLocalSystem out" }
+                  else { "Leave out -AllowLocalSystem" }
         throw ("$custodyAccountProblem, and $namedBy, a key provider whose custody refuses that " +
-            "account, so the service would not start. Leave " +
-            "out -AllowLocalSystem to run as the virtual account 'NT SERVICE\$ServiceName', or pass a " +
-            "-ServiceAccount of the service's own (docs/SERVICE.md 'Least-privilege service account').")
+            "account, so the service would not start. $remedy to run as the virtual account " +
+            "'NT SERVICE\$ServiceName' (docs/SERVICE.md 'Least-privilege service account').")
     }
 }
 

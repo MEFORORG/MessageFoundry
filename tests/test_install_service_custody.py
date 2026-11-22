@@ -3,8 +3,9 @@
 """install-service.ps1 under ``[store].key_provider = 'host'`` (vault BACKLOG #3411, key custody S3
 slice B3c).
 
-The installer refuses the accounts the host provider refuses as the engine account, before
-anything acts. Behaviour runs the script's own functions, extracted by AST, through ``pwsh``; the
+The installer refuses SYSTEM, LOCAL SERVICE and NETWORK SERVICE, which the host provider refuses as
+the engine account, before anything acts. It does not check the provider's refusal of a non-local
+account under enforce. Behaviour runs the script's own functions, extracted by AST, through ``pwsh``; the
 call sites are read by AST, since no test runs the script body.
 """
 
@@ -53,6 +54,13 @@ _SETTINGS: list[tuple[str, str | None]] = [
     ('[STORE]\nkey_provider = "host"\n', None),
     ('[store]\nKEY_PROVIDER = "host"\n', None),
     ('store = { tls = { key_provider = "host" } }\n', None),
+    # Text that only looks like the key: a comment, a string value, a multi-line string.
+    ('store = { backend = "sqlite" }  # was key_provider = "host"\n', None),
+    ('store = { backend = "sqlite", note = "x key_provider = \'host\'" }\n', None),
+    ('[api]\nnote = """\n[store]\nkey_provider = "host"\n"""\n', None),
+    # Lines that only look like a table header do not move the reader out of [store].
+    ('[store]\npairs = [\n  ["a", "b"]\n]\nkey_provider = "host"\n', "host"),
+    ('[store]\nnote = """\n[api]\n"""\nkey_provider = "host"\n', "host"),
     ("", None),
 ]
 
