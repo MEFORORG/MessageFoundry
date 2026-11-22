@@ -29,6 +29,10 @@ this line.**
   code field when the session owes one, the passkey page script sends it in its body, and the
   account page tells a directory user with no factor to ask an Administrator through the site's
   identity check, not by mail or chat.
+- **The nav heart warns on a FHIR lookup isolated at start.** When `/status` names a `FhirLookup`
+  in `fhir_lookups_failed`, the engine-health heart turns warn and its tooltip names the lookup, as
+  it does for a failed inbound. The engine sends those names to an estate-wide caller only, so a
+  channel-scoped operator's heart does not show it. (vault `BACKLOG #3008`)
 - **The sign-in page offers a combined passkey sign-in.** A "Sign in with password and passkey"
   button runs a usernameless passkey ceremony (`POST /ui/login/passkey`, which charges the sign-in
   window first and sets the challenge's handle as an HttpOnly cookie) and submits the assertion with

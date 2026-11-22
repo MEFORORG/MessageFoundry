@@ -242,6 +242,19 @@ def _failed_inbound_reason(count: int, names: list[str]) -> str:
     return f"{head}: {listed}, and {hidden} more" if hidden > 0 else f"{head}: {listed}"
 
 
+def _failed_lookup_reason(names: list[str]) -> str:
+    """The sentence for the isolated ``FhirLookup`` names in ``EngineInfo.fhir_lookups_failed``
+    (vault BACKLOG #3008). Names only, never the engine's reason, for the reason
+    ``_failed_inbound_reason`` gives."""
+    shown = names[:_MAX_NAMED_FAILURES]
+    if len(names) == 1:
+        return f"FHIR lookup {shown[0]} failed to start"
+    hidden = len(names) - len(shown)
+    listed = ", ".join(shown)
+    head = f"{len(names)} FHIR lookups failed to start: {listed}"
+    return f"{head}, and {hidden} more" if hidden > 0 else head
+
+
 def _num(value: object) -> str:
     """Render a count/None as text ('—' for None)."""
     return "—" if value is None else str(value)
