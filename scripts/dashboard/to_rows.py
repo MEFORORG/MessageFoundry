@@ -17,8 +17,8 @@ lines are a separate row, ``asvs.provenance``.
 
 THE ASVS HEADLINE IS NEVER SHOWN ALONE. It is pass cells over cells not marked n/a, so
 needs-review and unverified cells, which carry no verdict, sit in its denominator; their counts are
-rows beside it and are named in its note. When the snapshot holds neither count, the headline is
-null. ``scripts/asvs/scorecard.py`` itself prints no single headline score at all, and this rate
+rows beside it and are named in its note. Unless the snapshot holds both counts as whole numbers,
+the headline is null. ``scripts/asvs/scorecard.py`` itself prints no single headline score at all, and this rate
 is not one it gives: it does not separate cells decided with no ``last_verified``.
 
 A VALUE THAT IS NOT IN THE SNAPSHOT IS ``null``, never ``0`` or NaN: a metric that errored has no
@@ -111,23 +111,24 @@ def asvs_pair(snap: Snapshot) -> str:
 NO_VERDICT = (("needs-review", "Needs review"), ("unverified", "Unverified"))
 
 NO_ASVS_HEADLINE = (
-    "no headline: the snapshot holds no needs-review and unverified counts, so the pass rate "
-    "cannot be shown beside the cells in its denominator that carry no verdict"
+    "no headline: the snapshot does not hold both a needs-review and an unverified count as whole "
+    "numbers, so the pass rate cannot be shown beside the cells in its denominator that carry no "
+    "verdict"
 )
 
 
 def no_verdict_counts(detail: dict[str, Any]) -> dict[str, int] | None:
-    """The ASVS detail's needs-review and unverified counts, one the counts omit read as 0 (the
-    collector's cells line sums to its total); ``None`` when it holds neither, or one is not a
-    number, so the headline cannot be qualified."""
+    """The ASVS detail's needs-review and unverified counts; ``None`` unless both are whole
+    numbers, so the headline cannot be qualified. A missing or null count is no measurement, never
+    a quiet zero; the collector marks a cells line without one as partial."""
     counts = _dict(detail.get("counts"))
-    if not any(key in counts for key, _ in NO_VERDICT):
-        return None
-    try:
-        # A present null stays unreadable: it is no measurement, never a quiet zero.
-        return {key: int(counts.get(key, 0)) for key, _ in NO_VERDICT}
-    except (TypeError, ValueError):
-        return None
+    got: dict[str, int] = {}
+    for key, _ in NO_VERDICT:
+        value = counts.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+        got[key] = value
+    return got
 
 
 def _no_verdict(key: str) -> Callable[[dict[str, Any]], Any]:
@@ -253,10 +254,12 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
         }
         for m in snap.metrics
     ]
-    qualified = no_verdict_counts(snap.detail("asvs")) is not None
+    # A metric that errored has its own reason, and no counts because of it.
+    asvs_failed = bool(snap.by_id.get("asvs", {}).get("error"))
+    withheld = not asvs_failed and no_verdict_counts(snap.detail("asvs")) is None
     headline = next((r for r in rows if r["id"] == "asvs"), None)
-    if headline is not None and not qualified:
-        # No count to qualify it with: no headline. Its reason leads, beside any earlier one.
+    if headline is not None and withheld:
+        # No count to qualify it with: no headline. Its reason leads, beside any partial one.
         prior = headline["error"]
         headline.update(
             value=None,
@@ -265,7 +268,7 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
         )
     # A null ASVS fact whose metric has no error of its own still says why it is null.
     own_reason = {
-        **{k: NO_ASVS_HEADLINE for k, _ in NO_VERDICT if not qualified},
+        **{k: NO_ASVS_HEADLINE for k, _ in NO_VERDICT if withheld},
         "provenance": "the snapshot holds no scorecard provenance lines",
     }
     for mid, key, label, read in facts(len(snap.weeks)):

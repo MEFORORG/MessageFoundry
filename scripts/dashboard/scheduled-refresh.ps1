@@ -22,10 +22,11 @@ Work trees come and go, so this runner reads none of them. It:
    the last 200 lines, and removes the temporary directory.
 
 A failure exits non-zero and leaves the previous index.html in place: the page is replaced
-atomically, and only by a render that succeeded. Each Python process this runner and build.ps1
-start runs with -I: the interpreter probe, the renderer, the collector, and the collector's two
-children (the vault census driver and scripts/asvs/scorecard.py), which also get -X utf8 and an
-allowlisted environment with no token or GIT_* variable. -I is not a sandbox; collect_metrics.py's
+atomically, and only by a render that succeeded. At least these Python processes run with -I: the
+interpreter probe, the renderer and the collector that this runner and build.ps1 start, and the
+collector's two children (the vault census driver and scripts/asvs/scorecard.py), which
+collect_metrics.py starts through one helper, `_run_python`, with -X utf8 and an allowlisted
+environment with no token or GIT_* variable. -I is not a sandbox; collect_metrics.py's
 docstring says what the vault code can still do. gh uses the account's own
 existing authentication; this script holds no secret and logs none.
 

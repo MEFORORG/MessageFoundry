@@ -98,7 +98,7 @@ def _snapshot() -> dict[str, Any]:
             ),
             _metric(
                 "asvs",
-                value=50.0,
+                value=25.0,
                 status="warn",
                 detail={
                     "counts": {
@@ -141,7 +141,7 @@ def test_metric_rows_contract() -> None:
         "no verdict, are in that denominator and are not passes. Cells decided with no "
         "last_verified count as decided; scorecard.py --status reports them."
     )
-    assert rows["asvs"]["value"] == 50.0
+    assert rows["asvs"]["value"] == 25.0
     assert (rows["asvs.needs-review"]["value"], rows["asvs.unverified"]["value"]) == (1, 1)
     assert rows["asvs"]["ref"] == "scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234"
     # Every ASVS count row carries the ref pair too.
@@ -351,11 +351,20 @@ def test_asvs_without_no_verdict_counts_has_no_headline() -> None:
         "unverified": 0,
     }
     assert _rows(snap)["asvs"]["value"] is None
-    # One of the two present: the other is 0, since the cells line sums to its total.
-    snap["metrics"][3]["detail"]["counts"] = {"total": 3, "pass": 1, "fail": 1, "unverified": 1}
-    rows = _rows(snap)
-    assert rows["asvs"]["value"] == 50.0
-    assert (rows["asvs.needs-review"]["value"], rows["asvs.unverified"]["value"]) == (0, 1)
+    # Only one of the two, or one that is no whole number: still withheld, never a quiet zero.
+    for counts in (
+        {"total": 3, "pass": 1, "fail": 1, "unverified": 1},
+        {"total": 2, "pass": 1, "fail": 1, "needs-review": True, "unverified": 0},
+        {"total": 2, "pass": 1, "fail": 1, "needs-review": 0.9, "unverified": 0},
+    ):
+        snap["metrics"][3]["detail"]["counts"] = counts
+        rows = _rows(snap)
+        assert rows["asvs"]["value"] is None, counts
+        assert rows["asvs.needs-review"]["value"] is None, counts
+    # A metric that errored keeps its own reason alone: its counts are missing because of it.
+    snap["metrics"][3]["error"] = "vault read failed"
+    snap["metrics"][3]["detail"] = {}
+    assert _rows(snap)["asvs"]["error"] == "vault read failed"
 
 
 def test_asvs_provenance_row_quotes_the_tools_own_lines() -> None:

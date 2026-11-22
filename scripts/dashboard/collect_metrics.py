@@ -457,7 +457,9 @@ def child_env(*, home: bool = False) -> dict[str, str]:
 
 def _run_python(argv: Sequence[str], cwd: Path | None, env: dict[str, str]) -> str:
     # -X utf8, not PYTHONUTF8: -I ignores every PYTHON* variable.
-    return run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=env).decode("utf-8")
+    return run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=env).decode(
+        "utf-8", "replace"
+    )
 
 
 def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:
@@ -947,8 +949,8 @@ def c_asvs(ctx: Context, m: Metric) -> None:
     # Archived here, not with the ledger: a moved scorecard must null this metric alone.
     _archive_into(ctx, str(ctx.vault), v.sha, [VAULT_SCORECARD], v.root)
     toml = v.root / VAULT_SCORECARD
-    # Under -I and the allowlisted child environment, as the vault code runs: no PYTHON* variable
-    # and no token variable reaches the tool.
+    # Under -I and the allowlisted child environment plus the home variables (run_tool_child), not
+    # the vault code's narrower one: no PYTHON* variable and no token variable reaches the tool.
     out = ctx.run_tool(
         [
             str(ctx.engine_root / "scripts" / "asvs" / "scorecard.py"),
@@ -1000,7 +1002,9 @@ def c_asvs(ctx: Context, m: Metric) -> None:
         "state_as_of": "run time; --through does not apply",
     }
     if not {"needs-review", "unverified"} <= counts.keys():
-        # The headline is shown only beside these counts; a cells line without them is drift.
+        # The headline is shown only beside these counts; a cells line without them is drift, and
+        # the headline is withheld here, at the source, not only on the page.
+        m.value, m.status = None, "unknown"
         add_partial(m.detail, "scorecard cells line lacks a needs-review or unverified count")
     if engine_ref is None:
         # A score is quoted only beside its ref pair; without the engine half it cannot be.

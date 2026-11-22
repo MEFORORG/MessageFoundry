@@ -214,6 +214,7 @@ def test_the_asvs_ref_pair_sits_beside_its_value() -> None:
 def test_the_asvs_headline_is_withheld_without_no_verdict_counts() -> None:
     snap = _snapshot()
     snap["metrics"][3]["detail"]["counts"] = {"total": 2, "pass": 1, "fail": 1}
+    snap["metrics"][3]["error"] = None  # withholding applies to a metric that read without error
     page = rh.render(snap)
     tile = page[page.index("<h3>asvs") :]
     tile = tile[: tile.index("</section>")]

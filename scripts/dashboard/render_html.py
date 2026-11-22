@@ -19,7 +19,7 @@ snapshot, so the directory is refused, before anything is read, whenever the col
 (``refuse_dir_reason``) finds git reporting a work tree there; that guard's docstring says what
 it cannot see. Every ASVS number is shown beside the collector's ref pair (``to_rows.py`` says how
 it is built) and the scorecard tool's own ``#`` provenance lines, and the ASVS headline beside its
-needs-review and unverified counts, or not at all when the snapshot holds neither.
+needs-review and unverified counts, or not at all unless the snapshot holds both.
 
 The rows are built by ``to_rows.py``, so the page and the row files never disagree.
 
@@ -275,7 +275,7 @@ border:1px solid currentColor;margin-left:8px;vertical-align:middle}
 .pill.good{color:var(--good)}.pill.warn{color:var(--warn)}.pill.bad{color:var(--bad)}
 .pill.unknown{color:var(--unknown)}
 dl{display:grid;grid-template-columns:1fr auto;gap:2px 12px;margin:10px 0;font-size:13px}
-dt{color:var(--muted)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+dt{color:var(--muted)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;min-width:0;overflow-wrap:anywhere}
 .note{color:var(--muted);font-size:12px;margin:8px 0 0}
 .refpair{font:12px/1.4 ui-monospace,Consolas,monospace;margin:4px 0 0;overflow-wrap:anywhere}
 .err{color:var(--bad);font-size:12px;margin:6px 0 0;overflow-wrap:anywhere}

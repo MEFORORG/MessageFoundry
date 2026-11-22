@@ -901,11 +901,19 @@ def test_asvs_reads_counts_and_the_ref_pair(tmp_path: Path) -> None:
 
 def test_asvs_value_is_floored_like_the_ci_series(tmp_path: Path) -> None:
     # 2 of 3 is 66.67 percent: floored to 66.6, never rounded up to 66.7.
-    printed = "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 3: 2 pass, 1 fail\n"
+    printed = "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 3: 2 pass, 1 fail, 0 needs-review, 0 unverified\n"
     m = cm.Metric("asvs", "", "", "", "")
     cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
     assert m.value == 66.6
-    # No needs-review or unverified count on the cells line: the read is partial.
+    assert "partial_error" not in m.detail
+
+
+def test_asvs_without_no_verdict_counts_withholds_the_headline(tmp_path: Path) -> None:
+    # No needs-review or unverified count on the cells line: partial, and no headline at source.
+    printed = "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 3: 2 pass, 1 fail\n"
+    m = cm.Metric("asvs", "", "", "", "")
+    cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
+    assert (m.value, m.status) == (None, "unknown")
     assert "needs-review or unverified" in m.detail["partial_error"]
 
 
@@ -938,7 +946,7 @@ def test_the_scorecard_tool_runs_isolated(tmp_path: Path, monkeypatch: pytest.Mo
 
     def run_tool(argv: Sequence[str], cwd: Path | None) -> str:
         seen.append(argv)
-        return "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 1: 1 pass\n"
+        return "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 1: 1 pass, 0 needs-review, 0 unverified\n"
 
     ctx = _asvs_ctx(tmp_path, "unused")
     ctx.run = _failing
@@ -953,7 +961,7 @@ def test_the_scorecard_tool_runs_isolated(tmp_path: Path, monkeypatch: pytest.Mo
 
 def test_asvs_without_an_engine_ref_is_partial(tmp_path: Path) -> None:
     m = cm.Metric("asvs", "", "", "", "")
-    cm.c_asvs(_asvs_ctx(tmp_path, "cells 2: 1 pass, 1 fail\n"), m)
+    cm.c_asvs(_asvs_ctx(tmp_path, "cells 2: 1 pass, 1 fail, 0 needs-review, 0 unverified\n"), m)
     assert m.value == 50.0
     assert m.detail["engine_ref"] is None
     assert "engine= ref" in m.detail["partial_error"]
@@ -1134,7 +1142,7 @@ def test_the_driver_counts_its_clip_calls() -> None:
 
 
 def test_asvs_with_an_unattributable_engine_ref_is_partial(tmp_path: Path) -> None:
-    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 2: 2 pass\n"
+    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 2: 2 pass, 0 needs-review, 0 unverified\n"
     m = cm.Metric("asvs", "", "", "", "")
     cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
     assert m.value == 100.0
@@ -1151,7 +1159,7 @@ def test_write_json_atomic_is_strict_and_leaves_no_temp(tmp_path: Path) -> None:
 
 
 def test_dirty_engine_ref_is_partial(tmp_path: Path) -> None:
-    printed = "# asvs-status scorecard=NO-GIT engine=abc123+dirty\ncells 1: 1 pass\n"
+    printed = "# asvs-status scorecard=NO-GIT engine=abc123+dirty\ncells 1: 1 pass, 0 needs-review, 0 unverified\n"
     m = cm.Metric("asvs", "", "", "", "")
     cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
     assert "engine=abc123+dirty" in m.detail["partial_error"]
@@ -1202,7 +1210,7 @@ def test_asvs_from_an_archive_names_the_archived_commit(tmp_path: Path) -> None:
 
 
 def test_asvs_ignores_an_archive_ref_that_is_no_sha(tmp_path: Path) -> None:
-    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 1: 1 pass\n"
+    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 1: 1 pass, 0 needs-review, 0 unverified\n"
     ctx = _asvs_ctx(tmp_path, printed)
     ctx.archive_ref = "origin/main"
     m = cm.Metric("asvs", "", "", "", "")
