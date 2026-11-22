@@ -10,6 +10,7 @@ persisted AES-GCM invocation bound is charged for the whole burst first, and the
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Callable, Mapping, MutableMapping
 from contextlib import AbstractAsyncContextManager, nullcontext
@@ -31,6 +32,8 @@ __all__ = [
     "apply_converged",
     "seal_reference_snapshot",
 ]
+
+log = logging.getLogger(__name__)
 
 #: Rows per INSERT round trip on the server backends. SQL Server takes at most 2100 parameters per
 #: statement and four are bound per row. On Postgres it keeps each ``executemany`` well inside the
@@ -90,15 +93,15 @@ async def seal_reference_snapshot(
             failure = exc
             raise
 
-    if encoded and bounded_cipher(cipher) is not None:
-        async with reserve_scope() if reserve_scope is not None else nullcontext():
-            await reserve_invocations_ahead(cipher, _recording_add, len(encoded))
-    if failure is not None:
-        try:
+    try:
+        if encoded and bounded_cipher(cipher) is not None:
+            async with reserve_scope() if reserve_scope is not None else nullcontext():
+                await reserve_invocations_ahead(cipher, _recording_add, len(encoded))
+        if failure is not None:
             raise failure
-        finally:
-            # Breaks the exception -> traceback -> this frame cycle, whose locals hold plaintext.
-            failure = None
+    finally:
+        # Breaks the exception -> traceback -> this frame cycle, whose locals hold plaintext.
+        failure = None
 
     stop = threading.Event()
 
@@ -122,8 +125,11 @@ async def seal_reference_snapshot(
             cancelled = True
             stop.set()
     if cancelled:
-        if not worker.cancelled():
-            worker.exception()  # retrieved, so the loop does not log it with its traceback
+        if not worker.cancelled() and (error := worker.exception()) is not None:
+            # The class only: the traceback's frames hold plaintext.
+            log.warning(
+                "reference set seal failed after its write was cancelled: %s", type(error).__name__
+            )
         raise asyncio.CancelledError
     snapshot = worker.result()
     if snapshot is None:  # only a set `stop` returns None, and only a cancellation sets it

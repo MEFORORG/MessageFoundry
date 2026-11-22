@@ -9935,34 +9935,36 @@ class SqlServerStore:
         lock = (
             f"mefor:reference:{hashlib.sha256(name.encode('utf-8', 'surrogatepass')).hexdigest()}"
         )
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                # A real statement must open the transaction the applock is scoped to.
-                await cur.execute(
-                    "SELECT TOP (1) version FROM reference_version WHERE name=?", (name,)
-                )
-                await cur.fetchall()
-                await self._applock(cur, lock)
-                # Drop the set's prior version(s) — we keep only the active snapshot per name.
-                await cur.execute("DELETE FROM reference WHERE name=?", (name,))
-                for start in range(0, len(encrypted), REFERENCE_INSERT_BATCH):
-                    batch = encrypted[start : start + REFERENCE_INSERT_BATCH]
+                async with self._cursor(conn) as cur:
+                    # A real statement must open the transaction the applock is scoped to.
                     await cur.execute(
-                        "INSERT INTO reference (name, version, [key], value) VALUES "
-                        + ",".join(["(?,?,?,?)"] * len(batch)),
-                        tuple(cell for row in batch for cell in row),
+                        "SELECT TOP (1) version FROM reference_version WHERE name=?", (name,)
                     )
-                await cur.execute(
-                    "MERGE reference_version WITH (HOLDLOCK) AS t"
-                    " USING (SELECT ? AS name) AS s ON t.name = s.name"
-                    " WHEN MATCHED THEN UPDATE SET version=?, synced_at=?, row_count=?"
-                    " WHEN NOT MATCHED THEN INSERT (name, version, synced_at, row_count)"
-                    " VALUES (s.name, ?, ?, ?);",
-                    (name, version, now, len(encrypted), version, now, len(encrypted)),
-                )
-                await self._commit(conn)
+                    await cur.fetchall()
+                    await self._applock(cur, lock)
+                    # Drop the set's prior version(s) — we keep only the active snapshot per name.
+                    await cur.execute("DELETE FROM reference WHERE name=?", (name,))
+                    for start in range(0, len(encrypted), REFERENCE_INSERT_BATCH):
+                        batch = encrypted[start : start + REFERENCE_INSERT_BATCH]
+                        await cur.execute(
+                            "INSERT INTO reference (name, version, [key], value) VALUES "
+                            + ",".join(["(?,?,?,?)"] * len(batch)),
+                            tuple(cell for row in batch for cell in row),
+                        )
+                    await cur.execute(
+                        "MERGE reference_version WITH (HOLDLOCK) AS t"
+                        " USING (SELECT ? AS name) AS s ON t.name = s.name"
+                        " WHEN MATCHED THEN UPDATE SET version=?, synced_at=?, row_count=?"
+                        " WHEN NOT MATCHED THEN INSERT (name, version, synced_at, row_count)"
+                        " VALUES (s.name, ?, ?, ?);",
+                        (name, version, now, len(encrypted), version, now, len(encrypted)),
+                    )
+                    await self._commit(conn)
             except Exception:
-                # Not a bare rollback: a failed one would pool a connection holding the applock.
+                # After the cursor has closed. Not a bare rollback: a failed one would pool a
+                # connection still holding the applock.
                 await self._rollback_or_discard(conn)
                 raise
             # Commit succeeded: swap the active snapshot in the read cache (sealed, BACKLOG #1174)

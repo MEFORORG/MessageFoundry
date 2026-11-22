@@ -37,7 +37,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dryrun import route_message
-from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+from messagefoundry.pipeline.reference_sync import ReferenceSyncError, ReferenceSyncRunner
 from messagefoundry.store import postgres as pg_store_module
 from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
 from messagefoundry.store.postgres import PostgresStore
@@ -1358,6 +1358,81 @@ async def test_5688_cancel_stops_the_seal_and_waits_for_its_worker(tmp_path: Pat
     finally:
         object.__delattr__(cipher, "encrypt")
         await store.close()
+
+
+class _GatedStore:
+    """A store whose snapshot write blocks until released, recording each write's rows."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.written: list[dict[str, Any]] = []
+        self.active = self.peak = 0
+
+    async def write_reference_snapshot(
+        self, *, name: str, version: str, rows: dict[str, Any]
+    ) -> None:
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        self.entered.set()
+        try:
+            await self.release.wait()
+            self.written.append(dict(rows))
+        finally:
+            self.active -= 1
+
+    async def record_audit(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def _gated_runner(store: _GatedStore, csv: Path) -> ReferenceSyncRunner:
+    return ReferenceSyncRunner(
+        store,  # type: ignore[arg-type]
+        lambda: [_spec("codes", csv)],
+        REF,
+        egress=EgressSettings(deny_by_default=False),
+    )
+
+
+async def test_5688_overlapping_syncs_of_a_set_run_in_turn(tmp_path: Path) -> None:
+    csv = _csv(tmp_path / "c.csv", "key,value\nA,old\n")
+    store = _GatedStore()
+    runner = _gated_runner(store, csv)
+    first = asyncio.create_task(runner.sync_all())
+    await asyncio.wait_for(store.entered.wait(), 5)
+    _csv(csv, "key,value\nA,new\n")
+    second = asyncio.create_task(runner.sync_all())
+    await asyncio.sleep(0.05)
+    store.release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 5)
+    assert store.peak == 1
+    assert [w["A"] for w in store.written] == ["old", "new"]  # the later sync read afresh
+
+
+async def test_5688_stop_waits_for_a_write_in_flight(tmp_path: Path) -> None:
+    csv = _csv(tmp_path / "c.csv", "key,value\nA,1\n")
+    store = _GatedStore()
+    runner = _gated_runner(store, csv)
+    reload_sync = asyncio.create_task(runner.sync_all())  # not the runner's own task
+    await asyncio.wait_for(store.entered.wait(), 5)
+    stop = asyncio.create_task(runner.stop())
+    await asyncio.sleep(0.05)
+    assert not stop.done(), "stop returned with a snapshot write still in flight"
+    store.release.set()
+    await asyncio.wait_for(asyncio.gather(stop, reload_sync), 5)
+
+
+async def test_5688_sync_overtaken_by_stop_writes_nothing(tmp_path: Path) -> None:
+    csv = _csv(tmp_path / "c.csv", "key,value\nA,1\n")
+    store = _GatedStore()
+    store.release.set()
+    runner = _gated_runner(store, csv)
+    stale = runner._stop_generation
+    await runner.stop()
+    with pytest.raises(ReferenceSyncError):
+        await runner._load_and_write(_spec("codes", csv), stale)
+    assert store.written == []
+    assert (await runner.sync_all()).synced == 1  # a sync begun after the stop still runs
 
 
 class _PgConn:

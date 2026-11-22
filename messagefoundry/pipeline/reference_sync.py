@@ -573,6 +573,17 @@ class ReferenceSyncRunner:
         self._unsupported: set[str] = set()
         # BACKLOG #2617: each DATABASE set's login is role-probed once per DSN, not every pass.
         self._roles_probed: set[tuple[str, ...]] = set()
+        # BACKLOG #5688: a reload's sync_all can overlap the loop's pass. One lock per set runs them
+        # in turn, so the later one reads the source afresh and a slower, older load cannot commit
+        # over it.
+        self._set_locks: dict[str, asyncio.Lock] = {}
+        # BACKLOG #5688: stop() waits out a write in flight, since its seal runs in a worker thread
+        # and must not outlive the store's closing settlement of the invocation bound. A sync begun
+        # before a stop writes nothing after it.
+        self._stop_generation = 0
+        self._writes = 0
+        self._writes_idle = asyncio.Event()
+        self._writes_idle.set()
 
     @property
     def enabled(self) -> bool:
@@ -595,6 +606,7 @@ class ReferenceSyncRunner:
     async def stop(self) -> None:
         """Signal the loop and await its exit (idempotent)."""
         self._stop.set()
+        self._stop_generation += 1
         task = self._task
         self._task = None
         if task is not None:
@@ -603,6 +615,7 @@ class ReferenceSyncRunner:
                 await task
             except asyncio.CancelledError:
                 pass
+        await self._writes_idle.wait()
 
     async def _run(self) -> None:
         # One isolated pass per interval; a pass error is logged and the loop continues (a sync hiccup
@@ -729,6 +742,11 @@ class ReferenceSyncRunner:
         return result
 
     async def _sync_one(self, spec: ReferenceSpec) -> None:
+        generation = self._stop_generation  # read before the lock wait, which a stop can overtake
+        async with self._set_locks.setdefault(spec.name, asyncio.Lock()):
+            await self._load_and_write(spec, generation)
+
+    async def _load_and_write(self, spec: ReferenceSpec, generation: int) -> None:
         # Resolve env() refs in the source settings against this instance's environment. A hop-policy
         # flag is refused first, while still raw, as build_check does (vault BACKLOG #2232).
         try:
@@ -774,6 +792,10 @@ class ReferenceSyncRunner:
         # genuine re-materialization and keep stale data (Track B Step 6 correctness). The leading
         # seconds keep versions roughly time-ordered for an operator reading reference_version.
         version = f"v{int(self._clock())}-{uuid4().hex[:8]}"
+        if generation != self._stop_generation:
+            raise ReferenceSyncError(f"reference set {spec.name!r}: runner stopped; not written")
+        self._writes += 1
+        self._writes_idle.clear()
         try:
             await self._store.write_reference_snapshot(name=spec.name, version=version, rows=rows)
         except ReferenceKeyCollision as exc:
@@ -781,6 +803,10 @@ class ReferenceSyncRunner:
             # ordinals, never a key, so it is logged whole: the ordinals find the rows in the source.
             log.error("%s (not synced)", exc)
             raise
+        finally:
+            self._writes -= 1
+            if not self._writes:
+                self._writes_idle.set()
         log.info(
             "reference set %r materialized: %d rows (version %s)", spec.name, len(rows), version
         )
