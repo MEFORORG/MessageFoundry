@@ -1144,8 +1144,9 @@ function Get-SettingsKeyProvider {
       READ AS TEXT. Running the install's interpreter would run its code from this elevated prompt,
       which the interpreter check below declines to do. So this reads at least a key_provider line in
       a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table
-      with no table nested before the key, each holding a one-line string with no escape. Names
-      compare case-sensitively, as TOML's do. Any other form reads as $null. A triple quote in a
+      with no table nested before the key, each holding a one-line string with no escape. Lines
+      inside a multi-line array or string are skipped. Names compare case-sensitively, as TOML's
+      do. Any other form reads as $null. A triple quote in a
       comment or a one-line string, or a multi-line string holding the other delimiter, can make
       it misread every line after it, either way. What the installer does
       with the answer is an early refusal: the engine applies its own key custody refusals at start
@@ -1159,6 +1160,7 @@ function Get-SettingsKeyProvider {
     $table = ""
     $found = $null
     $inString = $false
+    $arrayDepth = 0
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
         $line = $line.TrimStart([char]0xFEFF)
         # A line inside a multi-line string is never a header or a key; an odd count of
@@ -1166,11 +1168,19 @@ function Get-SettingsKeyProvider {
         $wasInString = $inString
         if (([regex]::Matches($line, '"""|''''''').Count % 2) -eq 1) { $inString = -not $inString }
         if ($wasInString -or $inString) { continue }
-        if ($line -cmatch '^\s*\[\[') { $table = "[[]]"; continue }
-        # A header names a table by bare or quoted keys, so an array element such as ["a", "b"]
-        # is not one.
+        # A line inside a multi-line array is an element, never a header or a key, even one shaped
+        # like a header such as ["store"] or [1]. The depth counts the brackets left open, outside
+        # strings and comments, by the lines before this one.
+        $inArray = $arrayDepth -gt 0
+        $code = ($line -creplace '"(?:[^"\\]|\\.)*"|''[^'']*''', '""') -creplace '#.*$', ''
+        $arrayDepth = [Math]::Max(0, $arrayDepth + ([regex]::Matches($code, '\[').Count -
+            [regex]::Matches($code, '\]').Count))
+        if ($inArray) { continue }
+        if ($line -cmatch '^\s*\[\[') { $table = "[[]]"; $arrayDepth = 0; continue }
+        # A header names a table by bare or quoted keys.
         if ($line -cmatch ('^\s*\[(?<t>[A-Za-z0-9_.\-"'' ]+)\]' + $tail)) {
             $table = $Matches.t -creplace '[\s"'']', ''
+            $arrayDepth = 0
             continue
         }
         # A [store] line; a top-level dotted key; a top-level one-line inline table.

@@ -289,3 +289,4 @@ tests/test_dashboard_collect_metrics.py
 tests/test_dashboard_to_rows.py
 tests/test_dashboard_render_html.py
 tests/test_dashboard_ps_scripts.py
+tests/test_install_service_custody.py

@@ -60,6 +60,11 @@ _SETTINGS: list[tuple[str, str | None]] = [
     ('[api]\nnote = """\n[store]\nkey_provider = "host"\n"""\n', None),
     # Lines that only look like a table header do not move the reader out of [store].
     ('[store]\npairs = [\n  ["a", "b"]\n]\nkey_provider = "host"\n', "host"),
+    # A one-element nested array line has a header's shape, inside [store] and outside it.
+    ('[store]\nretired = [\n  ["k1"]\n]\nkey_provider = "host"\n', "host"),
+    ('[store]\nn = [\n  [1],\n  [2]\n]\nkey_provider = "host"\n', "host"),
+    ('[api]\nhosts = [\n  ["store"]\n]\nkey_provider = "host"\n', None),
+    ('[api]\nhosts = [ # "]"\n  ["store"]\n]\nkey_provider = "host"\n', None),
     ('[store]\nnote = """\n[api]\n"""\nkey_provider = "host"\n', "host"),
     ("", None),
 ]
