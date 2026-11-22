@@ -163,7 +163,10 @@ def _direct_workflow_file(path: str) -> str | None:
 def _workflow_states(
     repo: str | None, states_json: Path | None, required: Collection[str]
 ) -> dict[str, str]:
-    """``{workflow filename: state}`` for every workflow file directly in ``.github/workflows``.
+    """``{filename: state}`` of the direct workflow files, if every listed path is allowlisted.
+
+    A path ``_direct_workflow_file`` refuses raises ``RuntimeError``, even one directly in
+    ``.github/workflows``.
 
     Keyed on the FILENAME rather than the display name: the display name is what ``workflow_run``
     matches on, but a required context resolves to a FILE, and two workflows may legitimately share a
@@ -177,11 +180,11 @@ def _workflow_states(
         # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
         route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
         payload = gh_api(["--paginate", "--slurp", route])
-    # Only a file directly in .github/workflows can own a required context. Any other well-formed
-    # entry, such as GitHub's `dynamic/` ones, is left out so a basename match cannot let it stand in
-    # for a real file, and so it cannot abort the sweep and discard a real finding. A repeat that
-    # disagrees on a required file is refused, because last-wins could overwrite a disabled state. On
-    # any other file nothing reads the state, so a conflict there must not abort the sweep either.
+    # Only a file directly in .github/workflows can own a required context. A nested or `dynamic/`
+    # path the allowlist accepts is left out, so a basename match cannot let it stand in for a real
+    # file, and so its path cannot abort the sweep. A repeat that disagrees on a required file is
+    # refused, because last-wins could overwrite a disabled state. On any other file nothing reads
+    # the state, so a conflict there is not refused.
     states: dict[str, str] = {}
     for path, state in map(_workflow_state, _workflow_entries(payload)):
         name = _direct_workflow_file(path)
