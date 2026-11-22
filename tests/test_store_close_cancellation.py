@@ -11,6 +11,8 @@ only the hosted legs can prove the behaviour of a real pool.
 from __future__ import annotations
 
 import asyncio
+import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -176,7 +178,9 @@ async def test_a_statement_running_on_a_reader_does_not_outlive_a_cancelled_clos
 
 
 async def test_a_closed_coroutine_does_not_await_while_unwinding(tmp_path: Path) -> None:
-    """GeneratorExit in a suspended connection close must not raise RuntimeError."""
+    """GeneratorExit leaves ``_close_connection`` cleanly when the suspended close does not await
+    while unwinding, as this fake does not. A real aiosqlite close does await in its ``finally``,
+    which raises RuntimeError; ``_close_connection``'s docstring covers that case."""
     store = await MessageStore.open(tmp_path / "gen.db")
     conn: Any = store._read_conns[0]
     real_close = conn.close
@@ -340,6 +344,153 @@ async def test_a_plain_double_close_still_runs_the_close_twice(tmp_path: Path) -
     assert [w.name for w in workers if w.is_alive()] == []
 
 
+# --- a cancel must not cost the last-close checkpoint ---------------------------------------------
+
+
+_SYNTH_ROWS = 2000
+
+
+async def _committed_rows(store: MessageStore) -> None:
+    await store._db.execute("CREATE TABLE synth_close (v TEXT)")
+    await store._db.executemany(
+        "INSERT INTO synth_close VALUES (?)", [("synthetic" * 10,) for _ in range(_SYNTH_ROWS)]
+    )
+    await store._db.commit()
+
+
+def _rows_in_a_copy_of_only_the_db(db: Path, into: Path) -> int:
+    into.mkdir()
+    copy = into / db.name
+    shutil.copy2(db, copy)
+    conn = sqlite3.connect(copy)
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM synth_close").fetchone()[0])
+    finally:
+        conn.close()
+
+
+async def test_a_cancelled_close_of_an_idle_writer_still_checkpoints(tmp_path: Path) -> None:
+    """Red when the idle writer is interrupted: its last-close checkpoint aborts, leaving a -wal."""
+    db = tmp_path / "idle.db"
+    store = await MessageStore.open(db)
+    await _committed_rows(store)
+    assert Path(f"{db}-wal").stat().st_size > 0  # the control: the rows are in the WAL
+    await _cancel_close(store, "settle")
+    assert not Path(f"{db}-wal").exists()
+    assert _rows_in_a_copy_of_only_the_db(db, tmp_path / "copy") == _SYNTH_ROWS
+
+
+async def test_a_statement_running_on_the_writer_does_not_outlive_a_cancelled_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer is interrupted only once its stop has had the bound, and then it still is."""
+    monkeypatch.setattr("messagefoundry.store.close_steps.CANCELLED_CLOSE_GRACE_SECONDS", 0.1)
+    store = await MessageStore.open(tmp_path / "busywriter.db")
+    workers = _workers(store)
+    entered = _inject(store, "settle")
+    endless = asyncio.ensure_future(
+        store._db.execute(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT MAX(x) FROM c"
+        )
+    )
+    await asyncio.sleep(0.05)
+    task = asyncio.ensure_future(store.close())
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(task), 10)
+    await asyncio.gather(endless, return_exceptions=True)
+    assert [w.name for w in workers if w.is_alive()] == []
+
+
+# --- a cancel of the close, told from a cancelled future ------------------------------------------
+
+
+def _settle_on_a_future_someone_else_cancels(store: MessageStore) -> None:
+    async def settle(*_: object, **__: object) -> None:
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(future.cancel)
+        await future
+
+    store.checkpoint_cipher_invocations = settle  # type: ignore[method-assign]
+
+
+async def test_a_close_nobody_cancelled_does_not_raise_a_foreign_cancel(tmp_path: Path) -> None:
+    """Red when any CancelledError counts as a cancel of the close."""
+    store = await MessageStore.open(tmp_path / "foreign.db")
+    workers = _workers(store)
+    _settle_on_a_future_someone_else_cancels(store)
+    await store.close()
+    assert [w.name for w in workers if w.is_alive()] == []
+
+
+async def test_a_foreign_cancel_inside_a_connection_close_does_not_raise(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "foreignconn.db")
+    workers = _workers(store)
+    conn: Any = store._read_conns[0]
+    real_close = conn.close
+
+    async def close() -> None:
+        await real_close()
+        raise asyncio.CancelledError
+
+    conn.close = close
+    await store.close()
+    assert [w.name for w in workers if w.is_alive()] == []
+
+
+async def _close_inside_a_swallowed_cancel(store: MessageStore) -> asyncio.Future[None]:
+    async def closer() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await store.close()
+
+    task = asyncio.ensure_future(closer())
+    await asyncio.sleep(0)
+    task.cancel()
+    return task
+
+
+async def test_a_foreign_cancel_after_a_swallowed_cancel_does_not_raise(tmp_path: Path) -> None:
+    """The baseline: a cancel this task caught before the close is not a cancel of the close."""
+    store = await MessageStore.open(tmp_path / "baseline.db")
+    _settle_on_a_future_someone_else_cancels(store)
+    await asyncio.wait_for(await _close_inside_a_swallowed_cancel(store), 5)
+
+
+async def test_a_real_cancel_after_a_swallowed_cancel_still_raises(tmp_path: Path) -> None:
+    """The control for the baseline: a NEW cancel of the same task still reaches the caller."""
+    store = await MessageStore.open(tmp_path / "second.db")
+    workers = _workers(store)
+    entered = _inject(store, "settle")
+    task = await _close_inside_a_swallowed_cancel(store)
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [w.name for w in workers if w.is_alive()] == []
+
+
+async def test_a_cancel_the_task_requested_of_itself_before_the_close_still_raises(
+    tmp_path: Path,
+) -> None:
+    """Counted before the close starts but delivered inside it, so a bare baseline would lose it."""
+    store = await MessageStore.open(tmp_path / "selfcancel.db")
+    workers = _workers(store)
+
+    async def closer() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel()
+        await store.close()
+
+    task = asyncio.ensure_future(closer())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [w.name for w in workers if w.is_alive()] == []
+
+
 # --- fakes: SQL Server and Postgres ---------------------------------------------------------------
 
 
@@ -450,8 +601,31 @@ async def test_sqlserver_cancelled_pool_wait_still_releases_the_executor() -> No
     assert executor.shutdowns == 1
 
 
+async def test_sqlserver_repeat_close_does_not_wait_again_on_a_pool_wait_the_bound_cut() -> None:
+    """Red without the guard: the repeat awaits ``wait_closed()`` with nothing bounding it."""
+    pool, executor = _FakePool(park_on_wait=True), _FakeExecutor()
+    store, calls = _sqlserver(pool, executor)
+    store.checkpoint_cipher_invocations = AsyncMock()
+    await _cancel_at(store._close_handles, pool.entered)
+    assert pool.waited == 1
+    await asyncio.wait_for(store._close_handles(), _REPEAT_CLOSE_BOUND_SECONDS)
+    assert pool.waited == 1
+    assert calls == ["sync", "holders"]  # no second teardown
+
+
+async def test_sqlserver_plain_double_close_still_waits_twice() -> None:
+    """The control: a pool wait that completed is not short-circuited."""
+    pool, executor = _FakePool(), _FakeExecutor()
+    store, _calls = _sqlserver(pool, executor)
+    store.checkpoint_cipher_invocations = AsyncMock()
+    await store._close_handles()
+    await store._close_handles()
+    assert pool.waited == 2
+
+
 async def test_sqlserver_sync_pool_failure_leaves_before_the_unbounded_pool_wait() -> None:
-    """As before this change: _one_connection_store's fallback bounds the wait on this path."""
+    """As before this change, the failure leaves before the pool step and nothing here bounds a
+    later wait. On an ``open()``-built store no fallback closes the pool after it."""
     pool, executor = _FakePool(), _FakeExecutor()
     store, calls = _sqlserver(pool, executor)
 

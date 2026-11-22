@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A connection event's sealed reason opens whatever numeric spelling its timestamp was written in.
 
-Pin for BACKLOG #5690, which BACKLOG #5962 fixed in ``store/crypto.py``'s ``_aad_component``: the
-column hands back a float, so an ``int`` or ``-0.0`` written into it must bind the same AAD.
+BACKLOG #5962 fixed this in ``store/crypto.py``'s ``_aad_component``: the column hands back a float,
+so an ``int`` or ``-0.0`` written into it must bind the same AAD. This runs that shared code through
+the SQLite store only. It does not exercise SQL Server, the backend BACKLOG #5690 names.
 """
 
 from __future__ import annotations

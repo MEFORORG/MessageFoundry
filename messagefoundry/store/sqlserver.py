@@ -6008,14 +6008,29 @@ class SqlServerStore:
             if callable(release):
                 release()
 
+    #: Set when a cancel cut this store's ``wait_closed()``. The pool may be wedged, so a repeat close
+    #: must not await it again with nothing bounding it (BACKLOG #5668).
+    _pool_wait_cut: bool = False
+
+    async def _await_pool_closed(self) -> None:
+        try:
+            await self._pool.wait_closed()
+        except asyncio.CancelledError:
+            self._pool_wait_cut = True
+            raise
+
     async def _close_handles(self) -> None:
         # BACKLOG #5668: a cancellation must not skip a later step. With none held, a step's own
-        # failure still leaves before the pool step: _one_connection_store's fallback bounds that
-        # wait. With one held, the failure is logged and the pool wait is under the cancel's bound.
+        # failure still leaves before the pool step, so the pool is not closed here; only
+        # _one_connection_store's fallback closes it after that, and an open()-built store has no
+        # such fallback. With one held, the failure is logged and the pool wait is under the
+        # cancel's bound. A repeat after that bound cut the wait has nothing it can safely wait on.
+        if self._pool_wait_cut:
+            return
         steps = CloseSteps()
         await steps.run(self._settle_at_close(), "the AES-GCM settlement")
-        # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
-        # opened, so it never affects the async path). ADR 0071 B5.
+        # Tear down any synchronous fused-handoff pools first (a no-op when none were opened, so it
+        # never affects the async path). With no cancel held, a failure here raises. ADR 0071 B5.
         if steps.cancelled:
             # Off the loop: a pyodbc close on a dead server blocks, and on the loop the bound could
             # not fire. This lets the close return; it does not stop the thread, so a blocked pyodbc
@@ -6042,7 +6057,7 @@ class SqlServerStore:
                 self._pool.close()
             except Exception as exc:  # noqa: BLE001 — absorb re-raises it unless a cancel is held
                 steps.absorb(exc)
-            await steps.run(self._pool.wait_closed(), "the connection pool")
+            await steps.run(self._await_pool_closed(), "the connection pool")
         finally:
             if self._pool_executor is not None:
                 self._pool_executor.shutdown(wait=False)
