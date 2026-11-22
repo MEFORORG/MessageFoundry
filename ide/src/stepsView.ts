@@ -106,6 +106,7 @@ import { buildSegmentScope, sampleSegments } from "./hl7scope";
 import { pickHl7Path, type PickScope } from "./hl7Picker";
 import { nonce } from "./cspNonce";
 import { STARTUP_BANNERS } from "./webviewMessaging";
+import { StepsPanelProjection, type HandlerType } from "./stepsPanel";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
 const RERENDER_DEBOUNCE_MS = 250;
@@ -183,16 +184,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   // undefined if the fetch fails (an older/unavailable engine) -> every param falls back to a text input.
   private opSchema: OpSchema | undefined;
   private opSchemaFetched = false;
-  // ADR 0104 §2.3 P2: handler name -> its recognized message type, stashed by render() from the lens parse
-  // (a projection of the current parse, never persisted state). Read by scopeFor to rank the picker.
-  private handlerTypes = new Map<
-    string,
-    { acceptsTypes?: string[]; inferredType?: { code?: string; trigger?: string } }
-  >();
-  // ADR 0076 Amendment D: each projected element's ROLE, stashed by render() from the same parse (a
-  // projection of THIS parse, never persisted state). The webview greys the out-of-role Add items; this
-  // is the provider-side half of the same rule, because inbound webview data is untrusted.
-  private handlerRoles = new Map<string, "handler" | "router">();
+  // A panel's handler message types and roles live on that panel's StepsPanelProjection, never here:
+  // this one provider serves every open Steps editor (BACKLOG #5843).
 
   constructor(
     private readonly version: string,
@@ -205,11 +198,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   /** The segment ranking/scope for a handler's recognized message type (ADR 0104 §2.3 P2). Undefined when
    *  there is no schema bundle or the type is unresolvable → the picker offers the generic, unscoped
    *  segment list. Reads the (synthetic, PHI-safe) sample so its Z-segments / segments union in. */
-  private scopeFor(handler: string): PickScope | undefined {
+  private scopeFor(t: HandlerType | undefined): PickScope | undefined {
     if (!this.schema) {
       return undefined;
     }
-    const t = this.handlerTypes.get(handler);
     let sample: string[] = [];
     if (this.samplePath) {
       try {
@@ -310,6 +302,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     let sawAlive = false;
     // One edit at a time + the webview↔document update-loop guard (ADR 0076 §5).
     const guard = new EditLoopGuard();
+    // What THIS panel's last render projected (BACKLOG #5843): read by the picker scope and the Router
+    // role check, so a second open Steps editor can never answer for this one.
+    const panelState = new StepsPanelProjection();
     // The typed rewrites applied since the webview was last projected, so an edit on one of their rows
     // is sent with the row's current source rather than refused as stale (BACKLOG #5943). render()
     // tells it which buffer each new webview was projected from.
@@ -411,17 +406,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       // parse is non-null here (shouldFallBackToText returned fallback:false only for a real handler set).
       const handlers = buildHandlerViewModels(parse as LensParseResult, source);
-      // ADR 0104 §2.3 P2: stash each handler's recognized message type for the field picker's scope (a
-      // projection of THIS parse — not persisted state).
-      this.handlerTypes = new Map(
-        (parse as LensParseResult).handlers.map((h) => [
-          h.handler,
-          { acceptsTypes: h.accepts_types, inferredType: h.inferred_type },
-        ]),
-      );
-      this.handlerRoles = new Map(
-        (parse as LensParseResult).handlers.map((h) => [h.handler, h.role ?? "handler"]),
-      );
+      // ADR 0104 §2.3 P2 and ADR 0076 Amendment D: stash each element's message type (the field picker's
+      // scope) and role (the Router purity check) for THIS panel (a projection of THIS parse).
+      panelState.update(parse as LensParseResult);
       // Live values come from a SECOND `dryrun --trace` that reads the module FROM DISK, but the rows
       // above are projected from the LIVE buffer. While the buffer is dirty (an unsaved structural edit
       // shifted rows relative to disk — or any unsaved change made buffer != disk) the disk trace's line
@@ -648,7 +635,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       const picked = await pickHl7Path(this.schema, {
         mode,
-        scope: this.scopeFor(coords.handler),
+        scope: this.scopeFor(panelState.typeOf(coords.handler)),
         verified: this.structures?.verified,
         seed,
       });
@@ -924,7 +911,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // A router stays pure destination-selection (ADR 0076 D.6): refuse an item that authors a
           // transform verb, a lookup, a diagnostic or an outbound send inside one. The engine refuses it
           // too; this stops the request before it becomes an error toast the user has to read.
-          if (!itemAllowedInRole(item, this.handlerRoles.get(m.handler) ?? "handler")) {
+          if (!itemAllowedInRole(item, panelState.roleOf(m.handler))) {
             void vscode.window.showWarningMessage(
               `MessageFoundry: "${item.label}" is not available in a Router — a Router selects destinations, it does not transform the message.`,
             );
