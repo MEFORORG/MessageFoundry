@@ -631,32 +631,34 @@ def test_cli_json_reports_every_family_and_no_secret(
     assert by_hop["smtp"]["state"] == "not_probed"
 
 
-#: ESC, DEL, a C1 control (CSI), RIGHT-TO-LEFT OVERRIDE and LINE SEPARATOR: each one a terminal or
-#: a line reader acts on. ``--json`` output must carry them as ``\uXXXX`` escapes (BACKLOG #2891,
-#: PR 2390 note 3).
-_HOSTILE = "a\x1b[31mb\x7fc\x9bd‮e f"
+#: ESC, DEL, a C1 control (CSI), RIGHT-TO-LEFT OVERRIDE and LINE SEPARATOR. ``json.dumps`` always
+#: escapes ESC; it escapes the other four only under ``ensure_ascii``, so ``--json`` output must
+#: carry each as a ``\uXXXX`` escape (BACKLOG #2891, PR 2390 note 3).
+_HOSTILE = "a\x1b[31mb\x7fc\x9bd\u202ee\u2028f"
 
 
 def _assert_escaped(out: str) -> None:
-    assert out.isascii(), f"--json output carries a non-ASCII character: {out!r}"
-    controls = [ch for ch in out.rstrip("\n") if ch < " " or ch == "\x7f"]
-    assert not controls, f"--json output carries a control: {out!r}"
-    for escape in ("\\u001b", "\\u007f", "\\u009b", "\\u202e", "\\u2028"):
-        assert escape in out
+    line = out.rstrip("\n")
+    assert line.isascii() and line.isprintable(), f"--json output carries a raw character: {out!r}"
+    for ch in sorted({ch for ch in _HOSTILE if not (ch.isascii() and ch.isprintable())}):
+        assert f"\\u{ord(ch):04x}" in out, f"--json output lacks the escape for {ch!r}: {out!r}"
+
+
+def test_the_escape_assertion_fails_on_unescaped_json() -> None:
+    """The control for :func:`_assert_escaped`: output written without ``ensure_ascii`` fails it."""
+    with pytest.raises(AssertionError):
+        _assert_escaped(json.dumps({"error": _HOSTILE}, ensure_ascii=False))
+    _assert_escaped(json.dumps({"error": _HOSTILE}))
 
 
 def test_cli_json_result_escapes_controls_and_bidi_in_a_detail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _clear_env(monkeypatch)
-    _stub_probe(
-        monkeypatch,
-        StorePrivilegeReport(
-            backend=StoreBackend.SQLSERVER,
-            status=StorePrivilegeStatus.UNOBSERVABLE,
-            detail=_HOSTILE,
-        ),
+    report = dataclasses.replace(
+        _unobservable_report(), backend=StoreBackend.POSTGRES, detail=_HOSTILE
     )
+    _stub_probe(monkeypatch, report)
     argv = ["check-privileges", "--service-config", str(_server_toml(tmp_path)), "--json"]
     assert main(argv) == 4
     out = capsys.readouterr().out
