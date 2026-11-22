@@ -2,7 +2,7 @@
   hop, and refuses three TLS settings no hop of it applies.** (`BACKLOG #2977`) The sidecar makes
   the TLS connection to the partner, so the opener the engine built for the direct hop was
   discarded, but it loaded the CRL first, and a CRL the check rejects failed a connection that could
-  never consult it. That opener is now built with no CRL. `tls_allow_expired`, `tls_ca_file` and
+  never consult it. That opener is no longer built, so neither the CRL nor a `[tls].internal_ca_file` is loaded for that hop. `tls_allow_expired`, `tls_ca_file` and
   `tls_ca_pin` beside `ech_egress` are now refused at build, as `verify_tls = false` already was:
   the sidecar verifies the partner, and the engine verifies an `https://` sidecar against the
   system trust store. The refusal names the settings, not their values. The hop's revocation

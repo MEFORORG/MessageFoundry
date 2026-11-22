@@ -365,8 +365,8 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
     """With ECH the engine dials the loopback sidecar, and the sidecar verifies the destination.
 
     No context the engine holds checks that peer, so the guard is handed no opener on this arm. Before
-    vault BACKLOG #2977 item 7 the opener built before the sidecar swap carried the CRL, which is what
-    a guard placed above the swap would have read; it now loads no CRL."""
+    vault BACKLOG #2977 item 7 an opener for the direct hop was built first and carried the CRL, which
+    is what a guard handed that opener would have read; none is built now."""
     assert _LABEL["REST"] in _refused("REST", crl=pki["crl"], extra=_ECH)
     # CONTROL 1: the same CRL relaxes the same destination without the sidecar, so the refusal above
     # is the ECH arm and not a CRL that failed to load.
@@ -379,15 +379,46 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
 
 
 def test_a_bad_crl_file_is_not_reported_on_a_rest_ech_hop(pki: dict[str, str]) -> None:
-    """Vault BACKLOG #2977 item 7. With an ECH sidecar the opener built for the direct destination
-    hop is discarded, and the sidecar makes the partner TLS, so it loads no ``[tls].crl_file``. It
-    used to load the CRL, so a CRL the hop can never consult failed the connection."""
+    """Vault BACKLOG #2977 item 7. With an ECH sidecar no opener is built for the direct destination
+    hop, since the sidecar makes the partner TLS, so no ``[tls].crl_file`` is loaded. One used to be
+    built and discarded, and it loaded the CRL, so a CRL no hop consults failed the connection."""
     with active_hop_posture(PROD_PHI):
         dest = _build("REST", crl=pki["ca_and_crl"], revocation_attested=True, extra=_ECH)
     assert _checks_a_crl(dest) is False
     # CONTROL: the same CRL fails the same destination without the sidecar, so the build above
     # passes because the CRL was not loaded, not because it loads.
     _config_error("REST", r"crl_file", crl=pki["ca_and_crl"])
+
+
+@pytest.mark.parametrize("sidecar", [SIDECAR, f"https://{LOOPBACK}:8123"])
+def test_a_bad_internal_ca_does_not_fail_a_rest_ech_build(sidecar: str, tmp_path: Path) -> None:
+    """Vault BACKLOG #2977 item 7. An ECH REST connection builds no opener for the direct
+    destination hop, so it loads no ``[tls].internal_ca_file`` either: no hop of it reads that CA.
+    It used to build that opener, load the CA and discard it, so a bad CA failed the connection."""
+    bad = tmp_path / "internal-ca.pem"
+    bad.write_text("not a certificate\n", encoding="ascii")
+    policy = TrustAnchorPolicy(internal_ca_file=str(bad), mode="augment")
+
+    def build(extra: _Settings) -> object:
+        return build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings={**Rest(url=f"https://{REMOTE}/x").settings, **extra},
+                trust_anchor_policy=policy,
+                tls_revocation_attested=True,
+                tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
+            ),
+            egress=EgressSettings(deny_by_default=False, allowed_ech_sidecar=[f"{LOOPBACK}:8123"]),
+        )
+
+    with active_hop_posture(PROD_PHI):
+        dest = build({**_ECH, "ech_sidecar": sidecar})
+    assert _checks_a_crl(dest) is False
+    # CONTROL: the same CA still fails the same destination without the sidecar, so the build
+    # above passes because the CA was not loaded, not because it loads.
+    with active_hop_posture(PROD_PHI), pytest.raises(CaFileUnreadable):
+        build(_NONE)
 
 
 @pytest.mark.parametrize("sidecar", [SIDECAR, f"https://{LOOPBACK}:8123"])
@@ -452,7 +483,7 @@ def test_opener_is_a_required_keyword() -> None:
 # --- which opener the guard is handed, by identity ------------------------------------------------
 #
 # The arms above read the OUTCOME. These read the ARGUMENT, which is what the outcome cannot show in
-# two places. Handing the ECH arm its swapped plain opener refuses today exactly as handing it none
+# two places. Handing the ECH arm its plain sidecar opener refuses today exactly as handing it none
 # does, so only the argument tells the two apart. And a statement that replaced the opener below the
 # guard would leave every outcome arm green while the guard judged an opener the hop never uses.
 
