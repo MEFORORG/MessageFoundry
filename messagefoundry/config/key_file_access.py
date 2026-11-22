@@ -67,7 +67,7 @@ KEY_FILE_REMEDY: Final = (
     "Restrict it to the account the engine runs as, as a file rather than a link, with no junction "
     "or link above it, or folder holding or above one, that an account the check does not trust "
     "can change (it trusts at least SYSTEM and Administrators on Windows, root on POSIX, and the "
-    "engine's own account unless it is Local service or Network service) (Windows: in a "
+    "engine's own account unless it is Local service or Network service, or cannot be read) (Windows: in a "
     "directory no broad group "
     "may delete a file in or change the access list of; POSIX: a file that account owns, in a "
     "directory that account "

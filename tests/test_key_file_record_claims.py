@@ -186,4 +186,4 @@ def test_the_generated_key_remedy_names_the_trusted_accounts(
     # Step 11 (g): the delete-and-mint advice is for a refusal about the key's own owner, which
     # covers a broad-group owner too, and not for one about the directory's owner.
     assert "names who owns it" not in remedy
-    assert "is about who owns the key itself, rather than the directory that holds it" in remedy
+    assert "names who owns the key itself, rather than the directory that holds it" in remedy

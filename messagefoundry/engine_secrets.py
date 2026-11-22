@@ -116,7 +116,7 @@ _REMEDY: Final = (
     "directories rather than links, with no junction or link above them, or folder holding or "
     "above one, that an account the check does not trust can change (it trusts at least SYSTEM "
     "and Administrators on Windows, root on POSIX, and the engine's own account unless it is "
-    "Local service or Network service) (Windows: "
+    "Local service or Network service, or cannot be read) (Windows: "
     "in a folder no broad group may delete a file in or change the access list of; POSIX: the "
     "engine's own account, mode 0700 for the directory and 0600 for a file, in a folder that "
     "account or root owns and only it may write, or that has the sticky bit)"
