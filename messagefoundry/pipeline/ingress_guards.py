@@ -235,7 +235,8 @@ class IngressGuardError(Exception):
     ``phase`` names which guard fired (``"decode"`` or ``"size"``) and matches the live listener's ACK
     phase labels, so a caller that records dispositions can map it onto the same one the engine writes.
     :func:`admit_resubmitted_body` adds four more, ``"type"`` for the declared-type sniff,
-    ``"parse"`` for ``Peek.parse``, ``"ingest"`` for :func:`doc_ref_marker_refusal` and ``"strict"``
+    ``"parse"`` for a parse refusal, ``Peek.parse``'s among others, ``"ingest"`` for the
+    document-marker check, :func:`doc_ref_marker_refusal` among others, and ``"strict"``
     for strict ``hl7apy`` validation; the dry-run entry points never raise any of them.
 
     **Never raised with a body-holding error on its chain (BACKLOG #1796).** The caught error can hold
@@ -702,12 +703,12 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
 
     ``ic`` is ``None`` only on the edit-resend direct path, which writes an outbound row and so has no
     inbound to guard for; a re-route whose origin inbound is not registered is refused with a 409
-    before this runs. Only the engine-wide rules apply then, the NUL rule and the engine ceiling,
-    and, for a body that parses as HL7 and that the delivery re-attach's gate opens on
-    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), the **ingest** check: the
-    listeners' whole check on a body ``Peek.parse`` accepts, and the form limit alone on one only
-    the re-attach's own parse (``Message.parse``) accepts. Such a body the parser faults on is
-    refused at **parse**; ``raw`` is returned as is. Strict validation is an inbound's setting,
+    before this runs. The engine-wide rules apply then, at least the NUL rule and the engine
+    ceiling, and, for a body that the delivery re-attach's gate opens on
+    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), at least these: the listeners'
+    whole **ingest** check on a body ``Peek.parse`` accepts; a **parse** refusal of a body past
+    ``Peek.parse``'s segment cap, or one the parser faults on; and the form limit alone on one
+    only the re-attach's own parse (``Message.parse``) accepts. ``raw`` is returned as is. Strict validation is an inbound's setting,
     so it never applies there either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
     rule is ``docs/SECURITY.md`` control 5), so the ceiling is a backstop.
 
@@ -724,9 +725,9 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         # meets the listeners' document-marker refusal here, rather than being committed and then
         # dead-lettered (BACKLOG #5972). A body the parser refuses is left to the outbound, but a
         # fault in the parser refuses the body, as the re-attach re-raises one rather than admit
-        # what it could not read. A body Peek.parse refuses, such as an FHS- or BHS-led batch or
-        # one past its segment cap, is parsed again as the re-attach parses it, which reads both,
-        # and refused past the form limit, so it is not committed past that limit.
+        # what it could not read. A body Peek.parse refuses past its segment cap is refused. Another
+        # body it refuses, such as an FHS- or BHS-led batch, is parsed again as the re-attach parses
+        # it and refused past the form limit, so it is not committed past that limit.
         if not may_hold_doc_ref(raw):
             return raw
         # Raised once its handler has ended, so the parser's error is on no chain.
@@ -742,6 +743,14 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         if direct_peek is not None:
             _raise_if_marker_refused(direct_peek, raw)
             return raw
+        # Message.parse has no segment cap, so a body past the one Peek.parse enforces is refused
+        # here, unparsed, rather than parsed whole on the request (BACKLOG #5972).
+        try:
+            enforce_size_limits(normalize(raw), max_bytes=None)
+        except HL7PeekError as exc:
+            faulted = str(exc)
+        if faulted is not None:
+            raise IngressGuardError(faulted, phase="parse")
         try:
             message = Message.parse(raw)
         except HL7PeekError as exc:
