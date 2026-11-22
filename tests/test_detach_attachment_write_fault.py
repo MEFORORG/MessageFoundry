@@ -12,9 +12,10 @@ holds the frame and retries it until it is recorded or the inbound stops (BACKLO
 below pin those. A source that answers its sender keeps no copy: MLLP with replies NAKs or closes,
 and HTTP and DICOM receipt answer a failure, so the input survives only if the sender resends it
 (BACKLOG #1619 keeps the HTTP answer as an open item). A fault answered as a refusal
-would charge the refused-body allowance, and a body whose text no backend can encode would then fail
-the ``ERROR`` write as well, so each resend of it would drain the allowance for every other refused
-body on that inbound.
+would charge the refused-body allowance, so a fault the same body meets on every resend would drain
+the allowance for every other refused body on that inbound. A body whose decoded text holds a lone
+surrogate, which at least the SQLite store's write cannot encode, never reaches the detach: the
+decode refuses it and records it (BACKLOG #1619).
 
 What the detach does decide is the OBX-5.2 label, the one sender-controlled value a column could
 refuse: a label some backend's ``attachment.content_type`` cannot hold is stored as
@@ -282,7 +283,7 @@ async def test_a_fault_on_a_later_document_propagates_and_leaves_the_first_unref
     assert runner._stream_inflight_bytes == 0
 
 
-# --- a real lone surrogate in OBX-5.5 propagates before any allowance charge ---------------------
+# --- a real lone surrogate in the body is refused at decode, before any detach --------------------
 
 
 #: A fixed clock, so the allowance never refills between the attempt and the read-back.

@@ -46,10 +46,11 @@ def assert_no_records(
     level: int = logging.WARNING,
 ) -> None:
     """Fail when a captured record from ``logger`` or a child of it matches ``pred``, after
-    :func:`assert_capture_sees` has shown the capture sees ``logger`` at ``level``, so the probe and
-    the absence check name one logger (vault BACKLOG #3766 item 36)."""
+    :func:`assert_capture_sees_tree` has shown the capture sees ``logger`` and each child created
+    so far at ``level``, so the probe and the absence check cover one set of loggers (vault BACKLOG
+    #3766 item 36)."""
     log = logger if isinstance(logger, logging.Logger) else logging.getLogger(logger)
-    assert_capture_sees(caplog, log, level)
+    assert_capture_sees_tree(caplog, log.name, level)
     hits = [
         r.getMessage()
         for r in caplog.records

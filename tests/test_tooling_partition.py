@@ -143,7 +143,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # Reads the engine and console packages off disk with ast, and fails when a new reader of the
         # connection flag appears (BACKLOG #2623). What breaks it is an engine or console diff.
         "test_connection_flag_readers.py",
-        # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled out
+        # NOT engine source, but it meets the criterion above and the claim is spelled out
         # for review. Its subject is the TEST TREES: it scans both `testpaths` roots for a bare
         # `import conftest`, which binds to whichever root pytest loaded first (BACKLOG #1255). The
         # gating argument is the one that keeps test_control_char_check.py here, applied to a
@@ -154,7 +154,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # it would be deselected by `-m 'not tooling'` on the engine legs AND unreached by the
         # tooling job's path gate, so the PR that adds the offending import would face nothing.
         "test_conftest_name_collision_guard.py",
-        # NOT engine source, so this entry widens the list's stated rule, as
+        # NOT engine source, but it meets the criterion above, as
         # test_conftest_name_collision_guard.py above does. Its subject is docker/Dockerfile, a
         # shipped artifact: it holds the base image to a digest and every pip install to a hash
         # (BACKLOG #1193). A Dockerfile edit sets `code=true` but NOT `tooling=true`, so listed as
@@ -194,7 +194,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # which does not trip the tooling path gate, so as tooling it would face nothing there.
         "test_from_none_is_not_redaction.py",
         "test_licence_header_gate.py",
-        # NOT engine source, so this entry widens the list's stated rule, as
+        # NOT engine source, but it meets the criterion above, as
         # test_conftest_name_collision_guard.py does and for the same reason. Its subject is
         # tests/_log_absence.py, the positive control that at least the engine and console suites'
         # log-absence checks call (vault BACKLOG #3766 item 9). A change to that helper arrives as
@@ -213,7 +213,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # It loads scripts/release/forbidden_members.py by path; that is the RULE it reads, not its
         # subject.
         "test_packaged_tree_denylist.py",
-        # NOT engine source, so this entry widens the list's stated rule, as
+        # NOT engine source, but it meets the criterion above, as
         # test_conftest_name_collision_guard.py does and for the same reason. Its subject is the
         # test trees' log quiesce: it reads tests/conftest.py's ``_Baseline`` as pytest loaded it
         # and parses packaging/messagefoundry-webconsole/tests/conftest.py off disk (vault
@@ -234,7 +234,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # response emitter of a known shape against a register (BACKLOG #1120). A new emitter
         # arrives as an ENGINE diff, so as tooling it would face nothing on that change.
         "test_response_emitter_inventory.py",
-        # NOT engine source either, so this entry widens the list's stated rule and the claim is
+        # NOT engine source either, but it meets the criterion above and the claim is
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
         # security/runtime-closure-core.txt and holds that to two exported locks. The
@@ -248,7 +248,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_sandbox_worker_logging.py",
         "test_scan_forbidden.py",
         "test_scan_tokens_source.py",
-        # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled
+        # NOT engine source, but it meets the criterion above and the claim is spelled
         # out for review, as test_conftest_name_collision_guard.py and
         # test_risky_component_designation.py above do. Its subject is `.well-known/security.txt`,
         # and the gating argument is this file's standard one, checked against ci.yml rather than
@@ -264,8 +264,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
         # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #327).
         "test_security_txt_rfc9116.py",
-        # LEFT THE MANIFEST (vault BACKLOG #3652). NOT engine source, so this entry widens the
-        # list's stated rule, as test_conftest_name_collision_guard.py does. Its subject is the
+        # LEFT THE MANIFEST (vault BACKLOG #3652). NOT engine source, but it meets the
+        # criterion above, as test_conftest_name_collision_guard.py does. Its subject is the
         # server-DB store suites (tests/test_postgres_store.py, tests/test_sqlserver_store.py and
         # the others ci.yml's server-DB steps run): it AST-reads their messagefoundry imports and
         # holds ci.yml's `serverdb` arm to admit each one. What breaks it includes an engine
@@ -281,7 +281,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # `changes` job) is not tripped by one, so gating this behind scripts/** would
         # leave exactly the change that reintroduces the defect facing nothing.
         "test_username_access_key_screen.py",
-        # NOT engine source, so this entry widens the list's stated rule, as
+        # NOT engine source, but it meets the criterion above, as
         # test_conftest_name_collision_guard.py does and for the same reason. Its subject is the
         # TEST TREES: it AST-scans both `testpaths` roots for `assert not <collected list>` with no
         # earlier count assertion (BACKLOG #1746 limb 2). What it catches arrives as a new test in an
@@ -355,7 +355,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # those packages, or an edit to tests/_ast_sites.py; each arrives as an ENGINE, console,
         # toolkit or tests/ diff, and the tooling path gate sees none of them.
         "test_warn_query_credentials_callers.py",
-        # NOT engine source, so this entry widens the list's stated rule, as
+        # NOT engine source, but it meets the criterion above, as
         # test_risky_component_designation.py above does and for the same reason. It pins
         # security.yml's windows-lock-install job to the hashed runtime locks, and its
         # test_every_runtime_lock_exists reads requirements.lock, docker/locks/, security/locks/ and
@@ -373,7 +373,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # OIDC core allowlist entry excuses, as the control that the line stays clean (BACKLOG
         # #5445). A reworded comment arrives as an ENGINE diff the tooling path gate does not see.
         "test_scan_allowlist_whole_line_5445.py",
-        # NOT engine source, so this entry widens the list's stated rule, as
+        # NOT engine source, but it meets the criterion above, as
         # test_windows_lock_install.py above does and for the same reason (the path gate).
         # Pins the cap on the workers `pytest -n auto` starts: tests/_xdist_worker_cap.py and at
         # least the four places that register it, the `addopts` of pyproject.toml and of the web

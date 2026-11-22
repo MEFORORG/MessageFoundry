@@ -3007,11 +3007,11 @@ def _check_url_query_credentials(
     An ``env()`` URL is read against the environment values ``build-check`` loads, resolved as
     ``serve`` resolves them (:func:`_instance_env_values`, vault BACKLOG #3766 item 24), when a
     settings file or an environment declaration resolves and its values load. Otherwise it is read
-    by its literal ``default=``. Either way one that neither the values nor a default gives is not
-    read, and the detail says which reading ran, on a hit as on a clean graph (item 23). Settings
-    that are present but refused FAIL the line, as ``static-credentials`` does; values that do not
-    load are named, and the line falls back to the defaults. SKIPs when the graph will not load,
-    like its siblings."""
+    by its literal ``default=``, including where the settings are refused or the values do not
+    load, which the detail names. Either way one that neither the values nor a default gives, or
+    whose value does not resolve (a failed cast, say), is not read, and the detail says which
+    reading ran, on a hit as on a clean graph (item 23). SKIPs when the graph will not load, like
+    its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, query_credential_hops
 
     name = "url-query-credential"
@@ -3031,20 +3031,22 @@ def _check_url_query_credentials(
         cli: dict[str, dict[str, object]] | None = (
             {"environments": {"base_dir": str(project_root)}} if project_root is not None else None
         )
+        # The graph half needs no settings, so a refusal (which build-check reports) or values
+        # that do not load fall back to the defaults rather than drop the hops. Only the error's
+        # type is kept: a settings or decoder message can quote a configured value.
+        what = "the settings"
         try:
             settings = _load_check_settings(toml, cli=cli, env=env)
-        except _SETTINGS_LOAD_ERRORS as exc:
-            return _settings_refused(name, required=False, exc=exc)
-        try:
+            what = "the environment values"
             values = _instance_env_values(settings)
-        except (ValueError, OSError) as exc:
-            # The decoder's message names a line and column, never a value; the type alone is kept.
-            reading = f"{defaults_only}: the environment values did not load ({type(exc).__name__})"
+        except _SETTINGS_LOAD_ERRORS as exc:
+            reading = f"{defaults_only}: {what} did not load ({type(exc).__name__})"
         else:
             environment = settings.ai.environment
             reading = (
                 f"an env() url is read against the {environment!r} environment's values, else "
-                "its default=, so one that neither gives is not read"
+                "its default= where they hold no such key, so one that neither gives, or whose "
+                "value does not resolve, is not read"
                 if environment is not None
                 else f"{defaults_only}: the settings name no environment"
             )

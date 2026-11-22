@@ -2038,7 +2038,8 @@ def _resolved_setting(
 ) -> object:
     """A connection's ``key`` setting, an ``env()`` reference resolved as the build
     resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
-    values, or a key the values do not hold and no default. The graph readers share it, at least
+    values, a key the values do not hold and no default, or a value the resolution refuses, such
+    as one whose cast fails, with no fall back to the default. The graph readers share it, at least
     the DATABASE, ECH, FHIR path-form and query-credential ones (vault BACKLOG #3766 item 32)."""
     value = settings.get(key, default)
     if not isinstance(value, EnvRef):

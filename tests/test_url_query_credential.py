@@ -735,7 +735,22 @@ def test_control_an_env_url_the_values_do_not_hold_is_not_read(tmp_path: Path) -
     report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
     detail = next(x for x in report.results if x.name == "url-query-credential").detail
     assert "no outbound or FhirLookup url carries" in detail
-    assert "one that neither gives is not read" in detail
+    assert "so one that neither gives" in detail
+
+
+def test_refused_settings_still_list_a_literal_hit(tmp_path: Path) -> None:
+    """The graph half needs no settings, so settings that are refused fall back to the defaults
+    reading and keep listing a literal URL's hit, as the line did before it read any settings."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _write(tmp_path, _CONFIG)
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text('[store]\nbackend = "not-a-backend"\n', encoding="utf-8")
+    report = run_checks(cfg, run_lint=False, service_config=toml)
+    r = next(x for x in report.results if x.name == "url-query-credential")
+    assert r.ok and not r.required
+    assert "OB_KEYED (sig)" in r.detail
+    assert "the settings did not load" in r.detail and "not-a-backend" not in r.detail
 
 
 def test_a_hit_from_a_default_says_the_url_was_read_by_its_default(tmp_path: Path) -> None:
@@ -747,9 +762,15 @@ def test_a_hit_from_a_default_says_the_url_was_read_by_its_default(tmp_path: Pat
         'Rest(url="https://p.example.invalid/x?sig=SYNTHETIC-4")',
         'Rest(url=env("keyed_url", default="https://p.example.invalid/x?sig=SYNTHETIC-4"))',
     ).replace("from messagefoundry import ", "from messagefoundry import env, ")
-    report = run_checks(
-        _write(tmp_path, config), run_lint=False, service_config=tmp_path / "messagefoundry.toml"
+    cfg = _write(tmp_path, config)
+    # The values come from this test's own empty value file, not from the working directory's.
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(
+        _TOML + f'\n[environments]\nbase_dir = "{tmp_path.as_posix()}"\n', encoding="utf-8"
     )
+    (tmp_path / "environments").mkdir()
+    (tmp_path / "environments" / "dev.toml").write_text("", encoding="utf-8")
+    report = run_checks(cfg, run_lint=False, service_config=toml)
     detail = next(x for x in report.results if x.name == "url-query-credential").detail
     assert "OB_KEYED (sig)" in detail
     assert "else its default=" in detail
