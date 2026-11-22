@@ -261,20 +261,27 @@ async def test_an_mllp_mtls_sender_is_named_by_its_certificate_not_its_address(
     assert intake["cert_subject"] == f"CN={_PERSON}"
 
 
+class _Panic(BaseException):
+    """A stand-in for pyo3's ``PanicException``, which derives from ``BaseException``."""
+
+
+@pytest.mark.parametrize("raised", [RuntimeError, _Panic], ids=["exception", "base_exception"])
 async def test_a_defect_reading_the_subject_still_serves_the_sender(
     tmp_path: Path,
     store: MessageStore,
     tls_path: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    raised: type[BaseException],
 ) -> None:
     """The intake record is optional, so an unexpected exception from ``peer_subject`` on a plain
-    mTLS listener must not cut off a sender that was served before the record existed: the message is ACKed and stored
-    without a subject, and one ERROR line names the exception's type but not its message."""
+    mTLS listener must not cut off a sender that was served before the record existed: the
+    message is ACKed and stored without a subject, and one ERROR line names the exception's type
+    but not its message."""
     import messagefoundry.pki as pki
 
     def broken(_ssl_object: object) -> str | None:
-        raise RuntimeError(f"defect quoting {_PERSON}")
+        raise raised(f"defect quoting {_PERSON}")
 
     monkeypatch.setattr(pki, "peer_subject", broken)
     named = _ca("Partner CA")
@@ -295,8 +302,30 @@ async def test_a_defect_reading_the_subject_still_serves_the_sender(
     errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert len(errors) == 1, [r.getMessage() for r in errors]
     line = errors[0].getMessage()
-    assert "RuntimeError" in line and "broken" in line
+    assert raised.__name__ in line and "broken" in line
     assert _PERSON not in line and errors[0].exc_info is None
+
+
+@pytest.mark.parametrize("raised", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+def test_a_cancellation_or_exit_from_the_subject_read_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: type[BaseException]
+) -> None:
+    import messagefoundry.pki as pki
+
+    def stop(_ssl_object: object) -> str | None:
+        raise raised()
+
+    monkeypatch.setattr(pki, "peer_subject", stop)
+    named = _ca("Partner CA")
+    settings = _settings(tmp_path, [named[0]], None)  # mTLS, so the subject is read
+    source = MLLPSource(Source(type=ConnectorType.MLLP, settings=settings))
+
+    class _Writer:
+        def get_extra_info(self, name: str, default: object = None) -> object:
+            return default
+
+    with pytest.raises(raised):
+        source._intake(_Writer())  # type: ignore[arg-type]
 
 
 async def test_the_stored_context_holds_no_peer_address(

@@ -1684,6 +1684,16 @@ class MLLPDestination(DestinationConnector):
 # --- source ------------------------------------------------------------------
 
 
+#: What ``MLLPSource._intake`` re-raises from the certificate subject read rather than log and
+#: drop: a cancellation, which stop() relies on, and an interpreter exit (vault BACKLOG #2607).
+_RERAISED_FROM_INTAKE: tuple[type[BaseException], ...] = (
+    asyncio.CancelledError,
+    KeyboardInterrupt,
+    SystemExit,
+    GeneratorExit,
+)
+
+
 def _peer_host(writer: PeerInfo) -> str | None:
     """The peer IP from the socket for a connection-event row (#46) — socket metadata, never payload.
     ``None`` for a UNIX/unresolved peer."""
@@ -2892,13 +2902,16 @@ class MLLPSource(SourceConnector):
                 from messagefoundry.pki import peer_subject
 
                 subject = peer_subject(writer.get_extra_info("ssl_object"))
-            except Exception as exc:  # noqa: BLE001 -- the record is optional; the sender is not
-                # peer_subject already turns an unreadable certificate into None, so anything
-                # here is a defect. It is logged, and the sender is still served, as it was before
-                # this record existed: an optional record must not cut it off. A BaseException,
-                # such as a pyo3 PanicException, is not caught and still ends the connection.
-                # Its type and frames only, never its message, which could quote the
-                # certificate, and a subject can name a person.
+            except BaseException as exc:  # noqa: BLE001 -- the record is optional; the sender is not
+                # peer_subject already turns an unreadable certificate into None, so what lands
+                # here is a defect, a pyo3 PanicException (a BaseException) among them. It is
+                # logged, and the sender is still served, as it was before this record existed.
+                # A cancellation or an interpreter exit is not a defect of the read, so
+                # :data:`_RERAISED_FROM_INTAKE` is re-raised before anything is logged. The log line names
+                # the type and frames, never the message, which could quote the certificate, and
+                # a subject can name a person.
+                if isinstance(exc, _RERAISED_FROM_INTAKE):
+                    raise
                 frames = "; ".join(
                     f"{frame.filename}:{frame.lineno} in {frame.name}"
                     for frame in traceback.extract_tb(exc.__traceback__)
