@@ -202,8 +202,8 @@ _REFUSED_WEBHOOK_URLS = [
     # urlsplit drops these, so it would read the scheme as https.
     pytest.param(f"ht\ttps://hooks.example/{_WEBHOOK_TOKEN}", (), id="tab"),
     pytest.param(f"https\n://hooks.example/{_WEBHOOK_TOKEN}", (), id="lf"),
-    # Stripped by urllib's dial but not by urlsplit, so it is not stripped, and urlsplit then
-    # reads no scheme: refused at load as at the build.
+    # Stripped by urllib's dial but not by urlsplit, so it is not stripped: refused at load as at
+    # the build, by the whitespace-at-either-end check.
     pytest.param(f"\xa0https://hooks.example/{_WEBHOOK_TOKEN}", (), id="nbsp"),
     pytest.param(f"\u3000https://hooks.example/{_WEBHOOK_TOKEN}", (), id="ideographic-space"),
     # At the end, urlsplit keeps it in the host it judges and the dial strips it.
@@ -268,12 +268,20 @@ def test_an_https_or_unset_webhook_loads(url: str | None) -> None:
 
 
 def test_the_allowlist_judges_the_host_urllib_dials() -> None:
-    # An encoded dot dials hooks.example, so a list naming hooks.example admits it, and a list
-    # spelling the encoded form does not admit a host it never dials.
+    # An encoded dot dials hooks.example, so a list naming hooks.example admits it, and an entry
+    # that decodes to another host does not.
     url = "https://hooks%2Eexample/x"
     assert AlertsSettings(webhook_url=url, webhook_allowed_hosts=["hooks.example"]).webhook_url
     with pytest.raises(ValidationError, match="not in"):
-        AlertsSettings(webhook_url=url, webhook_allowed_hosts=["hooks%2eexample"])
+        AlertsSettings(webhook_url=url, webhook_allowed_hosts=["hooks%2eother"])
+
+
+def test_an_ipv6_zone_entry_written_as_the_url_spells_it_still_matches() -> None:
+    # Regression control: before the host was decoded, an entry spelled as in the URL ("%25")
+    # matched. It still does, since each entry is decoded too.
+    url = "https://[fe80::1%25eth0]/x"
+    alerts = AlertsSettings(webhook_url=url, webhook_allowed_hosts=["fe80::1%25eth0"])
+    assert alerts.webhook_url == url
 
 
 def test_a_listed_webhook_host_loads() -> None:

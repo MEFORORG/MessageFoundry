@@ -7,7 +7,7 @@
   build call one function for those checks. A command that loads settings, such as
   `provision-admin`, now stops on such a URL; before, `provision-admin` dropped an http webhook
   with a WARNING and ran. These refusals do not repeat the URL, whose path can carry the webhook's
-  token; the allowlist judges, and its refusal names, the host as urllib dials it, percent-decoded and lower-cased; a decoded host holding a space, control or non-ASCII character is refused. The WARNING the
+  token; the allowlist judges, and its refusal names, the host as urllib dials it, percent-decoded and lower-cased, against entries decoded the same way; a decoded host holding a space, control or non-ASCII character is refused. The WARNING the
   alert notifier logs for a failed webhook send now names the exception's class only, with no
   message and no traceback, since a send's exception text can quote the webhook URL; the other
   transports still log their exception and traceback. The static-credential
