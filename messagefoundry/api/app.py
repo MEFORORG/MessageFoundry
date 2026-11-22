@@ -4245,8 +4245,9 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: the same status the upload route gives a non-text file. A body the listener could not have decoded,
 #: an HL7 body ``Peek.parse`` or the document-marker check refuses, or one a ``validation.strict``
 #: inbound's strict hl7apy validation refuses or times out on, is 422. The edit-resend direct path
-#: refuses fewer bodies than the listener: ``admit_resubmitted_body`` says which, and a ``parse``
-#: refusal there is at least a parser fault or a body past ``Peek.parse``'s segment cap.
+#: refuses fewer bodies than the listener: ``admit_resubmitted_body`` says which. A ``parse``
+#: refusal there is at least a parser fault, and a body past ``Peek.parse``'s segment cap is a
+#: ``size`` refusal, as on a re-route.
 _INGRESS_GUARD_STATUS: dict[str, int] = {
     "size": 413,
     "type": 415,

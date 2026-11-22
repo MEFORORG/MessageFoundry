@@ -368,9 +368,10 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   (`UnreattachableDocumentError`). The count is read from the header lines alone, which the
   detach does not change, so a skeleton the detach grew is not refused for a count the
   listeners admitted; a payload a Handler built can be. The upload resend and both edit-resend
-  paths run the same listener check (`admit_resubmitted_body`). The direct path runs it only on
-  a body `Peek.parse` accepts; on another it runs fewer checks, and `admit_resubmitted_body`
-  says which. So a direct body the listeners would refuse for another
+  paths run the same listener check (`admit_resubmitted_body`). The direct path runs it on a
+  body `Peek.parse` accepts, and on one within that parse's segment cap that only the
+  re-attach's own parse accepts, such as an FHS- or BHS-led batch; on another it runs fewer
+  checks, and `admit_resubmitted_body` says which. So a direct body the listeners would refuse for another
   marker rule can still be committed and then refused at the re-attach. A
   body with no `MSH` never reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that

@@ -172,7 +172,8 @@ HEADER_FORMS_REFUSED_REASON = (
 
 
 #: The resubmission refusal when the document-marker check itself faults on a header read. Fixed
-#: text, so no fault's own message, which may quote the body, reaches the operator.
+#: text, followed only by the fault's type name, so no fault's own message, which may quote the
+#: body, reaches the operator.
 _MARKER_CHECK_FAULT_REASON = "document handle check failed reading the header"
 
 
@@ -765,8 +766,7 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         except HL7PeekError as exc:
             over_cap = str(exc)
         if over_cap is not None:
-            # The size phase, as the re-route answers the same body (an over-cap body is not a
-            # malformed one).
+            # The size phase, as the re-route answers the same body.
             raise IngressGuardError(over_cap, phase="size")
         try:
             message = Message.parse(raw)

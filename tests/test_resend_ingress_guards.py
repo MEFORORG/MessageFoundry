@@ -456,11 +456,13 @@ def test_guard_direct_path_refuses_the_marker_in_an_fhs_or_bhs_led_body() -> Non
     # the listeners' whole marker check on that parse rather than committing the body. The same
     # body led by MSH is refused at ingest too.
     from messagefoundry.parsing.peek import HL7PeekError, Peek
+    from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
 
     tail = "MSH|^~\\/|A|B\rNTE|1||mfdoc:v1:ref:x\r"
     with pytest.raises(IngressGuardError) as msh_led:
         admit_resubmitted_body(tail, None)
     assert msh_led.value.phase == "ingest"
+    assert msh_led.value.reason == DOC_REF_MARKER_REFUSED_REASON
     for lead in ("FHS", "BHS"):
         body = f"{lead}|^~\\/|APP\r" + tail
         with pytest.raises(HL7PeekError):
