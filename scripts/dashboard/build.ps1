@@ -24,9 +24,11 @@ param(
     [string]$Vault = 'D:/Code/MessageFoundry-vault',
     [ValidateRange(2, 104)][int]$Weeks = 8,
     [string]$OutDir = '',
-    # The engine git checkout for the release distance and the scorecard's --root. Empty: the
-    # checkout these scripts sit in, which the collector works out for itself.
+    # The engine git checkout for the release distance. Empty: the checkout these scripts sit in,
+    # which the collector works out for itself.
     [string]$EngineRepo = '',
+    # The engine commit these scripts were git-archived from, when they are no checkout.
+    [string]$ArchiveRef = '',
     # The interpreter as an argv prefix, for example 'py','-3.14'. Empty: py -3.14 when it runs,
     # else python on PATH.
     [string[]]$Python = @()
@@ -54,6 +56,7 @@ try {
     $collectArgs = @('-I', (Join-Path $PSScriptRoot 'collect_metrics.py'), '--vault', $Vault,
         '--out', $snapshot, '--weeks', $Weeks)
     if ($EngineRepo) { $collectArgs += @('--engine-repo', $EngineRepo) }
+    if ($ArchiveRef) { $collectArgs += @('--archive-ref', $ArchiveRef) }
     & $exe @prefix @collectArgs
     $collected = $LASTEXITCODE
     if ($collected -ne 0 -and $collected -ne 3) {

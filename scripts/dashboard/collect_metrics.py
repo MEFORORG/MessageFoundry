@@ -6,10 +6,11 @@
 WHAT IT READS, at least: the private vault at its ``origin/main`` (never its working tree, which
 may be dirty or on another branch); GitHub through an already-authenticated ``gh``; the public PyPI
 JSON for the ``messagefoundry`` package; the engine's ``origin/main`` for the release distance, in
-the git checkout ``--engine-repo`` names (default: the checkout this script sits in), which is also
-the ``--root`` the scorecard tool stamps as ``engine=``; and, from the tree THIS script sits in,
-``scripts/asvs/scorecard.py`` and ``scripts/ci/check_stalled_prs.py``, which it runs and imports.
-That tree need not be a git checkout: the scheduled refresh runs a ``git archive`` copy.
+the git checkout ``--engine-repo`` names (default: the checkout this script sits in); and, from the
+tree THIS script sits in, ``scripts/asvs/scorecard.py`` and ``scripts/ci/check_stalled_prs.py``,
+which it runs and imports. That tree need not be a git checkout: the scheduled refresh runs a
+``git archive`` copy, and passes ``--archive-ref`` with the commit it archived, because the
+scorecard tool then stamps ``engine=NO-GIT``.
 
 THE SNAPSHOT IS PRIVATE. It quotes counts read from the vault, so it must never land inside a git
 repository, where a ``git add .`` would publish it. ``--out`` is refused when its directory is inside
@@ -437,8 +438,10 @@ class Context:
     fetch: Fetcher = fetch_url
     #: The tree the engine scripts are run and imported from.
     engine_root: Path = ENGINE_ROOT
-    #: The engine git checkout for the release distance and the scorecard's ``--root``.
+    #: The engine git checkout for the release distance.
     engine_repo: Path = ENGINE_ROOT
+    #: The commit ``engine_root`` was ``git archive``d from, when it is no git checkout.
+    archive_ref: str | None = None
     #: The stalled-PR checker's runner; None uses its own retrying `gh` runner.
     stall_runner: Callable[[list[str], float], str] | None = None
     today: dt.date = field(default_factory=lambda: dt.datetime.now(dt.UTC).date())
@@ -835,8 +838,6 @@ def c_asvs(ctx: Context, m: Metric) -> None:
             str(ctx.engine_root / "scripts" / "asvs" / "scorecard.py"),
             "--scorecard",
             str(toml),
-            "--root",
-            str(ctx.engine_repo),
             "--status",
         ],
         ctx.engine_root,
@@ -850,6 +851,14 @@ def c_asvs(ctx: Context, m: Metric) -> None:
     pass_pct = round(100.0 * counts.get("pass", 0) / applicable, 1) if applicable else None
     provenance = [ln for ln in lines if ln.startswith("#")]
     engine_ref = asvs_engine_ref(provenance)
+    tool = (
+        "scripts/asvs/scorecard.py from the tree this collector runs from, whose ref engine= names"
+    )
+    if engine_ref is not None and "NO-GIT" in engine_ref and ctx.archive_ref:
+        # The tool ran from a git archive, so it could not stamp its own tree; the caller archived
+        # that tree from this commit, and says so.
+        engine_ref = f"{ctx.archive_ref}+archive"
+        tool = f"scripts/asvs/scorecard.py from a git archive of engine commit {ctx.archive_ref}"
     m.value = pass_pct
     m.status = status_pct(pass_pct, "asvs")
     m.detail = {
@@ -859,8 +868,7 @@ def c_asvs(ctx: Context, m: Metric) -> None:
         "scorecard_sha": v.sha,
         "engine_ref": engine_ref,
         "scorecard_ref": f"vault origin/main {v.sha} (archived, so the tool prints NO-GIT)",
-        "tool": "scripts/asvs/scorecard.py from this engine checkout, whose ref the provenance "
-        "line names",
+        "tool": tool,
         "history": "none: --status reads one ref and keeps no history",
         "state_as_of": "run time; --through does not apply",
     }
@@ -1237,8 +1245,14 @@ def main(argv: list[str] | None = None) -> int:
         "--engine-repo",
         type=Path,
         default=ENGINE_ROOT,
-        help="the engine git checkout for the release distance and the scorecard's --root "
-        "(default: the checkout this script sits in)",
+        help="the engine git checkout for the release distance (default: the checkout this "
+        "script sits in)",
+    )
+    ap.add_argument(
+        "--archive-ref",
+        default=None,
+        metavar="SHA",
+        help="the engine commit this script's tree was git-archived from, when it is no checkout",
     )
     ap.add_argument("--weeks", type=int, default=8, help="ISO weeks in the window (default 8)")
     ap.add_argument(
@@ -1277,7 +1291,9 @@ def main(argv: list[str] | None = None) -> int:
             weeks=args.weeks,
             workdir=tmp,
             today=today,
-            engine_repo=args.engine_repo,
+            # Resolved once, so a relative path names the same tree for every git call.
+            engine_repo=args.engine_repo.resolve(),
+            archive_ref=args.archive_ref,
         )
         metrics = collect(ctx)
         write_json_atomic(out, snapshot(ctx, metrics))

@@ -924,3 +924,30 @@ def test_archive_uses_literal_pathspecs(tmp_path: Path) -> None:
 
 def test_a_naive_timestamp_is_utc() -> None:
     assert cm.parse_stamp("2026-11-10T00:00:00").tzinfo is not None
+
+
+def test_release_distance_reads_the_engine_repo(tmp_path: Path) -> None:
+    seen: list[list[str]] = []
+
+    def run(argv: Sequence[str], cwd: Path | None) -> str:
+        seen.append(list(argv))
+        if "ls-remote" in argv:
+            return "aaa" + chr(9) + "refs/tags/v1.0.0"
+        return "1" if "rev-list" in argv else ""
+
+    ctx = _ctx(tmp_path, run)
+    ctx.engine_repo = tmp_path / "engine"
+    ctx.fetch = lambda url: json.dumps({"info": {"version": "1.0.0"}, "urls": []}).encode()
+    cm.c_release_distance(ctx, cm.Metric("release_distance", "", "", "", ""))
+    assert {a[2] for a in seen if a[0] == "git"} == {str(tmp_path / "engine")}
+
+
+def test_asvs_from_an_archive_names_the_archived_commit(tmp_path: Path) -> None:
+    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 1: 1 pass\n"
+    ctx = _asvs_ctx(tmp_path, printed)
+    ctx.archive_ref = "1a0c10fd3485"
+    m = cm.Metric("asvs", "", "", "", "")
+    cm.c_asvs(ctx, m)
+    assert m.detail["engine_ref"] == "1a0c10fd3485+archive"
+    assert "partial_error" not in m.detail
+    assert "git archive of engine commit 1a0c10fd3485" in m.detail["tool"]

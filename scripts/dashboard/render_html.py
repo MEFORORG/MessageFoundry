@@ -356,22 +356,22 @@ def render(data: dict[str, Any], *, source_name: str = "snapshot.json") -> str:
         [("Filed", "s2", _points(series, "Filed")), ("Closed", "s1", _points(series, "Closed"))],
         partial,
     )
+    # Series names and the CI bar come from their owners, so a rename or a new threshold shows here.
+    repos = [(name, f"s{i}") for i, (_, name) in enumerate(tr.repo_series(), start=1)]
     merged = stacked_chart(
         "Pull requests merged per week",
         weeks,
-        [
-            (n, c, _points(series, n))
-            for n, c in (("Engine", "s1"), ("Vault", "s2"), ("Korus", "s3"))
-        ],
+        [(n, c, _points(series, n)) for n, c in repos],
         partial,
     )
+    ci_bar = float(tr._collector().THRESHOLDS["ci_main"]["good_pct"])
     ci = line_chart(
         "CI pass percent on main per week",
         weeks,
         [("CI pass %", "s1", _points(series, "CI pass %"))],
         partial,
         top=100.0,
-        reference=90.0,
+        reference=ci_bar,
         unit="%",
     )
     tiles = "".join(tile(r, by_metric.get(str(r["id"]), [])) for r in headline)
@@ -397,7 +397,7 @@ def render(data: dict[str, Any], *, source_name: str = "snapshot.json") -> str:
 <section class="chart"><h2>Ledger rows filed and closed</h2>{burn}
 {legend([("Filed", "s2"), ("Closed", "s1")])}</section>
 <section class="chart"><h2>Pull requests merged per week</h2>{merged}
-{legend([("Engine", "s1"), ("Vault", "s2"), ("Korus", "s3")])}</section>
+{legend(repos)}</section>
 <section class="chart"><h2>CI pass percent on main</h2>{ci}
 {legend([("CI pass %", "s1")])}</section>
 </div>
@@ -449,7 +449,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not isinstance(data, dict):
         print(f"ERROR: {args.snapshot} is not a snapshot object", file=sys.stderr)
         return 1
-    page = render(data, source_name=args.snapshot.name)
+    # The footer names the copy published beside the page, not the input, which may be temporary.
+    page = render(data, source_name="snapshot.json")
     try:
         out.mkdir(parents=True, exist_ok=True)
         # The snapshot first: a page is never newer than the data published beside it.

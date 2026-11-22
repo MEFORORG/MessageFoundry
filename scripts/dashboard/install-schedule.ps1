@@ -8,6 +8,8 @@ Register (or, with -Uninstall, remove) the "MEFOR Dashboard Refresh" scheduled t
 The task runs scheduled-refresh.ps1 through `pwsh -NoProfile -File` at each of -Times, local time.
 The runner is copied to %LOCALAPPDATA%\MEFOR\dashboard first, so the task points at a path no work
 tree owns. -Force re-registers, so running this again replaces the task rather than adding one.
+The copy is frozen at install time: after scheduled-refresh.ps1 changes on main, run this again.
+The build scripts themselves are not frozen; the runner archives them from -Ref on every run.
 
 The task runs only while the user is logged on (LogonType Interactive), so no password is stored.
 It starts when available after a missed time, stops after 30 minutes, and skips a run while one is
@@ -47,11 +49,13 @@ if ($Uninstall) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'scheduled-refresh.ps1') -Destination $runner -Force
     $pwsh = (Get-Command pwsh).Source
     $action = New-ScheduledTaskAction -Execute $pwsh `
-        -Argument "-NoProfile -File `"$runner`" -Ref `"$Ref`""
+        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$runner`" -Ref `"$Ref`""
     $triggers = @($Times | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ })
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
+    # Battery is no reason to skip a refresh: the defaults would never start a laptop's run.
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 30) `
+        -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
         -Principal $principal -Settings $settings -Force | Out-Null
     Write-Output "registered task: $TaskName at $($Times -join ', ') local, runner $runner, ref $Ref"

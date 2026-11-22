@@ -7,11 +7,11 @@ Unattended dashboard refresh: build the page from a git archive of -Ref, never f
 .DESCRIPTION
 Work trees come and go, so this runner reads none of them. It:
 
-1. runs `git -C <EngineRepo> fetch origin` and `git -C <Vault> fetch origin`, which move only
-   remote-tracking refs and never touch either work tree;
-2. resolves -Ref to a commit and `git archive`s the scripts the build needs (scripts/dashboard,
-   which it runs; scripts/asvs and scripts/ci, which the collector runs and imports) into a fresh
-   directory under TEMP, outside every work tree;
+1. runs `git -C <EngineRepo> fetch --no-tags origin`, which moves only remote-tracking refs and
+   touches no work tree, then the same in the vault; a failed vault fetch is a warning, because the
+   collector fetches the vault itself and confines that failure to the vault metrics;
+2. resolves -Ref to a commit and `git archive`s all of scripts/ at it into a fresh directory under
+   TEMP, outside every work tree, so a new import in the build needs no change here;
 3. runs that copy's build.ps1, so the page lands in the dashboard directory render_html.py
    resolves (MEFOR_DASHBOARD_DIR, else the OneDrive or profile default);
 4. appends one line (UTC time, ref commit, exit code, URL) to build.log in that directory, keeping
@@ -35,10 +35,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-#: The engine paths the build reads from the archived copy. collect_metrics.py runs
-#: scripts/asvs/scorecard.py and imports scripts/ci/check_stalled_prs.py, which imports
-#: scripts/ci/_pr_checks.py.
-$ArchivePaths = @('scripts/dashboard', 'scripts/asvs', 'scripts/ci')
+#: The engine paths the build reads from the archived copy: the whole of scripts/, so the list
+#: never lags what collect_metrics.py runs and imports.
+$ArchivePaths = @('scripts')
 
 function Invoke-Git([string[]]$GitArgs) {
     $out = & git @GitArgs
@@ -55,20 +54,36 @@ function Resolve-Python([string[]]$Given) {
     return , @('python')
 }
 
+function Get-FallbackOutDir {
+    # render_html.py owns this rule; this copy is used only when the run failed before the
+    # archived render_html.py could be asked, so an early failure is still logged.
+    if ($env:MEFOR_DASHBOARD_DIR) { return $env:MEFOR_DASHBOARD_DIR }
+    $home_ = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+    $onedrive = Join-Path $home_ 'OneDrive\Desktop\MEFOR'
+    if (Test-Path -LiteralPath $onedrive -PathType Container) { return (Join-Path $onedrive 'dashboard') }
+    return (Join-Path $home_ 'MEFOR\dashboard')
+}
+
 function Write-BuildLog([string]$Dir, [string]$Line) {
-    # Only into a directory a render already made: a run that never rendered must not create one
-    # where the work-tree refusal was never asked.
-    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) {
-        [Console]::Error.WriteLine("build.log not written (no dashboard directory): $Line")
+    # Only beside a page a render already published there: that render passed the work-tree
+    # refusal, and a directory that was refused, or never made, gets nothing written into it.
+    if (-not $Dir -or -not (Test-Path -LiteralPath (Join-Path $Dir 'index.html') -PathType Leaf)) {
+        [Console]::Error.WriteLine("build.log not written (no published page in '$Dir'): $Line")
         return
     }
     $log = Join-Path $Dir 'build.log'
-    $lines = @()
-    if (Test-Path -LiteralPath $log) { $lines = @(Get-Content -LiteralPath $log -Encoding utf8) }
-    $lines = @($lines + $Line | Select-Object -Last 200)
     $tmpLog = "$log.$([guid]::NewGuid().ToString('N')).tmp"
-    Set-Content -LiteralPath $tmpLog -Value $lines -Encoding utf8
-    Move-Item -LiteralPath $tmpLog -Destination $log -Force
+    try {
+        $lines = @()
+        if (Test-Path -LiteralPath $log) { $lines = @(Get-Content -LiteralPath $log -Encoding utf8) }
+        $lines = @($lines + $Line | Select-Object -Last 200)
+        Set-Content -LiteralPath $tmpLog -Value $lines -Encoding utf8
+        Move-Item -LiteralPath $tmpLog -Destination $log -Force
+    } catch {
+        # A log that will not write (OneDrive holding the file) never changes the run's result.
+        Remove-Item -LiteralPath $tmpLog -Force -ErrorAction SilentlyContinue
+        [Console]::Error.WriteLine("WARNING: build.log not written: $($_.Exception.Message)")
+    }
 }
 
 $py = Resolve-Python $Python
@@ -79,8 +94,12 @@ $outDir = ''
 $code = 1
 try {
     New-Item -ItemType Directory -Path $tmp | Out-Null
-    Invoke-Git @('-C', $EngineRepo, 'fetch', '--quiet', 'origin') | Out-Null
-    Invoke-Git @('-C', $Vault, 'fetch', '--quiet', 'origin') | Out-Null
+    Invoke-Git @('-C', $EngineRepo, 'fetch', '--quiet', '--no-tags', 'origin') | Out-Null
+    try {
+        Invoke-Git @('-C', $Vault, 'fetch', '--quiet', '--no-tags', 'origin') | Out-Null
+    } catch {
+        [Console]::Error.WriteLine("WARNING: vault fetch failed, the collector retries it: $($_.Exception.Message)")
+    }
     $sha = (Invoke-Git @('-C', $EngineRepo, 'rev-parse', '--verify', "$Ref^{commit}") | Select-Object -First 1).Trim()
     $tar = Join-Path $tmp 'src.tar'
     Invoke-Git (@('-C', $EngineRepo, 'archive', '--format=tar', '-o', $tar, $sha, '--') + $ArchivePaths) | Out-Null
@@ -96,7 +115,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "render_html.py --print-out-dir exited $LASTEXITCODE" }
 
     $build = Join-Path $src 'scripts\dashboard\build.ps1'
-    $output = @(& $build -Vault $Vault -Weeks $Weeks -EngineRepo $EngineRepo -Python $py)
+    $output = @(& $build -Vault $Vault -Weeks $Weeks -EngineRepo $EngineRepo -ArchiveRef $sha -Python $py)
     $code = $LASTEXITCODE
     $output | ForEach-Object { Write-Output $_ }
     $url = @($output | Where-Object { "$_" -like 'file:///*' } | Select-Object -Last 1) -join ''
@@ -109,6 +128,7 @@ try {
         [Console]::Error.WriteLine("WARNING: could not remove temporary $tmp")
     }
 }
+if (-not $outDir) { $outDir = Get-FallbackOutDir }
 $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 $shown = if ($url) { $url } else { 'none' }
 Write-BuildLog $outDir "$stamp ref=$Ref sha=$sha exit=$code url=$shown"
