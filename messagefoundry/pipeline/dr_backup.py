@@ -3483,8 +3483,8 @@ def _teardown_staging(
             ", ".join(unrecorded),
         )
     else:
-        # Through `_HeldStagingDir`, which says where it goes by path; a link or a FIFO planted at
-        # either name is never opened (BACKLOG #2420).
+        # Through `_HeldStagingDir`, which says where it goes by path; on POSIX, where the
+        # directory is open, the exclusive create does not follow a planted link (BACKLOG #2420).
         try:
             with _HeldStagingDir(path) as held_dir:
                 for name in (_LOCK_NAME, _HELD_MARKER_NAME):
@@ -4330,8 +4330,8 @@ def _proven_abandoned(path: Path, owner: object) -> bool:
     logged, except at least a live run's lock, a missing lock or marker, and a candidate gone by its
     open.
 
-    The owner is read by path first, so another account's directory is never opened at all. Where
-    :class:`_HeldStagingDir` has the directory open, the owner is read again from it, and that
+    The owner is read by path first; when it cannot be read, the sweep logs it as another owner.
+    Where :class:`_HeldStagingDir` has the directory open, the owner is read again from it, and that
     read decides; where it goes by path, the first read is the only one, as before. What that class
     leaves to a path is said there (BACKLOG #2420)."""
     if _owner_of(path) != owner:
