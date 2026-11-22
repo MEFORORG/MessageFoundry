@@ -10,16 +10,21 @@ persisted AES-GCM invocation bound is charged for the whole burst first, and the
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Any, Final
 
-from messagefoundry.store.crypto import Cipher, cell_aad
+from messagefoundry.store.crypto import Cipher, cell_aad, encrypt_many
 from messagefoundry.store.gcm_bound import AddInvocations, reserve_invocations_ahead
 from messagefoundry.store.metadata import encode_reference_value
 from messagefoundry.store.sealed_cache import SealedDict, sealed_reference_set
 
-__all__ = ["REFERENCE_INSERT_BATCH", "SealedSnapshot", "seal_reference_snapshot"]
+__all__ = [
+    "REFERENCE_INSERT_BATCH",
+    "SealedSnapshot",
+    "apply_converged",
+    "seal_reference_snapshot",
+]
 
 #: Rows per INSERT round trip on the server backends. SQL Server takes at most 2100 parameters per
 #: statement and four are bound per row. On Postgres it keeps each ``executemany`` well inside the
@@ -57,29 +62,48 @@ async def seal_reference_snapshot(
 
     encoded = await asyncio.to_thread(_encode)
 
-    failures: list[Exception] = []
+    failure: Exception | None = None
 
     async def _recording_add(key_id: str, count: int) -> int:
+        nonlocal failure
         try:
             return await add_invocations(key_id, count)
         except Exception as exc:
-            failures.append(exc)
+            failure = exc
             raise
 
     await reserve_invocations_ahead(cipher, _recording_add, len(encoded))
-    if failures:
-        raise failures[0]
+    if failure is not None:
+        raise failure
 
     def _seal() -> SealedSnapshot:
-        sealed = [
-            (
-                name,
-                version,
-                k,
-                cipher.encrypt(text, aad=cell_aad("reference", "value", name, version, k)),
-            )
-            for k, text in encoded
-        ]
+        values = encrypt_many(
+            cipher,
+            [(text, cell_aad("reference", "value", name, version, k)) for k, text in encoded],
+        )
+        sealed = [(name, version, k, value) for (k, _), value in zip(encoded, values, strict=True)]
         return SealedSnapshot(rows=sealed, cache=sealed_reference_set(name, encoded))
 
     return await asyncio.to_thread(_seal)
+
+
+def apply_converged(
+    live_cache: MutableMapping[str, Any],
+    live_versions: MutableMapping[str, str],
+    held: Mapping[str, str],
+    cache: Mapping[str, Any],
+    versions: Mapping[str, str],
+) -> list[str]:
+    """Swap in each set whose shared version differs, and return the names swapped.
+
+    ``held`` is ``live_versions`` as it stood before the read. A set whose live version moved during
+    the read is left alone, since the read may predate that write. If the shared version is newer
+    still, the next pass picks it up."""
+    refreshed: list[str] = []
+    for name, version in versions.items():
+        live = live_versions.get(name)
+        if live == held.get(name) and live != version:
+            live_cache[name] = cache[name]
+            live_versions[name] = version
+            refreshed.append(name)
+    return refreshed

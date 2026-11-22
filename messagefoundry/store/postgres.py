@@ -203,7 +203,11 @@ from messagefoundry.store.queue_tag import (
     reseal_unless_tag_failure,
     set_aside_deadline,
 )
-from messagefoundry.store.reference_seal import REFERENCE_INSERT_BATCH, seal_reference_snapshot
+from messagefoundry.store.reference_seal import (
+    REFERENCE_INSERT_BATCH,
+    apply_converged,
+    seal_reference_snapshot,
+)
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
@@ -3552,15 +3556,9 @@ class PostgresStore:
         predate that write. If the shared version is newer still, the next pass picks it up."""
         held = dict(self._reference_versions)
         cache, versions = await self._read_active_reference_snapshots()
-        refreshed: list[str] = []
-        for name, version in versions.items():
-            if self._reference_versions.get(name) != held.get(name):
-                continue
-            if self._reference_versions.get(name) != version:
-                self._reference_cache[name] = cache[name]
-                self._reference_versions[name] = version
-                refreshed.append(name)
-        return refreshed
+        return apply_converged(
+            self._reference_cache, self._reference_versions, held, cache, versions
+        )
 
     def enable_state_convergence(self) -> None:
         """Turn on per-namespace state-version bumping (Track B Step 6b). The engine calls this whenever
