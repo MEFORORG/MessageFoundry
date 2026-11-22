@@ -13,6 +13,7 @@ Synthetic values only.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -28,6 +29,8 @@ from tests._serviceenv_remedy import CREATE, KEEP, REMOVE, RUNS_ON
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
 _PLAIN = "Parameters\\AppEnvironment"
+#: A synthetic stand-in for a store key: its ``=`` padding makes it look like ``NAME=``.
+_KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
 
 
 @dataclass
@@ -106,16 +109,42 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
 
 @pytest.mark.parametrize(
     "entry",
-    ["MEFOR_VALUE_A=\nOTHER=1", "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d"],
+    [
+        "MEFOR_VALUE_A=\nOTHER=1",
+        "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d",
+        "MEFOR_VALUE_A=\n   ",
+    ],
+    ids=["assignment", "directory-assignment", "blank-line"],
 )
 def test_a_name_empty_on_its_own_line_is_only_deleted(entry: str) -> None:
-    """The Lander's seventh hold on PR 3142: content is a name's own value, up to its first
-    line break. The lines after it in the same item give the name none, so the refusal says only
-    to delete it."""
+    """The Lander's seventh hold on PR 3142, as corrected in its eighth round: a later line
+    that is a ``NAME=`` assignment sets another variable, and a blank one adds nothing, so the
+    name has no content and the refusal says only to delete it."""
     refusal = service_env_refusal(_read([entry]))
     assert refusal is not None
     assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
     assert "Put " not in refusal and CREATE not in refusal and KEEP not in refusal
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        [(_EXTRA, "MEFOR_VALUE_A=\nhunter2")],
+        [(_EXTRA, "MEFOR_VALUE_A=\n-----BEGIN X-----\nAAAA\n-----END X-----")],
+        [(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "hunter2")],
+        [(_EXTRA, "MEFOR_VALUE_A=\n#x")],
+        [(_EXTRA, f"MEFOR_VALUE_A=\n{_KEY_B64}")],
+    ],
+    ids=["next-line", "pem-from-line-2", "next-item", "comment-only-line", "key-with-padding"],
+)
+def test_a_value_that_starts_on_a_later_line_is_moved(pairs: list[tuple[str, str]]) -> None:
+    """The Lander's eighth round on PR 3142: a later line, or the item joined after an empty
+    value, is the name's content unless it is a ``NAME=`` assignment, so Put prints. ``#`` is
+    nothing special, so ``#x`` is content too."""
+    refusal = service_env_refusal(_read_pairs(pairs))
+    assert refusal is not None
+    assert "Put each MEFOR_VALUE_* variable in the secrets directory" in refusal
+    assert "hunter2" not in refusal and "AAAA" not in refusal
 
 
 def test_a_name_empty_in_one_entry_and_joined_to_a_directory_in_another_moves_nothing() -> None:

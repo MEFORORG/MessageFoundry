@@ -173,9 +173,8 @@ class ServiceEnvPosture:
     #: keep it. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
     #: The ``MEFOR_VALUE_<KEY>`` names no entry sets to content of its own: each variable
-    #: :func:`_names` keeps for one has an own value, up to its first line break, that is empty
-    #: or blank, or takes only a joined directory entry. The remedy alone reads this, never the
-    #: refusal itself.
+    #: :func:`_names` keeps for one has no content (:func:`_has_content`), or takes only a
+    #: joined directory entry. The remedy alone reads this, never the refusal itself.
     contentless_value_names: tuple[str, ...] = field(default=(), repr=False)
 
     @property
@@ -369,6 +368,8 @@ _PLAIN_PATH = re.compile(
     r"(?=[A-Za-z0-9 ._()-]*[A-Za-z0-9])[A-Za-z0-9 ._()-]+(?:[\\/][A-Za-z0-9 ._()\\/-]*)?"
 )
 _EITHER_KEY_RUN = re.compile(r"[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43}")
+#: For the remedy only: a line that starts a ``NAME=`` assignment (:func:`_sets_a_name`).
+_ASSIGNMENT = re.compile(r"\s*[A-Za-z_][A-Za-z0-9_]*\s*=")
 
 #: One 32-byte secret, whole (vault BACKLOG #5394 added items 6 and 12): 43 characters of the
 #: standard base64 alphabet and its one ``=``, as a store key is written, or 43 of the base64url
@@ -1067,7 +1068,7 @@ def read_service_env_posture(
         contentless_value_names=_every_kept(
             variables,
             [f for f in found if f[0].startswith(_VALUE_PREFIX) and f[0] != _VALUE_PREFIX],
-            lambda v: v.directory_only or not _own_value(v) or _own_value(v).isspace(),
+            lambda v: v.directory_only or not _has_content(v),
         ),
         # Fail closed: one run-on value that takes anything but a blank or plain-path directory
         # entry may hold key material, so nothing says to keep any entry (sixth hold, H1).
@@ -1076,11 +1077,23 @@ def read_service_env_posture(
     )
 
 
-def _own_value(variable: _Variable) -> str:
-    """``variable``'s value up to its first line break: what its own line sets, not what a
-    reading of the whole string, or of the strings joined to it, adds (the Lander's seventh hold
-    on PR 3142). Remedy only."""
-    return _LINE_BREAK.split(variable.value, 1)[0]
+def _has_content(variable: _Variable) -> bool:
+    """Whether ``variable``'s value holds content: its own line is not blank, or a later line
+    is not blank and is no ``NAME=`` assignment (:func:`_sets_a_name`), which sets another
+    variable rather than continuing this one (the Lander's eighth round on PR 3142). A blank
+    later line adds nothing. ``#`` is nothing special to NSSM or to the engine, which reads the
+    value as it stands, so a line such as ``#x`` is content. Remedy only."""
+    own, *later = _LINE_BREAK.split(variable.value)
+    return bool(own.strip()) or any(line.strip() and not _sets_a_name(line) for line in later)
+
+
+def _sets_a_name(line: str) -> bool:
+    """Whether ``line`` is a ``NAME=`` assignment: a name of letters, digits and underscores,
+    then an equals sign. Key-shaped text (:func:`_is_key_value`, :func:`_holds_key_run`), such
+    as a base64 key and its padding, is content, not a name. Remedy only."""
+    return (
+        _ASSIGNMENT.match(line) is not None and not _is_key_value(line) and not _holds_key_run(line)
+    )
 
 
 def _every_kept(
