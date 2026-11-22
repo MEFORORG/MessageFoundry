@@ -92,7 +92,8 @@ AUDIT_ACTION = "remote_debug_refused"
 ALERT_SUBJECT = "remote_debug:refused"
 #: How often the watch reads the guard's count. The most rows one hour can add is 3600 over this.
 CHECK_INTERVAL_SECONDS = 30.0
-#: How long :meth:`RemoteDebugRefusalWatch.stop` waits for the last pass before it cancels it.
+#: The most :meth:`RemoteDebugRefusalWatch.stop` waits for the last pass before it cancels it,
+#: and then for the cancel. A stop deadline can cut each wait to :data:`STOP_FLOOR_SECONDS`.
 _STOP_SECONDS = 5.0
 #: Under a deadline, the least each of :meth:`RemoteDebugRefusalWatch.stop`'s two waits is given.
 STOP_FLOOR_SECONDS = 0.1

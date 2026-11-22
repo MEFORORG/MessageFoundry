@@ -310,24 +310,29 @@ Restart-Service MessageFoundry
 Run them from an elevated prompt. Services.msc and `sc.exe` work too. NSSM's own start, stop and
 restart commands send the same request, so there is no reason to use them.
 
-**A stop is held to a budget so it fits NSSM's stop window, and that can cut some waits short**
-(BACKLOG #3191). The shutdown hands `engine.stop()` what is left of its budget, never less than
-3 s. Inside it, at least four waits are shortened to fit: the graph supervisor's exit, a CRL
-reload pass in flight, the remote-debug refusal watch's last audit pass, and the drain of
-alert-instance writes. Each still gets at least 0.1 s. On a tight stop, at least these are lost:
+**A stop holds some of its waits to a budget, to keep inside NSSM's stop window, and that can cut
+them short** (BACKLOG #3191; the owner ruled on 2026-11-22 that the budget wins over the work it
+cuts). The shutdown hands `engine.stop()` what is left of its budget after the floors of the steps
+after it, never less than 3 s. Inside it, four waits are shortened to fit: the graph supervisor's
+exit, a CRL reload pass in flight, the remote-debug refusal watch's last audit pass, and the drain
+of alert-instance writes. Each still gets at least 0.1 s. The other stop steps are not held to the
+budget, so a slow one can still carry the stop past NSSM's window. On a tight stop, at least these
+can be lost:
 
 - **The remote-debug watch's last pass** can be cut to about 0.1 s and cancelled. A WARNING says
   so, and a refusal seen since the pass before it may then have no audit row and no alert.
-- **The alert-instance drain** can be cut to about 0.1 s. A raise or clear write that has not
-  landed by then is not retried and fails when the store closes, so it is not recorded. A clear
-  still waiting to retry is cancelled, and an ERROR counts it. This drain covers alert records in
-  the store, not the sending of alert notifications, which a later shutdown step closes.
-- **A CRL reload pass in flight** can be cut to about 1.5 s, and less when an earlier stop step
-  was slow, down to the same 0.1 s. The pass is abandoned with a WARNING. The next start loads
-  every CRL from the file again.
+- **The alert-instance drain** can be cut to about 0.1 s. A raise or clear write still running
+  then is not retried, and may fail when the store closes and go unrecorded. A clear still waiting
+  to retry is cancelled, and an ERROR counts it. An alert whose clear is lost can still read open
+  in the alert list. This drain covers alert records in the store, not the
+  sending of alert notifications, which a later shutdown step closes.
+- **A CRL reload pass in flight** gets at most about 1.8 s at the 3 s minimum, or about 0.8 s
+  while a config write is still running, and less when an earlier stop step was slow, down to the
+  same 0.1 s. The pass is abandoned with a WARNING. The next start loads every CRL from the file
+  again.
 
 A slow graph reconcile can also be cancelled part-way through starting the graph, which is then
-stopped as usual. The other stop steps are not held to the budget.
+stopped as usual.
 
 The service's own `nssm.exe` is in `C:\Program Files\MessageFoundry\nssm` (the installer's
 `-NssmDir`). The installer checked that copy's hash, and keeps it where only administrators can

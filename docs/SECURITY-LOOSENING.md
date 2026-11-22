@@ -2365,10 +2365,12 @@ count is above `0` (vault BACKLOG #2613).
   - **Stopping can lose the last row and the last alert.** The read at stop has no later read.
     A row or an alert it cannot deliver is lost. Where the store or the sink refused it, its
     ERROR line still says the next pass will retry. The engine stops the reads late in its own
-    stop, after the message graph has stopped. It then gives them about 5 seconds to finish,
-    which covers a read already in progress as well as the read at stop. If they have not
-    finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING that
-    a row may be missing. A row cut off this way has no ERROR line. The engine then goes on
+    stop, after the message graph has stopped. It then gives them up to about 5 seconds to
+    finish, which covers a read already in progress as well as the read at stop. If they have
+    not finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING
+    that a row may be missing. Under `serve`, the shutdown's stop budget can cut each of those
+    two waits to about 0.1 seconds (BACKLOG #3191), so on a tight stop the read at stop may get
+    almost no time at all. [SERVICE.md](SERVICE.md#start--stop--status) says when. A row cut off this way has no ERROR line. The engine then goes on
     stopping, even if a read is still running. A read in progress that is cancelled this way
     keeps the read at stop from running at all. Refusals that no read had reached then get
     neither a row nor an alert. Their WARNING lines may remain, within the limits the **No file
