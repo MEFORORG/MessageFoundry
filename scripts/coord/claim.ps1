@@ -389,22 +389,59 @@ function Add-HistoryLine([string]$Line) {
 # probe loaded, reported itself Available, and returned zero vetoing sessions for that exact path.
 # Every other outcome, including the probe failing to load at all, stays `present`. A missing
 # answer must cost a refusal, never a licence.
-$script:OccupancyProbe = $null   # $null = not yet tried; $false = unavailable; else the object
+#
+# ONE PROBE PER HOLDER REPOSITORY (BACKLOG #5870). Get-WorktreeOccupancy places a session only inside
+# the worktrees of the repository it was asked about, and -AsWorktree can record a holder in another
+# one, so a single probe of $repo would answer "nobody there" for a holder it never looked at. The
+# cache is keyed by git common dir so one repository's failed probe cannot stand in for another's.
+# Common dir -> $false when the probe was unavailable, else the answer plus the worktrees it lists.
+# The common dir comes from the holder's own .git pointer, which costs no git process: -List can walk
+# hundreds of claims. A path alone is not a safe key, because a stale listing in one repository can
+# name a path that is now a worktree of another.
+#
+# THE CACHE KEY IS CASE-FOLDED AND THE LISTING CHECK IS NOT. Get-OwningGitCommonDir folds case, so on
+# a case-sensitive filesystem two repositories can share a key. The exact check below is what stops
+# one answering for the other: a holder spelled differently from the listing reads `present`. Nothing
+# here can tell whether a case-only difference is the same directory, so it never counts as a match.
+# Only the drive letter folds, because it is case-insensitive on every volume.
+$script:OccupancyProbes = @{}
+$script:OccupancyLoaded = $null   # $null = not looked up yet. Whether occupancy.ps1 loaded cannot change.
 
-function Get-OccupancyOnce {
-    if ($null -ne $script:OccupancyProbe) { return $script:OccupancyProbe }
+function ConvertTo-ExactPathKey([string]$Path) {
+    $p = ($Path -replace '\\', '/').TrimEnd('/')
+    if ($p -match '^[A-Za-z]:') { $p = $p.Substring(0, 1).ToUpperInvariant() + $p.Substring(1) }
+    return $p
+}
+
+function Get-OccupancyForHolder([string]$HeldPath) {
     try {
-        if (-not (Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)) {
-            $script:OccupancyProbe = $false
-            return $false
+        if ($null -eq $script:OccupancyLoaded) {
+            # False first, so a lookup that throws is cached as "not loaded" and stays `present`.
+            $script:OccupancyLoaded = $false
+            $script:OccupancyLoaded = [bool](Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)
         }
-        $occ = Get-WorktreeOccupancy -Repo $repo
-        # `Available` false means the fence could not be built -- an unplaceable record, no repo.
-        # Treat that exactly like a failed probe.
-        $script:OccupancyProbe = if ($occ -and $occ.Available) { $occ } else { $false }
+        if (-not $script:OccupancyLoaded) { return $false }
+        $key = Get-OwningGitCommonDir $HeldPath
+        if (-not $key) { return $false }
+        if (-not $script:OccupancyProbes.ContainsKey($key)) {
+            # Recorded first, so a probe that throws is not re-run for every holder here.
+            $script:OccupancyProbes[$key] = $false
+            $occ = Get-WorktreeOccupancy -Repo $HeldPath
+            # `Available` false means the fence could not be built -- an unplaceable record, no repo.
+            # Treat that exactly like a failed probe.
+            if ($occ -and $occ.Available) {
+                # Ordinal, because a PowerShell @{} would fold case again.
+                $listed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                foreach ($w in @($occ.Worktrees)) { [void]$listed.Add((ConvertTo-ExactPathKey $w.Path)) }
+                $script:OccupancyProbes[$key] = [pscustomobject]@{ Answer = $occ; Listed = $listed }
+            }
+        }
+        $probe = $script:OccupancyProbes[$key]
+        # Zero occupants means something only for a worktree the answer actually lists.
+        if ($probe -and $probe.Listed.Contains((ConvertTo-ExactPathKey $HeldPath))) { return $probe.Answer }
+        return $false
     }
-    catch { $script:OccupancyProbe = $false }
-    return $script:OccupancyProbe
+    catch { return $false }
 }
 
 function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
@@ -420,7 +457,7 @@ function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
         $ct = & git -C $HeldPath log -1 --format=%ct 2>$null
         if ($ct) {
             $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
-            $occ = Get-OccupancyOnce
+            $occ = Get-OccupancyForHolder $HeldPath
             if ($occ) {
                 $who = @(Get-WorktreeOccupants -Occupancy $occ -Path $HeldPath)
                 if ($who.Count -eq 0) {
@@ -428,7 +465,7 @@ function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
                 }
                 return [pscustomobject]@{ State = 'occupied'; QuietHours = $quiet; Occupants = $who.Count }
             }
-            # PROBE UNAVAILABLE -> `present`, which keeps its PRE-#1348 meaning exactly: the path is
+            # PROBE UNAVAILABLE, OR ITS ANSWER DOES NOT LIST THIS PATH -> `present`, which keeps its PRE-#1348 meaning exactly: the path is
             # there and that is all this function knows. It still refuses.
             #
             # THIS SPLIT IS A BUG FIX, NOT A TIDY-UP. The first version of #1348 returned `present`
@@ -814,10 +851,10 @@ function Show-List {
                     $age = "  [held ${hrs}h; LIVE SESSION in the holder, last committed $($live.QuietHours)h ago]"
                     if ($live.QuietHours -ge 12) { $age += " -- QUIET but OCCUPIED, ask before releasing" }
                 }
-                # The probe could not run -- no Claude config root, or it failed. Says what it knows
+                # The probe gave no answer for this path -- no Claude config root, it failed, or it does not list the path. Says what it knows
                 # and no more: the path is there. It must NOT claim a session it never looked for.
                 'present' {
-                    $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe could not run]"
+                    $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe gave no answer for this path]"
                 }
                 # THE THIRD STATE, and the listing is the surface that matters (BACKLOG #1348).
                 # -List is what a dispatching seat reads to decide where to spend attention, so a
@@ -901,7 +938,7 @@ if ($Release) {
             }
             'present' {
                 Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
-                Write-Host "  OCCUPANCY UNKNOWN: the session probe could not run, so this does NOT say whether"
+                Write-Host "  OCCUPANCY UNKNOWN: the session probe gave no answer for this path, so this does NOT say whether"
                 Write-Host "  anyone is in it. Treat that as MORE reason to coordinate, not less."
                 Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
                 Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
@@ -1168,7 +1205,7 @@ try {
         }
         'present' {
             Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
-            Write-Host "  OCCUPANCY UNKNOWN: the session probe could not run, so this does NOT say whether"
+            Write-Host "  OCCUPANCY UNKNOWN: the session probe gave no answer for this path, so this does NOT say whether"
             Write-Host "  anyone is in it. Treat that as MORE reason to coordinate, not less."
             Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
             Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"

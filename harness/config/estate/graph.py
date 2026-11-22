@@ -22,7 +22,8 @@ Every value here is synthetic and generic — no real partner, site, host, or vo
 
 from __future__ import annotations
 
-from harness.config.estate._shape import EDIT, EstateShape, load_estate_shape
+from _shape import EDIT, EstateShape, load_estate_shape
+
 from messagefoundry import MLLP, Send, SetMeta, SetState, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.wiring import HandlerFn, RouterFn

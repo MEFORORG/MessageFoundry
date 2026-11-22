@@ -295,6 +295,14 @@ suite("liveDebug invocationsForFile", () => {
     assert.strictEqual(only.length, 1);
     assert.strictEqual(only[0].file, "/cfg/A.py");
   });
+
+  test("a relative trace path resolves against the given base, not the process cwd (BACKLOG #5835)", () => {
+    const entries = [traceEntry({ invocations: [inv({ file: "cfg/A.py" }), inv({ file: "cfg/B.py" })] })];
+    const ws = path.resolve("/b622-ws");
+    const only = invocationsForFile(entries, path.join(ws, "cfg", "A.py"), ws);
+    assert.strictEqual(only.length, 1);
+    assert.strictEqual(only[0].file, "cfg/A.py");
+  });
 });
 
 suite("LiveDebugController with a mocked traced-dryrun spawn", () => {

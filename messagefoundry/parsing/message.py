@@ -504,17 +504,36 @@ class Message:
             raise ValueError(f"index {index} out of range (1..{seg_count}); index 1 is after MSH")
         _builtin_hl7.add_segment_line(self._m, segment_id, tokens, index)
 
-    def delete_segments(self, segment_id: str) -> int:
-        """Remove every segment with ``segment_id`` and return how many were removed.
+    def delete_segments(self, segment_id: str, *, occurrence: int | None = None) -> int:
+        """Remove every segment with ``segment_id``, or only its ``occurrence``-th, and return how
+        many were removed.
 
         Deleting ``MSH`` is refused — the message must keep its header — and so is deleting the
         ``BHS`` or ``FHS`` that leads the message, whose delimiters every line is read and
         written in (BACKLOG #5972). Common for clearing a
         repeating block (e.g. ``delete_segments("ODS")``) before rebuilding it with
         :meth:`add_segment`. A fieldless bare line of that id is removed and counted too, though
-        :meth:`count_segments` skips it, so a delete leaves no stray bare line behind."""
+        :meth:`count_segments` skips it, so a delete leaves no stray bare line behind.
+
+        ``occurrence`` (1-based) removes only that one segment instead, numbered as :meth:`field`
+        and :meth:`count_segments` number it, so a fieldless bare line is no occurrence. It returns
+        1, or 0 when that occurrence is absent, and leaves every other segment as it was. It raises
+        ``ValueError`` at least for an ``occurrence`` below 1, for any ``MSH`` (as the delete-all
+        form does), and for the occurrence that is the leading header. So on a ``BHS``-led message
+        ``delete_segments("BHS")`` and ``delete_segments("BHS", occurrence=1)`` are both refused
+        and delete nothing, while ``occurrence=2`` removes a later ``BHS``."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
+        if occurrence is not None:
+            if occurrence < 1:
+                raise ValueError("occurrence is 1-based (>= 1)")
+            position = _builtin_hl7.segment_index(self._m, segment_id, occurrence)
+            if position is None:
+                return 0
+            # _delete_segment_at refuses position 0, the header that leads the message, so only
+            # that occurrence is refused and a later BHS or FHS of the same id may go.
+            self._delete_segment_at(position)
+            return 1
         if segment_id in _builtin_hl7.HEADER_IDS and self._m["segments"][0]["id"] == segment_id:
             raise ValueError(
                 f"refusing to delete the {segment_id} header that leads the message, whose "

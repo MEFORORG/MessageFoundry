@@ -100,9 +100,15 @@ re-arm compressing a swept-discovered backlog.
 
 7. THE CONCURRENCY NUMERATOR IS COUNTED, NOT DERIVED
 ----------------------------------------------------
-``concurrency.n_outbound_rows`` is the time-average of ``N(t) = #transformed<=t - #delivered<=t`` — an
-EXACT counting process over the rung's full event streams. No pairing, no ``claimed_at``, no Little's
-law. Two things it is NOT:
+``concurrency.n_outbound_rows`` is the time-average of ``N(t) = #transformed<=t - #delivered<=t`` — a
+counting process over the rung's full event streams. No pairing, no ``claimed_at``, no Little's law.
+It assumes one outbound row per ``transformed``, which the stores do not guarantee: they write one
+per handler handoff. So it is ``None`` when any message received before the window's end has a
+different count of the two, a repeated destination, or more deliveries than transforms at any
+point in its own stamps (``concurrency.n_outbound_parity``). That check is necessary rather than
+sufficient (``_outbound_parity``). A void figure makes an otherwise
+passing armed gate NO VERDICT (``census.ok`` null), which ``--strict`` does not pass. Two things it is
+NOT:
 
 * it is NOT capped at 8. It counts QUEUED **plus** IN-SERVICE outbound rows; only rows in service are
   bounded by the 8 destination lanes. "N is about 8, therefore the lanes are saturated" is a category error.
@@ -135,6 +141,7 @@ import statistics
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
@@ -212,17 +219,24 @@ def _lane_sql(since: float | None, until: float | None) -> str:
 
 
 def _transformed_sql(since: float | None, until: float | None) -> str:
-    """Every ``transformed`` row of the cohort as a ts stream — the BIRTH of an outbound row.
+    """Every ``transformed`` row of the cohort as a ts stream — one stamp per HANDLER handoff.
 
-    The routed->outbound handoff writes one ``transformed`` per handler and produces the outbound rows in
-    the SAME committed transaction, so a ``transformed`` stamp is the birth of an outbound row and a
-    ``delivered`` stamp is its death. Counting births minus deaths gives ``N_out(t)`` EXACTLY (see
-    ``_counting_n``) — no pairing, no ``claimed_at`` column, no Little's law.
+    The routed->outbound handoff writes one ``transformed`` per handler, however many outbound rows it
+    produced in that transaction. So a stamp is the birth of one outbound row only where each handler
+    delivers once, and ``_outbound_parity`` decides whether births minus deaths may be reported.
     """
     return (
         "SELECT ts FROM message_events "
         f"WHERE event = 'transformed'{_cohort_pred(since, until)} "
         "ORDER BY ts"
+    )
+
+
+def _marks_sql(since: float | None, until: float | None) -> str:
+    """Every birth and death of the cohort, by message, for ``_mark_overdelivered``."""
+    return (
+        "SELECT message_id, event, ts FROM message_events "
+        f"WHERE event IN ('transformed', 'delivered'){_cohort_pred(since, until)}"
     )
 
 
@@ -285,6 +299,8 @@ class _Agg:
     d_max: float | None = None
     n_delivered: int = 0
     n_dest: int = 0
+    #: At some stamp this message had more deliveries than transforms. See ``_mark_overdelivered``.
+    overdelivered: bool = False
 
     @property
     def complete(self) -> bool:
@@ -388,7 +404,12 @@ def _decompose(aggs: list[_Agg]) -> list[dict[str, Any]]:
     ]
 
 
-def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dict[str, Any]:
+def _census(
+    aggs: list[_Agg],
+    expect_t: int | None,
+    expect_d: int | None,
+    unmeasured: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """The population census + fan-out gate. LOUD by construction, and TRI-STATE.
 
     Four independent failure modes, reported separately because they mean different things:
@@ -405,6 +426,9 @@ def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dic
 
     ``ok`` is ``None`` when the gate is UNARMED (no topology passed). "No verdict" must be
     distinguishable from "verdict: failed" — a bare ``False`` would read as a refutation never made.
+    It is also ``None`` on an ARMED gate whose own checks passed while a figure named in ``unmeasured``
+    was refused: that rung was not shown good, and ``True`` would print OK beside the refusal. A check
+    that failed stays ``False`` either way. ``expected`` tells the two ``None`` states apart.
     """
     total = len(aggs)
     complete = [m for m in aggs if m.complete]
@@ -422,6 +446,8 @@ def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dic
     ok: bool | None = None
     if expected is not None:
         ok = bool(modal_ok) and full == len(complete) and censored == 0 and retried == 0
+        if ok and unmeasured:
+            ok = None
 
     return {
         "messages_in_cohort": total,
@@ -445,6 +471,7 @@ def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dic
             {"n_transformed": key[0], "n_delivered": key[1], "messages": v}
             for key, v in hist.most_common(12)
         ],
+        "unmeasured": list(unmeasured),
         "ok": ok,
     }
 
@@ -558,12 +585,13 @@ def _build_lanes(rows: list[tuple[Any, ...]]) -> list[_Lane]:
 
 
 def _counting_n(births: list[float], deaths: list[float], lo: float, hi: float) -> dict[str, float]:
-    """Time-average and peak of the EXACT counting process ``N(t) = #births<=t - #deaths<=t`` over
+    """Time-average and peak of the counting process ``N(t) = #births<=t - #deaths<=t`` over
     ``[lo, hi]``.
 
     This is the concurrency numerator, and it is measured, not derived. It needs NO pairing of a birth to
     its death (the store does not record which outbound row a ``delivered`` belongs to), NO ``claimed_at``
-    column, and NO Little's law: it is a count.
+    column, and NO Little's law: it is a count. For outbound rows the caller first checks
+    ``_outbound_parity``, because a ``transformed`` stamp is not always one row's birth.
 
     IT IS EXACT ONLY IF EVERY birth AND death IN THE WINDOW IS IN THE STREAMS. So the caller passes the
     FULL RUNG's streams and averages over a SUB-window: a rung's cohort is closed (the store is reset
@@ -579,17 +607,14 @@ def _counting_n(births: list[float], deaths: list[float], lo: float, hi: float) 
         return {"time_avg": 0.0, "peak": 0.0, "at_lo": 0.0, "at_hi": 0.0}
     marks: list[tuple[float, int]] = [(t, 1) for t in births] + [(t, -1) for t in deaths]
     marks.sort()
-    n = 0
+    n = sum(delta for t, delta in marks if t <= lo)
+    at_lo = float(n)
     area = 0.0
     peak = 0.0
     prev = lo
-    at_lo = 0.0
     for t, delta in marks:
         if t <= lo:
-            n += delta
             continue
-        if at_lo == 0.0 and prev == lo:
-            at_lo = float(n)
         clamped = min(t, hi)
         if clamped > prev:
             area += n * (clamped - prev)
@@ -607,6 +632,54 @@ def _counting_n(births: list[float], deaths: list[float], lo: float, hi: float) 
         "at_lo": round(at_lo, 4),
         "at_hi": round(float(n), 4),
     }
+
+
+def _outbound_parity(aggs: list[_Agg], hi: float) -> dict[str, int]:
+    """How many messages break the one-birth-one-death premise of ``n_outbound_rows``.
+
+    All three stores write ONE ``transformed`` per handler handoff, with the destination count only
+    in its ``detail``. Weighting births by that text would make this tool read a column its PHI note
+    says it does not, so a message whose two counts differ voids the figure instead. An in-flight or
+    dead-lettered message differs too: from these events it cannot be told from a handoff that
+    produced no row. ``retried`` voids it as well: a redelivery can offset a row that never delivered,
+    and a ``delivered`` with no destination is counted here but absent from the death stream. Two
+    handlers each delivering once to one shared connection look the same and lose the figure too:
+    without the event detail they cannot be told from a redelivery, and None is the safe answer.
+
+    Only messages received before ``hi`` count. A later one has no mark inside the window, so the
+    stop edge a tail trim exists to exclude cannot erase the rung's figure.
+
+    A message that is ever ``overdelivered`` voids it too, which covers a last delivery stamped
+    before the last ``transformed``.
+
+    NECESSARY, NOT SUFFICIENT. Handlers delivering 2 and 0 still pass here when a delivery lands
+    after the second handler's stamp, because every prefix of the message's stamps then fits.
+    """
+    relevant = [m for m in aggs if m.received is None or m.received < hi]
+    mismatched = sum(
+        1 for m in relevant if m.n_transformed != m.n_delivered or m.retried or m.overdelivered
+    )
+    return {"mismatched_messages": mismatched, "messages": len(relevant)}
+
+
+def _mark_overdelivered(by_msg: dict[str, _Agg], rows: list[tuple[Any, ...]]) -> None:
+    """Flag each message whose own count of births minus deaths ever drops below zero.
+
+    PER MESSAGE, because in the pooled count another message's live rows hide the dip, and a loaded
+    rung is what this tool measures. A transform sorts first on a tie: one clock reading is not an
+    ordering. There is NO skew tolerance. A row's delivery is stamped after the commit of the handoff
+    that made it, so on one clock this cannot fire on a valid run (measured on a real SQLite store:
+    150 messages of 8 handlers, twice, none, smallest last-transform-to-last-delivery gap 2.1 ms). Skew
+    between boxes could fire it, and the cost is then a no-verdict rather than a false figure.
+    """
+    marks: dict[str, list[tuple[float, bool]]] = {}
+    for mid, event, ts in rows:
+        marks.setdefault(str(mid), []).append((float(ts), event == "delivered"))
+    for mid, stamps in marks.items():
+        if mid in by_msg:
+            by_msg[mid].overdelivered = any(
+                n < 0 for n in accumulate(-1 if died else 1 for _, died in sorted(stamps))
+            )
 
 
 async def _window_report(
@@ -637,6 +710,7 @@ async def _window_report(
     behaviour) truncates the slowest messages' deliveries and drives the fitted latency slope to zero.
     """
     aggs_map = _build_aggs(await _query(store, _agg_sql(since, until)))
+    _mark_overdelivered(aggs_map, await _query(store, _marks_sql(since, until)))
     lane_rows = await _query(store, _lane_sql(since, until))
     transformed_ts = [float(r[0]) for r in await _query(store, _transformed_sql(since, until))]
 
@@ -662,7 +736,17 @@ async def _window_report(
     in_win = (
         [m for m in aggs if m.received is not None and lo <= m.received < hi] if window_s else []
     )
-    census = _census(in_win, expect_t, expect_d)
+    delivered_ts = [float(ts) for _, ts in lane_rows]
+    parity = _outbound_parity(aggs, hi)
+    n_out = (
+        None if parity["mismatched_messages"] else _counting_n(transformed_ts, delivered_ts, lo, hi)
+    )
+    census = _census(
+        in_win,
+        expect_t,
+        expect_d,
+        unmeasured=("n_outbound_rows",) if n_out is None else (),
+    )
 
     pop = [m for m in in_win if m.complete]
     population = "complete-path"
@@ -673,8 +757,6 @@ async def _window_report(
     if limit is not None:
         pop = pop[:limit]
 
-    delivered_ts = [float(ts) for _, ts in lane_rows]
-    n_out = _counting_n(transformed_ts, delivered_ts, lo, hi)
     # Messages in flight: born at `received`, dead at the LAST delivery. Same caveat — its time-average is
     # lambda x W by construction, so it corroborates the arithmetic; it cannot validate it.
     n_e2e = _counting_n(
@@ -697,7 +779,9 @@ async def _window_report(
         "lambda_msg_per_s": round(n_recv_win / window_s, 4) if window_s > 0 else 0.0,
         "lambda_del_per_s": round(n_del_win / window_s, 4) if window_s > 0 else 0.0,
         "concurrency": {
-            "n_outbound_rows": n_out,  # EXACT count: transformed(born) - delivered(died)
+            # transformed(born) - delivered(died), or None when parity says that premise failed.
+            "n_outbound_rows": n_out,
+            "n_outbound_parity": parity,
             "n_messages_in_flight": n_e2e,
             "note": (
                 "n_outbound_rows counts QUEUED + IN-SERVICE outbound rows. It has NO cap of 8 — the "
@@ -768,7 +852,7 @@ async def _collect(
             reports: list[dict[str, Any]] = []
             for r in rungs:
                 # The COHORT is always the WHOLE rung (`since`..`until` = the rung's own bounds), so the
-                # counting process N(t) sees every birth and every death and is EXACT. The steady-state
+                # counting process N(t) sees every birth and every death. The steady-state
                 # TRIM is applied INSIDE _window_report, to the ANALYSIS WINDOW (a time interval) and to
                 # the LATENCY POPULATION (which messages) — never to the event streams. That is what makes
                 # trimming safe: it cannot truncate a slow message's deliveries.
@@ -878,7 +962,7 @@ def _render_census(c: dict[str, Any], population: str) -> list[str]:
             f"({h['n_transformed']},{h['n_delivered']})={h['messages']}" for h in c["histogram"]
         )
     )
-    if c["expected"] is not None and not c["ok"]:
+    if c["expected"] is not None and c["ok"] is False:
         out += [
             "",
             "  ##############################################################################",
@@ -921,6 +1005,11 @@ def _render_census(c: dict[str, Any], population: str) -> list[str]:
             ]
         out.append(
             "  ##############################################################################"
+        )
+    elif c["expected"] is not None and c["ok"] is None:
+        out.append(
+            f"  gate: NO VERDICT — {', '.join(c['unmeasured'])} is void, so this rung is not "
+            "shown good. --strict does not pass it."
         )
     elif c["expected"] is not None:
         out.append("  gate: OK — no censoring, no partials, no retries, modal == topology.")
@@ -976,12 +1065,22 @@ def _render_stages(stages: list[dict[str, Any]]) -> list[str]:
 
 
 def _render_concurrency(c: dict[str, Any]) -> list[str]:
-    o, e = c["n_outbound_rows"], c["n_messages_in_flight"]
+    o, e, parity = c["n_outbound_rows"], c["n_messages_in_flight"], c["n_outbound_parity"]
+    if o is None:
+        outbound = (
+            f"  N_outbound_rows   UNAVAILABLE: {parity['mismatched_messages']} of "
+            f"{parity['messages']} messages have transformed != delivered rows, a destination "
+            "delivered more than once, or more deliveries than transforms at some point"
+        )
+    else:
+        outbound = (
+            f"  N_outbound_rows   time-avg={o['time_avg']:.3f}  peak={o['peak']:.0f}   "
+            "(transformed = born, delivered = died)"
+        )
     return [
         "",
-        "CONCURRENCY — the EXACT counting process (births - deaths), not lambda x W",
-        f"  N_outbound_rows   time-avg={o['time_avg']:.3f}  peak={o['peak']:.0f}   "
-        f"(transformed = born, delivered = died)",
+        "CONCURRENCY — the counting process (births - deaths), not lambda x W",
+        outbound,
         f"  N_messages_in_flight time-avg={e['time_avg']:.3f}  peak={e['peak']:.0f}",
         "  N_outbound_rows is QUEUED + IN-SERVICE. It is NOT capped at 8 — only rows IN SERVICE are.",
         "  Do not read 'N ~ 8' as 'the 8 lanes are saturated'; read occupancy_accounted for that.",
@@ -1053,10 +1152,19 @@ def _finite(v: float | None, flag: str) -> float | None:
     return v
 
 
+def _failure_label(r: dict[str, Any]) -> str:
+    """A report's name, marking an armed no-verdict so it cannot read as a refutation."""
+    label = str(r.get("label", "window"))
+    census = r.get("census", {})
+    if "error" not in r and census.get("expected") is not None and census.get("ok") is None:
+        label += f" (NO VERDICT: {', '.join(census['unmeasured'])} unmeasured)"
+    return label
+
+
 def _gate_failures(d: dict[str, Any]) -> list[str]:
     reports = d["rungs"] if d["mode"] == "per-rung" else [d]
     return [
-        str(r.get("label", "window"))
+        _failure_label(r)
         for r in reports
         if "error" in r or r.get("census", {}).get("ok") is not True
     ]
@@ -1145,7 +1253,10 @@ def main() -> int:
     ap.add_argument(
         "--strict",
         action="store_true",
-        help="exit 2 if ANY reported cohort fails the gate (censoring / partial / retry / modal)",
+        help=(
+            "exit 2 if ANY reported cohort does not pass the gate (censoring / partial / retry / "
+            "modal), or has no verdict because n_outbound_rows is void"
+        ),
     )
     args = ap.parse_args()
 
@@ -1203,7 +1314,7 @@ def main() -> int:
     if args.strict:
         bad = _gate_failures(d)
         if bad:
-            print(f"  GATE FAILED (--strict) for: {', '.join(bad)}", file=sys.stderr)
+            print(f"  GATE NOT PASSED (--strict) for: {', '.join(bad)}", file=sys.stderr)
             return 2
     return 0
 

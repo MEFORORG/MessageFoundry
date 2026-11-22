@@ -12,9 +12,10 @@ holds the frame and retries it until it is recorded or the inbound stops (BACKLO
 below pin those. A source that answers its sender keeps no copy: MLLP with replies NAKs or closes,
 and HTTP and DICOM receipt answer a failure, so the input survives only if the sender resends it
 (BACKLOG #1619 keeps the HTTP answer as an open item). A fault answered as a refusal
-would charge the refused-body allowance, and a body whose text no backend can encode would then fail
-the ``ERROR`` write as well, so each resend of it would drain the allowance for every other refused
-body on that inbound.
+would charge the refused-body allowance, so a fault the same body meets on every resend would drain
+the allowance for every other refused body on that inbound. A body whose decoded text holds a lone
+surrogate, which at least the SQLite store's write cannot encode, never reaches the detach: the
+decode refuses it and records it (BACKLOG #1619).
 
 What the detach does decide is the OBX-5.2 label, the one sender-controlled value a column could
 refuse: a label some backend's ``attachment.content_type`` cannot hold is stored as
@@ -282,7 +283,7 @@ async def test_a_fault_on_a_later_document_propagates_and_leaves_the_first_unref
     assert runner._stream_inflight_bytes == 0
 
 
-# --- a real lone surrogate in OBX-5.5 propagates before any allowance charge ---------------------
+# --- a real lone surrogate in the body is refused at decode, before any detach --------------------
 
 
 #: A fixed clock, so the allowance never refills between the attempt and the read-back.
@@ -299,44 +300,41 @@ def _utf7_runner(
     return runner, ic, allowance
 
 
-async def test_a_lone_surrogate_document_propagates_with_no_allowance_charge(
+async def test_a_lone_surrogate_document_is_refused_at_decode_before_any_write(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # UTF-7 "+2D8-" decodes to the lone surrogate U+D83F, which no backend's driver can encode, so the
-    # real put_attachment fails on it. It propagates before the refused-body allowance is charged:
-    # recording it would charge the allowance and then fail the ERROR write on the same text, so
-    # each resend would drain the allowance for every other refused body on the inbound.
+    # UTF-7 "+2D8-" decodes to the lone surrogate U+D83F, which strict UTF-8 cannot encode, so the
+    # ingress write and put_attachment would both fail on it, on every resend. The decode refuses it
+    # instead (BACKLOG #1619): an ERROR row holding the bytes as received, an AR, and no detach.
     assert b"+2D8-".decode("utf-7") == "\ud83f"
-    runner, ic, allowance = _utf7_runner(store)
+    runner, ic, _allowance = _utf7_runner(store)
     b64 = base64.b64encode(b"P" * 2000).decode("ascii")
     body = _doc_hl7(b64=b64[:100] + "+2D8-" + b64[100:]).encode("ascii")
-    real = store.put_attachment
-    raised: list[BaseException] = []
+    calls: list[str] = []
 
     async def spy(chunks: Iterable[str], content_type: str) -> str:
-        try:
-            return await real(chunks, content_type)
-        except UnicodeEncodeError as exc:
-            raised.append(exc)
-            raise
+        calls.append(content_type)
+        raise AssertionError("put_attachment ran on a body the decode refuses")
 
     monkeypatch.setattr(store, "put_attachment", spy)
 
-    with pytest.raises(UnicodeEncodeError) as escaped:
-        await runner._handle_inbound(ic, body)
+    ack = await runner._handle_inbound(ic, body)
 
-    assert raised == [escaped.value], "the fault did not come from the real put_attachment"
-    assert await _rows(store) == []
+    assert _ack_code(ack) == "AR"
+    assert calls == []
+    (row,) = await _rows(store)
+    assert row["status"] == MessageStatus.ERROR.value
+    assert "surrogate code point at position" in row["error"]
+    assert row["raw"] == body.decode("ascii")  # the received bytes, not the decoded text
+    assert await _attachment_types(store) == []
     assert runner._stream_inflight_bytes == 0
-    # The whole allowance is still there: nothing was charged.
-    assert allowance.try_charge(ic.name, _ALLOWANCE.allowance_bytes)
 
 
 async def test_control_a_refused_body_on_that_inbound_charges_the_allowance(
     store: MessageStore,
 ) -> None:
-    # Anti-vacuity for the read-back above: an escaped document on the same inbound is refused and
-    # recorded, and its body is charged to the allowance, so the whole allowance no longer fits.
+    # An escaped document on a UTF-7 inbound is refused and recorded, and its body is charged to the
+    # allowance, so the whole allowance no longer fits.
     runner, ic, allowance = _utf7_runner(store)
     b64 = base64.b64encode(b"P" * 2000).decode("ascii")
     body = _doc_hl7(b64=b64[:100] + "\\X0D\\" + b64[100:]).encode("ascii")
@@ -388,19 +386,19 @@ def test_the_label_rule_names_what_no_backend_column_takes(label: str, fits: boo
     assert wiring_runner._label_fits_every_backend(label) is fits
 
 
-async def test_a_lone_surrogate_label_propagates_and_stores_nothing(store: MessageStore) -> None:
-    # A UTF-7 inbound decodes "+2D8-" in OBX-5.2 to a lone surrogate, which stays in the skeleton too,
-    # so the ingress write would fail on it whatever the label. The label is not downgraded, so the
-    # real put_attachment fails first and no unreferenced attachment is left behind.
-    runner, ic, allowance = _utf7_runner(store)
+async def test_a_lone_surrogate_label_is_refused_at_decode_and_stores_no_attachment(
+    store: MessageStore,
+) -> None:
+    # A UTF-7 inbound decodes "+2D8-" in OBX-5.2 to a lone surrogate. The decode refuses the body
+    # before the detach (BACKLOG #1619), so no attachment is written and the ERROR row is stored.
+    runner, ic, _allowance = _utf7_runner(store)
 
-    with pytest.raises(UnicodeEncodeError):
-        await runner._handle_inbound(ic, _doc_hl7(type_of_data="Ap+2D8-p").encode("ascii"))
+    ack = await runner._handle_inbound(ic, _doc_hl7(type_of_data="Ap+2D8-p").encode("ascii"))
 
-    assert await _rows(store) == []
+    assert _ack_code(ack) == "AR"
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
     assert await _attachment_types(store) == []
     assert runner._stream_inflight_bytes == 0
-    assert allowance.try_charge(ic.name, _ALLOWANCE.allowance_bytes)
 
 
 def test_the_content_type_bound_is_the_narrowest_backend_column() -> None:

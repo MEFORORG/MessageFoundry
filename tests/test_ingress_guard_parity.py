@@ -361,6 +361,17 @@ _GUARD_CASES = [
         ADT_UMLAUT_TEXT.replace("JANE", "JA\x0bNE").encode("utf-8"),
         id="frame_byte_hl7",
     ),
+    # BACKLOG #1619: UTF-7 decodes "+2D8-" to a lone surrogate, which no store write can encode.
+    pytest.param(
+        _inbound(encoding="utf-7"),
+        ADT_UMLAUT_TEXT.replace("MÜLLER", "M+2D8-LLER").encode("ascii"),
+        id="surrogate_hl7",
+    ),
+    pytest.param(
+        _inbound(content_type=ContentType.JSON, encoding="utf-7"),
+        b'{"a": "+2D8-"}',
+        id="surrogate_text",
+    ),
     pytest.param(_inbound(content_type=ContentType.JSON), b'{"a": "b\x00c"}', id="nul_text"),
     pytest.param(
         _inbound(content_type=ContentType.JSON), b'{"a": "' + b"y" * 64 + b'"}', id="size_text"
