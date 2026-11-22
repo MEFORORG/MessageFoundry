@@ -5151,8 +5151,9 @@ def _safe_segment(value: str) -> str:
 
 #: A WAL-mode store is three files. Restoring `store.db` beside a leftover `store.db-wal` from a
 #: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so the sidecars
-#: are refused as destinations too, not just the main file.
-_SIDECAR_SUFFIXES = ("-wal", "-shm")
+#: are refused as destinations too, not just the main file. ``-journal`` is here for the same reason:
+#: SQLite replays a hot rollback journal on first open, even into a WAL-mode store (measured).
+_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 #: ASVS 5.2.3 bounds on the restored CONFIG bundle, which the per-member cap alone cannot give: N
 #: members each just under that cap would still fill the destination volume. A real config dir is a
@@ -6448,6 +6449,7 @@ def _refuse_colliding_config_members(
     try:
         win32_root_key: tuple[str, ...] = ()
         win32_published: set[tuple[str, ...]] = set()
+        store_key: tuple[str, ...] = ()
         win32_depth = 0  # the store key's length; 0 off Windows, where this comparison never runs
         if sys.platform == "win32":
             win32_root_key = _win32_path_key(str(config_dest.resolve()))
@@ -6479,11 +6481,22 @@ def _refuse_colliding_config_members(
                 exact = _norm_for_compare(out) in published
                 if not exact and win32_depth:
                     # Resolved first, so an 8.3 spelling of an existing parent is expanded.
-                    prefix = _win32_path_key(str(out.resolve()))[:win32_depth]
+                    resolved = ntpath.normpath(str(out.resolve()))
+                    prefix = _win32_path_key(resolved)[:win32_depth]
+                    # The store's 8.3 name does not exist until it is placed, so it cannot be
+                    # resolved here. A plain spelling of it meets the exclusive create; a STREAM on
+                    # it would not, and would write onto the store. So a stream on any `~` name in
+                    # the store's directory is refused. The generated name itself is not predicted.
+                    at_store_dir = len(prefix) == win32_depth and prefix[:-1] == store_key[:-1]
+                    component = resolved.split("\\")[win32_depth - 1] if at_store_dir else ""
+                    stem, stream_mark, _ = component.partition(":")
                     # A prefix equal to the root's own is the operator's path, not the member's.
-                    if prefix in win32_published and prefix != win32_root_key[:win32_depth]:
-                        # The member's name is not echoed: unlike the exact match below, this arm
-                        # is reachable by a name still carrying control characters.
+                    if (prefix in win32_published and prefix != win32_root_key[:win32_depth]) or (
+                        stream_mark and "~" in stem
+                    ):
+                        # The member's name is not echoed, because this check runs before the name
+                        # gate and a name can still carry control characters. The exact-match
+                        # refusal below does echo it, so it is not safe against such a name.
                         raise BackupError(
                             "destination",
                             "the archive's config bundle carries a member that Windows resolves "
@@ -6510,11 +6523,15 @@ def _refuse_colliding_config_members(
 
 
 def _win32_path_key(path: str) -> tuple[str, ...]:
-    """``path`` as Win32 would name it, one lower-cased entry per component. Pure, on every platform.
+    """A deliberately CONSERVATIVE key for "could this name reach that path on Windows", one
+    lower-cased entry per component. Pure, on every platform. It is not how Win32 names a path.
 
-    Each component loses an alternate-stream suffix and then its trailing dots and spaces. A component
-    of ONLY dots or spaces keeps its spelling: measured on NTFS, ``a/.../b`` is refused rather than
-    collapsed to ``a/b``, so dropping it would fuse two paths that are different. Case is lowered ONE
+    Each component loses an alternate-stream suffix and then its trailing dots and spaces. Win32
+    does less (measured): it keeps a trailing space on an intermediate component, and ``name.:x``
+    is a stream on a literal ``name.``. So this key OVER-REFUSES ``store.db-wal /x.toml`` and
+    ``store.db-wal.:x``, which name other paths; failing closed on a forged-looking name is the
+    intent. A component of ONLY dots or spaces keeps its spelling, so it cannot fuse its neighbours,
+    although Win32 can collapse one in final position; this key does not model that. Case is lowered ONE
     CHARACTER AT A TIME, because ``str.lower`` on a whole string picks final sigma by context and would
     separate two names NTFS treats as one. Per character, measured against ``RtlUpcaseUnicodeChar``
     over the BMP on one Windows 11 host, it separates no two characters that function folds together."""

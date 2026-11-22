@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tarfile
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -1489,6 +1490,80 @@ def test_alias_refusal_does_not_echo_the_member_name(tmp_path) -> None:
     message = str(excinfo.value)
     assert excinfo.value.kind == "destination"
     assert "\x1b" not in message and "forged" not in message and "\n" not in message
+
+
+@pytest.mark.parametrize(
+    ("planted", "refused"),
+    [("msg.db-journal", True), ("msg.db-journalnotes.toml", False)],
+)
+def test_restore_refuses_a_planted_rollback_journal_end_to_end(
+    tmp_path, key_b64, capsys, planted, refused
+) -> None:
+    # On every platform: SQLite replays a hot `<store>-journal` on first open, after the restore's
+    # integrity_check and row-count compare. The near-miss name is the control.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys, plant={planted: b"journal-bytes"})
+    capsys.readouterr()
+    d = tmp_path / "dr"
+    dest = d / "msg.db"
+    assert main(_restore_argv(archive, toml, dest, d)) == (1 if refused else 0)
+    if refused:
+        assert "restore failed (destination)" in _refusal(capsys)
+        assert not dest.exists() and not (d / planted).exists()
+    else:
+        assert dest.is_file() and (d / planted).read_bytes() == b"journal-bytes"
+
+
+def test_restore_refuses_a_destination_holding_a_stale_journal(tmp_path) -> None:
+    d = tmp_path / "dr"
+    d.mkdir()
+    (d / "msg.db-journal").write_bytes(b"stale")
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_existing_destination(d / "msg.db", None)
+    assert excinfo.value.kind == "destination"
+
+
+def test_alias_check_leaves_posix_names_alone(tmp_path, monkeypatch) -> None:
+    # The `sys.platform` branch, forced off: a Win32 spelling is an ordinary, distinct POSIX name.
+    monkeypatch.setattr(sys, "platform", "linux")
+    names = ["store.db-wal.", "store.db-wal ", "store.db-wal/x.toml", "RESTOR~1.DB:x"]
+    tar = _plain_tar(tmp_path / "posix.tar", [(f"config/{n}", b"x") for n in names])
+    d = tmp_path / "dr"
+    d.mkdir()
+    dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("name", ["store.db-wal /x.toml", "store.db-wal.:x"])
+def test_alias_key_deliberately_over_refuses_a_forged_looking_name(tmp_path, name) -> None:
+    # Each names a path other than the sidecar on NTFS. Refused on purpose: see `_win32_path_key`.
+    tar = _plain_tar(tmp_path / "forged.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("name", ["RESTOR~1.DB:x", "RESTOR~1.DB::$DATA", "RESTOR~2.DB:x/y.toml"])
+def test_restore_refuses_a_stream_on_the_stores_future_short_name(tmp_path, name) -> None:
+    # The short name does not exist until the store is placed, so it cannot be resolved here.
+    tar = _plain_tar(tmp_path / "forged.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "restored-store.db", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("name", ["notes~1.toml", "sub/RESTOR~1.DB:x"])
+def test_short_name_stream_refusal_stays_in_the_stores_directory(tmp_path, name) -> None:
+    # The controls: a tilde with no stream, and a tilde stream in another directory.
+    tar = _plain_tar(tmp_path / "ok.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    dr_backup._refuse_colliding_config_members(tar, d / "restored-store.db", d)
 
 
 @_WINDOWS_ONLY
