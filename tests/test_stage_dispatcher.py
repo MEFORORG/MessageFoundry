@@ -1887,7 +1887,8 @@ async def _stand_in_for_sweep(d: StageDispatcher, lane: str) -> None:
     sweep these tests disable. The caller has already established the stranding; this counts it, caps
     it, and makes it loud.
 
-    Shared by `_wait_lane` (phase targets) and `_wait_lane_until` (work predicates) so the cap has ONE
+    Shared by `_wait_lane` (phase targets), `_wait_lane_until` (work predicates) and
+    `_drive_lanes_to_stop` (test 8's multi-lane drive) so the cap has ONE
     definition. The cap is a property of the LANE's contention rate, not of the call site: two
     separate budgets would let one test spend it twice and still read as within the allowance.
     """
@@ -2348,22 +2349,27 @@ async def _drive_lanes_to_stop(
     stands in for (a swallowed 1222). The logs do not show it as the cause: the dispatcher's
     lock-timeout line is INFO and was not captured. So a stranded lane is re-readied under the
     same capped, warned allowance, and the loop's bound is a wall-clock ceiling, not a round count.
-    A stand-in needs a recorded contention route (a lock-timeout abort or a head skip), so an
-    EMPTY claim with no cause still fails here, as it failed the old loop.
+    A stranding before any contention route is recorded (a lock-timeout abort or a head skip)
+    still fails here, as it failed the old loop, and names that route as unrecorded. The counters
+    are dispatcher-wide, so a later stranding is excused by any earlier counted one. A stand-in
+    waits until no lane is CLAIMING or PROCESSING, so the re-claim does not race a sibling's
+    claim or re-pend, which is where this test's own lanes contend.
     """
 
     def all_stopped() -> bool:
         return all(d.phase(ln) is _LanePhase.STOPPED for ln in lanes)
 
+    busy = (_LanePhase.CLAIMING, _LanePhase.PROCESSING)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
         if all_stopped():
             return
+        quiet = not any(d.phase(ln) in busy for ln in lanes)
         for ln in lanes:
             # IDLE is never a waypoint on this path (PARKED -> READY -> CLAIMING -> PROCESSING ->
             # PARKED or STOPPED), so an IDLE lane with no timer is a stranding.
-            if _terminal_idle(d, ln):
+            if quiet and _terminal_idle(d, ln):
                 if d.claim_lock_timeouts + d.claim_head_skips == 0:
                     raise _WaitTimeout(
                         f"{ln} stranded in terminal IDLE with no contention recorded\n"
@@ -2441,16 +2447,15 @@ async def test_adr0070_8_correlated_outage_single_reload_rearms_all(store: Any) 
     await _correlated_outage_rearms_all(store, abort_second_claim=False)
 
 
-async def test_adr0070_8_correlated_outage_survives_an_aborted_reclaim(store: Any) -> None:
-    """Test 8 with the claim after every lane's first fault aborted on a lock timeout, which
-    strands the lanes it covered in terminal IDLE. The 30-round loop `_drive_lanes_to_stop`
-    replaced fails this arm, because nothing re-claims a stranded lane, and each lane then shows
-    one fault, as three of the four did in the SQL Server 2025 logs.
+@pytest.mark.parametrize("store", ["sqlite"], indirect=True)
+async def test_the_outage_drive_stands_in_for_an_aborted_reclaim(store: Any) -> None:
+    """The pin for `_drive_lanes_to_stop`, not an ADR 0070 guarantee: the test harness's stand-in,
+    not the dispatcher, re-claims the stranded lanes, because the sweep is disabled. Test 8's body
+    with the claim after every lane's first fault aborted on a lock timeout. The 30-round loop it
+    replaced fails this arm, because nothing re-claims a stranded lane.
 
-    SQLite only: the abort is injected, so the backend adds nothing, and a server's own 1222 on
-    top of it would spend a lane's single stand-in twice."""
-    if store._test_backend != "sqlite":
-        pytest.skip("the injected abort is backend-independent; one real 1222 more breaks the cap")
+    SQLite only: the abort is injected, so a server backend adds nothing but its own contention,
+    which could spend a lane's single stand-in a second time."""
     with pytest.warns(UserWarning, match="sweep stand-in"):
         await _correlated_outage_rearms_all(store, abort_second_claim=True)
 
