@@ -768,6 +768,47 @@ def test_refused_settings_still_list_a_literal_hit(tmp_path: Path) -> None:
     assert "the settings were refused" in r.detail and "not-a-backend" not in r.detail
 
 
+def test_a_missing_service_config_is_not_called_a_refusal(tmp_path: Path) -> None:
+    """PR 3150 finding 10: a ``--service-config`` path with no file behind it read as "the
+    settings were refused (FileNotFoundError)", though nothing was there to refuse."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _write(tmp_path, _CONFIG)
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "absent.toml")
+    r = next(x for x in report.results if x.name == "url-query-credential")
+    assert "OB_KEYED (sig)" in r.detail
+    assert "the settings file could not be read (FileNotFoundError)" in r.detail
+    assert "refused" not in r.detail
+
+
+def test_one_check_run_loads_the_environment_values_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR 3150 finding 7: ``build-check`` and this line each loaded the instance's environment
+    values, so one ``check`` run read the value file and the overlays twice. They now share one
+    load; a second run loads again."""
+    from messagefoundry.checks import run_checks
+    from messagefoundry.config import environments
+
+    calls: list[str] = []
+    real = environments.load_environment_values
+
+    def counting(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["environment"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(environments, "load_environment_values", counting)
+    cfg = _env_url_config(tmp_path, value="https://p.example.invalid/x?key=SYNTHETIC-14")
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    names = {x.name for x in report.results}
+    assert {"build-check", "url-query-credential"} <= names
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "OB_PLAIN (key)" in detail
+    assert calls == ["dev"]
+    run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    assert calls == ["dev", "dev"]
+
+
 def test_a_hit_from_a_default_says_the_url_was_read_by_its_default(tmp_path: Path) -> None:
     """Vault BACKLOG #3766 item 23: the hit's detail carries the reading caveat, as the clean
     detail does, since a hit can come from a ``default=`` the instance overrides."""

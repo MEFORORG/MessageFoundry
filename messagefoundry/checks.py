@@ -2509,7 +2509,13 @@ def _instance_env_values(settings: ServiceSettings) -> dict[str, Any]:
     value file, with its environment-variable and secrets-directory overlays, or ``{}`` when the
     settings name no environment. Raises what
     :func:`~messagefoundry.config.environments.load_environment_values` raises, at least
-    ``ValueError`` for a malformed file and ``OSError`` for one that cannot be read."""
+    ``ValueError`` for a malformed file and ``OSError`` for one that cannot be read.
+
+    Inside :func:`run_checks` the load runs once per distinct environment, base directory and
+    working directory, a refusal included, as :func:`_load_check_settings` memoizes its load, so
+    ``build-check`` and ``url-query-credential`` read one set of values (PR 3150 finding 7, vault
+    BACKLOG #3766). Each caller gets its own deep copy."""
+    import copy
     import os
 
     from messagefoundry.config.environments import (
@@ -2520,12 +2526,30 @@ def _instance_env_values(settings: ServiceSettings) -> dict[str, Any]:
     env_name = settings.ai.environment
     if env_name is None:
         return {}
-    return load_environment_values(
-        base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
-        dir_name=settings.environments.dir,
-        environment=env_name,
-        environ=os.environ,
-    )
+    base_dir, dir_name, cwd = settings.environments.base_dir, settings.environments.dir, Path.cwd()
+
+    def load() -> dict[str, Any]:
+        return load_environment_values(
+            base_dir=resolve_values_base_dir(base_dir, cwd=cwd),
+            dir_name=dir_name,
+            environment=env_name,
+            environ=os.environ,
+        )
+
+    memo = _RUN_MEMO.get()
+    if memo is None:
+        return load()
+    key = ("env-values", env_name, base_dir, dir_name, str(cwd))
+    if key not in memo:
+        try:
+            memo[key] = load()
+        except (ValueError, OSError) as exc:
+            memo[key] = exc
+            raise
+    cached = memo[key]
+    if isinstance(cached, BaseException):
+        raise cached.with_traceback(None)
+    return copy.deepcopy(cast("dict[str, Any]", cached))
 
 
 def _value_file_exists(settings: ServiceSettings, environment: str) -> bool:
@@ -3053,12 +3077,20 @@ def _check_url_query_credentials(
         # type is kept: a settings or decoder message can quote a configured value.
         # Not "settings did not load": that is the refused settings legs' own line, which a
         # census of those legs matches (tests/test_checks_settings_memo.py).
-        what = "the settings were refused"
+        loaded = False
         try:
             settings = _load_check_settings(toml, cli=cli, env=env)
-            what = "the environment values did not load"
+            loaded = True
             values = _instance_env_values(settings)
         except _SETTINGS_LOAD_ERRORS as exc:
+            if loaded:
+                what = "the environment values did not load"
+            elif isinstance(exc, OSError):
+                # A missing or unreadable --service-config is not a refusal of its content (PR
+                # 3150 finding 10, vault BACKLOG #3766).
+                what = "the settings file could not be read"
+            else:
+                what = "the settings were refused"
             reading = f"{defaults_only}: {what} ({type(exc).__name__})"
         else:
             environment = settings.ai.environment
