@@ -6897,7 +6897,7 @@ async def test_a_transit_answer_at_a_rename_read(
     run first). RED when: the answer escapes the pass, or it pages.
 
     Outage (Manager decision, 2026-11-22): the key service is down, so the loop pages it once and
-    the pass ends with it, as on main. RED when: the pass goes on, or the Outage is not paged once.
+    the pass ends with it, as on main, where it was not paged. RED when: the pass goes on, or the Outage is not paged once.
 
     Called the way the login path calls it, either answer is raised."""
     store, service, notifier = await _two_renamed_accounts()

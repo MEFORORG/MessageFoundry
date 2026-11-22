@@ -10216,7 +10216,8 @@ class AuthService:
             # Unverifiable answer at a checked read in either is about one record, so it skips
             # this rename and the pass goes on (see _rename_read_seal_answer). An Outage is the
             # key service being down, which every later rename would meet again, so it is paged
-            # once and ends the pass, as before (Manager decision, 2026-11-22).
+            # here and then ends the pass, as it ended it before this catch existed, when it was not
+            # paged (Manager decision, 2026-11-22).
             try:
                 await self._refresh_cached_username(
                     user_id=refresh.user_id,
@@ -10639,11 +10640,10 @@ class AuthService:
         new_username: str,
     ) -> None:
         """Answer an Unverifiable answer that one of a reconciler rename's checked reads raised:
-        Vault transit could not verify the record it read (vault BACKLOG #3069 item 1). An Outage
-        is not answered here; the loop pages it and lets it end the pass. The loop then skips that
-        one rename, as
-        the write's seal arm in :meth:`_refresh_cached_username` does (note T2): a raise would end
-        the pass and every rename after it. The checked reads it was written for run before the
+        Vault transit could not verify the record it read (vault BACKLOG #3069 item 1). The loop
+        then skips that one rename and goes on, as the write's seal arm in
+        :meth:`_refresh_cached_username` does (note T2), though unlike that arm it pages and audits
+        nothing (below): a raise would end the pass and every rename after it. The checked reads it was written for run before the
         rename's write lands, or after a write that wrote nothing, which is why the line says the
         rename was not applied. A record that fails its seal is mostly not raised by these reads:
         it comes back refused, for the refresh to handle as it already does. A row whose id cannot
