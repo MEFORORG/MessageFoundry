@@ -469,9 +469,10 @@ than a path is not checked
   list or take it over, or when that folder's owner is such a group or cannot be read
   (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list
   the engine's account may not read is refused: give that account read access to the folder's
-  permissions. On both platforms the check also refuses at least a junction or link on the key
-  file's path that an account it does not trust could change or re-point, through the link itself
-  or a folder that holds it or lies above it. On Windows it trusts at least SYSTEM, Administrators,
+  permissions. On both platforms the check also refuses at least a junction or link its walk
+  finds on the key file's path that an account it does not trust could change or re-point,
+  through the link itself or a folder that holds it or lies above it. On Windows the walk stops at
+  a network share, so a junction on the server is not found there. On Windows it trusts at least SYSTEM, Administrators,
   TrustedInstaller and the engine's own account, unless that is LOCAL SERVICE or NETWORK SERVICE;
   on POSIX, root and the engine's own account. A folder above the one that holds the key file is
   not judged by owner or access unless a junction or link on the path sits in it or below it, so
@@ -488,8 +489,8 @@ than a path is not checked
   whoever is in the group, and one held in a directory that such an account owns or that a group or
   other may write without the sticky bit (vault BACKLOG #5636). It reads the owner and mode bits a
   file system reports and reads no access list itself, so it can pass a key that a network or FUSE
-  file system, or an access list such as an NFSv4 or macOS one, lets another account reach. Keep
-  key files on a local file system. A directory a group or other account may write is accepted
+  file system, or an access list such as an NFSv4 or macOS one, lets another account reach. Check
+  those yourself. A directory a group or other account may write is accepted
   when it has the sticky bit, since that bit keeps them from deleting or renaming a file they do
   not own. The engine
   mints its own TLS key beside the store. **When it mints its own pair and the store directory does

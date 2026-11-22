@@ -2,22 +2,23 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Some records about the key-file check say no more than the check does (vault BACKLOG #5657 step 14).
 
-Each test pins a sentence a record was corrected to beside the behaviour it describes, read from a
-pure decision function, so a change to either shows here. The records pinned are ``docs/PHI.md``
-section 2, *Key files*, ADR 0214's amendments, ``docs/CONFIGURATION.md``'s secrets directory
-section, the ``docker/k8s`` manifests and the ``key_file_problem`` docstring. Text is compared with
-its line breaks folded to spaces.
+Most tests pin a sentence a record was corrected to beside the behaviour it describes, read from a
+pure decision function, so a change to either shows here. The records read are ``docs/PHI.md``
+section 2, *Key files*, ``docs/CONFIGURATION.md``'s secrets directory section, the ``docker/k8s``
+manifests and the ``key_file_problem`` docstring; for ADR 0214's amendments only the removed
+wording's absence is checked. Text is compared with its line breaks folded to spaces.
 """
 
 from __future__ import annotations
 
+import functools
 import re
 import stat
 from pathlib import Path
 
 import pytest
 
-from messagefoundry.auth.anchor_path import WinTrust
+from messagefoundry.auth.anchor_path import _SHARED_SERVICE_SIDS, WinTrust
 from messagefoundry.config.key_file_access import key_file_problem
 from messagefoundry.restricted_file import (
     _posix_holder_problem,
@@ -30,9 +31,10 @@ _ADR_0214 = (
     "docs/adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md"
 )
 _ENGINE_UID = 10001
-_SHARED_SERVICES = ("S-1-5-19", "S-1-5-20")  # LOCAL SERVICE, NETWORK SERVICE
+_SHARED_SERVICES = sorted(_SHARED_SERVICE_SIDS)  # LOCAL SERVICE, NETWORK SERVICE
 
 
+@functools.cache
 def _text(relative: str) -> str:
     return re.sub(r"\s+", " ", (_REPO / relative).read_text(encoding="utf-8"))
 
@@ -44,7 +46,7 @@ def test_the_manifests_say_a_key_whose_own_name_is_a_link_is_refused(manifest: s
     # refused whoever owns it, which is what a Secret volume serves.
     text = _text(manifest)
     assert "refuses a TLS key reached through a link" not in text
-    assert "refuses a TLS key whose own name is a link, or one a group may read" in text
+    assert "refuses at least a TLS key whose own name is a link, or one a group" in text
     assert _posix_own_problem(mode=stat.S_IFLNK | 0o777, uid=0, euid=_ENGINE_UID) is not None
 
 
@@ -81,6 +83,7 @@ def test_phi_says_the_link_rule_does_not_trust_a_shared_service_engine(shared: s
     ) in text
     trust = WinTrust(shared, lambda _sid: False)
     assert trust.owner(shared) is False
+    assert trust.grantee(shared) is False
     assert WinTrust("S-1-5-21-1-2-3-1001", lambda _sid: False).owner("S-1-5-21-1-2-3-1001")
 
 
