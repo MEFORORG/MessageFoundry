@@ -544,6 +544,7 @@ async def test_a_failed_refusal_row_write_still_refuses(
         r = await c.post(_PROBE, headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 500, r.text
     assert attempts == ["audit_gate_refused"], "the 500 must come from the refusal-row write"
+    assert await _decisions(engine) == [_GRANT_ROW], "the gate admitted it; the route body refused"
     assert ran == []
 
 
