@@ -7,7 +7,8 @@ Synthetic values only. On POSIX the open of a socket answers ``ENXIO``, and ``fd
 folder's descriptor ``EISDIR``. ``_refused_read`` answers an error whose path a fresh ``lstat``
 shows is not a regular file as damage, and one that names no path by its errno alone, through
 ``_NOT_A_FILE``, so the by-id read raises ``UploadDamagedError`` rather than re-raising either. The
-swap is forced by raising the error the open gives, since a real swap races the ``lstat``.
+swap is forced by raising the error the open gives, since a real swap races the ``lstat``; the
+socket case raises one naming no path, which the real open never does, to pin that errno verdict.
 """
 
 from __future__ import annotations

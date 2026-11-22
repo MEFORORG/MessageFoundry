@@ -94,6 +94,16 @@ def test_key_material_in_the_next_item_below_a_later_empty_line_reads_as_set(sha
     assert service_env_refusal(posture) is not None
 
 
+@pytest.mark.parametrize("shape", _SHAPES)
+def test_key_material_below_the_name_alone_makes_the_key_read_as_set(shape: str) -> None:
+    """The key's name written alone, with no equals sign, as ``nssm set ... NAME =value`` writes
+    it, on the line or in the item above."""
+    for entries in ([f"{_KEY}\n{shape}"], [_KEY, shape]):
+        posture = _read(entries)
+        assert posture.listed_keys == (_KEY,), (entries, posture.listed)
+        assert service_env_refusal(posture) is not None
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -116,9 +126,9 @@ def test_a_secret_alone_below_an_ordinary_name_set_to_a_key_is_named(name: str, 
 
 
 def test_an_ordinary_name_set_to_a_key_does_not_join_an_empty_value_item() -> None:
-    """An item with its own ``NAME=`` prefix is a variable of its own, so below an empty
-    ``MEFOR_VALUE_*`` item the empty entry is named, and the remedy does not say to remove the
-    item below it (Lander hold on PR 3142, finding 3)."""
+    """An item of an ordinary variable's shape whose value is a key is a variable of its own, so
+    below an empty ``MEFOR_VALUE_*`` item the empty entry is named, and the remedy does not say to
+    remove the item below it (Lander hold on PR 3142, finding 3)."""
     posture = _read(["MEFOR_VALUE_A=", f"x={_KEY_B64}"])
     assert posture.empty_value_names == ("MEFOR_VALUE_A",)
     assert not posture.value_runs_on
@@ -128,9 +138,11 @@ def test_an_ordinary_name_set_to_a_key_does_not_join_an_empty_value_item() -> No
     assert "remove those strings with it" not in refusal
 
 
-def test_a_nameless_key_item_still_joins_an_empty_value_item() -> None:
-    """Control: an item with no name before its equals sign, ``=<key>``, is still read as the
-    empty ``MEFOR_VALUE_*`` item's value split from it, so the remedy says to remove it too."""
+def test_a_nameless_key_item_joins_an_empty_value_item() -> None:
+    """An item with no name before its equals sign, ``=<key>``, is read as the empty
+    ``MEFOR_VALUE_*`` item's value split from it, so the remedy says to remove it too. This
+    pins the ``_is_key_value(rest)`` clause of ``serviceenv._continues_string`` (BACKLOG #5394
+    items 6 and 12); main at 895925f2d3a named the empty entry instead."""
     posture = _read(["MEFOR_VALUE_A=", f"={_KEY_B64}"])
     assert posture.value_runs_on
     assert posture.empty_value_names == ()
@@ -152,6 +164,13 @@ def test_an_ordinary_line_still_ends_the_empty_key(line: str) -> None:
     """Control: a line with no key material, under one of the few names that may end an empty
     secret-class value (``serviceenv._ends_blank_class``), still ends the empty key, on a later
     line and in the next item alike, so the secret reads as unset. Every other name refuses there
-    since BACKLOG #5394 wave 3 (``tests/test_b532w3_serviceenv_split_shapes.py``)."""
-    for entries in ([f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=\n{line}"], [f"{_KEY}=", line]):
+    since BACKLOG #5394 wave 3 (``tests/test_b532w3_serviceenv_split_shapes.py``). Each form the
+    positive tests above use is here."""
+    for entries in (
+        [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=\n{line}"],
+        [f"{_KEY}=", line],
+        [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=", line],
+        [f"{_KEY}\n{line}"],
+        [_KEY, line],
+    ):
         assert _read(entries).listed_keys == (), (entries, _read(entries).listed)
