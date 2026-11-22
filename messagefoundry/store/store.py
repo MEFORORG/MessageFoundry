@@ -13783,9 +13783,10 @@ class MessageStore:
                 release()
 
     async def _close_handles(self) -> None:
-        # BACKLOG #5668: a cancellation landing on one step must not skip the rest, or the workers
-        # of the connections after it stay alive and interpreter exit hangs on them. CloseSteps
-        # holds it until every step has run. The writer is stopped last, so a force-stopped writer
+        # BACKLOG #5668: a cancellation landing on a running step must not skip the rest, or the
+        # workers of the connections after it stay alive and interpreter exit hangs on them.
+        # CloseSteps holds it until every step has run; close_steps.py and _close_connection say
+        # what that does not cover. The writer is stopped last, so a force-stopped writer
         # means a close already ran them: a repeat has nothing to do, and must not wait on it.
         if _was_force_stopped(self._db):
             return
@@ -13829,14 +13830,22 @@ class MessageStore:
 
     @staticmethod
     async def _close_connection(conn: aiosqlite.Connection, steps: CloseSteps) -> None:
-        """Close ``conn`` and wait out its non-daemon worker, whatever cancellation arrives.
+        """Close ``conn`` and wait for its non-daemon worker, with the gaps named below.
 
-        Once a cancellation is held, the forced release replaces ``await close()``, which could park
-        on a busy worker past any single cancel: ``interrupt()`` aborts a running statement so the
-        close ``stop()`` queues behind it is reached. The wait re-enters on a further cancel, against
-        one deadline, so the worker is gone on return unless that bound was hit and logged. No
-        ``finally``: this must not await while a closed coroutine unwinds on ``GeneratorExit``.
-        A connection already force-stopped is not awaited again.
+        Once a cancellation is held before this starts, the forced release replaces ``await
+        close()``: ``interrupt()`` aborts a running statement so the close ``stop()`` queues behind
+        it is reached. The worker wait re-enters on a further cancel, against one deadline of at
+        least a second, and a worker still alive at that deadline is logged and left running. A
+        connection already force-stopped is not awaited again.
+
+        NOT BOUNDED: a single cancel landing inside a real ``await conn.close()`` on a busy reader.
+        aiosqlite's own ``finally`` then parks on its stop with no timeout, and no ``interrupt()``
+        runs for this connection, so it stays parked until the statement ends or another cancel
+        arrives.
+
+        This function has no ``finally``, but that does not keep a ``GeneratorExit`` unwind from
+        awaiting. On a real connection aiosqlite's ``finally`` awaits, the resulting
+        ``RuntimeError`` is caught below as a failure, and the code can go on to the worker wait.
         """
         if _was_force_stopped(conn):
             return
@@ -13857,8 +13866,9 @@ class MessageStore:
         except Exception as exc:  # noqa: BLE001 — raised below, once the worker is waited out
             failure = exc
         loop = asyncio.get_running_loop()
-        # At least a second even with the shared bound spent: a stopped worker exits in milliseconds
-        # but may need scheduling on a loaded box, and returning early would leave it listed.
+        # At least a second per connection even with the deadline spent: a stopped worker exits in
+        # milliseconds but may need scheduling on a loaded box, and returning early would leave it
+        # listed. So this wait can run past CANCELLED_CLOSE_GRACE_SECONDS.
         bound = max(steps.remaining(), 1.0) if steps.cancelled else _CONNECTION_WORKER_EXIT_TIMEOUT
         deadline = loop.time() + bound
         while True:

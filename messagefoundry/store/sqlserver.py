@@ -6009,7 +6009,10 @@ class SqlServerStore:
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
         # opened, so it never affects the async path). ADR 0071 B5.
         if steps.cancelled:
-            # Off the loop: a pyodbc close on a dead server blocks, and the bound could not fire.
+            # Off the loop: a pyodbc close on a dead server blocks, and on the loop the bound could
+            # not fire. This lets the close return; it does not stop the thread, so a blocked pyodbc
+            # close can still delay process exit. A job still queued at the bound is dropped, and
+            # those pools are then not closed.
             await steps.run(
                 asyncio.to_thread(self.close_sync_handoff_pool), "the sync handoff pools"
             )

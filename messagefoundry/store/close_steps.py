@@ -8,6 +8,9 @@ SQLite that left non-daemon aiosqlite workers alive, and interpreter exit then h
 Steps run inline in the closing task, never in a task of their own: a ``SystemExit`` or
 ``KeyboardInterrupt`` raised in a child task would leave through the event loop instead of reaching
 whoever awaits the close.
+
+This holds a cancellation only once a close is running. A close task cancelled before its first step
+never enters the close, so it runs no teardown and its workers stay alive.
 """
 
 from __future__ import annotations
@@ -19,9 +22,11 @@ from typing import Any, Final
 
 log = logging.getLogger(__name__)
 
-#: How long the later steps of a close are given, in all, once a cancellation has arrived: at this
-#: bound the running step is cancelled. A step may overrun by its own unwind, such as the group
-#: committer's bounded rollback, so this is not a hard limit on the close.
+#: The deadline a cancellation sets for the later steps of a close: at it the running step is
+#: cancelled. This is not a hard limit on the close. At least two things run past it: a step's own
+#: unwind, such as the group committer's bounded rollback, and SQLite's wait for each connection's
+#: worker, which gets at least a second even with the deadline spent. With every worker wedged, a
+#: cancelled SQLite close can take about twice this at the current read pool size.
 CANCELLED_CLOSE_GRACE_SECONDS: Final[float] = 5.0
 
 #: The least any step is given past that bound, so that it still starts.
@@ -32,7 +37,9 @@ class CloseSteps:
     """Holds the first cancellation of a close until :meth:`reraise`.
 
     Before a cancellation a step has no time limit, exactly as a plain ``await`` has none. After one,
-    every later step shares one bound. A step's own exception propagates from :meth:`run`.
+    later steps run against one deadline, but each still gets a floor past it, and a caller may
+    allow more (see ``CANCELLED_CLOSE_GRACE_SECONDS``). A step's own exception propagates from
+    :meth:`run`.
     """
 
     def __init__(self) -> None:
@@ -44,18 +51,18 @@ class CloseSteps:
         return self._cancelled is not None
 
     def hold(self, exc: asyncio.CancelledError) -> None:
-        """Keep ``exc`` to re-raise, and start the shared bound on the first one."""
+        """Keep ``exc`` to re-raise, and start the deadline on the first one."""
         if self._cancelled is None:
             self._cancelled = exc
             self._deadline = asyncio.get_running_loop().time() + CANCELLED_CLOSE_GRACE_SECONDS
 
     def remaining(self) -> float:
-        """Seconds a step may still take under the bound. Meaningful once :attr:`cancelled`."""
+        """Seconds left to the deadline, never below the floor. Meaningful once :attr:`cancelled`."""
         left = self._deadline - asyncio.get_running_loop().time()
         return max(left, _STEP_FLOOR_SECONDS)
 
     async def run(self, step: Coroutine[Any, Any, None], what: str) -> None:
-        """Await ``step``, holding a cancellation; once one is held, only up to the bound."""
+        """Await ``step``, holding a cancellation; once one is held, up to :meth:`remaining`."""
         if self._cancelled is None:
             try:
                 await step
