@@ -45,6 +45,7 @@ from messagefoundry.transports.database import (
     classify_login_roles,
     probe_login_roles,
 )
+from tests._fake_dbapi_driver import DriverError
 
 _EGRESS = EgressSettings(deny_by_default=False)
 _LOOKUP = {"clarity": {"server": "db.example", "database": "Clarity"}}
@@ -304,7 +305,7 @@ async def test_a_borrow_timeout_is_named_and_does_not_raise() -> None:
 
 async def test_a_failed_probe_statement_names_its_sqlstate_not_its_text() -> None:
     pool = _Pool(_row())
-    pool.probe_error = Exception("42000", "[Microsoft] secret-host denied PWD=hunter2")
+    pool.probe_error = DriverError("42000", "[Microsoft] secret-host denied PWD=hunter2")
     reading = await probe_login_roles(pool, label="db_lookup:clarity", acquire_timeout=5.0)
     assert reading.verdict is LoginRoleVerdict.NOT_RUN
     assert reading.cause is not None and "42000" in reading.cause
@@ -371,7 +372,7 @@ async def test_a_probe_that_cannot_run_does_not_block_the_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pool = _Pool(_row())
-    pool.probe_error = Exception("08S01", "link reset")
+    pool.probe_error = DriverError("08S01", "link reset")
     _serve(monkeypatch, pool)
     executor = DatabaseLookupExecutor(_LOOKUP, egress=_EGRESS)
     rows = await executor.query("clarity", "SELECT code, value FROM t", None)
@@ -501,7 +502,7 @@ async def test_a_reference_probe_that_did_not_run_is_tried_on_the_next_pass(
 ) -> None:
     """Red before the fix: a NOT_RUN reading was remembered, so the login stayed unjudged."""
     pool = _Pool(_row(("db_owner",)))
-    pool.probe_error = Exception("08S01", "link reset")
+    pool.probe_error = DriverError("08S01", "link reset")
     _serve(monkeypatch, pool)
     probed: set[tuple[str, ...]] = set()
     assert await _load_database_source(dict(_REF), _EGRESS, name="codes", probed=probed) == {

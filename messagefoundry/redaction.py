@@ -101,6 +101,7 @@ __all__ = [
     "clamp_untrusted",
     "codec_safe_line",
     "codec_safe_str",
+    "driver_sqlstate_of",
     "json_loads_or_refusal",
     "log_timestamp",
     "prepare_log_record",
@@ -117,6 +118,7 @@ __all__ = [
     "safe_text",
     "safe_text_bound",
     "safe_traceback",
+    "sqlite_errorname_of",
 ]
 
 _REDACTED = "[redacted]"
@@ -3095,10 +3097,44 @@ def _a_driver_class(kind: type) -> bool:
     )
 
 
-#: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters.
+#: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters. Lowercase is refused, so
+#: a word such as ``OSError('reset')``'s or a codec name such as ``ascii`` does not read as one.
 _DRIVER_SQLSTATE = re.compile(r"[0-9A-Z]{5}")
-#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``.
+#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
+#: such as ``SQLITE_CONSTRAINT_UNIQUE``, never a value.
 _SQLITE_ERRORNAME = re.compile(r"SQLITE_[A-Z_]{1,40}")
+
+
+def _a_sqlite_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is one of ``sqlite3``'s own errors or warnings."""
+    # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
+    # and the CLI defers loading it (tests/test_startup_import_budget.py).
+    sqlite = sys.modules.get("sqlite3")
+    return sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning))
+
+
+def driver_sqlstate_of(exc: BaseException) -> str | None:
+    """The SQLSTATE a database driver's own error names (:func:`raised_by_a_driver`): asyncpg's
+    ``sqlstate`` attribute, else ``args[0]``, when it is five characters of SQL's alphabet
+    (:data:`_DRIVER_SQLSTATE`). None for any other exception, so a ``KeyError('MRN42')`` is never
+    read as one, and None for a SQLite error, whose ``args[0]`` is its message (vault BACKLOG
+    #1661). The one reading that the DATABASE connector and :func:`safe_traceback` share."""
+    if not raised_by_a_driver(exc) or _a_sqlite_error(exc):
+        return None
+    state = getattr(exc, "sqlstate", None)
+    if state is None and exc.args:
+        state = exc.args[0]
+    return state if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state) else None
+
+
+def sqlite_errorname_of(exc: BaseException) -> str | None:
+    """SQLite's result-code name for one of ``sqlite3``'s errors, such as
+    ``SQLITE_CONSTRAINT_UNIQUE``, or None. SQLite has no SQLSTATE, so this fixed word is its only
+    diagnostic free of the statement's values."""
+    if not _a_sqlite_error(exc):
+        return None
+    name = getattr(exc, "sqlite_errorname", None)
+    return name if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name) else None
 
 
 def _driver_line(exc: BaseException, *, under: bool) -> str | None:
@@ -3126,25 +3162,11 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
 
 def _driver_code(exc: BaseException) -> str | None:
     """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code."""
-    # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
-    # and the CLI defers loading it (tests/test_startup_import_budget.py).
-    sqlite = sys.modules.get("sqlite3")
-    if sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning)):
-        # SQLite has no SQLSTATE, and its args[0] is the message itself, which can be a value as
-        # short as five characters; only its result-code name, a fixed word, is read.
-        name = getattr(exc, "sqlite_errorname", None)
-        if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
-            return f"[driver message withheld {name}]"
-        return None
-    state = getattr(exc, "sqlstate", None)
-    if state is None and exc.args:
-        state = exc.args[0]
-    if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state):
-        return f"[{state}] [driver message withheld]"
-    name = getattr(exc, "sqlite_errorname", None)
-    if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
+    name = sqlite_errorname_of(exc)
+    if name is not None:
         return f"[driver message withheld {name}]"
-    return None
+    state = driver_sqlstate_of(exc)
+    return f"[{state}] [driver message withheld]" if state is not None else None
 
 
 def safe_traceback(ei: ExcInfo) -> str:

@@ -122,10 +122,12 @@ from messagefoundry.odbc_call_gate import (
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import (
+    driver_sqlstate_of,
     prints_a_codec_error,
     raised_by_a_driver,
     safe_exc,
     safe_text,
+    sqlite_errorname_of,
 )
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
@@ -2785,41 +2787,24 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     )
 
 
-#: A SQLSTATE as SQL defines one: five characters, each a digit or an uppercase Latin letter.
-#: Lowercase is refused, so a word such as ``OSError('reset')``'s or a codec name such as
-#: ``ascii`` does not read as one (vault BACKLOG #1661, added items 1 and 2).
-_SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
-
-
 def _sqlstate(exc: BaseException) -> str | None:
-    """The 5-character SQLSTATE a DB driver error carries in ``args[0]`` (pyodbc/aioodbc), or ``None``
-    if ``exc`` isn't shaped like a DB error — letting a genuine bug propagate as an internal error
-    rather than being misread as a transport failure.
-
-    Never for a ``UnicodeError``, whose first argument is the codec name. Only text of the SQLSTATE
-    alphabet (:data:`_SQLSTATE_RE`) counts. That is a bound on the misread, not a test of who
-    raised ``exc``: a non-driver error whose ``args[0]`` is five uppercase letters or digits still
-    reads as one."""
+    """The 5-character SQLSTATE a DB driver's own error carries
+    (:func:`~messagefoundry.redaction.driver_sqlstate_of`), or ``None`` for any other exception,
+    letting a genuine bug propagate as an internal error rather than being misread as a transport
+    failure. A non-driver error whose ``args[0]`` reads like a SQLSTATE, such as ``KeyError('MRN42')``,
+    is not read as one (vault BACKLOG #1661; engine PR 3150, finding 1). Never for a
+    ``UnicodeError``, whose first argument is the codec name."""
     if isinstance(exc, UnicodeError):
         return None
-    args = getattr(exc, "args", ())
-    if args and isinstance(args[0], str) and _SQLSTATE_RE.fullmatch(args[0]):
-        return args[0]
-    return None
+    return driver_sqlstate_of(exc)
 
 
 def _log_sqlstate(exc: BaseException) -> str | None:
-    """The SQLSTATE a log line may name for ``exc``, or ``None`` when it is not read as a driver
-    error: asyncpg's ``sqlstate`` attribute, else :func:`_sqlstate`'s ``args[0]``.
-
-    Never for a ``UnicodeError`` or an exception that holds one. ``UnicodeEncodeError``'s first
-    argument is the codec name, which is not a SQLSTATE however it is spelled."""
+    """:func:`_sqlstate` for a log line, and also ``None`` for an exception that holds a Unicode
+    error, whose text a codec name can make read like a SQLSTATE."""
     if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
         return None
-    state = getattr(exc, "sqlstate", None)
-    if isinstance(state, str) and _SQLSTATE_RE.fullmatch(state):
-        return state
-    return _sqlstate(exc)
+    return driver_sqlstate_of(exc)
 
 
 def _connection_lost(exc: BaseException | None) -> bool:
@@ -2853,16 +2838,11 @@ def _connection_lost(exc: BaseException | None) -> bool:
 _raised_by_a_driver = raised_by_a_driver
 
 
-#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
-#: such as ``SQLITE_CONSTRAINT_UNIQUE``, never a value.
-_SQLITE_ERRORNAME_RE = re.compile(r"SQLITE_[A-Z_]{1,40}")
-
-
 def _withheld(exc: BaseException) -> str:
     """A driver error with no SQLSTATE: its type, and SQLite's result-code name when it has one,
     since SQLite has no SQLSTATE and that name is its only PHI-free diagnostic."""
-    name = getattr(exc, "sqlite_errorname", None)
-    code = f" {name}" if isinstance(name, str) and _SQLITE_ERRORNAME_RE.fullmatch(name) else ""
+    name = sqlite_errorname_of(exc)
+    code = f" {name}" if name is not None else ""
     return f"{type(exc).__name__} [driver message withheld{code}]"
 
 
@@ -2913,6 +2893,12 @@ class RedactedDbError(Exception):
     its name prints on every line it stands in for."""
 
 
+class RedactedDbErrorGroup(ExceptionGroup[RedactedDbError], RedactedDbError):
+    """:class:`RedactedDbError` for an exception group: its members are their own copies, so the
+    traceback prints each member's frames and line, as it prints the original's (vault BACKLOG
+    #1661, added item 6). Never raised."""
+
+
 def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
     """An ``exc_info`` for ``exc`` that keeps every frame and cause but no driver message.
 
@@ -2923,7 +2909,8 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
     The record then takes the logging chain's own path: ``prepare_log_record`` renders it into
     ``exc_text`` with the stdlib's walker, and the control-character scrub keeps its line breaks.
 
-    What the copy loses: an exception group's members, any ``__notes__``, the stdlib's extra hints
+    An exception group is copied as a :class:`RedactedDbErrorGroup` holding its members' copies.
+    What the copy loses: any ``__notes__``, the stdlib's extra hints
     (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and the text of
     every link :func:`_poll_log_line` withholds; ``safe_exc``'s 200-character bound applies to
     every non-driver line it keeps, and :data:`_ENGINE_TEXT_LIMIT` to the engine's fixed text.
@@ -2951,9 +2938,19 @@ def _redacted_copy(
     found = made.get(id(exc))
     if found is not None:
         return found
-    copy = RedactedDbError(_poll_log_line(exc, under=under)).with_traceback(exc.__traceback__)
-    made[id(exc)] = copy
+    line = _poll_log_line(exc, under=under)
     below = under or _raised_by_a_driver(exc)
+    members = exc.exceptions if isinstance(exc, BaseExceptionGroup) else ()
+    if members:
+        # A group's members exist before the group does, so a member whose chain leads back to the
+        # group meets this stand-in, which closes the cycle with the group's line and frames.
+        made[id(exc)] = RedactedDbError(line).with_traceback(exc.__traceback__)
+        copies = [_redacted_copy(member, made, under=below) for member in members]
+        copy: RedactedDbError = RedactedDbErrorGroup(line, copies)
+    else:
+        copy = RedactedDbError(line)
+    copy = copy.with_traceback(exc.__traceback__)
+    made[id(exc)] = copy
     if exc.__cause__ is not None:
         copy.__cause__ = _redacted_copy(exc.__cause__, made, under=below)
     if exc.__context__ is not None:
@@ -3948,7 +3945,8 @@ async def _close_cursor(cur: Any) -> None:
     try:
         await cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
+        if logger.isEnabledFor(logging.DEBUG):  # render only a line kept (vault BACKLOG #1661)
+            logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = False) -> None:
@@ -4097,7 +4095,8 @@ def _close_raw_cursor(raw_cur: Any) -> None:
     try:
         raw_cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
+        if logger.isEnabledFor(logging.DEBUG):  # render only a line kept (vault BACKLOG #1661)
+            logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
