@@ -671,8 +671,9 @@ class BackupRunner:
         self._ensure_destination(dest_dir)
 
         # The key SOURCE is the existing store DEK (ADR 0019). Resolve it the same way open_store does.
-        # Off the loop: the provider can dial a Vault that does not answer (BACKLOG #5888).
-        key = await asyncio.to_thread(self._resolve_key)
+        # Off the loop for a read-only provider, which can dial a Vault that does not answer. See
+        # `_key_hop` (BACKLOG #5888).
+        key = await _key_hop(self._store_settings, self._resolve_key)
         if key is None and not s.allow_unencrypted:
             # Fail-closed: a no-key instance refuses to write a cleartext archive unless the explicit,
             # audited [backup].allow_unencrypted escape is set (parallel to [store].allow_unencrypted_phi).
@@ -4509,12 +4510,29 @@ def _decode_store_key(key_b64: str) -> bytes:
     raise StoreCipherConfigError(reason)
 
 
+#: The ``[store].key_provider`` names whose key resolve writes nothing, so a thread abandoned by a
+#: caller's timeout has no effect to leave behind: ``env`` reads settings, ``auto`` and ``dpapi`` read
+#: and unprotect a key file, and ``vault`` asks Transit to read a key's type and decrypt. ``host`` is
+#: left out because its resolve can convert and delete a custody handoff. A name not listed here,
+#: a provider added later included, resolves on the loop.
+_READ_ONLY_KEY_PROVIDERS: tuple[str, ...] = ("auto", "env", "dpapi", "vault")
+
+
+async def _key_hop[T](store_settings: object, resolve: Callable[[], T]) -> T:
+    """``resolve()``, in its own thread hop for a read-only provider and on the loop for any other,
+    so an abort cannot land in the middle of a custody write (BACKLOG #5888). On the loop it blocks
+    the engine, and no timeout can fire, for as long as the provider takes.
+
+    A caller's timeout cannot stop the thread. One left behind runs until the provider returns,
+    which nothing here bounds, and holds process exit until then; its value is dropped."""
+    if getattr(store_settings, "key_provider", None) in _READ_ONLY_KEY_PROVIDERS:
+        return await asyncio.to_thread(resolve)
+    return resolve()
+
+
 def _resolve_decrypt_keyring(store_settings: object, posture: HopPosture | None) -> list[bytes]:
-    """The decrypt-capable keyring, decoded. Blocking: the provider can dial a Vault, so the callers
-    run this in its own thread hop, ahead of the verify or restore hop (BACKLOG #5888). A caller's
-    timeout cannot stop the thread. One left behind runs until the provider returns, which nothing
-    here bounds, and whatever the provider does in that time still happens; only its value is
-    dropped."""
+    """The decrypt-capable keyring, decoded. Blocking: the callers run it through :func:`_key_hop`,
+    ahead of the verify or restore hop."""
     return [
         _decode_store_key(k)
         for k in resolve_decrypt_keys(
@@ -4547,7 +4565,7 @@ async def run_restore_verify(
     # `posture` is the caller's, for the Vault hop the key resolve and a full verify can dial
     # (vault BACKLOG #2983). The engine's DR activation passes its own; the `restore-verify`
     # command holds none, and `None` counts as enforcing on that hop.
-    keys = await asyncio.to_thread(_resolve_decrypt_keyring, store_settings, posture)
+    keys = await _key_hop(store_settings, lambda: _resolve_decrypt_keyring(store_settings, posture))
     # `staging_root=None` is a standalone verify: a private directory under the OS temp dir, never
     # where the backup runner stages. See the staging-location block above `_Staging` (BACKLOG #1174).
     return await asyncio.to_thread(
@@ -5321,7 +5339,7 @@ async def run_restore(
     ``posture`` is the caller's, for the Vault hop the key resolve can dial, as on
     :func:`run_restore_verify`. ``None`` counts as enforcing on that hop; the ``restore`` command
     passes none."""
-    keys = await asyncio.to_thread(_resolve_decrypt_keyring, store_settings, posture)
+    keys = await _key_hop(store_settings, lambda: _resolve_decrypt_keyring(store_settings, posture))
     return await asyncio.to_thread(
         _restore_blocking,
         archive_path=archive_path,

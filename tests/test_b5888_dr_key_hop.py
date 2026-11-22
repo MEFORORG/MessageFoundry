@@ -1,30 +1,36 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5888: the DR backup, verify and restore resolve the store key off the event loop.
+"""BACKLOG #5888: the DR backup, verify and restore resolve a read-only store key off the event loop.
 
 Each resolved and decoded the key on the loop, so a slow key provider would have stalled the engine
-and, on a DR activation, kept the takeover timeout around ``run_restore_verify`` from firing. Every
-key and provider here is synthetic, and no Vault server is started."""
+and, on a DR activation, kept the takeover timeout around ``run_restore_verify`` from firing. A
+provider whose resolve can write custody state stays on the loop, so an abort cannot land mid-write.
+Every key and provider here is synthetic, and no Vault server is started."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import sys
 import threading
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry import restricted_file
 from messagefoundry.config.settings import BackupSettings, DrSettings, StoreSettings
 from messagefoundry.pipeline import dr as drmod
 from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.secrets_dpapi import DpapiError
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, custody_host
 from messagefoundry.store.base import StoreCipherConfigError
-from messagefoundry.store.keyprovider import KeyProviderError
+from messagefoundry.store.keyprovider import KNOWN_PROVIDERS, KeyProviderError
 from tests._refusal_log_capture import until
+from tests.test_store_custody_host import _handoff, _proved_blob
 
 #: A safety bound on the fake provider's hold, well past any scheduling delay on a loaded runner, so
 #: it cannot expire on correct code. Each test releases it. On the unfixed code it holds the loop.
@@ -32,26 +38,30 @@ _HOLD_SECONDS = 30.0
 _GOOD_KEY = "A" * 43 + "="
 
 
-def _verify(tmp_path: Path) -> Awaitable[object]:
+def _store(tmp_path: Path, provider: str = "auto") -> StoreSettings:
+    # model_copy: an unknown name must reach the code under test, past the settings validator.
+    return StoreSettings(path=str(tmp_path / "x.db")).model_copy(update={"key_provider": provider})
+
+
+def _verify(tmp_path: Path, provider: str = "auto") -> Awaitable[object]:
     return dr_backup.run_restore_verify(
-        str(tmp_path / "never-read.mfbak"),
-        store_settings=StoreSettings(path=str(tmp_path / "x.db")),
+        str(tmp_path / "never-read.mfbak"), store_settings=_store(tmp_path, provider)
     )
 
 
-def _restore(tmp_path: Path) -> Awaitable[object]:
+def _restore(tmp_path: Path, provider: str = "auto") -> Awaitable[object]:
     return dr_backup.run_restore(
         str(tmp_path / "never-read.mfbak"),
         dest_store_path=tmp_path / "never-written.db",
-        store_settings=StoreSettings(path=str(tmp_path / "x.db")),
+        store_settings=_store(tmp_path, provider),
     )
 
 
-def _backup(tmp_path: Path) -> Awaitable[object]:
+def _backup(tmp_path: Path, provider: str = "auto") -> Awaitable[object]:
     runner = BackupRunner(
         None,  # type: ignore[arg-type]  # the key is resolved before the store is touched
         BackupSettings(enabled=True, destination=str(tmp_path / "dest")),
-        store_settings=StoreSettings(path=str(tmp_path / "x.db")),
+        store_settings=_store(tmp_path, provider),
         config_dir=None,
         instance="dev",
     )
@@ -61,7 +71,7 @@ def _backup(tmp_path: Path) -> Awaitable[object]:
 _ENTRY_POINTS = pytest.mark.parametrize(
     "call", [_verify, _restore, _backup], ids=["restore-verify", "restore", "backup"]
 )
-_Call = Callable[[Path], Awaitable[object]]
+_Call = Callable[..., Awaitable[object]]
 
 
 class _Provider:
@@ -73,8 +83,10 @@ class _Provider:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.left = threading.Event()
+        self.threads: list[int] = []
 
     def _answer(self) -> str:
+        self.threads.append(threading.get_ident())
         self.entered.set()
         try:
             if self.hold:
@@ -105,7 +117,7 @@ def held(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Provider]:
         yield provider
     finally:
         provider.release.set()
-        assert not provider.entered.is_set() or provider.left.wait(_HOLD_SECONDS * 2)
+        assert not provider.entered.is_set() or provider.left.wait(_HOLD_SECONDS)
 
 
 @_ENTRY_POINTS
@@ -122,20 +134,26 @@ async def test_the_loop_stays_live_while_the_key_provider_blocks(
 
 
 async def test_the_takeover_timeout_fires_on_a_blocked_key_provider(
-    tmp_path: Path, held: _Provider
+    tmp_path: Path, held: _Provider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Red before the fix: the timeout could not fire, and the provider's own error aborted as
     ``seed`` once it returned. The abort must be the ``key`` one, while the provider still holds."""
 
+    def keyring(_settings: object, _posture: object) -> list[bytes]:
+        # Replaces the whole hop: a worker that starts after this test has undone its patches then
+        # reaches only this fake, never the real resolver.
+        return [dr_backup._decode_store_key(k) for k in held.keyring(_settings)]
+
     async def noop() -> None:
         return None
 
+    monkeypatch.setattr(dr_backup, "_resolve_decrypt_keyring", keyring)
     store = await MessageStore.open(tmp_path / "msg.db")
     try:
         coord = drmod.DrCoordinator(
             store,
             DrSettings(enabled=True, takeover_timeout_seconds=0.2),
-            store_settings=StoreSettings(path=str(tmp_path / "x.db")),
+            store_settings=_store(tmp_path),
             activate_profile=noop,
             deactivate_profile=noop,
         )
@@ -152,24 +170,27 @@ async def test_the_takeover_timeout_fires_on_a_blocked_key_provider(
 
 @_ENTRY_POINTS
 @pytest.mark.parametrize(
-    "error",
+    "make_error",
     [
-        DpapiError("synthetic dpapi refusal"),
-        KeyProviderError("synthetic provider refusal"),
-        StoreCipherConfigError("synthetic cipher refusal"),
+        lambda: DpapiError("synthetic dpapi refusal"),
+        lambda: KeyProviderError("synthetic provider refusal"),
+        lambda: StoreCipherConfigError("synthetic cipher refusal"),
     ],
     ids=["dpapi", "key-provider", "cipher-config"],
 )
+@pytest.mark.parametrize("provider", ["auto", "host"], ids=["off-loop", "inline"])
 async def test_each_key_error_reaches_the_caller_unchanged(
     call: _Call,
-    error: Exception,
+    make_error: Callable[[], Exception],
+    provider: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A control, green before and after: the same object, with no cause and no context."""
+    error = make_error()
     _install(monkeypatch, _Provider(raises=error))
     with pytest.raises(type(error)) as caught:
-        await call(tmp_path)
+        await call(tmp_path, provider)
     assert caught.value is error
     assert error.__cause__ is None and error.__context__ is None
 
@@ -205,3 +226,84 @@ async def test_the_blocking_step_runs_only_after_the_key_hop_and_gets_its_keys(
     monkeypatch.setattr(dr_backup, "_verify_archive_blocking", blocking)
     monkeypatch.setattr(dr_backup, "_restore_blocking", blocking)
     assert await call(tmp_path) == [bytes(32)]
+
+
+# --- which providers take the hop -------------------------------------------------------------
+
+
+@_ENTRY_POINTS
+@pytest.mark.parametrize("name", ["auto", "env", "dpapi", "vault"])
+async def test_a_read_only_provider_resolves_off_the_loop(
+    call: _Call, name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _Provider(raises=KeyProviderError("synthetic refusal"))
+    _install(monkeypatch, provider)
+    with pytest.raises(KeyProviderError):
+        await call(tmp_path, name)
+    assert provider.threads and threading.get_ident() not in provider.threads
+
+
+@_ENTRY_POINTS
+@pytest.mark.parametrize("name", ["host", "synthetic-unknown"])
+async def test_a_writing_or_unknown_provider_resolves_on_the_loop(
+    call: _Call, name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before the rule: every provider took the thread hop."""
+    provider = _Provider(raises=KeyProviderError("synthetic refusal"))
+    _install(monkeypatch, provider)
+    with pytest.raises(KeyProviderError):
+        await call(tmp_path, name)
+    assert provider.threads == [threading.get_ident()]
+
+
+def test_every_known_provider_but_host_is_classified_read_only() -> None:
+    """A provider added later takes the inline path until someone checks it and lists it here."""
+    assert {*dr_backup._READ_ONLY_KEY_PROVIDERS, "host"} == set(KNOWN_PROVIDERS)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the handoff is Windows-only")
+async def test_an_abort_is_not_followed_by_a_custody_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real host provider and a real synthetic handoff. Red before the rule: the abort returned
+    with the handoff in place, and the abandoned thread then wrote the host file and deleted it."""
+    for name in (
+        "MEFOR_STORE_ENCRYPTION_KEY",
+        "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
+        "MEFOR_SECRETS_DIRECTORY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    sid = custody_host._engine_sid()
+    if sid is not None and sid.upper().startswith("S-1-5-21-"):
+        domain = sid.rpartition("-")[0]
+        monkeypatch.setattr(restricted_file, "local_account_domain_sid", lambda: domain)
+    handoff, host = tmp_path / "handoff.key", tmp_path / "master.key"
+    _handoff(handoff, _proved_blob())
+    finished = threading.Event()
+    threads: list[int] = []
+    real = custody_host._convert_handoff
+
+    def slow_convert(host_path: Path, handoff_path: Path) -> Any:
+        threads.append(threading.get_ident())
+        time.sleep(0.4)  # longer than the caller's timeout below
+        try:
+            return real(host_path, handoff_path)
+        finally:
+            finished.set()
+
+    def files() -> tuple[bool, bool]:
+        return handoff.exists(), host.exists()
+
+    monkeypatch.setattr(custody_host, "_convert_handoff", slow_convert)
+    settings = StoreSettings(path=str(tmp_path / "store.db")).model_copy(
+        update={"key_provider": "host"}
+    )
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(
+            dr_backup.run_restore_verify(str(tmp_path / "none.mfbak"), store_settings=settings),
+            timeout=0.1,
+        )
+    at_abort = files()
+    assert finished.wait(_HOLD_SECONDS)
+    assert files() == at_abort, "a custody file changed after the caller had aborted"
+    assert threads == [threading.get_ident()]
