@@ -63,8 +63,8 @@ seen:
   decided from the previous token only (a TypeScript ``x! / y``, a ``)`` before a regex), a quoted
   string ended at a newline, and a U+2028 or U+2029 inside a string, which is folded to a newline;
 * for the TypeScript/JavaScript arms' per-token verdict (BACKLOG #5578): a lexer match is
-  confirmed only where both scans behind ``js_lexer.strict_verdicts`` call it code, so a misread
-  only one scan makes cannot confirm a mention. A misread both make, such as a quoted string
+  confirmed only where both scans behind ``js_lexer.strict_verdicts`` give it a verdict that
+  confirms it, so a misread only one scan makes cannot confirm a mention. A misread both make, such as a quoted string
   misread from an apostrophe that swallows a template's backtick, still makes template text after
   it read as code, and a mention there is confirmed as if it were a call. The first scan reads
   code inside a ``${}`` hole as template text, so a real call in a hole that the per-line view does
@@ -641,7 +641,8 @@ def _literal_test(test: ast.expr, param: str) -> frozenset[str] | None:
 def _pep562_hook(tree: ast.Module) -> ast.FunctionDef | None:
     """The module's PEP 562 ``__getattr__`` when it has a shape :func:`_hook_exports` reads: the
     last module-level binding of the name, a plain undecorated ``def`` directly in the module body,
-    not rebound after it, with exactly one positional parameter and no ``yield``, ``global`` or
+    with no later statement binding the name anywhere inside it (a nested scope included) and no
+    ``global`` naming it, with exactly one positional parameter and no ``yield``, ``global`` or
     ``nonlocal`` in it. Any other shape gives ``None``."""
     defs = [
         i
@@ -677,55 +678,63 @@ def _hook_exports(tree: ast.Module, mod: str, is_init: bool) -> dict[str, list[s
     follows to every other name. ``return X`` serves ``X`` only when ``X`` is a bare name bound by
     an import earlier on the same path, not rebound since, and ``"X"`` can still reach it. Any
     other read or rebinding of the parameter, any other ``if``, a star import, and any statement
-    holding a ``return`` other than these ends the reading: nothing after it is served."""
+    holding a ``return`` other than these ends the reading: nothing after it is served. A name
+    anything else in the module binds is never served, because Python calls the hook only for a
+    name the module lacks.
+
+    The body is walked with an explicit work list, so a long ``elif`` chain cannot exhaust the
+    recursion limit and crash the gate."""
     hook = _pep562_hook(tree)
     if hook is None:
         return {}
     param = (hook.args.posonlyargs + hook.args.args)[0].arg
+    elsewhere = {name for stmt in tree.body if stmt is not hook for name in _bound_names(stmt)}
     out: dict[str, list[str]] = {}
-
-    def block(stmts: list[ast.stmt], admitted: _Admitted, imports: dict[str, list[str]]) -> None:
-        imports = dict(imports)
+    work: list[tuple[list[ast.stmt], _Admitted, dict[str, list[str]]]] = [
+        (hook.body, (True, frozenset()), {})
+    ]
+    while work:
+        stmts, admitted, imports = work.pop()  # each task owns its ``imports`` copy
         for stmt in stmts:
             if isinstance(stmt, ast.Return):
                 value = stmt.value
                 if isinstance(value, ast.Name) and value.id in imports:
                     every, names = admitted
-                    if (value.id not in names) if every else (value.id in names):
+                    served = (value.id not in names) if every else (value.id in names)
+                    if served and value.id not in elsewhere:
                         for target in imports[value.id]:
                             _bind(out, value.id, target)
-                return
+                break
             if isinstance(stmt, ast.Raise):
-                return
+                break
             if isinstance(stmt, ast.If):
                 lits = _literal_test(stmt.test, param)
                 if lits is None:
-                    return
+                    break
                 every, names = admitted
-                block(stmt.body, (False, lits - names if every else names & lits), imports)
+                narrowed: _Admitted = (False, lits - names if every else names & lits)
+                work.append((stmt.body, narrowed, dict(imports)))
                 rest: _Admitted = (True, names | lits) if every else (False, names - lits)
                 if stmt.orelse:
-                    block(stmt.orelse, rest, imports)
-                    return
+                    work.append((stmt.orelse, rest, dict(imports)))
+                    break
                 if not isinstance(stmt.body[-1], (ast.Return, ast.Raise)):
-                    return
+                    break
                 admitted = rest
                 continue
             if isinstance(stmt, (ast.Import, ast.ImportFrom)):
                 pairs = _import_bindings(stmt, mod, is_init)
                 if any(a.name == "*" for a in stmt.names) or any(p == param for p, _ in pairs):
-                    return
+                    break
                 for local, target in pairs:
                     imports[local] = [target]
                 continue
             bound = _bound_names(stmt)
             reads = any(isinstance(n, ast.Name) and n.id == param for n in ast.walk(stmt))
             if reads or param in bound or any(isinstance(n, ast.Return) for n in ast.walk(stmt)):
-                return
+                break
             for name in bound:
                 imports.pop(name, None)
-
-    block(hook.body, (True, frozenset()), {})
     return out
 
 

@@ -2570,7 +2570,8 @@ _LineTokens = Callable[[str, str | None], tuple[set[str], set[str]]]
 
 def _js_token_views(text: str, line_tokens: _LineTokens) -> tuple[set[str], set[str]]:
     """``(found, verified)`` for one source: the tokens of both views, and the tokens of the
-    per-line view plus the lexer matches the lexer calls code. :func:`judge_tokens` reads the pair."""
+    per-line view plus the lexer matches :func:`_matches` confirms. :func:`judge_tokens` reads the
+    pair."""
     per_line, lexed = _js_views(text)
     main_view: set[str] = set()
     for line in per_line:

@@ -2158,6 +2158,16 @@ _OUT = frozenset({"hash:via messagefoundry.sec.impl (out of scope)"})
             id="class-level-getattr",
         ),
         pytest.param("def loader(name):\n" + _HOOK_IMPORT + "    return seal\n", id="not-the-hook"),
+        pytest.param(
+            "def seal(b):\n    return b\n\n\ndef __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    return seal\n",
+            id="module-level-def-of-the-name",
+        ),
+        pytest.param(
+            "seal = None\n\n\ndef __getattr__(name):\n" + _HOOK_IMPORT + "    return seal\n",
+            id="module-level-assignment-of-the-name",
+        ),
     ],
 )
 def test_a_pep562_hook_shape_the_reading_does_not_follow_stays_out_of_scope(
@@ -2165,6 +2175,21 @@ def test_a_pep562_hook_shape_the_reading_does_not_follow_stays_out_of_scope(
 ) -> None:
     # As on origin/main: every shape the hook reading does not follow exports nothing.
     assert _hook_caller_tokens(init_source) == _OUT
+
+
+def test_a_long_elif_chain_in_a_pep562_hook_does_not_crash_the_reading() -> None:
+    arms = "".join(
+        f"    elif name == 'n{k}':\n        from x import n{k}\n        return n{k}\n"
+        for k in range(1500)
+    )
+    source = "def __getattr__(name):\n    if name == 'a':\n        raise AttributeError(name)\n"
+    init = (
+        source
+        + arms
+        + _HOOK_IMPORT.replace("    ", "    else:\n        ", 1)
+        + "        return seal\n"
+    )
+    assert _hook_caller_tokens(init) == frozenset({"hash:via messagefoundry.sec.impl"})
 
 
 @pytest.mark.parametrize(
