@@ -24,10 +24,12 @@ import {
   renderHandlersHtml,
   renderStepsContextMenuHtml,
   resolveDrop,
+  resolveInsertAnchor,
   scopeLabel,
   walkMove,
   type BlockCaptureRow,
   type DropResolution,
+  type HandlerViewModel,
   type LensHandler,
   type LensParseResult,
   type LensRow,
@@ -344,6 +346,7 @@ function generateRowSet(seed: number): GeneratedRowSet {
     const expectSrc = `${"    ".repeat(d.nesting + 1)}stmt_${lineStart}(a & b, "<x>", 'y')`;
     const isReturn = isReturnRow({ kind: d.kind, appended: d.appended, scaffold: d.scaffold });
     web.push({
+      handler: "gen",
       lineStart,
       lineEnd,
       nesting: d.nesting,
@@ -655,6 +658,7 @@ function plain<T>(value: T): T {
 /** The row shape `stepsCtxRows()` yields — i.e. a row AFTER the renderRowHtml → dataset → read-back
  * round trip. The model side is built into the SAME shape from the view models, never from the DOM. */
 interface CtxRow {
+  handler: string;
   lineStart: number;
   lineEnd: number;
   nesting: number;
@@ -672,10 +676,11 @@ interface CtxRow {
  *  drag-interception marker documented in `renderRowHtml`); `isReturn` is recomputed with the
  *  exported {@link isReturnRow} rather than trusting the precomputed `RowViewModel.isReturn`, so the
  *  comparison also pins `buildRowViewModel`'s emission of it. */
-function modelCtxRows(vms: RowViewModel[]): CtxRow[] {
+function modelCtxRows(vms: RowViewModel[], handler: string): CtxRow[] {
   return vms.map((vm) => {
     const draggable = vm.movable === true || vm.kind === "code";
     return {
+      handler,
       lineStart: vm.lineStart,
       lineEnd: vm.lineEnd,
       nesting: vm.nesting,
@@ -694,7 +699,7 @@ function modelCtxRows(vms: RowViewModel[]): CtxRow[] {
  * omits `"raise"` (a `raise` header is neither an `elif` nor an `else`, the only two values any of the
  * drop helpers test for, so the narrowing is behaviour-preserving). */
 function modelDropRows(vms: RowViewModel[], handler: string): BlockCaptureRow[] {
-  const ctx = modelCtxRows(vms);
+  const ctx = modelCtxRows(vms, handler);
   return vms.map((vm, i) => ({
     handler,
     lineStart: ctx[i].lineStart,
@@ -742,6 +747,8 @@ interface Loaded {
   /** `{lineStart, title}` for EVERY row — the webview's `scopeLabel` searches all rows, not just the
    * control headers, so the model side is given the same population. */
   titles: { lineStart: number; title: string }[];
+  /** The view models per handler, so a model-side row carries the handler it belongs to. */
+  handlers: HandlerViewModel[];
 }
 
 function loadCase(c: CorpusCase, opts: LoadOptions = {}): Loaded {
@@ -754,8 +761,9 @@ function loadCase(c: CorpusCase, opts: LoadOptions = {}): Loaded {
     vms,
     handlerName: handlers[0].handler,
     webviewRows: plain(harness.hook.stepsCtxRows()) as CtxRow[],
-    modelRows: modelDropRows(vms, handlers[0].handler),
+    modelRows: handlers.flatMap((h) => modelDropRows(h.rows, h.handler)),
     titles: vms.map((vm) => ({ lineStart: vm.lineStart, title: vm.title })),
+    handlers,
   };
 }
 
@@ -798,7 +806,7 @@ suite("Steps mirror — row context parity (stepsCtxRows vs the view models)", (
         L.modelRows.length,
         `${c.name}: the DOM and the view models disagree on the ROW COUNT`,
       );
-      const expected = modelCtxRows(L.vms);
+      const expected = L.handlers.flatMap((h) => modelCtxRows(h.rows, h.handler));
       for (let i = 0; i < expected.length; i++) {
         assert.deepStrictEqual(
           L.webviewRows[i],
@@ -984,6 +992,27 @@ suite("Steps mirror — buildDropSlots / walkMove parity", () => {
             plain(L.harness.hook.walkMove(L.webviewRows, r.lineStart, dir)),
             walkMove(L.modelRows, r.lineStart, dir),
             `${c.name}: walkMove('${dir}') diverged at line ${r.lineStart} (${r.kind})`,
+          );
+        }
+      }
+    });
+  }
+});
+
+// ---- T4c: resolveInsertAnchor (BACKLOG #5839) -------------------------------------------------------
+
+suite("Steps mirror — resolveInsertAnchor parity", () => {
+  for (const c of CORPUS) {
+    test(`${c.name}: resolveInsertAnchor agrees before AND after every row`, () => {
+      const L = loadCase(c);
+      for (const r of L.webviewRows) {
+        for (const pos of ["before", "after"] as const) {
+          const w = L.harness.hook.resolveInsertAnchor(L.webviewRows, r.lineStart, pos) as DomNode | null;
+          const m = resolveInsertAnchor(L.modelRows, r.lineStart, pos);
+          assert.deepStrictEqual(
+            w === null ? null : [w.anchor.lineStart, w.position],
+            m === null ? null : [m.anchor.lineStart, m.position],
+            `${c.name}: resolveInsertAnchor('${pos}') diverged at line ${r.lineStart} (${r.kind})`,
           );
         }
       }
@@ -1369,10 +1398,11 @@ const MIRRORED = new Set([
   "resolveDrop",
   "barAnchor",
   "inRole",
+  "resolveInsertAnchor",
 ]);
 
 /** Top-level functions that are NOT mirrors — DOM/wiring helpers with no pure model counterpart. Each
- * entry carries the reason it is exempt. Adding an 11th mirror without a parity test must fail. */
+ * entry carries the reason it is exempt. Adding a mirror without a parity test must fail. */
 const NOT_A_MIRROR: Record<string, string> = {
   selectRow: "DOM: applies the .selected class and records the toolbar's insert anchor",
   numberEditValue: "DOM: reads a number <input>; steps-modes-webview.test.ts drives it (BACKLOG #5942)",
@@ -1388,7 +1418,7 @@ const NOT_A_MIRROR: Record<string, string> = {
   clearIndicators: "DOM: removes the insertion bar + scope pill and the scope tint",
   rowByLineStart: "DOM: finds an <li> by data-line-start",
   showIndicators: "DOM: positions the bar/pill from getBoundingClientRect (layout, not logic)",
-  menuInsert: "wiring: posts the same insertItem message the toolbar Add posts",
+  menuInsert: "wiring: resolveInsertAnchor + the insertItem message the toolbar Add and the menu post",
   menuDelete: "wiring: posts the same deleteRow message the row button posts",
   menuMove: "wiring: walkMove + the same moveTo message the row arrows post",
   menuAddDestination: "wiring: posts the same addDestination message the row button posts",

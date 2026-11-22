@@ -52,6 +52,9 @@
     // moveTo, so an arrow move rides the verified cross-suite engine path.
     function stepsCtxRows() {
       return Array.from(document.querySelectorAll('li.row')).map((el) => ({
+        // The page holds every Handler and Router of the module; a row names its own, as the model's
+        // RowDropContext does (BACKLOG #5830).
+        handler: el.dataset.handler,
         lineStart: Number(el.dataset.lineStart),
         lineEnd: Number(el.dataset.lineEnd),
         nesting: Number(el.dataset.nesting),
@@ -106,9 +109,9 @@
     function buildDropSlots(rws) {
       const bySuite = new Map();
       for (const r of rws) { const l = bySuite.get(r.suite); if (l) { l.push(r); } else { bySuite.set(r.suite, [r]); } }
-      const root = rws.find((r) => r.nesting === 0);
+      // Every function's top-level suite, in document order (BACKLOG #5840).
+      const roots = Array.from(new Set(rws.filter((r) => r.nesting === 0).map((r) => r.suite)));
       const slots = [];
-      if (!root) { return slots; }
       const cont = (r) => r.control === 'elif' || r.control === 'else';
       const emit = (suiteId) => {
         const ch = bySuite.get(suiteId) || [];
@@ -126,10 +129,30 @@
           }
         }
       };
-      emit(root.suite);
+      for (const s of roots) { emit(s); }
       return slots;
     }
-    function walkMove(rws, blockStartLine, direction) {
+    // Mirror of stepsModel.resolveInsertAnchor (BACKLOG #5839): an insert AFTER an if/elif/else/for
+    // header is requested BEFORE the block's first body row, since right after the header line, at the
+    // header's indent, the engine's re-parse refuses it. Any other anchor and position is unchanged.
+    function resolveInsertAnchor(rws, anchorLineStart, position) {
+      const anchor = rws.find((r) => r.lineStart === anchorLineStart);
+      if (!anchor) { return null; }
+      const isHeader = anchor.kind === 'control' && anchor.control !== undefined && anchor.control !== 'raise';
+      if (position !== 'after' || !isHeader) { return { anchor, position }; }
+      const bodySuite = String(anchor.lineStart);
+      // A blank-only body row is skipped: the engine would take the header's indent from it.
+      const first = rws.find((r) => r.suite === bodySuite && (r.expectSrc === undefined ? 'x' : r.expectSrc).trim() !== '');
+      return first ? { anchor: first, position: 'before' } : null;
+    }
+    function walkMove(allRws, blockStartLine, direction) {
+      // Walk only the moving row's own function, told apart by its root suite (def line), never by name:
+      // a Router and a Handler may share one (BACKLOG #5830).
+      const at = allRws.findIndex((r) => r.lineStart === blockStartLine);
+      if (at < 0) { return null; }
+      let root = '';
+      const roots = allRws.map((r) => (r.nesting === 0 ? (root = r.suite) : root));
+      const rws = allRws.filter((_r, i) => roots[i] === roots[at]);
       const mi = rws.findIndex((r) => r.lineStart === blockStartLine);
       if (mi < 0) { return null; }
       const m = rws[mi];
@@ -750,23 +773,10 @@
       if (sel.value === '' || !selected) { return; }
       // ADR 0104 fan-out: insert BEFORE a terminal return / scaffold footer (no dead code), AFTER a
       // mid-body append send or any other step.
-      const position = selected.isReturn ? 'before' : 'after';
-      // Remember what to select after the insert re-projects (the new neighbour of the anchor row).
-      vscode.setState(Object.assign({}, vscode.getState() || {}, {
-        selectAfterInsert: { handler: selected.handler, anchorExpectSrc: selected.expectSrc, position },
-      }));
-      vscode.postMessage({
-        command: 'insertItem',
-        itemId: sel.value,
-        // Pass the isReturn-aware position (a mid-body append → after, a return/footer → before) so the
-        // provider does not have to re-derive it from `kind` alone (which can't tell an append from a return).
-        position: position,
-        handler: selected.handler,
-        lineStart: selected.lineStart,
-        lineEnd: selected.lineEnd,
-        expectSrc: selected.expectSrc,
-        kind: selected.kind,
-      });
+      // Pass the isReturn-aware position (a mid-body append → after, a return/footer → before) so the
+      // provider does not have to re-derive it from `kind` alone (which can't tell an append from a return).
+      const opt = sel.selectedOptions && sel.selectedOptions[0];
+      menuInsert(sel.value, selected.isReturn ? 'before' : 'after', !!(opt && opt.dataset.anchor === 'if_chain'));
     });
 
     // Filter: hide rows that don't match the query (segment / field path / action / Send target). Pure client-
@@ -790,17 +800,26 @@
     // pure stepsModel.contextMenuEnablement (unit-tested there). Copy/Cut/Paste stay keyboard-served (they
     // are deliberately NOT in this menu). Dispatch helpers use the currently `selected` row. These post to
     // the SAME provider handlers, so the byte-stable lens-rewrite path + F7 stale guard are unchanged.
-    function menuInsert(itemId, position) {
+    // Shared by the toolbar Add and the menu's Insert before / after. `clause` marks an Else / Else If
+    // item (data-anchor="if_chain"), whose anchor must stay the if/elif row it extends; every other item
+    // goes through resolveInsertAnchor, so "after a header" lands as the block's first statement.
+    function menuInsert(itemId, position, clause) {
       if (!selected || !itemId || (position !== 'before' && position !== 'after')) { return; }
-      // Remember which row to re-select after the insert re-projects (the new neighbour of the anchor),
-      // exactly as the toolbar Add does — the position drives before/after neighbour selection.
+      let at = selected;
+      if (!clause) {
+        const res = resolveInsertAnchor(stepsCtxRows(), selected.lineStart, position);
+        // No body row to anchor on: send the request as asked, and the engine's refusal is shown.
+        if (res) { at = res.anchor; position = res.position; }
+      }
+      // Remember which row to re-select after the insert re-projects (the new neighbour of the anchor);
+      // the position drives before/after neighbour selection.
       vscode.setState(Object.assign({}, vscode.getState() || {}, {
-        selectAfterInsert: { handler: selected.handler, anchorExpectSrc: selected.expectSrc, position: position },
+        selectAfterInsert: { handler: at.handler, anchorExpectSrc: at.expectSrc, position: position },
       }));
       vscode.postMessage({
         command: 'insertItem', itemId: itemId, position: position,
-        handler: selected.handler, lineStart: selected.lineStart, lineEnd: selected.lineEnd,
-        expectSrc: selected.expectSrc, kind: selected.kind,
+        handler: at.handler, lineStart: at.lineStart, lineEnd: at.lineEnd,
+        expectSrc: at.expectSrc, kind: at.kind,
       });
     }
     function menuDelete() {
@@ -864,6 +883,9 @@
           if (!el) { return; }
           el.disabled = !!disabled;
           // A disabled Insert parent must also suppress its submenu (belt-and-suspenders with openSubmenu).
+          // Only the PARENT decides that: an item inside the submenu shares the same .ctx-sub, and
+          // letting it toggle the class would hide the whole submenu whenever its last item is greyed.
+          if (!el.classList.contains('ctx-parent')) { return; }
           const sub = el.closest('.ctx-sub');
           if (sub) { sub.classList.toggle('ctx-disabled', !!disabled); }
         }
@@ -878,7 +900,8 @@
           const ls = Number(el.dataset.lineStart);
           const ctxRows = stepsCtxRows();
           // Mirrors stepsModel.contextMenuEnablement: Insert before always; Insert after suppressed on a
-          // terminal RETURN / scaffold footer (dead code after the return) but ALLOWED on a mid-body append
+          // terminal RETURN / scaffold footer / Router route row (data-is-return, so dead code after the
+          // return) but ALLOWED on a mid-body append
           // send (ADR 0104); Delete only on an editable action/lookup/send row; ↑/↓ per walk.
           for (const p of insertParents) {
             setDisabled(p, p.dataset.sub === 'after' && isReturn);
@@ -896,15 +919,18 @@
           // ADR 0104 fan-out: "Add destination" only on a real send row (never the `return []` filter).
           setDisabled(addDestItem, !(kind === 'send' && el.dataset.filtered !== 'true'));
           // ADR 0106: Else / Else If (data-anchor="if_chain") only apply to an if-chain anchor (an if/elif row).
-          const isIfChain = kind === 'control' && (control === 'if' || control === 'elif');
-          for (const c of menu.querySelectorAll('.ctx-item[data-anchor="if_chain"]')) {
-            setDisabled(c, !isIfChain);
-          }
           // ADR 0076 Amendment D: grey every Add item outside the enclosing element's role, so a Router's
           // menu offers routing constructs only and the engine's refusal is never met as an error toast.
+          // The menu is shared by every row, so each item's state is set afresh on every open, enabling
+          // what this row allows as well as greying what it does not (BACKLOG #5842).
+          // A statement inserted BEFORE an elif/else header would land at the clause keyword's indent and
+          // split the if-chain, which the engine refuses; a Comment there is accepted, so only it stays.
+          const isIfChain = kind === 'control' && (control === 'if' || control === 'elif');
+          const continuation = kind === 'control' && (control === 'elif' || control === 'else');
           const rowRole = el.dataset.role || 'handler';
           for (const c of menu.querySelectorAll('.ctx-item[data-item-id]')) {
-            if (!inRole(c, rowRole)) { setDisabled(c, true); }
+            setDisabled(c, (c.dataset.anchor === 'if_chain' && !isIfChain) || !inRole(c, rowRole) ||
+              (continuation && c.dataset.position === 'before' && c.dataset.itemId !== 'comment'));
           }
           // Mirror isRowMovable: a code row (and an elif/else header) is NOT movable, even though walkMove
           // finds an adjacent slot for it (it is draggable only as a drag-interception marker). Gate the
@@ -967,7 +993,7 @@
           const item = ev.target.closest('.ctx-item');
           if (!item || item.disabled) { return; }
           const cmd = item.dataset.cmd;
-          if (cmd === 'insert') { menuInsert(item.dataset.itemId, item.dataset.position); }
+          if (cmd === 'insert') { menuInsert(item.dataset.itemId, item.dataset.position, item.dataset.anchor === 'if_chain'); }
           else if (cmd === 'deleteRow') { menuDelete(); }
           else if (cmd === 'addDestination') { menuAddDestination(); }
           else if (cmd === 'moveUp') { menuMove('up'); }
@@ -1022,7 +1048,7 @@
     }
 
     // ---- TEST-ONLY EXPORT HOOK (BACKLOG #1758; master test plan 13-steps-editor.md §S2 step 3) --------
-    // The ten functions above MIRROR pure, unit-tested helpers in ide/src/stepsModel.ts (the declared
+    // The mirrored functions above (steps-mirror.test.ts lists them in MIRRORED) MIRROR pure, unit-tested helpers in ide/src/stepsModel.ts (the declared
     // source of truth) because this script is loaded into a `default-src 'none'` webview and cannot
     // import across that boundary. The differential suite (ide/src/test/suite/steps-mirror.test.ts) loads
     // THIS FILE under jsdom and asserts every mirror agrees with its model counterpart, so a drift shows
@@ -1047,6 +1073,7 @@
         clipLabel: clipLabel,
         buildDropSlots: buildDropSlots,
         walkMove: walkMove,
+        resolveInsertAnchor: resolveInsertAnchor,
         canDrop: canDrop,
         scopeLabel: scopeLabel,
         resolveDrop: resolveDrop,
