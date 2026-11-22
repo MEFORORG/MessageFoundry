@@ -11,6 +11,7 @@ positive control beside it. The Postgres and SQL Server returns are pinned offli
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -19,12 +20,13 @@ import pytest
 
 from messagefoundry.config.models import BatchConfig, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Registry
+from messagefoundry.config.wiring import Loopback, Registry, build_inbound_connection
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, OutboxStatus
 from messagefoundry.store import store as store_module
-from messagefoundry.store.queue_tag import QueueTagError
+from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.queue_tag import QUEUE_TAG_FAILED_ACTION, QueueTagError
 from messagefoundry.transports.base import DestinationConnector, NegativeAckError
 from tests._mllp_recorder import run_one_batch
 
@@ -77,17 +79,17 @@ async def test_dead_letter_batch_counts_what_it_wrote(store: MessageStore) -> No
 
 
 @pytest.mark.parametrize("resolved", [True, False], ids=["declined", "written"])
-async def test_an_unopenable_row_is_reported_only_when_it_was_written(
+async def test_a_tag_failure_is_always_reported_and_only_a_write_claims_a_dead_letter(
     store: MessageStore,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     resolved: bool,
 ) -> None:
     caplog.set_level(logging.WARNING, logger=STORE_LOG)
-    reports: list[str] = []
+    reports: list[tuple[str, str | None]] = []
 
-    async def report(_store: Any, _cipher: Any, row: Any, **_kw: Any) -> None:
-        reports.append(str(row["id"]))
+    async def report(_store: Any, _cipher: Any, row: Any, **kw: Any) -> None:
+        reports.append((str(row["id"]), kw.get("outcome")))
 
     monkeypatch.setattr(store_module, "report_queue_tag_failure", report)
     (oid,) = await _claimed(store, "OB1")
@@ -98,8 +100,72 @@ async def test_an_unopenable_row_is_reported_only_when_it_was_written(
 
     assert await store._dead_letter_unopenable(row, QueueTagError("refused")) is None
 
-    lines = [r for r in caplog.records if "dead-lettering undecryptable" in r.getMessage()]
-    assert (reports, len(lines)) == (([], 0) if resolved else ([oid], 1))
+    # The tag verdict does not depend on who settled the row, so the evidence is always recorded.
+    assert [r[0] for r in reports] == [oid]
+    outcome = reports[0][1]
+    if resolved:
+        assert outcome is not None and "not dead-lettered by this call" in outcome
+    else:
+        assert outcome is None  # report_queue_tag_failure's default, "was dead-lettered"
+    lines = [r for r in caplog.records if "dead-lettered undecryptable" in r.getMessage()]
+    assert len(lines) == (0 if resolved else 1)
+
+
+async def test_a_declined_tag_failure_reaches_the_audit_and_the_alert(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="messagefoundry.store.queue_tag")
+    alerts: list[tuple[str, str]] = []
+    cast(Any, store._cipher).report_tag_failure = lambda table, why: alerts.append((table, why))
+    (oid,) = await _claimed(store, "OB1")
+    row = await store._row(oid)
+    assert row is not None
+    await store.mark_done(oid, now=101.0)
+
+    await store._dead_letter_unopenable(row, QueueTagError("refused"))
+
+    audits = [a for a in await store.list_audit() if a["action"] == QUEUE_TAG_FAILED_ACTION]
+    assert len(audits) == 1
+    assert len(alerts) == 1 and "not dead-lettered by this call" in alerts[0][1]
+    assert any("not dead-lettered by this call" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("write", ["declines", "raises"])
+async def test_an_open_failure_is_logged_whatever_the_write_does(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    write: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=STORE_LOG)
+    (oid,) = await _claimed(store, "OB1")
+    row = await store._row(oid)
+    assert row is not None
+
+    async def dead_letter(*_a: Any, **_kw: Any) -> bool:
+        if write == "raises":
+            raise sqlite3.DatabaseError("store fault")
+        return False
+
+    monkeypatch.setattr(store, "dead_letter_now", dead_letter)
+    await store._dead_letter_unopenable(row, CipherError("bad cell"))
+
+    assert any(
+        "could not be opened" in r.getMessage() and "bad cell" in r.getMessage()
+        for r in caplog.records
+    )
+    assert not [r for r in caplog.records if "dead-lettered undecryptable" in r.getMessage()]
+
+
+class _RefusesAfterBase:
+    """A connector that settles ``resolve`` during its send; a subclass says how the send ends."""
+
+    def __init__(self, store: MessageStore) -> None:
+        self.store = store
+        self.resolve: list[str] = []
+
+    async def aclose(self) -> None:
+        return None
 
 
 def _runner(store: MessageStore, connector: object | None = None) -> RegistryRunner:
@@ -123,7 +189,7 @@ def _runner(store: MessageStore, connector: object | None = None) -> RegistryRun
         ("_apply_transform_internal_error", False),
     ],
 )
-async def test_an_internal_error_arm_logs_a_dead_letter_only_when_written(
+async def test_an_internal_error_arm_logs_the_fault_and_claims_only_a_written_dead_letter(
     store: MessageStore, caplog: pytest.LogCaptureFixture, arm: str, resolved: bool
 ) -> None:
     caplog.set_level(logging.WARNING, logger=RUNNER_LOG)
@@ -134,8 +200,95 @@ async def test_an_internal_error_arm_logs_a_dead_letter_only_when_written(
 
     await getattr(_runner(store), arm)("IB", item, ValueError("boom"))
 
-    lines = [r for r in caplog.records if "dead-lettering" in r.getMessage()]
+    assert len([r for r in caplog.records if "(ValueError)" in r.getMessage()]) >= 1
+    lines = [r for r in caplog.records if "dead-lettered" in r.getMessage()]
     assert len(lines) == (0 if resolved else 1)
+
+
+@pytest.mark.parametrize("arm", ["_apply_router_internal_error", "_apply_transform_internal_error"])
+async def test_an_internal_error_arm_logs_the_fault_when_the_write_raises(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, arm: str
+) -> None:
+    caplog.set_level(logging.WARNING, logger=RUNNER_LOG)
+    (oid,) = await _claimed(store, "OB1")
+    item = cast(Any, type("Item", (), {"id": oid, "stage": "outbound"})())
+
+    async def raises(*_a: Any, **_kw: Any) -> bool:
+        raise sqlite3.DatabaseError("store fault")
+
+    monkeypatch.setattr(store, "dead_letter_now", raises)
+    with pytest.raises(sqlite3.DatabaseError):
+        await getattr(_runner(store), arm)("IB", item, ValueError("boom"))
+
+    assert [r for r in caplog.records if "(ValueError)" in r.getMessage()]
+    assert not [r for r in caplog.records if "dead-lettered" in r.getMessage()]
+
+
+class _RaisesAfter(_RefusesAfterBase):
+    """Raises an internal error, after ``resolve`` settled the rows mid-send."""
+
+    async def send(self, _payload: str) -> None:
+        for oid in self.resolve:
+            await self.store.mark_done(oid)
+        raise ValueError("boom")
+
+
+async def test_a_batch_internal_error_is_logged_when_every_member_was_settled(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=RUNNER_LOG)
+    connector = _RaisesAfter(store)
+    connector.resolve = [await _enqueue(store, n) for n in (1, 2)]
+
+    await run_one_batch(_runner(store, connector), OUT)
+
+    assert [r for r in caplog.records if "framing/internal error" in r.getMessage()]
+    assert not [r for r in caplog.records if "dead-lettered" in r.getMessage()]
+
+
+async def test_a_single_row_internal_error_is_logged_when_the_row_was_settled(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=RUNNER_LOG)
+    connector = _RaisesAfter(store)
+    oid = await _enqueue(store, 1)
+    connector.resolve = [oid]
+    runner = _runner(store, connector)
+    runner._batch[OUT] = None
+    item = await store.claim_next_fifo(OUT)
+    assert item is not None
+
+    await runner._process_delivery_item(OUT, item)
+
+    assert [r for r in caplog.records if "internal error delivering" in r.getMessage()]
+    assert not [r for r in caplog.records if "dead-lettered" in r.getMessage()]
+
+
+@pytest.mark.parametrize("field", ["unreadable", "missing_handler"])
+async def test_a_routed_dead_letter_arm_logs_the_fault_when_the_write_declines(
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=RUNNER_LOG)
+    (oid,) = await _claimed(store, "OB1")
+    item = cast(Any, type("Item", (), {"id": oid, "stage": "routed", "handler_name": "gone"})())
+    await store.mark_done(oid, now=101.0)
+    runner = _runner(store)
+    # The inbound is live and the handler is not, so apply settles on the missing-handler arm.
+    runner.registry.add_inbound(build_inbound_connection("IB", Loopback(), router="route"))
+    runner.registry.add_router("route", lambda _msg: [])
+    prep = (
+        wiring_runner._RoutedPrep(unreadable=wiring_runner._UnreadableLoopbackRow("no id"))
+        if field == "unreadable"
+        else wiring_runner._RoutedPrep(missing_handler=True)
+    )
+
+    await runner._apply_routed("IB", item, prep)
+
+    needle = "no id" if field == "unreadable" else "is missing"
+    assert [r for r in caplog.records if needle in r.getMessage()]
+    assert not [r for r in caplog.records if "dead-lettered" in r.getMessage()]
 
 
 async def test_a_refused_member_already_resolved_logs_no_dead_letter(
@@ -152,20 +305,13 @@ async def test_a_refused_member_already_resolved_logs_no_dead_letter(
     assert len(lines) == 1 and open_row in lines[0] and done not in lines[0]
 
 
-class _RefusesAfter:
+class _RefusesAfter(_RefusesAfterBase):
     """Refuses the envelope permanently, after ``resolve`` settled members mid-send."""
-
-    def __init__(self, store: MessageStore) -> None:
-        self.store = store
-        self.resolve: list[str] = []
 
     async def send(self, _payload: str) -> None:
         for oid in self.resolve:
             await self.store.mark_done(oid)
         raise NegativeAckError("refused", code="AR", permanent=True)
-
-    async def aclose(self) -> None:
-        return None
 
 
 def _adt(n: int) -> str:

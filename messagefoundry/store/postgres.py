@@ -24,8 +24,9 @@ fencing yet — but per-message finalize, the audit chain, and schema init are s
   re-counts on a fresh snapshot — no double-finalize; different ids never contend. A finalizer that
   spans **more than one** message takes every per-message lock in a **canonical (sorted) order** via
   :meth:`_lock_finalize_batch`, so two such callers with overlapping message sets can't form a lock
-  cycle (no multi-message deadlock). ``cancel_queued`` takes them up front; the dead-letter sweeps
-  take them after their row UPDATEs, which run in ``seq`` order (BACKLOG #5729).
+  cycle (no multi-message deadlock). ``cancel_queued`` takes them after its one row UPDATE, before
+  it finalizes any; the dead-letter sweeps take them after their row UPDATEs, which run in ``seq``
+  order (BACKLOG #5729).
   **Every multi-message finalizer is bound by this rule, not just the two named above** — the ADR 0082
   batch primitives (:meth:`mark_batch_done`, :meth:`mark_batch_failed`, :meth:`dead_letter_batch`) each
   finalize N distinct ids in ONE txn and so MUST iterate in ``sorted()`` id order. They originally
@@ -5894,8 +5895,8 @@ class PostgresStore:
     async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
         tag is also audited and alerted (BACKLOG #2593), a corrupt cell included, whose audit row
-        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then, and also for a row the
-        dead-letter did not write, which is not reported (ADR 0157 Amendment D).
+        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then. A row the dead-letter did
+        not write keeps its tag failure report, which says so (ADR 0157 Amendment D).
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
         the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
@@ -5904,6 +5905,10 @@ class PostgresStore:
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
+        # Before the write, so the fault is logged whatever the write does. The text, not the
+        # error: a record keeps its args, and the error's traceback holds the claim frame's
+        # locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("queue row %s could not be opened: %s", row["id"], str(exc))
         try:
             wrote = await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
         except PROGRAMMING_ERRORS:
@@ -5919,13 +5924,21 @@ class PostgresStore:
                     self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
-        if not wrote:  # ADR 0157 Amendment D: settled by another writer, or fenced
-            return None
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
+        if wrote:
+            log.warning("dead-lettered undecryptable queue row %s", row["id"])
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, row, error=exc)
+            # The tag verdict does not depend on who settled the row (ADR 0157 Amendment D).
+            if wrote:
+                await report_queue_tag_failure(self, self._cipher, row, error=exc)
+            else:
+                await report_queue_tag_failure(
+                    self,
+                    self._cipher,
+                    row,
+                    error=exc,
+                    outcome="was already settled, removed or fenced, and was not dead-lettered"
+                    " by this call",
+                )
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[Any], now: float | None) -> None:

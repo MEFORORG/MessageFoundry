@@ -19,8 +19,9 @@ H-8 LOCK ORDERING (multi-message finalizers). :meth:`_maybe_finalize` takes a pe
 lock, so any primitive that finalizes MORE THAN ONE message in a single transaction holds N of them
 at once and MUST acquire them in CANONICAL (sorted) message_id order — otherwise two such callers
 with overlapping id sets can take the same two locks in opposite orders and deadlock (SQL Server
-1205). ``cancel_queued`` does this up front via :meth:`_lock_finalize_batch`, and the dead-letter
-sweeps through the same helper after their row UPDATEs, which run in ``seq`` order (BACKLOG #5729);
+1205). ``cancel_queued`` does this via :meth:`_lock_finalize_batch` after its one row UPDATE, before
+it finalizes any, and the dead-letter sweeps through the same helper after their row UPDATEs, which
+run in ``seq`` order (BACKLOG #5729);
 ``claim_fifo_heads``' H2 sorts its own. The ADR 0082 batch primitives (:meth:`mark_batch_done`,
 :meth:`mark_batch_failed`, :meth:`dead_letter_batch`) are ALSO multi-message finalizers — they
 originally iterated their finalize dict in *insertion* (caller ``outbox_ids``) order, which is a real
@@ -11144,8 +11145,8 @@ class SqlServerStore:
     ) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
         tag is also audited and alerted (BACKLOG #2593), a corrupt cell included, whose audit row
-        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then, and also for a row the
-        dead-letter did not write, which is not reported (ADR 0157 Amendment D).
+        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then. A row the dead-letter did
+        not write keeps its tag failure report, which says so (ADR 0157 Amendment D).
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
         the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
@@ -11155,6 +11156,10 @@ class SqlServerStore:
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
         row = {**d, "stage": stage}
+        # Before the write, so the fault is logged whatever the write does. The text, not the
+        # error: a record keeps its args, and the error's traceback holds the claim frame's
+        # locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("queue row %s could not be opened: %s", d["id"], str(exc))
         try:
             wrote = await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
         except PROGRAMMING_ERRORS:
@@ -11170,13 +11175,21 @@ class SqlServerStore:
                     self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
-        if not wrote:  # ADR 0157 Amendment D: settled by another writer, or fenced
-            return None
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], str(exc))
+        if wrote:
+            log.warning("dead-lettered undecryptable queue row %s", d["id"])
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, row, error=exc)
+            # The tag verdict does not depend on who settled the row (ADR 0157 Amendment D).
+            if wrote:
+                await report_queue_tag_failure(self, self._cipher, row, error=exc)
+            else:
+                await report_queue_tag_failure(
+                    self,
+                    self._cipher,
+                    row,
+                    error=exc,
+                    outcome="was already settled, removed or fenced, and was not dead-lettered"
+                    " by this call",
+                )
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]], now: float | None) -> None:

@@ -15166,8 +15166,8 @@ class MessageStore:
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
         (BACKLOG #2593), a corrupt cell included, whose audit row names its cause as corrupt
-        (BACKLOG #5884). Returns ``None`` then, and also for a row another writer has settled, which
-        is neither written nor reported (ADR 0157 Amendment D).
+        (BACKLOG #5884). Returns ``None`` then. A row another writer has settled is not written,
+        and its tag failure is still reported, saying so (ADR 0157 Amendment D).
 
         A failure that says nothing about the row is returned instead, with nothing written
         (BACKLOG #5735): a key service that gave no verdict (:func:`is_transient_open_failure`) or
@@ -15178,6 +15178,10 @@ class MessageStore:
         (:meth:`_set_aside_claimed`)."""
         if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
             return queue_open_fault(exc)
+        # Before the write, so the fault is logged whatever the write does. The text, not the
+        # error: a record keeps its args, and the error's traceback holds the claim frame's
+        # locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("queue row %s could not be opened: %s", row["id"], str(exc))
         try:
             wrote = await self.dead_letter_now(
                 row["id"], f"undecryptable payload: {exc}", _standalone=True
@@ -15195,13 +15199,20 @@ class MessageStore:
                     self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
-        if not wrote:  # ADR 0157 Amendment D: another writer settled the row, so nothing to report
-            return None
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
+        if wrote:
+            log.warning("dead-lettered undecryptable queue row %s", row["id"])
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, row, error=exc)
+            # The tag verdict does not depend on who settled the row (ADR 0157 Amendment D).
+            if wrote:
+                await report_queue_tag_failure(self, self._cipher, row, error=exc)
+            else:
+                await report_queue_tag_failure(
+                    self,
+                    self._cipher,
+                    row,
+                    error=exc,
+                    outcome="was already settled or removed, and was not dead-lettered by this call",
+                )
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[aiosqlite.Row], now: float | None) -> None:

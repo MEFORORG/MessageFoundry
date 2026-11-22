@@ -192,7 +192,7 @@ async def test_a_reload_during_the_loopback_read_is_not_a_handler_error(
         assert outcome == (_ItemOutcome.PROCESSED, None)
         assert status == OutboxStatus.DEAD.value
         # The missing-handler dead-letter, not the internal-error policy's "handler error".
-        assert "is missing; dead-lettering" in caplog.text
+        assert "is missing" in caplog.text and "dead-lettered" in caplog.text
 
 
 class _Recorder:
@@ -460,7 +460,7 @@ async def test_a_partial_restore_settles_the_row_by_the_live_graph(
         assert outcome == (_ItemOutcome.PROCESSED, None), "a live inbound's lane was stopped"
         assert status == OutboxStatus.DEAD.value
         assert policies == []
-        assert "is missing; dead-lettering" in caplog.text
+        assert "is missing" in caplog.text and "dead-lettered" in caplog.text
     else:
         assert outcome == (_ItemOutcome.STOPPED, None)
         assert status == OutboxStatus.PENDING.value, "a reload alone dead-lettered an ACKed row"
@@ -531,7 +531,11 @@ async def test_a_partial_restore_between_prepare_and_apply_keeps_the_batch_runni
         rows = [(r["handler_name"], r["status"]) for r in await cur.fetchall()]
     assert rows == [("h_two", OutboxStatus.DEAD.value)], "S1 not handed off, or S2 not dead"
     # As a missing handler, not through the internal-error policy, which CONTINUE also dead-letters.
-    assert "handler 'h_two'" in caplog.text and "is missing; dead-lettering" in caplog.text
+    assert (
+        "handler 'h_two'" in caplog.text
+        and "is missing" in caplog.text
+        and "dead-lettered" in caplog.text
+    )
 
 
 async def test_a_reload_during_an_unreadable_read_reverts_rather_than_dead_letters(

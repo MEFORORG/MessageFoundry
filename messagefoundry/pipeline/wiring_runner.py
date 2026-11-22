@@ -11798,13 +11798,16 @@ class RegistryRunner:
                 )
                 self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
+            # The fault is logged whatever the write does; only "dead-lettered" is gated on it
+            # (BACKLOG #5724).
+            log.warning(
+                "delivery worker %r: internal error delivering %s (%s)",
+                name,
+                item.id,
+                type(exc).__name__,
+            )
             if await self.store.dead_letter_now(item.id, f"internal error: {safe_exc(exc)}"):
-                log.warning(
-                    "delivery worker %r: internal error delivering %s (%s); dead-lettering",
-                    name,
-                    item.id,
-                    type(exc).__name__,
-                )
+                log.warning("delivery worker %r: dead-lettered %s", name, item.id)
         else:
             # #46: a successful delivery means the lane is up — edge-trigger
             # connection_restored if it had been marked down (no-op otherwise). Not for a send
@@ -12313,18 +12316,24 @@ class RegistryRunner:
                 )
                 self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
+            # The fault is logged whatever the write does; only "dead-lettered" is gated on it,
+            # and counts the rows written (BACKLOG #5724).
+            log.warning(
+                "delivery worker %r: framing/internal error delivering a batch of %d (%s%s)",
+                name,
+                len(ids),
+                type(exc).__name__,
+                member,
+            )
             written = await self.store.dead_letter_batch(
                 ids, _member_error(f"internal error: {safe_exc(exc)}", current)
             )
-            if written:  # counts the rows written; none is no dead-letter (BACKLOG #5724)
+            if written:
                 log.warning(
-                    "delivery worker %r: framing/internal error delivering a batch of %d (%s%s); "
-                    "dead-lettering %d",
+                    "delivery worker %r: dead-lettered %d of a batch of %d",
                     name,
-                    len(ids),
-                    type(exc).__name__,
-                    member,
                     written,
+                    len(ids),
                 )
         else:
             if gated:
@@ -12584,8 +12593,8 @@ class RegistryRunner:
         incl. an unknown handler name) — the single source of truth for both the async ingress except
         block and the fused route branch (ADR 0071 B5 PR3; ADR 0057 STOP/CONTINUE). STOP: log + durably
         ``mark_failed`` the head + a ``connection_stopped`` alert + ``(STOPPED, None)``. CONTINUE
-        (default): ``dead_letter_now``, a log line if it wrote, ``(PROCESSED, None)``. Post-ACK, so no
-        NAK; the log emits the exception TYPE only (full detail goes to the secured store's
+        (default): log, ``dead_letter_now``, a second line if it wrote, ``(PROCESSED, None)``.
+        Post-ACK, so no NAK; the log emits the exception TYPE only (full detail goes to the secured store's
         ``last_error``, never the general log — PHI)."""
         if self._internal_error_default is InternalErrorPolicy.STOP:
             log.error(
@@ -12606,13 +12615,10 @@ class RegistryRunner:
             )
             self._hold_for_operator(name, "inbound", Stage(item.stage))
             return _ItemOutcome.STOPPED, None
+        # The fault is logged whatever the write does; only "dead-lettered" is gated (BACKLOG #5724).
+        log.warning("router worker %r: router error on %s (%s)", name, item.id, type(exc).__name__)
         if await self.store.dead_letter_now(item.id, f"router error: {safe_exc(exc)}"):
-            log.warning(
-                "router worker %r: router error on %s (%s); dead-lettering",
-                name,
-                item.id,
-                type(exc).__name__,
-            )
+            log.warning("router worker %r: dead-lettered %s", name, item.id)
         return _ItemOutcome.PROCESSED, None
 
     async def _apply_transform_internal_error(
@@ -12641,13 +12647,12 @@ class RegistryRunner:
             )
             self._hold_for_operator(name, "inbound", Stage(item.stage))
             return _ItemOutcome.STOPPED, None
+        # The fault is logged whatever the write does; only "dead-lettered" is gated (BACKLOG #5724).
+        log.warning(
+            "transform worker %r: handler error on %s (%s)", name, item.id, type(exc).__name__
+        )
         if await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}"):
-            log.warning(
-                "transform worker %r: handler error on %s (%s); dead-lettering",
-                name,
-                item.id,
-                type(exc).__name__,
-            )
+            log.warning("transform worker %r: dead-lettered %s", name, item.id)
         return _ItemOutcome.PROCESSED, None
 
     @_records_worker_death("router")
@@ -13630,10 +13635,10 @@ class RegistryRunner:
         if prep.unreadable is not None:
             # BACKLOG #5708: the loopback's correlation fails the same way on every pass, so
             # dead-letter it (message ERROR, replayable) rather than re-pend it at the lane head.
+            # The fault is logged whatever the write does (BACKLOG #5724).
+            log.warning("transform worker %r: %s for %s", name, prep.unreadable, item.id)
             if await self.store.dead_letter_now(item.id, str(prep.unreadable)):
-                log.warning(
-                    "transform worker %r: %s for %s; dead-lettering", name, prep.unreadable, item.id
-                )
+                log.warning("transform worker %r: dead-lettered %s", name, item.id)
             return _ItemOutcome.PROCESSED, None
         if prep.inbound_gone or prep.missing_handler:
             # BACKLOG #5708: a possibly STALE decision. The concurrent batch path decides this in
@@ -13674,15 +13679,12 @@ class RegistryRunner:
             # of the startup dead_letter_missing_handlers sweep. Dead-lettering (vs reverting)
             # avoids a hot-loop on a permanently-missing handler and gives operator visibility.
             hname = item.handler_name
+            # The fault is logged whatever the write does (BACKLOG #5724).
+            log.warning("transform worker %r: handler %r for %s is missing", name, hname, item.id)
             if await self.store.dead_letter_now(
                 item.id, f"handler {hname!r} removed from registry"
             ):
-                log.warning(
-                    "transform worker %r: handler %r for %s is missing; dead-lettering",
-                    name,
-                    hname,
-                    item.id,
-                )
+                log.warning("transform worker %r: dead-lettered %s", name, item.id)
             return _ItemOutcome.PROCESSED, None
         if prep.error is not None:
             # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no
