@@ -62,12 +62,11 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
     # Nothing here has a value of its own to move, so nothing says to put it in the directory or
-    # how one is created (the fifth hold on PR 3142, H3; the seventh hold). An empty value joined
-    # to the directory entry is still told to go (the fifth hold, H3).
+    # how one is created (the fifth hold on PR 3142, H3; the seventh hold).
     assert CREATE not in refusal and "Put " not in refusal
-    assert (
-        "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
-    ) is refused.startswith("MEFOR_VALUE_")
+    assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
+        refused.startswith("MEFOR_VALUE_") and " " not in directory
+    )
 
 
 def test_the_bare_prefix_joined_to_the_directory_is_only_deleted() -> None:
@@ -112,7 +111,7 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
 def test_a_name_empty_on_its_own_line_is_only_deleted(entry: str) -> None:
     """The Lander's seventh hold on PR 3142: content is a name's own value, up to its first
     line break. The lines after it in the same item give the name none, so the refusal says only
-    to delete it, as at e6e600bb27e."""
+    to delete it."""
     refusal = service_env_refusal(_read([entry]))
     assert refusal is not None
     assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
