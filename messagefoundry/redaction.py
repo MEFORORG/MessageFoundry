@@ -3071,16 +3071,26 @@ def raised_by_a_driver(exc: BaseException) -> bool:
     a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
     ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
     builtin exception a driver raises does not count, though :func:`safe_traceback` withholds it
-    under a driver error that holds it (vault BACKLOG #1661)."""
-    for kind in type(exc).__mro__:
-        parts = kind.__module__.split(".")
-        if parts[0] in _NON_DBAPI_DRIVERS:
-            return True
-        for depth in range(1, len(parts) + 1):
-            module = sys.modules.get(".".join(parts[:depth]))
-            if getattr(module, "apilevel", None) == "2.0":
-                return True
-    return False
+    under a driver error that holds it (vault BACKLOG #1661). A class whose ``__module__`` is not
+    text is not a driver's; this runs on every link of a logged traceback, so it must not raise."""
+    try:
+        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+    except Exception:  # noqa: BLE001 - a class or module that cannot be read declares no driver
+        return False
+
+
+def _a_driver_class(kind: type) -> bool:
+    """:func:`raised_by_a_driver` for one class of the MRO."""
+    name = kind.__module__
+    if not isinstance(name, str):
+        return False
+    parts = name.split(".")
+    if parts[0] in _NON_DBAPI_DRIVERS:
+        return True
+    return any(
+        getattr(sys.modules.get(".".join(parts[:depth])), "apilevel", None) == "2.0"
+        for depth in range(1, len(parts) + 1)
+    )
 
 
 #: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters.
@@ -3160,7 +3170,10 @@ def safe_traceback(ei: ExcInfo) -> str:
             # The instance's own attribute, so a class-level default cannot pass; and getattr, so a
             # __slots__ class with no __dict__ fails closed rather than raising.
             if "_str" not in getattr(node, "__dict__", {}):  # renamed: fail closed, no traceback
-                return safe_exc(value) if value is not None else ""
+                if value is None:
+                    return ""
+                root = _driver_line(value, under=False)
+                return f"{type(value).__name__}: {root}" if root is not None else safe_exc(value)
             node._str = line  # the stdlib's private name: see docstring
             if isinstance(exc, SyntaxError):  # printed from these four, never from _str
                 node.msg, node.text, node.filename, node.lineno = line, None, None, None

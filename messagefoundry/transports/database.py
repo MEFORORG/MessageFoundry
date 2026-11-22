@@ -54,6 +54,7 @@ import contextlib
 import errno
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -1041,8 +1042,8 @@ def _windows_path_verdict(
     return False
 
 
-#: The setting whose path a walk is judging, as its refusal names it: the connection and the
-#: keyword (:func:`judging_file_keyword`), or ``None`` outside such a judgement.
+#: The setting whose path a walk is judging, naming the connection and the keyword in its
+#: caller's spelling (:func:`judging_file_keyword`), or ``None`` outside such a judgement.
 _JUDGED_SETTING: ContextVar[str | None] = ContextVar("database_judged_setting", default=None)
 
 
@@ -1474,6 +1475,9 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: on a directory too. This set judges the file's own ``stat``. Before it, the
 #: :func:`names_another_host` walk has refused at least a code other than a missing name met on a
 #: folder in the path, 5, 123 and 1921 among them, so on a folder those are refused, not left.
+#: The walk's probe also reads the file's own name, and refuses there a not-found code other than
+#: 2 and 3 (:data:`_MISSING_WINERRORS`, vault BACKLOG #5197), so 15, 161 and 206 are left here only
+#: when the ``stat`` meets one the walk's probe did not.
 _LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921})
 
 
@@ -2713,6 +2717,21 @@ def _driver_code(message: str) -> str | None:
     """The driver's native error number from ``message``, or ``None`` when it carries none."""
     found = _DRIVER_CODE_RE.findall(message)
     return str(found[-1]) if found else None
+
+
+def _send_refusal(sqlstate: str | None, exc: BaseException) -> DeliveryError:
+    """A destination send's error for ``exc``: :func:`_classify_db_error` for a SQLSTATE, and for
+    a ``UnicodeError`` with none a permanent rejection naming its type alone. Text the driver
+    could not convert, such as a parameter its codec cannot encode, fails on this message's data,
+    not on the code, so it is dead-lettered rather than raised as an internal error, as it was
+    when its codec name read as a SQLSTATE (vault BACKLOG #1661, added item 2)."""
+    if sqlstate is not None:
+        return _classify_db_error(sqlstate, str(exc))
+    return NegativeAckError(
+        f"database driver could not convert the message's text ({type(exc).__name__})",
+        code="db",
+        permanent=True,
+    )
 
 
 def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False) -> DeliveryError:
@@ -4378,16 +4397,36 @@ def _json_default(value: Any) -> Any:
 
 def _rows_json(rows: Any) -> str:
     """``rows`` as standard JSON text, with :func:`_json_default` for the column types ``json``
-    has no encoding for. A float NaN or Infinity raises ``ValueError`` rather than being written as
-    the bare ``NaN`` or ``Infinity`` token, which is not JSON and which a strict reader refuses
-    (vault BACKLOG #6711, added item 1). The message is fixed text: ``json``'s own names the value.
-    Every caller already turns a ``ValueError`` here into its refusal of the row or the capture."""
+    has no encoding for. A float NaN or Infinity in a row's columns is written as the string
+    ``"NaN"``, ``"Infinity"`` or ``"-Infinity"``, as a non-finite ``Decimal`` already is, never as
+    the bare token, which is not JSON and which a strict reader refuses (vault BACKLOG #6711, added
+    item 1). One anywhere else still raises ``ValueError``, with fixed text since ``json``'s own
+    names the value; every caller turns that into its refusal of the row or the capture."""
     try:
-        return json.dumps(rows, default=_json_default, allow_nan=False)
+        return json.dumps(_finite_columns(rows), default=_json_default, allow_nan=False)
     except ValueError:
         pass
     # Raised outside the handler, so json's error is on neither __cause__ nor __context__.
     raise ValueError("a column value JSON cannot carry, such as a float NaN or Infinity")
+
+
+def _finite_columns(rows: Any) -> Any:
+    """``rows``, a row mapping or a list of them, with each non-finite float column value as its
+    JSON-safe text (:func:`_rows_json`)."""
+    if isinstance(rows, list):
+        return [_finite_columns(row) for row in rows]
+    if isinstance(rows, dict):
+        return {name: _finite_column(value) for name, value in rows.items()}
+    return rows
+
+
+def _finite_column(value: Any) -> Any:
+    """``value``, or for a non-finite float its text as ``str(Decimal)`` spells the same value."""
+    if not isinstance(value, float) or math.isfinite(value):
+        return value
+    if math.isnan(value):
+        return "NaN"
+    return "Infinity" if value > 0 else "-Infinity"
 
 
 async def _fetch_result_set(cur: Any) -> list[Any] | None:
@@ -4590,17 +4629,17 @@ class DatabaseDestination(DestinationConnector):
                         "discarded rather than returned to its pool: %s",
                         _safe_db_error(rollback_exc),
                     )
-                    if state is None:
+                    if state is None and not isinstance(exc, UnicodeError):
                         raise  # the send's failure is no driver error: the rollback's propagates
                     # Classified by the send's own error, as it would be had the rollback passed,
                     # never by the rollback's: the send's error is the best evidence of the
                     # message's fate, and a transient rollback state overriding a permanent one
                     # would retry a poison message for as long as the retry budget lasts. A
                     # dead-letter can be replayed. The rollback's error stays the context.
-                    raise _classify_db_error(state, str(exc)) from exc
-                if state is None:
+                    raise _send_refusal(state, exc) from exc
+                if state is None and not isinstance(exc, UnicodeError):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
-                raise _classify_db_error(state, str(exc)) from exc
+                raise _send_refusal(state, exc) from exc
         finally:
             await _close_and_release(pool, conn, cur, discard=discard)
         return captured

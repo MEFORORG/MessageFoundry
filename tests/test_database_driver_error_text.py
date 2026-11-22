@@ -91,17 +91,31 @@ def test_a_sqlstate_still_reads(state: str) -> None:
     assert database._sqlstate(Exception(state, "synthetic")) == state
 
 
-async def test_a_codec_error_in_a_send_is_not_a_permanent_rejection() -> None:
+@pytest.mark.parametrize("codec", ["ascii", "UTF16"])
+async def test_a_codec_error_in_a_send_is_dead_lettered_naming_no_codec(codec: str) -> None:
     """Item 2: in the destination arm the codec name read as a SQLSTATE, so the send was dead-
-    lettered as ``database rejected the statement [ascii]``. It now propagates as the internal
-    error it is. Red on main: a ``NegativeAckError``."""
-    failure = UnicodeEncodeError("ascii", "x\xe9", 1, 2, "synthetic")
+    lettered as ``database rejected the statement [ascii]``. It is still dead-lettered, since it
+    fails on the message's text, but by its type. Red on main: the text named ``[ascii]``."""
+    failure = UnicodeEncodeError(codec, "x\xe9", 1, 2, "synthetic")
     conn = _FakeConn(_FakeCursor(failure))
     dest = _dest()
     dest._pool = _FakePool(conn)
-    with pytest.raises(UnicodeEncodeError):
+    with pytest.raises(NegativeAckError) as refused:
         await dest.send('{"mrn": "1", "val": "x"}')
+    assert refused.value.permanent is True
+    assert str(refused.value) == (
+        "database driver could not convert the message's text (UnicodeEncodeError)"
+    )
     assert conn.rolledback
+
+
+async def test_a_non_driver_error_in_a_send_still_propagates() -> None:
+    """Control: an error that is neither a driver's nor a codec's is still an internal error."""
+    conn = _FakeConn(_FakeCursor(KeyError("synthetic")))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(KeyError):
+        await dest.send('{"mrn": "1", "val": "x"}')
 
 
 async def test_a_driver_error_in_a_send_is_still_rejected() -> None:
@@ -165,6 +179,33 @@ def test_the_log_chain_keeps_a_non_driver_message() -> None:
     """Control: an error no driver raised keeps its text, the diagnostic for a bug."""
     text = _rendered(_raised(KeyError("synthetic_column")))
     assert "KeyError: 'synthetic_column'" in text
+
+
+def test_a_class_with_no_text_module_does_not_break_the_traceback() -> None:
+    """Review round 1: the driver test read ``__module__`` as text, so a class whose module is not
+    text made the renderer raise on every traceback holding it."""
+    odd = type("Odd", (Exception,), {"__module__": None})
+    assert raised_by_a_driver(odd("synthetic")) is False
+    assert "Odd: synthetic" in _rendered(_raised(odd("synthetic")))
+
+
+@pytest.mark.usefixtures("_dbapi_driver")
+def test_the_fail_closed_fallback_withholds_a_driver_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 1: on a CPython with no ``TracebackException._str`` the renderer returns one
+    line, and for a driver error that line was ``safe_exc``'s, which keeps the duplicate key."""
+    import traceback
+
+    real = traceback.TracebackException.__init__
+
+    def without_str(self: traceback.TracebackException, *args: Any, **kwargs: Any) -> None:
+        real(self, *args, **kwargs)
+        self.__dict__.pop("_str", None)
+
+    monkeypatch.setattr(traceback.TracebackException, "__init__", without_str)
+    text = _rendered(_raised(_DriverError("23000", _DUPLICATE)))
+    assert text == "_DriverError: [23000] [driver message withheld]"
 
 
 def test_the_log_chain_and_the_connector_share_one_driver_test() -> None:
@@ -266,29 +307,45 @@ async def test_finish_stop_logs_no_driver_value(caplog: pytest.LogCaptureFixture
 # --- #6711 added item 1: JSON that is JSON -------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_a_non_finite_float_is_refused_with_fixed_text(value: float) -> None:
-    """Red on main: ``json.dumps`` wrote the bare ``NaN`` or ``Infinity`` token, which is not JSON."""
+def _strict(text: str) -> Any:
+    def refuse(token: str) -> Any:
+        raise AssertionError(f"non-standard JSON token {token}")
+
+    return json.loads(text, parse_constant=refuse)
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [(float("nan"), "NaN"), (float("inf"), "Infinity"), (float("-inf"), "-Infinity")],
+)
+def test_a_non_finite_float_column_is_written_as_text(value: float, text: str) -> None:
+    """Red on main: ``json.dumps`` wrote the bare ``NaN`` or ``Infinity`` token, which is not JSON.
+    It is now the text ``str(Decimal)`` gives the same value, in a row and in a list of rows."""
+    assert _strict(database._rows_json({"x": value})) == {"x": text}
+    assert _strict(database._rows_json([{"x": value}, {"x": 1.5}])) == [{"x": text}, {"x": 1.5}]
+
+
+def test_a_non_finite_float_outside_a_column_is_refused_with_fixed_text() -> None:
+    """A value the column pass does not reach still never becomes a bare token."""
     with pytest.raises(ValueError, match="JSON cannot carry") as refused:
-        database._rows_json([{"x": value}])
+        database._rows_json([{"x": [float("nan")]}])
     assert refused.value.__cause__ is None and refused.value.__context__ is None
 
 
 def test_a_finite_row_still_encodes() -> None:
-    """Control: an ordinary row encodes as before, and the text is strict JSON."""
-    text = database._rows_json({"x": 1.5, "y": None})
-    assert json.loads(text, parse_constant=_refuse_constant) == {"x": 1.5, "y": None}
+    """Control: an ordinary row encodes as before."""
+    assert database._rows_json({"x": 1.5, "y": None, "z": True}) == (
+        '{"x": 1.5, "y": null, "z": true}'
+    )
 
 
-def _refuse_constant(token: str) -> Any:
-    raise AssertionError(f"non-standard JSON token {token}")
-
-
-async def test_the_poller_skips_a_row_holding_nan() -> None:
-    """The poller's record-to-JSON body: the row is skipped as undecodable, as a row holding a
-    column type JSON has no encoding for is, and the next row still goes. Red on main: the
-    handler got a body holding a bare ``NaN``."""
+async def test_the_poller_delivers_a_row_holding_nan_as_strict_json() -> None:
+    """The poller's record-to-JSON body. Red on main: the handler got a bare ``NaN``. The row is
+    still delivered, so a non-finite value cannot strand it unmarked at the head of the table."""
     src = _src(body_column=None, mark_statement=None)
     handler = _RecordingHandler()
     await _run_poll(src, ["id", "v"], [(1, float("nan")), (2, 2.5)], handler)
-    assert handler.bodies == [b'{"id": 2, "v": 2.5}']
+    assert [_strict(body.decode()) for body in handler.bodies] == [
+        {"id": 1, "v": "NaN"},
+        {"id": 2, "v": 2.5},
+    ]

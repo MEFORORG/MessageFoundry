@@ -2262,7 +2262,8 @@ name, counts only when every folder before it exists; a path that ends at a miss
 is left to the driver, as a missing file is. A `subst` drive onto a share counts as leading to
 another host.
 When the check cannot finish, or finds that the path leads to another host, a WARNING names the
-kind of cause, never the path; the path is logged at DEBUG only. The value is judged as the text
+kind of cause, never the path; the path is logged at DEBUG only. At least where the build or the
+lane check judges the value, the WARNING also names the connection and the keyword. The value is judged as the text
 the build sends, so `0` is checked as the path `0`. On Windows each entry of an `SSLCAPATH` folder
 takes the same check, since the driver opens a `<hash>.0` entry there by name: an entry that leads
 to another host, or one the check cannot finish, refuses the value, and so does a folder the engine
