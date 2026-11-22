@@ -6,9 +6,10 @@
   one key or a comma list of keys, such as `Path=<key>`, now reads as that secret's value, and the
   start is refused. That is new at least in the next item of a multi-string value, below the
   secret's name written alone with no equals sign, as `nssm set ... NAME =value` writes it, and
-  below an empty secret on a later line of its registry string. An empty secret set with its
-  equals sign on a string's first line, with the key on the line below it, was already refused.
-  Under such a name, at least, these still end the empty value: a value holding key text beside
-  other text, such as `Path=C:\x;<key>`, and a key list with an empty entry, such as one with a
-  trailing or doubled comma, which the engine's own retired-keys reading accepts.
+  below an empty secret on a later line of its registry string. In those three forms, under such
+  a name, at least these still end the empty value: a value holding key text beside other text,
+  such as `Path=C:\x;<key>`, and a key list with an empty entry, such as one with a trailing or
+  doubled comma, which the engine's own retired-keys reading accepts. An empty secret set with
+  its equals sign on a string's first line still refuses with either of these on the line below
+  it, as it already did.
   (`BACKLOG #5394`)
