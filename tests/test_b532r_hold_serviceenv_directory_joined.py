@@ -111,7 +111,16 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
 
 
 #: Text in the shapes below that is a value, or could be: the refusal must echo none of it.
-_VALUE_TEXT = ("hunter2", "AAAA", "Winter", "2026!", "synthetic-other-line", _KEY_B64[:43])
+_VALUE_TEXT = (
+    "hunter2",
+    "AAAA",
+    "Winter",
+    "2026!",
+    "synthetic-other-line",
+    "foo",
+    "C:\\x",
+    _KEY_B64[:43],
+)
 
 
 #: Each shape, with whether the refusal adds the empty-entry delete clause and the rename.
@@ -187,6 +196,14 @@ _SHAPES = [
     pytest.param([(_EXTRA, "MEFOR_VALUE_A\nWinter=2026!")], False, True, id="O2-split-secret-line"),
     pytest.param(
         [(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "Winter=2026!")], False, False, id="O3-split-item"
+    ),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A\nfoo\n=")], True, True, id="O1-name-line-then-separator"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A\nPath=C:\\x")], False, True, id="O2-windows-name-line"),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "OTHER=hunter2")],
+        False,
+        False,
+        id="O3-assignment-item",
     ),
 ]
 
