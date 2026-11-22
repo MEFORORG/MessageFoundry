@@ -1286,6 +1286,9 @@ def _add_two_box_cacert_arg(parser: argparse.ArgumentParser) -> None:
 def _reject_cacert_with_insecure(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.insecure and args.cacert is not None:
         parser.error("--cacert and --insecure do not combine: --insecure polls plaintext http")
+    # An empty value would otherwise fall back to the default trust without a word.
+    if args.cacert is not None and not args.cacert.strip():
+        parser.error("--cacert needs a certificate path: an empty value names no certificate")
 
 
 def _log_store_env_source(label: str, store_env: dict[str, str]) -> None:

@@ -4641,9 +4641,11 @@ def Direct(
     (which must chain to ``trust_anchor`` and carry an RSA key), and submits the S/MIME message to
     ``host:port`` over STARTTLS. Cert/key material is loaded + validated at construction (fail loud),
     except the certificates' validity window: construction only warns on it, and each send refuses
-    a recipient cert or issuing anchor outside it (code ``direct-cert-validity``, BACKLOG #5631).
-    What construction refuses in the recipient cert, including one that does not name every address
-    in ``recipients``, is listed under *Recipient trust* in ``docs/CONNECTIONS.md``.
+    a recipient cert, issuing anchor or signing cert outside it (code ``direct-cert-validity``,
+    BACKLOG #5631). Construction also checks the recipient cert well beyond issuance by
+    ``trust_anchor``, including that it names every address in ``recipients``: what it refuses,
+    and which anchors it skips rather than refuses, is stated once, under *Recipient trust* in
+    ``docs/CONNECTIONS.md``.
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
@@ -9829,13 +9831,17 @@ _CONFIG_SOURCE_LEAD = "refusing to load config from"
 _BYTECODE_CACHE_DIR = "__pycache__"
 
 
-def config_source_trust_paths(directory: Path) -> list[Path]:
+def config_source_trust_paths(
+    directory: Path, *, refuse: Callable[[str], None] | None = None
+) -> list[Path]:
     """Every path in ``directory`` whose writer could change what a load of it runs or reads.
 
     The directory and each ``*.py`` (:func:`config_py_files`), and, when they exist, the
     ``__pycache__`` folder and each entry in it, ``connections.toml``, and the ``codesets`` folder
-    with each table the loader reads from it. Both config-source trust checks walk this list (vault
-    BACKLOG #2626 step 3, #2596 step 4).
+    with each table the loader reads from it. Each of those that is a symbolic link or a junction,
+    the directory included, is followed by the object it resolves to and, for a file, that file's
+    folder (:func:`_with_link_targets`, which says what ``refuse`` is handed). Both config-source
+    trust checks walk this list (vault BACKLOG #2626 step 3, #2596 step 4).
 
     **The cache folder is on the list although no load reads it.** The loader compiles each module
     from the bytes of its snapshot (:func:`load_config`), so a ``.pyc`` there never runs in place of
@@ -9846,7 +9852,13 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
 
     **Not on the list:** the value file and the settings file, which sit outside the config
     directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
-    folders above ``directory``."""
+    folders above ``directory``, except where a link's target or the folder holding it lies
+    there. A link at ``connections.toml``, ``codesets`` or a code-set table is listed even when it
+    leads to nothing, so that it is refused, as a dangling module link is: a writer of the folder
+    it points into could create the missing name before the read. So is a ``__pycache__`` link.
+    The directory's own link is followed with no ``refuse``, so one that dangles raises ``OSError``
+    rather than a refusal; a lax read (:func:`read_trusted_snapshot`) then lists the directory
+    again, and refuses one that is gone as missing."""
     # Lazy: connections_file imports this module (no circular import at load time).
     from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 
@@ -9855,8 +9867,11 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     if cache.is_dir():
         paths.append(cache)
         paths.extend(sorted(cache.iterdir()))
+    elif _is_link(cache):
+        paths.append(cache)
     connections = directory / CONNECTIONS_FILE_NAME
-    if connections.exists():
+    # A dangling link is listed too, so the link check refuses it rather than leaving it unread.
+    if connections.exists() or _is_link(connections):
         paths.append(connections)
     codesets = directory / CODESETS_DIR_NAME
     if codesets.is_dir():
@@ -9864,9 +9879,83 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
         # The loader's own rule (code_sets.is_code_set_name), so a table spelled .CSV is vetted on
         # POSIX too.
         paths.extend(
-            p for p in sorted(codesets.iterdir()) if p.is_file() and is_code_set_name(p.name)
+            p
+            for p in sorted(codesets.iterdir())
+            if (p.is_file() or _is_link(p)) and is_code_set_name(p.name)
         )
-    return paths
+    elif _is_link(codesets):
+        paths.append(codesets)
+    # The directory raises rather than being handed to refuse: see _with_link_targets.
+    listed = _with_link_targets(paths[:1]) + _with_link_targets(paths[1:], refuse=refuse)
+    return list(dict.fromkeys(listed))
+
+
+def _is_link(path: Path) -> bool:
+    """Whether ``path`` is a symbolic link or, on Windows, a junction, whether or not it leads
+    anywhere."""
+    return path.is_symlink() or path.is_junction()
+
+
+def _with_link_targets(
+    paths: list[Path], *, refuse: Callable[[str], None] | None = None
+) -> list[Path]:
+    """``paths`` with, after each one that is a symbolic link or a junction, the config directory
+    included, the object it resolves to and, for a file, the folder holding that file (vault
+    BACKLOG #2596).
+
+    A load reads a link's target, so vetting the link alone let a config module that is a link into
+    a writable folder pass: whoever can write that folder can swap the code the load runs, and on
+    Windows the link object's own access list was read rather than the target's. The target is
+    what :meth:`~pathlib.Path.resolve` answers: on POSIX that is Python's own ``realpath`` walk in
+    userspace, and nothing here checks it against the object an open of the path reaches, as the
+    ``serve`` start check does (:func:`_file_and_folder`).
+
+    A link whose target cannot be resolved, or that leads to nothing at check time, is refused: a
+    writer of the folder it points into could create the missing name before the read (Manager
+    decision under the owner's standing instruction of 2026-10-22). That refusal is handed to
+    ``refuse`` where one is given, and the link is listed with no target if ``refuse`` returns;
+    with none given it raises ``OSError`` naming the link. The load's check hands it
+    :func:`_refuse_unvetted_link`, which the dev/test escape does not downgrade.
+
+    **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
+    links outside the config directory, from which a writer could re-point one, the folders above
+    each target's folder, as the folders above the config directory are not, and on Windows a
+    name-surrogate reparse point that is neither a symbolic link nor a junction, which is not
+    followed (the start check's :func:`_link_chain` refuses one). The start check walks the links
+    of its own files further. A path already listed is not repeated."""
+    out: list[Path] = []
+    for path in paths:
+        out.append(path)
+        target = _resolved_link(path)
+        if target is None:
+            continue
+        if isinstance(target, str):
+            if refuse is None:
+                raise OSError(errno.EINVAL, target, str(path))
+            refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {target}")
+            continue
+        out.append(target)
+        if not target.is_dir():
+            out.append(target.parent)
+    return list(dict.fromkeys(out))
+
+
+def _resolved_link(path: Path) -> Path | str | None:
+    """What the link at ``path`` resolves to: ``None`` where ``path`` is not a link, and the reason
+    as text where its target cannot be resolved or leads to nothing at check time."""
+    if not _is_link(path):
+        return None
+    try:
+        target = path.resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        # Not expected from a non-strict resolve on the interpreters this project supports;
+        # caught so an unforeseen failure refuses the load rather than escaping it.
+        return f"a link could not be resolved ({type(exc).__name__})"
+    if not target.exists():
+        # exists() is False for any stat failure, so this also covers a target the check
+        # cannot reach (a permission fault, a link loop), not only one that is gone.
+        return "a link leads to nothing the check can read at check time"
+    return target
 
 
 def _config_module_name(path: Path) -> str:
@@ -11396,6 +11485,15 @@ def _refuse_unsafe_config_source(message: str) -> None:
     raise WiringError(message)
 
 
+def _refuse_unvetted_link(message: str) -> NoReturn:
+    """Raise ``WiringError(message)`` for a trust-list link that cannot be resolved or leads to
+    nothing at check time, whatever the dev/test escape says: nothing about what it leads to was
+    vetted (Manager decision d20261121T195422910-02289f, after vault BACKLOG #6654 item 2). The
+    ``serve`` start check differs for a link it can walk to a missing name: it vets the folder
+    that name would sit in, through the escape-aware refusal."""
+    raise WiringError(message)
+
+
 def _assert_safe_config_source(directory: Path) -> None:
     """Refuse to execute config Python from a writable-by-others location.
 
@@ -11407,8 +11505,9 @@ def _assert_safe_config_source(directory: Path) -> None:
     :func:`messagefoundry.auth.anchor_path.posix_path_verdict` applies to a trust anchor. A
     root-owned, read-only config is therefore accepted under a service-account engine. This check
     reads the paths :func:`config_source_trust_paths` lists (following links): the directory, its
-    ``*.py``, its ``__pycache__``, ``connections.toml`` and code-set tables. It does not read the
-    directories above it, as that function does; docs/SERVICE.md states what the layout then still
+    ``*.py``, its ``__pycache__``, ``connections.toml`` and code-set tables, and for a link what it
+    resolves to. It does not read the directories above it, except where that function lists a
+    link's target or the folder holding it there; docs/SERVICE.md states what the layout then still
     depends on. On Windows the equivalent NTFS-DACL check now runs in-process
     (:func:`_assert_safe_config_source_windows`, SEC-003): the owner and DACL of each of those
     paths is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
@@ -11431,7 +11530,7 @@ def _assert_safe_config_source(directory: Path) -> None:
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
-        paths = config_source_trust_paths(directory)
+        paths = config_source_trust_paths(directory, refuse=_refuse_unvetted_link)
     except OSError as exc:
         if is_missing_directory(exc):
             # Moved away since the caller's own check: missing, as that check answers (#3157).

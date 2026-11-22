@@ -591,7 +591,7 @@ def test_the_empty_code_check_is_the_verify_gates_own_hook(engine: Engine) -> No
     gate_vars = inspect.getclosurevars(gates[0]).nonlocals
     assert gate_vars["action"] == STEP_UP_ACTION_MFA_CONFIRM
     assert gate_vars["before_spend"] is account_routes._no_code_posted
-    assert gate_vars["reauth_next"](None) == "/ui/account/mfa/confirm"
+    assert gate_vars["continuation"](None) == "/ui/account/mfa/confirm"
 
 
 async def test_a_verify_post_resolves_its_session_once(

@@ -1195,6 +1195,102 @@ async def test_coordinator_signs_in_over_https_and_a_refusal_needs_a_barrier(
     assert report.no_loss
     assert report.drained is False  # the advisory drain went unread, and says so
     assert any("advisory /stats poller not opened" in n for n in report.notes), report.notes
+    # BACKLOG #5640: the ladder reads this to stop retrying a refused sign-in on later rungs.
+    assert report.sign_in_refused
+
+
+@pytest.mark.parametrize("case", ["unreachable", "rate-limited", "skipped"])
+async def test_gated_drive_flags_only_a_refused_sign_in_and_can_skip_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """BACKLOG #5640: an engine box that did not answer is not a refusal, so a later rung may try
+    again; and ``sign_in=False`` skips the sign-in altogether, with a note, so a ladder that saw a
+    refusal does not retry it on every rung and lock the rig Administrator out.
+
+    A 429 is transient too, so it is not a refusal either.
+
+    Mutation: flag every sign-in error as refused, or open the poller under ``sign_in=False``.
+    Red: the unreachable or rate-limited case reads refused, or the skipped case builds a poller."""
+    import types
+
+    from harness.load.rigadmin import RigSignInRateLimited, RigUnreachable
+
+    _install_coordinator_fakes(
+        monkeypatch,
+        sink_tally={
+            0: {
+                "sink_received": 40,
+                "lane_inversions": 0,
+                "lane_repeats": 0,
+                "lanes_observed": 2,
+                "ports": [3700],
+            }
+        },
+        worker_tally={
+            0: {"sent": 40, "acked": 40, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+        },
+        engine_final=types.SimpleNamespace(done=40, dead=0, in_pipeline=0),
+    )
+    built: list[object] = []
+
+    class UnreachablePoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            built.append(urls)
+
+        async def open(self) -> None:
+            if case == "rate-limited":
+                raise RigSignInRateLimited("HTTP 429 on every attempt")
+            raise RigUnreachable("the engine did not answer")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(sc, "EnginePoller", UnreachablePoller)
+    coord = FileDropCoord(tmp_path, run_id=f"signin{case}")
+    coord.post(
+        SHARDS_READY,
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 1,
+            "dests": 1,
+            "handlers": 1,
+            "delivering": 1,
+            "routing": "broadcast",
+            "api_ports": [9001],
+            "sink_base": 3700,
+            "sink_ports": 1,
+            "sink_port": 3700,
+        },
+    )
+    report = await sc.run_shardcert_drive(
+        engine_host="10.0.0.5",
+        aggregate_rate=20.0,
+        hold_seconds=1.0,
+        driver_count=1,
+        sink_count=1,
+        sink_host="10.0.0.9",
+        coord=coord,
+        await_engine_drained=True,
+        engine_drained_timeout=0.2,
+        sign_in=case != "skipped",
+    )
+    assert any("advisory /stats poller not opened" in n for n in report.notes), report.notes
+    if case != "skipped":
+        # Neither an engine that did not answer nor a transient 429 is a refused credential.
+        assert len(built) == 1
+        assert not report.sign_in_refused
+    else:
+        assert built == [], "a poller was built, so the refused sign-in was retried"
+        assert report.sign_in_refused
+
+
+async def test_ungated_drive_refuses_to_skip_the_sign_in(tmp_path: Path) -> None:
+    """Without the ENGINE_DRAINED gate the poll is the barrier, so it cannot be skipped."""
+    with pytest.raises(ValueError, match="await_engine_drained"):
+        await sc.run_shardcert_drive(
+            engine_host="10.0.0.5", coord=FileDropCoord(tmp_path, run_id="nogate"), sign_in=False
+        )
 
 
 def _gated_drive_fakes(

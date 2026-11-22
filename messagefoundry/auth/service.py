@@ -16780,7 +16780,11 @@ class AuthService:
         reads, the console's ``phi=True`` arm) and the paced writes (``require_paced``, the
         console's write gate), which refuse on ``True``. Not every caller refuses: the console's
         reauth-only action gate records the signal on a request it is refusing for another reason.
-        The base gate never calls it, so the monitoring polls are not refused.
+        The JSON plane's base gate (``require``) never calls it, so the monitoring polls are not
+        refused. The console's base gate (``require_ui``) calls it for a PHI read or a write, and,
+        since BACKLOG #5646, on every request a step-up gate serves, GET included, because the
+        step-up factories hand it their question; the console's plain monitoring polls ride none
+        of those, so they are not refused either.
 
         Disabled (returns ``False`` with no side effects) when ``[auth].admin_new_ip_step_up`` is off.
         It is ON by default since BACKLOG #288, and off is a named loosening. Even on, a single-host

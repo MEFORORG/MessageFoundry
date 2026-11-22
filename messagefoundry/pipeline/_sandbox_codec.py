@@ -1128,8 +1128,9 @@ def decode_boot(body: bytes) -> Boot:
 class GraphShape:
     """The names one loaded graph declares, and how its inbounds are bound (vault BACKLOG #2587).
 
-    The worker loads the config directory again, in its own process and under an allowlisted
-    environment, so its graph can differ from the engine's. It reports this in its ``ready`` frame
+    The worker runs the engine's config again, from the snapshot the engine sends it (vault
+    BACKLOG #2596), in its own process and under an allowlisted environment, so its graph can
+    differ from the engine's. It reports this in its ``ready`` frame
     and the engine compares (:func:`messagefoundry.pipeline.sandbox.graph_differences`).
 
     ``bindings`` maps an inbound to its Router, for the inbounds the process holds. An engine shard

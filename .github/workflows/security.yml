@@ -270,9 +270,11 @@ jobs:
       # Stdlib-only (no install). Fails CLOSED: it exits 2, "could not see", in at least these cases:
       # PyPI unreachable, a pyproject unreadable, no packaging/*/pyproject.toml found, the root's
       # runtime tables yielding no name, and zero distributions examined with nothing refused. A
-      # refusal or a failed check exits 1. What it sweeps, refuses and does not read, and its blind
-      # spots -- a real package that is not the INTENDED one among them -- are stated in the script's
-      # module docstring and pinned by tests/test_new_dependency_check.py.
+      # refusal or a failed check exits 1 only when none of the exit-2 cases occurred; beside one
+      # of them the run exits 2. The full exit table is the script's module docstring, EXIT CODES.
+      # What it sweeps, refuses and does not read, and its blind spots -- a real package that is not
+      # the INTENDED one among them -- are stated in that docstring and pinned by
+      # tests/test_new_dependency_check.py.
       - name: Verify every declared dependency is a real, established distribution
         run: python scripts/security/new_dependency_check.py
 
@@ -1864,9 +1866,11 @@ jobs:
       # Stdlib-only (no install). Fails CLOSED: it exits 2, "could not see", in at least these cases:
       # PyPI unreachable, a pyproject unreadable, no packaging/*/pyproject.toml found, the root's
       # runtime tables yielding no name, and zero distributions examined with nothing refused. A
-      # refusal or a failed check exits 1. What it sweeps, refuses and does not read, and its blind
-      # spots -- a real package that is not the INTENDED one among them -- are stated in the script's
-      # module docstring and pinned by tests/test_new_dependency_check.py.
+      # refusal or a failed check exits 1 only when none of the exit-2 cases occurred; beside one
+      # of them the run exits 2. The full exit table is the script's module docstring, EXIT CODES.
+      # What it sweeps, refuses and does not read, and its blind spots -- a real package that is not
+      # the INTENDED one among them -- are stated in that docstring and pinned by
+      # tests/test_new_dependency_check.py.
       - name: Verify every declared dependency is a real, established distribution
         if: ${{ !cancelled() }}
         run: python scripts/security/new_dependency_check.py

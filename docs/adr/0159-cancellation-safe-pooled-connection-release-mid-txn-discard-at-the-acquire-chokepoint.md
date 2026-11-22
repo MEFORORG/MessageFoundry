@@ -638,7 +638,7 @@ the next reader does not re-derive the wrong precedent from the same comment.
   rollback, so they discard nothing and return the connection as before: a cancelled statement on
   a connection with no gate, where a rollback would run beside the statement; a cancelled
   statement whose cursor has no raw pyodbc cursor (`raw_cursor` returns `None`); and a cancelled
-  statement whose close finds the default executor shut down. Where the executor is shut down
+  statement whose close finds its executor shut down (the pool's own since BACKLOG #5756). Where the executor is shut down
   after a failed send dropped the handle, no worker thread closes it; it is left for pyodbc to
   close when it is collected, outside the gate. The residual recorded above for the store holds
   here too: the close after a failed rollback can leave the session, with its transaction and

@@ -30,6 +30,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT, MLLPSource
 from scripts.security.dast_ingress_sweep import (
+    _ISA_LEN,
     HEADER_ONLY_CASES,
     KNOWN_DEFECT_DISCRIMINATORS,
     PROFILE_BOUNDS,
@@ -38,6 +39,7 @@ from scripts.security.dast_ingress_sweep import (
     CaseResult,
     PolicyError,
     _judge,
+    _keep_sentinel,
     apply_profile,
     carries_sentinel,
     case_bytes,
@@ -511,6 +513,52 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
     assert not carries_sentinel(Case("x", "tcp", b"\x02body\x03"), sentinel)
 
 
+def test_every_mutated_payload_keeps_the_sentinel() -> None:
+    """Vault BACKLOG #5581, #8240 item 37: a mutation that cut or flipped a byte of the sentinel left
+    a body the log_body detector could not recognise. Before mutation_cases put the sentinel back,
+    13 of the policy's 24 mutations at seed 318 lost it, and this test failed on that code. Each
+    mutated payload must carry its bytes, fit the limit, and an X12 one must still sit between the
+    untouched ISA and IEA. This reads payload bytes, not decoded frames: a framing byte a mutation
+    inserts can still leave a frame without it, which the docstring of
+    scripts/security/dast_ingress_sweep.py lists as not covered."""
+    policy = _policy()
+    seed = int(policy["seed"])
+    sentinel = run_sentinel(seed)
+    marker = sentinel.encode()
+    _, x12 = mutation_seeds(sentinel)
+    isa, iea = x12[:_ISA_LEN], x12[x12.rindex(b"IEA") :]
+    per_seed = max(48, int(policy["mutations"]))
+    seeds = (seed, seed + 1, seed + 2)
+    cases = [c for s in seeds for c in mutation_cases(s, per_seed, _CAP, sentinel)]
+    # The walk is not empty, so the absence check below cannot pass on nothing. The planes check
+    # after it is what shows every seed contributed.
+    assert len(cases) >= 3 * per_seed, len(cases)
+    # Each seed covers both planes. An origin reads mutation:<seed>:<index>.
+    planes = {(c.origin.rsplit(":", 1)[0], c.plane) for c in cases}
+    assert planes == {(f"mutation:{s}", p) for s in seeds for p in ("mllp", "x12")}, planes
+    lost = [c.origin for c in cases if marker not in c.payload]
+    assert not lost, f"mutations that lost the sentinel: {lost}"
+    for c in cases:
+        if c.plane == "x12":
+            assert c.payload.startswith(isa) and c.payload.endswith(iea), c.origin
+        # An MLLP payload is the body plus three framing bytes.
+        assert len(c.payload) <= _CAP // 2 + 3, (c.origin, len(c.payload))
+
+
+def test_keep_sentinel_appends_after_a_cut_and_respects_the_limit() -> None:
+    """Positive and negative control on the repair itself: a cut body gets the segment, after a
+    terminator when the cut ends mid-segment and none after a CR or LF, and fits a limit that holds
+    the segment."""
+    seg, ends = b"NTE|1||S\r", (b"\r", b"\n")
+    assert _keep_sentinel(b"MSH|^~\\&|A", seg, ends, 100) == b"MSH|^~\\&|A\rNTE|1||S\r"
+    assert _keep_sentinel(b"MSH|^~\\&|A\r", seg, ends, 100) == b"MSH|^~\\&|A\rNTE|1||S\r"
+    assert _keep_sentinel(b"MSH|^~\\&|A\r\n", seg, ends, 100) == b"MSH|^~\\&|A\r\nNTE|1||S\r"
+    assert _keep_sentinel(b"", seg, ends, 100) == seg
+    assert len(_keep_sentinel(b"X" * 500, seg, ends, 64)) <= 64
+    # A limit too small for the segment gets the segment alone, so the sentinel is never lost.
+    assert _keep_sentinel(b"abc", seg, ends, 4) == seg
+
+
 def test_the_sentinel_keeps_the_x12_seed_an_interchange() -> None:
     """The X12 sentinel sits in NM1-03, after the fixed-width ISA, so the well-formed X12 and raw-TCP
     cases still decode as one interchange each."""
@@ -708,10 +756,13 @@ def test_the_ingress_job_is_not_required_and_its_name_is_unique() -> None:
     name = _ingress_job()["name"]
     assert "${{" not in name
     assert name not in required_contexts()
-    elsewhere = [
+    # The walk must find this job itself and no other job declaring the same literal name: finding
+    # it is the positive control, so an empty walk or a comparison that never matches fails here.
+    # A templated name elsewhere that would expand to this one is not compared.
+    declaring = [
         (path.name, key)
-        for path in sorted(WORKFLOWS.glob("*.yml"))
+        for path in sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
         for key, job in jobs_of(path.name).items()
-        if context_of(key, job) == name and key != "dast-ingress"
+        if context_of(key, job) == name
     ]
-    assert not elsewhere, elsewhere
+    assert declaring == [("dast.yml", "dast-ingress")], declaring

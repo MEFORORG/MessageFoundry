@@ -3,8 +3,9 @@
 """BACKLOG #5646 -- every /ui message-search route refuses a session presented from a new address.
 
 Four search routes gate with ``require_ui_step_up``, which builds its ``require_ui`` base with
-``new_address_check=False`` and asks the question itself, through ``flag_new_client_ip``. The preset
-delete gates with plain ``require_ui``, which asks it for a write. Nothing drove a search route from
+``new_address_check=False`` and hands it ``step_up_new_address``, so the base asks the question on
+every request, through ``flag_new_client_ip``. The preset delete gates with plain ``require_ui``,
+which asks it for a write. Nothing drove a search route from
 a second address, so a change that dropped either call would have stayed green.
 
 **Each route has a REFUSE and an ALLOW arm built the same way.** One session, signed in at
@@ -15,9 +16,17 @@ arms are not otherwise identical: they run in turn, and a delete or layered arm 
 preset. Each REFUSE arm also requires the ``auth.new_address_reverify_required`` audit row for its
 request path, so a refusal for some other reason does not pass.
 
-Mutants, run by hand when this landed: replacing the ``flag_new_client_ip`` call in
-``require_ui_step_up`` with ``False`` failed the four step-up routes' cases; making
-``_refuse_from_new_address`` return without asking failed the delete case.
+Mutants, run by hand: replacing the ``flag_new_client_ip`` call in ``require_ui``'s
+``step_up_new_address`` branch with ``False`` fails the four step-up routes' cases (until BACKLOG
+#5646 that call sat in ``require_ui_step_up`` itself); making ``_refuse_from_new_address`` return
+without asking fails the delete case.
+
+**A refused request spends nothing** (BACKLOG #5646). Each REFUSE arm also requires that neither
+the admin-write nor the PHI-read budget was asked for while it ran. The step-up gate used to ask
+the address question after its ``require_ui`` base had returned, so a refused write had already
+spent the actor's admin-write budget. The ALLOW arms are the control that the spy sees each
+charge at all: each write's charges the admin-write budget, and each of the three searches' (form,
+run, layered) the PHI-read one.
 
 All data here is synthetic.
 """
@@ -27,6 +36,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from typing import NamedTuple
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -88,13 +98,14 @@ class Case(NamedTuple):
 CASES = (
     Case("form", SEARCH, "GET", _search_form, 200, SEARCH),
     Case("run", SEARCH + "/run", "POST", _search_run, 200, SEARCH),
-    # The save passes no reauth_next, so its refusal continues to its own POST path, which
-    # /ui/reauth does not accept. That is an open finding, pinned as it stands: a fix changes this
-    # value, and should.
-    Case("save_preset", PRESETS, "POST", _save, 303, PRESETS),
+    # A body-carrying write, so its refusal continues to the search form, a registered unlock page
+    # (BACKLOG #5646). It used to continue to its own POST path, which /ui/reauth refuses.
+    Case("save_preset", PRESETS, "POST", _save, 303, SEARCH),
     # A plain require_ui write lands on /ui after the re-auth: its body cannot be carried through.
     Case("delete_preset", DELETE, "POST", _delete, 303, "/ui"),
-    Case("layered", SEARCH + "/layered", "GET", _layered, 200, SEARCH + "/layered"),
+    # The presets ride the continuation (BACKLOG #5646): without them the run answers 400. The
+    # placeholder is the REFUSE arm's preset id.
+    Case("layered", SEARCH + "/layered", "GET", _layered, 200, SEARCH + "/layered?presets={pid}"),
 )
 
 
@@ -118,6 +129,21 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
     user = await service.store.get_user_by_username("op")
     assert user is not None
     await _seed(engine)
+
+    # Every budget charge a gate or handler asks for, recorded by a spy over this instance.
+    charges: list[str] = []
+    admin_write, phi_read = service.allow_admin_write, service.allow_phi_read
+
+    def spy_admin_write(actor: str) -> bool:
+        charges.append("admin_write")
+        return admin_write(actor)
+
+    def spy_phi_read(actor: str) -> bool:
+        charges.append("phi_read")
+        return phi_read(actor)
+
+    service.allow_admin_write = spy_admin_write  # type: ignore[method-assign]
+    service.allow_phi_read = spy_phi_read  # type: ignore[method-assign]
 
     async def preset_ids() -> set[str]:
         # Read from the store, not a gated page, so a refused or throttled read cannot pass for
@@ -148,6 +174,7 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
         before = set(by_name.values())
 
         # ALLOW: the handler ran. The search pages render the form; the writes land back on it.
+        charges.clear()
         ok = await case.send(home, allow_pid)
         assert ok.request.method == case.method
         assert ok.status_code == case.allowed, (ok.status_code, ok.headers.get("location"))
@@ -157,14 +184,24 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
             assert "Saved presets" in ok.text
         assert await _new_address_paths(engine) == []
         after_allow = await preset_ids()
+        # The controls for the spend check below: an admitted write does charge the write budget,
+        # and an admitted search the PHI-read one.
+        if case.method == "POST":
+            assert "admin_write" in charges, charges
+        if case.id in ("form", "run", "layered"):
+            assert "phi_read" in charges, charges
 
+    charges.clear()
     async with browser(ELSEWHERE) as away:
         away.cookies.set("mf_session", token)
         refused = await case.send(away, refuse_pid)
     assert refused.request.method == case.method
     location = refused.headers.get("location", "")
     assert refused.status_code == 303, (refused.status_code, location)
-    assert location == f"/ui/reauth?next={case.next_path}", location
+    expected = quote(case.next_path.format(pid=refuse_pid), safe="/")
+    assert location == f"/ui/reauth?next={expected}", location
+    # A refused request spends nothing (BACKLOG #5646): no budget was asked for.
+    assert charges == [], charges
     # The refusal was the address check, recorded for this route's request path.
     assert await _new_address_paths(engine) == [case.path.replace("{preset_id}", refuse_pid)]
     # The refused request changed nothing: no preset saved, none deleted.
@@ -191,3 +228,69 @@ async def test_every_search_route_is_covered(engine: Engine) -> None:
     # The control: the walk found the routes it exists for, so an empty set is not a pass.
     assert (SEARCH, "GET") in mounted, mounted
     assert mounted == covered, mounted ^ covered
+
+
+_ID = "0123456789abcdef" * 2  # the shape of a preset id: 32 lower-case hex digits
+
+
+def _layered_query(n: int, preset: str = _ID) -> str:
+    return SEARCH + "/layered?" + "&".join([f"presets={preset}"] * n)
+
+
+@pytest.mark.parametrize(
+    ("target", "admitted"),
+    [
+        (SEARCH + "/layered", True),
+        (_layered_query(1), True),
+        (_layered_query(8), True),
+        (_layered_query(9), False),
+        (_layered_query(1, "not-an-id"), False),
+        (_layered_query(1) + "&other=1", False),
+        (SEARCH + "/layered?other=1", False),
+    ],
+    ids=["bare", "one", "eight", "nine", "not-an-id", "extra-parameter", "other-only"],
+)
+def test_the_layered_continuation_admits_only_bounded_presets(target: str, admitted: bool) -> None:
+    """The layered unlock pattern takes one to eight preset ids under ``presets`` and nothing else
+    (BACKLOG #5646), so a continuation carrying more, or any other parameter, is not one
+    /ui/reauth will follow."""
+    from messagefoundry_webconsole._auth import is_unlock_action
+
+    assert is_unlock_action(target) is admitted
+
+
+def test_the_route_bound_matches_the_json_routes_cap() -> None:
+    # The console's copies of the JSON route's bounds (the id pattern its direct call skips, and
+    # the layer cap its unlock pattern carries) must not drift from them.
+    from messagefoundry.api import app as api_app
+    from messagefoundry.api.validation import LAYERED_PRESET_IDS_PATTERN
+    from messagefoundry_webconsole._auth import is_unlock_action
+    from messagefoundry_webconsole.routes import search
+
+    assert search._MAX_LAYERS == api_app._MAX_PRESET_LAYERS
+    assert rf"^{search._PRESET_ID}(,{search._PRESET_ID})*$" == LAYERED_PRESET_IDS_PATTERN
+    # The unlock pattern spells its repeat bound out (see _LAYERED_UNLOCK); it must admit exactly
+    # _MAX_LAYERS presets and refuse one more.
+    assert is_unlock_action(_layered_query(search._MAX_LAYERS))
+    assert not is_unlock_action(_layered_query(search._MAX_LAYERS + 1))
+
+
+@pytest.mark.parametrize(
+    ("presets", "expected"),
+    [([_ID] * 9, "at most 8"), (["not-an-id"], "not one of your saved presets")],
+    ids=["nine", "not-an-id"],
+)
+async def test_the_layered_route_refuses_what_its_pattern_would_not_admit(
+    engine: Engine, presets: list[str], expected: str
+) -> None:
+    """RED when: the layered route runs a selection its unlock pattern refuses (BACKLOG #5646);
+    the console's direct call skips the JSON route's ``Query`` pattern, so the route bounds it."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
+    transport = httpx.ASGITransport(app=app, client=(SIGN_IN, 51000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        assert (await _cookie_login(c, "op")).status_code == 303
+        r = await c.get(SEARCH + "/layered", params={"presets": presets})
+    assert r.status_code == 400, r.text
+    assert expected in r.text and "not-an-id" not in r.text

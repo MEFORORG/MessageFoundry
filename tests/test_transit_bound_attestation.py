@@ -2838,6 +2838,9 @@ async def _real_rcsi_refusal(monkeypatch: pytest.MonkeyPatch, driver: Exception)
         async def fetchone(self) -> tuple[int, int]:
             return (0, 0)  # RCSI off, on every read
 
+        async def close(self) -> None:
+            return None  # the open closes its state-read cursor before the ALTERs (#5666)
+
     class Conn:
         async def cursor(self) -> Cursor:
             return Cursor()
@@ -2893,6 +2896,41 @@ def test_cli_an_engine_refusal_quoting_a_driver_error_prints_the_remedy_not_the_
     assert _rcsi_remedy("mefor") in err, err
     assert "(_ServerDriverError [SQLSTATE 42000] native error 5011)" in err, err
     assert _ROW_TEXT not in err
+
+
+def test_cli_prints_the_sqlstate_remedy_when_the_refusal_quoted_redacted_driver_text(
+    transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5666: the options check quotes a driver error through ``redact_log_line``. Where
+    that rewrites the text, the refusal no longer holds the error's own ``str``, and the CLI still
+    prints the class, SQLSTATE and native number in place of the redacted text."""
+    import asyncio
+
+    import messagefoundry.store.base as store_base
+    from messagefoundry.store.sqlserver import _rcsi_remedy
+    from tests.test_keyless_chain_every_command import _ServerDriverError
+
+    secret = "Hunter2xyz"
+    _stand_in_server_drivers(monkeypatch)
+    driver = _ServerDriverError(
+        "42000",
+        f"[42000] permission denied on {_ROW_TEXT}; UID=sa;PWD={secret}; (5011) (SQLExecDirectW)",
+    )
+    refusal = asyncio.run(_real_rcsi_refusal(monkeypatch, driver))
+    # The controls: redaction rewrote the quotation, and the remaining text is still quoted.
+    assert secret not in str(refusal) and str(driver) not in str(refusal)
+    assert _ROW_TEXT in str(refusal)
+
+    async def refusing(*_a: object, **_k: object) -> object:
+        raise refusal
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["store", "withdraw-transit-bound", "--db", str(transit_db)])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert _rcsi_remedy("mefor") in err, err
+    assert "(_ServerDriverError [SQLSTATE 42000] native error 5011)" in err, err
+    assert _ROW_TEXT not in err and secret not in err
 
 
 def test_cli_record_refuses_a_store_not_on_vault_transit(

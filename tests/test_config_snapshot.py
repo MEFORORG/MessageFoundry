@@ -843,7 +843,7 @@ def test_validate_config_reports_a_trust_check_that_cannot_list_a_folder(
     """It returns every problem and raises none, and the check's walk raises what it cannot list."""
     cfg = _config(tmp_path / "cfg")
 
-    def unlistable(directory: Path) -> list[Path]:
+    def unlistable(directory: Path, **_: Any) -> list[Path]:
         raise PermissionError(13, "Permission denied", str(directory))
 
     monkeypatch.setattr(wiring, "config_source_trust_paths", unlistable)
@@ -858,7 +858,7 @@ def test_a_trust_check_that_cannot_list_a_folder_refuses_a_load(
     raises it, which its caller reports as a digest it could not take."""
     cfg = _config(tmp_path / "cfg")
 
-    def unlistable(directory: Path) -> list[Path]:
+    def unlistable(directory: Path, **_: Any) -> list[Path]:
         raise PermissionError(13, "Permission denied", str(directory))
 
     monkeypatch.setattr(wiring, "config_source_trust_paths", unlistable)
