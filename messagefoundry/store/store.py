@@ -5358,41 +5358,6 @@ def marker_test_sql(column: str, *, present: bool) -> str:
     )
 
 
-def rotation_totp_updates(
-    cipher: AesGcmCipher,
-    sealer: AnyRowSealer | None,
-    rows: Iterable[tuple[str, str, str]],
-    outcome: ResealOutcome,
-) -> tuple[list[tuple[str, str]], ResealOutcome]:
-    """The ``(new value, id)`` writes for the ``(id, totp_secret, authz_seal)`` rows that
-    :func:`rotation_reseal` left off the active key, and ``outcome`` with the rows it left counted
-    (BACKLOG #5611). ``classify_unrotated`` already counts a seal under another key, but not a
-    failing seal under the active key, whose secret is still under a prior key.
-
-    The user pass has already moved every record whose seal holds, so a row here with a seal failed
-    it. Its seal covers these bytes and it is left as it is, but its secret is still opened: a cell
-    no held key opens raises, as every other cell in a rotation does. A row with no seal has
-    nothing to break and rotates. With no sealer, nothing is sealed and every row rotates."""
-    updates: list[tuple[str, str]] = []
-    left = uncounted = 0
-    for user_id, stored, seal in rows:
-        aad = cell_aad("users", "totp_secret", user_id)
-        plaintext = cipher.decrypt(stored, aad=aad)
-        if seal and sealer is not None:
-            left += 1
-            uncounted += sealer.is_active(seal)
-        else:
-            updates.append((cipher.encrypt(plaintext, aad=aad), user_id))
-    if left:
-        log.warning(
-            "rotation left the TOTP secret of %d account(s) that fail their integrity seal; each"
-            " secret is still under a prior key, so recreate or remove these accounts before"
-            " dropping that key, or a later rotation aborts on them (BACKLOG #5611)",
-            left,
-        )
-    return updates, replace(outcome, refused=outcome.refused + uncounted)
-
-
 def report_refused_role_holder() -> None:
     """Log a holder of a custom role being deleted whose record fails its integrity seal (BACKLOG
     #2592). Its role row is deleted with the role, which needs no key, and nothing is re-sealed; the
@@ -13005,8 +12970,8 @@ class MessageStore:
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: first, each sealed account's TOTP secret re-encrypted and the account
         # re-sealed under the active key in one write (rotation_reseal), so the loop below finds those
-        # secrets already under the active key. The TOTP pass below then rotates accounts with no
-        # seal, and only opens the secret of one that fails its seal (BACKLOG #5611).
+        # secrets already under the active key. The loop then rotates the rest, which are accounts
+        # whose record has no seal or fails it and is refused anyway.
         # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
         # under a key this run does not hold leaves the store as this method found it.
         preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
@@ -13034,11 +12999,6 @@ class MessageStore:
                         select=", ".join(row_tag_columns(table, column)),
                         aad_of=functools.partial(row_tag_aad, table, column),
                     )
-                    continue
-                if (table, column) == ("users", "totp_secret"):
-                    # Its seal covers these bytes, so a record the user pass refused is not
-                    # rewritten here (BACKLOG #5611).
-                    total += await self._reencrypt_user_totp_to_active(cipher, active_like)
                     continue
                 while True:
                     # Anything not already under the active key (plaintext or a retired-key blob),
@@ -13124,26 +13084,6 @@ class MessageStore:
         if allows_unmarked(self._cipher):
             return f"{column} NOT LIKE ?1 AND {column} <> ''"
         return f"{marker_test_sql(column, present=False)} AND {column} <> ''"
-
-    async def _reencrypt_user_totp_to_active(self, cipher: AesGcmCipher, active_like: str) -> int:
-        """Rotate the TOTP secrets the user pass left (:func:`rotation_totp_updates`; caller holds
-        ``self._lock``). One read: a refused row stays selected, and ``users`` is a small table."""
-        cur = await self._db.execute(
-            "SELECT id, totp_secret, authz_seal FROM users"
-            f" WHERE {self._rotation_scan('totp_secret')}",
-            (active_like,),
-        )
-        rows = [(r["id"], r["totp_secret"], r["authz_seal"]) for r in await cur.fetchall()]
-        updates, self._reseal_outcome = rotation_totp_updates(
-            cipher, self._row_sealer, rows, self._reseal_outcome
-        )
-        if updates:
-            await self._update_every_row(
-                "UPDATE users SET totp_secret=? WHERE id=?", updates, "users.totp_secret"
-            )
-            await self._commit()
-            await self._charge_bound_batch()
-        return len(updates)
 
     @staticmethod
     def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:

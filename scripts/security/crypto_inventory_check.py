@@ -1738,8 +1738,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.queue_tag",
             # BACKLOG #2593: message cells and preset criteria open under their row tag.
             "cipher:via messagefoundry.store.cell_tag",
-            # BACKLOG #5611: rotation_totp_updates opens and re-seals the TOTP secrets rotation left.
-            "cipher:via messagefoundry.store.store",
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
@@ -1760,8 +1758,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.queue_tag",
             # BACKLOG #2593: message cells and preset criteria open under their row tag.
             "cipher:via messagefoundry.store.cell_tag",
-            # BACKLOG #5611: rotation_totp_updates opens and re-seals the TOTP secrets rotation left.
-            "cipher:via messagefoundry.store.store",
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",

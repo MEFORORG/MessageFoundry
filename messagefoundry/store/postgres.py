@@ -409,7 +409,6 @@ from messagefoundry.store.store import (
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
-    rotation_totp_updates,
     run_open_store_hook,
     scope_if_source,
     scope_withdrawal,
@@ -4134,10 +4133,6 @@ class PostgresStore:
                     aad_of=functools.partial(row_tag_aad, table, column),
                 )
                 continue
-            if (table, column) == ("users", "totp_secret"):
-                # Its seal covers these bytes; store.py's twin says why (BACKLOG #5611).
-                total += await self._reencrypt_user_totp_to_active(cipher, active_like)
-                continue
             while True:
                 rows = await self._fetchall(
                     f"SELECT id, {column} AS v FROM {table}"
@@ -4239,29 +4234,6 @@ class PostgresStore:
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
-
-    async def _reencrypt_user_totp_to_active(self, cipher: AesGcmCipher, active_like: str) -> int:
-        """Rotate the TOTP secrets the user pass left (``rotation_totp_updates``). One read: a
-        refused row stays selected, and ``users`` is a small table."""
-        rows = await self._fetchall(
-            "SELECT id, totp_secret, authz_seal FROM users"
-            " WHERE totp_secret NOT LIKE $1 AND totp_secret <> ''",
-            active_like,
-        )
-        updates, self._reseal_outcome = rotation_totp_updates(
-            cipher,
-            self._row_sealer,
-            [(r["id"], r["totp_secret"], r["authz_seal"]) for r in rows],
-            self._reseal_outcome,
-        )
-        if updates:
-            async with self._timed_acquire() as conn, conn.transaction():
-                for new_value, user_id in updates:
-                    await conn.execute(
-                        "UPDATE users SET totp_secret=$1 WHERE id=$2", new_value, user_id
-                    )
-            await self._charge_bound_batch()
-        return len(updates)
 
     async def _reencrypt_composite(
         self,

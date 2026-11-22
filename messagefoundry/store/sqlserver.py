@@ -420,7 +420,6 @@ from messagefoundry.store.store import (
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
-    rotation_totp_updates,
     run_open_store_hook,
     scope_if_source,
     scope_withdrawal,
@@ -10208,10 +10207,6 @@ class SqlServerStore:
                     aad_of=partial(row_tag_aad, table, column),
                 )
                 continue
-            if (table, column) == ("users", "totp_secret"):
-                # Its seal covers these bytes; store.py's twin says why (BACKLOG #5611).
-                total += await self._reencrypt_user_totp_to_active(cipher, active_like)
-                continue
             while True:
                 rows = await self._fetchall(
                     f"SELECT TOP (?) id, {column} AS v FROM {table}"
@@ -10432,34 +10427,6 @@ class SqlServerStore:
         if allows_unmarked(self._cipher):
             return f"{column} NOT LIKE ? AND {column} <> ''"
         return f"{column} COLLATE Latin1_General_100_BIN2 NOT LIKE ? AND DATALENGTH({column}) > 0"
-
-    async def _reencrypt_user_totp_to_active(self, cipher: AesGcmCipher, active_like: str) -> int:
-        """Rotate the TOTP secrets the user pass left (``rotation_totp_updates``). One read: a
-        refused row stays selected, and ``users`` is a small table."""
-        rows = await self._fetchall(
-            "SELECT id, totp_secret, authz_seal FROM users"
-            f" WHERE {self._rotation_scan('totp_secret')}",
-            (active_like,),
-        )
-        updates, self._reseal_outcome = rotation_totp_updates(
-            cipher,
-            self._row_sealer,
-            [(r["id"], r["totp_secret"], r["authz_seal"]) for r in rows],
-            self._reseal_outcome,
-        )
-        if updates:
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    for enc, user_id in updates:
-                        await cur.execute(
-                            "UPDATE users SET totp_secret=? WHERE id=?", (enc, user_id)
-                        )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-        return len(updates)
 
     async def _reencrypt_tagged_to_active(
         self,

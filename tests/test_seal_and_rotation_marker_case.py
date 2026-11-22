@@ -28,7 +28,6 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
-from tests._session_seal_contract import _user
 
 _BIN2 = "COLLATE Latin1_General_100_BIN2"
 
@@ -142,69 +141,6 @@ def test_the_sql_server_scans_compare_the_marker_in_binary() -> None:
     assert " NOT LIKE ?" not in body  # every scan goes through _rotation_scan
 
 
-async def _rotation_rig(tmp_path: Path) -> tuple[Path, str, str, AesGcmCipher]:
-    path = tmp_path / "r.db"
-    old, new = generate_key(), generate_key()
-    old_cipher = make_cipher(old)
-    assert isinstance(old_cipher, AesGcmCipher)
-    store = await MessageStore.open(path, cipher=old_cipher)
-    await _user(store, "u-refused")
-    await _user(store, "u-unsealed")
-    await store.close()
-    return path, old, new, old_cipher
-
-
-def _user_cell(path: Path, user_id: str) -> str:
-    with sqlite3.connect(path) as db:
-        return str(db.execute("SELECT totp_secret FROM users WHERE id=?", (user_id,)).fetchone()[0])
-
-
-def _set_totp(path: Path, user_id: str, value: str, *, clear_seal: bool = False) -> None:
-    with sqlite3.connect(path) as db:
-        db.execute("UPDATE users SET totp_secret=? WHERE id=?", (value, user_id))
-        if clear_seal:
-            db.execute("UPDATE users SET authz_seal='' WHERE id=?", (user_id,))
-
-
-async def test_rotation_leaves_a_refused_record_and_rotates_an_unsealed_one(
-    tmp_path: Path,
-) -> None:
-    path, old, new, old_cipher = await _rotation_rig(tmp_path)
-    refused = old_cipher.encrypt(
-        "JBSWY3DPSYNTHETIC", aad=cell_aad("users", "totp_secret", "u-refused")
-    )
-    unsealed = old_cipher.encrypt(
-        "JBSWY3DPSYNTHETIC", aad=cell_aad("users", "totp_secret", "u-unsealed")
-    )
-    _set_totp(path, "u-refused", refused)  # the seal no longer covers these bytes
-    _set_totp(path, "u-unsealed", unsealed, clear_seal=True)
-    cipher = make_cipher(new, [old])
-    assert isinstance(cipher, AesGcmCipher)
-    store = await MessageStore.open(path, cipher=cipher)
-    try:
-        await store.reencrypt_to_active()
-    finally:
-        await store.close()
-    assert _user_cell(path, "u-refused") == refused
-    assert _user_cell(path, "u-unsealed").startswith(cipher.active_marker_prefix)
-
-
-async def test_rotation_still_aborts_on_a_refused_record_with_an_unopenable_secret(
-    tmp_path: Path,
-) -> None:
-    path, old, new, _ = await _rotation_rig(tmp_path)
-    foreign = make_cipher(generate_key())
-    planted = foreign.encrypt("synthetic", aad=cell_aad("users", "totp_secret", "u-refused"))
-    _set_totp(path, "u-refused", planted)
-    store = await MessageStore.open(path, cipher=make_cipher(new, [old]))
-    try:
-        with pytest.raises(CipherError):
-            await store.reencrypt_to_active()
-    finally:
-        await store.close()
-    assert _user_cell(path, "u-refused") == planted
-
-
 async def test_rotation_aborts_on_the_uppercase_of_the_active_prefix(tmp_path: Path) -> None:
     path = tmp_path / "r.db"
     key = generate_key()
@@ -220,25 +156,6 @@ async def test_rotation_aborts_on_the_uppercase_of_the_active_prefix(tmp_path: P
     finally:
         await store.close()
     assert _reason(path, "plant") == plant
-
-
-async def test_a_refused_secret_under_an_active_key_seal_is_counted(tmp_path: Path) -> None:
-    path = tmp_path / "r.db"
-    old, new = generate_key(), generate_key()
-    old_cipher = make_cipher(old)
-    cipher = make_cipher(new, [old])
-    store = await MessageStore.open(path, cipher=cipher)
-    await _user(store, "u-active")
-    await store.close()
-    stale = old_cipher.encrypt("synthetic", aad=cell_aad("users", "totp_secret", "u-active"))
-    _set_totp(path, "u-active", stale)  # the seal is under the active key and no longer holds
-    store = await MessageStore.open(path, cipher=make_cipher(new, [old]))
-    try:
-        await store.reencrypt_to_active()
-        assert store.reseal_outcome().refused == 1
-    finally:
-        await store.close()
-    assert _user_cell(path, "u-active") == stale
 
 
 @pytest.mark.parametrize("row_id", [None, ""])
