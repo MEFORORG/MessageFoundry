@@ -687,12 +687,12 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
     # SQLite's own text, and views[0] is the broken view. A view already broken fails SQLite's
     # first check, with no suffix; a view the change breaks fails its re-check after the change,
     # with the "after drop column" suffix. Where both names rank first the code does not pick
-    # between them, so both are returned and the remedy names neither. In the suffix-name pair the text itself cannot settle
-    # the pair, since the healthy view's own name holds the suffix. The message-name pair and "vv
-    # after after drop column" are ones a list of SQLite's messages or suffixes could settle, and
-    # the code keeps none (see _foreign_objects). SQLite writes ": " after a name, so "a" is no
-    # candidate for "a:b". A view under a name this build creates
-    # among the candidates gives the plain remedy, so nothing is returned.
+    # between them, so both are returned and the remedy names neither. In the suffix-name pair the
+    # text itself cannot settle the pair, since the healthy view's own name holds the suffix. The
+    # message-name pair and "vv after after drop column" are ones a list of SQLite's messages or
+    # suffixes could settle, and the code keeps none (see _foreign_objects). SQLite writes ": "
+    # after a name, so "a" is no candidate for "a:b". A view under a name this build creates among
+    # the candidates gives the plain remedy, so nothing is returned.
     from messagefoundry.store.schema_verify import _foreign_objects
 
     path = tmp_path / "prefix.db"

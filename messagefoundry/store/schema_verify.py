@@ -460,8 +460,8 @@ async def run_schema_step[T](
                 f" schema step failed: {cause}.",
                 cause=cause,
             )
-            # Named only where safe_exc, which prints this error on the paths that cut it, shows
-            # the whole remedy unchanged: a cut or redacted name would name the wrong object.
+            # Named only where safe_exc shows the whole remedy, path and name, unchanged; any cut
+            # or redaction falls back to the plain remedy.
             if remedy in safe_exc(refusal):
                 raise refusal from exc
         if counts_under_dek is None:
