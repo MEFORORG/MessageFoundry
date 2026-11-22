@@ -12988,13 +12988,14 @@ class RegistryRunner:
             # key-service error, which can echo a URL or a body (BACKLOG #2318).
             read_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
             if read_fault is None:
-                # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
-                # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a
-                # claim does an unopenable payload; the token keeps its reference for a replay. The
-                # handoff below is not wrapped: its encrypt's invocation ceiling is a deliberate
-                # hard stop, so any CipherError the handoff raises still takes the fault arm. Each
-                # store's handoff contains its own decrypt failures that are verdicts on a cell
-                # (BACKLOG #5689, #5727).
+                # BACKLOG #4995: a reply body that fails this way fails again on a retry until its
+                # cause clears, and the fault arm re-pended it at the head of this FIFO lane each
+                # time. Dead-letter it at once, as a claim does an unopenable payload. The cause can
+                # clear later, for example a key the store lacks, so the token keeps its reference
+                # and a replay can recover it. The handoff below is not wrapped: its encrypt's
+                # invocation ceiling is a deliberate hard stop, so any CipherError the handoff
+                # raises still takes the fault arm. Each store's handoff dead-letters on its own
+                # decrypt failures, other than the two kinds above (BACKLOG #5689, #5727).
                 log.warning(
                     "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
                     name,

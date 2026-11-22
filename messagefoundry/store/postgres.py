@@ -6467,7 +6467,7 @@ class PostgresStore:
                             REINGRESS_TOKEN_TAG_FAILED,
                             "re-ingress work-row failed its integrity check",
                         )
-                    except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
+                    except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                         # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler,
                         # so the fault carries no chain to the raw key-service error.
                         ref_fault = (
@@ -6510,10 +6510,12 @@ class PostgresStore:
                             erased=True,
                         )
 
-                    # BACKLOG #5689: a reply or an origin cell that will never open or parse
-                    # dead-letters the token, keeping its reference for a replay, so the loopback
-                    # lane moves. A key service that gave no verdict says nothing about the cell, so
-                    # its error propagates and the token is retried.
+                    # BACKLOG #5689: a reply or an origin cell that fails to open or parse
+                    # dead-letters the token, so the loopback lane moves. A failure that
+                    # dead-letters can still clear later, for example a key the store lacks, so the
+                    # token keeps its reference and a replay can recover it. A key service that gave
+                    # no verdict says nothing about the cell, so its error propagates and the token
+                    # is retried.
                     async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
                         # A fault in the engine's own code propagates too, as on a claim.
                         if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):

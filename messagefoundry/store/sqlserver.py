@@ -9446,7 +9446,8 @@ class SqlServerStore:
                     await self._commit(conn)
                     return True
 
-                # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
+                # (2) Decrypt + parse the artifact ref. A transient open failure re-raises and the
+                # token is retried; any other failure consumes and dead-letters it.
                 ref_fault: QueueOpenFault | None = None
                 try:
                     ref = open_queue_cell(self._cipher, work_row) or ""
@@ -9463,7 +9464,7 @@ class SqlServerStore:
                         REINGRESS_TOKEN_TAG_FAILED,
                         "re-ingress work-row failed its integrity check",
                     )
-                except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
+                except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                     # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so
                     # the fault carries no chain to the raw key-service error.
                     ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
@@ -9501,11 +9502,12 @@ class SqlServerStore:
                         erased=True,
                     )
 
-                # BACKLOG #5727, as on Postgres (#5689): a reply or origin cell that will never
-                # open dead-letters the token, keeping its reference for a replay. A key service
-                # that gave no verdict, or a fault in the engine's own code, propagates and the
-                # token is retried. Only the decrypts are wrapped: the encrypt's invocation ceiling
-                # stays a hard stop.
+                # BACKLOG #5727, as on Postgres (#5689): a decrypt failure on a reply or origin cell
+                # dead-letters the token, unless a key service gave no verdict or the fault is in
+                # the engine's own code: those two propagate and the token is retried. A failure
+                # that dead-letters can still clear later, for example a key the store lacks, so
+                # the token keeps its reference and a replay can recover it. Only the decrypts are
+                # wrapped: the encrypt's invocation ceiling stays a hard stop.
                 async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
                     if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):
                         raise exc

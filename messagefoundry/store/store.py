@@ -16352,7 +16352,7 @@ class MessageStore:
                 return await _consume_dead(
                     REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
                 )
-            except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
+            except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                 # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so the
                 # fault carries no chain to the raw key-service error.
                 ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
@@ -16391,10 +16391,12 @@ class MessageStore:
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
                 )
 
-            # BACKLOG #5727, as on Postgres (#5689): a reply or origin cell that will never open
-            # dead-letters the token, keeping its reference for a replay, so the loopback lane
-            # moves. A key service that gave no verdict says nothing about the cell, and a fault in
-            # the engine's own code is not the cell's, so both propagate and the token is retried.
+            # BACKLOG #5727, as on Postgres (#5689): a decrypt failure on a reply or origin cell
+            # dead-letters the token, so the loopback lane moves. A failure that dead-letters can
+            # still clear later, for example a key the store lacks, so the token keeps its reference
+            # and a replay can recover it. A key service that gave no verdict says nothing about
+            # the cell, and a fault in the engine's own code is not the cell's, so both propagate
+            # and the token is retried.
             # Only the decrypts are wrapped: the encrypt's invocation ceiling stays a hard stop.
             async def _dead_unopenable(exc: CipherError, what: str) -> bool:
                 if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):
