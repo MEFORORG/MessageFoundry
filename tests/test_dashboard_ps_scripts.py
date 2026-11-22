@@ -87,3 +87,53 @@ def test_scheduled_refresh_reads_no_work_tree() -> None:
         assert f"'{verb}'" not in text
     assert "'archive'" in text
     assert "-I $render" in text
+
+
+_TIMES = r"""
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-TriggerTimes' }, $true)
+Invoke-Expression $fn.Extent.Text
+$r1 = ConvertTo-TriggerTimes @('07:00,19:00')
+$r2 = ConvertTo-TriggerTimes @('7:05', ' 19:30 ')
+$ok = @($r1 | ForEach-Object { $_.ToString('HH:mm') })
+$ok2 = @($r2 | ForEach-Object { $_.ToString('HH:mm') })
+$bad = try { ConvertTo-TriggerTimes @('07:00,noon'); '' } catch { $_.Exception.Message }
+[pscustomobject]@{ ok = $ok; ok2 = $ok2; bad = $bad } | ConvertTo-Json -Compress
+"""
+
+
+def test_installer_splits_and_validates_times() -> None:
+    # Only the parsing function is evaluated, lifted from the file's AST: nothing is registered.
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("pwsh is not installed")
+    path = _DIR / "install-schedule.ps1"
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, a checked-in script path
+        [
+            pwsh,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"$path = {_ps_literal(path)}" + _TIMES,
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+        check=True,
+    )
+    got = json.loads(proc.stdout)
+    assert got["ok"] == ["07:00", "19:00"]
+    assert got["ok2"] == ["07:05", "19:30"]
+    assert "'noon' is not a 24-hour time" in got["bad"]
+
+
+def test_installer_keeps_the_runner_out_of_appdata() -> None:
+    text = (_DIR / "install-schedule.ps1").read_text(encoding="utf-8")
+    # The code after the help block, which names AppData only to say why it is avoided.
+    code = text[text.index("[CmdletBinding()]") :]
+    code = "\n".join(ln for ln in code.splitlines() if not ln.lstrip().startswith("#"))
+    assert "LOCALAPPDATA" not in code
+    assert "'.mefor\\dashboard'" in code
+    assert "[string]$RunnerDir" in code
