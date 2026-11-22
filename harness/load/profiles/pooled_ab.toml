@@ -37,7 +37,8 @@ connect_batch = 50
 connect_batch_pause_s = 0.05
 poll_interval_s = 1.0
 drain_timeout_s = 300.0
-base_port = 2600
+# Clear of the default --sink-port 2700, which the shape guard refuses inside the inbound band.
+base_port = 20000
 transform = "cheap"
 # The A/B is about steady-state claim machinery, not reload latency — leave wall #5 off.
 reload_probe = false

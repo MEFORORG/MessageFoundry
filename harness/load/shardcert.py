@@ -753,6 +753,13 @@ def fidelity_note(
     WHOSE fault it was in words — and, where the cause was NOT measured, says THAT instead of guessing."""
     if fidelity is RungFidelity.ADMISSIBLE:
         return None
+    unknown = (
+        f"FIDELITY UNKNOWN — the gate's inputs were not recorded (sent={sent} acked={acked} "
+        f"offered={offered}); the rung is VOID for the ceiling. An unmeasured gate is never a pass"
+    )
+    # Before anything divides by offered: a non-positive offered is what makes a rung UNKNOWN.
+    if fidelity is RungFidelity.UNKNOWN or offered <= 0:
+        return unknown
     short = f"sent {sent} of {offered} offered ({sent / offered:.1%} < {_FIDELITY_SENT_FLOOR:.0%})"
     causes = f"deferred: backpressure={deferred_backpressure} schedule={deferred_schedule}"
     if fidelity is RungFidelity.DRIVE_SHORTFALL:
@@ -786,10 +793,8 @@ def fidelity_note(
             "finding, and a DIFFERENT one from a lane/claim wall: the bind is at INTAKE (ingress/routed are "
             "hard-1 per-lane pools keyed on the INBOUND connection — check G, not L)"
         )
-    return (
-        f"FIDELITY UNKNOWN — the gate's inputs were not recorded (sent={sent} acked={acked} "
-        f"offered={offered}); the rung is VOID for the ceiling. An unmeasured gate is never a pass"
-    )
+    # Fail-closed for a verdict added later: falling off the end would return None, which reads ADMISSIBLE.
+    return unknown
 
 
 #: WHY a ceiling was suppressed, keyed by the NOT-DRIVEN fidelity that suppressed it. Only the not-driven

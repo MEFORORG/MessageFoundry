@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from harness.config.connscale._shape import make_connscale_shape
+from harness.load._lookup import LOCAL_LABEL
 from harness.load.connscale.profile import (
     ConnScaleProfileError,
     get_connscale_profile,
@@ -140,6 +142,19 @@ def test_pooled_ab_builtin_resolves() -> None:
     assert p.claim_modes == ("per_lane", "pooled")
     assert p.sweep_mode == "fixed_aggregate"
     assert "pooled_ab" in list_connscale_profiles()
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(n for n, desc in list_connscale_profiles().items() if LOCAL_LABEL not in desc),
+)
+def test_shipped_profile_band_clears_the_default_sink_at_every_count(name: str) -> None:
+    # BACKLOG #5858, #5859, #5860: the documented command passes no --sink-port, so each step builds
+    # its shape against the default sink, and the shape guard refuses a band that contains it.
+    # Operator-local profiles are excluded: their ports are that site's to choose.
+    profile = get_connscale_profile(name)
+    for count in profile.counts:
+        make_connscale_shape(count=count, base_port=profile.base_port)
 
 
 def test_file_loader_tolerates_utf8_bom(tmp_path: Path) -> None:

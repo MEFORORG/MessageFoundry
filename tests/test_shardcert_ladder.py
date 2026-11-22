@@ -1142,6 +1142,16 @@ def test_step_record_fidelity_is_fail_closed_when_sent_is_unrecorded() -> None:
     assert rec.fidelity is RungFidelity.UNKNOWN
 
 
+@pytest.mark.parametrize("fidelity", [f for f in RungFidelity if f is not RungFidelity.ADMISSIBLE])
+def test_fidelity_note_for_a_zero_offered_rung_is_the_unknown_note(fidelity: RungFidelity) -> None:
+    # BACKLOG #5861: a zero-offered rung classifies UNKNOWN, and its note must say so rather than
+    # divide by the zero that made it UNKNOWN. Every void verdict, because the shortfall and intake
+    # notes each divide by offered.
+    assert shardcert.rung_fidelity(sent=0, acked=0, offered=0) is RungFidelity.UNKNOWN
+    note = shardcert.fidelity_note(fidelity, sent=0, acked=0, offered=0)
+    assert note is not None and note.startswith("FIDELITY UNKNOWN")
+
+
 def test_step_record_carries_sent_across_from_the_report() -> None:
     """⭐ THE `fill_ratio` REPEAT-FAILURE GUARD, exactly. `from_report` is where the filling terms had to be
     carried across, and omitting them would have pinned every rung at the "not measured" sentinel — a
