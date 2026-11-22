@@ -518,8 +518,10 @@ class Message:
         ``occurrence`` (1-based) removes only that one segment instead, numbered as :meth:`field`
         and :meth:`count_segments` number it, so a fieldless bare line is no occurrence. It returns
         1, or 0 when that occurrence is absent, and leaves every other segment as it was. It raises
-        ``ValueError`` only when that occurrence is the leading header, so on a ``BHS``-led message
-        ``delete_segments("BHS")`` is refused while ``occurrence=2`` removes a later ``BHS``."""
+        ``ValueError`` at least for an ``occurrence`` below 1, for any ``MSH`` (as the delete-all
+        form does), and for the occurrence that is the leading header. So on a ``BHS``-led message
+        ``delete_segments("BHS")`` and ``delete_segments("BHS", occurrence=1)`` are both refused
+        and delete nothing, while ``occurrence=2`` removes a later ``BHS``."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
         if occurrence is not None:

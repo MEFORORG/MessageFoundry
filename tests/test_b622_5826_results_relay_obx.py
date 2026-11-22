@@ -219,10 +219,23 @@ def test_delete_segments_occurrence_refuses_the_leading_batch_header(header: str
 def test_delete_segments_occurrence_removes_a_later_header_of_the_leading_id(header: str) -> None:
     # The negative control: only the occurrence that IS the leading header is refused; a later
     # header of the same id goes, and an absent occurrence of it returns 0.
-    msg = Message.parse(f"{header}|^~\\&|A\r{_MSH}\r{header}|^~\\&|B")
+    # The leader declares '#' as its component separator and the later header '^', so a read
+    # after the delete shows the message is still read in the leader's delimiters.
+    msg = Message.parse(
+        f"{header}|#~\\&|A\rMSH|#~\\&|A|B|C|D|20260101||ORU^R01|1|P|2.5.1\r"
+        f"PID|1||X#Y\r{header}|^~\\&|B"
+    )
     assert msg.delete_segments(header, occurrence=3) == 0
     assert msg.delete_segments(header, occurrence=2) == 1
-    assert msg.segments() == [header, "MSH"]
+    assert msg.segments() == [header, "MSH", "PID"]
+    assert msg.field("PID-3.2") == "Y"
+
+
+def test_delete_segments_occurrence_refusal_keys_on_position_not_id() -> None:
+    # The positive control: a BHS's first occurrence that does not lead the message is deleted.
+    msg = Message.parse(f"FHS|^~\\&|A\rBHS|^~\\&|A\r{_MSH}")
+    assert msg.delete_segments("BHS", occurrence=1) == 1
+    assert msg.segments() == ["FHS", "MSH"]
 
 
 def test_an_obx_before_the_first_obr_is_renumbered_too() -> None:
