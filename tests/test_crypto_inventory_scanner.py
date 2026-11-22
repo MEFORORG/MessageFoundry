@@ -2168,6 +2168,22 @@ _OUT = frozenset({"hash:via messagefoundry.sec.impl (out of scope)"})
             "seal = None\n\n\ndef __getattr__(name):\n" + _HOOK_IMPORT + "    return seal\n",
             id="module-level-assignment-of-the-name",
         ),
+        pytest.param(
+            "from messagefoundry.compat import *\n\n\ndef __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    return seal\n",
+            id="module-level-star-import",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n"
+            + _HOOK_IMPORT
+            + "    while True:\n        raise AttributeError\n    return seal\n",
+            id="raise-in-a-loop-before-the-return",
+        ),
+        pytest.param(
+            "def __getattr__(name):\n" + _HOOK_IMPORT + "    abort()\n    return seal\n",
+            id="call-before-the-return",
+        ),
     ],
 )
 def test_a_pep562_hook_shape_the_reading_does_not_follow_stays_out_of_scope(

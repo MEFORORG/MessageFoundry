@@ -79,7 +79,10 @@ seen:
   modelled as bindings. A call only the scope-aware reading gives is not reported, because the
   gate reports the union reading's tokens and only judges them. An import a PEP 562
   ``__getattr__`` serves is an export only in the shapes ``_hook_exports`` reads, so one served
-  in any other shape is marked out of scope though PEP 562 may serve it;
+  in any other shape is marked out of scope though PEP 562 may serve it. The other way, a name
+  bound without a module-level statement (at least a submodule of the same name, or a
+  ``globals()`` or ``sys.modules`` write) still reads as served, so a call the hook never
+  answers can be confirmed;
 * A union token is confirmed by its callee before ``[`` file-wide, so an out-of-scope label
   variant of a callee confirmed in scope elsewhere in the same file stays confirmed; per-site
   judgment would close it.
@@ -676,11 +679,12 @@ def _hook_exports(tree: ast.Module, mod: str, is_init: bool) -> dict[str, list[s
     ``if`` testing the parameter as :func:`_literal_test` reads it narrows its body to those names,
     and when that body ends in a ``return`` or ``raise`` and has no ``else``, it narrows what
     follows to every other name. ``return X`` serves ``X`` only when ``X`` is a bare name bound by
-    an import earlier on the same path, not rebound since, and ``"X"`` can still reach it. Any
-    other read or rebinding of the parameter, any other ``if``, a star import, and any statement
-    holding a ``return`` other than these ends the reading: nothing after it is served. A name
-    anything else in the module binds is never served, because Python calls the hook only for a
-    name the module lacks.
+    an import earlier on the same path and ``"X"`` can still reach it. Any other statement (an
+    expression other than a constant, an assignment, a loop, a ``try``, a ``with``, a ``match``),
+    any other ``if``, and an import that is a star import or binds the parameter ends the reading:
+    nothing after it is served. A name any other module-level statement binds is never served,
+    because Python calls the hook only for a name the module lacks, and a module-level star import
+    turns the reading off.
 
     The body is walked with an explicit work list, so a long ``elif`` chain cannot exhaust the
     recursion limit and crash the gate."""
@@ -689,6 +693,8 @@ def _hook_exports(tree: ast.Module, mod: str, is_init: bool) -> dict[str, list[s
         return {}
     param = (hook.args.posonlyargs + hook.args.args)[0].arg
     elsewhere = {name for stmt in tree.body if stmt is not hook for name in _bound_names(stmt)}
+    if "*" in elsewhere:  # ``_bound_names`` keeps a star import's alias as ``*``
+        return {}
     out: dict[str, list[str]] = {}
     work: list[tuple[list[ast.stmt], _Admitted, dict[str, list[str]]]] = [
         (hook.body, (True, frozenset()), {})
@@ -729,12 +735,9 @@ def _hook_exports(tree: ast.Module, mod: str, is_init: bool) -> dict[str, list[s
                 for local, target in pairs:
                     imports[local] = [target]
                 continue
-            bound = _bound_names(stmt)
-            reads = any(isinstance(n, ast.Name) and n.id == param for n in ast.walk(stmt))
-            if reads or param in bound or any(isinstance(n, ast.Return) for n in ast.walk(stmt)):
+            docstring = isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+            if not (docstring or isinstance(stmt, ast.Pass)):
                 break
-            for name in bound:
-                imports.pop(name, None)
     return out
 
 

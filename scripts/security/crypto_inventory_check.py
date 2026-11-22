@@ -2480,8 +2480,9 @@ def judge_tokens(found: Iterable[str], verified: Iterable[str], mark: str) -> fr
     the lexer's verdict confirms (:func:`_matches`); for Python, the scope-aware reading. A found
     token the stricter reading also gives keeps its spelling; any other is kept with ``mark``
     appended. A token only the stricter reading gives is not added: the stricter reading judges
-    what is found and never finds on its own, so the corpus line, ``--list-operations`` and the
-    import-only checks, which read the found set, describe the same tokens the diff reads.
+    what is found and never finds on its own, so the corpus line, ``--list-operations`` (which
+    adds each site's mark) and the import-only checks, which read the found set, describe the same
+    tokens the diff reads.
 
     Why a mark and not a drop. The undocumented and stale directions must read one set, or no
     inventory satisfies both: a token the first demands, the second must accept. Dropping an
