@@ -8197,9 +8197,7 @@ class PostgresStore:
         incomplete-write chunk groups (a future incremental writer that crashed before finalizing the
         header). Returns the number of attachments reclaimed. Idempotent: a second run finds nothing."""
         async with self._timed_acquire() as conn:  # noqa: SIM117
-            # READ COMMITTED pinned: FOR UPDATE then waits out a racing incref and re-checks the
-            # refcount, where repeatable read would raise a serialization failure.
-            async with conn.transaction(isolation="read_committed"):
+            async with conn.transaction():
                 # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
                 # so their chunks don't miscount — those are reclaimed as the refcount-0 class).
                 incomplete = int(
@@ -8209,23 +8207,13 @@ class PostgresStore:
                     )
                     or 0
                 )
-                # BACKLOG #5696: headers first, then the chunks of exactly the headers taken, so an
-                # incref that won keeps both. Locked in byte order (COLLATE "C"), the order of the
-                # Python-sorted increfs and decrefs, whatever the database collation.
-                taken = await conn.fetch(
-                    "WITH doomed AS (SELECT id FROM attachment WHERE refcount<=0"
-                    ' ORDER BY id COLLATE "C" FOR UPDATE)'
-                    " DELETE FROM attachment a USING doomed d WHERE a.id = d.id RETURNING a.id"
+                # Reclaim refcount-0 attachments: chunks (gated on the header's refcount) then the header.
+                await conn.execute(
+                    "DELETE FROM attachment_chunk WHERE attachment_id IN"
+                    " (SELECT id FROM attachment WHERE refcount<=0)"
                 )
-                headers = len(taken)
-                if taken:
-                    await conn.execute(
-                        "DELETE FROM attachment_chunk WHERE attachment_id = ANY($1::text[])",
-                        [r["id"] for r in taken],
-                    )
-                # Reclaim any header-less orphan chunks (incomplete writes). One statement snapshot
-                # covers both tables and a put commits header and chunks together, so a chunk this
-                # can see has its header visible too: it cannot take a concurrent put's chunks.
+                headers = _rowcount(await conn.execute("DELETE FROM attachment WHERE refcount<=0"))
+                # Reclaim any header-less orphan chunks (incomplete writes).
                 await conn.execute(
                     "DELETE FROM attachment_chunk WHERE attachment_id NOT IN (SELECT id FROM attachment)"
                 )

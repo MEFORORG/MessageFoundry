@@ -12905,76 +12905,33 @@ class SqlServerStore:
         ADR 0105). Two disjoint classes: refcount-0 attachments (header + chunks deleted) and header-less
         incomplete-write chunk groups (a future incremental writer that crashed before finalizing the
         header). Returns the number of attachments reclaimed. Idempotent: a second run finds nothing."""
-        headers = 0
-        committed_headers = 0
-        incomplete = 0
-        skipped = 0
-        async with self._acquire() as conn:
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                async with self._cursor(conn) as cur:
-                    # BACKLOG #5696: each header goes first, re-checking its refcount, and its chunks
-                    # only if this DELETE took it. An incref that won keeps header and chunks; one
-                    # that lost finds no header and fails its ingress. One id per statement, sorted
-                    # in Python, so the header locks follow the increfs' and decrefs' order and no
-                    # statement nears the 2100-parameter limit. OUTPUT, not rowcount, counts them
-                    # (see _exec_terminal on SET NOCOUNT ON).
-                    await cur.execute("SELECT id FROM attachment WHERE refcount<=0")
-                    for ref in sorted(str(r[0]) for r in await cur.fetchall()):
-                        await cur.execute(
-                            "DELETE FROM attachment OUTPUT deleted.id WHERE id=? AND refcount<=0",
-                            (ref,),
-                        )
-                        if await cur.fetchall():
-                            headers += 1
-                            await cur.execute(
-                                "DELETE FROM attachment_chunk WHERE attachment_id=?", (ref,)
-                            )
-                    if headers:
-                        await self._commit(conn)
-                        committed_headers = headers
-                    else:
-                        await self._commit_read(conn)
-                    # Header-less groups (incomplete writes), in a second transaction so the header
-                    # locks are released first and a failure here keeps the deletes above. A put
-                    # holds its content address's applock until it commits header and chunks
-                    # together, so a header re-read
-                    # under that applock tells a real orphan from a put that just landed. A single
-                    # anti-join could not: under RCSI its subquery reads a statement snapshot.
-                    await cur.execute(
-                        "SELECT DISTINCT attachment_id FROM attachment_chunk"
-                        " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
-                    )
-                    for ref in sorted(str(r[0]) for r in await cur.fetchall()):
-                        # No wait: a held applock means a put of this address is live, so the group
-                        # is not an orphan to judge now, and startup must not hang on it (a
-                        # command_timeout of 0 would make the default wait unbounded).
-                        try:
-                            await self._applock(cur, f"mefor:attachment:{ref}", timeout_ms=0)
-                        except _ApplockTimeout:
-                            skipped += 1
-                            continue
-                        await cur.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
-                        if await cur.fetchall():
-                            continue
-                        await cur.execute(
-                            "DELETE FROM attachment_chunk WHERE attachment_id=?", (ref,)
-                        )
-                        incomplete += 1
-                if incomplete:
-                    await self._commit(conn)
-                else:
-                    await self._commit_read(conn)
+                # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
+                # so their chunks don't miscount as orphans — those are reclaimed as the refcount-0 class).
+                await cur.execute(
+                    "SELECT COUNT(DISTINCT attachment_id) AS n FROM attachment_chunk"
+                    " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+                )
+                row = await cur.fetchone()
+                incomplete = int(row[0]) if row is not None else 0
+                # Reclaim refcount-0 attachments: chunks (gated on the header's refcount) then the header.
+                await cur.execute(
+                    "DELETE FROM attachment_chunk WHERE attachment_id IN"
+                    " (SELECT id FROM attachment WHERE refcount<=0)"
+                )
+                await cur.execute("DELETE FROM attachment WHERE refcount<=0")
+                headers = cur.rowcount or 0
+                if headers < 0:
+                    headers = 0
+                # Reclaim any header-less orphan chunks (incomplete writes).
+                await cur.execute(
+                    "DELETE FROM attachment_chunk WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+                )
+                await self._commit(conn)
             except Exception:
-                # The transaction may hold applocks. After the cursor closes, as put_attachment.
-                await self._rollback_or_discard(conn)
-                if committed_headers:
-                    log.warning(
-                        "attachment sweep failed after committing %d refcount-0 deletes",
-                        committed_headers,
-                    )
+                await conn.rollback()
                 raise
-        if skipped:
-            log.info("attachment sweep skipped %d chunk group(s) with a live put", skipped)
         reclaimed = headers + incomplete
         if reclaimed:
             log.info(
