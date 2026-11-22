@@ -76,6 +76,7 @@ kind of object holds. An EXTRA column or index is tolerated.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -163,13 +164,16 @@ _SP_RENAME = re.compile(
 )
 #: Every place a table or an index is created, dropped or renamed, read loosely, so a form the
 #: patterns above miss is counted and refused rather than silently left unchecked. A ``#`` temporary
-#: table is not the store's, behind an ``IF [NOT] EXISTS`` guard too, but a guarded ``DROP TABLE``
-#: whose list goes on past it is counted, as on any other list the strict pattern cannot read.
+#: table is not the store's, behind an ``IF [NOT] EXISTS`` guard too, but a ``DROP TABLE`` whose
+#: list goes on past one is counted, so the strict pattern's miss raises.
 _LOOSE: Final = (
     (re.compile(r"\bCREATE\s+TABLE\s+(?!\s|(?:IF\s+NOT\s+EXISTS\s+)?#)", re.I), _CREATE_TABLE),
     (re.compile(r"\bCREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\b", re.I), _CREATE_INDEX),
     (re.compile(r"\bALTER\s+TABLE\s+(?!\s|(?:IF\s+EXISTS\s+)?#)", re.I), _ALTER_TABLE),
-    (re.compile(r"\bDROP\s+TABLE\s+(?!\s|#|IF\s+EXISTS\s+#\w++(?!\s*,))", re.I), _DROP_TABLE),
+    (
+        re.compile(r"\bDROP\s+TABLE\s+(?!\s|(?:IF\s+EXISTS\s+)?#[\w$@#]++(?!\s*,))", re.I),
+        _DROP_TABLE,
+    ),
     (re.compile(r"\bDROP\s+INDEX\b", re.I), _DROP_INDEX),
     (re.compile(r"\bsp_rename\b", re.I), _SP_RENAME),
 )
@@ -991,7 +995,10 @@ class _Reader:
                     tail = text[end : stop - 1].replace("''", "'")
                     break
             tail = " " + tail  # so the scan never starts at index 0
-            definition = text[m.end() : end] + tail[: _statement_end(tail, 1)]
+            # Nested dynamic SQL's quotes can defeat the scan: keep it all, which only raises more.
+            with contextlib.suppress(ValueError):
+                tail = tail[: _statement_end(tail, 1)]
+            definition = text[m.end() : end] + tail
             self.opaque[name] = frozenset(_ident(w) for w in _TOKEN.findall(definition))
 
     def _built(self, table: str, name: str, action: str) -> _Built:

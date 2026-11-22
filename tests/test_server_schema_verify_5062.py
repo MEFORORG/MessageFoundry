@@ -442,3 +442,23 @@ def test_a_rename_to_a_data_word_is_read(name: str) -> None:
         ("CREATE TABLE t (a INT)", f"ALTER TABLE t RENAME COLUMN a TO {name}"), "postgres"
     )
     assert shape.columns["t"] == frozenset({name})
+
+
+@pytest.mark.parametrize(
+    "statement",
+    ["DROP TABLE IF EXISTS #t$1, u", "DROP TABLE IF EXISTS #a#b, u", "DROP TABLE #tmp, u"],
+)
+def test_a_drop_list_that_goes_on_past_any_temporary_name_raises(statement: str) -> None:
+    with pytest.raises(ValueError, match="cannot read"):
+        declared_schema(("CREATE TABLE u (a INT NULL)", statement))
+
+
+def test_a_partial_index_in_nested_dynamic_sql_is_read() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT NULL, b NVARCHAR(9) NULL)",
+            "EXEC('EXEC(''CREATE INDEX ix ON t (a) WHERE b <> ''''x'''''')')",
+        ),
+        "sqlserver",
+    )
+    assert shape.named_indexes["ix"].partial
