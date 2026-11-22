@@ -13,9 +13,11 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -222,6 +224,119 @@ async def test_a_clean_close_does_not_raise(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "clean.db", group_commit_window_ms=1.0)
     workers = _workers(store)
     await store.close()
+    assert [w.name for w in workers if w.is_alive()] == []
+
+
+# --- a repeat close after a forced stop -----------------------------------------------------------
+
+#: Far above a repeat close that does nothing, and far below the 5 second worker wait, so a repeat
+#: that waits on the wedged worker again fails here instead of passing slowly.
+_REPEAT_CLOSE_BOUND_SECONDS = 1.0
+
+
+def _wedge(conn: Any) -> threading.Event:
+    """Hold ``conn``'s worker in a call ``interrupt()`` cannot abort, until the event is set."""
+    release = threading.Event()
+    conn._tx.put_nowait((None, release.wait))
+    return release
+
+
+async def _unwedge(release: threading.Event, worker: Any) -> None:
+    release.set()
+    await asyncio.to_thread(worker.join, 5)
+    assert not worker.is_alive()
+
+
+async def test_a_repeat_close_after_a_forced_stop_hit_its_bound_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red without the fix: the repeat parks in aiosqlite's close on the wedged worker."""
+    monkeypatch.setattr("messagefoundry.store.close_steps.CANCELLED_CLOSE_GRACE_SECONDS", 0.1)
+    store = await MessageStore.open(tmp_path / "repeat.db")
+    worker: Any = store._db._thread
+    release = _wedge(store._db)
+    try:
+        await _cancel_close(store, "settle")
+        assert worker.is_alive()  # the forced stop did hit its bound
+        store.checkpoint_cipher_invocations = settle = AsyncMock()  # type: ignore[method-assign]
+        store._db.stop = stop = Mock(wraps=store._db.stop)  # type: ignore[method-assign]
+        await asyncio.wait_for(store.close(), _REPEAT_CLOSE_BOUND_SECONDS)
+        settle.assert_not_awaited()  # no second teardown
+        stop.assert_not_called()
+    finally:
+        await _unwedge(release, worker)
+
+
+async def test_a_repeat_close_after_a_cancel_inside_the_writer_close_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop here is aiosqlite's own, so the bound being hit is what marks the connection."""
+    monkeypatch.setattr("messagefoundry.store.close_steps.CANCELLED_CLOSE_GRACE_SECONDS", 0.1)
+    store = await MessageStore.open(tmp_path / "inside.db")
+    writer: Any = store._db
+    worker = writer._thread
+    release = _wedge(writer)
+    try:
+        task = asyncio.ensure_future(store.close())
+        await asyncio.sleep(0.1)  # past the read pool, onto the writer's queued close
+        task.cancel()  # aiosqlite then parks on its own stop
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), 5)
+        assert worker.is_alive()
+        await asyncio.wait_for(store.close(), _REPEAT_CLOSE_BOUND_SECONDS)
+    finally:
+        await _unwedge(release, worker)
+
+
+async def test_a_failed_open_cleanup_does_not_park_on_a_force_stopped_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red without the fix: past the open's bound the abandoned cleanup reaches _close_writer on
+    the stopped writer and parks, so a loop shutdown cancelling every task would hang on it."""
+    monkeypatch.setattr("messagefoundry.store.store.FAILED_OPEN_CANCEL_BOUND_S", 0.1)
+    monkeypatch.setattr("messagefoundry.store.close_steps.CANCELLED_CLOSE_GRACE_SECONDS", 0.1)
+    entered = asyncio.Event()
+    wedged: list[tuple[threading.Event, Any]] = []
+
+    async def parking(_self: Any, *_: object, settle: bool = False, **__: object) -> None:
+        if settle:
+            entered.set()
+            await asyncio.Event().wait()
+
+    async def fail(self: Any) -> None:
+        wedged.append((_wedge(self._db), self._db._thread))
+        raise RuntimeError("synthetic open failure")
+
+    monkeypatch.setattr(MessageStore, "checkpoint_cipher_invocations", parking)
+    monkeypatch.setattr(MessageStore, "_load_state_cache", fail)
+    before = asyncio.all_tasks()
+    opening = asyncio.ensure_future(MessageStore.open(tmp_path / "failed.db"))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        opening.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(opening), 5)
+        left = asyncio.all_tasks() - before - {asyncio.current_task()}
+        assert left  # the cleanup the open stopped waiting for
+        for task in left:  # as a loop shutdown does
+            task.cancel()
+        _, pending = await asyncio.wait(left, timeout=_REPEAT_CLOSE_BOUND_SECONDS * 3)
+        assert not pending
+    finally:
+        for release, worker in wedged:
+            await _unwedge(release, worker)
+
+
+async def test_a_plain_double_close_still_runs_the_close_twice(tmp_path: Path) -> None:
+    """The control: with no forced stop the repeat is not short-circuited."""
+    store = await MessageStore.open(tmp_path / "double.db")
+    workers = _workers(store)
+    store.checkpoint_cipher_invocations = settle = AsyncMock()  # type: ignore[method-assign]
+    await store.close()
+    await asyncio.wait_for(store.close(), _REPEAT_CLOSE_BOUND_SECONDS)
+    assert settle.await_count == 2
     assert [w.name for w in workers if w.is_alive()] == []
 
 

@@ -2111,9 +2111,22 @@ def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
         )
 
 
+#: Set on a connection once it has been force-stopped. Its worker may be wedged, and aiosqlite's
+#: ``close`` would queue another stop behind it and wait with no bound (BACKLOG #5668).
+_FORCE_STOPPED_ATTR = "_mefor_force_stopped"
+
+
+def _was_force_stopped(conn: aiosqlite.Connection) -> bool:
+    return getattr(conn, _FORCE_STOPPED_ATTR, False) is True
+
+
 def _stop_unawaited(conn: aiosqlite.Connection) -> None:
-    """``conn.stop()``, with its future's outcome read when it resolves (BACKLOG #5720)."""
+    """``conn.stop()``, with its future's outcome read when it resolves (BACKLOG #5720). Once only:
+    a repeat would queue a second stop on a worker that is wedged or gone (BACKLOG #5668)."""
+    if _was_force_stopped(conn):
+        return
     future = conn.stop()
+    setattr(conn, _FORCE_STOPPED_ATTR, True)
     if future is not None:
         future.add_done_callback(_read_stop_outcome)
 
@@ -12134,6 +12147,8 @@ class MessageStore:
             # by class (vault BACKLOG #3054). Run to completion, so a cancel cannot cut it short
             # and leave a non-daemon worker thread behind (BACKLOG #5720).
             async def _close_writer() -> None:
+                if _was_force_stopped(db):  # BACKLOG #5668: close() would park on its worker
+                    return
                 try:
                     await db.close()
                     # `close` returns before the worker thread it stops has left
@@ -13772,7 +13787,10 @@ class MessageStore:
     async def _close_handles(self) -> None:
         # BACKLOG #5668: a cancellation landing on one step must not skip the rest, or the workers
         # of the connections after it stay alive and interpreter exit hangs on them. CloseSteps
-        # holds it until every step has run.
+        # holds it until every step has run. The writer is stopped last, so a force-stopped writer
+        # means a close already ran them: a repeat has nothing to do, and must not wait on it.
+        if _was_force_stopped(self._db):
+            return
         steps = CloseSteps()
         await steps.run(self._settle_at_close(), "the AES-GCM settlement")
         # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members
@@ -13820,7 +13838,10 @@ class MessageStore:
         close ``stop()`` queues behind it is reached. The wait re-enters on a further cancel, against
         one deadline, so the worker is gone on return unless that bound was hit and logged. No
         ``finally``: this must not await while a closed coroutine unwinds on ``GeneratorExit``.
+        A connection already force-stopped is not awaited again.
         """
+        if _was_force_stopped(conn):
+            return
         failure: Exception | None = None
         try:
             if steps.cancelled:
@@ -13845,6 +13866,11 @@ class MessageStore:
                 break
             except asyncio.CancelledError as exc:
                 steps.hold(exc)
+        # A cancel inside aiosqlite's own close stopped it without _stop_unawaited: past the bound
+        # that worker is as wedged as a force-stopped one, so a repeat must not wait on it either.
+        thread = getattr(conn, "_thread", None)
+        if steps.cancelled and isinstance(thread, threading.Thread) and thread.is_alive():
+            setattr(conn, _FORCE_STOPPED_ATTR, True)
         if failure is not None:
             steps.absorb(failure)
 
