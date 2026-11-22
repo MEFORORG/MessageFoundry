@@ -842,16 +842,34 @@ SITES: dict[str, Site] = {
         1, INTERNAL, "A fixed directory name under the operator's destination."
     ),
     "messagefoundry/pipeline/dr_backup.py::_sweep_owned": Site(
+        1,
+        INTERNAL,
+        "A fixed lock name inside directories listed by this module's own prefix, after link "
+        "checks; tested for existence only.",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_HeldStagingDir.has": Site(
+        1,
+        INTERNAL,
+        "A fixed marker name in a staging directory, joined where it goes by path; tested for "
+        "existence only.",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_HeldStagingDir.mark": Site(
         3,
         INTERNAL,
-        "Fixed lock and marker names inside directories listed by this module's own prefix, after "
-        "link and owner checks.",
+        "Fixed lock and marker names in a staging directory, joined where it goes by path: on "
+        "Windows created exclusively and otherwise only lstat'ed; on POSIX created with "
+        "O_NOFOLLOW.",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_HeldStagingDir.open_lock": Site(
+        1,
+        INTERNAL,
+        "A fixed lock name in a staging directory, joined where it goes by path, as the sweep "
+        "opened it before.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_teardown_staging": Site(
-        3,
+        2,
         INTERNAL,
-        "Fixed lock and marker names, and the names of files a restore spared, inside a staging "
-        "directory; lstat'ed, read or created unfollowed.",
+        "The names of files a restore spared, inside a staging directory; lstat'ed or read only.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_spare_records": Site(
         2,
