@@ -4,7 +4,7 @@
 
 The template used to rebuild every kept OBX by joining a fixed subset of its fields with the raw
 delimiters. A feed copied from it would have emitted a decoded delimiter as live structure, dropped
-OBX-3.4 onward, OBX-4 and OBX-12 onward, and re-inserted every OBX under the first OBR. These tests
+OBX-3.4 onward, OBX-4, OBX-9, OBX-10 and OBX-12 onward, and re-inserted every OBX under the first OBR. These tests
 pin the fixed shape, and the per-occurrence ``Message.delete_segments`` the fix rests on.
 """
 
@@ -40,8 +40,8 @@ def test_two_orders_keep_every_obx_field_escape_and_order() -> None:
     assert [line[:3] for line in segments] == ["MSH", "PID", "OBR", "OBX", "OBX", "OBR", "OBX"]
     assert segments[2].startswith("OBR|1|") and segments[5].startswith("OBR|2|")
     assert segments[3:5] + segments[6:] == [
-        # OBX-3.4 to 3.6, OBX-4 and OBX-14/15 survive; only OBX-3.1 is remapped.
-        r"OBX|1|NM|GLUC^Glucose^L^2345-7^Glucose^LN|1|95|mg/dL|70-110|N|||F|||20260613121500|LAB01^Main Lab",
+        # OBX-3.4 to 3.6, OBX-4, OBX-10 and OBX-14/15 survive; only OBX-3.1 is remapped.
+        r"OBX|1|NM|GLUC^Glucose^L^2345-7^Glucose^LN|1|95|mg/dL|70-110|N||A|F|||20260613121500|LAB01^Main Lab",
         # The escaped delimiters in OBX-3.2 and OBX-5 stay escaped; the cancelled K result is gone
         # and the Set ID closes the gap.
         r"OBX|2|ST|SOD^Sodium\T\Serum^L||see note\S\ref A|mmol/L|135-145|N|||F",
@@ -62,6 +62,31 @@ def test_a_cancelled_results_comments_go_with_it() -> None:
         "OBX|2|NM|SOD^Sodium^L||140||||||F",
         "NTE|1||sodium ok",
     ]
+
+
+def test_a_cancelled_results_participants_and_z_rows_go_with_it() -> None:
+    segments = _relay_raw(
+        _HEAD + "OBX|1|NM|GLU^Glucose^L||95||||||F\r"
+        "OBX|2|NM|K^Potassium^L||4.1||||||X\rPRT|1|AD||RO\rZNT|1|x\rNTE|1||hemolyzed\r"
+        "OBX|3|NM|NA^Sodium^L||140||||||F\rPRT|1|AD||RO"
+    )
+    assert segments[2:] == [
+        "OBX|1|NM|GLUC^Glucose^L||95||||||F",
+        "OBX|2|NM|SOD^Sodium^L||140||||||F",
+        "PRT|1|AD||RO",
+    ]
+
+
+def test_a_fieldless_line_beside_a_dropped_result_fails_closed() -> None:
+    # A bare "NTE" line is listed by segments() but numbered by no occurrence, so the handler
+    # refuses the message rather than delete a note that belongs to another result.
+    raw = (
+        _HEAD + "NTE\rOBX|1|NM|GLU^Glucose^L||95||||||F\rNTE|1||keep\r"
+        "OBX|2|NM|K^K^L||4||||||X\rNTE|1||drop\rOBX|3|NM|NA^Sodium^L||140||||||F\rNTE|1||keep 3"
+    )
+    result = dry_run(load_config(RESULTS_RELAY), raw)
+    assert result.deliveries == []
+    assert result.disposition.value == "error"
 
 
 def test_an_unmapped_code_is_left_exactly_as_it_arrived() -> None:

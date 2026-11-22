@@ -100,14 +100,24 @@ def relay_results(msg):  # type: ignore[no-untyped-def]
     return [Send(OB_EHR, msg), Send(FILE_ARCHIVE, msg)]
 
 
+#: Segments that open the next observation, specimen or order, so they end a dropped OBX's rows.
+_NEXT_GROUP = {"OBX", "OBR", "ORC", "SPM"}
+
+
 def _drop_result(msg, i):  # type: ignore[no-untyped-def]
-    # Delete the i-th OBX and the NTE comments directly after it, so a cancelled result's comment
-    # never ends up annotating the result before it.
+    # Delete the i-th OBX and the rows that belong to it (its NTE comments, PRT participants and
+    # any Z-segment), so none of them ends up attached to the result before it.
     ids = msg.segments()
     at = [pos for pos, seg in enumerate(ids) if seg == "OBX"][i - 1]
-    first_note = ids[:at].count("NTE") + 1  # the NTE occurrence right after this OBX
-    after = at + 1
-    while after < len(ids) and ids[after] == "NTE":
-        msg.delete_segments("NTE", occurrence=first_note)  # the next note takes its number
-        after += 1
+    end = at + 1
+    while end < len(ids) and ids[end] not in _NEXT_GROUP:
+        end += 1
+    children = ids[at + 1 : end]
+    # segments() lists a fieldless bare line (e.g. "NTE" alone); occurrences skip it. Where one is
+    # present the positions above and the occurrences below disagree, so refuse the message (it
+    # takes the ERROR path) rather than delete another result's rows.
+    if any(ids.count(seg) != msg.count_segments(seg) for seg in {"OBX", *children}):
+        raise ValueError("a fieldless segment line makes the OBX rows ambiguous")
+    for seg in children:  # each deleted child's next sibling takes its occurrence number
+        msg.delete_segments(seg, occurrence=ids[:at].count(seg) + 1)
     msg.delete_segments("OBX", occurrence=i)
