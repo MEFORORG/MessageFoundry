@@ -4195,7 +4195,7 @@ class PostgresStore:
             "attachment_chunk",
             ("attachment_id", "seq"),
             active_like,
-            batch,
+            min(batch, _ATTACHMENT_CHUNK_BATCH),
             value_col="ciphertext",
         )
         # BIGSERIAL-id tables bind to insert-time-known natural columns (id_keyed=True) — their own
