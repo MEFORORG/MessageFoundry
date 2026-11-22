@@ -892,7 +892,8 @@
           const ls = Number(el.dataset.lineStart);
           const ctxRows = stepsCtxRows();
           // Mirrors stepsModel.contextMenuEnablement: Insert before always; Insert after suppressed on a
-          // terminal RETURN / scaffold footer (dead code after the return) but ALLOWED on a mid-body append
+          // terminal RETURN / scaffold footer / Router route row (data-is-return, so dead code after the
+          // return) but ALLOWED on a mid-body append
           // send (ADR 0104); Delete only on an editable action/lookup/send row; ↑/↓ per walk.
           for (const p of insertParents) {
             setDisabled(p, p.dataset.sub === 'after' && isReturn);
@@ -910,15 +911,14 @@
           // ADR 0104 fan-out: "Add destination" only on a real send row (never the `return []` filter).
           setDisabled(addDestItem, !(kind === 'send' && el.dataset.filtered !== 'true'));
           // ADR 0106: Else / Else If (data-anchor="if_chain") only apply to an if-chain anchor (an if/elif row).
-          const isIfChain = kind === 'control' && (control === 'if' || control === 'elif');
-          for (const c of menu.querySelectorAll('.ctx-item[data-anchor="if_chain"]')) {
-            setDisabled(c, !isIfChain);
-          }
           // ADR 0076 Amendment D: grey every Add item outside the enclosing element's role, so a Router's
           // menu offers routing constructs only and the engine's refusal is never met as an error toast.
+          // The menu is shared by every row, so each item's state is set afresh on every open, enabling
+          // what this row allows as well as greying what it does not (BACKLOG #5842).
+          const isIfChain = kind === 'control' && (control === 'if' || control === 'elif');
           const rowRole = el.dataset.role || 'handler';
           for (const c of menu.querySelectorAll('.ctx-item[data-item-id]')) {
-            if (!inRole(c, rowRole)) { setDisabled(c, true); }
+            setDisabled(c, (c.dataset.anchor === 'if_chain' && !isIfChain) || !inRole(c, rowRole));
           }
           // Mirror isRowMovable: a code row (and an elif/else header) is NOT movable, even though walkMove
           // finds an adjacent slot for it (it is draggable only as a drag-interception marker). Gate the
