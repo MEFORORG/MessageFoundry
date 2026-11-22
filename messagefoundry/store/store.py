@@ -14927,11 +14927,12 @@ class MessageStore:
                         loaded = None
                     if not isinstance(loaded, dict):
                         # A keyless open hands an mfenc: cell back unchanged: the engine's fault,
-                        # so the row stays in flight until the key returns.
+                        # so the runner re-pends the row rather than dead-lettering it.
                         if pmeta_json.startswith(_ENC_MARKER_PREFIX) and not self._cipher.encrypts:
                             raise StoreKeylessError(
                                 "store table 'messages' carries encrypted metadata (mfenc: markers)"
-                                " but no store encryption key is configured (fail-closed)"
+                                " but no store encryption key is configured; set"
+                                " MEFOR_STORE_ENCRYPTION_KEY to the key that wrote it (fail-closed)"
                             )
                         err = UnreadableParentMetadataError(
                             "messages", "metadata", message_id, msg_channel

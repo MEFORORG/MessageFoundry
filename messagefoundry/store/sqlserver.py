@@ -1419,12 +1419,13 @@ def _parent_meta_from_row(
     except (ValueError, TypeError, OverflowError, RecursionError):
         loaded = None
     if not isinstance(loaded, dict):
-        # A keyless open hands an mfenc: cell back unchanged: the engine's fault, so the row stays
-        # in flight until the key returns.
+        # A keyless open hands an mfenc: cell back unchanged: the engine's fault, so the runner
+        # re-pends the row rather than dead-lettering it.
         if pmeta_json.startswith(_ENC_MARKER_PREFIX) and not encrypts:
             raise StoreKeylessError(
                 "store table 'messages' carries encrypted metadata (mfenc: markers) but no store"
-                " encryption key is configured (fail-closed)"
+                " encryption key is configured; set MEFOR_STORE_ENCRYPTION_KEY to the key that"
+                " wrote it (fail-closed)"
             )
         # Raised outside the except: json's error holds the whole cell.
         err = UnreadableParentMetadataError("messages", "metadata", message_id, channel_id)
