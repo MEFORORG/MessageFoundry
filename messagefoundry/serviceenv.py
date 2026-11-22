@@ -1184,10 +1184,12 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     else:
         return None
     # A secret whose only value is a joined directory entry that is blank or plainly a path has
-    # nothing to move (the Lander's fifth hold on PR 3142, H2; the sixth hold, H1).
+    # nothing to move (the Lander's fifth hold on PR 3142, H2; the sixth hold, H1), and nor
+    # has such a MEFOR_VALUE_* name (the Lander's hold in comment 7085002242).
     only = posture.directory_only_names
     moving_keys = [k for k in keys if k not in only]
     moving_others = [o for o in others if o not in only]
+    moving_values = [v for v in values if v not in only]
     steps: list[str] = []
     if moving_keys:
         steps.append(
@@ -1201,14 +1203,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # The installer refuses an existing directory the service does not name, so this points
         # only at how one is created, and before the step that moves a setting there (the third
         # hold's H2, the fourth hold's H1).
-        if _DIRECTORY_VARIABLE not in posture.listed and (moving_others or values):
+        if _DIRECTORY_VARIABLE not in posture.listed and (moving_others or moving_values):
             steps.append(
                 'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
                 "says how it is created"
             )
         put = [", ".join(moving_others)] if moving_others else []
-        if values:
+        if moving_values:
             put.append("each MEFOR_VALUE_* variable")
         parts = (
             [
@@ -1219,7 +1221,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             else []
         )
         cite = 'See docs/CONFIGURATION.md, "The secrets directory"'
-        if values:
+        if moving_values:
             parts.append(
                 "A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
                 "of the environment may go in its value file instead, environments/<env>.toml by "
@@ -1239,7 +1241,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "empty override is really wanted, write it in the value file instead, since the "
                 "secrets directory refuses an empty file"
             )
-        if values:
+        if moving_values:
             if posture.unplain_value_names:
                 parts.append(
                     "At least one of them is spelled with a character other than an ASCII "
@@ -1255,6 +1257,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "engine. Renaming the variable outside MEFOR_VALUE_* ends this refusal but leaves "
                 "the secret in the registry key"
             )
+        if values:
             cite += ' and "[environments]"'
         if parts:
             steps.append(". ".join([*parts, cite]))

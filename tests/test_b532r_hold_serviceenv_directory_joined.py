@@ -64,13 +64,13 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert posture.value_runs_on
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
-    # A MEFOR_VALUE_* name always gets the one Put sentence and the create step (the Lander's
-    # decision d20261122T181059560-3bac03). A key whose only value is the directory entry has
-    # nothing to move (the fifth hold on PR 3142, H2).
-    moved = refused.startswith("MEFOR_VALUE_")
+    # A name whose only value is the joined directory entry has nothing to move (the fifth
+    # hold on PR 3142, H2; the Lander's hold in comment 7085002242). The spaced spelling is no
+    # directory entry, so a MEFOR_VALUE_* name joined to it is moved.
+    moved = refused.startswith("MEFOR_VALUE_") and " " in directory
     assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
-        moved and " " not in directory
+        refused.startswith("MEFOR_VALUE_") and " " not in directory
     )
 
 
@@ -81,7 +81,9 @@ def test_the_bare_prefix_joined_to_the_directory_is_deleted() -> None:
     assert refusal is not None
     assert "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry" in refusal
     assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
-    assert CREATE in refusal and "Put each MEFOR_VALUE_* variable" in refusal
+    # Its only value is the directory entry, so nothing goes to the directory (comment
+    # 7085002242).
+    assert CREATE not in refusal and "Put " not in refusal
 
 
 @pytest.mark.parametrize(
@@ -212,18 +214,18 @@ def test_every_value_name_gets_one_generic_put_sentence(
 
 
 def test_a_value_name_alone_joined_to_a_directory_path_keeps_the_path_entry() -> None:
-    """Where the unconditional MEFOR_VALUE_* steps meet the KEEP path: the create step, Put
-    and the delete clause come before the removal, and the run-on and KEEP sentences after
-    it."""
+    """The KEEP path (the Lander's hold in comment 7085002242): a MEFOR_VALUE_* name whose
+    only value is a joined plain-path directory entry has nothing to move, so neither the
+    create step nor Put prints, and the delete clause comes before the removal, the run-on
+    and KEEP sentences after it, as at da3fb43a7e4."""
     refusal = service_env_refusal(
         _read_pairs([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "mefor_secrets_directory=C:\\d")])
     )
     assert refusal is not None
+    assert CREATE not in refusal and "Put " not in refusal
     order = [
         refusal.index(text)
         for text in (
-            CREATE,
-            "Put each MEFOR_VALUE_* variable in the secrets directory",
             "An empty or blank MEFOR_VALUE_* entry is refused too: delete it",
             REMOVE,
             RUNS_ON,
@@ -231,6 +233,19 @@ def test_a_value_name_alone_joined_to_a_directory_path_keeps_the_path_entry() ->
         )
     ]
     assert order == sorted(order)
+
+
+def test_an_empty_value_beside_a_listed_directory_path_is_still_moved() -> None:
+    """``[MEFOR_VALUE_A=, mefor_secrets_directory=C:\\d]``: the directory entry is its own
+    variable, not joined to the value, so this is not the KEEP path. The empty value is told
+    to go, and gets Put; the listed directory takes no create step and no KEEP sentence."""
+    refusal = service_env_refusal(
+        _read_pairs([(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "mefor_secrets_directory=C:\\d")])
+    )
+    assert refusal is not None
+    assert "Put each MEFOR_VALUE_* variable in the secrets directory" in refusal
+    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    assert CREATE not in refusal and KEEP not in refusal and RUNS_ON not in refusal
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
