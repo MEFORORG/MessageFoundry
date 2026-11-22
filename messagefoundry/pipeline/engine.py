@@ -4266,7 +4266,15 @@ class Engine:
 
         ``budget_seconds`` is the time the managed API lifespan hands this stop, a share of NSSM's
         graceful-stop window (BACKLOG #3191). It bounds the waits :class:`_StopBudget` names and no
-        others. With none, every wait keeps its fixed bound."""
+        others. With none, every wait keeps its fixed bound.
+
+        A tight budget loses work, by the owner's ruling that the budget wins. At least the
+        remote-debug watch's last audit pass and the alert-state drain can be cut to about
+        :data:`_STOP_WAIT_FLOOR_SECONDS`, and a CRL reload pass to about 1.5 s or less. A cut
+        audit pass can leave a refusal with no audit row or alert. An alert-instance write that
+        has not landed is not retried and fails at the store's close, so it is not recorded. A cut
+        CRL pass is abandoned, and the next start reloads from the file. docs/SERVICE.md says so
+        for operators."""
         log.info("engine stopping")
         self._stopping = True
         budget = _StopBudget(budget_seconds)
