@@ -1481,8 +1481,8 @@ async def _recorded_decision(
 
     A refusal row is written exactly where the grant row would have been, so a gate writes at most
     one decision row per request, and a gate that wrote no grant row writes no refusal row either.
-    That keeps the per-request volume where the shipped trail already put it while the audit chain
-    has no drain (BACKLOG #1421). For a refusal a route body makes after its gate admitted the
+    The audit chain has no drain (BACKLOG #1421); a refused route-body request writes at most two
+    decision rows. For a refusal a route body makes after its gate admitted the
     request, see :func:`_record_route_refusal`. The reason comes from the
     :class:`_GateRefusal` the check raised. Any other exception leaves the block with no decision
     row from it, which is right for the :func:`_mfa_refusal` 403: it wrote its own
