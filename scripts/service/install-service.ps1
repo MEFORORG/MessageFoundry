@@ -1225,7 +1225,10 @@ function Set-CustodyDirAcl {
     if ($problems) {
         throw ("The custody directory '$Path' is not restricted as the host key provider needs: " +
             "$($problems -join '; '). The service's first start writes its store key file there. " +
-            "Check the directory's access list, and re-run the installer.")
+            "Check the directory's access list, then re-run the installer. When the service does " +
+            "not name the directory yet, as on a first install, remove the directory first, if it " +
+            "holds no master.key or handoff.key, since a rerun refuses a directory it finds and " +
+            "the service does not name.")
     }
 }
 
@@ -3588,7 +3591,11 @@ if ($HostCustody) {
     if ($null -ne $custodyNamingError) {
         throw ("Could not name the custody directory in the service's environment " +
             "($custodyNamingError), and without MEFOR_CUSTODY_DIRECTORY the service looks for its " +
-            "key file in the secrets directory, where it cannot write one. Re-run the installer. " +
+            "key file in the secrets directory, where it cannot write one. Add " +
+            "MEFOR_CUSTODY_DIRECTORY=$CustodyDir to the service's AppEnvironmentExtra by hand, keeping " +
+            "the entries already there, then re-enable the service; or remove the empty directory " +
+            "'$CustodyDir' and re-run the installer, since a rerun refuses a directory the service " +
+            "does not name. " +
             "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it would not find its custody directory')")
     }
     if ($replacedCustodyDir -and -not $CustodyDirNamed) {

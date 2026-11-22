@@ -361,3 +361,21 @@ def test_the_uninstaller_names_the_custody_directory_and_removes_its_grant(
     assert "-CustodyDir $custodyDir" in notice["text"], notice["text"]
     assert "-CustodyAceRemoved:$custodyAceRemoved" in notice["text"], notice["text"]
     assert 'StartsWith("MEFOR_CUSTODY_DIRECTORY="' in _UNINSTALL.read_text(encoding="utf-8")
+
+
+def test_the_uninstall_notice_says_what_the_custody_directory_keeps(tmp_path: Path) -> None:
+    """The notice names both key files, says master.key keeps its own entry for the account
+    whatever happens to the directory's, and warns that a reinstall refuses the kept directory.
+    The control: with no custody directory, none of it is printed."""
+    from tests.test_service_install_manifest import _FULL_FACTS, _notice
+
+    flat = " ".join(_notice(tmp_path, _FULL_FACTS).split())
+    for needed in (
+        "master.key",
+        "handoff.key",
+        "master.key keeps its own entry for 'NT SERVICE\\MessageFoundry'",
+        "A reinstall refuses this directory",
+    ):
+        assert needed in flat, (needed, flat)
+    without = " ".join(_notice(tmp_path, {**_FULL_FACTS, "CustodyDir": ""}).split())
+    assert "handoff.key" not in without and "Custody" not in without, without

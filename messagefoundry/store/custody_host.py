@@ -22,8 +22,8 @@ part B3b; the key custody ADR draft, rules 1 to 4, 3b and 13).
   (:class:`~messagefoundry.store.store.StorePin`): a new store's genesis record is written with
   the current id, and an existing store's must name one the blob names.
 * **Precedence.** A host blob is never read beside another store key source, and a host blob or a
-  handoff in a directory this provider may read refuses every other key provider (rules 2 and 13;
-  :func:`foreign_custody_refusal`).
+  handoff in a directory :func:`_key_file_directories` names refuses every other key provider
+  (rules 2 and 13; :func:`foreign_custody_refusal`).
 * **The account.** SYSTEM, LOCAL SERVICE and NETWORK SERVICE are refused always, and on Linux root
   and nobody (the custody primitives refuse them). An account that is not local to this host, at
   least a domain user or a group managed service account, is refused under ``enforce`` and named as
@@ -215,40 +215,30 @@ def _custody_paths(directory: Path) -> tuple[Path, Path]:
     return directory / HOST_FILE_NAME, directory / HANDOFF_FILE_NAME
 
 
-def _key_file_directories(
-    settings: StoreSettings, environ: Mapping[str, str], *, always_beside_store: bool
-) -> list[Path]:
-    """At least these directories a host file or handoff for this store may sit in: the ones
-    ``MEFOR_CUSTODY_DIRECTORY`` and ``MEFOR_SECRETS_DIRECTORY`` name, and a SQLite store's data
-    directory, where a mint run with neither variable writes. The data directory is named only when
-    ``MEFOR_SECRETS_DIRECTORY`` is unset, unless ``always_beside_store``. Not named, at least: a
-    custody directory an earlier setting named. A variable that is not an absolute path names none
-    here; :func:`custody_directory` refuses it."""
+def _key_file_directories(settings: StoreSettings, environ: Mapping[str, str]) -> list[Path]:
+    """At least these directories a ``host`` mint could have written a host file or handoff for
+    this store in: the ones ``MEFOR_CUSTODY_DIRECTORY`` and ``MEFOR_SECRETS_DIRECTORY`` name, and a
+    SQLite store's data directory, where a mint run with neither variable writes, whatever is set
+    here. Not named, at least: a custody directory an earlier setting named. A variable that is not
+    an absolute path counts as unset here; :func:`custody_directory` refuses it."""
     found: list[Path] = []
     for variable in (CUSTODY_DIRECTORY_VARIABLE, SECRETS_DIRECTORY_VARIABLE):
         raw = environ.get(variable, "").strip()
         if raw and Path(raw).is_absolute():
             found.append(Path(raw))
-    if always_beside_store or not environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip():
-        beside = custody_directory(settings, environ={})
-        if beside is not None:
-            found.append(beside)
+    beside = custody_directory(settings, environ={})
+    if beside is not None:
+        found.append(beside)
     return list(dict.fromkeys(found))
 
 
 def _key_files_outside(
-    settings: StoreSettings,
-    directory: Path | None,
-    environ: Mapping[str, str],
-    *,
-    always_beside_store: bool,
+    settings: StoreSettings, directory: Path | None, environ: Mapping[str, str]
 ) -> list[Path]:
     """The host files and handoffs in :func:`_key_file_directories` other than ``directory``."""
     return [
         p
-        for other in _key_file_directories(
-            settings, environ, always_beside_store=always_beside_store
-        )
+        for other in _key_file_directories(settings, environ)
         if other != directory
         for p in _custody_paths(other)
         if os.path.lexists(p)
@@ -294,24 +284,35 @@ def foreign_custody_refusal(
     handoff sits in a directory where a ``host`` mint may have written it
     (:func:`_key_file_directories`), so the store's key would be taken from somewhere other than
     the blob minted for it. A directory setting that is not an absolute path is passed over here,
-    and the directories the other setting names are still looked in."""
+    and the directories the other setting names are still looked in.
+
+    The way on names each file, and a step that clears the refusal whatever the variables say:
+    moving the file out of the directories this check reads. A new custody directory would not,
+    since the secrets directory and the data directory are read whatever names it."""
     environ = os.environ if environ is None else environ
-    # Beside the store only where the provider would read it now: the remedy, a new directory
-    # named by a variable, must be able to clear the refusal.
-    found = _key_files_outside(settings, None, environ, always_beside_store=False)
+    found = _key_files_outside(settings, None, environ)
     if not found:
         return None
+    named = " and ".join(str(p) for p in found)
     return (
-        f"{' and '.join(p.name for p in found)} is in "
-        f"{' and '.join(dict.fromkeys(str(p.parent) for p in found))}, but [store].key_provider is "
+        f"{named} is there, but [store].key_provider is "
         f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
         "if it holds this store's key, keep a copy of each key setting's value first, somewhere "
         "as protected as where it is now, since it may be the only copy of a store key, and then "
         "set [store].key_provider = 'host' and remove every other store key setting, with "
         "[store].cipher_provider = 'aesgcm', which that provider needs. The engine cannot tell "
-        "whether the blob holds this store's key, so it "
-        f"leaves the file in place. {keep_the_key_step(settings, new_store=False, environ=environ)}"
+        f"whether the blob holds this store's key, so it leaves the file in place. {_MOVE_OUT_STEP}"
     )
+
+
+#: The step that clears :func:`foreign_custody_refusal` when the file holds no key this store
+#: needs (Manager decision 2026-11-22 on vault BACKLOG #3411). A move, never a delete: the file
+#: may be another store's only key.
+_MOVE_OUT_STEP = (
+    "If it holds no key this store needs, move it as an administrator out of that directory, to a "
+    "folder only administrators can read on the same volume so it keeps its own access list, and "
+    "start again; it may be another store's only key, so keep it"
+)
 
 
 # --- the account ----------------------------------------------------------------------------------
@@ -671,7 +672,7 @@ def _left_outside_the_custody_directory(
     environ = os.environ if environ is None else environ
     if _directory_variable(environ) != CUSTODY_DIRECTORY_VARIABLE:
         return None  # without it the provider reads where it did before the variable existed
-    found = _key_files_outside(settings, directory, environ, always_beside_store=True)
+    found = _key_files_outside(settings, directory, environ)
     if not found:
         return None
     return (

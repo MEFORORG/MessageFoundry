@@ -23,7 +23,9 @@
 
     Two of them can be taken back on request, because both need elevation an operator may not have
     later: -RemoveLogonRight drops the "Log on as a service" right, and -RemoveAccountAces drops
-    the run-as account's entry from the data and config directories.
+    the run-as account's entry from the data and config directories, and from the secrets and
+    custody directories the service names (vault BACKLOG #3411). On the custody directory that is
+    the directory's own entry: master.key there keeps its own list, which names the account.
 
     The service SID type and the privilege list the installer sets are part of the registration,
     so they go with it. The script looks for the service's registry key after the removal, and the
@@ -54,7 +56,8 @@ param(
     # installer's default per-service virtual account, whose SID belongs to this service alone.
     [switch]$RemoveLogonRight,
     # Opt-in: remove the run-as account's access-control entry from the data directory and the
-    # config directory. The account is gone once the registration is, so the entry is orphaned -
+    # config directory, and from the secrets and custody directories the registration names. The
+    # account is gone once the registration is, so the entry is orphaned -
     # but removing it is still a permission change on directories that may outlive this service.
     [switch]$RemoveAccountAces
 )
@@ -354,8 +357,14 @@ function Get-UninstallResidueNotice {
         $lines += "  Custody dir      $CustodyDir"
         $lines += "                   The custody directory the service read under the host key"
         $lines += "                   provider. master.key in it holds the store's key, and may be its"
-        $lines += "                   only copy on this host. This script leaves it and its files."
-        $lines += "                   Keep it while the store is kept."
+        $lines += "                   only copy on this host; handoff.key, there until the service's"
+        $lines += "                   first start, holds it too. This script leaves the directory and"
+        $lines += "                   its files. Keep them while the store is kept. master.key keeps"
+        $lines += "                   its own entry for '$ServiceAccount', whatever happens to the"
+        $lines += "                   directory's. A reinstall refuses this directory while the new"
+        $lines += "                   service does not name it: move the key files out as an"
+        $lines += "                   administrator, on the same volume, remove the directory, re-run"
+        $lines += "                   the installer, and move them back."
     }
 
     if ($CachedNssm) {
