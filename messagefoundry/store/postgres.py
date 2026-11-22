@@ -8977,8 +8977,9 @@ class PostgresStore:
             "stage=$4 AND destination_name=$1 AND status=$2 AND ($3::text IS NULL OR channel_id=$3)"
         )
         # One guarded write (BACKLOG #5732): READ COMMITTED re-checks ``status`` on a row a concurrent
-        # claim changed, so that row is skipped and not counted. A claimed head returns no row rather
-        # than sliding to the next one, which the operator did not pick.
+        # claim changed, so that row is skipped and not counted. A head claimed after the subquery
+        # picked it returns no row. A claim committed before the pick is not the head: the head is
+        # the oldest PENDING row.
         target = f"id=(SELECT id FROM queue WHERE {lane} ORDER BY seq LIMIT 1) AND status=$2"
         # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
         async with (

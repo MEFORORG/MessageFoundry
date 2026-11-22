@@ -13799,9 +13799,11 @@ class SqlServerStore:
                     # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
                     # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
                     # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
-                    # #2754). The head's id is fixed BEFORE the write: a TOP (1) CTE carrying the PENDING
-                    # term would wait on a head being claimed, then pass over it and cancel the next
-                    # row, which the operator did not pick (BACKLOG #5732).
+                    # #2754). The head's id is fixed BEFORE the write, because a TOP (1) CTE carrying the
+                    # PENDING term would wait on a head being claimed and then cancel the next row
+                    # (BACKLOG #5732). Under RCSI this read does not wait, so a head claimed after it
+                    # returns zero; with RCSI off it can wait the same way. A claim committed before
+                    # the read is not the head: the head is the oldest PENDING row.
                     target, bound = lane, tuple(params)
                     if top_only:
                         await cur.execute(

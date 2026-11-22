@@ -17952,10 +17952,14 @@ class MessageStore:
             cur = await self._db.execute(query, tuple(params))
             rows = list(await cur.fetchall())
             if not rows:
-                # Only read so far: close BEGIN IMMEDIATE, so a purge with no audit row commits
-                # nothing, which would otherwise count a transaction that wrote nothing.
-                await self._db.rollback()
-                await self._commit_operator_noop(written, audit, 0)
+                # The audit row commits in this transaction. With none, close it without a commit,
+                # which would count a transaction that wrote nothing.
+                noop_audits = operator_audits(audit, 0)
+                if noop_audits:
+                    written.add(noop_audits, await self._append_audits(noop_audits, now=now))
+                    await self._commit()
+                else:
+                    await self._db.rollback()
                 return 0
             if top_only:
                 where.append("id=?")

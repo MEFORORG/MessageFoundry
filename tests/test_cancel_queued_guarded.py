@@ -82,7 +82,9 @@ async def test_sqlite_another_process_cannot_claim_between_select_and_update(
                     "UPDATE queue SET status=? WHERE id=?", (OutboxStatus.INFLIGHT.value, row_id)
                 )
             refused.append(False)
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            # Only a lock refusal counts: any other failure would prove nothing about the lock.
+            assert exc.sqlite_errorcode == sqlite3.SQLITE_BUSY
             refused.append(True)
         finally:
             rival.close()
