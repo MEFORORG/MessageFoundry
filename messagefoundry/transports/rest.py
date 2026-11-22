@@ -1867,10 +1867,8 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
 
 
 def request_target_as_sent(url: str) -> str:
-    """``url`` as urllib's ``Request`` holds it for a caller that appends no path (BACKLOG #5911):
-    ``urllib.parse.unwrap`` strips the whitespace around it, and the fragment is split off at the
-    LAST ``#``, as :func:`_url_segments_sent` reads it. A peer sees only this part, except where a
-    forward proxy is sent the full URL."""
+    """``url`` with ``urllib.parse.unwrap`` stripping the whitespace around it and the fragment
+    cut at the LAST ``#``, as :func:`_url_segments_sent` reads it (BACKLOG #5911)."""
     url = urllib.parse.unwrap(url)
     return url.rpartition("#")[0] if "#" in url else url
 
@@ -1883,10 +1881,10 @@ def digest_password_unmatched(url: str) -> bool:
 
 
 def unsendable_request_target(url: str, *, sent_as_is: bool = False) -> bool:
-    """Whether ``http.client`` could never send ``url`` as a request target (BACKLOG #5911).
+    """Whether ``url`` holds what this screen refuses in a request target (BACKLOG #5911).
 
-    It sends the target as ASCII and refuses a control character or a space in it, and urllib
-    sets the ``Host`` header from the URL's host as it stands, which ``http.client`` encodes as
+    ``http.client`` sends the target as ASCII and refuses a control character or a space in it,
+    and urllib sets the ``Host`` header from the URL's host, which ``http.client`` encodes as
     Latin-1 rather than IDNA. Every whitespace character is a control, a space or not ASCII, so
     all three are refused.
 
@@ -1940,7 +1938,7 @@ def refuse_unsendable_static_request(
         )
         raise ValueError(
             f"{setting} 'url' must be ASCII with no {refused} (http.client sends it as "
-            "ASCII); percent-encode it, and give an internationalized host in its IDNA form"
+            "ASCII); give an internationalized host in its IDNA form"
         )
     for name, value in headers.items():
         proxy_named = is_proxy_credential_header_name(name)
@@ -3176,8 +3174,8 @@ class RestDestination(DestinationConnector):
                 "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"
             )
         # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
-        # the proxy route's hop gate, rather than every message at send time. The url is sent with no
-        # path appended, so it is judged as urllib sends it.
+        # the proxy route's hop gate, rather than every message at send time. The url is judged
+        # against urllib's direct send; the ECH and forward-proxy paths read the url differently.
         self._headers = self._build_headers(s)
         refuse_unsendable_static_request(
             url,

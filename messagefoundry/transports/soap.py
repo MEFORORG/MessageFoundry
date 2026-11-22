@@ -765,8 +765,8 @@ class SoapDestination(DestinationConnector):
         self._refuse_half_credential_pairs(s)
         self._validate_ws(scheme, s)
         # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
-        # the proxy route's hop gate, rather than every message at send time. The url is sent with no
-        # path appended, so it is judged as urllib sends it.
+        # the proxy route's hop gate, rather than every message at send time. The url is judged
+        # against urllib's direct send; the forward-proxy path reads the url differently.
         self._headers = self._build_headers(s)
         refuse_unsendable_static_request(
             url,
