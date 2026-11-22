@@ -6743,9 +6743,10 @@ class AuthService:
         audit_bad_signature: bool,
     ) -> webauthn.AssertionResult | None:
         """Verify an assertion's signature against stored passkey ``cred``: the new sign count and
-        UV flag, or ``None`` when it is refused. The one copy of the refusal handling both passkey legs share,
-        :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write`` runs each audit
-        row: at once on the second-factor leg, deferred into the failure pad on the sign-in.
+        UV flag, or ``None`` when it is refused. The one copy of the refusal handling both passkey
+        legs share, :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write``
+        runs each audit row: at once on the second-factor leg, deferred into the failure pad on the
+        sign-in.
 
         * A stored key the registration rule refuses (BACKLOG #1963) will never sign in again, so it
           is logged and audited with a fixed slug, never the refusal text, which can quote the key.
@@ -8746,8 +8747,8 @@ class AuthService:
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
                 # window-gated action demands a real step-up: a directory re-bind, or an engine TOTP
                 # or recovery code at the MFA gate, or a user-verified passkey that completes a
-                # pending factor, for a `kerberos` session, since those stamp the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
-                # #296, #2142).
+                # pending factor, for a `kerberos` session, since those stamp the window, and only
+                # the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG #296, #2142).
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
                 # two Kerberos routes disagreed: `GET /ui/sso` passed False while `POST
@@ -16425,13 +16426,13 @@ class AuthService:
         """Whether the caller's session re-verified its credential within
         ``[auth].step_up_max_age_seconds`` -- the gate for sensitive operations (ASVS 7.5.3).
 
-        A LOCAL login that owes no second factor is the first verification. No directory login is:
+        A LOCAL login that owes no second factor is the first verification, unless it comes from an
+        address first seen for the account (BACKLOG #288), which opens no window. A combined
+        sign-in, which proves its code in the same request, opens one. No directory login is:
         Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5). A Kerberos session
         opens one by at least a step-up, a TOTP or recovery code, or a user-verified passkey that
         completes its pending factor (a passkey never renews a window once the factor is met), an
-        OIDC
-        session only by the IdP step-up
-        (BACKLOG #2142)."""
+        OIDC session only by the IdP step-up (BACKLOG #2142)."""
         if not token:
             return False
         session = await self._load_session(hash_token(token))
@@ -19839,16 +19840,16 @@ class AuthService:
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
         factor satisfied and re-key the session (ASVS 7.2.4). The same factor write, when the row it
-        reads in its own transaction has not met its factor, also re-anchors the session to the WP-L3-13 client as
-        :meth:`verify_mfa` does and stamps ``reauth_at`` only when the authenticator reported user
-        verification, clearing it otherwise. A session that had already met its factor when that
+        reads in its own transaction has not met its factor, also re-anchors the session to the
+        WP-L3-13 client as :meth:`verify_mfa` does and stamps ``reauth_at`` only when the
+        authenticator reported user verification, clearing it otherwise. A session that had already met its factor when that
         write ran, and any ``oidc`` session, is neither re-anchored nor stamped (vault BACKLOG #2964
         item 14, owner rulings 2026-11-14, ADR 0068 amendment of that date). Returns a not-``ok``
         :class:`Elevation` (never raises) for any invalid input, always audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
-        what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
-        0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
+        what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from
+        :meth:`verify_mfa`** (recorded in ADR 0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
         secrets and a flaky authenticator must not lock the account; abuse is bounded by the
         route's ``allow_reauth_attempt`` gate + cookie-holder-only reachability + these audits.
 
