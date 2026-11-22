@@ -11,8 +11,8 @@ from __future__ import annotations
 #: Always printed, after every step that moves a value elsewhere: what to remove, and the doc to
 #: see.
 REMOVE = (
-    "Remove each refused variable from the service's environment. See docs/SERVICE.md, "
-    '"Start / stop / status"'
+    "Remove each refused variable, with its value, from the service's environment. See "
+    'docs/SERVICE.md, "Start / stop / status"'
 )
 
 #: Printed when a refused variable's value runs on into the entries after it.
@@ -21,7 +21,8 @@ RUNS_ON = (
     "runs on into with it, or the value stays in the registry key"
 )
 
-#: Printed right after :data:`RUNS_ON`: a directory entry holding a path alone stays.
+#: Printed last, only where a refused variable runs on into a directory entry that sets the
+#: directory to a path and holds no key: that entry stays.
 KEEP = (
     "Keep any of them that sets MEFOR_SECRETS_DIRECTORY to a path and nothing else, as its own "
     "entry"

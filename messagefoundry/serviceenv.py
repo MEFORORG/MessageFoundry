@@ -164,6 +164,13 @@ class ServiceEnvPosture:
     #: Whether a refused name's value, empty in its own string, runs on into the next strings of
     #: its registry value, so the refusal can say to remove those entries too.
     value_runs_on: bool = False
+    #: The refused names whose only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that hold
+    #: no key (:func:`_directory_entry_value`), so the refusal sends none of them to a key file
+    #: or the secrets directory. The remedy alone reads this, never the refusal itself.
+    directory_only_names: tuple[str, ...] = field(default=(), repr=False)
+    #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
+    #: keep it. The remedy alone reads this, never the refusal itself.
+    directory_path_joined: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -605,6 +612,11 @@ class _Variable:
     #: Whether its value, blank in its own string, takes the strings after it, which
     #: :func:`_variables` joins to that string.
     runs_on: bool = False
+    #: Whether it runs on, and every non-blank string it takes is a directory entry holding no
+    #: key (:func:`_directory_entry_value`). Read by the remedy only.
+    directory_only: bool = False
+    #: Whether it runs on into such an entry that sets the directory to a path. Remedy only.
+    keeps_directory: bool = False
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
@@ -861,15 +873,34 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             key = (index, variable.written, line_on_string, variable.broken)
             joined_break = key in joined_breaks
             ran_on = (key in ran or joined_break) and bool(variable.value.strip())
+            # For the remedy only: what the strings this value takes hold. Nothing here feeds
+            # ``_names``, so it changes no refusal (the Lander's fifth hold on PR 3142, H2).
+            taken = [_directory_entry_value(s) for s in strings[index + 1 :] if not _still_blank(s)]
             read.append(
                 replace(
                     variable,
                     line=line_on_string,
                     broken=variable.broken and not joined_break,
                     runs_on=ran_on,
+                    directory_only=ran_on and bool(taken) and None not in taken,
+                    keeps_directory=ran_on
+                    and any(v is not None and not _still_blank(v) for v in taken),
                 )
             )
     return read
+
+
+def _directory_entry_value(entry: str) -> str | None:
+    """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it holds nothing but that one
+    line and the value is no key (:func:`_is_key_value`, :func:`_holds_key_run`); else None.
+    The remedy alone reads it, to tell a joined directory path from key material."""
+    lines = [line for line in _LINE_BREAK.split(entry) if line.strip()]
+    if len(lines) != 1:
+        return None
+    written, equals, value = lines[0].partition("=")
+    if not equals or written.strip().upper() != _DIRECTORY_VARIABLE:
+        return None
+    return None if _is_key_value(value) or _holds_key_run(value) else value
 
 
 def _kept_empty(variable: _Variable) -> bool:
@@ -991,7 +1022,22 @@ def read_service_env_posture(
         empty_value_names=empty,
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
+        directory_only_names=_directory_only_names(variables, found),
+        directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables),
     )
+
+
+def _directory_only_names(
+    variables: Sequence[_Variable], found: Sequence[tuple[str, str, int | None]]
+) -> tuple[str, ...]:
+    """The names in ``found`` each of whose variables :func:`_names` keeps takes only
+    directory entries holding no key (:attr:`_Variable.directory_only`). Remedy only."""
+    only: list[str] = []
+    for name, _where, _line in found:
+        kept = [v for v in variables if v.written.upper() == name and _names([v])]
+        if kept and all(v.directory_only for v in kept):
+            only.append(name)
+    return tuple(only)
 
 
 def _started_by_something_else(
@@ -1097,8 +1143,16 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         )
     else:
         return None
+    # A secret whose only value is a joined directory entry holding no key has nothing to move
+    # (the Lander's fifth hold on PR 3142, H2).
+    only = posture.directory_only_names
+    moving_keys = [k for k in keys if k not in only]
+    moving_others = [o for o in others if o not in only]
+    moving_values = any(
+        v not in posture.empty_value_names and v != _VALUE_PREFIX and v not in only for v in values
+    )
     steps: list[str] = []
-    if keys:
+    if moving_keys:
         steps.append(
             "Keep the store key in a DPAPI-protected key file instead: `messagefoundry protect-key "
             '--out <new path> --grant-account "NT SERVICE\\<service>"`, then set '
@@ -1110,50 +1164,53 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # The installer refuses an existing directory the service does not name, so this points
         # only at how one is created, only where a non-empty setting goes to one, and before the
         # step that moves it there (the third hold's H2, the fourth hold's H1 and H3).
-        moves = bool(others) or any(
-            v not in posture.empty_value_names and v != _VALUE_PREFIX for v in values
-        )
-        if _DIRECTORY_VARIABLE not in posture.listed and moves:
+        if _DIRECTORY_VARIABLE not in posture.listed and (moving_others or moving_values):
             steps.append(
                 'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
                 "says how it is created"
             )
-        put = [", ".join(others)] if others else []
-        if values:
+        put = [", ".join(moving_others)] if moving_others else []
+        if moving_values:
             put.append("each MEFOR_VALUE_* variable")
-        step = (
-            f"Put {' and '.join(put)} in the secrets directory MEFOR_SECRETS_DIRECTORY names, as "
-            "one restricted file per setting named as its variable"
+        parts = (
+            [
+                f"Put {' and '.join(put)} in the secrets directory MEFOR_SECRETS_DIRECTORY "
+                "names, as one restricted file per setting named as its variable"
+            ]
+            if put
+            else []
         )
         cite = 'See docs/CONFIGURATION.md, "The secrets directory"'
-        if values:
-            step += (
-                ". A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
+        if moving_values:
+            parts.append(
+                "A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
                 "of the environment may go in its value file instead, environments/<env>.toml by "
                 "default, keyed by the name after MEFOR_VALUE_ in lower case. Each MEFOR_VALUE_* "
                 "name is counted once, without regard to case, under the first registry value "
-                "that sets it, so remove it from every value that sets it"
+                "that sets it"
             )
-            if _VALUE_PREFIX in values:
-                step += (
-                    ". The bare name MEFOR_VALUE_ sets no env() key, so delete that entry rather "
-                    "than move it"
-                )
-            if posture.empty_value_names:
-                step += (
-                    ". An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where "
-                    "an empty override is really wanted, write it in the value file instead, "
-                    "since the secrets directory refuses an empty file"
-                )
+        if _VALUE_PREFIX in values:
+            parts.append(
+                "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry rather than "
+                "move it"
+            )
+        # A value whose only content is a joined directory entry is empty in its own entry.
+        if posture.empty_value_names or any(v in only for v in values):
+            parts.append(
+                "An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where an "
+                "empty override is really wanted, write it in the value file instead, since the "
+                "secrets directory refuses an empty file"
+            )
+        if moving_values:
             if posture.unplain_value_names:
-                step += (
-                    ". At least one of them is spelled with a character other than an ASCII "
+                parts.append(
+                    "At least one of them is spelled with a character other than an ASCII "
                     "letter, a digit or an underscore, a file name the secrets directory refuses, "
                     "so rename that env() key before moving it there"
                 )
-            step += (
-                '. A MEFOR_VALUE_* variable that a [secrets].provider = "env" reference names is '
+            parts.append(
+                'A MEFOR_VALUE_* variable that a [secrets].provider = "env" reference names is '
                 "read from the environment only, never from the secrets directory. Drop that "
                 "reference instead and put the credential in the secrets directory under the "
                 "setting it stands for, such as MEFOR_AUTH_AD_BIND_PASSWORD; or, second, use "
@@ -1161,21 +1218,28 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "engine. Renaming the variable outside MEFOR_VALUE_* ends this refusal but leaves "
                 "the secret in the registry key"
             )
+        if values:
             cite += ' and "[environments]"'
-        steps.append(f"{step}. {cite}")
+        if parts:
+            steps.append(". ".join([*parts, cite]))
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
     # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).
     steps.append(
-        "Remove each refused variable from the service's environment. See docs/SERVICE.md, "
-        '"Start / stop / status"'
+        "Remove each refused variable, with its value, from the service's environment. See "
+        'docs/SERVICE.md, "Start / stop / status"'
     )
     if posture.value_runs_on:
-        # Removing the name alone would leave the value, which then refuses nothing. A path
-        # alone holds no secret, and the service may read it as its directory (fourth hold, H2).
+        # Removing the name alone would leave the value, which then refuses nothing.
         steps.append(
             "At least one refused variable's value runs on past its own entry, so remove the "
-            "entries it runs on into with it, or the value stays in the registry key. Keep any "
-            f"of them that sets {_DIRECTORY_VARIABLE} to a path and nothing else, as its own entry"
+            "entries it runs on into with it, or the value stays in the registry key"
+        )
+    if posture.directory_path_joined:
+        # A path alone holds no secret, and the service may read it as its directory (fourth
+        # hold, H2), so only a joined entry that holds no key is spared (fifth hold, H2).
+        steps.append(
+            f"Keep any of them that sets {_DIRECTORY_VARIABLE} to a path and nothing else, as its "
+            "own entry"
         )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value refused "

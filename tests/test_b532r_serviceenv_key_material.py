@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 
@@ -196,15 +196,15 @@ def test_a_joined_directory_string_is_removed_with_the_value(entries: list[str])
 def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directory() -> None:
     """The third hold's H2. For the store key alone, which goes to a key file, the refusal says
     nothing of creating a secrets directory, even with a directory string joined to it. Beside a
-    secret the directory takes, with no entry read as naming it, it says how one is created."""
+    secret the directory takes, with no entry read as naming it, it says how one is created.
+    The joined entry holds the key, so nothing says to keep it (the fifth hold, H2)."""
     key_alone = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
     assert key_alone is not None
     remedy = key_alone.split("each value refused here. ", 1)[1]
-    # The key file comes first and the removal last (fourth hold, H1). Only the keep sentence
-    # names the directory, and it spares a path alone, not this key (second hold, H3).
+    # The key file comes first and the removal last (fourth hold, H1).
     assert remedy.startswith("Keep the store key in a DPAPI-protected key file instead")
-    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
-    assert "MEFOR_SECRETS_DIRECTORY" not in remedy.replace(KEEP, "")
+    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}{_END}")
+    assert "MEFOR_SECRETS_DIRECTORY" not in remedy
     beside = service_env_refusal(
         _read([f"{_KEY}=", _DIRECTORY_KEY, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
     )
@@ -219,6 +219,8 @@ def test_a_path_alone_joined_into_an_empty_key_is_kept() -> None:
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    # The key's only value is that path, so there is no key to protect (the fifth hold, H2).
+    assert "protect-key" not in refusal
 
 
 def test_a_path_alone_joined_into_an_empty_key_beside_a_secret_is_kept() -> None:
@@ -242,11 +244,13 @@ def test_a_key_bearing_directory_entry_still_gets_the_remove_guidance() -> None:
     refusal = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
     assert refusal is not None
     assert f"{REMOVE}. {RUNS_ON}" in refusal
+    assert KEEP not in refusal
 
 
 def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() -> None:
     """The fourth hold's H1: protect-key reads the key from the shell, and a secret is copied
-    to its file, before the step that says to remove each refused variable."""
+    to its file, before the step that says to remove each refused variable, with its value
+    (the fifth hold, H1)."""
     refusal = service_env_refusal(
         _read([f"{_KEY}=", _KEY_B64, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", "MEFOR_VALUE_A=1"])
     )
@@ -254,7 +258,7 @@ def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() ->
     first_removal = refusal.index(REMOVE)
     assert refusal.index("protect-key") < first_removal
     assert refusal.index("Put MEFOR_AUTH_AD_BIND_PASSWORD") < first_removal
-    assert "with its value" not in refusal
+    assert "Remove each refused variable, with its value, from" in REMOVE
 
 
 @pytest.mark.parametrize(
@@ -268,10 +272,64 @@ def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() ->
 )
 def test_the_create_guidance_needs_a_non_empty_setting_to_move(entry: str, creates: bool) -> None:
     """The fourth hold's H3: an empty value and the bare prefix are deleted, not moved, so
-    nothing goes to the directory and the refusal says nothing of creating one."""
+    nothing goes to the directory and the refusal says nothing of creating one, or of putting
+    anything there (the fifth hold, H3)."""
     refusal = service_env_refusal(_read([entry]))
     assert refusal is not None
     assert (CREATE in refusal) is creates
+    assert ("Put " in refusal) is creates
+
+
+def test_the_removal_step_says_with_its_value_for_a_single_item_key() -> None:
+    """The fifth hold's H1, for the store key written in one item with the key on its next
+    line: the removal step comes last and says to remove the variable with its value."""
+    refusal = service_env_refusal(_read([f"{_KEY}=\n{_KEY_B64}"]))
+    assert refusal is not None
+    assert refusal.endswith(f"{REMOVE}{_END}")
+    assert "Remove each refused variable, with its value, from" in REMOVE
+    assert _KEY_B64 not in refusal
+
+
+def test_a_joined_path_and_a_joined_key_print_different_remedies() -> None:
+    """The fifth hold's H2 pair. A path joined into the empty key is no key, so nothing says to
+    protect one and the entry is kept. A key joined in the same place is protected, and nothing
+    says to keep it. Both refuse alike."""
+    path = service_env_refusal(_read([f"{_KEY}=", "mefor_secrets_directory=C:\\d"]))
+    key = service_env_refusal(_read([f"{_KEY}=", f"mefor_secrets_directory={_KEY_B64}"]))
+    assert path is not None and key is not None and path != key
+    assert KEEP in path and "protect-key" not in path
+    assert KEEP not in key and "protect-key" in key
+    assert path.split(". ", 1)[0] == key.split(". ", 1)[0]
+
+
+def test_a_secret_whose_only_value_is_a_joined_path_moves_nothing() -> None:
+    """The fifth hold's H2: the bind password's only value is the directory path below it,
+    so nothing says to put it in the directory or how one is created, and the path is kept."""
+    posture = _read(["MEFOR_AUTH_AD_BIND_PASSWORD=", "mefor_secrets_directory=C:\\d"])
+    assert posture.listed == ("MEFOR_AUTH_AD_BIND_PASSWORD",) and posture.value_runs_on
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert CREATE not in refusal and "Put " not in refusal and "protect-key" not in refusal
+    assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [f"{_KEY}=", "mefor_secrets_directory=C:\\d"],
+        ["MEFOR_AUTH_AD_BIND_PASSWORD=", "mefor_secrets_directory=C:\\d"],
+        ["MEFOR_VALUE_A=", "MEFOR_SECRETS_DIRECTORY=="],
+    ],
+)
+def test_the_remedy_only_fields_change_no_refusal(entries: list[str]) -> None:
+    """The fifth hold's H2: the two fields the remedy alone reads decide no refusal. Cleared,
+    the same posture still refuses and lists the same names."""
+    posture = _read(entries)
+    assert posture.directory_only_names
+    cleared = replace(posture, directory_only_names=(), directory_path_joined=False)
+    assert cleared.listed == posture.listed
+    assert service_env_refusal(posture) is not None
+    assert service_env_refusal(cleared) is not None
 
 
 def test_a_directory_named_on_its_own_gets_no_create_guidance() -> None:

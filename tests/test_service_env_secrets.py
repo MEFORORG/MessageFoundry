@@ -895,12 +895,16 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
     )
     assert name not in refusal and name.lower() not in refusal
     assert "'MessageFoundry'" in refusal
+    # Only a value that is not empty goes to the directory, so only its refusal says to put it
+    # there and how one is created (the fourth hold on PR 3142, H3; the fifth hold, H3).
+    moves = bool(entry.split("=", 1)[1].strip())
     assert (
         "Put each MEFOR_VALUE_* variable in the secrets directory MEFOR_SECRETS_DIRECTORY names"
-    ) in refusal
-    assert "environments/<env>.toml" in refusal and '"[environments]"' in refusal
-    # Only a value that is not empty goes to the directory (the fourth hold on PR 3142, H3).
-    assert (CREATE in refusal) is bool(entry.split("=", 1)[1].strip())
+        in refusal
+    ) is moves
+    assert ("environments/<env>.toml" in refusal) is moves
+    assert '"[environments]"' in refusal
+    assert (CREATE in refusal) is moves
     assert _ENFORCEMENT_NOTE in refusal
     assert "protect-key" not in refusal
     value = entry.split("=", 1)[1]
@@ -945,7 +949,8 @@ def test_env_values_are_counted_per_registry_value() -> None:
     assert "rename that env() key" not in bare and "An empty or blank" not in bare
     assert "The bare name" not in refusal.split("3 MEFOR_VALUE_", 1)[0]
     assert "counted once, without regard to case, under the first registry value" in refusal
-    assert "remove it from every value that sets it" in refusal
+    # The fifth hold on PR 3142, H3: the counted-once sentence ends there.
+    assert "remove it from every value that sets it" not in refusal
     # Names are printed nowhere, so the shared ending speaks of what was refused, not named.
     assert REMOVE in refusal
     assert "each value named" not in refusal and "Remove each name" not in refusal

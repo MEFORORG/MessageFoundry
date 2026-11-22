@@ -61,8 +61,12 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert posture.value_runs_on
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
-    # Only a value goes to the directory, so only a value's refusal says how one is created.
-    assert (CREATE in refusal) is refused.startswith("MEFOR_VALUE_")
+    # Nothing here has a value of its own to move, so nothing says to put it in the directory or
+    # how one is created. An empty value is still told to go (the fifth hold on PR 3142, H3).
+    assert CREATE not in refusal and "Put " not in refusal
+    assert (
+        "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    ) is refused.startswith("MEFOR_VALUE_")
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
