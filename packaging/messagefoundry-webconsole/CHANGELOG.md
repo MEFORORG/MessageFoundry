@@ -29,12 +29,11 @@ this line.**
   code field when the session owes one, the passkey page script sends it in its body, and the
   account page tells a directory user with no factor to ask an Administrator through the site's
   identity check, not by mail or chat.
-- **The nav heart and the status page show a FHIR lookup isolated at start.** When `/status`
-  names a `FhirLookup` in `fhir_lookups_failed`, the engine-health heart raises a warn that names
-  the lookup when no other issue takes the tooltip first, such as a down-level issue or a failed
-  inbound, and `/ui/status` shows a "FHIR lookup start failures" row in the same words. The engine
-  sends those names to an estate-wide caller only, so a channel-scoped operator sees neither.
-  (vault `BACKLOG #3008`)
+- **The nav heart and the status page show a FHIR lookup isolated at start.** The engine names
+  such a lookup in `/status` as `fhir_lookups_failed`. The heart then raises a warn. Its tooltip
+  names the lookup unless another issue takes it first, such as a down-level issue or a failed
+  inbound. `/ui/status` shows a "FHIR lookup start failures" row in the same words. Neither shows
+  for a channel-scoped operator, who gets an empty list. (vault `BACKLOG #3008`)
 - **The sign-in page offers a combined passkey sign-in.** A "Sign in with password and passkey"
   button runs a usernameless passkey ceremony (`POST /ui/login/passkey`, which charges the sign-in
   window first and sets the challenge's handle as an HttpOnly cookie) and submits the assertion with

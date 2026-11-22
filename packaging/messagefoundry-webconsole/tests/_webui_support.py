@@ -144,8 +144,7 @@ def _sysinfo(
     the SQLite shapes. A server backend passes ``"not_applicable"``. ``journal_mode`` is carried
     only for display now; the rollup no longer reads it.
 
-    ``fhir_lookups_failed`` is the isolated ``FhirLookup`` names an estate-wide caller is shown
-    (vault BACKLOG #3008).
+    ``fhir_lookups_failed`` is ``EngineInfo.fhir_lookups_failed`` (vault BACKLOG #3008).
     """
     from messagefoundry.api.models import (
         DbInfo,

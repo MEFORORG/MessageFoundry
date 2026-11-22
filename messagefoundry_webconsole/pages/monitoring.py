@@ -482,8 +482,9 @@ def status(
     # nav heart above it cannot describe the same connection two ways.
     inbound = f"{e.channels_running}/{e.channels_total} running ({e.channels_stopped} stopped"
     inbound += f", of which {e.channels_failed} failed to start)" if e.channels_failed else ")"
-    failed_rows: list[list[object]] = (
-        [
+    failed_rows: list[list[object]] = []
+    if e.channels_failed:
+        failed_rows.append(
             [
                 "Inbound start failures",
                 el(
@@ -492,10 +493,7 @@ def status(
                     class_="status status-failed",
                 ),
             ]
-        ]
-        if e.channels_failed
-        else []
-    )
+        )
     # Vault BACKLOG #3008: the isolated FhirLookups, in the heart's own sentence as for inbounds.
     if e.fhir_lookups_failed:
         failed_rows.append(

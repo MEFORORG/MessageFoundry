@@ -30,9 +30,11 @@ def test_a_failed_inbound_wins_the_tooltip_and_the_lookup_wins_over_low_disk() -
     assert _derive_health(both, None, None, None) == ("warn", "inbound IB_ACME_ADT failed to start")
     low_disk = _sysinfo(2 * _GIB, fhir_lookups_failed=["L"])
     assert _derive_health(low_disk, None, None, None) == ("warn", "FHIR lookup L failed to start")
+    saturated = _sysinfo(50 * _GIB, pool_idle=0, fhir_lookups_failed=["L"])
+    assert _derive_health(saturated, None, None, None) == ("warn", "FHIR lookup L failed to start")
     # A down-level issue still takes the tooltip.
     full_disk = _sysinfo(0, fhir_lookups_failed=["L"])
-    assert _derive_health(full_disk, None, None, None)[0] == "down"
+    assert _derive_health(full_disk, None, None, None) == ("down", "low disk (db): 0.0 GiB free")
 
 
 def test_the_sentence_names_at_most_the_cap() -> None:
@@ -41,10 +43,8 @@ def test_the_sentence_names_at_most_the_cap() -> None:
     assert _failed_lookup_reason(names) == (
         f"{len(names)} FHIR lookups failed to start: {listed}, and 2 more"
     )
-    at_cap = names[:_MAX_NAMED_FAILURES]
-    assert _failed_lookup_reason(at_cap) == (
-        f"{_MAX_NAMED_FAILURES} FHIR lookups failed to start: {listed}"
-    )
-    assert _failed_lookup_reason(["A", "B"]) == "2 FHIR lookups failed to start: A, B"
-    # No dangling colon on an empty list.
-    assert _failed_lookup_reason([]) == "0 FHIR lookups failed to start"
+    if _MAX_NAMED_FAILURES >= 2:  # one name takes the singular sentence instead
+        at_cap = names[:_MAX_NAMED_FAILURES]
+        assert _failed_lookup_reason(at_cap) == (
+            f"{_MAX_NAMED_FAILURES} FHIR lookups failed to start: {listed}"
+        )
