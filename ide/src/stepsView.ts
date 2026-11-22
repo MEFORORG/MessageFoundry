@@ -239,7 +239,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       );
       // Reveal OFF, always — the lens never un-redacts and the argv never carried `--show-phi`, so every
       // captured value came back as the CLI's "REDACTED" sentinel and folds to the `▸ ⋯` placeholder.
-      return traceRowValues(invocationsForFile(entries, fsPath), false);
+      // The trace ran in `ws`, so its relative file paths resolve against `ws`, not the first folder.
+      return traceRowValues(invocationsForFile(entries, fsPath, ws), false);
     } catch {
       return []; // a live-value failure is never an error — the redacted placeholder stands
     }
