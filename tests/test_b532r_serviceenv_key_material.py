@@ -53,9 +53,9 @@ def test_the_stand_ins_have_a_secrets_shape() -> None:
     assert not _URL_ONE_PAD.endswith("==") and "-" in _URL_ONE_PAD and "_" in _URL_ONE_PAD
 
 
-#: Each as the line or the item below an empty store key. The ``x`` cases refused before BACKLOG
-#: #5394 items 6 and 12 too; the Windows-name cases below them did not, on a later line or in
-#: the next item, so only they show the change (Lander hold on PR 3142, finding 2).
+#: Each as the line or the item below an empty store key. Every case above the Windows-name ones
+#: already refused on main at 895925f2d3a; the Windows-name cases did not, on a later line or in
+#: the next item, so only they show this change (Lander hold on PR 3142, finding 2).
 _SHAPES = (
     pytest.param(f"x={_KEY_B64}", id="ordinary-name-set-to-a-key"),
     pytest.param(_URL_ONE_PAD, id="base64url-one-pad"),

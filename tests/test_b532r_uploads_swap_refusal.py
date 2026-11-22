@@ -59,9 +59,10 @@ async def test_a_swapped_part_answers_damaged_on_a_by_id_read(
         if path.name.endswith(suffix):
             if swap == "socket":
                 # A socket's ENXIO that names no path, so no fresh lstat is made and the errno
-                # alone decides (``uploads._NOT_A_FILE``). A real socket's open names the path, and
-                # its re-check would answer damage whatever the errno, so it is simulated here;
-                # this also runs where a socket cannot be made, as on Windows.
+                # alone decides (``uploads._NOT_A_FILE``); the part is left as it is, since
+                # nothing reads it. A real socket's open names the path, and its re-check would
+                # answer damage whatever the errno, so this pins only the errno's verdict; it also
+                # runs where a socket cannot be made, as on Windows.
                 raise OSError(errno.ENXIO, "synthetic swap")
             # The part really is a folder now, as a fresh lstat reads it (``uploads._recheck``):
             # an error naming a part that is still a regular file is not damage.
