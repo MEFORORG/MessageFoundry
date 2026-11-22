@@ -310,13 +310,15 @@ try {
     $damagedFile = ''
     $damagedGoal = ''
     $damagedBranch = ''
+    $seatUnattributed = 0
     if ($seatsDir -and (Test-Path -LiteralPath $seatsDir)) {
         $cands = Get-ChildItem -LiteralPath $seatsDir -Recurse -Filter '*.json' -File -EA SilentlyContinue |
                  Sort-Object LastWriteTimeUtc -Descending
         foreach ($f in $cands) {
-            try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
+            # A record that does not parse or names no worktree could be this tree's, so it is counted.
+            try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { $seatUnattributed++; continue }
             $wt = Get-RecordWorktree $j
-            if (-not $wt) { continue }
+            if (-not $wt) { $seatUnattributed++; continue }
             if (-not (Test-SameWorktree $wt $top)) { continue }
             # Another PC can hold a worktree at the same path. Its record is that PC's seat, not this
             # one's. A record with no host predates the field and is this PC's.
@@ -344,6 +346,12 @@ try {
                 if ($damagedGoal) { $damagedBranch = Get-RecordText $j 'branch' }
             }
         }
+    }
+
+    $damagedGoalLine = ''
+    if ($damagedGoal) {
+        $onBranch = if ($damagedBranch) { " (recorded on branch '$damagedBranch')" } else { '' }
+        $damagedGoalLine = "    goal in a damaged record, UNVERIFIED$onBranch`: $damagedGoal"
     }
 
     if ($declared) {
@@ -394,20 +402,27 @@ try {
             if ($declared.PSObject.Properties['outOfScope'] -and $declared.outOfScope) { $lines += "OUT OF SCOPE: $(Get-RecordText $declared 'outOfScope')" }
             if ($declaredDisplay) { $lines += "declared at $declaredDisplay$age" }
         }
+        # Every damaged record seen here is NEWER than the declaration, so its goal may supersede it.
+        if ($damagedGoalLine) {
+            $lines += "A NEWER record naming this worktree is DAMAGED and may supersede this: $damagedFile"
+            $lines += $damagedGoalLine
+        }
     } elseif ($damagedCount -gt 0) {
         $lines += "SEAT: not restored. $damagedCount DAMAGED record(s) name this worktree, so a declaration may"
         $lines += "have been lost. This is not known to be the never-declared case. Newest: $damagedFile"
-        if ($damagedGoal) {
-            $onBranch = if ($damagedBranch) { " (recorded on branch '$damagedBranch')" } else { '' }
-            $lines += "    goal in a damaged record, UNVERIFIED$onBranch`: $damagedGoal"
-        }
+        if ($damagedGoalLine) { $lines += $damagedGoalLine }
         $lines += 'Check it, then declare again:'
         $lines += $declareCmd
     } elseif ($sharedError -and -not $seatsDir) {
         $lines += "SEAT: not restored. The shared seat registry did not answer ($sharedError)."
     } else {
-        $lines += "SEAT: not declared. Nothing on disk carries a goal for this worktree, so this is the"
-        $lines += "'never asked or never answered' case, NOT a goal lost to compaction. Declare one:"
+        if ($seatUnattributed -gt 0) {
+            $lines += "SEAT: not declared by any readable record, but $seatUnattributed seat record(s) cannot be read or"
+            $lines += "name no worktree, and any of them could be this tree's. A goal may be lost. Declare one:"
+        } else {
+            $lines += "SEAT: not declared. Nothing on disk carries a goal for this worktree, so this is the"
+            $lines += "'never asked or never answered' case, NOT a goal lost to compaction. Declare one:"
+        }
         $lines += $declareCmd
     }
 

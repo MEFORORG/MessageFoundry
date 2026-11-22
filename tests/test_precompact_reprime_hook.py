@@ -571,7 +571,7 @@ def test_a_non_ascii_digit_filename_is_not_a_held_number(repo: Worktree) -> None
     _declaration(repo)
     _plant_newest(
         repo.common / "mefor-coord" / "alloc" / "adr",
-        "٤٢.json",
+        "\u0664\u0662.json",
         json.dumps({"worktree": repo.top}),
     )
 
@@ -653,7 +653,7 @@ def test_a_non_string_worktree_is_counted_not_lost(repo: Worktree, worktree: obj
     assert _UNATTRIBUTED_ALLOC in run_hook(repo, _COMPACT_RESTART)
 
 
-@pytest.mark.parametrize("extra", ["​", "‍", "\x01"], ids=["zwsp", "zwj", "control"])
+@pytest.mark.parametrize("extra", ["\u200b", "\u200d", "\x01"], ids=["zwsp", "zwj", "control"])
 def test_a_path_differing_by_an_ignorable_character_is_another_tree(
     repo: Worktree, extra: str
 ) -> None:
@@ -741,6 +741,34 @@ def test_only_damaged_records_are_not_reported_as_never_declared(
     assert "seat.ps1 -Declare" in out, out
     if shown is not None:
         assert shown in out, f"a goal the record holds was lost: {out!r}"
+
+
+def test_a_newer_damaged_goal_is_shown_beside_an_older_declaration(repo: Worktree) -> None:
+    """The record is newest, so its goal may supersede the good one and must not vanish."""
+    _declaration(repo, goal="an older good goal")
+    _plant_newest(
+        repo.common / "mefor-coord" / "seats" / "box",
+        "damaged.json",
+        json.dumps({"goal": "a newer damaged goal", "worktree": repo.top}),
+    )
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "GOAL: an older good goal" in out, out
+    assert "UNVERIFIED: a newer damaged goal" in out, out
+    assert not re.search(r"^GOAL: a newer damaged goal", out, re.MULTILINE), out
+
+
+@pytest.mark.parametrize("body", ["", '{"seat":"builder","goal":"torn'], ids=["empty", "torn"])
+def test_an_unreadable_seat_record_is_not_called_never_declared(repo: Worktree, body: str) -> None:
+    """It could be this tree's, so the hook cannot say that nothing on disk carries a goal."""
+    _plant_newest(repo.common / "mefor-coord" / "seats" / "box", "torn.json", body)
+
+    out = run_hook(repo, _COMPACT_RESTART)
+
+    assert "Nothing on disk carries a goal" not in out, out
+    assert "1 seat record(s) cannot be read" in out, out
+    assert "seat.ps1 -Declare" in out, out
 
 
 def test_a_seat_record_with_a_null_goal_is_still_never_declared(repo: Worktree) -> None:
