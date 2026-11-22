@@ -144,11 +144,17 @@ def test_pooled_ab_builtin_resolves() -> None:
     assert "pooled_ab" in list_connscale_profiles()
 
 
-@pytest.mark.parametrize(
-    "path",
-    sorted({path for pattern in CONNSCALE_PATTERNS for path in PROFILES_DIR.glob(pattern)}),
-    ids=lambda path: path.stem,
+_SHIPPED_PROFILES = sorted(
+    {path for pattern in CONNSCALE_PATTERNS for path in PROFILES_DIR.glob(pattern)}
 )
+
+
+def test_the_shipped_profile_scan_finds_the_profiles() -> None:
+    # An empty parametrize list skips and exits green, which would retire the band check below.
+    assert {"connscale", "fuse_ab", "pooled_ab"} <= {path.stem for path in _SHIPPED_PROFILES}
+
+
+@pytest.mark.parametrize("path", _SHIPPED_PROFILES, ids=lambda path: path.stem)
 def test_shipped_profile_band_clears_the_default_sink_at_every_count(path: Path) -> None:
     # BACKLOG #5858, #5859, #5860: the documented command passes no --sink-port, so each step builds
     # its shape against the default sink, and the shape guard refuses a band that contains it.
