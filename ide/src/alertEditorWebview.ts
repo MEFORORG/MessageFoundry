@@ -9,6 +9,8 @@ import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guar
 /** The largest `cooldown_seconds` the engine loads: `_ALERT_COOLDOWN_MAX_SECONDS` in
  *  messagefoundry/config/settings.py (BACKLOG #5770). A unit test pins the two together. */
 export const ALERT_COOLDOWN_MAX_SECONDS = 7 * 24 * 60 * 60;
+/** The same cap in days, for the text that states it. */
+export const ALERT_COOLDOWN_MAX_DAYS = ALERT_COOLDOWN_MAX_SECONDS / 86400;
 
 /** The whole inline `<script>` body for one render, guard included. `token` is this render's
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
@@ -84,13 +86,15 @@ export function alertEditorScript(
       // Each in-range test is the engine's own bound on AlertRule (messagefoundry/config/settings.py,
       // BACKLOG #5831), so a value the engine would refuse is refused here, before Add.
       for (const [k, label, inRange, bound] of [
-        ['min_depth', 'Min depth', (v) => mfInt(v) && v >= 1, 'a whole number of 1 or more'],
+        ['min_depth', 'Min depth', (v) => Number.isInteger(v) && v >= 1, 'a whole number of 1 or more'],
         ['min_oldest_seconds', 'Min oldest', (v) => v >= 0, '0 or more seconds'],
         ['cooldown_seconds', 'Cooldown', (v) => v > 0 && v <= ${ALERT_COOLDOWN_MAX_SECONDS},
-          'more than 0 and at most ${ALERT_COOLDOWN_MAX_SECONDS} seconds (7 days)'],
+          'more than 0 and at most ${ALERT_COOLDOWN_MAX_SECONDS} seconds (${ALERT_COOLDOWN_MAX_DAYS} days)'],
       ]) {
         if (rule[k] === undefined) { continue; }
         if (!Number.isFinite(rule[k])) { return invalid(label + ' must be a number.'); }
+        // min_depth is an int on the engine, and past 2^53 the number posted is not the digits typed.
+        if (k === 'min_depth' && Number.isInteger(rule[k]) && !mfInt(rule[k])) { return invalid(label + ' is too large to send exactly.'); }
         if (!inRange(rule[k])) { return invalid(label + ' must be ' + bound + '.'); }
       }
       if (removeIsOff()) { show(REMOVE_OFF); }

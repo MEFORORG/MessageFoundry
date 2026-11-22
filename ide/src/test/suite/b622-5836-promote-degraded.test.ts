@@ -48,10 +48,21 @@ suite("b622 #5836 promote reports a degraded reload", () => {
     assert.strictEqual(msg.level, "warning");
     assert.ok(msg.text.startsWith("MessageFoundry: restart the engine for [auth].ad_tls_ca_cert_file: "), msg.text);
     assert.ok(
-      msg.text.endsWith("Check the engine's log: these follow-on steps failed after the swap: " +
+      msg.text.endsWith("Check the engine's log: this follow-on step failed after the swap: " +
         "cluster_propagate. The new graph is live."),
       msg.text,
     );
+  });
+
+  // An unreadable restart list knows of no stale CA, so the known failure leads.
+  test("a degraded reload with an unreadable restart list leads with the failed step", () => {
+    const msg = message({ degraded: true, failures: ["audit"], restart_required: null });
+    assert.strictEqual(msg.level, "warning");
+    assert.ok(
+      msg.text.startsWith("MessageFoundry: check the engine's log: this follow-on step failed after the swap: audit."),
+      msg.text,
+    );
+    assert.ok(msg.text.endsWith("the engine's list of them could not be read."), msg.text);
   });
 
   for (const [name, body] of [

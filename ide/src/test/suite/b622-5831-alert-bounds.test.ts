@@ -133,6 +133,20 @@ suite("b622 #5831 Alert Rules numeric bounds", () => {
     }
   });
 
+  // The two seconds fields are floats on the engine, so a fraction still posts.
+  test("Add posts fractional seconds the engine accepts", () => {
+    const p = load();
+    try {
+      add(p, { min_oldest_seconds: "0.25", cooldown_seconds: "0.5" });
+      assert.strictEqual(p.posted.length, 1, `expected one add: ${JSON.stringify(p.posted)}`);
+      const rule = JSON.parse(JSON.stringify(p.posted[0])).rule;
+      assert.strictEqual(rule.min_oldest_seconds, 0.25);
+      assert.strictEqual(rule.cooldown_seconds, 0.5);
+    } finally {
+      p.close();
+    }
+  });
+
   test("the cooldown cap matches the engine's _ALERT_COOLDOWN_MAX_SECONDS", () => {
     const source = fs.readFileSync(path.resolve(__dirname, "../../../../messagefoundry/config/settings.py"), "utf8");
     const m = /^_ALERT_COOLDOWN_MAX_SECONDS = ([0-9.]+)$/m.exec(source);
@@ -140,7 +154,8 @@ suite("b622 #5831 Alert Rules numeric bounds", () => {
     assert.strictEqual(Number(m[1]), ALERT_COOLDOWN_MAX_SECONDS);
   });
 
-  // The page mirrors these by hand, so a change to any of them on the engine fails here first.
+  // The page mirrors these three declarations by hand, so a change to one of them fails here. A bound
+  // added another way, such as a validator, is not caught.
   test("AlertRule still declares the lower bounds the page mirrors", () => {
     const source = fs.readFileSync(path.resolve(__dirname, "../../../../messagefoundry/config/settings.py"), "utf8");
     const start = source.indexOf("\nclass AlertRule(BaseModel):");

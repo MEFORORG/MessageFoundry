@@ -130,8 +130,9 @@ function degradedShortfall(r: ReloadResult): string[] {
   }
   // `audit` is among the labels, and nobody can redo that one by hand, so the sentence names the
   // steps and the log rather than promising a step to finish.
+  const which = steps.length === 1 ? "this follow-on step" : "these follow-on steps";
   return [
-    `Check the engine's log: these follow-on steps failed after the swap: ${steps.join(", ")}. ` +
+    `Check the engine's log: ${which} failed after the swap: ${steps.join(", ")}. ` +
       "The new graph is live.",
   ];
 }
@@ -139,14 +140,19 @@ function degradedShortfall(r: ReloadResult): string[] {
 /**
  * The sentences for what a live swap left to do, as far as this reply says. A list, as in the web
  * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, #5836) sits beside the restart
- * sentence. The restart goes first, unlike the web console, which shows each sentence as its own
+ * sentence. A known restart goes first, unlike the web console, which shows each sentence as its own
  * banner: here only the lead survives a collapsed notification, and a stale CA is the one left
- * trusted. This reads applied replies only, so null or no value is unreadable, as any other shape
+ * trusted. An unreadable restart list knows of no stale CA, so a degraded report leads then. This
+ * reads applied replies only, so null or no value is unreadable, as any other shape
  * is. An unreadable list keeps the counts and says so: the swap did happen, and it must not read as
  * a clean promote.
  */
 function reloadShortfall(r: ReloadResult): string[] {
-  return [...restartShortfall(r), ...degradedShortfall(r)];
+  const restart = restartShortfall(r);
+  const degraded = degradedShortfall(r);
+  return printableList(r.restart_required, SETTING_NAME_RE) === undefined
+    ? [...degraded, ...restart]
+    : [...restart, ...degraded];
 }
 
 function restartShortfall(r: ReloadResult): string[] {
