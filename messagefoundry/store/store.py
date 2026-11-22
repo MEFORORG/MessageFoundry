@@ -11993,8 +11993,8 @@ class MessageStore:
         # a v2 marker with this `aad` — a wrong-cell v2 blob fails the tag → CipherError (fail-closed).
         return self._cipher.decrypt(value, aad=aad)
 
-    # BACKLOG #3929: the async store methods call these, not ``_enc``/``_dec`` and the cipher, so
-    # under a cipher that blocks on I/O (``vault_transit``) the call runs on the Transit pool and
+    # BACKLOG #3929: async store methods call these rather than ``_enc``/``_dec`` and the cipher,
+    # so under a cipher that blocks on I/O (``vault_transit``) the call runs on the Transit pool and
     # the event loop keeps serving. Under an in-process cipher it runs inline, as before.
     async def _aenc(self, value: str | None, *, aad: bytes) -> str | None:
         if not value:
@@ -12009,12 +12009,8 @@ class MessageStore:
     async def _aencrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
         return await cipher_call(self._cipher, self._cipher.encrypt, plaintext, aad=aad)
 
-    async def _adecrypt(
-        self, stored: str, *, aad: bytes | None = None, allow_unmarked: bool = False
-    ) -> str:
-        return await cipher_call(
-            self._cipher, self._cipher.decrypt, stored, aad=aad, allow_unmarked=allow_unmarked
-        )
+    async def _adecrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        return await cipher_call(self._cipher, self._cipher.decrypt, stored, aad=aad)
 
     def cipher_info(self) -> CipherInfo:
         """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""

@@ -1743,7 +1743,7 @@ class AesGcmCipher(_UnmarkedPolicy):
     from when that writer emitted v2; since ADR 0196 it emits v4, sealed under the store data sub-key."""
 
     encrypts = True
-    #: In-process AES-GCM: no network call, so the stores call it on the event loop (BACKLOG #3929).
+    #: In-process AES-GCM: no network call, so ``row_seal.cipher_call`` runs it inline (BACKLOG #3929).
     blocks_on_io = False
 
     def __init__(

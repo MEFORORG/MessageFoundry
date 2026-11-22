@@ -147,6 +147,7 @@ async def test_the_loop_keeps_serving_while_transit_blocks(tmp_path: Path) -> No
         assert time.perf_counter() - started >= _BLOCK, "the write made no blocked Transit call"
         assert gaps and max(gaps) < _BLOCK / 2
     finally:
+        transit.block = 0.0
         await store.close()
 
 

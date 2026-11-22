@@ -524,9 +524,10 @@ _UNVERIFIABLE: Final = "unverifiable"
 
 #: The most Transit calls in flight at once on this pool, process-wide. They run on this pool, not
 #: asyncio's default executor, so a slow Vault cannot fill the default executor with seal checks.
-#: The row sealer's own calls use it, through ``_in_transit_pool``, and so do the stores' cipher
-#: calls under a cipher that blocks on I/O, through :func:`cipher_call` (BACKLOG #3929): a seal
-#: check can queue behind cell encrypts and decrypts. The
+#: The row sealer's own calls use it, through ``_in_transit_pool``, and so do the store cipher
+#: calls routed through :func:`cipher_call` under a cipher that blocks on I/O (BACKLOG #3929): a
+#: seal check can queue behind cell encrypts and decrypts. Other store paths still hand Transit
+#: calls to the default executor through ``asyncio.to_thread``. The
 #: queue past the bound has no deadline, so a check waits for a free thread for as long as the
 #: calls ahead of it take, each bounded by the Vault client's own timeout; a thread whose caller
 #: was cancelled finishes its call, and interpreter exit waits for it.
@@ -569,9 +570,10 @@ async def cipher_call[**P, T](
 ) -> T:
     """``call(*args, **kwargs)``, on the Transit pool when ``cipher`` blocks on I/O, else inline.
 
-    The stores route their cell cipher calls and audit MAC through this (BACKLOG #3929). Under the
-    ``vault_transit`` cipher each call is an HTTP round trip, which held the event loop. Under an
-    in-process cipher the call runs here, on the loop, with no thread hop and no suspension."""
+    The stores route many of their cell cipher calls and audit MAC calls through this (BACKLOG
+    #3929), though not all: some still run on the loop or through :func:`asyncio.to_thread`. Under
+    the ``vault_transit`` cipher each call is an HTTP round trip, which held the event loop. Under
+    an in-process cipher the call runs here, on the loop, with no thread hop and no suspension."""
     if cipher_blocks_on_io(cipher):
         return await _in_transit_pool(call, *args, **kwargs)
     return call(*args, **kwargs)
