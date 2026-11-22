@@ -6478,7 +6478,14 @@ class AuthService:
             )
         except _BindingChangedMidLogin:
             # BACKLOG #2733: the account was deleted after the load above, so no session was
-            # minted. The answer, and its deferred row, are an unknown account's.
+            # minted. The answer, and its deferred row, are an unknown account's. The log line
+            # says what happened, which that row does not (vault BACKLOG #2733 item 7).
+            _log.info(
+                "a local sign-in for account id %s was refused because the account was deleted "
+                "before its session was minted; it is answered and audited as an unknown account "
+                "(vault BACKLOG #2733)",
+                user.id,
+            )
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         await self._record_login_address(
@@ -8760,14 +8767,15 @@ class AuthService:
                 # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
                 # YET, which is the race this closes: an admin unbinding this account mid-login
                 # revokes what is live at that instant, and without the guard this login's own
-                # INSERT lands just after it. The password leg passes no guard, so it skips the
-                # binding comparison; its account read still runs, for the session epoch.
+                # INSERT lands just after it. The local password sign-in (`_login_local`), which
+                # does not reach this mint, passes no guard, so it skips the binding comparison;
+                # its account read still runs, for the session epoch.
                 #
-                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so the
-                # sentence above holds for the password leg only. The refusal further up read
-                # the row before this mint, and a bind can commit between the two: its sweep
-                # runs in the bind's own transaction and cannot see a session inserted after
-                # it. So the insert itself requires an unbound row, under the lock the bind
+                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so both
+                # legs that reach this mint pass one (vault BACKLOG #2733 item 9). The refusal
+                # further up read the row before this mint, and a bind can commit between the two:
+                # its sweep runs in the bind's own transaction and cannot see a session inserted
+                # after it. So the insert itself requires an unbound row, under the lock the bind
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
