@@ -498,26 +498,30 @@ _PR_STRONG_VERB = (
     r"|(?:went|goes|moves?|moved) from)"
 )
 _PR_PLAIN_STATE_VERB = rf"(?:{_PR_STRONG_VERB}|is(?: now| still)?|was|are|reads|now|at|from)"
+#: The adverbs a record sentence hedges a verdict with, one list for each place one may stand: before
+#: the verb (_PR_AUX), after a modal (_PR_MODAL), between "has" and "been", and before the verdict
+#: (_PR_QUALIFIER). Lists kept apart drifted, so a word one place took unbound another (BACKLOG #8175
+#: item 6): "<id> has likely been met", "<id> is only partial", "<id> never stays partial".
+_PR_HEDGE = r"(?:likely|probably|still|now|also|only|then|already|so|never|yet|honestly|since)"
+#: "has been" with any negations and hedges between, in any order and any markup ("has since been",
+#: "hasn't yet been", "has still not been", "has _never_ been").
+_PR_HAS_BEEN = rf"(?:has|have|had)(?:n['\u2019]t)?(?:{_PR_SEP}(?:not|{_PR_HEDGE}))*{_PR_SEP}been"
 #: The passive and negated forms ("were", "has been", "isn't", "has not been", "is no longer") bind an
 #: unmarked identifier only with a state verdict ending its clause (_pr_verdict_bound).
 _PR_STATE_VERB = (
-    rf"(?:{_PR_PLAIN_STATE_VERB}|were"
-    # A word may stand between "has" and "been" ("has since been met", "has never been met").
-    r"|(?:(?:has|have|had)(?: not|n['\u2019]t)?(?: (?:since|still|now|yet|never|already))* )?been"
+    rf"(?:{_PR_PLAIN_STATE_VERB}|were|(?:{_PR_HAS_BEEN}|been)"
     r"|(?:is|was|are|were)(?:n['\u2019]t| not| no longer))"
 )
-_PR_PLAIN_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
+_PR_PLAIN_QUALIFIER_WORDS = r"a|an|the|its|permanent|genuine|accepted|honest"
+_PR_PLAIN_QUALIFIER = rf"(?:(?:{_PR_PLAIN_QUALIFIER_WORDS}){_PR_SEP})*"
 _PR_QUALIFIER = (
-    r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest|recorded|known|interim|provisional"
-    r"|likely|probably|still|already|never)" + _PR_SEP + r")*"
+    rf"(?:(?:{_PR_PLAIN_QUALIFIER_WORDS}|recorded|known|interim|provisional|{_PR_HEDGE}){_PR_SEP})*"
 )
 #: Words that may stand between the identifier and its verb without unbinding it: a passive auxiliary
-#: ("<id> was held at partial"), a negated one ("<id> isn't met") and the adverbs a record sentence
-#: hedges with ("<id> likely stays").
+#: ("<id> was held at partial"), a negated one ("<id> isn't met") and the hedges ("<id> likely stays").
 _PR_AUX = (
-    r"(?:(?:is|was|are|were|be|been|(?:has|have|had)(?: not)? been|(?:has|have|had)n['\u2019]t been"
-    r"|(?:is|was|are|were)n['\u2019]t|not|no longer|likely|probably|still|now|also|only|then"
-    r"|already|so)" + _PR_SEP + r")*"
+    rf"(?:(?:is|was|are|were|be|been|{_PR_HAS_BEEN}"
+    rf"|(?:is|was|are|were)n['\u2019]t|not|no longer|{_PR_HEDGE})" + _PR_SEP + r")*"
 )
 #: A modal or a negation bound to a bare verdict verb: "<id> cannot pass", "<id> would not be met",
 #: "<id> needs to pass", "<id> will remain partial". On an identifier the text does not mark as a
@@ -526,8 +530,7 @@ _PR_AUX = (
 _PR_MODAL = (
     r"(?:can(?:not)?|can['\u2019]t|could|would|will|should|may|might|must|does|do|did"
     r"|(?:does|did|wo|would|could|should)n['\u2019]t|needs? to|has to|is (?:un)?able to)"
-    rf"(?:{_PR_SEP}(?:not|now|still|yet|never|only|honestly|also|then|reach|have|be|been|stay"
-    r"|remain|likely|probably))*"
+    rf"(?:{_PR_SEP}(?:not|{_PR_HEDGE}|reach|have|be|been|stay|remain))*"
 )
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
@@ -549,13 +552,16 @@ _PR_PLAIN_VERDICT_AFTER = re.compile(
     rf"{_PR_PLAIN_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
 )
 _PR_VERDICT_STATE_RE = re.compile(rf"(?i){_PR_VERDICT_STATE}")
-#: A modal chained into a record verb ("<id> will remain partial") is as strong as the verb alone.
-_PR_MODAL_STRONG = re.compile(r"(?i)(?:stay|remain)$")
+#: A modal chained into a record verb ("<id> will remain partial") is as strong as the verb alone,
+#: with or without a hedge after the verb ("<id> will remain only partial"): the verb is searched as
+#: a word anywhere in the modal group, not only at its end.
+_PR_MODAL_STRONG = re.compile(r"(?i)(?<![A-Za-z])(?:stay|remain)(?![A-Za-z])")
 #: What may follow a verdict a modal binds: the end of the clause, or a word that starts no object. A
 #: preposition is not one: "<version> will fail on the strict validator" is a verb and its phrase.
 _PR_VERDICT_END = re.compile(
     rf"(?i){_PR_FMT}(?:\s*(?:$|[.,;:!?)\]|])"
-    r"|\s+(?:yet|today|now|either|again|until|unless|because)\b)"
+    # Emphasis on the word ("_yet_", "*yet*", "`yet`") does not hide it, as "\b" hid "_yet_".
+    rf"|\s+{_PR_FMT}(?:yet|today|now|either|again|until|unless|because){_PR_EA})"
 )
 #: A verb that states the verdict BEFORE the identifier: "does not meet <id>", "satisfies ASVS <id>",
 #: and the record's idiom for a requirement that does not pass yet, "an honest pass for <id>". "pass"
@@ -609,8 +615,9 @@ _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`
 #: one deleted, inside a word or a cell as well as around one, and keeps the hits of both readings.
 #: The deletion reaches the text the verdict, gap and map patterns read, not the line's kind:
 #: _pr_units decides a row, heading, list item or empty line from the line as written, so an
-#: invisible character before a row's first pipe makes it a paragraph in both readings (an open
-#: evasion). A fixed table, so an import pays nothing for it.
+#: invisible character before a row's first pipe makes it a paragraph in both passes. A further
+#: pass of each reading deletes them before the kinds are read (_pr_scan_reading). A fixed table,
+#: so an import pays nothing for it.
 _PR_DEFAULT_IGNORABLE = (
     (0x00AD, 0x00AD),
     (0x034F, 0x034F),
@@ -790,16 +797,16 @@ _PR_INLINE_TAG = re.compile(
 #: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
 #: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
 _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
-#: The floor. The baseline reading is one pass of :func:`scan_pr_body` and reads every line as
-#: origin/main did before BACKLOG #5582 changed the reading: the rewrites above found more, and missed
-#: some main caught, three review rounds running. It takes the quote marker out with the pattern below,
-#: as main did, and reads links and splits sentences with :func:`_pr_base_link_sub` and
+#: The floor. The baseline reading is one pass of :func:`scan_pr_body`. It strips quote markers,
+#: reads links and splits sentences as origin/main did before BACKLOG #5582 changed those steps: the
+#: rewrites above found more, and missed some main caught, three review rounds running. It takes the
+#: quote marker out with the pattern below, as main did, and reads links and splits sentences with
+#: :func:`_pr_base_link_sub` and
 #: :func:`_pr_base_split_spans`, which give the output of main's link and split patterns in linear
 #: time; those patterns backtrack on a long run, and tests/test_scan_forbidden.py keeps them as its
 #: oracles and pins the two functions equal to them. Do not
 #: tighten any of the three: a change to one is a change to the floor. The pass runs this module's
-#: table model, whose loose reading keeps a table's ASVS columns wherever main kept them
-#: (_pr_loose_columns).
+#: table model (_pr_loose_columns).
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
 #: The lookahead class of main's full-stop split.
 _PR_BASE_SPLIT_LOOKAHEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ*`[(\"'#>-")
@@ -1159,6 +1166,11 @@ def _pr_is_delimiter(row: str) -> bool:
     return "-" in row and set(row) <= _PR_TABLE_DELIMITER_CHARS
 
 
+def _pr_between(found: list[int], above: int, below: int) -> bool:
+    """Whether a line number in ``found``, which is sorted, lies strictly between two lines."""
+    return bisect.bisect_right(found, above) < bisect.bisect_left(found, below)
+
+
 def _pr_table_starts(
     units: _PrUnits, blanks: list[int], quote_blanks: list[int], quoted: set[int]
 ) -> list[bool]:
@@ -1176,9 +1188,6 @@ def _pr_table_starts(
     These runs bound only the GFM reading (_pr_table_columns), whose columns can only add marks; the
     loose reading (_pr_loose_columns), which keeps every mark main kept, does not read them."""
 
-    def between(found: list[int], above: int, below: int) -> bool:
-        return bisect.bisect_right(found, above) < bisect.bisect_left(found, below)
-
     starts = []
     # Whether every row since the last unit that is not a row opens with a quote marker.
     block_quoted = True
@@ -1191,8 +1200,8 @@ def _pr_table_starts(
             and (
                 above is None
                 or not above[2]
-                or between(blanks, above[0][0][1], line)
-                or (block_quoted and between(quote_blanks, above[0][0][1], line))
+                or _pr_between(blanks, above[0][0][1], line)
+                or (block_quoted and _pr_between(quote_blanks, above[0][0][1], line))
             )
         )
     return starts
@@ -1321,8 +1330,9 @@ def scan_pr_body(body: str) -> list[str]:
     Reasons only, never the matched text. One hit per kind per LINE: sentences of one paragraph that
     restate a verdict on the same line report it once, rather than storming.
 
-    Read three times, and the hits are the union (BACKLOG #5582). The baseline reads the lines as
-    origin/main did before BACKLOG #5582 (see ``_PR_BASE_QUOTE``). The second reads each link as its text and each inline tag as no
+    Read three times, and the hits are the union (BACKLOG #5582). The baseline strips quote markers,
+    reads links and splits sentences as origin/main did before BACKLOG #5582 (see
+    ``_PR_BASE_QUOTE``). The second reads each link as its text and each inline tag as no
     edge, and the third keeps each link's target beside it, so a code path only a target names is
     seen; from the third only a map counts. Each reading builds its own units from one line model
     (:func:`_pr_lines`), so every reading keeps each line where it was and the hits merge by (line,
@@ -1353,6 +1363,22 @@ def scan_pr_body(body: str) -> list[str]:
     return [f"pr-body:{line}: {PR_BODY_REASONS[kinds[kind]]}" for line, kind in sorted(found)]
 
 
+def _pr_scan_units(
+    units: _PrUnits,
+    gfm: tuple[list[int], list[int], set[int]],
+    sentences: Callable[[str, bool], list[tuple[int, str]]],
+    kinds: frozenset[str],
+    found: set[tuple[int, int]],
+) -> tuple[list[bool], list[set[int]], list[set[int]]]:
+    """Scan every unit with its own runs of rows and columns; return the runs and both columns."""
+    starts = _pr_table_starts(units, *gfm)
+    asvs = _pr_table_columns(units, starts)
+    loose = _pr_loose_columns(units)
+    for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
+        _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
+    return starts, asvs, loose
+
+
 def _pr_scan_reading(
     lines: list[str],
     gfm: tuple[list[int], list[int], set[int]],
@@ -1366,11 +1392,7 @@ def _pr_scan_reading(
     sentences = _pr_base_sentences if reading == _PR_BASE else _pr_sentences
     # Both passes of a reading share the units' kinds and lines, so they share where each run of rows
     # starts.
-    starts = _pr_table_starts(units, *gfm)
-    asvs = _pr_table_columns(units, starts)
-    loose = _pr_loose_columns(units)
-    for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
-        _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
+    starts, asvs, loose = _pr_scan_units(units, gfm, sentences, kinds, found)
     # Where the body holds an invisible character, it is read again with each one deleted. A unit
     # whose text and columns that leaves unchanged reads the same, so only the others are scanned.
     if invisible:
@@ -1386,6 +1408,13 @@ def _pr_scan_reading(
         ):
             if unit[1] != plain[1] or unit_asvs != plain_asvs or unit_loose != plain_loose:
                 _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
+        # The passes above read each line's kind as written, so an invisible character before a
+        # row's first pipe makes it a paragraph there. A further pass deletes every one before the
+        # kinds are read, so such a line is read as a row, with its own runs of rows. It only adds
+        # hits; where it builds the units the second pass built, it would add none.
+        regrouped = _pr_units([_PR_INVISIBLE.sub("", line) for line in lines], False, reading)
+        if regrouped != deleted:
+            _pr_scan_units(regrouped, gfm, sentences, kinds, found)
 
 
 def _pr_scan_unit(
