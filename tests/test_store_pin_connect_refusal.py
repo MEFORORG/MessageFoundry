@@ -143,6 +143,8 @@ async def test_a_passing_settings_check_lets_the_store_connect_again(
     pin = _pin(tmp_path)
     good = pin.read_bytes()
     settings = await _refuse_at(store, pin, enforcing=True)
+    with pytest.raises(StoreTlsRefused):  # the control: refused until the check passes
+        refuse_connect_after_pin_refusal(settings)
     pin.write_bytes(good)
     await run_anchor_preflight(_specs(settings), store, enforcing=True)
     refuse_connect_after_pin_refusal(settings)
@@ -156,6 +158,8 @@ async def test_a_store_open_check_at_enforce_lets_the_store_connect_again(
     pin = _pin(tmp_path)
     good = pin.read_bytes()
     settings = await _refuse_at(store, pin, enforcing=True)
+    with pytest.raises(StoreTlsRefused):  # the control: refused until the check passes
+        refuse_connect_after_pin_refusal(settings)
     pin.write_bytes(good)
     check_pinned_certificate(settings)
     refuse_connect_after_pin_refusal(settings)
