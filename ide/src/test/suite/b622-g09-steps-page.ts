@@ -11,6 +11,7 @@ import {
   buildHandlerViewModels,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
+  roleScopeAttr,
   type LensHandler,
   type LensParseResult,
   type LensRow,
@@ -177,6 +178,7 @@ function pageShell(bodyHtml: string): string {
               (item) =>
                 `<option value="${item.id}"` +
                 (item.anchorConstraint ? ` data-anchor="${item.anchorConstraint}"` : "") +
+                ` data-role-scope="${roleScopeAttr(item)}"` +
                 `>${item.label}</option>`,
             )
             .join("") +

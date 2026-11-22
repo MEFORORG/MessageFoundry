@@ -1603,11 +1603,13 @@ export function buildToolbarInsertRequest(
  * failure (BACKLOG #5839). The Steps view draws the block's body right below its header, so "after the
  * header" is requested as "before the block's first body row" (the body's suite id is the header's line
  * number), which the engine indents into the body. Every other anchor and position comes back unchanged.
+ * A blank-only body row (an unformatted module's blank line after the header) is skipped: the engine
+ * takes an insert's indent from the anchor's first non-blank line, which for such a row is the header.
  * Null when no row starts at `anchorLineStart`, or a header has no body row to anchor on. An `elif` /
  * `else` clause insert must keep the `if` row as its anchor, so its callers do not route it through here.
  */
 export function resolveInsertAnchor<
-  T extends { lineStart: number; kind: RowKind; suite: string; control?: string },
+  T extends { lineStart: number; kind: RowKind; suite: string; control?: string; expectSrc?: string },
 >(
   rows: readonly T[],
   anchorLineStart: number,
@@ -1623,7 +1625,7 @@ export function resolveInsertAnchor<
     return { anchor, position };
   }
   const bodySuite = String(anchor.lineStart);
-  const first = rows.find((r) => r.suite === bodySuite);
+  const first = rows.find((r) => r.suite === bodySuite && (r.expectSrc ?? "x").trim() !== "");
   return first ? { anchor: first, position: "before" } : null;
 }
 
@@ -2017,11 +2019,14 @@ export function contextMenuEnablement(
     filtered?: boolean;
     pragma?: boolean;
     action?: string;
+    control?: string;
   },
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
   return {
-    insertBefore: true,
+    // Insert BEFORE an elif/else header would land at the clause keyword's indent and split the
+    // if-chain, which the engine refuses; every other row takes it.
+    insertBefore: !(row.kind === "control" && (row.control === "elif" || row.control === "else")),
     // Insert AFTER is suppressed on a terminal return (a returned send OR the `return sends` footer) — a
     // step after it is dead code — but ALLOWED on a mid-body `sends.append(...)` (ADR 0104), which is a
     // normal step, not a return. A Router's `route` row is a return ({@link isReturnRow}).
@@ -2713,18 +2718,24 @@ export function blockLabel(
  * already at the very top/bottom of the handler) or when it is the SOLE primary child of its suite
  * (moving it would empty the suite — the engine refuses that, so the arrow is a no-op). `allRows` is in
  * document order and may hold several functions' rows (the webview passes the whole page): only the
- * moving row's own handler is walked, so a step never walks into another function (BACKLOG #5830/#5840).
+ * moving row's own function is walked, so a step never walks into another one (BACKLOG #5830/#5840).
+ * A function is told apart by its top-level suite id (its def line), never by name: a module may hold a
+ * `@router` and a `@handler` registered under the same name.
  */
 export function walkMove(
   allRows: readonly RowDropContext[],
   blockStartLine: number,
   direction: "up" | "down",
 ): DropResolution | null {
-  const start = allRows.find((r) => r.lineStart === blockStartLine);
-  if (!start) {
+  const at = allRows.findIndex((r) => r.lineStart === blockStartLine);
+  if (at < 0) {
     return null;
   }
-  const rows = allRows.filter((r) => r.handler === start.handler);
+  // Each function's rows are contiguous and open with a nesting-0 row, so a row belongs to the root
+  // suite of the last nesting-0 row at or above it.
+  let root = "";
+  const roots = allRows.map((r) => (r.nesting === 0 ? (root = r.suite) : root));
+  const rows = allRows.filter((_r, i) => roots[i] === roots[at]);
   // The block's row span [mi..mj] — the SAME extent {@link captureBlock} joins, so an arrow move and a
   // copy/cut can never disagree about what "the block" is (both go through {@link blockExtent}).
   const extent = blockExtent(rows, blockStartLine);

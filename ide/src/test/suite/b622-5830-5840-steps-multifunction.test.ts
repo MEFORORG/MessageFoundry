@@ -31,6 +31,17 @@ suite("b622 #5830/#5840 — Move up/down in every function of a multi-function m
     assert.strictEqual(walkMove(rows, 7, "up"), null);
   });
 
+  test("a Router and a Handler sharing one name never walk into each other", () => {
+    // Same name, two functions: the def lines (root suites "1" and "6") tell them apart.
+    const rows = dropRows(twoHandlers()).map((r) => ({ ...r, handler: "ADT" }));
+    assert.strictEqual(walkMove(rows, 7, "up"), null, "model");
+    assert.strictEqual(walkMove(rows, 3, "down"), null, "model");
+    const page = loadPage(twoHandlers());
+    const web = page.hook.stepsCtxRows().map((r: Record<string, unknown>) => ({ ...r, handler: "ADT" }));
+    assert.strictEqual(page.hook.walkMove(web, 7, "up"), null, "webview");
+    assert.strictEqual(page.hook.walkMove(web, 3, "down"), null, "webview");
+  });
+
   test("webview: the second handler's arrows are enabled, and its mirrors agree with the model", () => {
     const f = twoHandlers();
     const page = loadPage(f);

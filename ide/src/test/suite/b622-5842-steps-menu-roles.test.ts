@@ -25,6 +25,17 @@ suite("b622 #5842 — the context menu re-enables role-scoped items and greys In
     assert.strictEqual(handlerOnly().filter((b) => !b.disabled).length, enabled);
   });
 
+  test("a Router row's Insert submenu can still open: a greyed item never hides its submenu", () => {
+    const page = loadPage(routerAndHandler());
+    page.rightClick(page.row(2));
+    const sub = page.doc.querySelector('#stepsCtxMenu .ctx-sub:has(> .ctx-parent[data-sub="before"])');
+    assert.strictEqual(sub.classList.contains("ctx-disabled"), false, "the before submenu is not suppressed");
+    sub.dispatchEvent(new page.window.Event("mouseenter"));
+    assert.strictEqual(sub.classList.contains("ctx-open"), true, "hovering opens it");
+    const route = page.menuItem('.ctx-submenu[data-for="before"] .ctx-item[data-item-id="route"]');
+    assert.strictEqual(route.disabled, false, "Route To is offered in a Router");
+  });
+
   test("Insert after is greyed on a Router route row, in the model and in the webview", () => {
     assert.strictEqual(
       contextMenuEnablement({ kind: "route" }, { canMoveUp: false, canMoveDown: false }).insertAfter,

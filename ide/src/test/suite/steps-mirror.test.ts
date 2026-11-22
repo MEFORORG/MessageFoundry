@@ -24,6 +24,7 @@ import {
   renderHandlersHtml,
   renderStepsContextMenuHtml,
   resolveDrop,
+  resolveInsertAnchor,
   scopeLabel,
   walkMove,
   type BlockCaptureRow,
@@ -998,6 +999,27 @@ suite("Steps mirror — buildDropSlots / walkMove parity", () => {
   }
 });
 
+// ---- T4c: resolveInsertAnchor (BACKLOG #5839) -------------------------------------------------------
+
+suite("Steps mirror — resolveInsertAnchor parity", () => {
+  for (const c of CORPUS) {
+    test(`${c.name}: resolveInsertAnchor agrees before AND after every row`, () => {
+      const L = loadCase(c);
+      for (const r of L.webviewRows) {
+        for (const pos of ["before", "after"] as const) {
+          const w = L.harness.hook.resolveInsertAnchor(L.webviewRows, r.lineStart, pos) as DomNode | null;
+          const m = resolveInsertAnchor(L.modelRows, r.lineStart, pos);
+          assert.deepStrictEqual(
+            w === null ? null : [w.anchor.lineStart, w.position],
+            m === null ? null : [m.anchor.lineStart, m.position],
+            `${c.name}: resolveInsertAnchor('${pos}') diverged at line ${r.lineStart} (${r.kind})`,
+          );
+        }
+      }
+    });
+  }
+});
+
 // ---- T4b: the generated row-set sweep (STEPS-07/08, ≥2,000 sets) ------------------------------------
 
 suite("Steps mirror — generated row sets (STEPS-07/08)", () => {
@@ -1376,12 +1398,11 @@ const MIRRORED = new Set([
   "resolveDrop",
   "barAnchor",
   "inRole",
-  // Its parity test is in b622-5839-steps-header-insert.test.ts (BACKLOG #5839).
   "resolveInsertAnchor",
 ]);
 
 /** Top-level functions that are NOT mirrors — DOM/wiring helpers with no pure model counterpart. Each
- * entry carries the reason it is exempt. Adding an 11th mirror without a parity test must fail. */
+ * entry carries the reason it is exempt. Adding a mirror without a parity test must fail. */
 const NOT_A_MIRROR: Record<string, string> = {
   selectRow: "DOM: applies the .selected class and records the toolbar's insert anchor",
   numberEditValue: "DOM: reads a number <input>; steps-modes-webview.test.ts drives it (BACKLOG #5942)",
@@ -1481,7 +1502,7 @@ suite("Steps mirror — context-menu enablement parity (STEPS-10)", () => {
         // the walk result as an INPUT, so the model side composes the same two facts from its own data.
         const movable = vm.movable === true;
         const expected = contextMenuEnablement(
-          { kind: vm.kind, appended: vm.appended, scaffold: vm.scaffold, filtered: vm.filtered },
+          { kind: vm.kind, appended: vm.appended, scaffold: vm.scaffold, filtered: vm.filtered, control: vm.control },
           {
             canMoveUp: movable && walkMove(L.modelRows, vm.lineStart, "up") !== null,
             canMoveDown: movable && walkMove(L.modelRows, vm.lineStart, "down") !== null,

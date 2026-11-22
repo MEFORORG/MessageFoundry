@@ -2,7 +2,7 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
 
-import { resolveInsertAnchor } from "../../stepsModel";
+import { contextMenuEnablement, resolveInsertAnchor } from "../../stepsModel";
 import { dropRows, loadPage, withControls, type DomNode } from "./b622-g09-steps-page";
 
 // BACKLOG #5839: an insert AFTER an if/elif/else/for header was requested directly after the header
@@ -74,6 +74,27 @@ suite("b622 #5839 — insert after a control header lands as the block's first s
     assert.ok(ins, "an insertItem was posted");
     assert.strictEqual(ins.lineStart, 7);
     assert.strictEqual(ins.position, "before");
+  });
+
+  test("a blank-only first body row is skipped as the anchor", () => {
+    const rows = [
+      { lineStart: 2, kind: "control" as const, control: "if", suite: "1", expectSrc: "    if x:" },
+      { lineStart: 3, kind: "code" as const, suite: "2", expectSrc: "   " },
+      { lineStart: 4, kind: "action" as const, suite: "2", expectSrc: "        f()" },
+    ];
+    assert.strictEqual(resolveInsertAnchor(rows, 2, "after")?.anchor.lineStart, 4);
+  });
+
+  test("Insert before is greyed on an elif/else header, in the model and in the webview", () => {
+    assert.strictEqual(
+      contextMenuEnablement({ kind: "control", control: "else" }, { canMoveUp: false, canMoveDown: false }).insertBefore,
+      false,
+    );
+    const page = loadPage(withControls());
+    page.rightClick(page.row(4));
+    assert.strictEqual(page.menuItem('.ctx-parent[data-sub="before"]').disabled, true);
+    page.rightClick(page.row(2));
+    assert.strictEqual(page.menuItem('.ctx-parent[data-sub="before"]').disabled, false);
   });
 
   test("webview: an Else clause insert on an if header keeps the header as its anchor", () => {

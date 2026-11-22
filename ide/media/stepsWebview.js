@@ -52,8 +52,8 @@
     // moveTo, so an arrow move rides the verified cross-suite engine path.
     function stepsCtxRows() {
       return Array.from(document.querySelectorAll('li.row')).map((el) => ({
-        // The page holds every Handler and Router of the module; walkMove walks only the moving row's
-        // own (BACKLOG #5830).
+        // The page holds every Handler and Router of the module; a row names its own, as the model's
+        // RowDropContext does (BACKLOG #5830).
         handler: el.dataset.handler,
         lineStart: Number(el.dataset.lineStart),
         lineEnd: Number(el.dataset.lineEnd),
@@ -141,13 +141,18 @@
       const isHeader = anchor.kind === 'control' && anchor.control !== undefined && anchor.control !== 'raise';
       if (position !== 'after' || !isHeader) { return { anchor, position }; }
       const bodySuite = String(anchor.lineStart);
-      const first = rws.find((r) => r.suite === bodySuite);
+      // A blank-only body row is skipped: the engine would take the header's indent from it.
+      const first = rws.find((r) => r.suite === bodySuite && (r.expectSrc === undefined ? 'x' : r.expectSrc).trim() !== '');
       return first ? { anchor: first, position: 'before' } : null;
     }
     function walkMove(allRws, blockStartLine, direction) {
-      const start = allRws.find((r) => r.lineStart === blockStartLine);
-      if (!start) { return null; }
-      const rws = allRws.filter((r) => r.handler === start.handler);
+      // Walk only the moving row's own function, told apart by its root suite (def line), never by name:
+      // a Router and a Handler may share one (BACKLOG #5830).
+      const at = allRws.findIndex((r) => r.lineStart === blockStartLine);
+      if (at < 0) { return null; }
+      let root = '';
+      const roots = allRws.map((r) => (r.nesting === 0 ? (root = r.suite) : root));
+      const rws = allRws.filter((_r, i) => roots[i] === roots[at]);
       const mi = rws.findIndex((r) => r.lineStart === blockStartLine);
       if (mi < 0) { return null; }
       const m = rws[mi];
@@ -878,6 +883,9 @@
           if (!el) { return; }
           el.disabled = !!disabled;
           // A disabled Insert parent must also suppress its submenu (belt-and-suspenders with openSubmenu).
+          // Only the PARENT decides that: an item inside the submenu shares the same .ctx-sub, and
+          // letting it toggle the class would hide the whole submenu whenever its last item is greyed.
+          if (!el.classList.contains('ctx-parent')) { return; }
           const sub = el.closest('.ctx-sub');
           if (sub) { sub.classList.toggle('ctx-disabled', !!disabled); }
         }
@@ -895,10 +903,13 @@
           // terminal RETURN / scaffold footer / Router route row (data-is-return, so dead code after the
           // return) but ALLOWED on a mid-body append
           // send (ADR 0104); Delete only on an editable action/lookup/send row; ↑/↓ per walk.
-          for (const p of insertParents) {
-            setDisabled(p, p.dataset.sub === 'after' && isReturn);
-          }
+          // Insert BEFORE an elif/else header is greyed: it would land at the clause keyword's indent and
+          // split the if-chain, which the engine refuses.
           const control = el.dataset.control;
+          const continuation = kind === 'control' && (control === 'elif' || control === 'else');
+          for (const p of insertParents) {
+            setDisabled(p, p.dataset.sub === 'after' ? isReturn : continuation);
+          }
           // Mirror isRowMutable: note + route join the editable kinds, and a PRAGMA note is read-only
           // (the engine refuses set_params/delete_row/move_row on one, ADR 0076 A.4).
           const mutable =
@@ -1036,7 +1047,7 @@
     }
 
     // ---- TEST-ONLY EXPORT HOOK (BACKLOG #1758; master test plan 13-steps-editor.md §S2 step 3) --------
-    // The ten functions above MIRROR pure, unit-tested helpers in ide/src/stepsModel.ts (the declared
+    // The mirrored functions above (steps-mirror.test.ts lists them in MIRRORED) MIRROR pure, unit-tested helpers in ide/src/stepsModel.ts (the declared
     // source of truth) because this script is loaded into a `default-src 'none'` webview and cannot
     // import across that boundary. The differential suite (ide/src/test/suite/steps-mirror.test.ts) loads
     // THIS FILE under jsdom and asserts every mirror agrees with its model counterpart, so a drift shows
