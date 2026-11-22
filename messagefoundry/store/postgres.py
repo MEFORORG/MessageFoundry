@@ -12436,6 +12436,8 @@ class PostgresStore:
                 "purge every snapshot in the store. A registry declaring zero reference sets cannot "
                 "authorize purging any — the caller must skip the phase instead."
             )
+        from messagefoundry.store.base import StoreAcquireTimeout
+
         rows = await self._pool.fetch(
             "SELECT name FROM reference_version WHERE synced_at < $1", older_than
         )
@@ -12454,28 +12456,38 @@ class PostgresStore:
             # One read_committed transaction, DELETE first, the order write_reference_snapshot takes
             # its locks. Each statement takes a fresh snapshot, so the UPDATE's age predicate
             # re-evaluates after a concurrent re-sync commits and matches nothing.
-            async with self._timed_acquire() as conn, conn.transaction(isolation="read_committed"):
-                result = await conn.execute(
-                    "DELETE FROM reference WHERE name = $1"
-                    " AND EXISTS (SELECT 1 FROM reference_version v"
-                    "             WHERE v.name = $1 AND v.synced_at < $2)",
-                    name,
-                    older_than,
-                )
-                # KEEP the pointer, BUMP the version. converge_reference_cache only reloads a set
-                # whose active version DIFFERS from the one this handle reflects, so leaving the
-                # version alone would let every follower keep serving the purged PHI out of
-                # `_reference_cache` until the process restarts — and deleting the pointer outright
-                # is worse, because converge only ever adds/updates names present in a fresh read and
-                # would never notice. Bumping routes the deletion through the convergence path that
-                # already exists. Runs even on a zero-row DELETE, so an aged empty set is marked.
-                purged_version = await conn.fetchval(
-                    "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
-                    " WHERE name = $1 AND synced_at < $2 AND version NOT LIKE 'purged:%'"
-                    " RETURNING version",
-                    name,
-                    older_than,
-                )
+            try:
+                async with (
+                    self._timed_acquire() as conn,
+                    conn.transaction(isolation="read_committed"),
+                ):
+                    result = await conn.execute(
+                        "DELETE FROM reference WHERE name = $1"
+                        " AND EXISTS (SELECT 1 FROM reference_version v"
+                        "             WHERE v.name = $1 AND v.synced_at < $2)",
+                        name,
+                        older_than,
+                    )
+                    # KEEP the pointer, BUMP the version. converge_reference_cache only reloads a
+                    # set whose active version DIFFERS from the one this handle reflects, so leaving
+                    # the version alone would let every follower keep serving the purged PHI out of
+                    # `_reference_cache` until the process restarts — and deleting the pointer
+                    # outright is worse, because converge only ever adds/updates names present in a
+                    # fresh read and would never notice. Bumping routes the deletion through the
+                    # convergence path that already exists. Runs even on a zero-row DELETE, so an
+                    # aged empty set is marked.
+                    purged_version = await conn.fetchval(
+                        "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
+                        " WHERE name = $1 AND synced_at < $2 AND version NOT LIKE 'purged:%'"
+                        " RETURNING version",
+                        name,
+                        older_than,
+                    )
+            except StoreAcquireTimeout:
+                # The bounded borrow is new here. Raising would abort the retention pass and lose
+                # the audit row for what it already purged, so stop and let the next pass resume.
+                log.warning("reference-snapshot purge stopped early: store pool busy")
+                break
             deleted += _rowcount(result)
             if purged_version is None:
                 continue  # a concurrent re-sync won the race, or it was already marked
