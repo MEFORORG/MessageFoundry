@@ -469,9 +469,9 @@ async def test_a_foreign_object_that_stops_a_migration_gets_the_drop_remedy(
     cause = info.value.cause
     assert cause is not None and cause.startswith(f"error in {kind} {name}: no such module"), cause
     text = str(info.value)
-    assert text.startswith(f"store {path}: drop this {kind}, then restart: '{name}'. This build"), (
-        text
-    )
+    assert text.startswith(
+        f"store {path}: drop this {kind}, then restart. The {kind}: '{name}'."
+    ), text
     assert "recreate" not in text and "NEW store key" not in text, text
     # The remedy is true: with that object dropped, the same migration runs and the open succeeds.
     _sql(path, drop)
@@ -728,12 +728,11 @@ async def test_names_the_text_cannot_tell_apart_are_all_named_in_the_remedy(
     assert info.value.cause == cause
     assert isinstance(info.value.__cause__, sqlite3.OperationalError)
     assert str(info.value) == (
-        f"store {path}: save each one's CREATE statement, then drop whichever of these 2 stops its"
-        " upgrade, and restart: the view 'vv' and the view 'vv after drop column'. Each CREATE"
-        " statement is"
-        " the sql column of its sqlite_master row, and saving it lets a healthy one be restored."
-        " The error's text could name each of them, and this build created none of them. The"
-        f" schema step failed: {cause}."
+        f"store {path}: save each CREATE statement, then drop whichever of these 2 stops the"
+        " upgrade, and restart. The 2: the view 'vv' and the view 'vv after drop column'. Each"
+        " CREATE statement is the sql column of its sqlite_master row, and saving it lets a healthy"
+        " one be restored. The error's text could name each of them, and this build created none"
+        f" of them. The schema step failed: {cause}."
     )
 
 
@@ -748,11 +747,11 @@ _CUT_SERVICE_PATHS = (
     [
         pytest.param(
             True,
-            "save each one's CREATE statement, then drop whichever of these 2 stops its upgrade, and"
-            " restart:",
+            "save each CREATE statement, then drop whichever of these 2 stops the upgrade, and"
+            " restart.",
             id="two-names",
         ),
-        pytest.param(False, "drop this view, then restart:", id="one-name"),
+        pytest.param(False, "drop this view, then restart.", id="one-name"),
     ],
 )
 async def test_the_drop_instruction_survives_the_cut(
@@ -803,9 +802,9 @@ async def test_three_names_the_text_cannot_tell_apart_are_listed_in_the_remedy(
                 db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
             )
     assert str(info.value).startswith(
-        f"store {path}: save each one's CREATE statement, then drop whichever of these 3 stops its"
-        " upgrade, and restart: the view 'vv', the view 'vv after drop column' and the view 'vv"
-        " after drop column: no such column'."
+        f"store {path}: save each CREATE statement, then drop whichever of these 3 stops the"
+        " upgrade, and restart. The 3: the view 'vv', the view 'vv after drop column' and the view"
+        " 'vv after drop column: no such column'."
     ), str(info.value)
 
 

@@ -447,30 +447,34 @@ async def run_schema_step[T](
         foreign = await _foreign_objects(db, cause)
         if len(foreign) == 1:
             ((kind, name),) = foreign
-            # The whole instruction leads and the name follows it, so safe_exc's 200-character cut
-            # keeps the instruction; a long name, and the text after it, may be cut.
+            # The whole instruction leads and the name follows it. safe_exc's 200-character cut
+            # keeps the instruction on a store path of up to 163 raw characters for a view and 160
+            # for a trigger (measured), fewer where the redactor lengthens a path segment. A long
+            # name, and the text after it, may be cut, and a cut at a space inside a name leaves a
+            # shorter name; safe_exc's cut marker is then all that shows the name is incomplete.
             raise SchemaMismatchError(
-                f"store {path}: drop this {kind}, then restart: {name!r}. This build did not create"
-                f" it, and it stops its upgrade. The schema step failed: {cause}.",
+                f"store {path}: drop this {kind}, then restart. The {kind}: {name!r}. This build did"
+                f" not create it, and it stops the store's upgrade. The schema step failed: {cause}.",
                 cause=cause,
             ) from exc
         if foreign:
             # _foreign_objects does not pick among these, so the remedy names them all rather than
             # tell the operator to drop one that may be healthy. The instruction, its save step and
             # the count of names included, leads and is short. safe_exc's 200-character cut keeps
-            # all of it on the service paths the tests pin, measured whole on paths of up to 96
-            # raw characters, and fewer where the redactor lengthens a path segment. The names
-            # follow it, so a long path or a long list loses names, and the text after them, to
-            # the cut; the count tells a reader of a cut copy that more names follow.
+            # all of it on a store path of up to 102 raw characters with fewer than 10 names, one
+            # character fewer for each further digit of the count (measured), and fewer where the
+            # redactor lengthens a path segment. The names follow it, so a long path or a long list
+            # loses names, and the text after them, to the cut; the count tells a reader of a cut
+            # copy that more names follow.
             listed = [f"the {kind} {name!r}" for kind, name in foreign]
             names = f"{', '.join(listed[:-1])} and {listed[-1]}"
+            count = len(foreign)
             raise SchemaMismatchError(
-                f"store {path}: save each one's CREATE statement, then drop whichever of these"
-                f" {len(foreign)} stops its upgrade, and restart: {names}. Each CREATE statement is"
-                f" the sql column of its"
-                f" sqlite_master row, and saving it lets a healthy one be restored. The error's text"
-                f" could name each of them, and this build created none of them. The schema step"
-                f" failed: {cause}.",
+                f"store {path}: save each CREATE statement, then drop whichever of these {count}"
+                f" stops the upgrade, and restart. The {count}: {names}. Each CREATE statement is"
+                " the sql column of its sqlite_master row, and saving it lets a healthy one be"
+                " restored. The error's text could name each of them, and this build created none"
+                f" of them. The schema step failed: {cause}.",
                 cause=cause,
             ) from exc
         if counts_under_dek is None:
