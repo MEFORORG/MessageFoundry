@@ -4,7 +4,7 @@
 
 ``batch_18_messages.txt``, ``oml_o21.hl7`` and ``adt_a03.txt`` under ``samples/messages/hapi-hl7v2/`` were scrubbed
 by DEFAULT_RULES plus a committed overlay each, under ``tests/fixtures/anon/``. These tests hold
-each corpus to its overlay in two ways:
+each corpus to its overlay in two ways, and adt_a03 in a third:
 
 * no field of any message is undecided: a rule scrubs it or the overlay keeps it; and
 * each field a rule scrubs holds what that rule writes. A name, clinician or address must come from
@@ -13,7 +13,8 @@ each corpus to its overlay in two ways:
 
 The second check cannot see every kind. A phone, an SSN, a date of birth and the first component of
 an identifier are fabricated in the shape of the value they replace, so a residue of those kinds
-passes it.
+passes it. For adt_a03 a third check covers that gap: digests of its upstream identifying values
+must not match any token of the file.
 
 The README's manifest must count each file's messages, since ``samples/send_mllp.py`` refuses a
 multi-message file; that test checks only counts and the type of a one-message file. Every message
@@ -72,8 +73,9 @@ _CORPORA = {
     "oml_o21.hl7": _Corpus(_FIXTURES / "oml_o21.anon.toml", 7, 100),
     "adt_a03.txt": _Corpus(_FIXTURES / "adt_a03.anon.toml", 3, 17),
 }
-#: SHA-256 digests of identifying values upstream adt_a03.txt carried, held as digests so the
-#: values themselves are not in this file: the patient key, the fiscal code, the birth date, the
+#: SHA-256 digests of identifying values upstream adt_a03.txt carried, held as digests only so the
+#: literal text is not in this file. They are unsalted, so a short value is easily recovered from
+#: one: this is not de-identification. They are the patient key, the fiscal code, the birth date, the
 #: visit number, the hospital, and the sending facility. The surrogate check cannot see an id or a
 #: birth date put back, since both are fabricated in the shape of the value they replace.
 _ADT_A03_UPSTREAM_DIGESTS = frozenset(
@@ -145,8 +147,8 @@ def _is_filled_date(comps: list[str], rep: str, seps: Seps) -> bool:
 def _is_identifier(comps: list[str], rep: str, seps: Seps) -> bool:
     # The surrogate leaves an empty id empty and still writes the kept components, as in adt_a03's
     # ``^^^^TEAM`` repetition, so an empty id passes when every component set beside it is one the
-    # surrogate keeps. An empty repetition is not one the surrogate writes.
-    return bool(rep) and _kept_tail(comps, _CX_KEPT_COMPONENTS) == comps[1:]
+    # surrogate keeps. That also passes an empty repetition, which the surrogate writes for ``^``.
+    return _kept_tail(comps, _CX_KEPT_COMPONENTS) == comps[1:]
 
 
 _IDENTIFIER = (_is_identifier, "components an identifier surrogate blanks are set")
@@ -281,9 +283,10 @@ def test_the_surrogate_check_passes_what_the_anonymizer_writes() -> None:
     [
         ("^^^^TEAM", True),  # what the surrogate writes for an empty id beside a type code
         ("6075145^^^PK^PK", True),
+        ("", True),  # what the surrogate writes for ``^``
         ("^", False),
         ("^8^M10", False),  # a check digit left beside an empty id
-        ("^^^^TEAM^^20070103", False),  # an effective date left beside an empty id
+        ("^^^^TEAM^^20260101", False),  # an effective date left beside an empty id
     ],
 )
 def test_the_identifier_check_judges_an_empty_id(rep: str, expected: bool) -> None:
@@ -291,14 +294,23 @@ def test_the_identifier_check_judges_an_empty_id(rep: str, expected: bool) -> No
 
 
 def _tokens(text: str) -> set[str]:
-    return set(re.split(r"[|^~&\r\n]", text)) - {""}
+    """Every value in ``text``, comment lines included, split on the separators its first MSH
+    declares."""
+    parsed = read_message_seps(text.replace("\r\n", "\r").split("\r", 1)[0])
+    assert parsed is not None
+    seps = parsed[0]
+    splitters = {"|", seps.component, seps.repetition, seps.subcomponent, "\r", "\n"}
+    return set(re.split("|".join(map(re.escape, splitters)), text)) - {""}
 
 
 def test_no_upstream_identifier_is_left_in_adt_a03() -> None:
     """A put-back id or birth date passes the surrogate check, so the upstream values are pinned
     absent by digest. A token of the committed file is found, so the tokens were read; on the
     upstream file this test fails."""
-    digests = {hashlib.sha256(t.encode()).hexdigest() for t in _tokens(_messages("adt_a03.txt")[0])}
+    digests = {
+        hashlib.sha256(t.encode()).hexdigest()
+        for t in _tokens((_HAPI / "adt_a03.txt").read_bytes().decode("utf-8"))
+    }
     assert digests.isdisjoint(_ADT_A03_UPSTREAM_DIGESTS)
     assert hashlib.sha256(b"ADT").hexdigest() in digests
 

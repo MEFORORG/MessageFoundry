@@ -30,7 +30,7 @@ deterministic, salt-keyed surrogate machinery the tee relay and test harness use
 written** (§9: centralize the rules, don't reimplement beside the framework). Each overlay scrubs
 the fields this corpus needs that are not defaults, and lists every other field the leak-check
 walks as reviewed and kept, so no field it walks is undecided. The leak-check does not walk the
-MSH header, so no MSH field is listed, and only `adt_a03.txt`'s overlay scrubs any.
+MSH header, so no MSH field is in a keep list. Only `adt_a03.txt`'s overlay scrubs MSH fields.
 [`tests/test_anon_hapi_samples.py`](../../../tests/test_anon_hapi_samples.py) holds each file to its
 overlay. The salt is not recorded: these surrogates are final, not reversible, and the files are
 not intended to be re-derived. Line endings, segment order and every line's field count are
@@ -38,8 +38,8 @@ unchanged.
 
 **What the scrub does not replace.** A run of `DEFAULT_RULES` is not Safe Harbor
 de-identification, and ADR 0030 and [`docs/PHI.md`](../../../docs/PHI.md) §9 say why. In these files,
-at least: outside `adt_a03.txt`, `MSH-7` and the other MSH routing fields keep their upstream
-values; a query time, an
+at least: `MSH-7` and the other MSH routing fields keep their upstream values, except `MSH-4`,
+`MSH-6` and `MSH-7` in `adt_a03.txt`; a query time, an
 order's requested time in `batch_18_messages.txt` and an order's quantity and timing keep their
 timestamps, an identifier keeps its assigning authority (a hospital or system name), and the coded
 clinical content is kept.
@@ -121,17 +121,17 @@ bytes as its own frozen input, the upstream names included. Nothing can regenera
 > https://github.com/hapifhir/hapi-hl7v2 at commit `de1503651040`, licensed MPL-2.0.
 > The modification is de-identification only, described below.
 
-Upstream this one-message file carries a named hospital and ward, a patient key, an identifier in
-the shape of an Italian fiscal code, a birth date, a visit number and two clinicians (BACKLOG
-#5825). The patient and clinician names are placeholders, but the hospital, ward and identifiers
-are not plainly so, so it was scrubbed, by `DEFAULT_RULES` plus
+Upstream this one-message file carries a named hospital and ward and a patient key. It also
+carries an identifier shaped like an Italian fiscal code, a birth date, a visit number and two
+clinicians (BACKLOG #5825). The names are placeholders, but the hospital, ward and identifiers are
+not plainly so. So it was scrubbed, by `DEFAULT_RULES` plus
 [`tests/fixtures/anon/adt_a03.anon.toml`](../../../tests/fixtures/anon/adt_a03.anon.toml), which
 also scrubs the message time and the sending and receiving facility in the MSH header and says why.
 
-**What was deliberately preserved:** the five segments in order, their field counts, the CRLF line
-endings with no final line ending, the sending and receiving applications, the message type,
-control id and version, the identifiers' assigning authorities and type codes, and the coded
-procedure. The same limits as above apply.
+**What was deliberately preserved:** the five segments in order, their field counts, and the CRLF
+line endings with no final line ending. In the header, the sending and receiving applications, the
+message type, the control id and the version are kept. So are the identifiers' assigning
+authorities and type codes, and the coded procedure. The same limits as above apply.
 
 **What the scrub changed beyond identifier values**, at least:
 

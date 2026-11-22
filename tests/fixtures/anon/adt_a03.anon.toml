@@ -24,8 +24,8 @@
 "MSH-7" = "date"
 
 [hl7]
-# Every other field this corpus carries, reviewed and left intact. A keep makes a field decided;
-# the leak-check still scans it for PHI shapes. A keep rewrites nothing.
+# At least the fields the leak-check would report undecided, reviewed and left intact. A keep
+# makes a field decided; the leak-check still scans it for PHI shapes. A keep rewrites nothing.
 keep = [
     # The patient death indicator (N) and the procedure functional type (02): table-coded flags.
     "PID-30", "PR1-6",
