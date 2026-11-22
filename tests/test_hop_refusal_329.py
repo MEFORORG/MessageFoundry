@@ -216,6 +216,10 @@ _REFUSED_WEBHOOK_URLS = [
     pytest.param(f"https://hooks.example\u2003/{_WEBHOOK_TOKEN}", (), id="em-space-in-host"),
     pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\ufeff", (), id="trailing-bom"),
     pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\udc80", (), id="lone-surrogate"),
+    # Percent-encoded in the host: urllib decodes it before http.client refuses it at every POST.
+    pytest.param(f"https://hooks.example%20/{_WEBHOOK_TOKEN}", (), id="encoded-space-in-host"),
+    pytest.param(f"https://hooks%0d%0aexample/{_WEBHOOK_TOKEN}", (), id="encoded-crlf-in-host"),
+    pytest.param(f"https://hooks.example%7f/{_WEBHOOK_TOKEN}", (), id="encoded-del-in-host"),
     # Whitespace both readers strip is stripped, so an http URL inside it is still refused.
     pytest.param(f" http://hooks.example/{_WEBHOOK_TOKEN}\n", (), id="space-http"),
     pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}", ("other.example",), id="off-allowlist"),
@@ -261,6 +265,15 @@ def test_an_https_or_unset_webhook_loads(url: str | None) -> None:
     # Negative control: an https URL loads, inside whitespace both readers strip too, and an empty
     # value stays "not configured". The value is kept as written.
     assert AlertsSettings(webhook_url=url).webhook_url == url
+
+
+def test_the_allowlist_judges_the_host_urllib_dials() -> None:
+    # An encoded dot dials hooks.example, so a list naming hooks.example admits it, and a list
+    # spelling the encoded form does not admit a host it never dials.
+    url = "https://hooks%2Eexample/x"
+    assert AlertsSettings(webhook_url=url, webhook_allowed_hosts=["hooks.example"]).webhook_url
+    with pytest.raises(ValidationError, match="not in"):
+        AlertsSettings(webhook_url=url, webhook_allowed_hosts=["hooks%2eexample"])
 
 
 def test_a_listed_webhook_host_loads() -> None:

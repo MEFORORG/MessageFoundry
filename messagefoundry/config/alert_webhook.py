@@ -13,6 +13,7 @@ settings load would pay for it.
 
 from __future__ import annotations
 
+import urllib.parse
 from collections.abc import Sequence
 
 from messagefoundry.urlscreen import (
@@ -59,12 +60,25 @@ def _refuse_hostless_or_off_allowlist(url: str, allowed_hosts: Sequence[str]) ->
     does not admit. Private: ``url`` must already have passed ``refuse_url_credentials``, whose
     screen keeps urlsplit's own netloc-quoting ``ValueError`` from being raised here.
 
+    The host is judged as urllib dials it: percent-decoded, as ``urllib.request.Request`` decodes
+    it before ``http.client`` validates it. A decoded host ``http.client`` could not send (a
+    space, a control character or a non-ASCII character, written as ``%20``, ``%0d%0a`` or
+    ``%7f`` say) is refused without naming it, and the allowlist judges the decoded host, so
+    ``hooks%2Eexample`` is judged as the ``hooks.example`` it dials.
+
     Names the host, never the URL: the path carries the webhook's token (BACKLOG #1793)."""
-    host = UNCACHED_URLSPLIT(url).hostname or ""  # urlsplit lower-cases the host
+    # urlsplit lower-cases the host; the decoded form is lower-cased again for an encoded capital.
+    host = urllib.parse.unquote(UNCACHED_URLSPLIT(url).hostname or "").lower()
     if not host:
         # Whatever the allowlist: the build's revocation guard refuses a hostless URL in every
         # posture too, so this keeps settings load from passing one the build refuses.
         raise ValueError(f"{_SETTING} names no host")
+    if unsendable_request_target(host):
+        raise ValueError(
+            f"{_SETTING} has a percent-encoded space, control character or non-ASCII character in "
+            "its host, which http.client cannot send once urllib decodes it; the value is not "
+            "repeated here, since its path can carry the webhook's token"
+        )
     if not alert_host_allowed(host, allowed_hosts):
         raise ValueError(f"{_SETTING} host {host!r} is not in [alerts].webhook_allowed_hosts")
 
