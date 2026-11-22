@@ -1295,24 +1295,6 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             cite += ' and "[environments]"'
         if parts:
             steps.append(". ".join([*parts, cite]))
-        if _DIRECTORY_VARIABLE not in posture.listed and not posture.directory_joined:
-            # A joined directory string may still be set in the lists, so "add it back" would
-            # be false there.
-            # Two routes, because install-service.ps1 refuses an existing directory the service
-            # does not name: an operator whose later `nssm set` dropped the variable must not be
-            # sent to the installer, which would say to remove the directory holding the files.
-            steps.append(
-                f"The service's lists set no {_DIRECTORY_VARIABLE}. Where install-service.ps1 "
-                f"already made the secrets directory, add {_DIRECTORY_VARIABLE} naming that "
-                "existing path back to the service's AppEnvironmentExtra, beside its other "
-                "entries, before any re-run of the installer, which refuses an existing directory "
-                "the service does not name. `nssm set` replaces that whole list, so read it first "
-                "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
-                "back every entry but those refused above: see docs/SERVICE.md, "
-                '"Start / stop / status". Where none exists yet, the bullet "The other secrets: '
-                'a secrets directory" under docs/SERVICE.md, "Protect the store encryption key at '
-                'rest", says how the directory is created'
-            )
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
     # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).
     steps.append(
@@ -1324,6 +1306,30 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         steps.append(
             "At least one refused variable's value runs on past its own entry, so remove the "
             "entries it runs on into with it, or the value stays in the registry key"
+        )
+    if (
+        (others or values)
+        and _DIRECTORY_VARIABLE not in posture.listed
+        and not posture.directory_joined
+    ):
+        # After the removal and the run-on sentence, as on origin/main, so the list it says
+        # to pass back is the one those steps left.
+        # A joined directory string may still be set in the lists, so "add it back" would
+        # be false there.
+        # Two routes, because install-service.ps1 refuses an existing directory the service
+        # does not name: an operator whose later `nssm set` dropped the variable must not be
+        # sent to the installer, which would say to remove the directory holding the files.
+        steps.append(
+            f"The service's lists set no {_DIRECTORY_VARIABLE}. Where install-service.ps1 "
+            f"already made the secrets directory, add {_DIRECTORY_VARIABLE} naming that "
+            "existing path back to the service's AppEnvironmentExtra, beside its other "
+            "entries, before any re-run of the installer, which refuses an existing directory "
+            "the service does not name. `nssm set` replaces that whole list, so read it first "
+            "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
+            "back every entry but those refused above: see docs/SERVICE.md, "
+            '"Start / stop / status". Where none exists yet, the bullet "The other secrets: '
+            'a secrets directory" under docs/SERVICE.md, "Protect the store encryption key at '
+            'rest", says how the directory is created'
         )
     if posture.directory_path_joined:
         # A path alone holds no secret, and the service may read it as its directory (fourth

@@ -51,7 +51,7 @@ from messagefoundry.serviceenv import (
     service_env_loosenings,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import ADD_BACK, CREATE, REMOVE
+from tests._serviceenv_remedy import ADD_BACK, CREATE, REMOVE, RUNS_ON
 
 #: Synthetic stand-ins. Never a real key: the tests check that no value is kept, by searching for
 #: these strings in what the reading returns.
@@ -620,6 +620,9 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
         pytest.param(["MEFOR_VALUE_PARTNER_HOST=example.test"], True, id="value"),
         pytest.param(["MEFOR_STORE_PASSWORD=x"], True, id="directory-secret"),
         pytest.param(
+            ["MEFOR_STORE_PASSWORD=", "synthetic-run-on", "MEFOR_VALUE_B=1"], True, id="run-on"
+        ),
+        pytest.param(
             ["MEFOR_VALUE_PARTNER_HOST=example.test", "MEFOR_SECRETS_DIRECTORY=C:/s"],
             False,
             id="directory-listed",
@@ -637,13 +640,16 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
 ) -> None:
     """origin/main's step for a secrets directory that exists but the lists no longer name,
     restored by the Lander's hold on PR 3142 (comment 7085002242): printed once, after the Put
-    step and before the removal, where the lists set no MEFOR_SECRETS_DIRECTORY and no string
+    step and the removal, where the lists set no MEFOR_SECRETS_DIRECTORY and no string
     joined to a value sets one. A store key alone goes to a key file and gets none."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     assert refusal.count(ADD_BACK) == (1 if adds_back else 0)
     if adds_back:
-        assert refusal.index("Put ") < refusal.index(ADD_BACK) < refusal.index(REMOVE)
+        assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(ADD_BACK)
+        # The list it says to pass back is the one the run-on sentence left.
+        assert RUNS_ON not in refusal or refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
+    assert "synthetic-run-on" not in refusal
 
 
 @pytest.mark.parametrize(
@@ -657,9 +663,7 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
 )
 def test_the_remedy_names_no_list_string_or_command(entries: list[str], adds_back: bool) -> None:
     """The installer refuses an existing directory the service does not name, so the remedy
-    sends nobody to a re-run. It says what to remove and points at SERVICE.md. It names no
-    list, registry string or `nssm` command, since which of those applies depends on the host
-    (the Lander's third hold on PR 3142, H1)."""
+    sends nobody to a re-run. It says what to remove and points at SERVICE.md."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     # The control: the finding before the remedy names the lists, so the probe can fire.

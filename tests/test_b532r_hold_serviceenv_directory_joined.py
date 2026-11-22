@@ -4,8 +4,7 @@
 (vault BACKLOG #5394), whether or not the variable it is joined to is refused.
 
 The join stays: the string still continues the empty value, and every input that refused before
-still refuses. Since the Lander's third hold on PR 3142 the remedy names no list, registry string
-or command: it says to remove each refused variable and what a value runs on
+still refuses. The remedy says to remove each refused variable and what a value runs on
 into, and points at docs/SERVICE.md. An OIDC key empty on its own line runs on and refuses
 (round-2 finding 1).
 Synthetic values only.
@@ -213,10 +212,9 @@ def test_every_value_name_gets_one_generic_put_sentence(
     pairs: list[tuple[str, str]], delete: bool, rename: bool
 ) -> None:
     """The Lander's decision d20261122T181059560-3bac03 on PR 3142: no reading of which line is
-    content gates the steps. Every MEFOR_VALUE_* refusal prints the one Put sentence, naming no
-    variable, the create step, the value-file alternative and the ``provider = "env"`` sentence.
-    An empty entry adds the delete clause, and a name the secrets directory refuses adds the
-    rename."""
+    content gates the steps. Each shape prints the one Put sentence, naming no variable, the
+    create step, the value-file alternative and the ``provider = "env"`` sentence. An empty
+    entry adds the delete clause, and a name the secrets directory refuses adds the rename."""
     refusal = service_env_refusal(_read_pairs(pairs))
     assert refusal is not None
     assert refusal.count("Put each MEFOR_VALUE_* variable in the secrets directory") == 1
