@@ -317,16 +317,16 @@ the steps after it, never less than 3 s. The budget covers at least these waits:
 in flight, the remote-debug refusal watch's two waits, for its last audit pass and then for that
 pass's cancel, and the drain of alert-instance writes. A budgeted wait is shortened only when what
 is left of the budget, less the time kept for the stop steps after it, is under that wait's fixed
-bound, and it still gets at least 0.1 s. The graph supervisor's exit is not budgeted: it waits its
-fixed 10 s, and then, once cancelled, for that cancel to land with no bound. It and the other stop
-steps are not held to the budget, so a slow one can still carry the stop past NSSM's window, and
-it spends budget the waits after it would have had. On a tight stop, at least these can be lost:
+bound, and it still gets at least 0.1 s. The graph supervisor's exit is not budgeted: it waits up
+to its fixed 10 s, and then, once cancelled, for that cancel to land with no bound. It and the
+other stop steps are not held to the budget, so a slow one can still carry the stop past NSSM's
+window, and it spends budget the waits after it would have had. On a tight stop, at least these can be lost:
 
 - **The remote-debug watch's last pass** can be cut to about 0.1 s and cancelled. Every stop step
   before it, the graph supervisor's wait and the stopping of the message graph included, shortens
-  its waits by what it took, so a slow graph stop alone can leave the pass only that floor. A
-  WARNING says when the pass was cut, and a refusal seen since the pass before it may then have no
-  audit row and no alert. A pass
+  its waits by what it took, so a slow graph stop alone can leave the pass only that floor. When
+  the budget cuts the pass, a WARNING says so, and a refusal seen since the pass before it may then
+  have no audit row and no alert. A cancel of the stop itself cancels the pass and logs none. A pass
   whose cancel has not landed when the second wait ends is left running and can outlive the
   store's close, so its row may not be written; the WARNING then says it may still be running.
 - **The alert-instance drain** can be cut to about 0.1 s. A raise or clear write still running
@@ -336,7 +336,8 @@ it spends budget the waits after it would have had. On a tight stop, at least th
   sending of alert notifications, which a later shutdown step closes.
 - **A CRL reload pass in flight** gets at most about 1.8 s at the 3 s minimum, or about 0.8 s
   while a config write is still running, and less when an earlier stop step was slow, down to the
-  same 0.1 s. The pass is abandoned with a WARNING. Abandoning it does not end its read: the worker
+  same 0.1 s. When the budget cuts the pass, it is abandoned with a WARNING; a cancel of the stop
+  itself cancels it and logs none. Abandoning it does not end its read: the worker
   thread running the pass cannot be cancelled and runs on, and it can hold the process's exit past
   NSSM's window. The next start loads every CRL from the file again.
 
