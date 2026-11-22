@@ -287,3 +287,4 @@ tests/test_worktree_gate_quoted_and_every_invocation.py
 tests/test_dashboard_collect_metrics.py
 tests/test_dashboard_to_rows.py
 tests/test_dashboard_render_html.py
+tests/test_dashboard_ps_scripts.py
