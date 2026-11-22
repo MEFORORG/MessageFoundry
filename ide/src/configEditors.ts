@@ -53,11 +53,12 @@ const SAVE_GUARD_RESET_MS = 1500;
  * no workspace folder (a relative configDir can't be resolved, and the CLI-backed editor is already
  * inert there).
  *
- * A document of any other scheme, such as a `git:` revision tab or one side of an Open Changes diff,
- * is never the file the CLI writes (`isConfigDirDocument`), so it gets no form and no scripts. It is
- * shown in place, as its own read-only text, and is not reopened: an `openWith` there would pull the
- * revision out of the diff into a separate tab. The save and remove handlers re-check the scheme as
- * defense in depth, though a panel this returns true for never enables scripts and so never posts.
+ * A document of any other scheme is never the file the CLI writes (`isConfigDirDocument`), so it gets
+ * no form and no scripts. A revision (`git:` and the like, such as one side of an Open Changes diff)
+ * is shown in place as its own read-only text, kept current as that document reloads: an `openWith`
+ * would pull it out of the diff into a separate tab. An `untitled:` new file is editable, so it is
+ * reopened as text like a stray file. The save and remove handlers re-check the scheme as defense in
+ * depth, though a panel this returns true for never enables scripts and so never posts.
  */
 function reopenAsTextIfNotConfigDirFile(
   document: vscode.TextDocument,
@@ -65,21 +66,22 @@ function reopenAsTextIfNotConfigDirFile(
   expected: string,
   isConfigDirFile: (fsPath: string, ws: string, dir: string) => boolean,
 ): boolean {
-  const nonFile = document.uri.scheme !== "file";
-  if (!nonFile) {
+  const { scheme } = document.uri;
+  if (scheme === "file") {
     const ws = workspaceDir();
     if (!ws || isConfigDirDocument(document.uri, ws, configDir(), isConfigDirFile)) {
       return false;
     }
   }
+  const inPlace = scheme !== "file" && scheme !== "untitled";
   let notice: string;
-  let text: string | undefined;
-  if (nonFile) {
-    // Shown in place as the revision's own text; never reopened (see above).
-    notice = `This ${document.uri.scheme}: document is read-only here; the form edits only the file on disk.`;
-    text = document.getText();
+  if (inPlace) {
+    notice = `This ${scheme}: document is read-only here; the form edits only the file on disk.`;
   } else {
-    const reason = `This file is not ${expected} under the configured config dir (messagefoundry.configDir)`;
+    const reason =
+      scheme === "file"
+        ? `This file is not ${expected} under the configured config dir (messagefoundry.configDir)`
+        : `This ${scheme}: document is not ${expected} on disk`;
     void vscode.window.showInformationMessage(
       `MessageFoundry: ${reason}, so it opens as text. The form edits only that file.`,
     );
@@ -88,7 +90,19 @@ function reopenAsTextIfNotConfigDirFile(
     // Leave a static notice in the about-to-be-replaced webview in case the reopen is slow.
     notice = `${reason}; opening it as text…`;
   }
-  panel.webview.html = configNoticeHtml(notice, text);
+  const paint = (): void => {
+    panel.webview.html = configNoticeHtml(notice, inPlace ? document.getText() : undefined);
+  };
+  paint();
+  if (inPlace) {
+    // A `~` revision follows the index, so the git provider reloads it when the file is staged.
+    const sub = vscode.workspace.onDidChangeTextDocument((e) => {
+      if (e.document.uri.toString() === document.uri.toString()) {
+        paint();
+      }
+    });
+    panel.onDidDispose(() => sub.dispose());
+  }
   return true;
 }
 

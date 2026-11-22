@@ -169,8 +169,8 @@ export function configNoticeHtml(notice: string, text?: string): string {
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   const body = text === undefined ? "" : `<pre style='white-space:pre-wrap'>${esc(text)}</pre>`;
   return (
-    "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
-    "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline';\">" +
+    `<!DOCTYPE html><html><head><meta charset="utf-8">` +
+    `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">` +
     `</head><body style='font-family:sans-serif;padding:1rem'><p>${esc(notice)}</p>${body}</body></html>`
   );
 }
