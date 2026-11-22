@@ -80,13 +80,23 @@ _KEYED_DETAIL = (
     " so restarting under the old key would zero its AES-GCM use count, which lives in the store. If"
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
+# The ALTER re-check's prefix when an object other than the altered table fails to parse. Only the
+# view and trigger forms: this build creates neither (see _ORDINARY_TABLE), so the object named is
+# another tool's. SQLite uses the same form for a table or an index, which may be this build's own.
+_FOREIGN_OBJECT_PREFIXES = ("error in view ", "error in trigger ")
+# Dropping a view or a trigger removes no row, so this remedy keeps the store and its key.
+_REMEDY_FOREIGN = (
+    "holds a view or trigger this build did not create, which stops its upgrade: drop that object,"
+    " then restart."
+)
 
 # The reads below skip a table whose stored SQL is LIKE 'CREATE VIRTUAL TABLE%', because a pragma
 # on a virtual table whose module is not loaded here can raise "no such module" (BACKLOG #6719).
 # The store builds none, and a test pins that, so an expected name held by a virtual table reads
 # as a missing table and is refused rather than skipped.
-# THIS BUILD CREATES NO VIRTUAL TABLE AND NO VIEW, which tests/test_schema_verify_6719_6720.py
-# pins; the other notes in this module rely on that and point here.
+# THIS BUILD CREATES NO VIRTUAL TABLE, NO VIEW AND NO TRIGGER, which
+# tests/test_schema_verify_6719_6720.py pins; the other notes in this module rely on that and point
+# here.
 _ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
@@ -125,7 +135,8 @@ class SchemaMismatchError(sqlite3.DatabaseError):
     exits 2, the code it keeps apart from a negative finding (BACKLOG #1670).
 
     ``differences`` lists what the check found missing, one clause each. It is empty when the schema
-    script or a migration itself failed (BACKLOG #2101), and then ``cause`` holds that failure's text.
+    script, a migration or this check's own read failed (BACKLOG #2101, #6720), and then ``cause``
+    holds that failure's text.
     Both are kept apart from the message so a caller whose remedy differs, such as a restore-verify
     of an old backup, can word its own refusal without parsing this one.
     """
@@ -338,8 +349,18 @@ async def verify_live_schema(
     holds a count but no store salt was last written under the DEK, so an operator shell without the
     service's key still gets the new-key remedy. A process that HAS a key is never overruled by the
     file, because a restored cell-bound store also has counts and no salt row until its first open.
+
+    A read that fails on the store's shape is refused the same way, through
+    :func:`run_schema_step` (BACKLOG #6720): a virtual table whose stored SQL the
+    ``_ORDINARY_TABLE`` predicate does not recognise, held under an expected name, raises "no such
+    module" from the column read rather than reading as a difference.
     """
-    problems = await live_schema_differences(db, schema=schema, migrate=migrate)
+    problems = await run_schema_step(
+        db,
+        live_schema_differences(db, schema=schema, migrate=migrate),
+        path=path,
+        counts_under_dek=counts_under_dek,
+    )
     if problems:
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
@@ -393,28 +414,38 @@ def is_schema_step_error(exc: BaseException) -> bool:
     )
 
 
-async def run_schema_step(
+async def run_schema_step[T](
     db: aiosqlite.Connection,
-    step: Awaitable[object],
+    step: Awaitable[T],
     *,
     path: object,
     counts_under_dek: bool | None,
-) -> None:
-    """Await the schema script or the migrations, turning a shape failure into a refusal.
+) -> T:
+    """Await the schema script, the migrations or the verify's read, turning a shape failure into a
+    refusal, and return what the step returned.
 
     A failure :func:`is_schema_step_error` accepts is raised as :class:`SchemaMismatchError`, from
     the original so the driver's text stays in the chain (BACKLOG #2101). It carries the remedy a
     verify refusal carries, chosen the same way: a statement that fails on an existing object's
     shape is the same incompatible version the verify reports, found one step earlier. Any other
-    failure propagates unchanged."""
+    failure propagates unchanged.
+
+    One shape failure gets another remedy: SQLite's re-check of the schema after an ``ALTER``
+    names the view or trigger it could not parse, as in "error in view V: no such module". This
+    build creates neither kind, so that object is another tool's, and dropping it lets the
+    migration run past it (BACKLOG #6719)."""
     try:
-        await step
+        return await step
     except Exception as exc:
         if not is_schema_step_error(exc):
             raise
+        cause = str(exc)
+        if cause.startswith(_FOREIGN_OBJECT_PREFIXES):
+            raise SchemaMismatchError(
+                f"store {path} {_REMEDY_FOREIGN} The schema step failed: {cause}.", cause=cause
+            ) from exc
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
-        cause = str(exc)
         raise SchemaMismatchError(
             f"store {path} {_remedy(counts_under_dek)} The schema step failed: {cause}.",
             cause=cause,

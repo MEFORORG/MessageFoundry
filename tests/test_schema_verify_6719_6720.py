@@ -200,10 +200,10 @@ async def test_a_counted_store_whose_salt_is_a_readable_foreign_object_gets_the_
 _TABLES_FLAGGED_VIRTUAL = (
     f"SELECT m.name, NOT ({_ORDINARY_TABLE}) FROM sqlite_master AS m WHERE m.type = 'table'"
 )
-#: Every schema object with a flag saying whether it is a view, so one walk both counts what it saw
-#: and finds the views (a view query alone returns nothing on the built schema, so it cannot show it
-#: ran). The flag is in the SQL, so the negative control below pins the same predicate.
-_OBJECTS_FLAGGED_VIEW = "SELECT name, type = 'view' FROM sqlite_master"
+#: Every schema object with a flag saying whether it is a view or a trigger, so one walk both counts
+#: what it saw and finds those (a query for them alone returns nothing on the built schema, so it
+#: cannot show it ran). The flag is in the SQL, so the negative control below pins the same predicate.
+_OBJECTS_FLAGGED_VIEW = "SELECT name, type IN ('view', 'trigger') FROM sqlite_master"
 
 
 async def test_the_expected_shape_holds_no_virtual_table() -> None:
@@ -227,16 +227,22 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
     virtual = [name for name, is_virtual in tables if is_virtual]
     assert virtual == []
     # The reads skip views too, so a view this build created would never be verified either
-    # (BACKLOG #6719 item 10).
+    # (BACKLOG #6719 item 10). And the foreign-object remedy tells the operator to drop a view or a
+    # trigger that stops an upgrade, which is safe only while this build creates neither.
     views = [name for name, is_view in objects if is_view]
     assert views == []
 
 
 async def test_the_virtual_table_probe_finds_one_without_fts5(tmp_path: Path) -> None:
     # Negative control for the pin above that needs no fts5 (BACKLOG #6719 item 8): a planted
-    # virtual table is flagged, an ordinary one is not, and the view flag marks a view.
+    # virtual table is flagged, an ordinary one is not, and the view flag marks a view and a trigger.
     path = tmp_path / "probe.db"
-    _sql(path, "CREATE TABLE plain (a)", "CREATE VIEW v AS SELECT 1")
+    _sql(
+        path,
+        "CREATE TABLE plain (a)",
+        "CREATE VIEW v AS SELECT 1",
+        "CREATE TRIGGER tr AFTER INSERT ON plain BEGIN SELECT 1; END",
+    )
     _plant_unloaded_virtual_table(path, "planted")
     async with _connected(path) as db:
         async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
@@ -244,7 +250,7 @@ async def test_the_virtual_table_probe_finds_one_without_fts5(tmp_path: Path) ->
         async with db.execute(_OBJECTS_FLAGGED_VIEW) as cur:
             views = [name for name, is_view in await cur.fetchall() if is_view]
     assert rows == {"plain": False, "planted": True}
-    assert views == ["v"]
+    assert views == ["v", "tr"]
 
 
 async def test_a_planted_ordinary_table_with_rootpage_zero_is_not_skipped(tmp_path: Path) -> None:
@@ -410,3 +416,151 @@ async def test_the_open_refuses_a_name_held_by_another_kind_of_object(
     assert text.startswith(f"store {path} is from an incompatible version; recreate it:"), text
     assert info.value.cause is not None and cause in info.value.cause, info.value.cause
     assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+
+
+# --- BACKLOG #6719 item 3: a foreign view or trigger that stops the upgrade ------------------------
+
+
+def _preset_columns(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return {r[1] for r in conn.execute("PRAGMA table_info(search_presets)")}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "dependent", "drop"),
+    [
+        pytest.param("view", "CREATE VIEW vv AS SELECT x FROM vt", "DROP VIEW vv", id="view"),
+        pytest.param(
+            "trigger",
+            "CREATE TRIGGER tt AFTER INSERT ON users BEGIN SELECT x FROM vt; END",
+            "DROP TRIGGER tt",
+            id="trigger",
+        ),
+    ],
+)
+async def test_a_foreign_object_that_stops_a_migration_gets_the_drop_remedy(
+    tmp_path: Path, kind: str, dependent: str, drop: str
+) -> None:
+    # A 0.3.2 preset table needs the RENAME COLUMN migration, and SQLite re-checks every view and
+    # trigger after it. One that reads an unloaded module fails that check, naming itself. The store
+    # is otherwise this build's, so the remedy is to drop that object, not to recreate the store.
+    path = tmp_path / "foreign.db"
+    await _fresh(path)
+    _sql(path, "ALTER TABLE search_presets RENAME COLUMN owner_user_id TO owner")
+    _plant_unloaded_virtual_table(path, "vt")
+    name, table = dependent.split()[2], "vv" if kind == "view" else "users"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute(
+            "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES (?, ?, ?, 0, ?)",
+            (kind, name, table, dependent),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(SchemaMismatchError) as info:
+        await _fresh(path)
+    cause = info.value.cause
+    assert cause is not None and cause.startswith(f"error in {kind} {name}: no such module"), cause
+    text = str(info.value)
+    assert text.startswith(f"store {path} holds a view or trigger this build did not create"), text
+    assert "recreate" not in text and "NEW store key" not in text, text
+    # The remedy is true: with that object dropped, the same migration runs and the open succeeds.
+    _sql(path, drop)
+    await _fresh(path)
+    assert "owner_user_id" in _preset_columns(path)
+
+
+# --- BACKLOG #6720 item 4: the verify's own read --------------------------------------------------
+
+
+async def test_a_shape_error_from_the_verify_read_is_refused_with_the_remedy(
+    tmp_path: Path,
+) -> None:
+    # No statement of the script or the migrations touches shared_body, so the first read of it is
+    # the verify's column read. A virtual table whose stored SQL the ordinary-table predicate does
+    # not recognise (two spaces) is read there, and its unloaded module raises.
+    path = tmp_path / "read.db"
+    await _fresh(path)
+    _sql(
+        path,
+        "DROP TABLE shared_body",
+        "PRAGMA writable_schema = ON",
+        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table',"
+        " 'shared_body', 'shared_body', 0,"
+        " 'CREATE  VIRTUAL TABLE shared_body USING no_such_module(x)')",
+    )
+    with pytest.raises(SchemaMismatchError) as info:
+        await _fresh(path)
+    text = str(info.value)
+    assert text.startswith(f"store {path} is from an incompatible version; recreate it:"), text
+    assert "The schema step failed: no such module" in text, text
+    assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+
+
+async def test_a_read_error_that_is_not_a_shape_keeps_its_own_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control: a read failure that recreating the store would not fix is not given the remedy.
+    from messagefoundry.store import schema_verify
+
+    async def locked(*_args: object, **_kwargs: object) -> list[str]:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(schema_verify, "live_schema_differences", locked)
+    async with _connected(":memory:") as db:
+        with pytest.raises(sqlite3.OperationalError) as info:
+            await schema_verify.verify_live_schema(
+                db,
+                schema=_SCHEMA,
+                migrate=MessageStore._migrate,
+                path="locked.db",
+                counts_under_dek=False,
+            )
+    assert not isinstance(info.value, SchemaMismatchError)
+    assert str(info.value) == "database is locked"
+
+
+# --- BACKLOG #6720 item 1: a foreign view using an unloaded function or collation ----------------
+
+
+@pytest.mark.parametrize(
+    "view",
+    [
+        pytest.param("CREATE VIEW vf AS SELECT f(name) AS n FROM search_presets", id="function"),
+        pytest.param(
+            "CREATE VIEW vf AS SELECT name FROM search_presets ORDER BY name COLLATE mycoll",
+            id="collation",
+        ),
+    ],
+)
+async def test_a_foreign_view_using_an_unloaded_function_or_collation_stops_nothing(
+    tmp_path: Path, view: str
+) -> None:
+    # Measured on the local SQLite: neither the script, the RENAME COLUMN migration nor the verify
+    # fails on such a view, so there is no failure for the step test to classify. Reading the view
+    # fails, as the control below shows, and the open succeeds all the same.
+    path = tmp_path / "foreign-view.db"
+    await _fresh(path)
+    _sql(path, "ALTER TABLE search_presets RENAME COLUMN owner_user_id TO owner")
+    conn = sqlite3.connect(path)
+    try:
+        conn.create_function("f", 1, lambda x: x)
+        conn.create_collation("mycoll", lambda a, b: (a > b) - (a < b))
+        conn.execute(view)
+        conn.commit()
+    finally:
+        conn.close()
+    # Positive control: without the function or collation loaded, reading the view does fail.
+    conn = sqlite3.connect(path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="no such (function|collation)"):
+            conn.execute("SELECT * FROM vf").fetchall()
+    finally:
+        conn.close()
+    await _fresh(path)
+    assert "owner_user_id" in _preset_columns(path)
