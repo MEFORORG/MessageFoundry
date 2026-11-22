@@ -353,14 +353,22 @@ class MessageDetailPanel(QWidget):
                     o.status,
                     str(o.attempts),
                     fmt_ts(o.next_attempt_at),
-                    o.last_error or "",
+                    o.last_error
+                    or ("withheld" if getattr(o, "last_error_withheld", False) else ""),
                 ]
             ):
                 self._outbox.setItem(r, c, QTableWidgetItem(text))
 
         self._events.setRowCount(len(detail.events))
         for r, e in enumerate(detail.events):
-            for c, text in enumerate([fmt_ts(e.ts), e.event, e.destination or "", e.detail or ""]):
+            for c, text in enumerate(
+                [
+                    fmt_ts(e.ts),
+                    e.event,
+                    e.destination or "",
+                    e.detail or ("withheld" if getattr(e, "detail_withheld", False) else ""),
+                ]
+            ):
                 self._events.setItem(r, c, QTableWidgetItem(text))
 
     def _on_show_body(self) -> None:

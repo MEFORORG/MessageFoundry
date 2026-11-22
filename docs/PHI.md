@@ -1820,8 +1820,12 @@ which client asked: `harness`, `apiclient` or `api` as the HTTP caller declares 
 which the engine records itself for the web console), `summary_access` (patient summaries) and
 `attachment_download` (a detached document's bytes, with `"served": "sanitized-svg"` when they
 are a sanitized copy). A refused download is not an access, since it serves nothing, and writes
-`attachment_download_refused` with a `reason` (BACKLOG #2387). These sit beside the auth and admin
-events listed in [SECURITY.md](SECURITY.md). Each row carries actor, action, timestamp, channel, the
+`attachment_download_refused` with a `reason` (BACKLOG #2387). A detail read that withholds a cell
+because its marker names a key the store does not hold, which a rewritten marker also reads as,
+still succeeds. Its `message_view` or `outbound.read` row then carries a `withheld` map of column
+name to count, never a value, key id or marker. The open also sets `outbox[].last_error_withheld`
+and `events[].detail_withheld` for a `messages:view_summary` holder (BACKLOG #5693). These sit
+beside the auth and admin events listed in [SECURITY.md](SECURITY.md). Each row carries actor, action, timestamp, channel, the
 caller's `client` address, and a JSON `detail` (filters, counts, exposed control IDs — **not** the
 bodies). Read the trail via `GET /audit` (`audit:read`).
 

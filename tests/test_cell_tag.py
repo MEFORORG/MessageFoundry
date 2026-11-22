@@ -1483,6 +1483,71 @@ async def test_the_message_view_audit_names_each_withheld_detail_column(
             assert content not in detail
 
 
+async def test_the_outbound_read_audit_names_a_withheld_last_error(
+    tmp_path: pathlib.Path,
+) -> None:
+    """BACKLOG #5693: ``GET /messages/{id}/outbound`` succeeds past a withheld ``last_error``, so
+    its ``outbound.read`` row is the per-message record of a rewritten marker. Column name and
+    count only, and a read that withholds nothing writes the detail it always wrote."""
+    import json
+
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+
+    db = tmp_path / "outbound-audit.db"
+    foreign_key = generate_key()
+    foreign = make_cipher(foreign_key, write_v2=True).encrypt("SYNTH-FOREIGN")
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
+    engine = Engine(
+        store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+
+    async def read(client: httpx.AsyncClient, message_id: str) -> str:
+        response = await client.get(f"/messages/{message_id}/outbound")
+        assert response.status_code == 200
+        assert {p["payload"] for p in response.json()["payloads"]} == {_DETAIL_RAW}
+        rows = await store.list_audit(limit=1, action="outbound.read")
+        return str(rows[0]["detail"])
+
+    try:
+        mid = await store.enqueue_message(
+            channel_id="ch1",
+            raw=_DETAIL_RAW,
+            deliveries=[("archive", _DETAIL_RAW), ("second", _DETAIL_RAW)],
+        )
+        for destination in ("archive", "second"):
+            item = await store.claim_next_fifo(destination)
+            assert item is not None
+            await store.dead_letter_now(item.id, "synthetic permanent reject")
+
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            # Control: nothing withheld, so the detail is byte-for-byte what it was.
+            assert await read(client, mid) == json.dumps({"message_id": mid, "count": 2})
+
+            with sqlite3.connect(db) as planted:
+                planted.execute(
+                    "UPDATE queue SET last_error=? WHERE message_id=? AND stage='outbound'"
+                    " AND destination_name='archive'",
+                    (foreign, mid),
+                )
+            planted.close()
+            audited = await read(client, mid)
+    finally:
+        await engine.stop()
+
+    assert json.loads(audited) == {
+        "message_id": mid,
+        "count": 2,
+        "withheld": {"outbox.last_error": 1},
+    }
+    for content in ("mfenc", "SYNTH-FOREIGN", foreign_key):  # the marker opens every cell
+        assert content not in audited
+
+
 def _transit_refusing(text: str) -> Any:
     """A Vault Transit cipher whose every ``decrypt`` gets Vault's HTTP 400 with ``text``."""
     from hvac.exceptions import InvalidRequest

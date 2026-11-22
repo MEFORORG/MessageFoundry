@@ -236,3 +236,49 @@ def test_an_unexpected_body_failure_is_reported_and_the_button_offered_again(qap
         assert panel._show_body.isEnabled()
     finally:
         panel.stop()
+
+
+@pytest.mark.parametrize(
+    ("flags", "shown"),
+    [
+        ({"last_error_withheld": True, "detail_withheld": True}, "withheld"),
+        ({"last_error_withheld": False, "detail_withheld": False}, ""),  # control
+        ({}, ""),  # a response without the fields
+    ],
+)
+def test_a_withheld_cell_does_not_read_as_one_that_never_failed(
+    qapp: Any, flags: dict[str, bool], shown: str
+) -> None:
+    """BACKLOG #5693: a withheld ``last_error`` or ``detail`` is null, like a cell never written,
+    so the panel says which it is."""
+
+    class _Withheld(_FakeClient):
+        def get_message(self, message_id: str) -> Any:
+            opened = super().get_message(message_id)
+            outbox = {k: v for k, v in flags.items() if k == "last_error_withheld"}
+            events = {k: v for k, v in flags.items() if k == "detail_withheld"}
+            opened.outbox = [
+                SimpleNamespace(
+                    destination_name="archive",
+                    status="dead",
+                    attempts=1,
+                    next_attempt_at=1_780_000_000.0,
+                    last_error=None,
+                    **outbox,
+                )
+            ]
+            opened.events = [
+                SimpleNamespace(
+                    ts=1_780_000_000.0, event="dead", destination=None, detail=None, **events
+                )
+            ]
+            return opened
+
+    panel = MessageDetailPanel(_Withheld())  # type: ignore[arg-type]
+    try:
+        _open(panel, "m1")
+        last_error, detail = panel._outbox.item(0, 4), panel._events.item(0, 3)
+        assert last_error is not None and last_error.text() == shown
+        assert detail is not None and detail.text() == shown
+    finally:
+        panel.stop()

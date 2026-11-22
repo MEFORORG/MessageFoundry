@@ -8742,11 +8742,18 @@ def create_app(
         payload_rows = await engine.store.outbox_payloads_for(message_id)
         # Returning transformed bodies is PHI access — audit the read, and (when bodies are actually
         # returned) record the per-message PHI view timeline, exactly like opening a raw body.
+        audit_detail: dict[str, object] = {"message_id": message_id, "count": len(payload_rows)}
+        # A rewritten marker reads as a key not held and no longer fails this read, so this row is
+        # its per-message record, as on message_view (BACKLOG #5693). Column name and count only:
+        # never a value, key id, marker or error text.
+        withheld = sum(o["last_error_withheld"] for o in payload_rows)
+        if withheld:
+            audit_detail["withheld"] = {"outbox.last_error": withheld}
         await engine.store.record_audit(
             "outbound.read",
             actor=identity.username,
             channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id, "count": len(payload_rows)}),
+            detail=json.dumps(audit_detail),
             client=client_ip(request),
         )
         if payload_rows:
