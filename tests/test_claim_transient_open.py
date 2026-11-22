@@ -1137,7 +1137,7 @@ async def test_claim_ready_does_not_release_a_row_it_already_set_aside(
         with pytest.raises(TypeError):
             await store.claim_ready(10, destination_name=_DEST)
         # The first row was set aside and settled; the second, which raised, is set aside too.
-        assert len(set_aside) == 2 and released == [set_aside[1]]
+        assert len(set_aside) == 2 and released == []
     finally:
         await store.close()
 
@@ -1331,4 +1331,4 @@ async def test_server_claim_ready_does_not_release_a_row_it_already_set_aside(
     store.reschedule_claimed = reschedule
     with pytest.raises(TypeError):
         await _claim_ready_server(store)
-    assert released == [rows[1]["id"]]
+    assert released == []  # both rows were set aside, so neither is this claim's to release

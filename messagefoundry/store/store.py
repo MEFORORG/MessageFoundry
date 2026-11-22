@@ -15232,13 +15232,16 @@ class MessageStore:
     ) -> None:
         """Hand back a claim that is about to re-raise (BACKLOG #5723). ``failed`` is set aside
         first, so it reads not-due and the next pass can take the rows around it, or the FIFO
-        prefix before it, rather than meet the same error. ``rows`` are then released; the release
-        skips a row that is no longer ``inflight``, ``failed`` included. Never raises an
-        ``Exception``, so the caller's error stays the one re-raised."""
+        prefix before it, rather than meet the same error. The other ``rows`` are then released;
+        ``failed`` is released too only if its set-aside failed, since once its backoff passes
+        another claim may hold it. Never raises an ``Exception``, so the caller's error stays the
+        one re-raised."""
         try:
             await self._set_aside_claimed([failed], now)
         except Exception as exc:  # noqa: BLE001 -- the release below still runs
             log.warning("could not set aside a failed claimed row (%s)", type(exc).__name__)
+        else:
+            rows = [r for r in rows if r["id"] != failed["id"]]
         await release_unreturned(self, [rows])
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:

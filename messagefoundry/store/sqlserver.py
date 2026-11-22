@@ -11180,6 +11180,8 @@ class SqlServerStore:
             await self._set_aside_claimed([failed], now)
         except Exception as exc:  # noqa: BLE001 -- the release below still runs
             log.warning("could not set aside a failed claimed row (%s)", type(exc).__name__)
+        else:
+            rows = [r for r in rows if r["id"] != failed["id"]]
         await release_unreturned(self, [rows])
 
     async def _open_queue_body(self, cur: Any, row: dict[str, Any], *, alert: bool = True) -> str:

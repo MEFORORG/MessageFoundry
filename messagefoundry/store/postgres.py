@@ -5949,8 +5949,8 @@ class PostgresStore:
         """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
         (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
         too, its error propagates to the claim, which releases its unsettled rows and re-raises
-        (BACKLOG #5723); if the release fails as well, they stay ``inflight`` until startup
-        recovery, or a FIFO lane's reclaim of an expired lease."""
+        (BACKLOG #5723); if the release fails as well, they stay ``inflight`` until a
+        recovery path re-pends them, at least startup recovery or a FIFO lane's lease reclaim."""
         log.warning(
             "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
             " dead-lettered, for a reason the claim could not settle",
@@ -5968,6 +5968,8 @@ class PostgresStore:
             await self._set_aside_claimed([failed], now)
         except Exception as exc:  # noqa: BLE001 -- the release below still runs
             log.warning("could not set aside a failed claimed row (%s)", type(exc).__name__)
+        else:
+            rows = [r for r in rows if r["id"] != failed["id"]]
         await release_unreturned(self, [rows])
 
     async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:

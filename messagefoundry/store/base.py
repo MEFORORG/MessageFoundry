@@ -665,8 +665,9 @@ class QueueStore(StoreLifecycle, Protocol):
         backend, first returns the claimed rows not yet settled to ``pending`` with ``attempts``
         undone, the row that failed with the set-aside backoff (BACKLOG #5723). Such a row is
         retried with no cap, and nothing dead-letters it. If that write fails, or a cancellation
-        escapes instead, the rows stay ``inflight`` until :meth:`reset_stale_inflight` or, for a
-        Postgres FIFO lane, a reclaim of the expired lease, and a later FIFO claim can pass them.
+        escapes instead, the rows stay ``inflight`` until a recovery path re-pends them, at least
+        :meth:`reset_stale_inflight` or a Postgres FIFO lane's lease reclaim, and a later FIFO
+        claim can pass them.
         :meth:`claim_ready` and :meth:`claim_next_fifo_batch` settle a row the same way.
 
         On the Postgres backend (active-passive HA) the claim also reclaims this lane's stranded head —
