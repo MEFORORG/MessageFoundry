@@ -6,6 +6,12 @@
 // source in a jsdom page (webview-receivers.test.ts), so what the tests exercise is what ships.
 import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
+/** The largest `cooldown_seconds` the engine loads: `_ALERT_COOLDOWN_MAX_SECONDS` in
+ *  messagefoundry/config/settings.py (BACKLOG #5770). A unit test pins the two together. */
+export const ALERT_COOLDOWN_MAX_SECONDS = 7 * 24 * 60 * 60;
+/** The same cap in days, for the text that states it. */
+export const ALERT_COOLDOWN_MAX_DAYS = ALERT_COOLDOWN_MAX_SECONDS / 86400;
+
 /** The whole inline `<script>` body for one render, guard included. `token` is this render's
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
 export function alertEditorScript(
@@ -49,7 +55,14 @@ export function alertEditorScript(
       if (t.length === 0) return 'suppress';
       return t.join(', ');
     }
-    const num = (id) => { const v = $(id).value.trim(); return v === '' ? undefined : Number(v); };
+    // A number input reads '' for text it cannot parse, as for an empty box; badInput tells them
+    // apart, so "5-" is refused rather than dropped from the rule (BACKLOG #5831).
+    const num = (id) => {
+      const el = $(id);
+      if (el.validity && el.validity.badInput) { return NaN; }
+      const v = el.value.trim();
+      return v === '' ? undefined : Number(v);
+    };
 
     function build() {
       const rule = {
@@ -70,8 +83,19 @@ export function alertEditorScript(
     function invalid(msg) { show(removeIsOff() ? msg + ' ' + REMOVE_OFF : msg); return false; }
     function validate(rule) {
       if (!rule.connection) { return invalid('Connection is required (use * for all).'); }
-      for (const [k, label] of [['min_depth','Min depth'],['min_oldest_seconds','Min oldest'],['cooldown_seconds','Cooldown']]) {
-        if (rule[k] !== undefined && !Number.isFinite(rule[k])) { return invalid(label + ' must be a number.'); }
+      // Each in-range test is the engine's own bound on AlertRule (messagefoundry/config/settings.py,
+      // BACKLOG #5831), so a value the engine would refuse is refused here, before Add.
+      for (const [k, label, inRange, bound] of [
+        ['min_depth', 'Min depth', (v) => Number.isInteger(v) && v >= 1, 'a whole number of 1 or more'],
+        ['min_oldest_seconds', 'Min oldest', (v) => v >= 0, '0 or more seconds'],
+        ['cooldown_seconds', 'Cooldown', (v) => v > 0 && v <= ${ALERT_COOLDOWN_MAX_SECONDS},
+          'more than 0 and at most ${ALERT_COOLDOWN_MAX_SECONDS} seconds (${ALERT_COOLDOWN_MAX_DAYS} days)'],
+      ]) {
+        if (rule[k] === undefined) { continue; }
+        if (!Number.isFinite(rule[k])) { return invalid(label + ' must be a number.'); }
+        // min_depth is an int on the engine, and past 2^53 the number posted is not the digits typed.
+        if (k === 'min_depth' && Number.isInteger(rule[k]) && !mfInt(rule[k])) { return invalid(label + ' is too large to send exactly.'); }
+        if (!inRange(rule[k])) { return invalid(label + ' must be ' + bound + '.'); }
       }
       if (removeIsOff()) { show(REMOVE_OFF); }
       // An error that arrived before any list rendered is all the page has to show under "Current
