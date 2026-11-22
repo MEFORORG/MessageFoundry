@@ -1703,8 +1703,9 @@ docstring of `_shown_name` in
 [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
 The checked read's seal-failure report is per account and
 rate-limited, in each engine process: only the first refusal of an account in
-each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) for a record that
-fails its seal writes the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. Each engine
+each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) for its record failing
+its integrity check writes the `integrity.authority_seal_failed` audit row and raises the
+`integrity_drift` alert. Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
@@ -1734,12 +1735,11 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-answered by these reads the same way, a 423 or listed as failed, except on the pages that read the
-name through `_shown_name` and the delete confirmation, but reported under
+answered the same way, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
-its own. A Vault transit Outage on any account these reads check, except on the pages that read the
-name through `_shown_name`, answers 503 with `Retry-After`,
-lists nothing, pages `authority-seal-transit` and writes no audit row.
+its own. A Vault transit Outage on any account these reads check lists nothing, pages
+`authority-seal-transit` and writes no audit row, and, except on the pages that read the name
+through `_shown_name`, answers 503 with `Retry-After`.
 
 A custom role save checks the role name (BACKLOG #5785) after its gate. Where
 `[auth].require_action_step_up` is on, the default, and the save would end the caller's own
