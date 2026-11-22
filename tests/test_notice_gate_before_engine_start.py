@@ -14,6 +14,7 @@ warn arm is its control: the same app with the dial moved, and the probe must fi
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -32,9 +33,9 @@ def _record_engine_start(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("engine.start")
         raise RuntimeError("PROBE: engine.start reached")
 
-    async def _stop(self: Engine) -> None:
+    async def _stop(self: Engine, **kwargs: Any) -> None:
         calls.append("engine.stop")
-        await real_stop(self)
+        await real_stop(self, **kwargs)
 
     monkeypatch.setattr(Engine, "start", _probe)
     monkeypatch.setattr(Engine, "stop", _stop)

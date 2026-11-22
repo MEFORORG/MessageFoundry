@@ -91,8 +91,8 @@ class _StopRecordingRunner(crl_reload.CrlReloadRunner):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**{**kwargs, "interval_seconds": 0.05})
 
-    async def stop(self) -> None:
-        await super().stop()
+    async def stop(self, *, timeout: float | None = None) -> None:
+        await super().stop(timeout=timeout)
         type(self).stops += 1
 
 

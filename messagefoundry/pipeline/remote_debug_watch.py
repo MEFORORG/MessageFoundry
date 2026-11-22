@@ -75,6 +75,7 @@ import json
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -82,7 +83,13 @@ from messagefoundry.pipeline.intake_bound import process_alert_subject
 from messagefoundry.remotedebug import remote_debug_posture
 from messagefoundry.store.base import AuditStore
 
-__all__ = ["ALERT_SUBJECT", "AUDIT_ACTION", "CHECK_INTERVAL_SECONDS", "RemoteDebugRefusalWatch"]
+__all__ = [
+    "ALERT_SUBJECT",
+    "AUDIT_ACTION",
+    "CHECK_INTERVAL_SECONDS",
+    "RemoteDebugRefusalWatch",
+    "StopDeadline",
+]
 
 log = logging.getLogger(__name__)
 
@@ -92,12 +99,26 @@ AUDIT_ACTION = "remote_debug_refused"
 ALERT_SUBJECT = "remote_debug:refused"
 #: How often the watch reads the guard's count. The most rows one hour can add is 3600 over this.
 CHECK_INTERVAL_SECONDS = 30.0
-#: How long :meth:`RemoteDebugRefusalWatch.stop` waits for the last pass before it cancels it.
+#: The most :meth:`RemoteDebugRefusalWatch.stop` waits for the last pass before it cancels it,
+#: and then for the cancel. A stop deadline can cut each wait to :data:`STOP_FLOOR_SECONDS`.
 _STOP_SECONDS = 5.0
+#: Under a deadline, the least each of :meth:`RemoteDebugRefusalWatch.stop`'s two waits is given.
+STOP_FLOOR_SECONDS = 0.1
 #: How long the pass waits for one audit row before it cancels the write. The cancel can take
-#: longer to finish. A later pass retries the row. At stop, the shorter :data:`_STOP_SECONDS`
-#: bound in :meth:`RemoteDebugRefusalWatch.stop` cuts in first, and no later pass retries.
+#: longer to finish. A later pass retries the row. At stop, the shorter bound in
+#: :meth:`RemoteDebugRefusalWatch.stop` cuts in first, and no later pass retries.
 _ROW_SECONDS = CHECK_INTERVAL_SECONDS
+
+
+@dataclass(frozen=True, slots=True)
+class StopDeadline:
+    """An event-loop time, from ``loop.time()``, that :meth:`RemoteDebugRefusalWatch.stop` ends by.
+
+    A class and not a bare float, so mypy refuses a relative timeout passed where this deadline
+    belongs, which would silently give each wait the floor, and refuses this deadline passed where
+    a relative timeout belongs, such as ``CrlReloadRunner.stop(timeout=...)`` (BACKLOG #3191)."""
+
+    loop_time: float
 
 
 def _refused_scripts() -> int:
@@ -142,8 +163,21 @@ class RemoteDebugRefusalWatch:
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
 
-    async def stop(self) -> None:
-        """Signal the loop, let it make its last pass, and await its exit (idempotent)."""
+    async def stop(self, *, deadline: StopDeadline | None = None) -> None:
+        """Signal the loop, let it make its last pass, and await its exit (idempotent).
+
+        Each of the two waits, the pass's and the cancel's, is bounded by :data:`_STOP_SECONDS`.
+        ``deadline``, an event-loop time engine.stop() passes under its budget (BACKLOG #3191),
+        also ends each wait by then, keeping :data:`STOP_FLOOR_SECONDS` of it for the cancel's
+        wait, and never gives a wait less than that floor."""
+        loop = asyncio.get_running_loop()
+
+        def _bound(kept: float) -> float:
+            if deadline is None:
+                return _STOP_SECONDS
+            left = deadline.loop_time - loop.time() - kept
+            return min(_STOP_SECONDS, max(STOP_FLOOR_SECONDS, left))
+
         self._stop.set()
         task, self._task = self._task, None
         if task is None:
@@ -151,7 +185,8 @@ class RemoteDebugRefusalWatch:
         # ``wait``, not ``wait_for``: a loop task that something else cancelled must not make
         # this call look cancelled, which would end the engine's stop before it closed the store.
         try:
-            done, _pending = await asyncio.wait({task}, timeout=_STOP_SECONDS)
+            wait = _bound(STOP_FLOOR_SECONDS)
+            done, _pending = await asyncio.wait({task}, timeout=wait)
         except asyncio.CancelledError:
             task.cancel()
             raise
@@ -159,12 +194,24 @@ class RemoteDebugRefusalWatch:
             task.cancel()
             # Bounded too: a driver call can take as long to unwind a cancel as it took to hang,
             # and the engine's stop must still reach the store's close.
-            await asyncio.wait({task}, timeout=_STOP_SECONDS)
-            log.warning(
-                "remote-debug refusal watch: the last pass did not finish in %.0f s and was "
-                "cancelled, so a refusal since the pass before it may have no audit row",
-                _STOP_SECONDS,
-            )
+            cancel_wait = _bound(0.0)
+            await asyncio.wait({task}, timeout=cancel_wait)
+            if task.done():
+                log.warning(
+                    "remote-debug refusal watch: the last pass did not finish in %.2f s and was "
+                    "cancelled, so a refusal since the pass before it may have no audit row and "
+                    "no alert",
+                    wait,
+                )
+            else:
+                log.warning(
+                    "remote-debug refusal watch: the last pass did not finish in %.2f s and had not "
+                    "ended %.2f s after its cancel, so it may still be running when the store "
+                    "closes, and a refusal since the pass before it may have no audit row and no "
+                    "alert",
+                    wait,
+                    cancel_wait,
+                )
 
     async def _run(self) -> None:
         while not self._stop.is_set():
