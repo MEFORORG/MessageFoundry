@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The tee relay refuses a non-positive retry count or shadow-queue bound (BACKLOG #5829).
+"""The tee relay refuses a non-positive attempt count or shadow-queue bound (BACKLOG #5829).
 
 A ``corepoint_attempts`` of zero or less would skip the forward loop, so an ACKed Epic message
-would never reach Corepoint and the relay would fail on its "the loop ran" invariant instead of
-tripping fail-closed. A ``mefor_queue_max`` of zero or less would make ``asyncio.Queue``
+would never reach Corepoint (before this fix it then failed an assert rather than tripping
+fail-closed). A ``mefor_queue_max`` of zero or less would make ``asyncio.Queue``
 unbounded. Both must be refused at construction and at the CLI, before any listener starts.
 """
 

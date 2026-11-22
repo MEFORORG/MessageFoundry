@@ -11,11 +11,12 @@ Topology (backlog #14):
 
 Failure model:
 
-* The **Corepoint** leg is the production path. On a *transport* failure (on every one of a few quick
-  tries, counting the first) the relay is **fail-closed**: it stops accepting on Listener A and drops
-  live Epic connections so Epic sees the outage and queues/retries on its side. It does **not** exit
-  (avoids a crash-loop against a down Corepoint); restart it once Corepoint is healthy. A Corepoint
-  **NAK** is *logged, not* a trip — the partner is reachable, it just rejected one message.
+* The **Corepoint** leg is the production path. On a *transport* failure on every one of a few
+  tries, counting the first, the relay is **fail-closed**: it stops accepting on Listener A and
+  drops live Epic connections so Epic sees the outage and queues/retries on its side. It does
+  **not** exit (avoids a crash-loop against a down Corepoint); restart it once Corepoint is
+  healthy. A Corepoint **NAK** is *logged, not* a trip — the partner is reachable, it just
+  rejected one message.
 * The **MEFOR** leg is shadow-only and fully **decoupled** (a bounded queue drained by its own worker), so
   a slow/down MEFOR never back-pressures or trips the production path. Its failures are logged and dropped.
 
@@ -77,8 +78,8 @@ class RelayConfig:
 
     def __post_init__(self) -> None:
         # Refuse these here, before any listener binds: a zero/negative attempt count would skip the
-        # Corepoint forward loop, so an ACKed Epic message would never be sent and fail-closed would
-        # not trip; a zero/negative bound makes asyncio.Queue unbounded.
+        # Corepoint forward loop, so every ACKed Epic message would trip fail-closed without one
+        # forward being tried; a zero/negative bound makes asyncio.Queue unbounded.
         for name in ("corepoint_attempts", "mefor_queue_max"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -533,7 +534,7 @@ class TeeRelay:
             logger.error("could not record the cut-off message (%r) control_id=%s", exc, control_id)
 
     async def _forward_corepoint(self, payload: bytes) -> tuple[str, str | None, str | None]:
-        """Forward to Corepoint with a few quick retries; raise :class:`ForwardError` if all fail."""
+        """Try Corepoint up to ``corepoint_attempts`` times; raise :class:`ForwardError` if all fail."""
         cfg = self.config
         last: ForwardError | None = None
         for attempt in range(1, cfg.corepoint_attempts + 1):
