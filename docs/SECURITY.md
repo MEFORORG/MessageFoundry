@@ -1698,16 +1698,15 @@ only when the checked read refuses the record for its seal.
 `GET /ui/users/{user_id}`, `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
-account's name the same way. That an `Exception` from that read, a defect included, still shows
-what was issued, naming the account by its id, and what it logs, is stated once, in the docstring
-of `_shown_name` in
+account's name the same way. What those pages show and log when that read fails is stated in the
+docstring of `_shown_name` in
 [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
-The checked read's own seal-failure report, separate from those lines, is per account and
+The checked read's own seal-failure report is per account and
 rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
 inside that interval, from any of these routes or any other reader of the same account in that
-process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
+process, is refused as the sentences above say and adds no row and no alert. Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
