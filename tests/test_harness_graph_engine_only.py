@@ -111,9 +111,10 @@ def test_inlined_id_parser_matches_harness_load_ids() -> None:
         assert inlined.parse(SHARDCERT_IDS.format(seq)) == seq
 
 
+@pytest.mark.parametrize("module", ["_shape.py", "graph.py"])
 @pytest.mark.parametrize("graph", _GRAPHS)
-def test_the_shape_does_not_import_the_harness_package(graph: str) -> None:
-    # Walks function bodies too, which the load test above never runs.
-    tree = parse_source((_CONFIG / graph / "_shape.py").read_text(encoding="utf-8"))
+def test_the_graph_does_not_import_the_harness_package(graph: str, module: str) -> None:
+    # Walks function bodies too: a Router's or Handler's body does not run in the load test above.
+    tree = parse_source((_CONFIG / graph / module).read_text(encoding="utf-8"))
     imported = _modules_imported_by(tree, f"harness.config.{graph}")
     assert not [name for name in imported if name.split(".")[0] == "harness"]

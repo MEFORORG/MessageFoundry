@@ -43,10 +43,10 @@ class ControlIds:
         return int(tail)
 
 
-#: THE shardcert control-id scheme — the ONE definition of the wire format its senders stamp and its
-#: PARTITIONED router decodes. Defined here, beside :class:`ControlIds`, because it is now READ on the
-#: engine side too (``harness.config.shardcert._shape.ShardCertShape.destination_index`` recovers the seq
-#: to pick the destination lane), which makes the prefix a genuine SENDER↔ROUTER contract rather than a
+#: THE shardcert control-id scheme — the definition of the wire format its senders stamp. Its PARTITIONED
+#: router decodes that format through a parity-tested copy of the parser
+#: (``harness.config.shardcert._shape.ShardCertShape.destination_index`` recovers the seq to pick the
+#: destination lane), which makes the prefix a genuine SENDER↔ROUTER contract rather than a
 #: sender-local detail. Every shardcert sender (single-box, two-box driver, sink) MUST import this object.
 #: The graph's ``_shape`` holds the one permitted copy of the parser, so that it loads without the harness
 #: package (BACKLOG #5854), and ``tests/test_harness_graph_engine_only.py`` holds that copy equal to this
