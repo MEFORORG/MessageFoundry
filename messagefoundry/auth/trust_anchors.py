@@ -1782,8 +1782,9 @@ def hold_store_pin_refused(spec: AnchorSpec, refusal: str) -> None:
         log.error(
             "%s: a settings check at enforce refused the SQL Server pin %r, so this engine "
             "process's store now refuses new connections; the ones already open stay open. A "
-            "later settings check, such as a reload, that passes the pin with no warning lets it "
-            "connect again, and so does a restart once the file is corrected",
+            "later settings check at enforce that passes the pin with no content warning lets it "
+            "connect again, but a reload may not reach that check: its route can need a new store "
+            "connection first. A restart once the file is corrected lifts it",
             spec.setting,
             spec.path,
         )
