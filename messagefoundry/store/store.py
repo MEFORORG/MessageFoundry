@@ -1521,6 +1521,19 @@ class ConnectionEventWrite(TypedDict):
     now: NotRequired[float | None]
 
 
+def stamped_connection_event(ev: ConnectionEventWrite) -> ConnectionEventWrite:
+    """``ev``, with ``now`` set to the current time when it is absent or ``None``.
+
+    The writers call this on the event loop before they hand the event's params to the cipher
+    (BACKLOG #3929), so an event is stamped when it is written, not when a busy Transit pool
+    reaches it; the stamp is also in the reason cell's AAD."""
+    if ev.get("now") is not None:
+        return ev
+    stamped = ev.copy()
+    stamped["now"] = time.time()
+    return stamped
+
+
 #: The session columns a session seal leaves out, each with the reason (BACKLOG #2592). Everything
 #: else in :class:`SessionRecord` is sealed, so a column added later is covered by default.
 #: ``tests/test_session_seal.py`` pins this list.
@@ -18551,15 +18564,17 @@ class MessageStore:
         params = await cipher_call(
             self._cipher,
             self._connection_event_params,
-            ConnectionEventWrite(
-                connection=connection,
-                transport=transport,
-                direction=direction,
-                kind=kind,
-                peer_host=peer_host,
-                message_id=message_id,
-                reason=reason,
-                now=now,
+            stamped_connection_event(
+                ConnectionEventWrite(
+                    connection=connection,
+                    transport=transport,
+                    direction=direction,
+                    kind=kind,
+                    peer_host=peer_host,
+                    message_id=message_id,
+                    reason=reason,
+                    now=now,
+                )
             ),
         )
         async with _writer_guard(self._db, self._lock):
@@ -18570,7 +18585,10 @@ class MessageStore:
         # A burst in ONE transaction (BACKLOG #1731): the runner's drainer hands over everything
         # already queued, so a connect-per-message sender pays one commit per burst, not per event.
         # _writer_txn: the whole burst is one explicit transaction, so it commits or unwinds whole.
-        rows = [await cipher_call(self._cipher, self._connection_event_params, ev) for ev in events]
+        stamped = [stamped_connection_event(ev) for ev in events]
+        rows = [
+            await cipher_call(self._cipher, self._connection_event_params, ev) for ev in stamped
+        ]
         if not rows:
             return
         async with _writer_txn(self._db, self._lock):

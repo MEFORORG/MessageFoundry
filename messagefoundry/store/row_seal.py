@@ -561,7 +561,7 @@ async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs
         # the hand-off is caught: a RuntimeError raised BY the call is a defect and propagates as
         # itself. Where the pool queued the call before failing to start a thread, it may still run
         # later, unawaited.
-        raise CipherUnavailableError("the Transit row-seal pool could not take the call")
+        raise CipherUnavailableError("the Transit call pool could not take the call")
     return await future
 
 

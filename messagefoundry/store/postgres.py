@@ -427,6 +427,7 @@ from messagefoundry.store.store import (
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
+    stamped_connection_event,
     tee_audits,
     totp_enable,
     totp_enable_spending_code,
@@ -3535,11 +3536,24 @@ class PostgresStore:
         active-version list) LEFT JOIN ``reference`` so a set synced to ZERO rows is still a present
         empty ``{}``. Returns ``({name: {key: value}}, {name: version})``, each set sealed (BACKLOG
         #1174)."""
-        rows = await self._fetchall(
+        return await cipher_call(
+            self._cipher, self._decode_reference_rows, await self._reference_rows()
+        )
+
+    async def _reference_rows(self) -> Sequence[Mapping[str, Any]]:
+        """Every set's ACTIVE snapshot rows, still sealed: the read half of
+        :meth:`_read_active_reference_snapshots`."""
+        return await self._fetchall(
             "SELECT v.name AS name, v.version AS version, r.key AS key, r.value AS value "
             "FROM reference_version v "
             "LEFT JOIN reference r ON r.name = v.name AND r.version = v.version"
         )
+
+    def _decode_reference_rows(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> tuple[dict[str, MutableMapping[str, Any]], dict[str, str]]:
+        """The decrypt half of :meth:`_read_active_reference_snapshots`. Synchronous, so the
+        whole read decrypts in one :func:`cipher_call` (BACKLOG #3929)."""
         cache: dict[str, MutableMapping[str, Any]] = {}
         versions: dict[str, str] = {}
         for r in rows:
@@ -3549,9 +3563,7 @@ class PostgresStore:
             versions[r["name"]] = r["version"]
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
                 # #241 F2: fail closed on a keyless open of an encrypted store (see _decode_state_cell).
-                entry[r["key"]] = await cipher_call(
-                    self._cipher,
-                    decrypt_json_cell,
+                entry[r["key"]] = decrypt_json_cell(
                     self._cipher,
                     r["value"],
                     aad=cell_aad("reference", "value", r["name"], r["version"], r["key"]),
@@ -3570,10 +3582,19 @@ class PostgresStore:
         versions already match (the leader's own just-written sets). Returns the names refreshed
         (``[]`` when none advanced). The runner only calls this when clustered
         (``coordinator.is_clustered()``), so single-node Postgres never issues this read."""
-        cache, versions = await self._read_active_reference_snapshots()
+        rows = await self._reference_rows()
+        # The versions this handle held when the read returned. Under a cipher that blocks on I/O
+        # the decrypt below suspends (BACKLOG #3929), and this handle's own sync may commit a newer
+        # snapshot meanwhile; a set whose held version moved is left as that sync wrote it, so the
+        # compare is the one made right after the read, as when the decrypt ran inline.
+        held = dict(self._reference_versions)
+        cache, versions = await cipher_call(self._cipher, self._decode_reference_rows, rows)
         refreshed: list[str] = []
         for name, version in versions.items():
-            if self._reference_versions.get(name) != version:
+            current = self._reference_versions.get(name)
+            if current != held.get(name):
+                continue
+            if current != version:
                 self._reference_cache[name] = cache[name]
                 self._reference_versions[name] = version
                 refreshed.append(name)
@@ -7002,7 +7023,10 @@ class PostgresStore:
         # A burst in ONE transaction (BACKLOG #1731): one commit per drained burst, not per event.
         # record=False keeps this diagnostic side path out of the worker acquire-wait histogram, the
         # same exemption the low-frequency convenience helpers take.
-        rows = [await cipher_call(self._cipher, self._connection_event_params, ev) for ev in events]
+        stamped = [stamped_connection_event(ev) for ev in events]
+        rows = [
+            await cipher_call(self._cipher, self._connection_event_params, ev) for ev in stamped
+        ]
         if not rows:
             return
         async with self._timed_acquire(record=False) as conn, conn.transaction():
