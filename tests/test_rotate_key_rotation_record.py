@@ -953,10 +953,10 @@ async def test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_
     #4936), and a real ``Engine.start`` runs the reconcile. Nothing tells this start from a key
     changed by hand after a run, so it stamps the new key and opens no record. The row's decision
     of 2026-11-22 (d20261122T111306998-a53d58) keeps that, with PHI.md's warning against the order
-    as the remedy, pinned by
-    ``test_phi_md_warns_against_a_start_before_the_first_run_on_a_store_with_no_keyed_chain``:
-    ``Engine.start`` neither refuses nor holds it, under either enforcement
-    setting. The seed's stamp is long overdue, so under ``ENFORCE`` a hold that kept the prior
+    as its precaution and no code check (a stamp written this way stands however the run ends),
+    to be revisited if #4936 step 3 covers the case. The warning is pinned by
+    ``test_phi_md_warns_against_a_start_before_the_first_run_on_a_store_with_no_keyed_chain``.
+    ``Engine.start`` neither refuses nor holds it, under either enforcement setting. The seed's stamp is long overdue, so under ``ENFORCE`` a hold that kept the prior
     stamp would refuse this start. This covers ``Engine.start`` only, not the gates ``serve`` runs
     before it."""
     from messagefoundry.config.settings import EgressSettings, StoreSettings
