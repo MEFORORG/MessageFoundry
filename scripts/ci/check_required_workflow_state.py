@@ -37,7 +37,7 @@ import argparse
 import json
 import subprocess
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -45,12 +45,28 @@ _ROOT = Path(__file__).resolve().parents[2]
 # A second implementation of that mapping is exactly the drift this repo keeps writing parity tests to
 # catch (ruff/bandit scan scope, the required-set prose). One resolver, two callers.
 sys.path.insert(0, str(_ROOT))
-from scripts.ci.required_contexts import gh_api  # noqa: E402
-from tests._workflow_contexts import (  # noqa: E402
-    reportable_contexts,
-    required_contexts,
-    resolve,
-)
+
+# Run as a script, an import failure would exit 1, the findings code, so it exits 2 here. The script
+# imports yaml first: without it the resolver falls back to pytest's importorskip, whose Skipped is a
+# BaseException. Imported by a test module, the failure propagates, so that skip still works there.
+try:
+    if __name__ == "__main__":
+        import yaml as _yaml_before_resolver  # noqa: F401
+
+    from scripts.ci.required_contexts import gh_api
+    from tests._workflow_contexts import (
+        reportable_contexts,
+        required_contexts,
+        resolve,
+    )
+except ImportError as exc:
+    if __name__ != "__main__":
+        raise
+    print(
+        f"::error::could not import a dependency ({exc!r}). Treating as a FAILURE.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from exc
 
 # isort: split
 # After the resolver, which owns the handling of an absent PyYAML.
@@ -61,7 +77,7 @@ import yaml  # noqa: E402
 #: will not dispatch, so a required context it owns can never report.
 _RUNNABLE = "active"
 
-_WORKFLOW_DIR = PurePosixPath(".github/workflows")
+_WORKFLOW_DIR = ".github/workflows"
 
 #: What reading the local contexts file and workflow YAML can raise. The resolver asserts a mapping
 #: and then indexes into the parse, so a wrongly shaped file surfaces as an assertion, attribute or
@@ -120,6 +136,18 @@ def _workflow_state(entry: object) -> tuple[str, str]:
     return path, state
 
 
+def _direct_workflow_file(path: str) -> str | None:
+    """The filename of a path directly in ``.github/workflows``, ``None`` for any other canonical path.
+
+    A non-canonical path raises ``RuntimeError``. The raw segments are read because PurePosixPath
+    collapses ``./`` and ``//``, which would let such a path pass as the real file.
+    """
+    *parents, name = segments = path.split("/")
+    if any(part in ("", ".", "..") or part != part.strip() for part in segments):
+        raise RuntimeError(f"workflow path {path!r} is not canonical")
+    return name if "/".join(parents) == _WORKFLOW_DIR else None
+
+
 def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, str]:
     """``{workflow filename: state}`` for every workflow file directly in ``.github/workflows``.
 
@@ -134,24 +162,15 @@ def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, st
         # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
         route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
         payload = gh_api(["--paginate", "--slurp", route])
-    # Only a file directly in .github/workflows can own a required context. The list also carries
-    # GitHub's `dynamic/` entries, skipped so a basename match cannot let one stand in for a real
-    # file; any other path is malformed. PurePosixPath keeps `..`, so it is refused first: it could
-    # otherwise ride the skip out of `dynamic/`, or be the "filename" in `.github/workflows/..`. The
-    # RAW string is compared because PurePosixPath collapses `./` and `//`, which would let a
-    # non-canonical path pass as the real file. A repeat that disagrees is refused, because
-    # last-wins could overwrite a disabled state.
+    # Only a file directly in .github/workflows can own a required context. Any other canonical
+    # entry, such as GitHub's `dynamic/` ones, is left out so a basename match cannot let it stand in
+    # for a real file, and so it cannot abort the sweep and discard a real finding. A repeat that
+    # disagrees is refused, because last-wins could overwrite a disabled state.
     states: dict[str, str] = {}
     for path, state in map(_workflow_state, _workflow_entries(payload)):
-        where = PurePosixPath(path)
-        if ".." in where.parts:
-            raise RuntimeError(f"workflow path {path!r} has a `..` segment")
-        if path.startswith("dynamic/") and len(where.parts) > 1:  # bare `dynamic/` is no entry
-            continue
-        if path != f"{_WORKFLOW_DIR}/{where.name}":
-            raise RuntimeError(f"workflow path {path!r} is not directly in {_WORKFLOW_DIR}")
-        if states.setdefault(where.name, state) != state:
-            raise RuntimeError(f"workflow {where.name} is listed with conflicting states")
+        name = _direct_workflow_file(path)
+        if name is not None and states.setdefault(name, state) != state:
+            raise RuntimeError(f"workflow {name} is listed with conflicting states")
     return states
 
 

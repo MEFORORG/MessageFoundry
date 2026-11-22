@@ -174,15 +174,6 @@ def test_an_identical_repeat_is_harmless(monkeypatch: pytest.MonkeyPatch) -> Non
     assert main(["--repo", "owner/name"]) == 0
 
 
-def test_a_same_named_file_elsewhere_cannot_stand_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A ``dynamic/`` entry with a required file's basename does not make that file present."""
-    entries = _active_entries()
-    name = Path(str(entries[0]["path"])).name
-    entries[0] = {**entries[0], "path": f"dynamic/other/{name}"}
-    _stub_gh(monkeypatch, json.dumps([{"workflows": entries}]))
-    assert main(["--repo", "owner/name"]) == 1
-
-
 @pytest.mark.parametrize(
     ("returncode", "stdout"), [pytest.param(1, "", id="gh-fails"), pytest.param(0, "", id="empty")]
 )
@@ -280,7 +271,7 @@ _GOOD = {"path": ".github/workflows/ci.yml", "state": "active"}
         pytest.param({"workflows": [{"path": "   ", "state": "active"}]}, id="path-blank"),
         pytest.param({"workflows": [{**_GOOD, "state": "   "}]}, id="state-blank"),
         pytest.param(
-            {"workflows": [{"path": " .github/workflows/ci.yml", "state": "active"}]},
+            {"workflows": [{"path": "other/ci.yml", "state": "active"}]},
             id="path-outside-directory",
         ),
         pytest.param(
@@ -315,9 +306,10 @@ def test_a_malformed_shape_exits_2(tmp_path: Path, payload: object) -> None:
         pytest.param("dynamic/x/../../.github/workflows/{name}", id="deep-traversal"),
         pytest.param("dynamic/..", id="dynamic-parent"),
         pytest.param(".github/workflows/..", id="dotdot-as-the-filename"),
-        pytest.param("dynamic", id="bare-dynamic"),
         pytest.param("dynamic/", id="bare-dynamic-slash"),
         pytest.param("./dynamic/x", id="dot-prefixed-dynamic"),
+        pytest.param("dynamic/./.github/workflows/{name}", id="dot-segment-in-dynamic"),
+        pytest.param("dynamic//x", id="doubled-slash-in-dynamic"),
     ],
 )
 def test_a_path_the_dynamic_skip_must_not_take_exits_2(
@@ -331,38 +323,103 @@ def test_a_path_the_dynamic_skip_must_not_take_exits_2(
     assert main(["--repo", "owner/name"]) == 2
 
 
-def test_a_real_dynamic_entry_is_still_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Control for the refusal above: GitHub's own ``dynamic/`` shape does not abort the sweep."""
-    entries = _active_entries()
-    dynamic = {"path": "dynamic/pages/pages-build-deployment", "state": "disabled_manually"}
-    _stub_gh(monkeypatch, json.dumps([{"workflows": [*entries, dynamic]}]))
+@pytest.mark.parametrize(
+    "path",
+    [
+        pytest.param("dynamic/pages/pages-build-deployment", id="dynamic"),
+        pytest.param(".github/workflows/nested/other.yml", id="nested"),
+    ],
+)
+def test_a_canonical_entry_elsewhere_is_ignored(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    """Control for the refusal above: its disabled state neither aborts nor fails the sweep."""
+    other = {"path": path, "state": "disabled_manually"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": [*_active_entries(), other]}]))
     assert main(["--repo", "owner/name"]) == 0
 
 
 @pytest.mark.parametrize(
     "template",
     [
-        pytest.param(".github/workflows/nested/{name}", id="nested-under-workflows"),
-        pytest.param(".github/workflows/a/b/{name}", id="deeply-nested"),
-        pytest.param("vendor/.github/workflows/{name}", id="workflows-dir-further-down"),
-        pytest.param(".github/workflows-old/{name}", id="sibling-directory"),
         pytest.param("/.github/workflows/{name}", id="absolute"),
-        pytest.param("{name}", id="bare-basename"),
         pytest.param(".github/workflows/./{name}", id="dot-segment"),
         pytest.param(".github//workflows/{name}", id="doubled-slash"),
         pytest.param("./.github/workflows/{name}", id="dot-prefix"),
         pytest.param(".github/workflows/{name}/", id="trailing-slash"),
+        pytest.param(".github/workflows/ {name}", id="padded-segment"),
     ],
 )
-def test_a_file_elsewhere_cannot_stand_in_by_basename(
-    monkeypatch: pytest.MonkeyPatch, template: str
+def test_a_non_canonical_path_exits_2(monkeypatch: pytest.MonkeyPatch, template: str) -> None:
+    """Each of these could otherwise be read as the required file, so the payload is refused."""
+    entries = _active_entries()
+    name = Path(str(entries[0]["path"])).name
+    entries[0] = {**entries[0], "path": template.format(name=name)}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": entries}]))
+    assert main(["--repo", "owner/name"]) == 2
+
+
+_ELSEWHERE = [
+    pytest.param(".github/workflows/nested/{name}", id="nested-under-workflows"),
+    pytest.param(".github/workflows/a/b/{name}", id="deeply-nested"),
+    pytest.param("vendor/.github/workflows/{name}", id="workflows-dir-further-down"),
+    pytest.param(".github/workflows-old/{name}", id="sibling-directory"),
+    pytest.param("{name}", id="bare-basename"),
+    pytest.param("dynamic/other/{name}", id="under-dynamic"),
+    pytest.param(".github/workflows/nested/other.yml", id="unrelated-nested"),
+    pytest.param("other/thing.yml", id="unrelated-elsewhere"),
+    pytest.param("dynamic", id="bare-dynamic"),
+]
+
+
+@pytest.mark.parametrize("template", _ELSEWHERE)
+def test_a_file_elsewhere_cannot_stand_in_for_an_absent_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], template: str
 ) -> None:
     """Keyed on the basename, an active file here would report the required workflow as runnable."""
     entries = _active_entries()
     name = Path(str(entries[0]["path"])).name
     entries[0] = {**entries[0], "path": template.format(name=name)}
     _stub_gh(monkeypatch, json.dumps([{"workflows": entries}]))
-    assert main(["--repo", "owner/name"]) == 2
+    assert main(["--repo", "owner/name"]) == 1
+    assert f"workflow {name} not present on the server" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("template", _ELSEWHERE)
+def test_a_file_elsewhere_cannot_mask_a_disabled_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], template: str
+) -> None:
+    """An active same-named file beside a disabled required file leaves it reported as disabled."""
+    entries = _active_entries()
+    name = Path(str(entries[0]["path"])).name
+    entries[0] = {**entries[0], "state": "disabled_manually"}
+    stand_in = {"path": template.format(name=name), "state": "active"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": [*entries, stand_in]}]))
+    assert main(["--repo", "owner/name"]) == 1
+    err = capsys.readouterr().err
+    assert f"{name}  [state=disabled_manually]" in err, err
+
+
+@pytest.mark.parametrize(
+    "blocked",
+    [
+        pytest.param(("yaml",), id="no-pyyaml-with-pytest"),
+        pytest.param(("yaml", "pytest"), id="no-pyyaml-no-pytest"),
+        pytest.param(("tests._workflow_contexts",), id="no-resolver"),
+    ],
+)
+def test_an_unimportable_dependency_exits_2(blocked: tuple[str, ...]) -> None:
+    """Exit 1 is the findings code, and an uncaught import error would exit 1 too."""
+    script = _ROOT / "scripts" / "ci" / "check_required_workflow_state.py"
+    probe = (
+        "import runpy, sys\n"
+        f"sys.modules.update(dict.fromkeys({blocked!r}))\n"
+        f"sys.argv = [{str(script)!r}, '--states-json', 'absent.json']\n"
+        f"runpy.run_path({str(script)!r}, run_name='__main__')\n"
+    )
+    out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120, cwd=_ROOT
+    )
+    assert out.returncode == 2, out.stderr
+    assert "::error::" in out.stderr, out.stderr
 
 
 @pytest.mark.parametrize(
