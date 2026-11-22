@@ -94,6 +94,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
+    LOCK_NOTICE_ID_KEY,
     LOG_SILENT_EVENT_TYPES,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
@@ -19842,16 +19843,18 @@ class AuthService:
         factor satisfied and re-key the session (ASVS 7.2.4). The same factor write, when the row it
         reads in its own transaction has not met its factor, also re-anchors the session to the
         WP-L3-13 client as :meth:`verify_mfa` does and stamps ``reauth_at`` only when the
-        authenticator reported user verification, clearing it otherwise. A session that had already met its factor when that
-        write ran, and any ``oidc`` session, is neither re-anchored nor stamped (vault BACKLOG #2964
-        item 14, owner rulings 2026-11-14, ADR 0068 amendment of that date). Returns a not-``ok``
-        :class:`Elevation` (never raises) for any invalid input, always audited.
+        authenticator reported user verification, clearing it otherwise. A session that had already
+        met its factor when that write ran, and any ``oidc`` session, is neither re-anchored nor
+        stamped (vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068 amendment of that
+        date). Returns a not-``ok`` :class:`Elevation` (never raises) for any invalid input, always
+        audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from
-        :meth:`verify_mfa`** (recorded in ADR 0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
-        secrets and a flaky authenticator must not lock the account; abuse is bounded by the
-        route's ``allow_reauth_attempt`` gate + cookie-holder-only reachability + these audits.
+        :meth:`verify_mfa`** (recorded in ADR 0068): assertion failures do NOT feed
+        ``_register_failure`` — signatures are not guessable secrets and a flaky authenticator must
+        not lock the account; abuse is bounded by the route's ``allow_reauth_attempt`` gate +
+        cookie-holder-only reachability + these audits.
 
         A successful assertion DOES clear the failure counter (BACKLOG #1638). That is the other
         direction and the divergence does not cover it — see the call site.
@@ -22245,15 +22248,17 @@ class AuthService:
                 # cut-off or failed row write, or a refused hand-off, then costs at most a
                 # duplicate mail at the next lock, the cheap failure. The other order could leave
                 # a row saying a mail went out that never did, holding the next one back a day.
+                # The id ties a failed send's row to this notice's row (vault BACKLOG #1138 item 2).
+                notice_id = uuid4().hex
                 handed = await self._notify_security(
                     ACCOUNT_LOCKED,
                     username=user.username,
                     email=user.notify_email,
                     client=client,
-                    detail=detail,
+                    detail={**detail, LOCK_NOTICE_ID_KEY: notice_id},
                 )
                 if wired:
-                    await self._record_lock_notice(user, lock, handed=handed)
+                    await self._record_lock_notice(user, lock, handed=handed, notice_id=notice_id)
         except asyncio.CancelledError:
             _log.warning(
                 "a security notice was cancelled before it finished; it may be neither mailed "
@@ -22275,6 +22280,8 @@ class AuthService:
 
         ADR 0197 Decision item 7 (BACKLOG #1131): at most one mail per lock kind per account per
         :data:`_LOCK_NOTICE_WINDOW_SECONDS`, and always a mail for the first lock after a quiet window.
+        A mail whose send the notifier recorded as failed does not count toward that one, so a
+        later lock in the window can mail again (:meth:`_lock_notice_held_back`).
         Throttled by TIME, not by cycle: the cycle count survives ``admin-unlock`` and never decays, so
         a cycle throttle would go quiet for a new campaign starting at a high count.
 
@@ -22328,13 +22335,16 @@ class AuthService:
         and ``GET /logs/tail`` serves the log to ``logs:view``. A traceback would carry the
         driver's message, which can quote the bound username.
 
-        **A send that failed after its hand-off does not hold the next one back** (vault BACKLOG
-        #1138 item 2). Its ``auth.lock_notice`` row still reads ``mailed: true``, because the send
-        fails on the notifier's task after that row is written. The notifier records the failure on
-        an ``auth.lock_notice_undelivered`` row with ``reason: send_failed`` and the lock kind, so a
-        mailable account is held back only while its handed rows of the kind in the window
-        outnumber its failed sends of the kind. A count, not an order: the failure row can land
-        before or after the row it cancels. An unread failure row only lets a duplicate through."""
+        **A mail whose send failed after its hand-off does not hold the next one back** (vault
+        BACKLOG #1138 item 2). Its ``auth.lock_notice`` row still reads ``mailed: true``, because
+        the send fails on the notifier's task. The notifier records the failure on an
+        ``auth.lock_notice_undelivered`` row with ``reason: send_failed`` and the notice's
+        :data:`~messagefoundry.auth.notifications.LOCK_NOTICE_ID_KEY` token, which the taken row
+        carries too. So a mailable account is held back while some taken row of the kind in the
+        window has no failed send with its token. A matched pair, not an order or a count, because
+        the failure row can land before or after the row it matches. A failure row not read yet,
+        for at least a send still pending or a failure write that failed, leaves its mail holding
+        the next one back."""
         mailable = bool(user.notify_email)
         since = max(time.time() - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
         try:
@@ -22342,11 +22352,12 @@ class AuthService:
                 rows = await self._store.list_audit(
                     actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
                 )
-                handed = 0
+                taken: set[str] = set()
                 for row in rows:
                     try:
                         detail = json.loads(row["detail"] or "{}")
                         kind, mailed = detail.get("lock"), detail.get("mailed", True)
+                        notice_id = detail.get(LOCK_NOTICE_ID_KEY)
                     except (TypeError, ValueError, AttributeError):
                         continue
                     if kind != lock:
@@ -22355,8 +22366,10 @@ class AuthService:
                     if not mailable:
                         return True
                     if mailed is not False:
-                        handed += 1
-                if not handed:
+                        if not isinstance(notice_id, str):
+                            return True  # no token, so no failure row can match it
+                        taken.add(notice_id)
+                if not taken:
                     return False
                 failed = await self._store.list_audit(
                     actor=user.username,
@@ -22374,15 +22387,17 @@ class AuthService:
         for row in failed:
             try:
                 detail = json.loads(row["detail"] or "{}")
-                kind, reason = detail.get("lock"), detail.get("reason")
+                reason, notice_id = detail.get("reason"), detail.get(LOCK_NOTICE_ID_KEY)
             except (TypeError, ValueError, AttributeError):
                 continue
             # A full queue or a closing notifier already wrote ``mailed: false`` on its own row.
-            if kind == lock and reason == "send_failed":
-                handed -= 1
-        return handed > 0
+            if reason == "send_failed" and isinstance(notice_id, str):
+                taken.discard(notice_id)
+        return bool(taken)
 
-    async def _record_lock_notice(self, user: UserRecord, lock: str, *, handed: bool) -> None:
+    async def _record_lock_notice(
+        self, user: UserRecord, lock: str, *, handed: bool, notice_id: str
+    ) -> None:
         """Write the ``auth.lock_notice`` row the throttle reads, after the mail.
 
         ``mailed`` is true only when the account had an address AND the notifier took the event
@@ -22393,13 +22408,14 @@ class AuthService:
 
         **A send that fails after the hand-off still leaves ``mailed: true``** here. It fails on
         the notifier's own task and is recorded on the notifier's ``auth.lock_notice_undelivered``
-        row (BACKLOG #2383), which the throttle counts against this one
-        (:meth:`_lock_notice_held_back`, vault BACKLOG #1138 item 2)."""
-        await self._audit(
-            _LOCK_NOTICE_ACTION,
-            actor=user.username,
-            detail=_json({"lock": lock, "mailed": bool(user.notify_email) and handed}),
-        )
+        row (BACKLOG #2383). A ``mailed: true`` row carries ``notice_id``, which that failure row
+        carries too, so the throttle can match them (:meth:`_lock_notice_held_back`, vault BACKLOG
+        #1138 item 2)."""
+        mailed = bool(user.notify_email) and handed
+        record: dict[str, Any] = {"lock": lock, "mailed": mailed}
+        if mailed:
+            record[LOCK_NOTICE_ID_KEY] = notice_id
+        await self._audit(_LOCK_NOTICE_ACTION, actor=user.username, detail=_json(record))
 
     async def _notify_security(
         self,

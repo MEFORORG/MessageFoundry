@@ -32,6 +32,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
+    LOCK_NOTICE_ID_KEY,
     LOG_SILENT_EVENT_TYPES,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
@@ -821,9 +822,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         say which account was never told. The actor is the notice's recipient, so the row also
         reaches that account's ``/me/security-events`` feed. The detail is the notice kind and
         ``why``, plus the holder's username on an issuer's reminder, which says whose credential it
-        was, and the lock kind on a lock notice. Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED carries an address
-        in its detail. A lock notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG
-        #1131). A failed write is swallowed, like the send it reports on. It is logged by class, and
+        was, and a lock notice's lock kind and ``LOCK_NOTICE_ID_KEY`` token. Never the rest of
+        ``event.detail`` or the address: an EMAIL_CHANGED carries an address in its detail. A lock
+        notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG #1131). A failed
+        write is swallowed, like the send it reports on. It is logged by class, and
         not at all for a lock notice: that kind writes no other line, so a lone line would say a
         lock landed."""
         if self._audit is None:
@@ -834,11 +836,13 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         holder = event.detail.get("holder")
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER and isinstance(holder, str):
             detail["holder"] = holder
-        # The lock kind, which the lock-notice throttle matches a failed send against (vault
-        # BACKLOG #1138 item 2). The hidden ``auth.lock_notice`` row already carries it.
-        lock = event.detail.get("lock")
-        if event.event_type == ACCOUNT_LOCKED and isinstance(lock, str):
-            detail["lock"] = lock
+        # The lock kind and the notice's token, which the lock-notice throttle matches a failed
+        # send by (vault BACKLOG #1138 item 2). The hidden ``auth.lock_notice`` row carries both.
+        if event.event_type == ACCOUNT_LOCKED:
+            for key in ("lock", LOCK_NOTICE_ID_KEY):
+                value = event.detail.get(key)
+                if isinstance(value, str):
+                    detail[key] = value
         try:
             await self._audit.record_audit(
                 action, actor=event.username, detail=json.dumps(detail, sort_keys=True)
