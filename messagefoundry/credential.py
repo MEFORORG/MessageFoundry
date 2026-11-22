@@ -119,10 +119,8 @@ def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
     ASVS 11.2.4 (BACKLOG #1167): ``==`` stops at the first differing character. This is for values
     such as a session token hash, a credential-id hash or a config fingerprint, not for a presented
     credential, which is :func:`constant_time_match`'s job. It differs from that function in two
-    ways, both on purpose: two empty values ARE equal here, and nothing is digested first. The
-    compare's time can show the length of either input. For a ``str`` input it can also show what
-    kind of characters the input holds, because the UTF-8 encode runs first. Beyond that, it does
-    not depend on content.
+    ways, both on purpose: two empty values ARE equal here, and nothing is digested first. Its time
+    can depend on either input's length and, for a ``str``, on its characters.
 
     Total: ``surrogatepass`` encodes any ``str`` CPython can hold, so a caller's string can never
     raise ``TypeError`` out of the compare, and two distinct strings never map to the same bytes.
