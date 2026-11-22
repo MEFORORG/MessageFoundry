@@ -5362,10 +5362,14 @@ def create_app(
         # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes none, so
         # None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
-        # context that reads the system trust store, under a lock a worker thread may hold, or an
-        # opener of its own that reads the [tls] CA and CRL files.
+        # context that reads the system trust store, under a lock a worker thread may hold, or
+        # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
         tls_settings = getattr(request.app.state, "tls_settings", None)
         try:
+            # BACKLOG #5527: an embedder's stash of another type is a misconfiguration, mapped to
+            # the 503 below, rather than an AttributeError the route would answer 500 for.
+            if tls_settings is not None and not isinstance(tls_settings, TlsSettings):
+                raise AiBrokerError("app.state.tls_settings is not a TlsSettings")
             broker = await asyncio.to_thread(
                 ai_broker_from_settings,
                 ai,

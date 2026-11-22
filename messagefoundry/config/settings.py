@@ -5521,7 +5521,8 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     ``:`` outside brackets, or none inside them; and a host the
     sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
     machine. An IP literal is returned in :mod:`ipaddress`'s compressed form, so ``::1`` and
-    ``0:0:0:0:0:0:0:1`` are one host; a name is returned lowercased."""
+    ``0:0:0:0:0:0:0:1`` are one host, and an IPv4-mapped IPv6 literal as the IPv4 address it
+    can reach, so ``::ffff:127.0.0.1`` and ``127.0.0.1`` are one host; a name is returned lowercased."""
     host, _, port = entry.strip().rpartition(":")
     host = host.strip()
     if host.startswith("[") and host.endswith("]"):
@@ -5539,9 +5540,13 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
         return None
     try:
-        return ipaddress.ip_address(host).compressed, number
+        address = ipaddress.ip_address(host)
     except ValueError:
         return host.lower(), number
+    # An IPv4-mapped IPv6 address can reach no listener but its IPv4 address, so it compares as
+    # that (BACKLOG #5528).
+    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    return (mapped or address).compressed, number
 
 
 class EgressSettings(_Section):

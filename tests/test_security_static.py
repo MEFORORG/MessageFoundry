@@ -807,6 +807,14 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/auth/trust_anchors.py": (
         r"""''.join((re.escape(ch) if ch.isascii() else '..' if ord(ch) > 65535 else '.' for ch in anchor_path)) + '(?:\\s+|$)'""",
     ),
+    # BACKLOG #5526 item 3 -- the Authorization-name rule. Unresolvable BY CONSTRUCTION: ``_TCHARS``
+    # is imported from ``transports/bounded_read.py`` so the two copies of the RFC 9110 tchar set
+    # cannot drift, and this scanner does not follow an import. ``bounded_read`` spells its twin,
+    # ``_PROXY_CREDENTIAL_NAME``, with a local ``_TCHARS``, so that copy resolves and is scanned. The
+    # shape is linear by inspection: the leading ``[^tchar]*`` cannot match the ``a`` that follows
+    # it, a tchar, so each character is read once; the optional tail is one ``.*`` with nothing
+    # after it. ``is_authorization_header_name`` uses ``fullmatch``, so there is one start position.
+    "messagefoundry/transports/http_auth.py": ("f'[^{_TCHARS}]*authorization(?:[^{_TCHARS}].*)?'",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py

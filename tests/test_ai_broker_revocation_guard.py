@@ -840,6 +840,26 @@ async def test_the_route_hands_the_broker_the_instance_tls_policy(
     assert seen[0].verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+async def test_a_tls_stash_of_another_type_answers_503_not_500(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row #5527 item 21: ``.policy()`` ran outside the ``AiBrokerError`` mapping, so an embedder
+    stash of another type was an ``AttributeError`` and a 500. Nothing is sent."""
+    sent: list[str] = []
+
+    def fake_chat(self: AiBroker, prompt: str) -> str:
+        sent.append(prompt)
+        return "synthetic reply"
+
+    monkeypatch.setattr(ai_broker_mod.AiBroker, "chat", fake_chat)
+    app = create_app(engine, ai_settings=_managed_ai(), allow_no_auth=True)
+    app.state.tls_settings = {"crl_file": "synthetic.crl"}
+    async with _client(app) as c:
+        r = await c.post("/ai/chat", json={"prompt": "synthetic prompt"})
+    assert r.status_code == 503
+    assert sent == []
+
+
 # --- the posture entry claims no CRL check where [tls].crl_file does not reach (#5527) ---------
 
 

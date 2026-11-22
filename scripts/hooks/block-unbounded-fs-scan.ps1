@@ -101,7 +101,22 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # commit-message form. Arithmetic, `$((...))`, is blanked for the same reason: `1 << n` would read
 # as a heredoc opener. A substitution inside it still runs, so that is left visible, and so is the
 # `#` of a comment, whose body is blanked.
-function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
+# THE REFINED VIEW, -Refined, ONLY ADDS DENIES (BACKLOG #5607). It is this bash reading with
+# corrections, and every line it adds sits in an `if ($Refined)` block, so the bash view is
+# unchanged. `$((` is read as arithmetic, but if a `)` at its depth 0 is not followed by `)`, that
+# `$((` is read again as `$(` and `(`, as bash does; inside it a quote or a backslash keeps a paren
+# from counting. `((` starting a word, outside `${...}`, is read the same way. `$[ ... ]` is
+# arithmetic. A `<<` glued to a plain word (`cat<<EOF`) opens a heredoc, unless the line has
+# already opened arithmetic or a `[`, it is inside `${...}`, or the word is not a plain name. Every heredoc
+# opened on a line gets its own body, and each terminator line stays visible. The delimiter is read in place, never from a
+# slice of the text. Past a processed-character budget it gives up and returns $null, and the
+# caller then adds nothing. It still does not read at least these, which stay as the bash view
+# reads them: a spaced shift in a command with no quote, `((` glued to a keyword (`do((`), a
+# substitution in the body of a heredoc whose delimiter is unquoted, a glued opener after a bare
+# `(` or later on a line that opened arithmetic, a `$((cmd) )` nested inside arithmetic, a case
+# pattern's `)`, a terminator compared after trimming, delimiters such as `<<END-X` and
+# `<<E"O"F`, and a glued opener whose word is not a plain name. The older masker in block-blanket-git-stage.ps1 is untouched.
+function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
     if ($Plain) {
         $sb = [System.Text.StringBuilder]::new($Text.Length)
@@ -134,7 +149,48 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     $pending = $null
     $bodyTerm = $null
     $n = 0
+    if ($Refined) {
+        # One save per open arithmetic frame, to restore when the frame turns out to be a subshell;
+        # the sites already read as subshells; heredoc delimiters opened on this line, then the
+        # bodies still to blank, in order.
+        $saves = [System.Collections.Generic.List[object]]::new()
+        $subshellSites = [System.Collections.Generic.HashSet[int]]::new()
+        $siteStack = [System.Collections.Generic.List[int]]::new()
+        $pendingQ = [System.Collections.Generic.List[string]]::new()
+        $bodyQ = [System.Collections.Generic.List[string]]::new()
+        $arithOnLine = $false
+        # An unquoted `[` earlier on the line: bash reads a subscript such as `a[ x<<y ]=1` whole.
+        $bracketOnLine = $false
+        $steps = 0
+        $budget = 8 * $Text.Length + 4096
+        $delimRe = [regex]::new('\G-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
+        $newSave = {
+            param([int]$Site)
+            @{
+                Site = $Site; Frame = $kinds.Count; SbLen = $sb.Length
+                Kinds = [System.Collections.Generic.List[string]]::new($kinds)
+                Depths = [System.Collections.Generic.List[int]]::new($depths)
+                PrevDollar = $prevDollar; WordStart = $wordStart; BraceDepth = $braceDepth
+                Pending = $pending; BodyTerm = $bodyTerm; ArithOnLine = $arithOnLine; BracketOnLine = $bracketOnLine
+                PendingQ = [System.Collections.Generic.List[string]]::new($pendingQ)
+                BodyQ = [System.Collections.Generic.List[string]]::new($bodyQ)
+            }
+        }
+    }
     while ($n -lt $Text.Length) {
+        if ($Refined) {
+            if (++$steps -gt $budget) { return $null }
+            if ($bodyQ.Count -gt 0) {
+                $end = $Text.IndexOf("`n", $n)
+                if ($end -lt 0) { $end = $Text.Length }
+                $line = $Text.Substring($n, $end - $n)
+                if ($line.Trim() -ceq $bodyQ[0]) { [void]$sb.Append($line); $bodyQ.RemoveAt(0) }
+                else { [void]$sb.Append(' ' * $line.Length) }
+                if ($end -lt $Text.Length) { [void]$sb.Append("`n") }
+                $n = $end + 1
+                continue
+            }
+        }
         if ($null -ne $bodyTerm) {
             # At the start of a body line: blank it whole, or keep the terminator line as it is.
             $end = $Text.IndexOf("`n", $n)
@@ -151,6 +207,40 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
         $kind = $kinds[$top]
         $next = if ($n + 1 -lt $Text.Length) { $Text[$n + 1] } else { $null }
         if ($kind -ceq 'arith') {
+            if ($Refined) {
+                # A `)` at depth 0 not followed by `)` ends a subshell, so this frame was never
+                # arithmetic: restore the state saved at its site and read the site again as one.
+                if ($ch -ceq ')' -and $depths[$top] -eq 0 -and $saves.Count -gt 0 -and
+                    $saves[$saves.Count - 1].Frame -eq $top) {
+                    $sv = $saves[$saves.Count - 1]
+                    $saves.RemoveAt($saves.Count - 1)
+                    if ($next -cne ')') {
+                        # Sites are pushed in ascending order, as every later one is cut first.
+                        while ($siteStack.Count -gt 0 -and $siteStack[$siteStack.Count - 1] -gt $sv.Site) {
+                            [void]$subshellSites.Remove($siteStack[$siteStack.Count - 1])
+                            $siteStack.RemoveAt($siteStack.Count - 1)
+                        }
+                        if ($subshellSites.Add($sv.Site)) { $siteStack.Add($sv.Site) }
+                        $sb.Length = $sv.SbLen
+                        $kinds = $sv.Kinds; $depths = $sv.Depths
+                        $prevDollar = $sv.PrevDollar; $wordStart = $sv.WordStart; $braceDepth = $sv.BraceDepth
+                        $pending = $sv.Pending; $bodyTerm = $sv.BodyTerm; $arithOnLine = $sv.ArithOnLine
+                        $bracketOnLine = $sv.BracketOnLine
+                        $pendingQ = $sv.PendingQ; $bodyQ = $sv.BodyQ
+                        $n = $sv.Site; continue
+                    }
+                }
+                # A quote or an escape keeps a paren from counting, as bash reads the frame.
+                if ($ch -ceq '\' -and $null -ne $next) {
+                    [void]$sb.Append(' ')
+                    [void]$sb.Append($(if ($next -ceq "`n") { $next } else { ' ' }))
+                    $n += 2; continue
+                }
+                if ($ch -ceq "'" -or $ch -ceq '"') {
+                    $kinds.Add($(if ($ch -ceq "'") { 'sq' } else { 'dq' })); $depths.Add(0); [void]$sb.Append($ch)
+                    $n++; continue
+                }
+            }
             # Arithmetic still runs a substitution, so that is left visible as in double quotes.
             if ($ch -ceq '$' -and $next -ceq '(' -and -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(')) {
                 $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $wordStart = $true; $n += 2; continue
@@ -164,6 +254,48 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
             elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
             else { [void]$sb.Append(' ') }
             $n++; continue
+        }
+        if ($Refined -and $kind -ceq 'arithb') {
+            # `$[ ... ]`, read as the arithmetic frame above is, closing at its matching `]`.
+            if ($ch -ceq '$' -and $next -ceq '(' -and -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(')) {
+                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $wordStart = $true; $n += 2; continue
+            }
+            if ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $wordStart = $true; $n++; continue }
+            if ($ch -ceq '\' -and $null -ne $next) {
+                [void]$sb.Append(' ')
+                [void]$sb.Append($(if ($next -ceq "`n") { $next } else { ' ' }))
+                $n += 2; continue
+            }
+            if ($ch -ceq "'" -or $ch -ceq '"') {
+                $kinds.Add($(if ($ch -ceq "'") { 'sq' } else { 'dq' })); $depths.Add(0); [void]$sb.Append($ch)
+                $n++; continue
+            }
+            if ($ch -ceq '[') { $depths[$top]++; [void]$sb.Append(' ') }
+            elseif ($ch -ceq ']' -and $depths[$top] -gt 0) { $depths[$top]--; [void]$sb.Append(' ') }
+            elseif ($ch -ceq ']') { $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append($ch); $wordStart = $false }
+            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+            else { [void]$sb.Append(' ') }
+            $n++; continue
+        }
+        if ($Refined -and $ch -ceq '$' -and $kind -cne 'sq' -and $kind -cne 'ansi') {
+            if ($next -ceq '(' -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(') {
+                if ($subshellSites.Contains($n)) {
+                    # Read again as `$(`, then `(`, as the bash view reads a `$(`.
+                    $arithOnLine = $true
+                    if ($kind -cne 'top') { $kinds.Add('sub'); $depths.Add(0) }
+                    [void]$sb.Append('$('); $prevDollar = $false; $wordStart = $true
+                    $n += 2; continue
+                }
+                $saves.Add((& $newSave $n))
+                $arithOnLine = $true
+                $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('$(('); $prevDollar = $false
+                $n += 3; continue
+            }
+            if ($next -ceq '[') {
+                $arithOnLine = $true
+                $kinds.Add('arithb'); $depths.Add(0); [void]$sb.Append('$['); $prevDollar = $false
+                $n += 2; continue
+            }
         }
         if ($ch -ceq '$' -and $next -ceq '(' -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(' -and
             $kind -cne 'sq' -and $kind -cne 'ansi') {
@@ -199,6 +331,47 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
         # Unquoted: top, sub or bt. A newline ends the line a heredoc was opened on, so its body
         # starts here. A heredoc opener is read as Hide-HeredocBodies reads it: after a space or at
         # the start, not `<<<`, and a delimiter that starts with a letter or underscore.
+        if ($Refined) {
+            if ($ch -ceq '[') { $bracketOnLine = $true }
+            if ($ch -ceq "`n") {
+                $arithOnLine = $false; $bracketOnLine = $false
+                if ($pendingQ.Count -gt 0) {
+                    [void]$sb.Append($ch); $bodyQ.AddRange($pendingQ); $pendingQ.Clear()
+                    $prevDollar = $false; $wordStart = $true
+                    $n++; continue
+                }
+            }
+            if ($ch -ceq '<' -and $next -ceq '<' -and -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '<') -and
+                -not ($n -gt 0 -and $Text[$n - 1] -ceq '<')) {
+                $opens = $n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1])
+                if (-not $opens -and $braceDepth -eq 0 -and -not $arithOnLine -and -not $bracketOnLine) {
+                    # Glued: the word before it must be a plain name, starting after whitespace,
+                    # `;`, `&`, `|`, `$(` or a backtick -- never after a bare `(`.
+                    $w = $n - 1
+                    while ($w -ge 0 -and 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./-'.IndexOf($Text[$w]) -ge 0) { $w-- }
+                    $opens = $w -lt $n - 1 -and ($w -lt 0 -or [char]::IsWhiteSpace($Text[$w]) -or
+                        ';&|`'.IndexOf($Text[$w]) -ge 0 -or ($Text[$w] -ceq '(' -and $w -gt 0 -and $Text[$w - 1] -ceq '$'))
+                }
+                if ($opens) {
+                    $d = $delimRe.Match($Text, $n + 2)
+                    if ($d.Success) {
+                        $pendingQ.Add((@($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
+                            Where-Object { $_ } | Select-Object -First 1))
+                    }
+                    [void]$sb.Append('<<'); $prevDollar = $false; $wordStart = $false
+                    $n += 2; continue
+                }
+            }
+            if ($ch -ceq '(' -and $next -ceq '(') {
+                if ($wordStart -and $braceDepth -eq 0 -and -not $subshellSites.Contains($n)) {
+                    $saves.Add((& $newSave $n))
+                    $arithOnLine = $true
+                    $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('(('); $prevDollar = $false
+                    $n += 2; continue
+                }
+                $arithOnLine = $true
+            }
+        }
         if ($ch -ceq "`n" -and $null -ne $pending) {
             [void]$sb.Append($ch); $bodyTerm = $pending; $pending = $null; $prevDollar = $false; $wordStart = $true
             $n++; continue
@@ -226,6 +399,10 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
                 if ($tick -ge 0 -and $tick -lt $end) { $end = $tick }
             }
             [void]$sb.Append('#' + ' ' * ($end - $n - 1)); $prevDollar = $false
+            # The operand loop reads the RAW text to the end of a bound, so a comment the refined
+            # view exposes would hand it the comment's words (`find . # see; ls /proc`). Ending the
+            # bound at the `#` keeps them out.
+            if ($Refined) { $sb[$sb.Length - ($end - $n)] = [char]';' }
             $n = $end; continue
         }
         # An unquoted backslash escapes the next character, whatever it is.
@@ -611,7 +788,8 @@ try {
     # "$(...)". So a bash command is scanned under BOTH views and denied if either denies: the bash
     # reading can only add denies to the toggle's, never remove one. The floor does NOT make the bash
     # reading right. Where the toggle blanks the same walk -- inside one double-quoted span, say --
-    # a misreading still allows it; at least `$((cmd) )`, `cat<<`, and two heredocs on a line remain.
+    # a misreading still allows it, unless the refined view below reads that form; Hide-QuotedSpans
+    # names at least the forms it does not.
     # The price is the toggle's own false denies, such as `'It'\''s; find /proc'`, which main had.
     # Most commands mask the same under both, and then one scan is enough.
     $scans = @(Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain))
@@ -647,6 +825,25 @@ try {
         Add-ScanBounds $psScan
         return $bounds.Count -gt $before
     }
+    # THE REFINED VIEW (BACKLOG #5607) IS BUILT LAST, under the same rule: it is built only once every
+    # toggle, bash and PowerShell bound has been judged and allowed, and it only appends bounds, so
+    # a throw, a slow path or its budget giving up returns the allow those views reached. It is built
+    # only for a command holding at least one of `((`, `<<` or `$[`. Its other change, ending a bound
+    # at a comment, only removes tokens, so skipping the view elsewhere loses no deny.
+    $refinedPending = @{ Value = ($tool -cne 'PowerShell' -and
+        ($cmd.IndexOf('((', [StringComparison]::Ordinal) -ge 0 -or $cmd.IndexOf('<<', [StringComparison]::Ordinal) -ge 0 -or
+         $cmd.IndexOf('$[', [StringComparison]::Ordinal) -ge 0)) }
+    function Add-RefinedBounds {
+        if (-not $refinedPending.Value) { return $false }
+        $refinedPending.Value = $false
+        $refinedMask = Hide-QuotedSpans $cmd -Refined
+        if ($null -eq $refinedMask) { return $false }
+        $refinedScan = Hide-HeredocBodies $cmd $refinedMask
+        if ($scans -ccontains $refinedScan) { return $false }
+        $before = $bounds.Count
+        Add-ScanBounds $refinedScan
+        return $bounds.Count -gt $before
+    }
     foreach ($scan in $scans) { Add-ScanBounds $scan }
 
     # Options whose value is a SEPARATE word, so the value is skipped rather than read as a program,
@@ -672,7 +869,7 @@ try {
 
     # A segment both views mask alike is checked once.
     $checked = [System.Collections.Generic.HashSet[string]]::new()
-    for ($bi = 0; $bi -lt $bounds.Count -or (Add-PowerShellBounds); $bi++) {
+    for ($bi = 0; $bi -lt $bounds.Count -or (Add-PowerShellBounds) -or (Add-RefinedBounds); $bi++) {
         $b = $bounds[$bi]
         if ($b[2] -le 0) { continue }
         $seg = $b[0].Substring($b[1], $b[2])

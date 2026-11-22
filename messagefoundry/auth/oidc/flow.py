@@ -466,6 +466,7 @@ def exchange_code(
     # keeps each refusal on the audited login-failure path.
     from messagefoundry.transports.bounded_read import (  # noqa: PLC0415  (matches the import above)
         AmbiguousFramingError,
+        ContentCodedReplyError,
         EgressReplyError,
         ResponseTooLargeError,
         TruncatedResponseError,
@@ -500,6 +501,9 @@ def exchange_code(
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         unreachable = True
         refusal = f"token endpoint unreachable: {type(exc).__name__}"
+    except ContentCodedReplyError:
+        # BACKLOG #5910: named for its coding, which the engine does not decode, not its length.
+        refusal = "token endpoint response is in a content coding the engine does not decode"
     except AmbiguousFramingError:
         refusal = "token endpoint response framed its body length ambiguously"
     except ResponseTooLargeError:

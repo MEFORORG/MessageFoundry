@@ -120,6 +120,7 @@ from messagefoundry.transports.rest import (
     assert_probe_hop,
     auth_challenge_refused,
     capture_response_headers,
+    digest_password_unmatched,
     egress_route_from_settings,
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
@@ -132,8 +133,10 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_unrevoked_verified_hop,
+    refuse_unsendable_static_request,
     refuse_url_credentials,
     refuse_verify_off,
+    request_target_as_sent,
     url_scheme,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -761,6 +764,33 @@ class SoapDestination(DestinationConnector):
         digest_selected = refuse_http_digest_conflicts(s)
         self._refuse_half_credential_pairs(s)
         self._validate_ws(scheme, s)
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
+        # the proxy route's hop gate, rather than every message at send time. The url is judged
+        # against urllib's direct send; the forward-proxy path reads the url differently.
+        self._headers = self._build_headers(s)
+        refuse_unsendable_static_request(
+            url,
+            self._headers,
+            setting="SOAP destination",
+            sent_as_is=True,
+            leave_proxy_credential_names=True,
+        )
+        if self.ws_addressing and request_target_as_sent(url) != url:
+            # The POST drops both, but wsa:To carries the url as written, so a server that matches
+            # To against its own address would fault every message.
+            raise ValueError(
+                "SOAP destination 'url' must hold no whitespace around it and no '#' when "
+                "ws_addressing is on (wsa:To carries the url as written, while the POST drops "
+                "both)"
+            )
+        if digest_selected and digest_password_unmatched(url):
+            # Every send would otherwise end in a 401 the Digest handler cannot answer.
+            raise ValueError(
+                "SOAP destination 'url' must not end in whitespace the Digest password lookup "
+                "keeps, such as a space, with HTTP Digest (the password is stored under the url "
+                "as written, and the request goes to the url without it, so no challenge would "
+                "find the password)"
+            )
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(
@@ -773,7 +803,6 @@ class SoapDestination(DestinationConnector):
         proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
-        self._headers = self._build_headers(s)
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
             self._headers.update(proxy_dest.auth_headers())

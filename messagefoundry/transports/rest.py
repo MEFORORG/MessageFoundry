@@ -93,6 +93,8 @@ from messagefoundry.transports.base import (
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
+    _FIELD_NAME,
+    _VALUE_CTL,
     EgressReplyError,
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
@@ -139,6 +141,9 @@ __all__ = [
     "refuse_unsendable_static_request",
     "refuse_url_credentials",
     "refuse_verify_off",
+    "digest_password_unmatched",
+    "request_target_as_sent",
+    "unsendable_request_target",
     "url_host_label",
     "url_scheme",
 ]
@@ -1235,13 +1240,17 @@ def refuse_cleartext_credentials(
     http off this machine*, says why and defines which values are credential-shaped. A static
     ``Proxy-Authorization``, in any spelling, is left out when :func:`hop_reaches_a_proxy` answers
     ``True``, since the send-time proxy rule judges it then; otherwise it is judged like any other
-    header. An ``Authorization`` header in the built ``headers``,
-    in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
+    header. An ``Authorization`` header in the built ``headers``, in any spelling
+    :func:`~messagefoundry.transports.http_auth.is_authorization_header_name` reads (BACKLOG
+    #5526), counts as well; the bearer re-checks pass one in, as defense in depth should the
     inventory and the bearer providers ever disagree. As for
     :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
     SOAP, FHIR and DICOMweb cells and the ``FhirLookup`` read path."""
+    # Lazy: http_auth imports this module.
+    from messagefoundry.transports.http_auth import is_authorization_header_name
+
     sent = list(credentials)
-    if not sent and any(str(name).strip().lower() == "authorization" for name in headers):
+    if not sent and any(is_authorization_header_name(str(name)) for name in headers):
         sent = ["Authorization header"]
     if not sent:
         return
@@ -1857,30 +1866,89 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
     )
 
 
-def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, setting: str) -> None:
+def request_target_as_sent(url: str) -> str:
+    """``url`` with ``urllib.parse.unwrap`` stripping the whitespace around it and the fragment
+    cut at the LAST ``#``, as :func:`_url_segments_sent` reads it (BACKLOG #5911)."""
+    url = urllib.parse.unwrap(url)
+    return url.rpartition("#")[0] if "#" in url else url
+
+
+def digest_password_unmatched(url: str) -> bool:
+    """True when a Digest password stored under ``url`` as written would not be found for the
+    url urllib requests (BACKLOG #5911). Asked of ``urllib.request.HTTPPasswordMgr.reduce_uri``."""
+    reduce = urllib.request.HTTPPasswordMgr().reduce_uri
+    return reduce(url) != reduce(request_target_as_sent(url))
+
+
+def unsendable_request_target(url: str, *, sent_as_is: bool = False) -> bool:
+    """Whether ``url`` holds what this screen refuses in a request target (BACKLOG #5911).
+
+    ``http.client`` sends the target as ASCII and refuses a control character or a space in it,
+    and urllib sets the ``Host`` header from the URL's host, which ``http.client`` encodes as
+    Latin-1 rather than IDNA. Every whitespace character is a control, a space or not ASCII, so
+    all three are refused.
+
+    ``sent_as_is`` is for a caller that sends the URL with no path appended: it is judged as
+    :func:`request_target_as_sent` gives it. Otherwise the URL is judged as written and a ``#`` is
+    refused too: urllib would split it off with every path the caller appends after it.
+    """
+    if sent_as_is:
+        url = request_target_as_sent(url)
+    elif "#" in url:
+        return True
+    return not url.isascii() or any(ch <= " " or ch == "\x7f" for ch in url)
+
+
+def refuse_unsendable_static_request(
+    url: str,
+    headers: Mapping[str, str],
+    *,
+    setting: str,
+    sent_as_is: bool = False,
+    leave_proxy_credential_names: bool = False,
+) -> None:
     """Refuse at construction a static URL or header ``http.client`` could never send (BACKLOG #5911).
 
     The screen a configured value needs beside :func:`enforce_outbound_length_limits`: that gate
     bounds lengths only, and these values are the same for every message, so one the wire refuses
-    would fail every send. A URL must be ASCII with no whitespace: ``http.client`` sends the request
-    target as ASCII and refuses a space in it, and urllib sets the ``Host`` header from the URL's
-    host as it stands, which ``http.client`` encodes as Latin-1 rather than IDNA. A ``#`` is refused
-    too, because urllib splits it off client-side, so every path the connector appends to the URL
-    would be dropped. Each header is put to ``http.client`` itself, as
+    would fail every send. The URL is judged by :func:`unsendable_request_target`, with
+    ``sent_as_is`` passed through. Each header name must be an RFC 9110 token. Each header is put
+    to ``http.client`` itself, as
     :func:`~messagefoundry.transports.bounded_read._refusal_by_http_client` does for a proxy
-    header, so the screen follows its name and value rules in every Python version.
+    header, so the screen follows its name and value rules in every Python version. Those rules
+    let a NUL or a folded line through in a value, so a control character other than HTAB, which
+    RFC 9110 section 5.5 forbids in a value, is refused here as well.
+
+    A header whose name :func:`~messagefoundry.transports.bounded_read.is_proxy_credential_header_name`
+    reads is a proxy credential, which the proxy-header rule judges by name (vault BACKLOG #3443,
+    #3457), so the RFC 9110 name check skips it; ``http.client``'s own name check still applies.
+    ``leave_proxy_credential_names`` skips such a header entirely, for a connector that left it to
+    that rule alone before this screen reached it.
 
     Raises :class:`ValueError` naming ``setting``, and a header key only as
     :func:`_shown_header_key` shows it, never a value, which an ``env()`` binding can fill with a
     credential. Every raise sits outside any ``except`` block, so no ``__context__`` carries the
     value (see :func:`_latin1_refusal_position`).
     """
-    if not url.isascii() or any(ch.isspace() for ch in url) or "#" in url:
+    if unsendable_request_target(url, sent_as_is=sent_as_is):
+        refused = (
+            "whitespace or a control character once the whitespace around it is stripped"
+            if sent_as_is
+            else ("whitespace, a control character or '#'")
+        )
         raise ValueError(
-            f"{setting} 'url' must be ASCII with no whitespace or '#' (http.client sends it as "
-            "ASCII); percent-encode it, and give an internationalized host in its IDNA form"
+            f"{setting} 'url' must be ASCII with no {refused} (http.client sends it as "
+            "ASCII); give an internationalized host in its IDNA form"
         )
     for name, value in headers.items():
+        proxy_named = is_proxy_credential_header_name(name)
+        if proxy_named and leave_proxy_credential_names:
+            continue
+        if not proxy_named and not _FIELD_NAME.fullmatch(name):
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} is not a header name the engine "
+                "sends (RFC 9110 allows only tchar characters in one)"
+            )
         if _refusal_by_http_client(name, "") is not None:
             raise ValueError(
                 f"{setting} header {_shown_header_key(name)} is not a header name http.client "
@@ -1895,6 +1963,11 @@ def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, se
             raise ValueError(
                 f"{setting} header {_shown_header_key(name)} has a value http.client refuses to "
                 "send"
+            )
+        if _VALUE_CTL.search(value):
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} has a control character in its "
+                "value (RFC 9110 allows none but HTAB)"
             )
 
 
@@ -2824,7 +2897,8 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     :data:`_ECH_SIDECAR_CREDENTIAL_USE` (BACKLOG #5528): urllib would dial ``user:pw@host`` as the
     host. It is refused here, not only at the egress gate, so a directly built connector refuses it.
     So, in fixed words that quote no part of the value, are at least a space or control character,
-    a ``?`` or ``#``, a non-ASCII character and a ``%`` in the host; the comments below say why each.
+    a ``?`` or ``#``, a non-ASCII character, a ``%`` in the host, a port that cannot be read and
+    port 0; the comments below say why each.
 
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
@@ -2873,6 +2947,23 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
         raise ValueError(
             "ech_sidecar must be a loopback address (the ECH sidecar runs beside the engine; a remote "
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
+        )
+    # BACKLOG #5528: refused here, not only at the egress gate, so a directly built connector and
+    # every other reader of this resolver refuse them too. A port of more than 4300 digits, leading
+    # zeros and all, passes the credential screen's port check and breaks int(); urlsplit's own
+    # text is not let out, and the raise comes after the handler ends.
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    if port == -1:
+        raise ValueError("ech_sidecar names a port that cannot be read as a number")
+    if port == 0:
+        # Not "not in the allowlist" at the gate: no entry can list port 0, so that would send the
+        # operator looking for an entry to add.
+        raise ValueError(
+            "ech_sidecar names port 0, which is not a port a sidecar can listen on and no "
+            "[egress].allowed_ech_sidecar entry can list; name the sidecar's own port"
         )
     return sidecar.rstrip("/")
 
@@ -3082,6 +3173,25 @@ class RestDestination(DestinationConnector):
                 f"{hop_name_prefix(config.name)}ech_egress and HTTP Digest are mutually exclusive -- "
                 "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"
             )
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
+        # the proxy route's hop gate, rather than every message at send time. The url is judged
+        # against urllib's direct send; the ECH and forward-proxy paths read the url differently.
+        self._headers = self._build_headers(s)
+        refuse_unsendable_static_request(
+            url,
+            self._headers,
+            setting="REST destination",
+            sent_as_is=True,
+            leave_proxy_credential_names=True,
+        )
+        if digest_selected and digest_password_unmatched(url):
+            # Every send would otherwise end in a 401 the Digest handler cannot answer.
+            raise ValueError(
+                "REST destination 'url' must not end in whitespace the Digest password lookup "
+                "keeps, such as a space, with HTTP Digest (the password is stored under the url "
+                "as written, and the request goes to the url without it, so no challenge would "
+                "find the password)"
+            )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
         self._proxy: ProxyConfig | None = (
@@ -3098,7 +3208,6 @@ class RestDestination(DestinationConnector):
         )
         proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
-        self._headers = self._build_headers(s)
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none). urllib moves it into the
             # CONNECT tunnel for an https destination, sends it to the proxy for an http one (ADR 0126).
