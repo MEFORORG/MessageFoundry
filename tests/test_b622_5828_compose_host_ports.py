@@ -6,6 +6,9 @@ A service with no ``profiles`` key runs under every profile, so the default ``en
 the ``ha`` pair under ``docker compose --profile ha up``. Both it and ``engine-ha`` published host
 port 2575, so that documented command would fail on the second bind. Each profile's co-running
 set is checked, with a negative control that the check sees a collision.
+
+Ports are keyed on number and protocol, not host address: a wildcard bind conflicts with any
+address on the same port, so comparing addresses would miss a real collision.
 """
 
 from __future__ import annotations
@@ -26,13 +29,14 @@ def _profiles(doc: dict[str, Any]) -> set[str]:
     return {p for svc in doc["services"].values() for p in svc.get("profiles") or []}
 
 
-def _host_port(entry: object) -> str:
-    """The host side of a short-syntax ``[ip:]host:container`` entry, or a long-syntax mapping's."""
+def _host_port(entry: object) -> str | None:
+    """``<port>/<protocol>`` on the host for a ``ports`` entry, or None when it publishes none."""
     if isinstance(entry, dict):
-        return f"{entry.get('host_ip', '')}:{entry['published']}"
-    parts = str(entry).split(":")
-    assert len(parts) in (2, 3), f"no host port in {entry!r}"
-    return f"{parts[0] if len(parts) == 3 else ''}:{parts[-2]}"
+        published = entry.get("published")
+        return f"{published}/{entry.get('protocol', 'tcp')}" if published else None
+    spec, _, proto = str(entry).partition("/")
+    parts = spec.split(":")
+    return f"{parts[-2]}/{proto or 'tcp'}" if len(parts) > 1 and parts[-2] else None
 
 
 def _duplicates(doc: dict[str, Any], active: frozenset[str]) -> dict[str, int]:
@@ -41,7 +45,7 @@ def _duplicates(doc: dict[str, Any], active: frozenset[str]) -> dict[str, int]:
         profiles = set(svc.get("profiles") or [])
         if profiles and not profiles & active:
             continue
-        ports.update(_host_port(p) for p in svc.get("ports") or [])
+        ports.update(p for p in map(_host_port, svc.get("ports") or []) if p)
     return {port: n for port, n in ports.items() if n > 1}
 
 
@@ -55,9 +59,23 @@ def test_no_two_co_running_services_publish_one_host_port(active: frozenset[str]
     assert not dup, f"host ports published twice under profiles {sorted(active)}: {dup}"
 
 
-def test_the_check_sees_a_collision() -> None:
-    """Negative control: engine-ha publishing the default engine's MLLP host port again is found."""
+@pytest.mark.parametrize(
+    "planted",
+    ("2575:2575", "127.0.0.1:2575:2575", {"target": 2575, "published": 2575}),
+    ids=("short", "host-address", "long"),
+)
+def test_the_check_sees_a_collision(planted: object) -> None:
+    """Negative control: engine-ha publishing the default engine's MLLP host port is found."""
     doc = copy.deepcopy(_compose_doc())
-    doc["services"]["engine-ha"]["ports"] = [*doc["services"]["engine-ha"]["ports"], "2575:2575"]
-    assert _duplicates(doc, frozenset({"ha"})) == {":2575": 2}
+    svc = doc["services"]["engine-ha"]
+    svc["ports"] = [*svc["ports"], planted]
+    assert _duplicates(doc, frozenset({"ha"})) == {"2575/tcp": 2}
     assert not _duplicates(doc, frozenset())
+
+
+@pytest.mark.parametrize("entry", ("2575", "2575:2575/udp", {"target": 2575}))
+def test_a_container_only_or_other_protocol_entry_is_no_collision(entry: object) -> None:
+    doc = copy.deepcopy(_compose_doc())
+    svc = doc["services"]["engine-ha"]
+    svc["ports"] = [*svc["ports"], entry]
+    assert not _duplicates(doc, frozenset({"ha"}))

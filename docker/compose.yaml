@@ -77,11 +77,12 @@ x-ha-engine-env: &ha-engine-env
   # The store hop is verified TLS at every posture: the engine refuses a store login over
   # encrypt=false or trust_server_certificate=true, and no escape lifts that (vault BACKLOG #3533
   # item 2), so this file sets no MEFOR_ALLOW_INSECURE_TLS. The local Postgres below serves the
-  # certificate in ./pg-tls, and the engines pin the CA that issued it, or that certificate itself
-  # when it is self-signed. The certificate must name the host `postgres`, which is how the
-  # engines reach it. Put the pin under ./config/pki/, owned as ./config is, because the engine
-  # refuses a pin file another account could replace. A managed Postgres whose certificate the
-  # system trust store already verifies needs no pin: remove this line.
+  # certificate in ./pg-tls (its comment says what it must hold), and the engines pin the CA that
+  # issued it, or that certificate itself when it is self-signed. Put the pin under ./config/pki/,
+  # owned as ./config is, so no other account can replace it: the store login trusts the file
+  # before serve's preflight checks its owner, and `store provision-schema` never checks it. A
+  # managed Postgres whose certificate the system trust store already verifies needs no pin:
+  # remove this line.
   MEFOR_STORE_SSL_ROOT_CERT: "/config/pki/store-ca.pem"
   # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.
   # Under the shipped enforce dial an over-granted store login refuses to start (ADR 0199), so this
@@ -324,11 +325,19 @@ services:
     image: postgres:16
     # TLS from your certificate and key in ./pg-tls (server.crt, server.key), mounted read-only.
     # The engines verify it, host name included (x-ha-engine-env, MEFOR_STORE_SSL_ROOT_CERT), so
-    # the certificate must name `postgres`. Postgres refuses a key file another account can read,
-    # and a bind mount keeps the host's owner and mode, so own both files by the image's postgres
-    # account, uid 999, with the key at 0600. On Linux:
+    # the certificate must name the host `postgres`. Postgres refuses a key file with group or
+    # other bits wider than it allows, and a bind mount keeps the host's owner and mode: own the
+    # key by the image's postgres account, uid 999, at 0600, or by root with group 999 at 0640.
+    # Either way the host account or group with that number can read it. On Linux:
     #   sudo chown -R 999:999 ./pg-tls && sudo chmod 0600 ./pg-tls/server.key
-    # Without them Postgres does not start, so neither engine does.
+    # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 999
+    # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and is refused.
+    # Without them Postgres does not start, so no ha engine does. A first start without them
+    # still initializes the mefor-pg volume but never creates the messagefoundry database, and a
+    # later start skips initialization; so after fixing them, remove that volume once
+    # (docker compose --profile ha down -v, which also removes the other named volumes).
+    # This server still accepts a plaintext session from another client on the compose network;
+    # the engines never open one.
     command:
       - "postgres"
       - "-c"
@@ -380,9 +389,9 @@ services:
   #
   # NOTE on ports: a single host cannot publish one port twice, and the default `engine` has no profile,
   # so it runs beside this pair under --profile ha and already owns host 8443 and 2575. So only
-  # `engine-ha` publishes the MLLP port, on host port 2576 (the container still listens on 2575).
-  # When `engine-ha` is the leader, MLLP works through host port 2576; when it is the standby its
-  # listener is closed (connection refused on 2576) and the leader is `engine-standby`, reachable on the
+  # `engine-ha` publishes the MLLP port, on host port 2578 (the container still listens on 2575).
+  # When `engine-ha` is the leader, MLLP works through host port 2578; when it is the standby its
+  # listener is closed (connection refused on 2578) and the leader is `engine-standby`, reachable on the
   # container network but not via the host-published port. That host-port asymmetry is a single-host
   # docker limitation only — in k8s the L4 LB's primary-only health check moves the VIP to whichever pod is
   # the leader (docs/CLOUD-DEPLOYMENT.md §3). For a clean local failover demo, hit `engine-ha` first, then
@@ -403,10 +412,10 @@ services:
       - mefor-spool-ha:/var/lib/mefor
     ports:
       - "8444:8443"     # API on a distinct host port (the default `engine` already owns 8443)
-      - "2576:2575"     # MLLP on a distinct host port (the default `engine` already owns 2575); leader only
+      - "2578:2575"     # MLLP on a distinct host port (the default `engine` already owns 2575); leader only
 
   # Clustered engine #2 — same image + config + cluster; the warm standby (or leader after a failover).
-  # Publishes only its API on a distinct host port; it publishes no MLLP port (engine-ha owns host 2576).
+  # Publishes only its API on a distinct host port; it publishes no MLLP port (engine-ha owns host 2578).
   engine-standby:
     <<: *ha-engine
     environment:
