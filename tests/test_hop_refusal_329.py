@@ -179,47 +179,47 @@ def test_webhook_notifier_refuses_cleartext_in_every_posture(
 
 
 _WEBHOOK_TOKEN = "T0KEN-in-the-path"
+_SETTING_NAMED = r"\[alerts\]\.webhook_url"
+
+#: Each refused by the build's posture-free checks, which settings load runs too (#3533 item 14).
+_REFUSED_WEBHOOK_URLS = [
+    pytest.param(f"http://hooks.example/{_WEBHOOK_TOKEN}", (), id="http"),
+    pytest.param(f"HTTP://hooks.example/{_WEBHOOK_TOKEN}", (), id="upper-http"),
+    pytest.param(f"ftp://hooks.example/{_WEBHOOK_TOKEN}", (), id="ftp"),
+    pytest.param(f"hooks.example/{_WEBHOOK_TOKEN}", (), id="no-scheme"),
+    # urlsplit's own ValueError quotes the netloc; the refusal must not pass it on.
+    pytest.param(f"https://svc:{_WEBHOOK_TOKEN}\uff03x@hooks.example/x", (), id="nfkc-netloc"),
+    pytest.param(f"https://svc:pw@[{_WEBHOOK_TOKEN}]/x", (), id="bad-bracket"),
+    pytest.param(f"https://svc:{_WEBHOOK_TOKEN}@hooks.example/x", (), id="userinfo"),
+    # urlsplit drops these, so it would read the scheme as https.
+    pytest.param(f"ht\ttps://hooks.example/{_WEBHOOK_TOKEN}", (), id="tab"),
+    pytest.param(f"https\n://hooks.example/{_WEBHOOK_TOKEN}", (), id="lf"),
+    # Stripped by urllib's dial but not by urlsplit, so it is not stripped, and urlsplit then
+    # reads no scheme: refused at load as at the build.
+    pytest.param(f"\xa0https://hooks.example/{_WEBHOOK_TOKEN}", (), id="nbsp"),
+    pytest.param(f"\u3000https://hooks.example/{_WEBHOOK_TOKEN}", (), id="ideographic-space"),
+    # Whitespace both readers strip is stripped, so an http URL inside it is still refused.
+    pytest.param(f" http://hooks.example/{_WEBHOOK_TOKEN}\n", (), id="space-http"),
+    pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}", ("other.example",), id="off-allowlist"),
+    pytest.param(f"https://h.example/{_WEBHOOK_TOKEN}" + "x" * 8192, (), id="over-length"),
+]
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        f"http://hooks.example/{_WEBHOOK_TOKEN}",
-        f"HTTP://hooks.example/{_WEBHOOK_TOKEN}",
-        f"ftp://hooks.example/{_WEBHOOK_TOKEN}",
-        f"hooks.example/{_WEBHOOK_TOKEN}",
-        # urlsplit's own ValueError quotes the netloc; the refusal must not pass it on.
-        f"https://svc:{_WEBHOOK_TOKEN}\uff03x@hooks.example/x",
-        f"https://svc:pw@[{_WEBHOOK_TOKEN}]/x",
-        # urlsplit drops these, so it would read the scheme as https.
-        f"ht\ttps://hooks.example/{_WEBHOOK_TOKEN}",
-        f"https\n://hooks.example/{_WEBHOOK_TOKEN}",
-        # Surrounding whitespace is ignored, so an http URL inside it is still refused.
-        f" http://hooks.example/{_WEBHOOK_TOKEN}\n",
-    ],
-    ids=[
-        "http",
-        "upper-http",
-        "ftp",
-        "no-scheme",
-        "nfkc-netloc",
-        "bad-bracket",
-        "tab",
-        "lf",
-        "space-http",
-    ],
-)
-def test_a_non_https_webhook_is_refused_at_load_without_echoing_it(url: str) -> None:
-    # Vault BACKLOG #3533 item 14: settings load refuses it, so check and the serve pre-flight do
-    # too, not only the notifier build. The path can hold the webhook's token, so the message
-    # repeats no part of the URL.
-    with pytest.raises(ValidationError, match="must be a well-formed https URL") as info:
-        AlertsSettings(webhook_url=url)
+@pytest.mark.parametrize(("url", "allowed"), _REFUSED_WEBHOOK_URLS)
+def test_a_webhook_the_build_refuses_is_refused_at_load_without_echoing_it(
+    url: str, allowed: tuple[str, ...]
+) -> None:
+    # Vault BACKLOG #3533 item 14: settings load runs the build's own checks, so check and the
+    # serve pre-flight refuse what the build refuses. The path can hold the webhook's token, so
+    # no message repeats the token.
+    with pytest.raises(ValueError, match=_SETTING_NAMED + "|outbound URL") as built:
+        WebhookTransport(url, allowed_hosts=allowed, posture=STAGING_PHI)
+    with pytest.raises(ValidationError) as info:
+        AlertsSettings(webhook_url=url, webhook_allowed_hosts=list(allowed))
     text = str(info.value)
-    assert _WEBHOOK_TOKEN not in text and "hooks.example" not in text
+    assert str(built.value) in text  # one refusal, the same at load and at the build
+    assert _WEBHOOK_TOKEN not in text and _WEBHOOK_TOKEN not in info.value.json()
     assert "ftp" not in text.lower()
-    as_json = info.value.json()
-    assert _WEBHOOK_TOKEN not in as_json and "hooks.example" not in as_json
 
 
 def test_a_non_https_webhook_is_refused_by_the_settings_loader(tmp_path: Path) -> None:
@@ -227,7 +227,7 @@ def test_a_non_https_webhook_is_refused_by_the_settings_loader(tmp_path: Path) -
     config.write_text(
         f'[alerts]\nwebhook_url = "http://hooks.example/{_WEBHOOK_TOKEN}"\n', encoding="utf-8"
     )
-    with pytest.raises(ValidationError, match="must be a well-formed https URL") as info:
+    with pytest.raises(ValidationError, match="cleartext http") as info:
         load_settings(config_path=config, environ={})
     assert _WEBHOOK_TOKEN not in str(info.value)
 
@@ -237,9 +237,17 @@ def test_a_non_https_webhook_is_refused_by_the_settings_loader(tmp_path: Path) -
     [None, "", "https://hooks.example/x", "HTTPS://hooks.example/x", " https://hooks.example/x\n"],
 )
 def test_an_https_or_unset_webhook_loads(url: str | None) -> None:
-    # Negative control: an https URL loads, inside surrounding whitespace too (urllib's dial strips
-    # it), and an empty value stays "not configured".
+    # Negative control: an https URL loads, inside whitespace both readers strip too, and an empty
+    # value stays "not configured". The value is kept as written.
     assert AlertsSettings(webhook_url=url).webhook_url == url
+
+
+def test_a_listed_webhook_host_loads() -> None:
+    # Negative control for the allowlist case above.
+    alerts = AlertsSettings(
+        webhook_url="https://hooks.example/x", webhook_allowed_hosts=["HOOKS.example"]
+    )
+    assert alerts.webhook_allowed_hosts == ["HOOKS.example"]
 
 
 def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:

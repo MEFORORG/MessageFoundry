@@ -36,19 +36,20 @@ string derived from it, makes a different key, which that test does not see. Oth
 still add one, at least the hop label for a value with no ``http(s)`` scheme, which falls back to
 a cached split, and ``ambient_proxy``'s label.
 
-Imports only the standard library, so ``bounded_read`` and ``rest`` can both use it without a
-cycle.
+Imports only the standard library and the stdlib-only leaf ``messagefoundry.urlscreen``, so
+``bounded_read`` and ``rest`` can both use it without a cycle.
 """
 
 from __future__ import annotations
 
-import inspect
 import ipaddress
 import re
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
+from messagefoundry.urlscreen import UNCACHED_URLSPLIT
 
 __all__ = [
     "ProxyAddress",
@@ -68,10 +69,9 @@ _NUMERIC_LABEL = re.compile(r"(?:0[xX][0-9A-Fa-f]*|[0-9]+)")
 #: A port as digits only. Its range is checked apart, so ``0`` and ``99999`` read as refused.
 _PORT = re.compile(r"[0-9]{1,5}")
 
-#: ``urlsplit`` without its ``functools.lru_cache`` layer; the module docstring says why.
-_UNCACHED_URLSPLIT: Callable[[str], urllib.parse.SplitResult] = inspect.unwrap(
-    urllib.parse.urlsplit
-)
+#: ``urlsplit`` without its ``functools.lru_cache`` layer; the module docstring says why. Defined in
+#: the leaf ``messagefoundry.urlscreen``, so ``config`` can use it without this package.
+_UNCACHED_URLSPLIT: Callable[[str], urllib.parse.SplitResult] = UNCACHED_URLSPLIT
 
 #: The fixed refusal text. It names the setting and the rule, never the value.
 _REFUSED = (

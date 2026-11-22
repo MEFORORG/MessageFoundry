@@ -40,6 +40,10 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar, cast
 
+from messagefoundry.config.alert_webhook import (
+    alert_host_allowed,
+    refuse_unbuildable_webhook_url,
+)
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
@@ -637,39 +641,6 @@ def _attested_with_a_reason(attested: bool, reason: str | None, *, flag: str) ->
     return True
 
 
-def alert_host_allowed(host: str, allowed_hosts: Sequence[str]) -> bool:
-    """Whether the ``[alerts]`` egress allowlist ``allowed_hosts`` admits ``host``.
-
-    The one test the build and every send of the webhook and the SMTP relay apply, and the one the
-    serve gate's security-channel check reads (BACKLOG #5088), so no two of them can disagree on
-    which host is listed. Hosts compare without case.
-
-    An empty allowlist admits every host: that is the settings' documented ``[]`` = any, and an
-    environment value that splits to no host, such as ``""`` or ``","``, yields it too. A non-empty
-    one admits only a host it lists, and an empty host is never listed, so ``[""]``, which names no
-    host, refuses every one rather than matching a URL with no host."""
-    if not allowed_hosts:
-        return True
-    candidate = host.lower()
-    return bool(candidate) and candidate in (h.lower() for h in allowed_hosts)
-
-
-def _refuse_off_allowlist_webhook(url: str, allowed_hosts: Sequence[str]) -> None:
-    """Refuse a webhook URL whose host ``[alerts].webhook_allowed_hosts`` does not admit.
-
-    Run at the build and at every POST. Names the host, never the URL: the path carries the
-    webhook's token (BACKLOG #1793)."""
-    host = urllib.parse.urlsplit(url).hostname or ""  # urlsplit lower-cases the host
-    if not host and allowed_hosts:
-        # The remedy is the URL, not the allowlist, so say that. With no allowlist the https
-        # revocation guard's hop_url_host refuses the same URL at the build.
-        raise ValueError("[alerts].webhook_url names no host")
-    if not alert_host_allowed(host, allowed_hosts):
-        raise ValueError(
-            f"[alerts].webhook_url host {host!r} is not in [alerts].webhook_allowed_hosts"
-        )
-
-
 def _refuse_off_allowlist_smtp_host(host: str, allowed_hosts: Sequence[str]) -> None:
     """Refuse an ``[alerts]`` SMTP relay that ``[alerts].smtp_allowed_hosts`` does not admit.
 
@@ -810,47 +781,6 @@ def _refuse_alert_smtp_revocation(
     ).enforce_construction()
 
 
-def _refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> None:
-    """The webhook URL checks that read no secret and log nothing. :func:`notifier_from_settings`
-    runs them before it reads the SMTP password, so a secret store that is down cannot hide them
-    (vault BACKLOG #3533 item 18), and :class:`WebhookTransport` runs them first in its build."""
-    # https is the only scheme (ASVS 12.2.1). A plaintext http:// target is refused with no
-    # escape, in every posture (vault BACKLOG #3533 item 5): the URL can carry the hop's
-    # credential as a path token.
-    # Until then MEFOR_ALLOW_INSECURE_TLS released it at [security].enforcement = warn.
-    #
-    # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
-    # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen
-    # runs first so no later message can reach one. This sink is built outside the connector gate,
-    # so the transports' own construction refusal never saw this URL. Imported lazily to keep this
-    # module's import cost unchanged for the far commoner non-webhook sinks.
-    from messagefoundry.transports.rest import (
-        enforce_outbound_length_limits,
-        refuse_url_credentials,
-    )
-
-    refuse_url_credentials(
-        url, "[alerts].webhook_url", use="the path token the webhook service issues"
-    )
-    scheme = urllib.parse.urlsplit(url).scheme.lower()
-    # Before the allowlist, so an http URL is never sent to fix an entry it cannot use.
-    if scheme == "http":
-        raise ValueError(
-            "[alerts].webhook_url over cleartext http would send the URL, and any path token in "
-            "it, in clear; refused, with no escape, in every posture — use https"
-        )
-    if scheme != "https":
-        raise ValueError(f"[alerts].webhook_url must be https, got scheme {scheme!r}")
-    # BACKLOG #5088: the allowlist _post applies, here before the send, so a host it would refuse
-    # at every POST refuses the start instead. Before the revocation guard, which reads no
-    # allowlist, so that guard never judges a host the egress policy forbids.
-    _refuse_off_allowlist_webhook(url, allowed_hosts)
-    # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
-    # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
-    # added between here and the wire.
-    enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
-
-
 class WebhookTransport:
     """POST the event as JSON to a configured URL (fronts Slack/Teams/PagerDuty/custom webhooks)."""
 
@@ -864,7 +794,9 @@ class WebhookTransport:
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
     ) -> None:
-        _refuse_unbuildable_webhook_url(url, allowed_hosts)
+        # The posture-free checks, stated once in config/alert_webhook.py, which settings load
+        # runs too (vault BACKLOG #3533 item 14).
+        refuse_unbuildable_webhook_url(url, allowed_hosts)
         # BACKLOG #2484: build the shared opener here, so an OpenSSL that refuses the engine's list
         # refuses the start, as the #5088 allowlist check does, rather than failing every POST.
         _shared_no_redirect_opener()
@@ -897,10 +829,7 @@ class WebhookTransport:
         # (bandit B310). The URL is operator-configured, but an https-only check is cheap
         # defense-in-depth so a typo'd or hostile config can't turn an alert POST into a local-file
         # read. With the scheme provably https here, the Request nosec is justified.
-        split = urllib.parse.urlsplit(self.url)
-        if split.scheme.lower() != "https":
-            raise ValueError(f"[alerts].webhook_url must be https, got scheme {split.scheme!r}")
-        _refuse_off_allowlist_webhook(self.url, self.allowed_hosts)
+        refuse_unbuildable_webhook_url(self.url, self.allowed_hosts)
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
         # onto the wire — the fan-out pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
@@ -2993,7 +2922,7 @@ def notifier_from_settings(
         # Vault BACKLOG #3533 item 18: the same reason, for the webhook's checks that log nothing.
         # The build repeats them. The webhook itself is still built after the read, so its
         # revocation guard never logs a crossing for a sink the read then stops.
-        _refuse_unbuildable_webhook_url(alerts.webhook_url, alerts.webhook_allowed_hosts)
+        refuse_unbuildable_webhook_url(alerts.webhook_url, alerts.webhook_allowed_hosts)
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,
