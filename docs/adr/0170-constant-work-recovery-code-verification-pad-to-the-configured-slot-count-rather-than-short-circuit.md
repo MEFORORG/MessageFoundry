@@ -113,6 +113,11 @@ parametrized test pins the hashes each verify ran against, not only their number
 code, and the walk's own list for a replay and for a wrong code, which is the control. It was red
 first: the replay row made 0 verifies.
 
+**CORRECTED 2026-11-22 (BACKLOG #1167):** "the same store read" no longer holds. Since BACKLOG
+#2592 the walk reads the hashes the account's checked record carries, not the store. The two
+refusals also differ by one store call: the replay matched a step, so it made a
+`consume_totp_step` call that a wrong code does not make.
+
 A first version ran `slots` verifies against the dummy hash alone. Review caught that it would drift
 from the wrong-code path once the live codes and the dummy were minted under different argon2
 parameters, because nothing rehashes a recovery code. Falling through to the one walk removes that

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""ASVS 11.2.4 (BACKLOG #1167): the store side compares passkey digests in constant time.
+"""ASVS 11.2.4 (BACKLOG #1167): passkey digests are compared in constant time.
 
 A timing difference is not measurable in a unit test, so these pin the mechanism instead: the
-store's passkey checks reach ``hmac.compare_digest``, and no ``==`` or ``!=`` on a passkey digest or a
-credential-id hash is left in the three store backends' source.
+store's passkey checks reach ``hmac.compare_digest``, and a source scan of the three store backends
+and ``auth/service.py`` finds no ``==`` or ``!=`` in the shapes :func:`_bare_digest_compares` names.
+A digest bound to a local name first is not one of those shapes.
 
 Synthetic data only.
 """
@@ -29,7 +30,7 @@ from messagefoundry.store.store import (
 )
 
 _STORE_DIR = Path(store_mod.__file__).parent
-_BACKENDS = ("store.py", "postgres.py", "sqlserver.py")
+_SCANNED = ("store/store.py", "store/postgres.py", "store/sqlserver.py", "auth/service.py")
 #: Id hashes under the current ``wc1:`` scheme, so each passkey can count as a way past.
 _A = "wc1:" + "a" * 64
 _B = "wc1:" + "b" * 64
@@ -109,8 +110,9 @@ def _record(cred_digest: str) -> store_mod.UserAuthzRecord:
 
 
 def _bare_digest_compares(path: Path) -> list[int]:
-    """Lines where ``==`` or ``!=`` has a ``passkey_digest(...)`` call or a ``credential_id_hash``
-    attribute as an operand."""
+    """Lines where ``==`` or ``!=`` has as an operand a ``passkey_digest(...)`` call, a
+    ``credential_id_hash`` attribute, or a ``cred_digest`` attribute compared with anything but a
+    literal (``cred_digest != ""`` asks whether any passkey is held, and stays)."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     hits: list[int] = []
     for node in ast.walk(tree):
@@ -125,24 +127,30 @@ def _bare_digest_compares(path: Path) -> list[int]:
                 and operand.func.id == "passkey_digest"
             )
             is_id_hash = isinstance(operand, ast.Attribute) and operand.attr == "credential_id_hash"
-            if is_digest_call or is_id_hash:
+            is_sealed_digest = (
+                isinstance(operand, ast.Attribute)
+                and operand.attr == "cred_digest"
+                and not any(isinstance(o, ast.Constant) for o in (node.left, *node.comparators))
+            )
+            if is_digest_call or is_id_hash or is_sealed_digest:
                 hits.append(node.lineno)
                 break
     return hits
 
 
-@pytest.mark.parametrize("name", _BACKENDS)
-def test_no_backend_compares_a_passkey_digest_with_eq(name: str) -> None:
-    """RED when: a store backend compares a passkey digest or a credential-id hash with ``==`` or
+@pytest.mark.parametrize("name", _SCANNED)
+def test_no_scanned_module_compares_a_passkey_digest_with_eq(name: str) -> None:
+    """RED when: a scanned module compares a passkey digest or a credential-id hash with ``==`` or
     ``!=`` rather than through :func:`passkey_set_matches` or ``constant_time_equal``."""
-    assert _bare_digest_compares(_STORE_DIR / name) == []
+    assert _bare_digest_compares(_STORE_DIR.parent / name) == []
 
 
 def test_the_scan_finds_a_bare_compare(tmp_path: Path) -> None:
-    """Positive control: the scan above flags both shapes it looks for."""
+    """Positive control: the scan flags each shape it looks for, and not the literal compare."""
     sample = tmp_path / "sample.py"
     sample.write_text(
-        "if passkey_digest(a) != b:\n    pass\nx = [c for c in d if c.credential_id_hash == e]\n",
+        "if passkey_digest(a) != b:\n    pass\nx = [c for c in d if c.credential_id_hash == e]\n"
+        "y = f.cred_digest == u.cred_digest\nz = f.cred_digest != ''\n",
         encoding="utf-8",
     )
-    assert _bare_digest_compares(sample) == [1, 3]
+    assert sorted(_bare_digest_compares(sample)) == [1, 3, 4]

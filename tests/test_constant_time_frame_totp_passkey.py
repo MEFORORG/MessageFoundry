@@ -86,13 +86,24 @@ def test_every_frame_takes_one_decrypt_under_its_own_aad(
     assert tries == [bc._aad(digest, i, final=i == 2) for i in range(3)]
 
 
-@pytest.mark.parametrize("cut", ["after a non-final frame", "bytes appended after the final"])
-def test_the_frame_position_cannot_pass_a_cut_or_padded_archive(cut: str) -> None:
+@pytest.mark.parametrize(
+    ("cut", "refusal", "written"),
+    [
+        ("after a non-final frame", r"truncated \.mfbak archive \(no final frame\)", 0),
+        ("bytes appended after the final", "trailing bytes after the final", 8192),
+    ],
+)
+def test_the_frame_position_cannot_pass_a_cut_or_padded_archive(
+    cut: str, refusal: str, written: int
+) -> None:
     """The AAD is chosen by where the stream ends. A stream cut right after a non-final frame reads
-    that frame as final, and one that runs on past the final frame reads it as non-final: both fail
-    the tag, and neither writes the frame's plaintext."""
+    that frame as final, and one that runs on past the final frame reads it as non-final, so each
+    fails its tag, is named for what it is, and writes no plaintext of the frame it refused.
+
+    RED when: the loop picks the AAD by which one authenticates, so the refused frame is written."""
     key = os.urandom(32)
-    blob = _archive(key, os.urandom(9000))
+    payload = os.urandom(9000)
+    blob = _archive(key, payload)
     off = len(bc.MAGIC) + 1
     (hdrlen,) = bc._U32.unpack(blob[off : off + bc._U32.size])
     first_frame_end = off + bc._U32.size + hdrlen + bc._NONCE_BYTES + bc._U32.size + 4096 + 16
@@ -101,10 +112,9 @@ def test_the_frame_position_cannot_pass_a_cut_or_padded_archive(cut: str) -> Non
         "bytes appended after the final": blob + b"EXTRA",
     }[cut]
     out = io.BytesIO()
-    with pytest.raises(bc.BackupCodecError, match="authentication failed on frame"):
+    with pytest.raises(bc.BackupCodecError, match=refusal):
         bc.decrypt_stream(io.BytesIO(stream), out, key)
-    if cut == "after a non-final frame":
-        assert out.getvalue() == b""
+    assert out.getvalue() == payload[:written]
 
 
 def test_a_tampered_frame_still_fails_closed() -> None:

@@ -6623,9 +6623,11 @@ class AuthService:
         # enrolled to anyone who knows the username. It would also add a locked round trip on the
         # account's row to every wrong code. So a wrong code makes no ``consume_totp_step`` call. It
         # still opens the TOTP cell above (``open_totp_secret``), and under a Transit cipher that
-        # open is a round trip to the cipher service: a timing difference this line does not settle. A refusal here still escapes
-        # unpadded, as before, but only on a code that matched a step. Nothing in the types keeps
-        # this short-circuit: ``tests/test_constant_time_frame_totp_passkey.py`` pins it.
+        # open is a round trip to the cipher service: a timing difference this line does not
+        # settle. A refusal here still escapes unpadded, as before, but only on a code that matched
+        # a step. The ``int`` parameter refuses an unconditional call on ``step`` itself, not a
+        # coerced one such as ``step or 0``; ``tests/test_constant_time_frame_totp_passkey.py``
+        # pins the short-circuit.
         code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
@@ -19985,7 +19987,7 @@ class AuthService:
             )
             if isinstance(fresh, Elevation):
                 return fresh
-            settled = fresh.cred_digest == user.cred_digest
+            settled = constant_time_equal(fresh.cred_digest, user.cred_digest)
             user = fresh
             if settled or standing != "held":
                 break

@@ -33,9 +33,9 @@ module imports ``cryptography`` / ``hashlib``, it is registered in
 The per-chunk **AAD binds**: ``header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)``, where
 the header digest is over the canonical header bytes the writer emits. The reader refuses a header
 not in that exact form, so a header changed in any byte is refused or fails closed. A reordered,
-dropped, truncated, or appended chunk changes the AAD and **fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame, and the
-decoder reads the frame the stream ends on under that flag, so a truncation that drops the tail frame
-fails the tag rather than being silently accepted. The frame counter is **monotonic from 0**, re-derived on decode, so a frame replayed
+dropped, truncated, or appended chunk changes the AAD and **fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame and the
+decoder requires it, so a truncation that drops the tail frame is detected as a missing terminator, not
+silently accepted. The frame counter is **monotonic from 0**, re-derived on decode, so a frame replayed
 out of order authenticates against the wrong counter and fails the tag.
 
 **Every attacker-declared length is bounded BEFORE the read it drives.** ``hdrlen`` and each frame's
@@ -477,6 +477,42 @@ def archive_key_id(path: str | Path) -> str:
         return read_header(fh).key_id
 
 
+def _open_frame(
+    aes: AESGCM, nonce: bytes | bytearray, ct: bytes | bytearray, aad: bytes
+) -> bytes | None:
+    """One frame's plaintext, or ``None`` when its GCM tag does not authenticate under ``aad``."""
+    from cryptography.exceptions import InvalidTag
+
+    try:
+        return aes.decrypt(nonce, ct, aad)
+    except InvalidTag:
+        return None
+
+
+def _frame_refusal(
+    aes: AESGCM,
+    nonce: bytes | bytearray,
+    ct: bytes | bytearray,
+    header_digest: bytes,
+    frame_index: int,
+    read_as_final: bool,
+) -> str:
+    """Why frame ``frame_index`` failed its tag when read with ``final=read_as_final``. On this
+    failure path alone the other flag is tried, so the refusal can say what an operator needs: a
+    frame that authenticates as non-final where the stream ends is a truncated archive, and a final
+    frame with bytes after it has trailing bytes. Anything else is corrupt, tampered, or under the
+    wrong key."""
+    other = _aad(header_digest, frame_index, final=not read_as_final)
+    if _open_frame(aes, nonce, ct, other) is not None:
+        if read_as_final:
+            return "truncated .mfbak archive (no final frame)"
+        return "trailing bytes after the final .mfbak frame (tampered archive)"
+    return (
+        f"authentication failed on frame {frame_index} (corrupt/tampered/truncated archive, "
+        "or the wrong key)"
+    )
+
+
 def decrypt_stream(
     src: BinaryIO, dst: BinaryIO, key: bytes, *, max_plaintext_bytes: int | None = None
 ) -> ArchiveHeader:
@@ -489,8 +525,8 @@ def decrypt_stream(
     as a key mismatch when its ``key_id`` changed; by the frame-length bound when a lowered
     ``chunk_size`` is below a real frame; and at the tag, which covers the header bytes as read.
     Each frame's plaintext is written to ``dst`` once that frame authenticates, before the next
-    frame's length and ciphertext are read, so a refusal can leave earlier frames' plaintext in ``dst``: discard ``dst`` on
-    any error.
+    frame's length and ciphertext are read, so a refusal can leave earlier frames' plaintext in
+    ``dst``: discard ``dst`` on any error.
 
     Raises :class:`BackupKeyMismatch` when the header ``key_id`` does not match ``key`` — checked first,
     so a wrong key is a clean early error, not an opaque tag failure.
@@ -501,8 +537,6 @@ def decrypt_stream(
     ``store/`` may not import ``pipeline/`` — the dependency direction is one-way. Reaching upward for
     that constant would invert it; re-declaring the same number down here would fork it. The bound is
     checked BEFORE each write, so an over-cap archive never lands a byte past the ceiling."""
-    from cryptography.exceptions import InvalidTag
-
     _validate_key(key)
     header, header_bytes = _read_header(src)
     expected_kid = key_fingerprint(key)
@@ -539,20 +573,18 @@ def decrypt_stream(
             )
         ct = _read_exact(src, ctlen, "frame ciphertext")
         # A frame is read as the final one when the stream ends right after it, and as a non-final
-        # one otherwise, so each frame takes ONE decrypt, under the AAD its position names (ASVS
-        # 11.2.4, BACKLOG #1167). The number of decrypts is then the number of frames, which the
-        # file's length already shows, and no AAD is tried and discarded. Position cannot pass a
-        # tampered archive: a cut after a non-final frame reads that frame as final, and bytes
-        # appended after the final frame read it as non-final, so either fails the tag below.
+        # one otherwise, so an authentic frame takes ONE decrypt, under the AAD its position names
+        # (ASVS 11.2.4, BACKLOG #1167). The number of decrypts on success is then the number of
+        # frames, which the file's length already shows. Within one archive, a cut after a
+        # non-final frame reads that frame as final, and bytes appended after the final frame read
+        # it as non-final, so each fails the tag here.
         ahead, _ = _read_up_to(src, 1, "frame boundary")
         this_final = not ahead
-        try:
-            plaintext = aes.decrypt(nonce, ct, _aad(header_digest, frame_index, final=this_final))
-        except InvalidTag:
+        plaintext = _open_frame(aes, nonce, ct, _aad(header_digest, frame_index, final=this_final))
+        if plaintext is None:
             raise BackupCodecError(
-                f"authentication failed on frame {frame_index} (corrupt/tampered/truncated archive, "
-                "or the wrong key)"
-            ) from None
+                _frame_refusal(aes, nonce, ct, header_digest, frame_index, this_final)
+            )
         if max_plaintext_bytes is not None and written + len(plaintext) > max_plaintext_bytes:
             raise BackupCodecError(
                 f"the .mfbak archive decrypts to more than the caller's {max_plaintext_bytes}-byte "
