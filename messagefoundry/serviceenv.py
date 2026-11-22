@@ -165,8 +165,9 @@ class ServiceEnvPosture:
     #: its registry value, so the refusal can say to remove those entries too.
     value_runs_on: bool = False
     #: The refused names whose only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that are
-    #: blank or plainly a path (:func:`_directory_entry_value`), so the refusal sends none of them
-    #: to a key file or the secrets directory. The remedy alone reads this, never the refusal itself.
+    #: blank or plainly a path (:func:`_directory_entry_value`), so the refusal sends none of
+    #: them to a key file or the secrets directory. The remedy alone reads this, never the
+    #: refusal itself.
     directory_only_names: tuple[str, ...] = field(default=(), repr=False)
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it. The remedy alone reads this, never the refusal itself.
@@ -358,10 +359,10 @@ _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
 
 #: For the remedy only (the Lander's sixth hold on PR 3142, H1): a whole value that is plainly
-#: an absolute path, from a drive letter, a UNC share or a POSIX root, in letters, digits,
-#: blanks, ``.``, ``_``, ``-``, parentheses and separators only, and a key run in either base64
-#: alphabet. A joined directory value is kept only when it is such a path and holds no such run;
-#: anything else may be key material, so the remedy treats it as one.
+#: an absolute path, from a drive letter, a UNC share or a POSIX root, in ASCII letters,
+#: digits, spaces, ``.``, ``_``, ``-``, parentheses and separators only; and a key run in either
+#: base64 alphabet. A joined directory value is kept only when it is such a path and holds no
+#: such run; anything else may be key material, so the remedy treats it as one.
 _PLAIN_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\[A-Za-z0-9._-]+[\\/]|/)[A-Za-z0-9 ._()\\/-]*")
 _EITHER_KEY_RUN = re.compile(r"[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43}")
 
@@ -920,15 +921,17 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
 
 def _directory_entry_value(entry: str) -> str | None:
     """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with
-    only blanks or line breaks after it and no blank around the name, and the value is blank or
-    plainly a path (:data:`_PLAIN_PATH`) with no key run in it (:data:`_EITHER_KEY_RUN`); else
-    None, as for key material. The engine strips the value it reads, so what trails it does not matter. The
-    remedy alone reads it, to tell a joined directory path from key material."""
+    only blanks or line breaks after it and no blank around the name, the name is ASCII, and the
+    value is blank or plainly a path (:data:`_PLAIN_PATH`) with no key run in it
+    (:data:`_EITHER_KEY_RUN`); else None, as for key material. The engine strips the value it
+    reads, so what trails it does not matter. ``str.upper`` maps some non-ASCII letters onto
+    ASCII ones, so a name that is not ASCII is not taken as the directory's. The remedy alone
+    reads it, to tell a joined directory path from key material."""
     line = entry.rstrip()
     if _LINE_BREAK.search(line):
         return None
     written, equals, value = line.partition("=")
-    if not equals or written.upper() != _DIRECTORY_VARIABLE:
+    if not equals or not written.isascii() or written.upper() != _DIRECTORY_VARIABLE:
         return None
     if _still_blank(value):
         return value  # nothing in it, so no key and no path to keep
@@ -1063,7 +1066,10 @@ def read_service_env_posture(
             [f for f in found if f[0].startswith(_VALUE_PREFIX) and f[0] != _VALUE_PREFIX],
             lambda v: v.directory_only or not v.value or v.value.isspace(),
         ),
-        directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables),
+        # Fail closed: one run-on value that takes anything but a blank or plain-path directory
+        # entry may hold key material, so nothing says to keep any entry (sixth hold, H1).
+        directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
+        and all(v.directory_only for v in variables if v.runs_on and _names([v])),
     )
 
 
@@ -1185,8 +1191,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         )
     else:
         return None
-    # A secret whose only value is a joined directory entry holding no key has nothing to move
-    # (the Lander's fifth hold on PR 3142, H2).
+    # A secret whose only value is a joined directory entry that is blank or plainly a path has
+    # nothing to move (the Lander's fifth hold on PR 3142, H2; the sixth hold, H1).
     only = posture.directory_only_names
     moving_keys = [k for k in keys if k not in only]
     moving_others = [o for o in others if o not in only]
@@ -1278,7 +1284,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         )
     if posture.directory_path_joined:
         # A path alone holds no secret, and the service may read it as its directory (fourth
-        # hold, H2), so only a joined entry that holds no key is spared (fifth hold, H2).
+        # hold, H2), so only a joined entry that is plainly a path is spared, and only when
+        # every refused variable that runs on takes nothing else (sixth hold, H1).
         steps.append(
             f"Keep any of them that sets {_DIRECTORY_VARIABLE} to a path and nothing else, as its "
             "own entry"

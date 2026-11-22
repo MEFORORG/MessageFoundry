@@ -249,9 +249,10 @@ def test_only_an_entry_the_engine_reads_as_the_directory_is_kept(entry: str) -> 
         ),
         pytest.param("Summer!2026", False, id="not-a-path"),
         pytest.param("C:\\d;Summer!2026", False, id="path-then-text"),
-        pytest.param("C:\\Summer!2026 hunter2", False, id="path-start-then-text"),
+        pytest.param("C:\\Summer!2026 hunter2", False, id="path-start-with-a-bang"),
         pytest.param(r"\\srv\share\secrets", True, id="unc-path"),
         pytest.param("/srv/secrets", True, id="posix-path"),
+        pytest.param("   ", False, id="blank"),
         pytest.param("C:\\d", True, id="plain-path"),
     ],
 )
@@ -263,8 +264,34 @@ def test_only_a_plain_absolute_path_is_kept(value: str, kept: bool) -> None:
     refusal = service_env_refusal(_read([f"{_KEY}=", f"mefor_secrets_directory={value}"]))
     assert refusal is not None
     assert (KEEP in refusal) is kept
-    assert ("protect-key" in refusal) is not kept
+    # A blank value holds no key either, so nothing says to protect one.
+    assert ("protect-key" in refusal) is not (kept or not value.strip())
     assert REMOVE in refusal and RUNS_ON in refusal
+
+
+def test_one_joined_value_that_is_no_plain_path_keeps_nothing() -> None:
+    """The sixth hold's H1, failing closed: a plain path joined to one secret is not kept when
+    another secret runs on into a directory entry that is no plain path."""
+    refusal = service_env_refusal(
+        _read(
+            [
+                "MEFOR_AUTH_AD_BIND_PASSWORD=",
+                "mefor_secrets_directory=C:\\d",
+                f"{_KEY}=",
+                f"mefor_secrets_directory=C:\\d\\{_KEY_B64.rstrip('=')}",
+            ]
+        )
+    )
+    assert refusal is not None
+    assert KEEP not in refusal and "protect-key" in refusal
+
+
+@pytest.mark.parametrize("name", ["mefor_secrets_d\u0131rectory", "mefor_\u017fecrets_directory"])
+def test_a_name_that_only_upper_cases_to_the_directory_is_not_kept(name: str) -> None:
+    """A non-ASCII letter that ``str.upper`` maps onto ASCII does not make the directory's name."""
+    refusal = service_env_refusal(_read([f"{_KEY}=", f"{name}=C:/d"]))
+    assert refusal is not None
+    assert KEEP not in refusal and "protect-key" in refusal
 
 
 def test_a_secret_joined_to_a_directory_value_that_is_no_path_is_moved() -> None:

@@ -21,8 +21,8 @@ RUNS_ON = (
     "runs on into with it, or the value stays in the registry key"
 )
 
-#: Printed last, only where a refused variable runs on into a directory entry that sets the
-#: directory to a path and holds no key: that entry stays.
+#: Printed last, only where every refused variable that runs on takes only directory entries
+#: that are blank or plainly a path, and one sets the directory to a path: that entry stays.
 KEEP = (
     "Keep any of them that sets MEFOR_SECRETS_DIRECTORY to a path and nothing else, as its own "
     "entry"
