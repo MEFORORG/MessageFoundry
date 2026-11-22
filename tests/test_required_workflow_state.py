@@ -360,13 +360,8 @@ def test_a_non_canonical_path_exits_2(monkeypatch: pytest.MonkeyPatch, template:
 _ELSEWHERE = [
     pytest.param(".github/workflows/nested/{name}", id="nested-under-workflows"),
     pytest.param(".github/workflows/a/b/{name}", id="deeply-nested"),
-    pytest.param("vendor/.github/workflows/{name}", id="workflows-dir-further-down"),
-    pytest.param(".github/workflows-old/{name}", id="sibling-directory"),
-    pytest.param("{name}", id="bare-basename"),
     pytest.param("dynamic/other/{name}", id="under-dynamic"),
     pytest.param(".github/workflows/nested/other.yml", id="unrelated-nested"),
-    pytest.param("other/thing.yml", id="unrelated-elsewhere"),
-    pytest.param("dynamic", id="bare-dynamic"),
 ]
 
 
@@ -395,7 +390,77 @@ def test_a_file_elsewhere_cannot_mask_a_disabled_one(
     _stub_gh(monkeypatch, json.dumps([{"workflows": [*entries, stand_in]}]))
     assert main(["--repo", "owner/name"]) == 1
     err = capsys.readouterr().err
-    assert f"{name}  [state=disabled_manually]" in err, err
+    assert f"{name}  [state='disabled_manually']" in err, err
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        pytest.param(".github\\workflows\\{name}", id="backslashes"),
+        pytest.param(".github/workflows\\{name}", id="mixed-separator"),
+        pytest.param(".GITHUB/workflows/{name}", id="upper-case-prefix"),
+        pytest.param(".github/Workflows/{name}", id="upper-case-directory"),
+        pytest.param(".github/workflows/%2e/{name}", id="percent-encoded-dot"),
+        pytest.param(".github/workflows/{name}\x00", id="trailing-nul"),
+        pytest.param(".github/workflows/{name}\u200b", id="trailing-zero-width-space"),
+        pytest.param(".github/workflows/nested\u200b/{name}", id="zero-width-in-nested"),
+        pytest.param(".github/workflows/.{name}", id="leading-dot-filename"),
+        pytest.param(".github/workflows/.hidden/{name}", id="leading-dot-directory"),
+        pytest.param("dynamic/x\x00/{name}", id="nul-in-dynamic"),
+        pytest.param("dynamic/caf\u00e9/{name}", id="non-ascii-in-dynamic"),
+        pytest.param("dynamic/{name}", id="dynamic-with-one-segment"),
+        pytest.param("dynamic", id="bare-dynamic"),
+        pytest.param(".github/workflows", id="the-directory-itself"),
+        pytest.param("vendor/.github/workflows/{name}", id="workflows-dir-further-down"),
+        pytest.param(".github/workflows-old/{name}", id="sibling-directory"),
+        pytest.param("{name}", id="bare-basename"),
+        pytest.param("other/thing.yml", id="unrelated-elsewhere"),
+    ],
+)
+def test_a_path_off_the_allowlist_exits_2(monkeypatch: pytest.MonkeyPatch, template: str) -> None:
+    """Skipped, a disabled entry in any of these spellings would sit beside an active file: a pass."""
+    entries = _active_entries()
+    name = Path(str(entries[0]["path"])).name
+    odd = {"path": template.format(name=name), "state": "disabled_manually"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": [*entries, odd]}]))
+    assert main(["--repo", "owner/name"]) == 2
+
+
+_UNRELATED_CONFLICT = [
+    {"path": ".github/workflows/not-required.yml", "state": "active"},
+    {"path": ".github/workflows/not-required.yml", "state": "disabled_manually"},
+]
+
+
+def test_a_conflict_on_an_unrelated_workflow_keeps_the_real_finding(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file no required context resolves to must not abort the sweep and discard a finding."""
+    entries = _active_entries()
+    name = Path(str(entries[0]["path"])).name
+    entries[0] = {**entries[0], "state": "disabled_manually"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": [*entries, *_UNRELATED_CONFLICT]}]))
+    assert main(["--repo", "owner/name"]) == 1
+    assert f"{name}  [state='disabled_manually']" in capsys.readouterr().err
+
+
+def test_a_conflict_on_an_unrelated_workflow_alone_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control: with every required workflow active, that conflict is not a failure at all."""
+    _stub_gh(monkeypatch, json.dumps([{"workflows": [*_active_entries(), *_UNRELATED_CONFLICT]}]))
+    assert main(["--repo", "owner/name"]) == 0
+
+
+def test_an_interior_newline_in_state_cannot_forge_an_annotation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Printed raw, the text after the newline would be its own ``::error::`` workflow command."""
+    entries = _active_entries()
+    entries[0] = {**entries[0], "state": "disabled\n::error::forged"}
+    _stub_gh(monkeypatch, json.dumps([{"workflows": entries}]))
+    assert main(["--repo", "owner/name"]) == 1
+    err = capsys.readouterr().err
+    assert not any(line.startswith("::error::forged") for line in err.splitlines()), err
+    assert "disabled\\n::error::forged" in err, err
 
 
 @pytest.mark.parametrize(

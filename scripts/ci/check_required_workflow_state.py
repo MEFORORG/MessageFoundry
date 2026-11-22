@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
+from collections.abc import Collection
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -77,7 +79,14 @@ import yaml  # noqa: E402
 #: will not dispatch, so a required context it owns can never report.
 _RUNNABLE = "active"
 
-_WORKFLOW_DIR = ".github/workflows"
+#: One path segment, ASCII only. The literal ``.github`` below is the only leading dot allowed.
+_SEGMENT = r"[A-Za-z0-9_][A-Za-z0-9._-]*"
+
+#: Every path this script accepts. Group 1 is set only for a file directly in ``.github/workflows``.
+_WORKFLOW_PATH = re.compile(
+    rf"\.github/workflows/(?:({_SEGMENT})|{_SEGMENT}(?:/{_SEGMENT})+)"
+    rf"|dynamic/{_SEGMENT}(?:/{_SEGMENT})+"
+)
 
 #: What reading the local contexts file and workflow YAML can raise. The resolver asserts a mapping
 #: and then indexes into the parse, so a wrongly shaped file surfaces as an assertion, attribute or
@@ -137,23 +146,29 @@ def _workflow_state(entry: object) -> tuple[str, str]:
 
 
 def _direct_workflow_file(path: str) -> str | None:
-    """The filename of a path directly in ``.github/workflows``, ``None`` for any other canonical path.
+    """The filename of a path directly in ``.github/workflows``, ``None`` for a well-formed other.
 
-    A non-canonical path raises ``RuntimeError``. The raw segments are read because PurePosixPath
-    collapses ``./`` and ``//``, which would let such a path pass as the real file.
+    An ALLOWLIST on the raw path, because a list of bad spellings cannot be complete: a backslash, a
+    case change, ``%2e``, or a trailing NUL or zero-width space each once passed as an ignorable
+    entry, which would hide a disabled workflow. The well-formed others are a file nested under
+    ``.github/workflows`` and a ``dynamic/`` entry, each at least two segments deep. Anything else
+    raises ``RuntimeError``.
     """
-    *parents, name = segments = path.split("/")
-    if any(part in ("", ".", "..") or part != part.strip() for part in segments):
+    match = _WORKFLOW_PATH.fullmatch(path)
+    if match is None:
         raise RuntimeError(f"workflow path {path!r} is not canonical")
-    return name if "/".join(parents) == _WORKFLOW_DIR else None
+    return match[1]
 
 
-def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, str]:
+def _workflow_states(
+    repo: str | None, states_json: Path | None, required: Collection[str]
+) -> dict[str, str]:
     """``{workflow filename: state}`` for every workflow file directly in ``.github/workflows``.
 
     Keyed on the FILENAME rather than the display name: the display name is what ``workflow_run``
     matches on, but a required context resolves to a FILE, and two workflows may legitimately share a
-    display name (this repo has two called "CodeQL").
+    display name (this repo has two called "CodeQL"). ``required`` names the files a required context
+    resolves to, the only ones whose conflicting repeat is refused.
     """
     if states_json is not None:
         payload = json.loads(states_json.read_text(encoding="utf-8"))
@@ -162,14 +177,15 @@ def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, st
         # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
         route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
         payload = gh_api(["--paginate", "--slurp", route])
-    # Only a file directly in .github/workflows can own a required context. Any other canonical
+    # Only a file directly in .github/workflows can own a required context. Any other well-formed
     # entry, such as GitHub's `dynamic/` ones, is left out so a basename match cannot let it stand in
     # for a real file, and so it cannot abort the sweep and discard a real finding. A repeat that
-    # disagrees is refused, because last-wins could overwrite a disabled state.
+    # disagrees on a required file is refused, because last-wins could overwrite a disabled state. On
+    # any other file nothing reads the state, so a conflict there must not abort the sweep either.
     states: dict[str, str] = {}
     for path, state in map(_workflow_state, _workflow_entries(payload)):
         name = _direct_workflow_file(path)
-        if name is not None and states.setdefault(name, state) != state:
+        if name is not None and states.setdefault(name, state) != state and name in required:
             raise RuntimeError(f"workflow {name} is listed with conflicting states")
     return states
 
@@ -207,7 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        states = _workflow_states(args.repo, args.states_json)
+        required = {where[0] for where in resolved.values() if where is not None}
+        states = _workflow_states(args.repo, args.states_json, required)
     except (RuntimeError, ValueError, subprocess.SubprocessError, OSError) as exc:
         # FAIL CLOSED. "We could not read workflow state" must never read as "every workflow is fine" —
         # that is the same blindness this script exists to catch, one level up. ValueError covers both
@@ -240,7 +257,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         checked += 1
         if state != _RUNNABLE:
-            unreachable.append(f"{ctx}  ->  {workflow}  [state={state}]")
+            # !r because the value is server data, and a raw newline would start a new `::` command.
+            unreachable.append(f"{ctx}  ->  {workflow}  [state={state!r}]")
 
     # Liveness receipt: report what was EXAMINED. "no unreachable contexts" and "nothing was checked"
     # are otherwise indistinguishable from the exit code.
