@@ -687,7 +687,7 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
     # SQLite's own text, and views[0] is the broken view. A view already broken fails SQLite's
     # first check, with no suffix; a view the change breaks fails its re-check after the change,
     # with the "after drop column" suffix. Where both names rank first the code does not pick
-    # between them, so both views are named. In the suffix-name pair the text itself cannot settle
+    # between them, so both are returned and the remedy names neither. In the suffix-name pair the text itself cannot settle
     # the pair, since the healthy view's own name holds the suffix. The message-name pair and "vv
     # after after drop column" are ones a list of SQLite's messages or suffixes could settle, and
     # the code keeps none (see _foreign_objects). SQLite writes ": " after a name, so "a" is no
@@ -769,7 +769,7 @@ async def test_one_name_is_named_only_while_its_whole_remedy_survives_the_cut(
     assert str(refusal) == message
     assert refusal.cause == _CAUSE.format(name)
     rendered = safe_exc(refusal)
-    assert rendered.index(_COUNT_OPENER) >= len(f"SchemaMismatchError: {remedy}"), rendered
+    assert rendered.startswith(f"SchemaMismatchError: {remedy}"), rendered
 
     remedy, message = _named(longer)
     rendered = safe_exc(SchemaMismatchError(message))
@@ -779,33 +779,32 @@ async def test_one_name_is_named_only_while_its_whole_remedy_survives_the_cut(
 
 
 @pytest.mark.parametrize(
-    ("broken", "healthy", "cause"),
+    ("healthy", "reads", "statement", "cause"),
     [
         pytest.param(
-            "vv",
             "vv after drop column",
+            "c FROM t",
+            "ALTER TABLE t DROP COLUMN c",
             "error in view vv after drop column: no such column: c",
             id="healthy-suffix-name",
         ),
         pytest.param(
-            "vv",
             "vv: no such column",
+            "missing FROM t",
+            "ALTER TABLE t RENAME TO t2",
             "error in view vv: no such column: missing",
             id="healthy-message-name",
         ),
     ],
 )
 async def test_two_candidates_get_the_plain_remedy(
-    tmp_path: Path, broken: str, healthy: str, cause: str
+    tmp_path: Path, healthy: str, reads: str, statement: str, cause: str
 ) -> None:
-    # The text fits both views, so naming either could tell the operator to drop the healthy one.
+    # A broken vv beside a healthy view. The text fits both, so naming either could tell the
+    # operator to drop the healthy one.
     path = tmp_path / "both.db"
-    reads = "c FROM t" if "drop column" in cause else "missing FROM t"
-    statement = (
-        "ALTER TABLE t DROP COLUMN c" if "drop column" in cause else "ALTER TABLE t RENAME TO t2"
-    )
     _sql(path, "CREATE TABLE t (a, c)", "CREATE TABLE u (c)")
-    _sql(path, f'CREATE VIEW "{broken}" AS SELECT {reads}')
+    _sql(path, f"CREATE VIEW vv AS SELECT {reads}")
     _sql(path, f'CREATE VIEW "{healthy}" AS SELECT c FROM u')
     async with _connected(path) as db:
         with pytest.raises(SchemaMismatchError) as info:

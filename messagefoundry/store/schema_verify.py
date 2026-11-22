@@ -455,14 +455,15 @@ async def run_schema_step[T](
                 f"store {path}: save the CREATE statement of the {kind} {name!r} from sqlite_master,"
                 " drop it, and restart."
             )
-            message = (
+            refusal = SchemaMismatchError(
                 f"{remedy} This build did not create it, and it stops the store's upgrade. The"
-                f" schema step failed: {cause}."
+                f" schema step failed: {cause}.",
+                cause=cause,
             )
             # Named only where safe_exc, which prints this error on the paths that cut it, shows
             # the whole remedy unchanged: a cut or redacted name would name the wrong object.
-            if remedy in safe_exc(SchemaMismatchError(message)):
-                raise SchemaMismatchError(message, cause=cause) from exc
+            if remedy in safe_exc(refusal):
+                raise refusal from exc
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
         raise SchemaMismatchError(
