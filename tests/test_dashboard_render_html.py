@@ -81,7 +81,13 @@ def _snapshot() -> dict[str, Any]:
                 unit="percent",
                 error='<script>alert("x")</script>',
                 detail={
-                    "counts": {"total": 2, "pass": 1, "fail": 1},
+                    "counts": {
+                        "total": 2,
+                        "pass": 1,
+                        "fail": 1,
+                        "needs-review": 0,
+                        "unverified": 0,
+                    },
                     "scorecard_sha": "abcdef0123456789",
                     "engine_ref": "deadbeef1234",
                 },
@@ -199,7 +205,19 @@ def test_the_asvs_ref_pair_sits_beside_its_value() -> None:
     tile = tile[: tile.index("</section>")]
     pair = "scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234"
     assert '<span class="big">50%</span></div><dl>' in tile
-    assert f'<p class="refpair">{pair}</p>' in tile
+    assert f'<p class="refpair">Collector ref pair: {pair}</p>' in tile
+    # The headline's unexamined counts sit in the same tile.
+    assert "<dt>Needs review</dt><dd>0</dd>" in tile
+    assert "<dt>Unverified</dt><dd>0</dd>" in tile
+
+
+def test_the_asvs_headline_is_withheld_without_unexamined_counts() -> None:
+    snap = _snapshot()
+    snap["metrics"][3]["detail"]["counts"] = {"total": 2, "pass": 1, "fail": 1}
+    page = rh.render(snap)
+    tile = page[page.index("<h3>asvs") :]
+    tile = tile[: tile.index("</section>")]
+    assert '<span class="big"><span class="nodata">no data</span></span>' in tile
 
 
 def test_print_out_dir_refuses_a_work_tree(

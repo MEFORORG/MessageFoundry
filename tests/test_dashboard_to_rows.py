@@ -101,7 +101,13 @@ def _snapshot() -> dict[str, Any]:
                 value=50.0,
                 status="warn",
                 detail={
-                    "counts": {"total": 2, "pass": 1, "fail": 1},
+                    "counts": {
+                        "total": 4,
+                        "pass": 1,
+                        "fail": 1,
+                        "needs-review": 1,
+                        "unverified": 1,
+                    },
                     "scorecard_sha": "abcdef0123456789",
                     "engine_ref": "deadbeef1234",
                 },
@@ -130,7 +136,12 @@ def test_metric_rows_contract() -> None:
     for row in rows.values():
         assert set(row) == METRIC_KEYS
     # The headline row carries its pair in ref alone, so the tile never shows it twice.
-    assert rows["asvs"]["note"] == "Pass cells over cells not marked n/a."
+    assert rows["asvs"]["note"] == (
+        "Pass cells over cells not marked n/a. 1 needs-review and 1 unverified cells are in that "
+        "denominator and are not passes."
+    )
+    assert rows["asvs"]["value"] == 50.0
+    assert (rows["asvs.needs-review"]["value"], rows["asvs.unverified"]["value"]) == (1, 1)
     assert rows["asvs"]["ref"] == "scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234"
     # Every ASVS count row carries the ref pair too.
     assert (
@@ -309,6 +320,33 @@ def test_every_asvs_row_carries_the_ref_pair() -> None:
     rows = _rows(_snapshot())
     pair = "scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234"
     asvs = [r for r in rows.values() if str(r["id"]).split(".")[0] == "asvs"]
-    assert len(asvs) == 4  # the headline row and its pass, partial and fail counts
+    # The headline row, its pass, partial, fail, needs-review and unverified counts, and the tool's
+    # provenance.
+    assert len(asvs) == 7
     assert all(r["ref"] == pair for r in asvs)
     assert all(r["ref"] == "" for r in rows.values() if r not in asvs)
+
+
+def test_asvs_without_unexamined_counts_has_no_headline() -> None:
+    snap = _snapshot()
+    snap["metrics"][3]["detail"]["counts"] = {"total": 2, "pass": 1, "fail": 1}
+    rows = _rows(snap)
+    assert rows["asvs"]["value"] is None
+    assert rows["asvs"]["status"] == "unknown"
+    assert rows["asvs"]["error"] == tr.NO_ASVS_HEADLINE
+    assert rows["asvs.needs-review"]["value"] is None
+    assert rows["asvs.pass"]["value"] == 1  # the counts themselves still show
+    # One of the two present: the other is 0, since the cells line sums to its total.
+    snap["metrics"][3]["detail"]["counts"] = {"total": 3, "pass": 1, "fail": 1, "unverified": 1}
+    rows = _rows(snap)
+    assert rows["asvs"]["value"] == 50.0
+    assert (rows["asvs.needs-review"]["value"], rows["asvs.unverified"]["value"]) == (0, 1)
+
+
+def test_asvs_provenance_row_quotes_the_tools_own_lines() -> None:
+    snap = _snapshot()
+    lines = ["# asvs-status scorecard=NO-GIT engine=NO-GIT", "# at 2026-11-18"]
+    snap["metrics"][3]["detail"]["provenance"] = lines
+    assert _rows(snap)["asvs.provenance"]["value"] == "; ".join(lines)
+    del snap["metrics"][3]["detail"]["provenance"]
+    assert _rows(snap)["asvs.provenance"]["value"] is None

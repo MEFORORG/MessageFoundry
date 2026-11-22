@@ -17,7 +17,9 @@ file and an atomic replace, so a failed run leaves the previous page whole; the 
 input and is never copied beside the page. The page quotes the same private vault counts as the
 snapshot, so the directory is refused, before anything is read, whenever the collector's guard
 (``refuse_dir_reason``) finds git reporting a work tree there; that guard's docstring says what
-it cannot see. Every ASVS number is shown beside the ref pair the scorecard tool measured it at.
+it cannot see. Every ASVS number is shown beside the collector's ref pair (``to_rows.py`` says how
+it is built) and the scorecard tool's own ``#`` provenance lines, and the ASVS headline beside its
+needs-review and unverified counts, or not at all when the snapshot holds neither.
 
 The rows are built by ``to_rows.py``, so the page and the row files never disagree.
 
@@ -326,7 +328,11 @@ def tile(row: Mapping[str, Any], facts: Sequence[Mapping[str, Any]]) -> str:
         + "</div>"
         + (f"<dl>{dl}</dl>" if dl else "")
         # The ASVS ref pair sits beside the value it qualifies, never only in a footnote.
-        + (f'<p class="refpair">{esc(row["ref"])}</p>' if row.get("ref") else "")
+        + (
+            f'<p class="refpair">Collector ref pair: {esc(row["ref"])}</p>'
+            if row.get("ref")
+            else ""
+        )
         + (f'<p class="note">{esc(row["note"])}</p>' if row.get("note") else "")
         + (f'<p class="err">{esc(error)}</p>' if error else "")
         + "</section>"

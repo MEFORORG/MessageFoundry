@@ -9,8 +9,17 @@ WRITES ``<out>/metrics.json`` (one row per headline metric, then one per fact) a
 
 THE ROWS ARE AS PRIVATE AS THE SNAPSHOT: they quote the same vault counts. ``--out`` is refused
 wherever the collector's own guard (``refuse_out_dir``) finds git reporting a work tree; that
-guard's docstring says what it cannot see. Every row quoting an ASVS number carries the scorecard
-tool's ref pair in its ``ref`` field (empty on every other row).
+guard's docstring says what it cannot see. Every row quoting an ASVS number carries the collector's
+ref pair in its ``ref`` field (empty on every other row): the collector builds it from the vault
+commit it archived the scorecard at and the ``engine=`` ref, which in an archive run is the commit
+the caller archived, because the tool itself then prints ``NO-GIT``. The tool's own ``#`` provenance
+lines are a separate row, ``asvs.provenance``.
+
+THE ASVS HEADLINE IS NEVER SHOWN ALONE. It is pass cells over cells not marked n/a, so
+needs-review and unverified cells sit in its denominator; their counts are rows beside it and are
+named in its note. When the snapshot holds neither count, the headline is null, following
+``scripts/asvs/scorecard.py``'s caveat that there is no headline score while unexamined cells may
+exist.
 
 A VALUE THAT IS NOT IN THE SNAPSHOT IS ``null``, never ``0`` or NaN: a metric that errored has no
 detail, and its facts read null rather than as a quiet zero.
@@ -93,8 +102,52 @@ class Snapshot:
 
 
 def asvs_pair(snap: Snapshot) -> str:
-    """The ref pair every ASVS number is quoted beside, rendered by the collector itself."""
+    """The collector's ref pair, which every ASVS number is quoted beside."""
     return str(cm.asvs_ref_pair(snap.detail("asvs")))
+
+
+#: The verdicts in the headline's denominator that are not passes and carry no verdict reached.
+UNEXAMINED = (("needs-review", "Needs review"), ("unverified", "Unverified"))
+
+NO_ASVS_HEADLINE = (
+    "no headline: the snapshot holds no needs-review or unverified count, and scorecard.py gives "
+    "no headline score while unexamined cells may exist"
+)
+
+
+def unexamined_counts(detail: dict[str, Any]) -> dict[str, int] | None:
+    """The ASVS detail's needs-review and unverified counts, one the counts omit read as 0 (the
+    collector's cells line sums to its total); ``None`` when it holds neither, so the headline
+    cannot be qualified."""
+    counts = _dict(detail.get("counts"))
+    if not any(key in counts for key, _ in UNEXAMINED):
+        return None
+    try:
+        return {key: int(counts.get(key) or 0) for key, _ in UNEXAMINED}
+    except (TypeError, ValueError):
+        return None
+
+
+def _unexamined(key: str) -> Callable[[dict[str, Any]], Any]:
+    return lambda d: (unexamined_counts(d) or {}).get(key)
+
+
+def asvs_note(snap: Snapshot) -> str:
+    base = "Pass cells over cells not marked n/a."
+    unexamined = unexamined_counts(snap.detail("asvs"))
+    if unexamined is None:
+        return base
+    return (
+        f"{base} {unexamined['needs-review']} needs-review and {unexamined['unverified']} "
+        "unverified cells are in that denominator and are not passes."
+    )
+
+
+def _provenance(d: dict[str, Any]) -> str | None:
+    lines = d.get("provenance")
+    if not isinstance(lines, list):
+        return None
+    return "; ".join(str(ln) for ln in lines if str(ln).strip()) or None
 
 
 def notes(snap: Snapshot) -> dict[str, str]:
@@ -105,7 +158,7 @@ def notes(snap: Snapshot) -> dict[str, str]:
         "flow_health": "Open engine PRs right now.",
         "ci_main": f"Pass rate of ci.yml push runs on main, week {week}. Cancelled and skipped "
         "runs not counted.",
-        "asvs": "Pass cells over cells not marked n/a.",
+        "asvs": asvs_note(snap),
         "dependency_vulns": "Open Dependabot alerts on the engine.",
         "owner_waiting": "Open ledger rows with verdict owner-ruling. Open class C questions not "
         "counted yet.",
@@ -160,6 +213,8 @@ def facts(weeks: int) -> list[Fact]:
         ("asvs", "pass", "Pass", _count("pass")),
         ("asvs", "partial", "Partial", _count("partial")),
         ("asvs", "fail", "Fail", _count("fail")),
+        *[("asvs", key, label, _unexamined(key)) for key, label in UNEXAMINED],
+        ("asvs", "provenance", "Tool provenance", _provenance),
         ("dependency_vulns", "critical_high", "Critical + high", _critical_high),
         (
             "dependency_vulns",
@@ -195,6 +250,10 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
         }
         for m in snap.metrics
     ]
+    headline = next((r for r in rows if r["id"] == "asvs"), None)
+    if headline is not None and unexamined_counts(snap.detail("asvs")) is None:
+        # No count to qualify it with: no headline, as scorecard.py's own caveat says.
+        headline.update(value=None, status="unknown", error=headline["error"] or NO_ASVS_HEADLINE)
     for mid, key, label, read in facts(len(snap.weeks)):
         if mid not in snap.by_id:
             continue
@@ -216,7 +275,7 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
                 "note": f"Measured at {asvs_pair(snap)}." if mid == "asvs" else "",
                 "source": snap.by_id[mid].get("source", ""),
                 "error": reason,
-                # The ref pair the scorecard tool printed, for every row quoting an ASVS number.
+                # The collector's ref pair, on every row quoting an ASVS number.
                 "ref": asvs_pair(snap) if mid == "asvs" else "",
             }
         )
