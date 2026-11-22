@@ -2980,13 +2980,15 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
   name, on any install.
 - **When a replaced file is used**, whoever wrote it. For the `vault` key provider the engine reads
   the file at least at every store open and every DR backup pass, and for
-  `[secrets].provider = "vault"` at every secret read. The `vault_transit` cipher reads it once,
-  when the store opens, and builds every one of its Vault clients from that token: one used by
-  the thread that builds the cipher, one for any other thread when it first needs one, and a new
-  one on a thread's next Transit request after a store that holds the cipher closes
-  (BACKLOG #5963). None of those builds reads the file again, so a token replaced
-  after the store opens is not used until the next start, and once the token it holds expires,
-  every Transit call fails. So under `vault_transit`, restart the engine after each replacement.
+  `[secrets].provider = "vault"` at every secret read. The `vault_transit` cipher reads it when
+  the store opens and again after Vault answers a Transit request with HTTP 403 (BACKLOG #5609),
+  at most once in 5 seconds. If the token changed, every thread's Vault client moves to it on its
+  next request, and a call off the event loop is asked once more. A call on the event loop does
+  not wait for the read: it fails, and a later call uses the new token. So replacing the file
+  needs no restart, but the engine does not renew a token and does not read the file until a 403
+  arrives. If the file is unchanged, missing or unreadable, or Vault refuses the new token too,
+  the call fails closed as any Transit refusal does. Replace the file before the token expires,
+  so no call is refused.
 
 **A Vault Agent sink can write that file, where this route is offered.** A site running Vault
 Agent auto-auth points the agent's file sink at the file, and leaves the sink unwrapped and

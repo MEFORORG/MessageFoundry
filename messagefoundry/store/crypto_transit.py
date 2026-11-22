@@ -47,6 +47,7 @@ is ONE Vault client-construction path); the base install pulls zero Vault SDK.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import logging
@@ -99,6 +100,7 @@ from messagefoundry.store.keyprovider_vault import (
     is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
+    store_vault_token,
     vault_failure_text,
 )
 from messagefoundry.store.row_seal import transit_mac_version
@@ -122,6 +124,11 @@ PROVIDER_NAME = "vault_transit"
 #: A request it ends raises a requests timeout, which :func:`_transit_failure` reads as an outage
 #: that gave no verdict on the value.
 TRANSIT_REQUEST_TIMEOUT_S: tuple[float, float] = (5.0, 30.0)
+#: The least time, in seconds, between two re-reads of the store token after a Transit 403 (BACKLOG
+#: #5609), so a token that stays refused cannot drive a read of the secrets directory per call.
+_TOKEN_REREAD_INTERVAL_S = 5.0
+#: How long, in seconds, a worker thread waits for a re-read in progress. The event loop never waits.
+_TOKEN_REREAD_WAIT_S = 2.0
 
 # Connection reuses the shared Vault wiring (a deployment runs one Vault): the address and token are read
 # through keyprovider_vault.store_vault_hop, which refuses either one unset rather
@@ -548,16 +555,91 @@ def _close_client(client: object, owner: int) -> None:
         _warn_quietly(lambda: ("closing a Transit client's connections raised %s", name))
 
 
+def _on_event_loop() -> bool:
+    """Whether the calling thread is running an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+class _StoreToken:
+    """The store token this cipher's clients are built from, re-read after a 403 (BACKLOG #5609).
+
+    The re-read goes through :func:`~messagefoundry.store.keyprovider_vault.store_vault_token`, the
+    source the startup read uses, so it adds no fallback. It runs on its own short-lived thread, one
+    at a time and at most once per :data:`_TOKEN_REREAD_INTERVAL_S`. :attr:`value` is written before
+    :attr:`epoch`, so a client recorded under the current epoch never holds an older token."""
+
+    __slots__ = ("_lock", "_next_read", "_reader", "epoch", "value")
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+        self.epoch = 0
+        self._lock = threading.Lock()
+        self._reader: threading.Thread | None = None
+        self._next_read = 0.0
+
+    def replaced_since(self, epoch: int) -> bool:
+        """Whether a token newer than ``epoch`` is available, starting a re-read when one is due.
+        A worker thread waits up to :data:`_TOKEN_REREAD_WAIT_S` for the read. The event loop does
+        not wait: its call fails as it would have, and a later call uses what the read found."""
+        with self._lock:
+            if self.epoch != epoch:
+                return True
+            reader = self._reader
+            if reader is None:
+                now = time.monotonic()
+                if now < self._next_read:
+                    return False
+                self._next_read = now + _TOKEN_REREAD_INTERVAL_S
+                reader = threading.Thread(
+                    target=self._reread, name="transit-token-reread", daemon=True
+                )
+                self._reader = reader
+                try:
+                    reader.start()
+                except RuntimeError:  # no new thread, at least at interpreter shutdown
+                    self._reader = None
+                    return False
+        if _on_event_loop():
+            return False
+        reader.join(_TOKEN_REREAD_WAIT_S)
+        return self.epoch != epoch
+
+    def _reread(self) -> None:
+        """Adopt the configured token if it changed. A read that fails keeps the current token, and
+        is logged by the failure's class alone."""
+        try:
+            fresh = store_vault_token()
+            if fresh != self.value:
+                with self._lock:
+                    self.value = fresh
+                    self.epoch += 1
+                _warn_quietly(lambda: ("Transit answered 403; using the replaced Vault token",))
+        except Exception as exc:  # noqa: BLE001 -- the caller's 403 stands; logged by class
+            kind = type(exc).__name__
+            _warn_when_due(
+                lambda: "token-reread-failed",
+                lambda: ("re-reading the Vault token after a Transit 403 raised %s", kind),
+            )
+        finally:
+            with self._lock:
+                self._reader = None
+
+
 class _ThreadClient:
     """One thread's own hvac client (BACKLOG #5963). :attr:`release` closes it only when it runs
     on that thread. Run on any other thread, as when the cipher is collected there, it leaves the
     client to garbage collection. weakref's exit hook does not run it."""
 
-    __slots__ = ("__weakref__", "client", "generation", "release")
+    __slots__ = ("__weakref__", "client", "generation", "release", "token_epoch")
 
-    def __init__(self, client: Any, generation: int) -> None:
+    def __init__(self, client: Any, generation: int, token_epoch: int) -> None:
         self.client = client
         self.generation = generation
+        self.token_epoch = token_epoch
         self.release = weakref.finalize(self, _close_client, client, threading.get_ident())
         self.release.atexit = False
 
@@ -579,6 +661,7 @@ class TransitCipher(_UnmarkedPolicy):
         *,
         allow_unmarked: bool = False,
         client_factory: Callable[[], Any] | None = None,
+        token_source: _StoreToken | None = None,
     ) -> None:
         # BACKLOG #5963: requests does not document its Session as thread-safe, and this cipher is
         # called on the event loop and in worker threads. With a ``client_factory`` each thread
@@ -590,8 +673,10 @@ class TransitCipher(_UnmarkedPolicy):
         self._thread_clients = threading.local()
         #: Bumped by :meth:`close_connections`; a thread holding an older one replaces its client.
         self._generation = 0
+        # BACKLOG #5609: set together with a factory that builds from it. Without it a 403 is final.
+        self._token_source = token_source
         if client_factory is not None:
-            self._hold(client, 0)
+            self._hold(client, 0, self._token_epoch())
         self._key = key_name
         # The same unmarked-value refusal as the in-process cipher (BACKLOG #1169, ASVS 11.3.3).
         self._init_unmarked_policy(allow_unmarked)
@@ -614,13 +699,49 @@ class TransitCipher(_UnmarkedPolicy):
         if self._client_factory is None:
             return self._shared_client
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
+        # Read before the build: a token replaced during it leaves this client marked stale.
+        epoch = self._token_epoch()
         if held is not None:
-            if held.generation == self._generation:
+            if held.generation == self._generation and held.token_epoch == epoch:
                 return held.client
             # Stale: close it before the build, so a build that raises cannot leave it open.
             self._drop_held(held)
         generation = self._generation
-        return self._hold(self._client_factory(), generation)
+        return self._hold(self._client_factory(), generation, epoch)
+
+    def _token_epoch(self) -> int:
+        return 0 if self._token_source is None else self._token_source.epoch
+
+    def _transit_call(self, client: Any, ask: Callable[[Any], Any]) -> Any:
+        """``ask(client)``, asked once more on a rebuilt client when Vault answered 403 and the
+        store token has been replaced (BACKLOG #5609). A 403 is a request Transit refused before
+        using a key, so asking again cannot seal or MAC anything twice. Every other failure, and a
+        403 with no replaced token, propagates as raised. Each ``ask`` names its Transit call in
+        source, which is what the crypto inventory scanner reads."""
+        try:
+            return ask(client)
+        except Exception as exc:
+            renewed = self._client_on_new_token(exc)
+            if renewed is None:
+                raise
+        return ask(renewed)
+
+    def _client_on_new_token(self, exc: Exception) -> Any | None:
+        """The calling thread's client on a replaced token, after the 403 ``exc``; else ``None``.
+        A rebuild that fails is ``None`` too, so the caller raises the 403 it would have raised,
+        and the thread's next call builds again."""
+        source = self._token_source
+        if source is None or not is_vault_forbidden(exc):
+            return None
+        held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
+        if held is None or not source.replaced_since(held.token_epoch):
+            return None
+        try:
+            return self._client
+        except Exception as build_exc:  # noqa: BLE001 -- the caller raises the 403; logged by class
+            kind = type(build_exc).__name__
+            _warn_quietly(lambda: ("rebuilding a Transit client on a new token raised %s", kind))
+            return None
 
     def _thread_client(self, op: str) -> Any:
         """:attr:`_client` for a data-key ``op``, a build failure raised as
@@ -630,9 +751,9 @@ class TransitCipher(_UnmarkedPolicy):
         except Exception as exc:
             raise _build_failure(op, self._key, exc) from exc
 
-    def _hold(self, client: Any, generation: int) -> Any:
+    def _hold(self, client: Any, generation: int, token_epoch: int) -> Any:
         """Keep ``client`` as the calling thread's own; this cipher closes it only on this thread."""
-        self._thread_clients.held = _ThreadClient(client, generation)
+        self._thread_clients.held = _ThreadClient(client, generation, token_epoch)
         return client
 
     def _drop_held(self, held: _ThreadClient) -> None:
@@ -677,7 +798,9 @@ class TransitCipher(_UnmarkedPolicy):
             kwargs: dict[str, Any] = {"name": self._key, "plaintext": pt_b64}
             if assoc is not None:
                 kwargs["associated_data"] = assoc
-            response: Any = client.secrets.transit.encrypt_data(**kwargs)
+            response: Any = self._transit_call(
+                client, lambda c: c.secrets.transit.encrypt_data(**kwargs)
+            )
             ciphertext = response["data"]["ciphertext"]  # "vault:v1:…" — no plaintext, no key
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
@@ -712,7 +835,9 @@ class TransitCipher(_UnmarkedPolicy):
             kwargs: dict[str, Any] = {"name": self._key, "ciphertext": ciphertext}
             if assoc is not None:
                 kwargs["associated_data"] = assoc
-            response: Any = client.secrets.transit.decrypt_data(**kwargs)
+            response: Any = self._transit_call(
+                client, lambda c: c.secrets.transit.decrypt_data(**kwargs)
+            )
             plaintext_b64 = response["data"]["plaintext"]
         except Exception as exc:
             # Covers a failed AEAD tag (wrong cell AAD / corrupt blob) AND transport failure — both fail
@@ -741,6 +866,15 @@ class TransitCipher(_UnmarkedPolicy):
                 item["associated_data"] = assoc
             batch_input.append(item)
         return batch_input
+
+    def _batch_failure_flags(self, exc: Exception) -> tuple[bool, bool]:
+        """:func:`_classify_batch_failure`, a 403 read as a 400 when this cipher can replace its
+        token (BACKLOG #5609): the single requests after it may succeed on the new token, and that
+        says nothing about Transit's batch support, so batching stays on."""
+        unavailable, bad_request = _classify_batch_failure(exc)
+        return unavailable, bad_request or (
+            self._token_source is not None and is_vault_forbidden(exc)
+        )
 
     def _send_alone_from_now(self, op: str, why: str) -> None:
         if not self._batch_alone:
@@ -826,13 +960,15 @@ class TransitCipher(_UnmarkedPolicy):
         failed = unavailable = bad_request = False
         failure_type = ""
         try:
-            response = client.secrets.transit.decrypt_data(
-                name=self._key, batch_input=self._batch_input("ciphertext", sent)
+            batch_input = self._batch_input("ciphertext", sent)
+            response = self._transit_call(
+                client,
+                lambda c: c.secrets.transit.decrypt_data(name=self._key, batch_input=batch_input),
             )
         except Exception as exc:
             # Only flags and a type name leave this handler (see _classify_batch_failure).
             failed, failure_type = True, type(exc).__name__
-            unavailable, bad_request = _classify_batch_failure(exc)
+            unavailable, bad_request = self._batch_failure_flags(exc)
         if unavailable:
             down = CipherUnavailableError(
                 f"Transit decrypt failed (key={self._key!r}): {failure_type}"
@@ -911,13 +1047,15 @@ class TransitCipher(_UnmarkedPolicy):
         failed = unavailable = bad_request = False
         failure_type = ""
         try:
-            response = client.secrets.transit.encrypt_data(
-                name=self._key, batch_input=self._batch_input("plaintext", sent)
+            batch_input = self._batch_input("plaintext", sent)
+            response = self._transit_call(
+                client,
+                lambda c: c.secrets.transit.encrypt_data(name=self._key, batch_input=batch_input),
             )
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
             failed, failure_type = True, type(exc).__name__
-            unavailable, bad_request = _classify_batch_failure(exc)
+            unavailable, bad_request = self._batch_failure_flags(exc)
         if unavailable:
             raise CipherUnavailableError(
                 f"Transit encrypt failed (key={self._key!r}): {failure_type}"
@@ -983,8 +1121,11 @@ class TransitCipher(_UnmarkedPolicy):
         as a break later, for example one a proxy or the wrong key answered."""
         inp = base64.b64encode(data).decode("ascii")
         try:
-            response: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key, hash_input=inp, algorithm=AUDIT_TRANSIT_HASH_ALGO
+            response: Any = self._transit_call(
+                self._client,
+                lambda c: c.secrets.transit.generate_hmac(
+                    name=self._audit_key, hash_input=inp, algorithm=AUDIT_TRANSIT_HASH_ALGO
+                ),
             )
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
@@ -1195,11 +1336,15 @@ class TransitCipher(_UnmarkedPolicy):
     def _transit_verify_call(self, key_name: str, data: bytes, mac: str) -> object:
         """Transit's ``verify`` of ``mac`` over ``data`` under ``key_name``: the raw reply. Any
         failure of the call propagates as raised, for the caller to classify. Blocking."""
-        response: object = self._client.secrets.transit.verify_signed_data(
-            name=key_name,
-            hash_input=base64.b64encode(data).decode("ascii"),
-            hmac=mac,
-            hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
+        hash_input = base64.b64encode(data).decode("ascii")
+        response: object = self._transit_call(
+            self._client,
+            lambda c: c.secrets.transit.verify_signed_data(
+                name=key_name,
+                hash_input=hash_input,
+                hmac=mac,
+                hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            ),
         )
         return response
 
@@ -1212,10 +1357,13 @@ class TransitCipher(_UnmarkedPolicy):
     def _probe_mac(self) -> object:
         """Transit's ``hmac`` over FIXED input under the audit key's latest version, raw. Fixed
         input keeps a row's own content from deciding a probe. Any failure propagates. Blocking."""
-        probe: Any = self._client.secrets.transit.generate_hmac(
-            name=self._audit_key,
-            hash_input=_VERSION_PROBE_INPUT,
-            algorithm=AUDIT_TRANSIT_HASH_ALGO,
+        probe: Any = self._transit_call(
+            self._client,
+            lambda c: c.secrets.transit.generate_hmac(
+                name=self._audit_key,
+                hash_input=_VERSION_PROBE_INPUT,
+                algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            ),
         )
         return probe["data"]["hmac"]
 
@@ -1325,8 +1473,11 @@ class TransitCipher(_UnmarkedPolicy):
         probe. Returns Transit's raw value; the sealer checks its shape. Any failure raises
         :class:`CipherError` naming the key and Vault's failure text, never the input."""
         try:
-            response: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key, hash_input=hash_input, algorithm=AUDIT_TRANSIT_HASH_ALGO
+            response: Any = self._transit_call(
+                self._client,
+                lambda c: c.secrets.transit.generate_hmac(
+                    name=self._audit_key, hash_input=hash_input, algorithm=AUDIT_TRANSIT_HASH_ALGO
+                ),
             )
             return response["data"]["hmac"]
         except Exception as exc:
@@ -1422,11 +1573,12 @@ def build_transit_cipher(
     key name, a missing extra, or an unreachable/unknown Transit key raises :class:`KeyProviderError` so
     ``open_store`` refuses to start rather than degrading to plaintext."""
     key_name, audit_key = _key_names()
-    # Read once, and every client this cipher builds takes this token: the startup client below,
-    # each thread's own on its first call there, and each rebuild after close_connections (BACKLOG
-    # #5963). A token replaced afterwards, in the environment or the secrets directory, is not seen
-    # by any of them until the store is opened again.
+    # Every client this cipher builds takes the current token: the startup client below, each
+    # thread's own on its first call there, and each rebuild after close_connections (BACKLOG
+    # #5963). The token is read again only after a Transit 403 (BACKLOG #5609, _StoreToken); the
+    # address is not.
     addr, token = store_vault_hop()
+    store_token = _StoreToken(token)
     # The CA anchor is read once too, like the address and token, and handed to every thread's own
     # client (BACKLOG #5963). Not everything is: each build still reads the settings object, and
     # hvac and requests read their own environment (at least proxies) as each client is made.
@@ -1438,7 +1590,7 @@ def build_transit_cipher(
         # engine's request timeout (BACKLOG #5983).
         return _build_client(
             addr,
-            token,
+            store_token.value,
             revocation_attested=settings.vault_revocation_attested,
             posture=posture,
             revocation_reason=settings.vault_revocation_attested_reason,
@@ -1503,6 +1655,7 @@ def build_transit_cipher(
         audit_key=audit_key,
         allow_unmarked=settings.allow_unmarked_ciphertext,
         client_factory=build_client,
+        token_source=store_token,
     )
 
 
