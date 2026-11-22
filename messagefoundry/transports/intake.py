@@ -20,10 +20,13 @@ at rest as it does ``connection_event.reason``.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol, cast
+from typing import Any, cast
+
+from messagefoundry.transports.admission import PeerInfo
 
 __all__ = [
     "IntakeAuth",
@@ -76,21 +79,11 @@ class IntakeContext:
 
     def fields(self) -> dict[str, Any]:
         """The context as a JSON-ready mapping, with every unknown field left out."""
-        out: dict[str, Any] = {"transport": self.transport}
-        for name in (
-            "peer_host",
-            "peer_port",
-            "listener",
-            "cert_subject",
-            "address_listed",
-            "source",
-        ):
-            value = getattr(self, name)
-            if value is not None:
-                out[name] = value
-        if self.auth_mode is not None:
-            out["auth_mode"] = self.auth_mode.value
-        return out
+        return {
+            f.name: value
+            for f in dataclasses.fields(self)
+            if (value := getattr(self, f.name)) is not None
+        }
 
 
 def peer_address(name: object) -> tuple[str | None, int | None]:
@@ -102,10 +95,6 @@ def peer_address(name: object) -> tuple[str | None, int | None]:
     return None, None
 
 
-class _SocketInfo(Protocol):
-    def get_extra_info(self, name: str, default: Any = None) -> Any: ...
-
-
 def _host_port(name: object) -> str | None:
     host, port = peer_address(name)
     if host is None or port is None:
@@ -114,7 +103,7 @@ def _host_port(name: object) -> str | None:
 
 
 def socket_intake(
-    peer: _SocketInfo,
+    peer: PeerInfo,
     *,
     transport: str,
     auth_mode: IntakeAuth,
