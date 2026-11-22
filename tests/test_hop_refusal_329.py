@@ -194,7 +194,8 @@ _REFUSED_WEBHOOK_URLS = [
     pytest.param(f"HTTP://hooks.example/{_WEBHOOK_TOKEN}", (), id="upper-http"),
     pytest.param(f"ftp://hooks.example/{_WEBHOOK_TOKEN}", (), id="ftp"),
     pytest.param(f"hooks.example/{_WEBHOOK_TOKEN}", (), id="no-scheme"),
-    # urlsplit's own ValueError quotes the netloc; the refusal must not pass it on.
+    # Shapes whose urlsplit ValueError would quote the netloc. The http.client screen now
+    # refuses the non-ASCII one first; the bracket one still reaches the split.
     pytest.param(f"https://svc:{_WEBHOOK_TOKEN}\uff03x@hooks.example/x", (), id="nfkc-netloc"),
     pytest.param(f"https://svc:pw@[{_WEBHOOK_TOKEN}]/x", (), id="bad-bracket"),
     pytest.param(f"https://svc:{_WEBHOOK_TOKEN}@hooks.example/x", (), id="userinfo"),

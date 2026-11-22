@@ -91,8 +91,8 @@ def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> st
       token;
     * a URL that names no host, and a host off a non-empty ``webhook_allowed_hosts`` (BACKLOG
       #5088), after the scheme, so an http URL is never sent to fix an entry it cannot use;
-    * a URL over the outbound length bound (ASVS 4.2.5). Construction-only is enough: the URL is
-      operator config and the sole header is a fixed ``Content-Type``.
+    * a URL over the outbound length bound (ASVS 4.2.5). The URL is operator config and the
+      sole header is a fixed ``Content-Type``, so nothing longer is added before the wire.
     """
     candidate = url.strip(_STRIPPED_BY_BOTH)
     if candidate != candidate.strip():
