@@ -413,3 +413,32 @@ def test_a_temporary_table_is_not_the_stores_in_any_spacing(statement: str) -> N
 def test_a_not_null_constraint_with_an_escaped_or_dollar_name_raises(name: str) -> None:
     with pytest.raises(ValueError, match="not-null constraint"):
         declared_schema((f"CREATE TABLE t (a INT, CONSTRAINT {name} NOT NULL a)",), "postgres")
+
+
+# --- review round 3 repair: regressions against main -----------------------------------------------
+
+
+def test_a_guarded_drop_whose_list_goes_on_past_a_temporary_table_raises() -> None:
+    with pytest.raises(ValueError, match="cannot read"):
+        declared_schema(("CREATE TABLE u (a INT NULL)", "DROP TABLE IF EXISTS #tmp, u"))
+
+
+@pytest.mark.parametrize(
+    ("statement", "partial"),
+    [
+        ("IF COL_LENGTH('t','b') IS NOT NULL EXEC('CREATE INDEX ix ON t (a) WHERE b > 0')", True),
+        ("EXEC('CREATE INDEX ix ON t (a) INCLUDE (b)')", False),
+        ("EXEC('CREATE INDEX ix ON t (a) WHERE b <> ''x''')", True),
+    ],
+)
+def test_an_opaque_index_inside_an_exec_string_is_read(statement: str, partial: bool) -> None:
+    shape = declared_schema(("CREATE TABLE t (a INT NULL, b INT NULL)", statement), "sqlserver")
+    assert shape.named_indexes["ix"].partial is partial
+
+
+@pytest.mark.parametrize("name", ["update", "delete", "insert"])
+def test_a_rename_to_a_data_word_is_read(name: str) -> None:
+    shape = declared_schema(
+        ("CREATE TABLE t (a INT)", f"ALTER TABLE t RENAME COLUMN a TO {name}"), "postgres"
+    )
+    assert shape.columns["t"] == frozenset({name})

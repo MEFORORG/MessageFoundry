@@ -42,14 +42,17 @@ DDL the reader cannot place raises ``ValueError`` rather than being skipped or m
 not match, an ``ALTER TABLE`` with more than one clause or an action it does not know, a table rename,
 an ``ALTER INDEX``, a second ``CREATE TABLE`` of a table no ``DROP`` removed, a ``USING`` access
 method, a key column or expression carrying a collation, an operator class or a ``NULLS`` order, a key
-that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server inline ``INDEX``, a
-``NOT NULL`` table constraint, a ``DROP COLUMN`` of a column an expression, ``INCLUDE`` or predicate
-of an index on its table may name, other than one of its key columns, a column type or clause it does not know, a SQL Server column that
-leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--`` or ``/*`` inside a
-quoted string, which may be dynamic SQL's comment or a literal's text. A unit test reads each shipped
-batch, so a new form fails there before it reaches an open. Not every misread raises: at least DDL
-text inside a string literal is read as run, and an ``ALTER COLUMN`` is read as reaching only an older
-store, whether or not either holds (BACKLOG #5062).
+that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server
+inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it does not know, a SQL
+Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--``
+or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text. A unit test
+reads each shipped batch, so a new form fails there before it reaches an open.
+
+Not every misread raises (BACKLOG #5062). At least: DDL text inside a string literal is read as run,
+and an ``ALTER COLUMN`` is read as reaching only an older store, whether or not either holds. A
+``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
+``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
+a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
 
 What is NOT compared includes at least: a column's default, other than whether PostgreSQL's is a
 ``nextval()`` call, which reads as numbering; a PostgreSQL column's collation; constraint indexes (a
@@ -160,12 +163,13 @@ _SP_RENAME = re.compile(
 )
 #: Every place a table or an index is created, dropped or renamed, read loosely, so a form the
 #: patterns above miss is counted and refused rather than silently left unchecked. A ``#`` temporary
-#: table is not the store's, behind an ``IF [NOT] EXISTS`` guard too.
+#: table is not the store's, behind an ``IF [NOT] EXISTS`` guard too, but a guarded ``DROP TABLE``
+#: whose list goes on past it is counted, as on any other list the strict pattern cannot read.
 _LOOSE: Final = (
     (re.compile(r"\bCREATE\s+TABLE\s+(?!\s|(?:IF\s+NOT\s+EXISTS\s+)?#)", re.I), _CREATE_TABLE),
     (re.compile(r"\bCREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\b", re.I), _CREATE_INDEX),
     (re.compile(r"\bALTER\s+TABLE\s+(?!\s|(?:IF\s+EXISTS\s+)?#)", re.I), _ALTER_TABLE),
-    (re.compile(r"\bDROP\s+TABLE\s+(?!\s|(?:IF\s+EXISTS\s+)?#)", re.I), _DROP_TABLE),
+    (re.compile(r"\bDROP\s+TABLE\s+(?!\s|#|IF\s+EXISTS\s+#\w++(?!\s*,))", re.I), _DROP_TABLE),
     (re.compile(r"\bDROP\s+INDEX\b", re.I), _DROP_INDEX),
     (re.compile(r"\bsp_rename\b", re.I), _SP_RENAME),
 )
@@ -200,11 +204,12 @@ _DIRECTION = re.compile(r"\s+(ASC|DESC)$", re.I)
 #: The words a statement inside a block starts with, at which an ``ALTER TABLE`` clause has ended
 #: when no ``;`` closes it. None can appear inside a column definition.
 _STATEMENT_START = frozenset({"if", "begin", "end", "exec", "execute", "else", "declare", "go"})
-#: Words that start a data statement, which a clause ends at unless ``ON`` precedes them (BACKLOG
-#: #5062: an ``ADD CONSTRAINT`` read on into the next statement took that statement's ``PRIMARY KEY``
-#: as its own).
-#: The words after which a data word is a name: a column's, a constraint's or a referenced table's.
-_NAME_BEFORE = frozenset({"on", "add", "column", "exists", "constraint", "references"})
+#: The words after which a data word is a name: a column's, a constraint's, a referenced table's
+#: or a rename's new name. After ``ON`` it is a foreign key's action.
+_NAME_BEFORE = frozenset({"on", "add", "column", "exists", "constraint", "references", "to"})
+#: Words that start a data statement, which a clause ends at unless a word in ``_NAME_BEFORE``
+#: precedes them (BACKLOG #5062: an ``ADD CONSTRAINT`` read on into the next statement took that
+#: statement's ``PRIMARY KEY`` as its own).
 _DATA_STATEMENT = frozenset({"insert", "update", "delete", "merge", "select", "truncate"})
 #: What an ``ALTER`` or ``DROP`` that starts the next statement names, after the word itself.
 _DDL_OBJECT = re.compile(
@@ -978,8 +983,15 @@ class _Reader:
         self.indexes[name] = shape
         self.opaque.pop(name, None)
         if include or shape.partial or any(k.startswith("<expr>") for k in shape.columns):
-            # To the statement's end: a predicate has no closing mark of its own.
-            definition = text[m.end() : _statement_end(text, end)]
+            # To the statement's end: a predicate has no closing mark of its own. Inside an
+            # EXEC string, to the string's end, its quotes undoubled, as alter() reads one.
+            tail = text[end:]
+            for start, stop in _string_spans(text):
+                if start < m.start() < stop:
+                    tail = text[end : stop - 1].replace("''", "'")
+                    break
+            tail = " " + tail  # so the scan never starts at index 0
+            definition = text[m.end() : end] + tail[: _statement_end(tail, 1)]
             self.opaque[name] = frozenset(_ident(w) for w in _TOKEN.findall(definition))
 
     def _built(self, table: str, name: str, action: str) -> _Built:
