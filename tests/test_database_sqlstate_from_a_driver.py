@@ -51,15 +51,16 @@ def test_a_non_driver_error_is_not_read_as_a_sqlstate(exc: BaseException) -> Non
 
 async def test_a_non_driver_error_in_a_send_is_never_dead_lettered_with_its_text() -> None:
     """Red on main: ``KeyError('MRN42')`` was dead-lettered as ``database rejected the statement
-    [MRN42]``, a value in ``last_error`` and the alert. It is an internal error now, re-raised from
-    the original naming its type alone, so the text the runner stores for it carries no value."""
+    [MRN42]``, a value in ``last_error`` and the alert. It is an internal error now, raised in its
+    place naming its type alone with no chain, so the text the runner stores carries no value."""
     failure = KeyError(_VALUE)
     conn = _FakeConn(_FakeCursor(failure))
     dest = _dest()
     dest._pool = _FakePool(conn)
     with pytest.raises(database.WithheldSendError) as raised:
         await dest.send('{"mrn": "1", "val": "x"}')
-    assert raised.value.__cause__ is failure
+    assert str(raised.value) == "KeyError [message withheld]"
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
     assert not isinstance(raised.value, NegativeAckError)
     assert _VALUE not in safe_exc(raised.value)  # what the runner's internal-error arm stores
     assert conn.rolledback
@@ -91,15 +92,45 @@ class _UnreadableState(DriverError):
 
 
 async def test_a_driver_error_whose_sqlstate_cannot_be_read_still_rolls_back() -> None:
-    """The send reads the SQLSTATE after the rollback, so a read that raises never leaves the
-    failed statement's transaction open on a returned connection (BACKLOG #5010). A regression
-    check: main read ``args`` alone there."""
+    """The send reads ``args`` alone before its rollback, as main does, so an attribute that
+    raises when read never skips the rollback and leaves the failed statement's transaction open
+    (BACKLOG #5010). The release's connection-lost read of the attribute then raises, as on main.
+    A regression check of this branch's first head, not red on main."""
     conn = _FakeConn(_FakeCursor(_UnreadableState("23000", "synthetic")))
     dest = _dest()
     dest._pool = _FakePool(conn)
     with pytest.raises(RuntimeError, match="unreadable"):
         await dest.send('{"mrn": "1", "val": "x"}')
     assert conn.rolledback
+
+
+@pytest.mark.parametrize("attribute", ["", None, 7])
+def test_an_unusable_sqlstate_attribute_falls_back_to_args(attribute: object) -> None:
+    """As main's log reading did: an attribute that is not a SQLSTATE leaves ``args[0]`` read, so
+    a class-08 link is still seen as a lost connection. A regression check, not red on main."""
+    exc = DriverError("08S01", "synthetic")
+    exc.sqlstate = attribute  # type: ignore[attr-defined]
+    assert database._log_sqlstate(exc) == "08S01"
+    assert database._connection_lost(exc)
+
+
+class _UnclassableMeta(type):
+    """A class whose ``__mro__`` raises when read, so no driver test can class it."""
+
+    @property
+    def __mro__(cls) -> tuple[type, ...]:
+        raise RuntimeError("unclassable")
+
+
+class _Unclassable(Exception, metaclass=_UnclassableMeta):
+    pass
+
+
+def test_an_error_whose_driver_test_raises_names_no_sqlstate() -> None:
+    """``raised_by_a_driver`` answers True for such a class, to withhold its text; the SQLSTATE
+    reading answers None, so its argument is never named as one."""
+    assert database._sqlstate(_Unclassable(_VALUE)) is None
+    assert database._log_sqlstate(_Unclassable(_VALUE)) is None
 
 
 async def test_a_driver_error_in_a_send_is_still_rejected_by_its_sqlstate() -> None:

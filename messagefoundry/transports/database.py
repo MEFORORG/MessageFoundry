@@ -2789,21 +2789,25 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
 
 
 def _sqlstate(exc: BaseException) -> str | None:
-    """The 5-character SQLSTATE a DB driver's own error carries
-    (:func:`~messagefoundry.redaction.driver_sqlstate_of`), or ``None`` for any other exception,
+    """The 5-character SQLSTATE a DB driver's own error carries in ``args[0]`` (pyodbc/aioodbc;
+    :func:`~messagefoundry.redaction.driver_sqlstate_of`), or ``None`` for any other exception,
     letting a genuine bug propagate as an internal error rather than being misread as a transport
     failure. A non-driver error whose ``args[0]`` reads like a SQLSTATE, such as ``KeyError('MRN42')``,
     is not read as one (vault BACKLOG #1661; engine PR 3150, finding 1). Never for a
-    ``UnicodeError``, whose first argument is the codec name."""
+    ``UnicodeError``, whose first argument is the codec name. It reads no attribute, so an error
+    arm can call it before its cleanup."""
     if isinstance(exc, UnicodeError):
         return None
-    return driver_sqlstate_of(exc)
+    return driver_sqlstate_of(exc, attribute=False)
 
 
 def _log_sqlstate(exc: BaseException) -> str | None:
-    """:func:`_sqlstate` for a log line, and also ``None`` for an exception that holds a Unicode
-    error, whose text a codec name can make read like a SQLSTATE."""
-    return None if prints_a_codec_error(exc) else _sqlstate(exc)
+    """The SQLSTATE a log line may name for ``exc``: asyncpg's ``sqlstate`` attribute, else
+    :func:`_sqlstate`'s ``args[0]``, from a driver's own error alone. Never for a ``UnicodeError``
+    or an exception that holds one, whose text a codec name can make read like a SQLSTATE."""
+    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
+        return None
+    return driver_sqlstate_of(exc)
 
 
 def _sqlstate_shaped(exc: BaseException) -> bool:
@@ -2903,9 +2907,10 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
 
 class WithheldSendError(Exception):
     """A send's failure that is no driver's error although its first argument reads like a SQLSTATE
-    (:func:`_sqlstate_shaped`), such as ``KeyError('MRN42')``: still an internal error, re-raised
-    from the original with its type alone, since the runner stores an internal error's text and its
-    arguments may carry a value (engine PR 3150, finding 1). Unprefixed because its name prints."""
+    (:func:`_sqlstate_shaped`), such as ``KeyError('MRN42')``: still an internal error, raised in
+    its place naming its type alone, with no chain, since the runner stores an internal error's text
+    and its arguments may carry a value (engine PR 3150, finding 1). Unprefixed because its name
+    prints."""
 
 
 class RedactedDbError(Exception):
@@ -4596,6 +4601,7 @@ class DatabaseDestination(DestinationConnector):
                 # the refusal (_cursor_refusal_discards says where a static one keeps it).
                 discard = True
                 raise refused from exc
+            withheld: str | None = None  # a non-driver error's type, raised below with no chain
             try:
                 await cur.execute(self._sql, params)
                 # Capture the RETURNING/OUTPUT rows from the SAME cursor BEFORE commit (re-run-stable:
@@ -4605,8 +4611,7 @@ class DatabaseDestination(DestinationConnector):
                 captured = await self._capture(cur) if self.capture_response else None
                 await conn.commit()
             except Exception as exc:
-                # The SQLSTATE is read only once the rollback has run or failed: a driver error
-                # whose ``sqlstate`` raises when read must not skip it (BACKLOG #5010).
+                state = _sqlstate(exc)
                 try:
                     await conn.rollback()
                 except Exception as rollback_exc:
@@ -4619,7 +4624,6 @@ class DatabaseDestination(DestinationConnector):
                         "discarded rather than returned to its pool: %s",
                         _safe_db_error(rollback_exc),
                     )
-                    state = _sqlstate(exc)
                     if state is None and not isinstance(exc, UnicodeEncodeError):
                         raise  # the send's failure is no driver error: the rollback's propagates
                     # Classified by the send's own error, as it would be had the rollback passed,
@@ -4628,12 +4632,14 @@ class DatabaseDestination(DestinationConnector):
                     # would retry a poison message for as long as the retry budget lasts. A
                     # dead-letter can be replayed. The rollback's error stays the context.
                     raise _send_refusal(state, exc) from exc
-                state = _sqlstate(exc)
-                if state is None and not isinstance(exc, UnicodeEncodeError):
-                    if _sqlstate_shaped(exc):
-                        raise WithheldSendError(f"{type(exc).__name__} [message withheld]") from exc
+                if state is not None or isinstance(exc, UnicodeEncodeError):
+                    raise _send_refusal(state, exc) from exc
+                if not _sqlstate_shaped(exc):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
-                raise _send_refusal(state, exc) from exc
+                withheld = type(exc).__name__
+            if withheld is not None:
+                # Raised outside the handler, so the withheld error is on no chain (BACKLOG #1796).
+                raise WithheldSendError(f"{withheld} [message withheld]")
         finally:
             await _close_and_release(pool, conn, cur, discard=discard)
         return captured
