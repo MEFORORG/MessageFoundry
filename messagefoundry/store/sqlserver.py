@@ -10148,8 +10148,9 @@ class SqlServerStore:
         currently reflects, swap that set's freshly-read rows into :attr:`_reference_cache` — WITHOUT
         re-reading the external source. It issues a real read each call (a ``reference_version`` LEFT
         JOIN ``reference`` + per-row decrypt) but mutates nothing when the versions already match (the
-        leader's own just-written sets). Returns the names refreshed (``[]`` when none advanced). The
-        runner only calls this when clustered (``coordinator.is_clustered()``), so a single node never
+        leader's own just-written sets). A set whose version this handle's own sync or purge moved
+        while the read was in flight is left for the next call (BACKLOG #3929). Returns the names
+        refreshed (``[]`` when none advanced). The runner only calls this when clustered (``coordinator.is_clustered()``), so a single node never
         issues this read."""
         # The versions this handle held before the read. The read awaits, and under a cipher that
         # blocks on I/O so does the decrypt below (BACKLOG #3929); this handle's own sync or purge
