@@ -330,12 +330,8 @@ _CENSUS: dict[str, Guarded | Exempt] = {
 #: The sites :data:`_CENSUS` lists as Exempt, pinned exactly (vault BACKLOG #3512). A Guarded hop
 #: moved to Exempt, with its guard call deleted, can pass every other check here (a relaxed hop
 #: fails its own census below), so this list is the second edit such a change needs. A diff that
-#: edits both still passes, so review stays the check on what is added here. At least these
-#: downgrades pass every test in this file too, and only review sees them: a Guarded entry whose
-#: ``by`` is re-pointed at another function that calls a guard, in any module, after its own guard
-#: call is deleted; a hop rewritten to get its context from a name outside :data:`_BUILDERS`, so it
-#: stops being a site and its entry is deleted; one of two guard calls deleted in a function that
-#: guards two legs; and a guard call moved onto a branch that never runs.
+#: edits both still passes, so review stays the check on what is added here. What this census
+#: does not prove is in the module docstring.
 _EXEMPT_SITES = frozenset(
     {
         "messagefoundry/apiclient/client.py::_build_verify_context",
@@ -498,8 +494,7 @@ def test_every_guarded_site_calls_a_guard() -> None:
     guarded = {site: entry for site, entry in _CENSUS.items() if isinstance(entry, Guarded)}
     # A floor against a census emptied or turned all Exempt, over which the check below would pass
     # on nothing. A single hop moved from Guarded to Exempt fails the next test unless
-    # _EXEMPT_SITES moves too; at least the downgrades listed on _EXEMPT_SITES are caught by
-    # neither.
+    # _EXEMPT_SITES moves too.
     assert len(guarded) >= 10, f"only {len(guarded)} Guarded census entries, floor 10"
     unguarded = [
         f"{site} (guard expected in {entry.by or 'the site itself'}; {entry.note or 'no note'})"
