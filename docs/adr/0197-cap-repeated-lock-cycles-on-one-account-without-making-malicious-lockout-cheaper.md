@@ -1579,8 +1579,8 @@ At least these checks run, in this order:
 1. the scoped read of the message: 404 when it is unknown or outside the caller's scope, and 423,
    which gives the proof back, when an in-scope row's cells fail their integrity tag;
 2. the scope check on the target, 403, with its `auth.channel_denied` audit row;
-3. the engine-wide ingress guard for a direct target, which here refuses a body holding a NUL
-   byte, and whose refusal gives the proof back;
+3. the engine-wide ingress guard for a direct target, which here refuses at least a body holding
+   a NUL byte, and whose refusal gives the proof back;
 4. the registry checks on the target: 404 when it is not registered, 409 when it is not deployed,
    is owned by another engine shard or is not running;
 5. the 409 for a refused body stored only as its head, the last check before the store write.

@@ -95,8 +95,8 @@ open points settled below.
    `ERROR`; a listener with an ACK channel answers `AR` with MSA-3 `more than one MSH in body`. The
    dry-run runs the same guard, so it refuses the same body. The resubmission paths run it whenever
    they know the inbound connection. `admit_resubmitted_body` with no connection (`ic=None`: the
-   edit-resend direct path, or a re-route whose inbound is gone) runs only the engine-wide NUL and
-   size rules, so it does not refuse a second `MSH`; ADR 0205 documents the same skip for its frame
+   edit-resend direct path, or a re-route whose inbound is gone) does not run that guard, so it
+   does not refuse a second `MSH`; ADR 0205 documents the same skip for its frame
    bytes. The loopback re-ingress of a captured reply (`_process_response_item` in
    `messagefoundry/pipeline/wiring_runner.py`) does not run `check_decoded` either. It checks the
    size ceiling and peeks the reply, so a reply holding a second `MSH` is ingested as one message,
