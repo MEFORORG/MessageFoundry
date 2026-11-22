@@ -84,6 +84,7 @@ from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import (
     DEFAULT_MAX_MESSAGE_BYTES,
+    PEEK_READ_FAULTS,
     HL7PeekError,
     Peek,
     enforce_size_limits,
@@ -169,6 +170,11 @@ HEADER_FORMS_REFUSED_REASON = (
 )
 
 
+#: The resubmission refusal when the document-marker check itself faults on a header read. Fixed
+#: text, so no fault's own message, which may quote the body, reaches the operator.
+_MARKER_CHECK_FAULT_REASON = "document handle check failed reading the header"
+
+
 def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
     """The reason to refuse a parsed HL7 body before the ACK, or ``None`` to go on: at least one
     that holds the document handle marker under a delimiter in the base64 alphabet, which delivery
@@ -227,9 +233,9 @@ class IngressGuardError(Exception):
 
     ``phase`` names which guard fired (``"decode"`` or ``"size"``) and matches the live listener's ACK
     phase labels, so a caller that records dispositions can map it onto the same one the engine writes.
-    :func:`admit_resubmitted_body` adds three more, ``"type"`` for the declared-type sniff,
-    ``"parse"`` for ``Peek.parse`` and ``"strict"`` for strict ``hl7apy`` validation; the dry-run entry
-    points never raise any of them.
+    :func:`admit_resubmitted_body` adds four more, ``"type"`` for the declared-type sniff,
+    ``"parse"`` for ``Peek.parse``, ``"ingest"`` for :func:`doc_ref_marker_refusal` and ``"strict"``
+    for strict ``hl7apy`` validation; the dry-run entry points never raise any of them.
 
     **Never raised with a body-holding error on its chain (BACKLOG #1796).** The caught error can hold
     the body: a ``UnicodeEncodeError``'s or ``UnicodeDecodeError``'s ``.object`` is the WHOLE text or
@@ -741,11 +747,12 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             raise IngressGuardError(refused, phase="parse")
         # The listeners' document-marker refusal, after the parse as they run it, so a resubmitted
         # body they would refuse is not committed and then refused by every outbound's re-attach
-        # (BACKLOG #5972). Its reason names no byte of the body.
+        # (BACKLOG #5972). It reads the header too, so a read fault refuses here as the listeners
+        # record one; neither reason names a byte of the body.
         try:
             refused = doc_ref_marker_refusal(peek, text)
-        except HL7PeekError as exc:
-            refused = f"parse error: {safe_exc(exc)}"
+        except PEEK_READ_FAULTS:
+            refused = _MARKER_CHECK_FAULT_REASON
         if refused is not None:
             raise IngressGuardError(refused, phase="ingest")
     else:

@@ -2697,13 +2697,13 @@ async def test_the_reattach_draws_at_most_one_form_past_the_limit(
 ) -> None:
     """The re-attach looked for every later-header form with a scan of the payload. It now draws
     at most its limit's forms plus one, scans the text for at most its limit's, and refuses a
-    payload past the limit without those scans. Its limit is twice the listeners'."""
+    payload past the limit without those scans."""
     from messagefoundry.parsing import binary
     from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
 
     counter = _CountedForms(binary._later_header_forms)
     monkeypatch.setattr(binary, "_later_header_forms", counter)
-    limit = 2 * _floor_limit
+    limit = _floor_limit
     body = _ORDINARY_HEAD + _headers(limit + count_over)
     counted = _counting(body)
     if count_over:
@@ -2752,7 +2752,7 @@ async def test_a_handler_built_payload_past_the_form_limit_dead_letters_at_deliv
     col = _Collector()
     runner._destinations[DEST] = col  # type: ignore[assignment]
 
-    over = _ORDINARY_HEAD + _headers(2 * _floor_limit + 1)
+    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
     assert may_hold_doc_ref(over)
     _mid, rows = await _deliver(store, runner, over)
     assert _dead_lettered_at_once(rows)
@@ -2772,7 +2772,7 @@ def test_a_payload_longer_than_a_body_the_listeners_admitted_is_not_refused_for_
     delivery payload one character longer than its received body refused a form count the
     listeners had admitted. With a budget small enough to put the limit above its floor, a body
     at the listeners' limit is admitted, and a payload up to twice as long holding it re-attaches;
-    one past twice the limit is refused."""
+    one past the re-attach's own limit is refused."""
     import asyncio
 
     from messagefoundry.parsing import binary
@@ -2780,12 +2780,14 @@ def test_a_payload_longer_than_a_body_the_listeners_admitted_is_not_refused_for_
     from messagefoundry.parsing.peek import Peek
     from messagefoundry.pipeline.ingress_guards import doc_ref_marker_refusal
 
-    probe = _ORDINARY_HEAD + _headers(10)
-    monkeypatch.setattr(binary, "_MARKER_SCAN_BUDGET_CHARS", 10 * len(probe))
+    # An odd limit: twice the limit, floored, at twice the length would fall one short of it.
+    probe = _ORDINARY_HEAD + _headers(9)
+    monkeypatch.setattr(binary, "_MARKER_SCAN_BUDGET_CHARS", 9 * len(probe))
     limit = binary._later_header_forms_limit(len(probe))
-    assert limit == 10 > binary._LATER_HEADER_FORMS_LIMIT
+    assert limit == 9 > binary._LATER_HEADER_FORMS_LIMIT
     assert doc_ref_marker_refusal(Peek.parse(probe), probe) is None
-    for payload in (probe + "NTE|1||x\r", probe + "NTE|1||" + "y" * (len(probe) - 10) + "\r"):
+    doubled = probe + "NTE|1||" + "y" * (len(probe) - 9) + "\r"
+    for payload in (probe + "NTE|1||x\r", doubled):
         assert len(payload) <= 2 * len(probe)
         assert asyncio.run(reattach_documents_in_hl7(payload, _no_read, bound=frozenset())) == (
             payload
@@ -2838,3 +2840,11 @@ def test_a_resubmitted_body_past_the_form_limit_is_refused_before_it_is_committe
     assert str(caught.value) == HEADER_FORMS_REFUSED_REASON
     at_limit = _ORDINARY_HEAD + _headers(_floor_limit)
     assert admit_resubmitted_body(at_limit, _plain_ic()) == at_limit
+
+
+def test_the_api_answers_a_marker_refused_resubmission_with_422() -> None:
+    """Review round-4d17e09a: the API maps a guard's phase to a status, and ``ingest`` was not in
+    the map, so the new refusal raised ``KeyError`` there and the operator got a 500."""
+    from messagefoundry.api.app import _INGRESS_GUARD_STATUS
+
+    assert _INGRESS_GUARD_STATUS["ingest"] == 422

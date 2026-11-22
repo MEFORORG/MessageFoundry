@@ -1131,14 +1131,14 @@ def _later_header_forms_limit(text_len: int) -> int:
 
 def _reattach_forms_limit(text_len: int) -> int:
     """How many later-header marker forms the delivery re-attach looks for in a payload of
-    ``text_len`` characters: twice :func:`_later_header_forms_limit` (BACKLOG #5972). The listeners
-    measure their limit on the received body, and a delivery payload derived from it can be
-    longer, for example a re-encode that adds a closing CR, a handle in place of a small document,
-    or a field a Handler adds. Twice the limit at ``text_len`` is at least the limit at half that
-    length, so a payload up to twice its received body's length is never refused here for a form
-    count the listeners admitted. Each form costs a scan of the payload, so a re-attach pays at
-    most twice the listeners' scan budget per attempt."""
-    return 2 * _later_header_forms_limit(text_len)
+    ``text_len`` characters: :func:`_later_header_forms_limit` at half that length (BACKLOG
+    #5972). The listeners measure their limit on the received body, and a delivery payload derived
+    from it can be longer, for example a re-encode that adds a closing CR, a handle in place of a
+    small document, or a field a Handler adds. The limit never rises with the length, so a payload
+    up to twice its received body's length is never refused here for a form count the listeners
+    admitted. Each form costs a scan of the payload, so a re-attach pays at most about twice the
+    listeners' scan budget per attempt."""
+    return _later_header_forms_limit(max(text_len // 2, 1))
 
 
 def _bounded_later_header_forms(message: Message, limit: int) -> list[str] | None:
@@ -1161,8 +1161,9 @@ def _later_header_markers(message: Message, text: str) -> set[str]:
     this costs at most that many substring scans of ``text``, and reads at most one form past it.
     Past the limit it raises :class:`UnreattachableDocumentError` without those scans (fail
     closed), and the row dead-letters as its payload's own refusal. The checks before the ACK
-    refuse a received body past half this limit (:func:`later_header_forms_over_limit`), so a
-    payload no longer than twice its received body is not refused here. At least these can still
+    refuse a received body past :func:`_later_header_forms_limit` at its own length
+    (:func:`later_header_forms_over_limit`), so a payload no longer than twice its received body
+    is not refused here. At least these can still
     be: a payload a Handler built or grew past that, and an edit-and-resend's outbound body, which
     meets no listener check."""
     forms = _bounded_later_header_forms(message, _reattach_forms_limit(len(text)))

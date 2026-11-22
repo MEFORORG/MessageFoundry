@@ -4243,6 +4243,7 @@ _INGRESS_GUARD_STATUS: dict[str, int] = {
     "type": 415,
     "decode": 422,
     "parse": 422,
+    "ingest": 422,
     "strict": 422,
 }
 
