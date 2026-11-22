@@ -1,12 +1,9 @@
-- **The Windows service start now refuses a store key written below an empty secret in more
-  shapes.** In the service's registry environment, an empty secret such as
-  `MEFOR_STORE_ENCRYPTION_KEY=` followed by `x=<key>`, by `x=` set to a comma list of keys or to a
-  quoted key, on the next line or in the next item, would have read as unset, so the start was not
-  refused. So would a base64url secret with one `=`, or `=<key>`, in the next item; on the next
-  line those two already refused. Each now reads as that secret's value, and the start is refused.
-  Only a line under a name Windows itself sets, spelled as Windows spells it, or under
-  `MEFOR_SECRETS_DIRECTORY`, still ends the empty value, and only when its whole value is not one
-  key or a comma list of keys. Under such a name, at least, these still end it: a value holding key
-  text beside other text, such as `Path=C:\x;<key>`, and a key list with an empty entry, such as
-  one with a trailing or doubled comma, which the engine's own retired-keys reading accepts.
+- **The Windows service start now refuses a store key written below an empty secret under a name
+  Windows sets.** In the service's registry environment, below an empty secret such as
+  `MEFOR_STORE_ENCRYPTION_KEY=`, a line or item under a name Windows itself sets, spelled as
+  Windows spells it, or under `MEFOR_SECRETS_DIRECTORY`, whose whole value is one key or a comma
+  list of keys, such as `Path=<key>`, now reads as that secret's value, and the start is refused.
+  Under such a name, at least, these still end the empty value: a value holding key text beside
+  other text, such as `Path=C:\x;<key>`, and a key list with an empty entry, such as one with a
+  trailing or doubled comma, which the engine's own retired-keys reading accepts.
   (`BACKLOG #5394`)
