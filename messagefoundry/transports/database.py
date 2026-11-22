@@ -2980,8 +2980,7 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     bug's message included; the frames still locate it, and their source lines still print. An
     error with no arguments has no text to
     withhold and is named by its type alone. It never raises: a link whose classification raises
-    is named by its type and a fixed note. A failure in :func:`_redacted_copy`'s own driver test
-    on that link still falls to :func:`_safe_db_exc_info`'s whole-chain fallback."""
+    is named by its type and a fixed note."""
     try:
         if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)

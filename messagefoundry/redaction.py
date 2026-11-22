@@ -74,6 +74,7 @@ import logging
 import os
 import pkgutil
 import re
+import sqlite3
 import sys
 import traceback
 import weakref
@@ -3072,11 +3073,13 @@ def raised_by_a_driver(exc: BaseException) -> bool:
     ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
     builtin exception a driver raises does not count, though :func:`safe_traceback` withholds it
     under a driver error that holds it (vault BACKLOG #1661). A class whose ``__module__`` is not
-    text is not a driver's; this runs on every link of a logged traceback, so it must not raise."""
+    text is not a driver's. This runs on every link of a logged traceback, so it must not raise:
+    a class or module that raises when read answers ``True``, so its message is withheld rather
+    than printed on a guess that no driver raised it."""
     try:
         return any(_a_driver_class(kind) for kind in type(exc).__mro__)
-    except Exception:  # noqa: BLE001 - a class or module that cannot be read declares no driver
-        return False
+    except Exception:  # noqa: BLE001 - fail closed: see the docstring
+        return True
 
 
 def _a_driver_class(kind: type) -> bool:
@@ -3104,7 +3107,8 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
     link (vault BACKLOG #1661, added item 3). A driver's message can quote a value the statement
     carried, such as a duplicate key, so it is withheld. A driver error keeps its SQLSTATE,
-    asyncpg's ``sqlstate`` or else ``args[0]``, when that is five characters of SQL's alphabet. A
+    asyncpg's ``sqlstate`` or else ``args[0]``, when that is five characters of SQL's alphabet; a
+    SQLite error keeps only its result-code name, since its ``args[0]`` is its message. A
     link under a driver error is withheld whole, since a driver can raise its error from the
     builtin one its codec raised, whose text can quote the value too. An attribute that raises
     when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
@@ -3123,12 +3127,18 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
 
 def _driver_code(exc: BaseException) -> str | None:
     """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code."""
+    if isinstance(exc, sqlite3.Error):
+        # SQLite has no SQLSTATE, and its args[0] is the message itself, which can be a value as
+        # short as five characters; only its result-code name, a fixed word, is read.
+        name = getattr(exc, "sqlite_errorname", None)
+        if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
+            return f"[driver message withheld {name}]"
+        return None
     state = getattr(exc, "sqlstate", None)
     if state is None and exc.args:
         state = exc.args[0]
     if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state):
         return f"[{state}] [driver message withheld]"
-    # SQLite has no SQLSTATE; its result-code name is a fixed word, never a value.
     name = getattr(exc, "sqlite_errorname", None)
     if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
         return f"[driver message withheld {name}]"

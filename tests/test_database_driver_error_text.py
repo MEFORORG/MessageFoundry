@@ -186,6 +186,36 @@ def test_the_log_chain_keeps_a_non_driver_message() -> None:
     assert "KeyError: 'synthetic_column'" in text
 
 
+@pytest.mark.parametrize("name", ["SQLITE_CONSTRAINT_TRIGGER", None])
+def test_a_short_sqlite_message_is_not_read_as_a_sqlstate(name: str | None) -> None:
+    """SQLite has no SQLSTATE, and its ``args[0]`` is its message. Red on 7c7c0cc54cd: a message
+    of five uppercase letters or digits printed as ``[MRN42]``, the value as if it were a code,
+    and the result-code name was dropped."""
+    import sqlite3
+
+    exc = sqlite3.IntegrityError("MRN42")
+    if name is not None:
+        exc.sqlite_errorname = name
+    text = _rendered(_raised(exc))
+    assert "MRN42" not in text
+    kept = f" {name}" if name is not None else ""
+    assert f"IntegrityError: [driver message withheld{kept}]" in text
+
+
+def test_a_class_chain_that_cannot_be_read_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Red on 7c7c0cc54cd: an error reading the class chain answered "not a driver", so the
+    message printed in full. It now answers "a driver", so the message is withheld."""
+    import messagefoundry.redaction as redaction
+
+    def unreadable(_kind: type) -> bool:
+        raise ImportError("synthetic lazy module")
+
+    monkeypatch.setattr(redaction, "_a_driver_class", unreadable)
+    exc = _raised(RuntimeError(f"dup key MRN{_SYNTHETIC_ID}"))
+    assert raised_by_a_driver(exc) is True
+    assert _SYNTHETIC_ID not in _rendered(exc)
+
+
 def test_a_class_with_no_text_module_does_not_break_the_traceback() -> None:
     """Review round 1: the driver test read ``__module__`` as text, so a class whose module is not
     text made the renderer raise on every traceback holding it."""
