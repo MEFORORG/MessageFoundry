@@ -176,8 +176,10 @@ already-shown counts separately.
 reached or a receipt that aged out. Read a receipt inside the window or not at all.
 
 **The OFF switch.** Creating the file `mefor-coord/mail/OFF` suppresses delivery repo-wide. Mail keeps
-being queued and is not lost; it is not shown. It reaches **already-running** sessions, which an
-environment variable cannot, and that is the point of it being a file. Delete it to resume.
+being queued and is not lost; it is not shown or consumed. The drain says so as context at
+SessionStart and on stderr at Stop, because output at Stop would re-wake the session. It reaches
+**already-running** sessions, which an environment variable cannot, and that is the point of it being
+a file. Delete it to resume.
 
 ---
 

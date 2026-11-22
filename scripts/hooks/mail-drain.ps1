@@ -113,7 +113,7 @@
     sentences: mail delivered, mail deferred by the caps, mail truncated, a body withheld, mail
     expired, mail unreadable, a filename this channel did not mint, a claim lost to a sibling drain,
     a claim stranded by a dead claimer, box empty, mail waiting in the box of a worktree the session
-    moved into, and mail suppressed by the OFF switch. The defect
+    moved into, and mail suppressed by the OFF switch (on stderr at Stop, so it wakes nothing). The defect
     being designed against is on record in announce-session.ps1 -- a hook that was wired, fired,
     resolved nothing and exited 0 for weeks, byte-identical to a healthy hook with nothing to do. A
     channel whose output never changes cannot be told apart from one that is dead.
@@ -378,6 +378,14 @@ function Write-Injection {
         try { (Get-Item -LiteralPath $script:MovedBoxStamp -EA Stop).LastWriteTime = Get-Date } catch { }
         $script:MovedBoxStamp = ''
     }
+}
+
+function Write-StateNotice {
+    # A notice about the channel's state rather than about mail. Output at Stop re-wakes the model, so
+    # there it goes to stderr, which still leaves a running session a signal and wakes nothing.
+    param([bool]$Consuming, [string]$Event, [string]$Text)
+    if ($Consuming) { try { [Console]::Error.WriteLine($Text) } catch { } }
+    else { Write-Injection -Event $Event -Text $Text }
 }
 
 function Get-Clean {
@@ -666,6 +674,30 @@ function Write-MailReceipt {
     Set-Content -LiteralPath $Path -Value ($receipt | ConvertTo-Json -Depth 5) -Encoding ascii -ErrorAction Stop
 }
 
+function ConvertTo-MailExpiryUtc {
+    # THE ONE READER OF expiresUtc, returning a UTC DateTime, or $null for missing or unreadable.
+    #
+    # NEVER GO THROUGH [string]. ConvertFrom-Json has already turned an ISO stamp into a DateTime:
+    # Kind Utc for a Z stamp, Local for an offset, Unspecified for neither. [string] on that prints
+    # month-first with the Kind and the offset gone, so re-parsing it misread day-first cultures and
+    # treated a Local wall clock as UTC (BACKLOG #5864).
+    #
+    # A string that reaches here is one the JSON reader did not recognise. Only an ISO date is read
+    # from it, because '03/04/2026' has no reading that does not depend on a convention. Anything
+    # else is unreadable, and the caller applies the receiver's floor. A stamp with no zone is UTC,
+    # which is what the field's name says.
+    param($Value)
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc) }
+        return $Value.ToUniversalTime()
+    }
+    if ($Value -isnot [string] -or $Value -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ]|\z)') { return $null }
+    $parsed = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $parsed.UtcDateTime }
+    return $null
+}
+
 function Get-LiveMessageStems {
     # EVERY STEM THAT STILL HAS A MESSAGE FILE SOMEWHERE, read in one pass over every box, and read
     # BEFORE anything is deleted. It is the keep set for the receipt sweep, and reading it first is
@@ -882,8 +914,7 @@ try {
     if ($mr.Error) {
         $note = "[mefor-mail] SHARED ROOT UNAVAILABLE as of $([DateTime]::UtcNow.ToString('o')): " +
             "$(Get-Clean $mr.Error 300). NOTHING WAS READ. This is not an empty box."
-        if ($consuming) { try { [Console]::Error.WriteLine($note) } catch { } }
-        else { Write-Injection -Event $eventName -Text $note }
+        Write-StateNotice -Consuming $consuming -Event $eventName -Text $note
         exit 0
     }
     # The coordination root is named in its own variable because the receipt sweep's citation guard
@@ -897,7 +928,8 @@ try {
 
     # --- Kill switch. Reaches ALREADY-RUNNING sessions, unlike an env var, which is the point.
     if (Test-Path -LiteralPath (Join-Path $root 'OFF')) {
-        Write-Injection -Event $eventName -Text (
+        # Said at every drain while the switch is up, so at Stop it must not wake (BACKLOG #5863).
+        Write-StateNotice -Consuming $consuming -Event $eventName -Text (
             "[mefor-mail] SUPPRESSED as of ${asOf}: the OFF switch is present at mefor-coord/mail/OFF. " +
             "Mail is still being queued and is NOT lost; it is not being shown. Remove that file to resume."
         )
@@ -969,9 +1001,8 @@ try {
                             if (-not $parts) { continue }
                             $m = $null
                             try { $m = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
-                            $exp = [DateTime]::MinValue
-                            if ($m.expiresUtc -and [DateTime]::TryParse([string]$m.expiresUtc, [Globalization.CultureInfo]::InvariantCulture,
-                                    [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$exp) -and $exp -lt $nowUtc) { continue }
+                            $exp = ConvertTo-MailExpiryUtc $m.expiresUtc
+                            if ($null -ne $exp -and $exp -lt $nowUtc) { continue }
                             $to = if ($m.to -and $m.to.sessionId) { [string]$m.to.sessionId } else { '' }
                             if ($to -and $to -ne $sessionId) { continue }
                             $parts.Stem
@@ -1443,8 +1474,8 @@ try {
         # states a longer TTL would silently overrule an explicit instruction from the sender, which is
         # a different and worse failure than the one being closed.
         $expiredNow = $false
-        $exp = [DateTime]::MinValue
-        if ($m.expiresUtc -and [DateTime]::TryParse([string]$m.expiresUtc, [ref]$exp)) {
+        $exp = ConvertTo-MailExpiryUtc $m.expiresUtc
+        if ($null -ne $exp) {
             $expiredNow = $exp -lt [DateTime]::UtcNow
         }
         else {
