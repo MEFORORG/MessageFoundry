@@ -44,6 +44,8 @@ import json
 import logging
 import math
 import ntpath
+import numbers
+import operator
 import os
 import re
 import stat
@@ -342,6 +344,11 @@ class EnvRef:
         # ``object.__setattr__``; ``_cast_bool`` is defined below and only looked up at call time.
         if self.cast is bool:
             object.__setattr__(self, "cast", _cast_bool)
+        # vault BACKLOG #1650: the builtin ``int`` reads a TOML ``true`` in ``environments/<env>.toml``
+        # as 1 and ``2575.9`` as 2575, so ``env("p", cast=int)`` built a port nobody wrote, and the
+        # connector's own check saw only the cast's result. The same swap, for the same reason.
+        elif self.cast is int:
+            object.__setattr__(self, "cast", _cast_int)
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
         # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
@@ -401,7 +408,8 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
-    made, and an unreadable one is refused then. Any other callable runs as given. On a boolean
+    made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
+    (vault BACKLOG #1650, :func:`_cast_int`). Any other callable runs as given. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
@@ -473,11 +481,53 @@ def _cast_bool(raw: Any) -> bool:
 _cast_bool.__name__ = "bool"
 
 
+def _cast_int(raw: Any) -> int:
+    """Read an environment value as a whole number: the ``cast = "int"`` named cast, and what a
+    code-first ``env(..., cast=int)`` runs, since :class:`EnvRef` swaps the builtin ``int`` for it
+    (vault BACKLOG #1650).
+
+    The builtin turns ``True`` into 1 and ``2575.9`` into 2575. ``environments/<env>.toml`` is TOML,
+    so either one reaches a cast typed, and a port read that way would have dialled a port nobody
+    named. So a bool is refused, ``False`` as well as ``True``, and so is a number that is not whole
+    or not finite. Text is read by ``int()``, as before. An integer passes, and so does another
+    number that is whole, such as ``2575.0`` or ``Decimal("2575")``. Anything else is refused.
+
+    Raises ``ValueError`` with the value withheld, by the rule :func:`_cast_bool` states, outside the
+    handler, so ``int()``'s own message, which quotes the value, is not left on ``__context__``."""
+    reason: str
+    if isinstance(raw, bool):
+        reason = "a bool is not a whole number"
+    elif isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            reason = "text must be a whole number in digits"
+    elif isinstance(raw, numbers.Integral):
+        return operator.index(raw)
+    elif isinstance(raw, numbers.Number):
+        number: Any = raw  # numbers.Number promises no int(); a complex makes it raise TypeError
+        try:
+            whole: int = int(number)
+        except (TypeError, ValueError, OverflowError):
+            reason = "not a finite real number"
+        else:
+            if whole == number:
+                return whole
+            reason = "not a whole number, and int() would truncate it"
+    else:
+        reason = f"a {type(raw).__name__} is not a number or text"
+    raise ValueError(f"{reason} (value withheld)")
+
+
+# Named "int" for the reason ``_cast_bool`` is named "bool": the resolver's message names the cast.
+_cast_int.__name__ = "int"
+
+
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
 #: arbitrary Python callable the way :func:`env` can, so the file form is restricted to these — and
 #: ``int`` is the only cast used across the migration estate today.
 _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
-    "int": int,
+    "int": _cast_int,
     "float": float,
     "bool": _cast_bool,
     "str": str,

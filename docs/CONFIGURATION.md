@@ -519,7 +519,8 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   Python's own `bool`, which reads any non-empty text as true. A `MEFOR_VALUE_*` of `false` would
   then have turned on a loosening such as `tls_allow_expired` or `trust_server_certificate`.
   Since vault BACKLOG #3234, an `env()` reference on a boolean setting is read this strict way
-  once it resolves, whatever its cast, and so is its `default=`. That covers at least a setting
+  once it resolves, whatever its cast, and so is its `default=`. A `cast=int` there refuses a
+  TOML `true` or `false` before that read, since vault BACKLOG #1650. That covers at least a setting
   the factory stores under its own name, such as `verify_tls` or `tls_allow_expired`. It covers
   the `enabled` flag of `with_smart_backend`, `with_oauth2_client_credentials` and `with_signing`.
   It covers `Ftp(tls=...)` too, which the factory turns into the protocol, so `false` means plain

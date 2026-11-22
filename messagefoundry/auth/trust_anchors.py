@@ -223,15 +223,25 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       not run this check, though each new connect of its store reads the swapped file too.
     * A server that answers has at least three ways to keep the change out of the real store. It
       can answer the read with the new fingerprint: then the change check writes no row and logs
-      nothing, and where the file passes its other checks too, nothing in this preflight records
-      the swap. It can answer with no row: then a fresh ``observed`` row is written in place of
+      nothing, and where the file passes its other checks too, no row this preflight writes
+      records the swap; only the in-process compare below logs it, and only for a swap made
+      after the process first checked the pin. It can answer with no row: then a fresh ``observed`` row is written in place of
       ``changed``. Or it can acknowledge the ``changed`` row, which the real store never
       receives. Where a row is written and its commit returns, the audit tee
       (:mod:`messagefoundry.store.audit_tee`) still logs a copy. A collector receives it only
       where a log forwarder is configured and up, and the first way writes no ``changed`` or
       ``observed`` row to copy.
 
-    So the change audit in the store is only as good as the hop it is meant to catch. The file
+    So the change audit in the store is only as good as the hop it is meant to catch. **The
+    in-process compare** (vault BACKLOG #3714 step 9) does not read the store: each settings
+    preflight of the pin compares the file with the first pin bytes this engine process checked
+    and passed, at a store open or else at a preflight (:data:`_STORE_PIN_FIRST_CHECKED`), and logs
+    a WARNING at each check that finds them different; the baseline does not move until a
+    restart. It writes no row and refuses nothing. It reads the file only when a check runs, so
+    at least a swap undone before the next check is not seen. A restart starts a new baseline, so
+    it does not see a swap made before the process first checked the pin, and each engine process
+    holds its own. A pin that passes a preflight with only a warning, such as an expired one, can
+    become the baseline where no store open in this process passed one first. The file
     checks are judged on the file, not on the store, and refuse or warn as they do elsewhere (the
     next paragraph says which a reload runs); only their rows travel the hop. A file that cannot
     be read refuses before this anchor writes any row. **A refusal at a reload refuses only the
@@ -268,7 +278,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     start the store has already been opened with this file when this check runs, so its
     connections may have trusted the file and sent the store login. A command that opens the
     store and runs no preflight does not check the file at all. What the paragraphs above say of the pin's audit riding its own hop, and of a refused reload
-    leaving the pool open, holds for this CA too.
+    leaving the pool open, holds for this CA too, except the in-process compare, which runs for
+    the pin alone: a swap of this CA that the store's answer hides is not logged.
 12. **A generic DATABASE connection's driver CA** (vault BACKLOG #3090, step 7). The CA file a
     generic-dialect ``Database`` outbound or ``DatabasePoll`` names as ``odbc_params`` ``sslca``
     is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. It
@@ -1697,6 +1708,44 @@ def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
 #: command that opens the store and runs no preflight still logs the warning at open.
 _WARNED_AT_OPEN: dict[tuple[str, str], tuple[object, ...]] = {}
 
+#: The SQL Server store pin's in-process baseline (vault BACKLOG #3714 step 9), keyed by label and
+#: path: the fingerprint of the first pin bytes this process checked and passed, at a store open
+#: or, failing that, at a settings preflight (:func:`note_store_pin_checked`). Only the first is
+#: kept, so a later open or preflight of a swapped file cannot move it. The settings
+#: preflight compares the file with it (:func:`_warn_off_hop_pin_change`) without reading the
+#: store, so the compare does not ride the hop the pin secures (module item 11).
+_STORE_PIN_FIRST_CHECKED: dict[tuple[str, str], str] = {}
+
+
+def note_store_pin_checked(spec: AnchorSpec, fingerprint: str) -> None:
+    """Record ``fingerprint`` as the SQL Server pin's in-process baseline unless one is already
+    held (:data:`_STORE_PIN_FIRST_CHECKED`). The store open and the settings preflight call it once
+    their checks of the pin pass, so a file the open or the preflight refuses never becomes the
+    baseline."""
+    _STORE_PIN_FIRST_CHECKED.setdefault((spec.label, spec.path), fingerprint)
+
+
+def _warn_off_hop_pin_change(spec: AnchorSpec, fingerprint: str) -> None:
+    """Log a WARNING when the SQL Server pin's bytes differ from its in-process baseline
+    (:data:`_STORE_PIN_FIRST_CHECKED`); with no baseline held, do nothing. It reads no store row,
+    so a server the swapped pin admits cannot answer it. Module item 11 states its limits."""
+    first = _STORE_PIN_FIRST_CHECKED.get((spec.label, spec.path))
+    if first is None or first == fingerprint:
+        return
+    log.warning(
+        "%s: the SQL Server pin %r on disk (%s %s) differs from the pin this engine process first "
+        "checked (%s). This compare reads no store row, so it does not depend on the store hop "
+        "the pin secures. Connections the store opened since the change trust the new file. If "
+        "the change is not a certificate renewal you made, treat the store login and the traffic "
+        "on those connections as exposed, correct the file, and restart each engine process that "
+        "uses this store",
+        spec.setting,
+        spec.path,
+        ANCHOR_DIGEST,
+        fingerprint,
+        first,
+    )
+
 
 def enforced_anchor(
     spec: AnchorSpec, *, enforcing: bool, remember_warning: bool = False
@@ -2798,6 +2847,8 @@ async def _preflight_checks(
             spec.path,
         )
         raise
+    if spec.server_pin:
+        _warn_off_hop_pin_change(spec, verdict.fingerprint)  # before any store call (step 9)
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
     if pin_warning is not None:
@@ -2843,6 +2894,8 @@ async def _preflight_checks(
     except TrustAnchorError as refusal:
         refusal.unaudited = store_fault is not None
         raise
+    if spec.server_pin:
+        note_store_pin_checked(spec, verdict.fingerprint)  # the file passed (step 9)
     if store_fault is not None:
         raise store_fault
     return verdict.fingerprint

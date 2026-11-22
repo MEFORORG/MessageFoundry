@@ -73,6 +73,24 @@ async def test_stop_returns_within_the_grace_when_a_share_call_blocks(
     assert any("did not stop within" in r.getMessage() for r in caplog.records)
 
 
+class _WatchedAsyncio:
+    """``asyncio`` as ``file.py`` sees it, with ``wait`` wrapped so a test learns each time a wait
+    in ``stop()`` ends with the poll task still running. Only ``file.py``'s name is replaced, so no
+    other caller of ``asyncio.wait`` is touched."""
+
+    def __init__(self, on_timeout: Any) -> None:
+        self._on_timeout = on_timeout
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(asyncio, name)
+
+    async def wait(self, fs: Any, **kw: Any) -> Any:
+        done, pending = await asyncio.wait(fs, **kw)
+        if not done:
+            self._on_timeout()
+        return done, pending
+
+
 async def test_stop_never_cancels_a_hand_off_in_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -83,42 +101,53 @@ async def test_stop_never_cancels_a_hand_off_in_progress(
     Mutation: cancel regardless of ``_in_store_call``. Red: the hand-off is cancelled mid-commit.
     Mutation: drop the grace restart after a store call. Red: the poll task is cancelled mid-move.
 
-    Two graces. The hand-off runs under a 0.25 s grace and lasts four of them. Once it has
-    committed, the grace goes up to 10 s for the archive move that follows. A 0.25 s grace for that
-    move flaked on loaded Windows runners: stop() cancelled the poll task mid-move, and the move
-    finished on its thread only after the assertion had looked. The move here is slowed to 0.5 s,
-    the shape of that slow runner. A passing run still ends when the poll task does, so the long
-    grace costs nothing. This relies on stop() reading the grace at each use, not once on entry."""
+    It waits on events, not on time (BACKLOG #2095). The hand-off does not return until a grace in
+    ``stop()`` has run out while it was in flight, and the archive move does not start until a
+    grace has run out after the hand-off ended. So each mutation's cancel point is reached on every
+    run, however slow the runner. Once the hand-off has committed, the grace goes up to 10 s, so
+    the correct code waits out the released move with room to spare. A passing run ends when the
+    poll task does, so the long grace costs nothing. This relies on stop() reading the grace at
+    each use, not once on entry."""
     monkeypatch.setattr(file_mod, "_STOP_GRACE_S", 0.25)
     inbox = tmp_path / "in"
     inbox.mkdir()
     (inbox / "one.hl7").write_bytes(_MSG.format(n=1).encode("ascii"))
     source = _source(inbox)
     real_move = source._move
+    committed: list[bool] = []
+    grace_ran_out_in_hand_off = asyncio.Event()
+    grace_ran_out_after_hand_off = threading.Event()  # set on the loop, waited on by the move
 
-    def slow_move(path: Path, dest_dir: Path, *rest: Any, **kw: Any) -> bool:
-        # Longer than the 0.25 s window before stop() next looks, so a stop() that skips the grace
-        # restart cancels the poll task mid-move.
-        time.sleep(0.5)
+    def on_timeout() -> None:
+        if source._in_store_call:
+            grace_ran_out_in_hand_off.set()
+        elif committed:
+            grace_ran_out_after_hand_off.set()
+
+    monkeypatch.setattr(file_mod, "asyncio", _WatchedAsyncio(on_timeout))
+
+    def gated_move(path: Path, dest_dir: Path, *rest: Any, **kw: Any) -> bool:
+        # Held until stop() has looked once after the hand-off, so a stop() that skips the grace
+        # restart cancels the poll task mid-move. The bound only keeps a broken run from hanging.
+        assert grace_ran_out_after_hand_off.wait(30), "stop() never looked after the hand-off"
         return real_move(path, dest_dir, *rest, **kw)
 
-    monkeypatch.setattr(source, "_move", slow_move)
+    monkeypatch.setattr(source, "_move", gated_move)
     in_handler = asyncio.Event()
-    committed: list[bool] = []
 
-    async def slow_commit(_raw: bytes) -> str | None:
+    async def gated_commit(_raw: bytes) -> str | None:
         in_handler.set()
-        await asyncio.sleep(1.0)  # four graces long
+        await grace_ran_out_in_hand_off.wait()  # a grace ran out mid-hand-off
         committed.append(True)
         # Set while still inside the store call, so stop() sees it when the store call ends.
         monkeypatch.setattr(file_mod, "_STOP_GRACE_S", 10.0)
         return None
 
-    await source.start(slow_commit)
+    await source.start(gated_commit)
     poll_task = source._task
     assert poll_task is not None
-    await asyncio.wait_for(in_handler.wait(), 5)
-    await asyncio.wait_for(source.stop(), 20)  # the 1 s hand-off, then at most the 10 s grace
+    await asyncio.wait_for(in_handler.wait(), 30)
+    await asyncio.wait_for(source.stop(), 60)  # bounds a broken run only; a pass ends far sooner
 
     assert committed == [True], "the hand-off was cut short"
     # Checked before the file: a cancelled move can still finish on its thread, so the file alone
