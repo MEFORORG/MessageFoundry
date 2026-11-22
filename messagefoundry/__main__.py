@@ -10030,14 +10030,19 @@ def _open_changes(store: StoreSettings, *, salt: bool) -> str:
     return f"{'; '.join(changed[:-1])}; and {changed[-1]}"
 
 
+def _binds_salt(store: StoreSettings) -> bool:
+    """Whether a keyed writable open of ``store`` binds a salt: the ``aesgcm`` cipher with
+    ``aad_bind``, since the salt bind skips the ``vault_transit`` cipher and the v1 writer."""
+    return store.cipher_provider == "aesgcm" and store.aad_bind
+
+
 def _open_steps_left_behind(store: StoreSettings, *, salt: bool) -> str | None:
     """What a key, cipher or keyless-chain refusal left behind when it can follow the open's own
     writing steps (BACKLOG #5067): sentences, the last with no full stop, as
     :func:`_open_refusal_left_behind` returns them, or ``None`` when :func:`_open_changes` names
     nothing. ``salt`` is whether the cipher binds a salt; the caller says, since a keyless open
     binds none, and the salt bind skips the ``vault_transit`` cipher and the v1 writer too."""
-    binds_salt = salt and store.cipher_provider == "aesgcm" and store.aad_bind
-    listed = _open_changes(store, salt=binds_salt)
+    listed = _open_changes(store, salt=salt and _binds_salt(store))
     if not listed:
         return None
     return (
@@ -10106,10 +10111,11 @@ def _invocation_bound_left_behind(store: StoreSettings) -> str:
     So the text says no account or audit row was written, and never that nothing was: the open's
     own steps may have written, and a minting ``provision-admin`` run wrote its key file before
     the open, which its caller names."""
+    listed = _open_changes(store, salt=_binds_salt(store))
     return (
         "The open stopped where the AES-GCM invocation bound reads the key's persisted total. No "
         "account or audit row was written, but the steps the open runs before that read may "
-        f"already have changed the database: at least {_open_changes(store, salt=True)}"
+        f"already have changed the database{f': at least {listed}' if listed else ''}"
     )
 
 
@@ -10149,7 +10155,12 @@ def _invocation_bound_provision_refusal(
 
 
 def _provision_open_refusal(
-    exc: BaseException, store: StoreSettings, *, kept: Path | None = None, opened: bool = False
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    kept: Path | None = None,
+    opened: bool = False,
+    keyed: bool = True,
 ) -> str:
     """``provision-admin``'s text for a refused store open: the refusal, then what it left
     behind (:func:`_open_refusal_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
@@ -10157,12 +10168,13 @@ def _provision_open_refusal(
     it decoded (BACKLOG #2532). ``kept`` is the store key a failed create kept: the text then
     names it, and never says nothing was written (PR 2804 fourteenth hold). ``opened`` says the
     open had returned before ``exc``, so a refusal :func:`_open_refusal_left_behind` says nothing
-    for names what the open may have changed (BACKLOG #5067)."""
+    for names what the open may have changed (BACKLOG #5067); ``keyed`` says a store key is
+    configured, since a keyless open binds no salt."""
     from messagefoundry.redaction import codec_safe_str
 
     left = _open_refusal_left_behind(exc, store)
     if left is None and opened:
-        left = _open_steps_left_behind(store, salt=True)
+        left = _open_steps_left_behind(store, salt=keyed)
     if kept is not None:
         held = _kept_key_sentence(kept)
         tail = (
@@ -11066,7 +11078,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # says what the open may have changed, and that the shown key's entry has no seed (#5067).
         text = after_the_key(
             codec_safe_str(exc),
-            _provision_open_refusal(exc, settings.store, kept=kept_key, opened=store_opened),
+            _provision_open_refusal(
+                exc,
+                settings.store,
+                kept=kept_key,
+                opened=store_opened,
+                keyed=_store_key_configured(settings),
+            ),
         )
         _emit_error(text, as_json=args.json)
         return 2
@@ -11078,7 +11096,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
             raise
         text = after_the_key(
             codec_safe_str(exc),
-            _provision_open_refusal(exc, settings.store, kept=kept_key, opened=store_opened),
+            _provision_open_refusal(
+                exc,
+                settings.store,
+                kept=kept_key,
+                opened=store_opened,
+                keyed=_store_key_configured(settings),
+            ),
         )
         _emit_error(text, as_json=args.json)
         return 2

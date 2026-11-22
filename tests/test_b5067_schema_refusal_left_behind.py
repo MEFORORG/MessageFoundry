@@ -873,3 +873,22 @@ async def test_the_service_calls_on_first_write_before_a_repair_clears_the_facto
         assert fired.count("first write") == 1, fired
     finally:
         await store.close()
+
+
+def test_a_keyless_store_open_names_no_salt_record() -> None:
+    """A keyless open binds no salt, so a refusal after a keyless open does not name the salt
+    record; a keyed one does, and the v1 writer (``aad_bind = false``) binds none either.
+
+    Mutation: pass ``salt=True`` in ``_provision_open_refusal``'s opened branch again."""
+    from messagefoundry.__main__ import _invocation_bound_left_behind, _provision_open_refusal
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    store = StoreSettings(path="synthetic.db")
+    refusal = KeyProviderError("synthetic")
+    keyless = _provision_open_refusal(refusal, store, opened=True, keyed=False)
+    keyed = _provision_open_refusal(refusal, store, opened=True, keyed=True)
+    assert _OWN_WRITES in keyless and "salt record" not in keyless, keyless
+    assert "the store's salt record" in keyed, keyed
+    v1 = StoreSettings(path="synthetic.db", aad_bind=False)
+    assert "salt record" not in _invocation_bound_left_behind(v1)
