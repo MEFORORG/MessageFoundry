@@ -7627,10 +7627,11 @@ class SqlServerStore:
                     # (the enclosing transaction rolls back → no ACK). `refs` is de-duplicated, so the
                     # message_attachment PK never conflicts and the refcount is bumped once per distinct ref.
                     for ref in refs:
-                        await cur.execute(
-                            "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
-                        )
-                        if not cur.rowcount:
+                        # On this cursor, so the incref stays in the ingress transaction. Read from
+                        # OUTPUT: under a session-wide SET NOCOUNT ON, rowcount is a truthy -1 and a
+                        # missing ref would commit a dangling link (BACKLOG #5667).
+                        await cur.execute(_SQL_INCREF_ATTACHMENT, (1, ref))
+                        if await cur.fetchone() is None:
                             raise KeyError(f"attachment {ref!r} not found for ingress incref")
                         await cur.execute(
                             "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
@@ -12698,14 +12699,18 @@ class SqlServerStore:
     async def read_attachment(self, ref: str) -> AsyncIterator[str]:
         """Yield the detached document's chunks back as decrypted plaintext, in ``seq`` order — the exact
         verbatim slices that were put (Approach B: concatenating them reconstructs OBX-5.5 byte-for-byte).
-        Raises :class:`KeyError` if the attachment does not exist (corruption or already GC'd)."""
-        exists = False
+        Raises :class:`KeyError` if the attachment does not exist (corruption or already GC'd), or,
+        after the last chunk, if the chunks do not add up to the header's ``total_bytes``: the two
+        reads are separate statements, so a GC between them must not read as an empty document
+        (BACKLOG #5728). A consumer must treat the content as good only once iteration ends."""
+        total: int | None = None
         rows: list[dict[str, Any]] = []
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
-                exists = await cur.fetchone() is not None
-                if exists:
+                await cur.execute("SELECT total_bytes FROM attachment WHERE id=?", (ref,))
+                header = await cur.fetchone()
+                if header is not None:
+                    total = int(header[0])
                     await cur.execute(
                         "SELECT seq, ciphertext FROM attachment_chunk WHERE attachment_id=? ORDER BY seq",
                         (ref,),
@@ -12716,12 +12721,23 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        if not exists:
+        if total is None:
             raise KeyError(f"attachment {ref!r} not found")
-        for r in rows:
-            yield self._cipher.decrypt(
-                r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
+
+        def _open(ciphertext: str, seq: int) -> tuple[str, int]:
+            plain = self._cipher.decrypt(
+                ciphertext, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq)
             )
+            # isascii is O(1) and the detach path's base64 is ASCII, so this rarely copies a chunk.
+            return plain, len(plain) if plain.isascii() else len(plain.encode("utf-8"))
+
+        seen = 0
+        for r in rows:
+            plain, size = await asyncio.to_thread(_open, r["ciphertext"], r["seq"])
+            seen += size
+            yield plain
+        if seen != total:
+            raise KeyError(f"attachment {ref!r} incomplete: {seen} of {total} bytes")
 
     async def attachments_for(
         self, message_id: str, *, include_inherited: bool = False
@@ -12889,32 +12905,54 @@ class SqlServerStore:
         ADR 0105). Two disjoint classes: refcount-0 attachments (header + chunks deleted) and header-less
         incomplete-write chunk groups (a future incremental writer that crashed before finalizing the
         header). Returns the number of attachments reclaimed. Idempotent: a second run finds nothing."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        headers = 0
+        incomplete = 0
+        async with self._acquire() as conn:
             try:
-                # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
-                # so their chunks don't miscount as orphans — those are reclaimed as the refcount-0 class).
-                await cur.execute(
-                    "SELECT COUNT(DISTINCT attachment_id) AS n FROM attachment_chunk"
-                    " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
-                )
-                row = await cur.fetchone()
-                incomplete = int(row[0]) if row is not None else 0
-                # Reclaim refcount-0 attachments: chunks (gated on the header's refcount) then the header.
-                await cur.execute(
-                    "DELETE FROM attachment_chunk WHERE attachment_id IN"
-                    " (SELECT id FROM attachment WHERE refcount<=0)"
-                )
-                await cur.execute("DELETE FROM attachment WHERE refcount<=0")
-                headers = cur.rowcount or 0
-                if headers < 0:
-                    headers = 0
-                # Reclaim any header-less orphan chunks (incomplete writes).
-                await cur.execute(
-                    "DELETE FROM attachment_chunk WHERE attachment_id NOT IN (SELECT id FROM attachment)"
-                )
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    # BACKLOG #5696: each header goes first, re-checking its refcount, and its chunks
+                    # only if this DELETE took it. An incref that won keeps header and chunks; one
+                    # that lost finds no header and fails its ingress. One id per statement, sorted
+                    # in Python, so the header locks follow the increfs' and decrefs' order and no
+                    # statement nears the 2100-parameter limit. OUTPUT, not rowcount, counts them
+                    # (see _exec_terminal on SET NOCOUNT ON).
+                    await cur.execute("SELECT id FROM attachment WHERE refcount<=0")
+                    for ref in sorted(str(r[0]) for r in await cur.fetchall()):
+                        await cur.execute(
+                            "DELETE FROM attachment OUTPUT deleted.id WHERE id=? AND refcount<=0",
+                            (ref,),
+                        )
+                        if await cur.fetchall():
+                            headers += 1
+                            await cur.execute(
+                                "DELETE FROM attachment_chunk WHERE attachment_id=?", (ref,)
+                            )
+                    await self._commit(conn)
+                    # Header-less groups (incomplete writes), in a second transaction so no header
+                    # lock is held while waiting on an applock. A put holds its content address's
+                    # applock until it commits header and chunks together, so a header re-read
+                    # under that applock tells a real orphan from a put that just landed. A single
+                    # anti-join could not: under RCSI its subquery reads a statement snapshot.
+                    await cur.execute(
+                        "SELECT DISTINCT attachment_id FROM attachment_chunk"
+                        " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+                    )
+                    for ref in sorted(str(r[0]) for r in await cur.fetchall()):
+                        await self._applock(cur, f"mefor:attachment:{ref}")
+                        await cur.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
+                        if await cur.fetchall():
+                            continue
+                        await cur.execute(
+                            "DELETE FROM attachment_chunk WHERE attachment_id=?", (ref,)
+                        )
+                        incomplete += 1
+                if incomplete:
+                    await self._commit(conn)
+                else:
+                    await self._commit_read(conn)
             except Exception:
-                await conn.rollback()
+                # The transaction may hold applocks. After the cursor closes, as put_attachment.
+                await self._rollback_or_discard(conn)
                 raise
         reclaimed = headers + incomplete
         if reclaimed:

@@ -14,11 +14,16 @@ the reference backend (Phases 3/4 are separate); mirrors ``test_store_once_deliv
 from __future__ import annotations
 
 import hashlib
+import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
+from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import (
     MessageStatus,
     MessageStore,
@@ -65,6 +70,106 @@ async def _refcount(s: MessageStore, ref: str) -> int | None:
     cur = await s._db.execute("SELECT refcount FROM attachment WHERE id=?", (ref,))
     row = await cur.fetchone()
     return None if row is None else int(row["refcount"])
+
+
+# --- #5728: a read checks the bytes it yielded against the header --------------------------------
+
+
+async def test_read_raises_when_chunks_are_missing(store: MessageStore) -> None:
+    """Red before #5728: the header alone made an emptied or truncated document read as success."""
+    ref = await store.put_attachment(CHUNKS, "application/pdf")
+    await store._db.execute("DELETE FROM attachment_chunk WHERE attachment_id=? AND seq=2", (ref,))
+    await store._db.commit()
+    with pytest.raises(KeyError, match="incomplete"):
+        await _read(store, ref)
+    await store._db.execute("DELETE FROM attachment_chunk WHERE attachment_id=?", (ref,))
+    await store._db.commit()
+    with pytest.raises(KeyError, match="incomplete"):
+        await _read(store, ref)
+
+
+async def test_read_of_an_empty_document_still_succeeds(store: MessageStore) -> None:
+    """The control: zero chunks is right for a zero-byte document, whose header says 0."""
+    ref = await store.put_attachment([], "text/plain")
+    assert await _read(store, ref) == []
+
+
+async def test_read_counts_utf8_bytes_as_the_put_does(store: MessageStore) -> None:
+    """``total_bytes`` is UTF-8 bytes, so a non-ASCII document must not read as a mismatch."""
+    chunks = ["café-", "文書"]
+    ref = await store.put_attachment(chunks, "text/plain")
+    assert await _read(store, ref) == chunks
+
+
+async def test_read_decrypts_off_the_event_loop(
+    enc_store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before #5728: decryption is CPU work in proportion to the document."""
+    ref = await enc_store.put_attachment(CHUNKS, "application/pdf")
+    real = enc_store._cipher.decrypt
+    threads: list[int] = []
+
+    def _spy(*args: Any, **kwargs: Any) -> str:
+        threads.append(threading.get_ident())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(enc_store._cipher, "decrypt", _spy)
+    assert "".join(await _read(enc_store, ref)) == DOC
+    assert len(threads) == len(CHUNKS)
+    assert threading.get_ident() not in threads
+
+
+class _ReadCursor:
+    """Answers the header read and then the chunk read, as a SQL Server cursor would."""
+
+    def __init__(self, total: int, rows: list[tuple[int, str]]) -> None:
+        self._total = total
+        self._rows = rows
+        self.description: list[tuple[str]] = [("seq",), ("ciphertext",)]
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self._sql = sql
+
+    async def fetchone(self) -> tuple[int] | None:
+        return (self._total,)
+
+    async def fetchall(self) -> list[tuple[int, str]]:
+        return self._rows
+
+
+class _ReadConn:
+    async def commit(self) -> None:
+        pass
+
+    async def rollback(self) -> None:
+        pass
+
+
+def _sqlserver_reader(total: int, rows: list[tuple[int, str]]) -> SqlServerStore:
+    reader = SqlServerStore.__new__(SqlServerStore)
+
+    @asynccontextmanager
+    async def _acquire(*args: Any, **kwargs: Any) -> AsyncIterator[_ReadConn]:
+        yield _ReadConn()
+
+    @asynccontextmanager
+    async def _cursor(conn: Any) -> AsyncIterator[_ReadCursor]:
+        yield _ReadCursor(total, rows)
+
+    reader._acquire = _acquire  # type: ignore[method-assign]
+    reader._cursor = _cursor  # type: ignore[method-assign]
+    reader._cipher = make_cipher(None)
+    return reader
+
+
+async def test_sqlserver_read_raises_on_a_short_document() -> None:
+    """Red before #5728, offline: GC between the two reads returned no chunks and no error."""
+    with pytest.raises(KeyError, match="incomplete"):
+        _ = [c async for c in _sqlserver_reader(5, []).read_attachment("a" * 64)]
+    with pytest.raises(KeyError, match="incomplete"):
+        _ = [c async for c in _sqlserver_reader(5, [(0, "abc")]).read_attachment("a" * 64)]
+    whole = _sqlserver_reader(5, [(0, "abc"), (1, "de")])
+    assert [c async for c in whole.read_attachment("a" * 64)] == ["abc", "de"]
 
 
 async def test_put_read_roundtrip_verbatim_chunked(store: MessageStore) -> None:

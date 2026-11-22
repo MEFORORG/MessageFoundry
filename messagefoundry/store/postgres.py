@@ -7981,18 +7981,33 @@ class PostgresStore:
     async def read_attachment(self, ref: str) -> AsyncIterator[str]:
         """Yield the detached document's chunks back as decrypted plaintext, in ``seq`` order — the exact
         verbatim slices that were put (Approach B: concatenating them reconstructs OBX-5.5 byte-for-byte).
-        Raises :class:`KeyError` if the attachment does not exist (corruption or already GC'd)."""
+        Raises :class:`KeyError` if the attachment does not exist (corruption or already GC'd), or,
+        after the last chunk, if the chunks do not add up to the header's ``total_bytes``: the two
+        reads are separate statements, so a GC between them must not read as an empty document
+        (BACKLOG #5728). A consumer must treat the content as good only once iteration ends."""
         async with self._timed_acquire() as conn:
-            if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is None:
+            total = await conn.fetchval("SELECT total_bytes FROM attachment WHERE id=$1", ref)
+            if total is None:
                 raise KeyError(f"attachment {ref!r} not found")
             rows = await conn.fetch(
                 "SELECT seq, ciphertext FROM attachment_chunk WHERE attachment_id=$1 ORDER BY seq",
                 ref,
             )
-        for r in rows:
-            yield self._cipher.decrypt(
-                r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
+
+        def _open(ciphertext: str, seq: int) -> tuple[str, int]:
+            plain = self._cipher.decrypt(
+                ciphertext, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq)
             )
+            # isascii is O(1) and the detach path's base64 is ASCII, so this rarely copies a chunk.
+            return plain, len(plain) if plain.isascii() else len(plain.encode("utf-8"))
+
+        seen = 0
+        for r in rows:
+            plain, size = await asyncio.to_thread(_open, r["ciphertext"], r["seq"])
+            seen += size
+            yield plain
+        if seen != total:
+            raise KeyError(f"attachment {ref!r} incomplete: {seen} of {total} bytes")
 
     async def attachments_for(
         self, message_id: str, *, include_inherited: bool = False
@@ -8182,7 +8197,9 @@ class PostgresStore:
         incomplete-write chunk groups (a future incremental writer that crashed before finalizing the
         header). Returns the number of attachments reclaimed. Idempotent: a second run finds nothing."""
         async with self._timed_acquire() as conn:  # noqa: SIM117
-            async with conn.transaction():
+            # READ COMMITTED pinned: FOR UPDATE then waits out a racing incref and re-checks the
+            # refcount, where repeatable read would raise a serialization failure.
+            async with conn.transaction(isolation="read_committed"):
                 # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
                 # so their chunks don't miscount — those are reclaimed as the refcount-0 class).
                 incomplete = int(
@@ -8192,13 +8209,23 @@ class PostgresStore:
                     )
                     or 0
                 )
-                # Reclaim refcount-0 attachments: chunks (gated on the header's refcount) then the header.
-                await conn.execute(
-                    "DELETE FROM attachment_chunk WHERE attachment_id IN"
-                    " (SELECT id FROM attachment WHERE refcount<=0)"
+                # BACKLOG #5696: headers first, then the chunks of exactly the headers taken, so an
+                # incref that won keeps both. Locked in byte order (COLLATE "C"), the order of the
+                # Python-sorted increfs and decrefs, whatever the database collation.
+                taken = await conn.fetch(
+                    "WITH doomed AS (SELECT id FROM attachment WHERE refcount<=0"
+                    ' ORDER BY id COLLATE "C" FOR UPDATE)'
+                    " DELETE FROM attachment a USING doomed d WHERE a.id = d.id RETURNING a.id"
                 )
-                headers = _rowcount(await conn.execute("DELETE FROM attachment WHERE refcount<=0"))
-                # Reclaim any header-less orphan chunks (incomplete writes).
+                headers = len(taken)
+                if taken:
+                    await conn.execute(
+                        "DELETE FROM attachment_chunk WHERE attachment_id = ANY($1::text[])",
+                        [r["id"] for r in taken],
+                    )
+                # Reclaim any header-less orphan chunks (incomplete writes). One statement snapshot
+                # covers both tables and a put commits header and chunks together, so a chunk this
+                # can see has its header visible too: it cannot take a concurrent put's chunks.
                 await conn.execute(
                     "DELETE FROM attachment_chunk WHERE attachment_id NOT IN (SELECT id FROM attachment)"
                 )

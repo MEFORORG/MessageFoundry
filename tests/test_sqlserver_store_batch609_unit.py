@@ -25,6 +25,8 @@ import pytest
 
 import messagefoundry.store.sqlserver as sqlserver_module
 from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
+from messagefoundry.store.crypto import make_cipher
+from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore, _SyncHandoffPool
 
 # --- #5663: the sync handoff pool -------------------------------------------------------------
@@ -428,6 +430,189 @@ async def test_the_options_reread_failure_logs_no_driver_text(
     rereads = [r for r in caplog.records if "RCSI re-read" in r.getMessage()]
     assert rereads, "the control: the re-read failed and logged"
     assert all(r.exc_info is None and _SECRET not in r.getMessage() for r in rereads)
+
+
+# --- #5667: the ingress incref reads OUTPUT -----------------------------------------------------
+
+
+class _IncrefCursor(_NocountCursor):
+    """Answers the incref from ``known``, and every other statement with an empty rowset."""
+
+    def __init__(self, known: set[str]) -> None:
+        super().__init__([])
+        self._known = known
+        self.params: list[Any] = []
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self.executed.append(sql)
+        self.params.append(params)
+        self._current = []
+        if sql == sqlserver_module._SQL_INCREF_ATTACHMENT and params[1] in self._known:
+            self._current = [(params[1],)]
+
+
+def _ingress_store(cur: _IncrefCursor) -> tuple[SqlServerStore, list[int]]:
+    store, commits = _store(cur)
+    store._cipher = make_cipher(None)
+    store._message_events = "all"
+    store.body_copies = 0
+    return store, commits
+
+
+async def test_ingress_of_a_missing_attachment_raises_under_nocount() -> None:
+    """Red before #5667: ``rowcount`` of -1 is truthy, so the link to a missing row committed."""
+    cur = _IncrefCursor(known=set())
+    store, commits = _ingress_store(cur)
+    with pytest.raises(KeyError):
+        await store.enqueue_ingress(channel_id="c", raw="MSH|", attachment_refs=["f" * 64])
+    assert commits == [], "a message linked to a missing attachment must not commit"
+    assert not any("message_attachment" in sql for sql in cur.executed)
+
+
+async def test_ingress_increfs_inside_its_own_transaction() -> None:
+    """The incref runs on the ingress cursor, so one commit carries the row, incref and link."""
+    ref = "a" * 64
+    cur = _IncrefCursor(known={ref})
+    store, commits = _ingress_store(cur)
+    await store.enqueue_ingress(channel_id="c", raw="MSH|", attachment_refs=[ref])
+    assert commits == [1]
+    at = cur.executed.index(sqlserver_module._SQL_INCREF_ATTACHMENT)
+    assert cur.params[at] == (1, ref)
+    assert "INSERT INTO message_attachment" in cur.executed[at + 1]
+
+
+# --- #5696: the orphan sweep deletes the header first -------------------------------------------
+
+
+class _SweepCursor(_NocountCursor):
+    """A small model of the two attachment tables, enough to follow the sweep's statements."""
+
+    def __init__(self, headers: dict[str, int], chunks: set[str]) -> None:
+        super().__init__([])
+        self.headers = headers
+        self.chunks = chunks
+        self.log: list[tuple[str, str]] = []
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self.executed.append(sql)
+        self._current = []
+        ref = params[0] if params else ""
+        if sql.startswith("SELECT id FROM attachment WHERE refcount<=0"):
+            # Reversed, so only a sort in the store can produce content-address order.
+            ids = [k for k, v in self.headers.items() if v <= 0]
+            self._current = [(k,) for k in sorted(ids, reverse=True)]
+        elif sql.startswith("DELETE FROM attachment OUTPUT deleted.id"):
+            assert "refcount<=0" in sql
+            self.log.append(("header", ref))
+            if self.headers.get(ref, 1) <= 0:
+                del self.headers[ref]
+                self._current = [(ref,)]
+        elif sql.startswith("DELETE FROM attachment_chunk"):
+            self.log.append(("chunks", ref))
+            self.chunks.discard(ref)
+        elif sql.startswith("SELECT DISTINCT attachment_id"):
+            orphans = sorted(self.chunks - set(self.headers), reverse=True)
+            self._current = [(k,) for k in orphans]
+        elif "sp_getapplock" in sql:
+            self.log.append(("applock", str(params[0])))
+            self._current = [(0,)]
+        elif sql.startswith("SELECT 1 FROM attachment WHERE id=?"):
+            self._current = [(1,)] if ref in self.headers else []
+
+
+async def test_sweep_deletes_each_header_before_its_chunks_in_address_order() -> None:
+    """Red before #5696: chunks went first, so a racing incref could keep a header with none."""
+    a, b = "a" * 64, "b" * 64
+    cur = _SweepCursor({b: 0, a: 0, "c" * 64: 1}, {a, b, "c" * 64})
+    store, _ = _store(cur)
+    assert await store.sweep_orphan_attachments() == 2  # OUTPUT counts them under NOCOUNT
+    assert cur.log == [("header", a), ("chunks", a), ("header", b), ("chunks", b)]
+    assert cur.chunks == {"c" * 64}
+
+
+async def test_sweep_keeps_the_chunks_of_a_header_a_racing_incref_saved() -> None:
+    """The header DELETE re-checks the refcount; a row it did not delete keeps its chunks."""
+    ref = "a" * 64
+
+    class _Raced(_SweepCursor):
+        async def execute(self, sql: str, params: Any = None) -> None:
+            if sql.startswith("DELETE FROM attachment OUTPUT"):
+                self.headers[ref] = 1  # the incref commits between the read and the delete
+            await super().execute(sql, params)
+
+    cur = _Raced({ref: 0}, {ref})
+    store, _ = _store(cur)
+    assert await store.sweep_orphan_attachments() == 0
+    assert cur.chunks == {ref}
+
+
+async def test_sweep_rechecks_an_orphan_under_the_put_applock() -> None:
+    """A put commits its header and chunks together. Seen as an orphan by a stale read, its chunks
+    survive because the sweep re-reads the header while holding that content address's applock."""
+    ref, dead = "a" * 64, "d" * 64
+
+    class _PutLands(_SweepCursor):
+        async def execute(self, sql: str, params: Any = None) -> None:
+            await super().execute(sql, params)
+            if "sp_getapplock" in sql and ref in str(params[0]):
+                self.headers[ref] = 0  # the put held the applock and has now committed
+
+    cur = _PutLands({}, {ref, dead})
+    store, _ = _store(cur)
+    assert await store.sweep_orphan_attachments() == 1
+    assert cur.chunks == {ref}
+    locks = [what for kind, what in cur.log if kind == "applock"]
+    assert locks == [f"mefor:attachment:{ref}", f"mefor:attachment:{dead}"]
+    assert cur.log.index(("applock", locks[1])) < cur.log.index(("chunks", dead))
+
+
+class _PgSweepConn:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+        self.isolation: str | None = None
+        self.chunk_ids: list[str] = []
+
+    @asynccontextmanager
+    async def _tx(self) -> AsyncIterator[None]:
+        yield
+
+    def transaction(self, *, isolation: str | None = None) -> Any:
+        self.isolation = isolation
+        return self._tx()
+
+    async def fetchval(self, sql: str, *args: Any) -> int:
+        self.statements.append(sql)
+        return 1  # one header-less group
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, str]]:
+        self.statements.append(sql)
+        return [{"id": "a" * 64}, {"id": "b" * 64}]
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.statements.append(sql)
+        if args:
+            self.chunk_ids = list(args[0])
+        return "DELETE 0"
+
+
+async def test_postgres_sweep_locks_headers_in_order_and_deletes_returned_ids() -> None:
+    """Red before #5696. The header statement locks in byte order, as the Python sort of the
+    increfs does, and the chunk delete names exactly the ids it returned."""
+    store: Any = PostgresStore.__new__(PostgresStore)
+    conn = _PgSweepConn()
+
+    @asynccontextmanager
+    async def _timed_acquire() -> AsyncIterator[_PgSweepConn]:
+        yield conn
+
+    store._timed_acquire = _timed_acquire
+    assert await store.sweep_orphan_attachments() == 3
+    assert conn.isolation == "read_committed"
+    header = conn.statements[1]
+    assert 'ORDER BY id COLLATE "C" FOR UPDATE' in header and "RETURNING" in header
+    assert "attachment_chunk" in conn.statements[2]
+    assert conn.chunk_ids == ["a" * 64, "b" * 64]
+    assert "NOT IN" in conn.statements[3]
 
 
 async def test_a_failed_alter_cursor_open_reaches_the_alters_handler(
