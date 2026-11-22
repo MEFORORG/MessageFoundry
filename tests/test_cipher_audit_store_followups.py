@@ -13,21 +13,25 @@ import ast
 import asyncio
 import builtins
 import inspect
+import json
 import sqlite3
 import textwrap
+from collections.abc import Iterator
 from itertools import product
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 import messagefoundry.__main__ as cli
 import messagefoundry.store.base as store_base
+import messagefoundry.store.cipher_cells as cipher_cells_module
 import messagefoundry.store.postgres as postgres
 import messagefoundry.store.sqlserver as sqlserver
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.base import build_store_cipher, check_walk_identifiers
-from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
+from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS, CipherWalkInterrupted
+from messagefoundry.store.crypto import Cipher, CipherUnavailableError
 from tests.test_cipher_cells_readback import (
     _copy,
     _flip_one_aead_byte,
@@ -80,6 +84,117 @@ def test_a_failure_found_before_a_mid_walk_error_is_still_reported(
     assert "state.value position=1 did not decrypt" in payload["reason"], payload
     assert payload["opened"] is None, payload  # a partial walk prints no counts
     assert all(handle.closed for _kw, handle in opened)
+
+
+class _DownFrom:
+    """The real store cipher, until it is asked to open a value of ``table``: from there the key
+    service is unreachable, as Transit's outage reads. Not a batch cipher, so the walk opens value
+    by value and stops at the first outage."""
+
+    def __init__(self, cipher: Any, table: str) -> None:
+        self._cipher, self._table = cipher, table.encode()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cipher, name)
+
+    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        if aad is not None and self._table in aad:
+            raise CipherUnavailableError("synthetic: key service unreachable")
+        return cast(str, self._cipher.decrypt(stored, aad=aad))
+
+
+def _damaged_state(tmp_path: Path, template: tuple[Path, StoreSettings]) -> tuple[Path, Any]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db, settings = _copy(template, tmp_path)
+    _flip_one_aead_byte(db, next(c for c in SQLITE_CIPHER_CELLS if c.table == "state"))
+    return db, settings
+
+
+def _assert_stop_names_the_failure(rc: int, payload: dict[str, Any], out: str) -> None:
+    assert rc == 1 and payload["status"] == "FAIL", out
+    assert "stopped part way" in payload["reason"], payload
+    assert "already fail" in payload["reason"], payload
+    assert "state.value" in payload["reason"] and "did not decrypt" in payload["reason"], payload
+
+
+def test_a_key_service_stop_on_a_server_store_keeps_the_failure_found_before_it(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Item 1, the outage limb: Transit going down at ``attachment_chunk`` still names the damaged
+    ``state.value`` the walk read before it. Control: the same outage over intact cells is a FAIL
+    that names no value."""
+    db, settings = _copy(_template, tmp_path)
+    _serve_from(
+        monkeypatch, db, cast(Cipher, _DownFrom(build_store_cipher(settings), "attachment"))
+    )
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 1 and "did not decrypt" not in payload["reason"], out
+    db, settings = _damaged_state(tmp_path / "damaged", _template)
+    _serve_from(
+        monkeypatch, db, cast(Cipher, _DownFrom(build_store_cipher(settings), "attachment"))
+    )
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    _assert_stop_names_the_failure(rc, payload, out)
+    assert "CipherUnavailableError" in payload["reason"], payload
+
+
+def _sqlite_cli(
+    db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> tuple[int, dict[str, Any], str]:
+    monkeypatch.chdir(db.parent)
+    rc = cli.main(["cipher-audit", "--db", str(db), "--json"])
+    out = capsys.readouterr().out
+    return rc, json.loads(out.strip().splitlines()[-1]), out
+
+
+def _stop_reading_at(monkeypatch: pytest.MonkeyPatch, table: str, error: Exception) -> None:
+    """Make the SQLite walk raise ``error`` when it reaches ``table``, after the cells before it."""
+    real = cipher_cells_module.read_cipher_cells
+
+    def stopping(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        for reading in real(*args, **kwargs):
+            if reading.cell.table == table:
+                raise error
+            yield reading
+
+    monkeypatch.setattr(cipher_cells_module, "read_cipher_cells", stopping)
+
+
+@pytest.mark.parametrize(
+    "stop",
+    [
+        sqlite3.OperationalError("synthetic: database is locked"),
+        CipherWalkInterrupted("synthetic: the store changed under the walk"),
+        "key_service",
+    ],
+    ids=["sqlite-error", "interrupted", "key-service"],
+)
+def test_a_sqlite_stop_keeps_the_failure_found_before_it(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stop: Exception | str,
+) -> None:
+    """Item 1 on SQLite: a lock, a VACUUM or an outage reached at ``attachment_chunk`` still names
+    the damaged ``state.value`` the walk read before it, and exits 1."""
+    db, settings = _damaged_state(tmp_path, _template)
+    assert settings.encryption_key is not None
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", settings.encryption_key)
+    if isinstance(stop, Exception):
+        _stop_reading_at(monkeypatch, "attachment_chunk", stop)
+    else:
+        real = store_base.build_store_cipher
+        monkeypatch.setattr(
+            store_base,
+            "build_store_cipher",
+            lambda store, **kw: _DownFrom(real(store, **kw), "attachment"),
+        )
+    rc, payload, out = _sqlite_cli(db, monkeypatch, capsys)
+    _assert_stop_names_the_failure(rc, payload, out)
 
 
 def test_a_mid_walk_grant_error_with_nothing_failing_still_could_not_start(

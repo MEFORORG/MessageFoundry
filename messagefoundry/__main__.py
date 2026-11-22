@@ -109,7 +109,6 @@ if TYPE_CHECKING:
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import NoticeAuditSink, SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
-    from messagefoundry.store.cipher_cells import CipherCellSource
     from messagefoundry.store.custody_host import MintedCustody
     from messagefoundry.store.store import UserRecord
 
@@ -13332,15 +13331,22 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         return type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
 
     def failing_value(found: CipherAudit) -> str | None:
-        # The first value the walk read that fails the audit, as the verdicts below rank them:
-        # a key mismatch, a value that did not open or a BLOB, then an unmarked value the store
-        # refuses at read. None when the values read so far all pass.
-        if found.key_mismatch is not None:
-            return found.key_mismatch
+        # The FAIL reason the values read earn, a value that did not open or a BLOB before an
+        # unmarked value the store refuses at read; None when every value read passes. The one
+        # ranking: the verdict below and a walk stopped part way both read it.
         if found.failed or found.blob:
-            return next(t.first_failure for t in found.tallies if t.first_failure)
+            first = next(t.first_failure for t in found.tallies if t.first_failure)
+            return (
+                f"{found.failed} sealed value(s) did not open, and {found.blob} BLOB(s) sit where "
+                f"the store writes only text; the first: {first}"
+            )
         if found.unmarked and not store.allow_unmarked_ciphertext:
-            return next(t.first_unmarked for t in found.tallies if t.first_unmarked)
+            first = next(t.first_unmarked for t in found.tallies if t.first_unmarked)
+            return (
+                f"{found.unmarked} non-blank value(s) on surfaces this keyed store has sealed "
+                "carry no at-rest marker, so the store refuses each at read: a damaged or "
+                f"stripped marker, or a planted row (BACKLOG #1169); the first: {first}"
+            )
         return None
 
     if server:
@@ -13398,26 +13404,23 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 ]
                 if "keyed_surface" not in columns:
                     hidden.append("keyed_surface")
-                # A store error in a chunk or surface read ends the walk but keeps what it had
-                # tallied, so a failure found before the error is still reported (#1719 item 1).
-                walk = _CipherWalkStopsOnError(source, walk_errors)
+                # Filled in place, so a walk that raises part way keeps what it had tallied and a
+                # failure found before the stop is still reported (BACKLOG #1719 item 1).
+                found = CipherAudit()
                 try:
-                    found = await audit_server_cipher_cells(
-                        walk,
+                    await audit_server_cipher_cells(
+                        source,
                         server_cipher,
                         cells=cells,
                         chunk_rows=chunk_rows,
                         columns=columns,
+                        into=found,
                     )
-                    error = walk.error
                 except walk_errors as exc:
-                    # Raised outside a chunk or surface read, at least by the keyed-surface read
-                    # before any value is read, so nothing tallied survives it.
-                    found, error = CipherAudit(), exc
+                    error: Exception = exc
                 except key_service_down as exc:
-                    stop = stopped_by_key_service(exc)
-                    return server_cipher.encrypts, CipherAudit(), stop, hidden
-                if error is None:
+                    return server_cipher.encrypts, found, stopped_by_key_service(exc), hidden
+                else:
                     return server_cipher.encrypts, found, None, hidden
                 if is_store_shape_error(error) and failing_value(found) is None:
                     # A table, column or grant the read needs, as `audit-verify` splits it:
@@ -13487,7 +13490,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                     as_json=as_json,
                 )
                 return 2
-            audit = audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows)
+            # Filled in place, so a stop part way keeps what was counted (BACKLOG #1719 item 1).
+            audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows, into=audit)
         except sqlite3.Error as exc:
             # Part way: a lock held past --busy-timeout, a disk error, a value the driver cannot
             # read. The rendering quotes no row's content.
@@ -13499,6 +13503,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         finally:
             conn.close()
 
+    failing = failing_value(audit)
     if audit.key_mismatch is not None:
         status, code = "KEY_MISMATCH", 4
         reason = (
@@ -13509,29 +13514,14 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         status, code = "FAIL", 1
         reason = (
             f"the audit stopped part way on an error ({stopped}). The values after it were not "
-            "read, and the counts are not reported: treat the store as unaudited until a run that "
-            "finishes says otherwise"
+            "read, and the per-cell counts are not reported: treat the store as unaudited until a "
+            "run that finishes says otherwise"
         )
-        before = failing_value(audit)
-        if before is not None:
-            reason += (
-                f". Before it stopped, the audit found a value that fails; the first: {before}"
-            )
-    elif audit.failed or audit.blob:
+        if failing is not None:
+            reason += f". Before it stopped, the values it read already fail: {failing}"
+    elif failing is not None:
         status, code = "FAIL", 1
-        first = next(t.first_failure for t in audit.tallies if t.first_failure)
-        reason = (
-            f"{audit.failed} sealed value(s) did not open, and {audit.blob} BLOB(s) sit where the "
-            f"store writes only text; the first: {first}"
-        )
-    elif audit.unmarked and not store.allow_unmarked_ciphertext:
-        status, code = "FAIL", 1
-        first = next(t.first_unmarked for t in audit.tallies if t.first_unmarked)
-        reason = (
-            f"{audit.unmarked} non-blank value(s) on surfaces this keyed store has sealed carry no "
-            "at-rest marker, so the store refuses each at read: a damaged or stripped marker, or a "
-            f"planted row (BACKLOG #1169); the first: {first}"
-        )
+        reason = failing
     elif hidden:
         # A server schema is the build's own, so an expected cell the catalog read did not show
         # was hidden from this login (at least a missing grant) rather than never created. Its
@@ -14973,56 +14963,6 @@ def _store_label(settings: StoreSettings) -> str:
 class _StoreUnreachable(RuntimeError):
     """A driver or connection error ``audit-verify``'s open raised outside its read of the chain's
     rows: "could not start", exit 2 (vault BACKLOG #3054, item 10). The error is its cause."""
-
-
-class _CipherWalkStopsOnError:
-    """A ``CipherCellSource`` over a server store for ``cipher-audit``'s walk, where the first of
-    ``errors`` a chunk or surface read raises ends the walk rather than propagating out of it
-    (BACKLOG #1719 item 1). The error is kept in :attr:`error` for the caller to report, and every
-    later read returns at once without a statement, so the audit returns what it had tallied, and
-    a failing value found before the error is still named. The catalog and keyed-surface reads,
-    which run before any value is read, raise as they do on the store."""
-
-    def __init__(self, source: CipherCellSource, errors: tuple[type[Exception], ...]) -> None:
-        self._source = source
-        self._errors = errors
-        self.error: Exception | None = None
-
-    async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
-        return await self._source.cipher_walk_columns(tables)
-
-    async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
-        return await self._source.cipher_walk_keyed_surface()
-
-    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
-        if self.error is not None:
-            return True  # no chunk is read after the error, so the answer is never used
-        try:
-            return await self._source.cipher_walk_surface_sealed(table, column, keyed=keyed)
-        except self._errors as exc:
-            self.error = exc
-            return True
-
-    async def cipher_walk_chunk(
-        self,
-        table: str,
-        column: str,
-        select: Sequence[str],
-        order: Sequence[str],
-        after: Sequence[Any] | None,
-        limit: int,
-        *,
-        sealed_only: bool,
-    ) -> list[tuple[Any, ...]]:
-        if self.error is not None:
-            return []
-        try:
-            return await self._source.cipher_walk_chunk(
-                table, column, select, order, after, limit, sealed_only=sealed_only
-            )
-        except self._errors as exc:
-            self.error = exc
-            return []
 
 
 class _AuditWalkStopped(RuntimeError):

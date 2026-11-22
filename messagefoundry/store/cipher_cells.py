@@ -697,6 +697,17 @@ def keyed_store_mismatch(
     return None if keyed is None else _keyed_mismatch_line(keyed[0], keyed[1], source)
 
 
+def _tally_into(into: CipherAudit | None, tallies: list[CellTally]) -> CipherAudit:
+    """``into`` reset to ``tallies``, or a new audit of them. A caller that passes ``into`` keeps
+    what the walk counted when it raises part way, on a store error or a key-service outage, so a
+    failure found before the stop can still be reported (BACKLOG #1719 item 1)."""
+    if into is None:
+        return CipherAudit(tallies)
+    into.tallies[:] = tallies
+    into.key_mismatch = None
+    return into
+
+
 class _Tallier:
     """Folds readings into a :class:`CipherAudit`, for :func:`audit_cipher_cells` and
     :func:`audit_server_cipher_cells` alike, so the backends' verdicts cannot drift apart."""
@@ -742,17 +753,18 @@ def audit_cipher_cells(
     *,
     cells: Iterable[CipherCell] = SQLITE_CIPHER_CELLS,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    into: CipherAudit | None = None,
 ) -> CipherAudit:
     """Walk every value in ``cells`` to the end and tally it, unlike the restore-verify, which
     stops at its first failure. Counts unmarked values in a keyed store.
 
     The verdict precedence is :func:`keyed_store_mismatch`'s, then a keyless reading's, then a
     failure's, so it does not depend on which value the walk meets first. What stops the walk is
-    :meth:`_Tallier.add`'s to say."""
+    :meth:`_Tallier.add`'s to say. :func:`_tally_into` says what ``into`` is for."""
     wanted = tuple(cells)
     tables = store_tables(conn)
-    audit = CipherAudit(
-        [CellTally(c.table, c.column, present=cell_present(conn, c, tables)) for c in wanted]
+    audit = _tally_into(
+        into, [CellTally(c.table, c.column, present=cell_present(conn, c, tables)) for c in wanted]
     )
     audit.key_mismatch = keyed_store_mismatch(conn, cipher, tables)
     if audit.key_mismatch is not None:
@@ -943,14 +955,17 @@ async def audit_server_cipher_cells(
     cells: Iterable[CipherCell],
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     columns: Mapping[str, frozenset[str]] | None = None,
+    into: CipherAudit | None = None,
 ) -> CipherAudit:
     """:func:`audit_cipher_cells` for a PostgreSQL or SQL Server store, through
-    :func:`read_server_cipher_cells`, with the same precedence and the same stops."""
+    :func:`read_server_cipher_cells`, with the same precedence, the same stops and the same
+    ``into``."""
     wanted = tuple(cells)
     if columns is None:
         columns = await source.cipher_walk_columns(server_walk_tables(wanted))
-    audit = CipherAudit(
-        [CellTally(c.table, c.column, present=server_cell_present(c, columns)) for c in wanted]
+    audit = _tally_into(
+        into,
+        [CellTally(c.table, c.column, present=server_cell_present(c, columns)) for c in wanted],
     )
     audit.key_mismatch = await server_keyed_store_mismatch(source, cipher, columns)
     if audit.key_mismatch is not None:
