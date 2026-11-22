@@ -3,8 +3,9 @@
 """The intake context: what a source knows about who handed it one inbound body (vault BACKLOG #2607).
 
 Before this, the generic :data:`~messagefoundry.transports.base.InboundHandler` took the body and
-nothing else, so a stored message could not name the peer that sent it. A source that knows the peer
-now builds an :class:`IntakeContext` and hands it over with the body through :func:`deliver`; the
+nothing else, so a stored message could not name the peer that sent it. The MLLP and raw-TCP
+listeners and the File source now build an :class:`IntakeContext` and hand it over with the body
+through :func:`deliver`; other sources still pass the body alone. The
 runner's handler, marked with :func:`intake_handler`, takes both, and writes the context into the
 message's metadata in the ingress transaction.
 

@@ -10488,8 +10488,9 @@ class RegistryRunner:
     ) -> str | None:
         """Decode, guard and parse one body, commit it to the ingress stage, and return the wire
         reply. ``intake`` is the source's intake context, written into the message's metadata in
-        the ingress transaction (vault BACKLOG #2607), so the stored message names the peer that
-        sent it; a refusal recorded before ingress does not carry it."""
+        the ingress transaction (vault BACKLOG #2607). The MLLP, raw-TCP and File sources pass one,
+        so a message they received names its peer or path; a source that passes none, and a
+        refusal recorded before ingress, store no context."""
         ack_mode = ic.ack_mode
         # Built once, before any commit, so every ingress path below writes the same cell.
         metadata = intake_metadata_json(intake.fields() if intake is not None else None)
