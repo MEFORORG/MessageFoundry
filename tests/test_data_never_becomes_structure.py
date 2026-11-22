@@ -856,7 +856,11 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
             # poller reads the flag while the stop is still queued (BACKLOG #2967). So the worker
             # blocks until the loop has run the stop, and a bound that expires raises here rather
             # than letting the split go on. On the loop thread nothing could run the stop, so the
-            # wait would stall the shared loop for the whole bound; fail at once instead.
+            # wait would stall the shared loop for the whole bound; fail at once instead. That
+            # failure is raised inside the hand-off, which _poll_once catches and logs, so an inline
+            # split turns this test red through the WARNING assertion below rather than here (vault
+            # BACKLOG #3766 item 22). Wrapping asyncio.to_thread itself would also order the stop;
+            # patching the split keeps the handshake on the batch's own job (item 6).
             assert threading.get_ident() != loop_thread, "the split ran on the loop thread"
             asyncio.run_coroutine_threadsafe(_set_stop(), loop).result(timeout=30)
             holds_at_split.append(holds)

@@ -2099,9 +2099,11 @@ count is above `0` (vault BACKLOG #2613).
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
   `FhirLookup '<name>'`; the `check` line and the posture entry name it with a `fhir_lookup:`
   prefix. The WARNING reads the resolved URL. The posture entry reads an `env()` URL against the
-  values the graph builds with, falling back to its literal `default=`. The `check` line does not
-  load the instance's environment values, so it reads the `default=` only, and misses a URL that
-  only the environment supplies. A lane the engine has not built (for example `auto_start=False`,
+  values the graph builds with, falling back to its literal `default=`. The `check` line reads it
+  against the environment values `build-check` loads, falling back the same way, when a settings
+  file or an environment declaration resolves and those values load. Otherwise it reads the
+  `default=` only, and misses a URL that only the environment supplies; its detail says which
+  reading ran. Both skip a URL whose value does not resolve, such as one whose cast fails. A lane the engine has not built (for example `auto_start=False`,
   or DR-parked) logs no WARNING until it is built or checked, though the posture entry and the
   `check` line still read its URL as above. A `deployed=False` outbound is never built or
   build-checked, so no WARNING fires for it, and both readers skip one whose `url` is `env()`, whose

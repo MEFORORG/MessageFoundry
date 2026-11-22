@@ -55,7 +55,7 @@ from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
-from tests._log_absence import assert_capture_sees
+from tests._log_absence import assert_no_records
 
 DEST = "OB_PARTNER"
 
@@ -1827,8 +1827,10 @@ def test_the_retention_strip_reports_an_unreadable_skip_to_its_caller(
         batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
         assert strip_documents(batch, pruned_at=0.0, on_unreadable=report) == (batch, 0, 0)
         assert calls == ["unreadable", "unreadable"]
-    assert_capture_sees(caplog, "messagefoundry.parsing.binary")
-    assert [r for r in caplog.records if r.name.startswith("messagefoundry.parsing")] == []
+        # Every logger created under the parsing package so far, probed inside the act's capture
+        # at its level (vault BACKLOG #3766 items 27 and 28): the codec module defines none of its
+        # own, so a probe of it alone proved nothing.
+        assert_no_records(caplog, "messagefoundry.parsing", lambda r: True, logging.DEBUG)
 
 
 def test_the_retention_strip_contains_any_fault_in_the_separator_read(

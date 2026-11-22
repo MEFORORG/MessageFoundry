@@ -1246,9 +1246,7 @@ def _label_fits_every_backend(label: str) -> bool:
     measured.
 
     A lone surrogate is deliberately not tested. A label can hold one only when the decoded body
-    does, and the same character then stays in the skeleton, whose ingress write fails on it
-    whatever the label is. Downgrading it would only store an unreferenced attachment first, so
-    ``put_attachment``'s own encode fault propagates instead, writing nothing."""
+    does, and ``decode_body`` refuses such a body before the detach runs."""
     if len(label) > ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
         return False
     return utf16_units(label) <= ATTACHMENT_CONTENT_TYPE_MAX
@@ -1460,8 +1458,8 @@ def _peek_read_fault(ic: InboundConnection, exc: Exception) -> str:
 
 def _unstorable_reply(body: str) -> str | None:
     """Why ``body`` cannot be written as strict UTF-8, or ``None`` when it can (BACKLOG #5616): it
-    holds a lone surrogate, which no charset decode yields. At least the SQLite store and every
-    keyed store's cipher write text that way, and the re-ingress handoff writes the reply as a
+    holds a lone surrogate, which at least a ``utf-7`` decode yields. At least the SQLite store and
+    every keyed store's cipher write text that way, and the re-ingress handoff writes the reply as a
     child's raw. The reason names a position and never the character (``safe_exc``). The trial
     encode is a C-speed pass, skipped for an ASCII body, and nothing is raised from the handler."""
     if body.isascii():
