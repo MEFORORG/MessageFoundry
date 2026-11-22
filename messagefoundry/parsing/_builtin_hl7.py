@@ -607,7 +607,8 @@ def field_values(
     splits every line on the first header's separators, so the walk stops at a later header declaring
     others; when the first occurrence lies past such a header, only its first value is read. A
     malformed header-like line such as ``BHSZ|note`` counts as such a header. So a search can still
-    under-report past a stray escape or a header-like line.
+    under-report: a stray escape limits its field to the first repetition, and a header-like line
+    ends the walk.
 
     ``extract_field`` finds an occurrence by scanning from the top, so calling it with each
     ``occurrence`` would be quadratic in segments. It is called here on a one-segment view instead,

@@ -89,7 +89,8 @@ decrypt**, over a **bounded** candidate set:
    segment and every repetition of the field**, so a value past the first is not under-reported.
    Shapes the parse could misread (colliding separators, a split leaving an escape open, a later
    header declaring others) are not widened; that function's docstring gives the rule. A stray
-   escape or a malformed header-like line also stops the walk, so a search can still under-report.
+   escape limits that one field to its first repetition, and a malformed header-like line ends the
+   walk, so a search can still under-report.
    Because decrypt is CPU work (AES-GCM) and `Peek` parses HL7, the scan runs **off the asyncio event
    loop** via `asyncio.to_thread` (the `db_lookup` / `WebhookTransport` off-loop pattern), so a long
    search never stalls the listener/router/transform tasks ([CLAUDE.md](../../CLAUDE.md) §6).
