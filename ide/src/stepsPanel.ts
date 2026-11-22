@@ -49,7 +49,7 @@ export class StepsPanelProjection {
   private roles = new Map<string, "handler" | "router">();
   private rows = new Map<string, ProjectedRow>();
 
-  update(parse: LensParseResult, handlers: readonly HandlerViewModel[] = []): void {
+  update(parse: LensParseResult, handlers: readonly HandlerViewModel[]): void {
     this.types = new Map(
       parse.handlers.map((h) => [
         h.handler,
@@ -82,10 +82,14 @@ export class StepsPanelProjection {
    * So the row's kind and flags come from THIS panel's projection when it holds the row the message
    * names (same handler and line range, and the same source when the message carries one); otherwise
    * from the message's own fields, as addDestination always sent them. `fallbackKind` is used only when
-   * neither names a kind.
+   * neither names a kind. Returns undefined for a message whose expectSrc is present but not a string:
+   * dropping it there would run the op with no stale check at all, so the caller drops the message.
    */
-  anchorFor(m: AnchorMessage, fallbackKind: RowKind): StructuralAnchor {
-    const expectSrc = typeof m.expectSrc === "string" ? m.expectSrc : undefined;
+  anchorFor(m: AnchorMessage, fallbackKind: RowKind = "send"): StructuralAnchor | undefined {
+    if (m.expectSrc !== undefined && typeof m.expectSrc !== "string") {
+      return undefined;
+    }
+    const expectSrc = m.expectSrc;
     const row = this.rows.get(rowKey(m.handler, m.lineStart, m.lineEnd));
     const flags =
       row !== undefined && (expectSrc === undefined || row.expectSrc === expectSrc)

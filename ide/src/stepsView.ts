@@ -406,10 +406,6 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       // parse is non-null here (shouldFallBackToText returned fallback:false only for a real handler set).
       const handlers = buildHandlerViewModels(parse as LensParseResult, source);
-      // ADR 0104 §2.3 P2 and ADR 0076 Amendment D: stash each element's message type (the field picker's
-      // scope) and role (the Router purity check), and each row's kind and fan-out flags (the structural
-      // insert anchor, BACKLOG #5844), for THIS panel (a projection of THIS parse).
-      panelState.update(parse as LensParseResult, handlers);
       // Live values come from a SECOND `dryrun --trace` that reads the module FROM DISK, but the rows
       // above are projected from the LIVE buffer. While the buffer is dirty (an unsaved structural edit
       // shifted rows relative to disk — or any unsaved change made buffer != disk) the disk trace's line
@@ -431,6 +427,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       );
       // Each projection gets a new id, which the page echoes in every edit it posts (#5943).
       const projection = ++projectionId;
+      // ADR 0104 §2.3 P2 and ADR 0076 Amendment D: stash each element's message type (the field picker's
+      // scope) and role (the Router purity check), and each row's kind and fan-out flags (the structural
+      // insert anchor, BACKLOG #5844), for THIS panel. Updated beside the HTML it describes, after the
+      // last await, so the projection always answers for the page the user sees.
+      panelState.update(parse as LensParseResult, handlers);
       panel.webview.html = pageHtml(
         panel.webview,
         handlers,
@@ -807,7 +808,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         ) {
           // ADR 0104 fan-out "＋ dest": pick a destination, then add_destination via the SAME byte-stable
           // applyStructural path. The anchor's fan-out flags drive the insert position (isReturnRow).
-          const anchor = panelState.anchorFor(m as AnchorMessage, "send");
+          const anchor = panelState.anchorFor(m as AnchorMessage);
+          if (anchor === undefined) {
+            return; // a malformed expectSrc: dropped, never run without the stale check
+          }
           void pickDestination("Add destination", "Destination (fan out)").then((dest) => {
             if (dest !== undefined && dest !== "" && !disposed) {
               void applyStructural(buildAddDestinationRequest(anchor, dest));
@@ -875,12 +879,12 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // before the return, else after) inside buildToolbarInsertRequest, which reuses the byte-stable
           // `lens rewrite` path via applyStructural. The anchor carries the row's fan-out flags, so a
           // derived position puts a mid-body append send before the new step and a footer after it (#5844).
+          const anchor = panelState.anchorFor(m as AnchorMessage);
+          if (anchor === undefined) {
+            return; // a malformed expectSrc: dropped, never run without the stale check
+          }
           void applyStructural(
-            buildToolbarInsertRequest(
-              panelState.anchorFor(m as AnchorMessage, m.kind as RowKind),
-              m.action,
-              m.position as "before" | "after" | undefined,
-            ),
+            buildToolbarInsertRequest(anchor, m.action, m.position as "before" | "after" | undefined),
           );
         } else if (
           m?.command === "insertItem" &&
@@ -906,7 +910,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             return;
           }
           // The anchor carries the row's fan-out flags, for a request that derives its position (#5844).
-          const anchor = panelState.anchorFor(m as AnchorMessage, m.kind as RowKind);
+          const anchor = panelState.anchorFor(m as AnchorMessage);
+          if (anchor === undefined) {
+            return; // a malformed expectSrc: dropped, never run without the stale check
+          }
           const position = m.position as "before" | "after" | undefined;
           if (item.prompts.length === 0) {
             void applyStructural(buildAddMenuRequest(item, anchor, {}, position));
@@ -954,7 +961,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             typeof m.text === "string" ? m.text : "MessageFoundry: pasted the steps.";
           // The page posts no fan-out flags with a paste, so the anchor takes them from this panel's
           // projection: a block pasted at a mid-body append send lands after it, at a footer before (#5844).
-          const anchor = panelState.anchorFor(m as AnchorMessage, m.kind as RowKind);
+          const anchor = panelState.anchorFor(m as AnchorMessage);
+          if (anchor === undefined) {
+            return; // a malformed expectSrc: dropped, never run without the stale check
+          }
           void applyStructural(
             buildPasteRequest(anchor, {
               source: m.block,

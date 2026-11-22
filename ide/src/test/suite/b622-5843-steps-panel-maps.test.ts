@@ -38,8 +38,8 @@ suite("BACKLOG #5843: Steps handler roles and message types are per panel", () =
   test("a second panel's render does not change the first panel's role or message type", () => {
     const a = new StepsPanelProjection();
     const b = new StepsPanelProjection();
-    a.update(routerFile);
-    b.update(handlerFile); // the other panel renders last
+    a.update(routerFile, []);
+    b.update(handlerFile, []); // the other panel renders last
     assert.strictEqual(a.roleOf("route_adt"), "router", "panel A's Router stays a Router");
     assert.strictEqual(a.typeOf("route_adt")?.acceptsTypes, undefined, "panel A has no ORU scope");
     assert.strictEqual(b.roleOf("route_adt"), "handler");
@@ -49,32 +49,41 @@ suite("BACKLOG #5843: Steps handler roles and message types are per panel", () =
   test("an element the projection does not know reads as a Handler, as the provider did", () => {
     const p = new StepsPanelProjection();
     assert.strictEqual(p.roleOf("nope"), "handler");
-    p.update(routerFile);
+    p.update(routerFile, []);
     assert.strictEqual(p.roleOf("nope"), "handler");
   });
 
   test("update replaces the projection wholesale", () => {
     const p = new StepsPanelProjection();
-    p.update(handlerFile);
-    p.update(routerFile);
+    p.update(handlerFile, []);
+    p.update(routerFile, []);
     assert.strictEqual(p.roleOf("route_adt"), "router");
     assert.strictEqual(p.typeOf("route_adt")?.inferredType, undefined);
   });
 
   test("a contract-1 payload with no role reads as a Handler", () => {
     const p = new StepsPanelProjection();
-    p.update({
-      module: "m.py",
-      handlers: [{ handler: "h", module: "m.py", def_line: 1, rows: [] }],
-    });
+    p.update({ module: "m.py", handlers: [{ handler: "h", module: "m.py", def_line: 1, rows: [] }] }, []);
     assert.strictEqual(p.roleOf("h"), "handler");
+  });
+
+  test("render updates the projection beside the HTML it describes, after the last await", () => {
+    const src = fs.readFileSync(STEPS_VIEW_TS, "utf8");
+    assert.ok(
+      /panelState\.update\(parse as LensParseResult, handlers\);\s+panel\.webview\.html = pageHtml\(/.test(src),
+      "an update before an await would let an interleaved render leave the projection describing another page",
+    );
   });
 
   // stepsView.ts imports vscode, so the provider cannot be loaded node-side; pin its wiring by scan.
   test("the provider holds no provider-wide role or message-type map", () => {
+    const banned = /this\.handler(Roles|Types)\b/;
+    // Positive control: the scan matches the lines it was written against (origin/main before #5843).
+    assert.ok(banned.test('itemAllowedInRole(item, this.handlerRoles.get(m.handler) ?? "handler")'));
+    assert.ok(banned.test("const t = this.handlerTypes.get(handler);"));
     const src = fs.readFileSync(STEPS_VIEW_TS, "utf8");
     assert.ok(
-      !/this\.handler(Roles|Types)\b/.test(src),
+      !banned.test(src),
       "stepsView.ts must not read or write a provider-wide handlerRoles/handlerTypes field",
     );
     const resolve = src.slice(src.indexOf("resolveCustomTextEditor("));
