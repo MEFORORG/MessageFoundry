@@ -704,8 +704,8 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     inbound to guard for; a re-route whose origin inbound is not registered is refused with a 409
     before this runs. Only the engine-wide rules apply then, the NUL rule and the engine ceiling,
     and, for a body that parses as HL7 and that the delivery re-attach's gate opens on
-    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), the **ingest** check; ``raw`` is
-    returned as is. Strict validation is an inbound's setting, so it never applies there
+    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), the **ingest** check, and such a
+    body the parser faults on is refused at **parse**; ``raw`` is returned as is. Strict validation is an inbound's setting, so it never applies there
     either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
     rule is ``docs/SECURITY.md`` control 5), so the ceiling is a backstop.
 
@@ -720,13 +720,21 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         _raise_if_oversize(len(raw))
         # The delivery re-attach judges a payload its gate opens on, so one that parses as HL7
         # meets the listeners' document-marker refusal here, rather than being committed and then
-        # dead-lettered (BACKLOG #5972). A body that does not parse is left to the outbound.
+        # dead-lettered (BACKLOG #5972). A body the parser refuses is left to the outbound, but a
+        # fault in the parser refuses the body, as the re-attach re-raises one rather than admit
+        # what it could not read.
         if not may_hold_doc_ref(raw):
             return raw
+        # Raised once its handler has ended, so the parser's error is on no chain.
+        faulted: str | None = None
         try:
             peek = Peek.parse(raw, max_bytes=DEFAULT_MAX_MESSAGE_BYTES)
-        except HL7PeekError:
-            return raw
+        except HL7PeekError as exc:
+            if not exc.parser_fault:
+                return raw
+            faulted = f"parse error: {safe_exc(exc)}"
+        if faulted is not None:
+            raise IngressGuardError(faulted, phase="parse")
         _raise_if_marker_refused(peek, raw)
         return raw
     # The reason a caught error refused the body, raised once its handler has ended.

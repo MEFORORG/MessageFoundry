@@ -397,6 +397,34 @@ def test_guard_applies_the_hl7_ceiling_per_connection() -> None:
     assert exc.value.phase == "size"
 
 
+def test_guard_direct_path_refuses_a_body_the_parser_faults_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5972: on the edit-resend direct path (no inbound) a body the re-attach's gate opens
+    # on, which the parser faults on, is refused rather than admitted unchecked: the re-attach
+    # re-raises such a fault too. A body the parser refuses as not HL7 is still left to the outbound.
+    from messagefoundry.parsing import _builtin_hl7
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+
+    not_hl7 = "not hl7 " + DOC_REF_MARKER
+    assert admit_resubmitted_body(not_hl7, None) == not_hl7
+    body = EDITED + f"NTE|1||{DOC_REF_MARKER}x\r"
+
+    def _fault(text: str) -> None:
+        raise RuntimeError("stand-in parser fault")
+
+    monkeypatch.setattr(_builtin_hl7, "parse", _fault)
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(body, None)
+    assert exc.value.phase == "parse"
+    assert (
+        exc.value.reason == "parse error: HL7PeekError: could not parse HL7 message (RuntimeError)"
+    )
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    # A body the gate does not open on never reaches the parser.
+    assert admit_resubmitted_body(EDITED, None) == EDITED
+
+
 def test_guard_sniffs_the_declared_type() -> None:
     admit_resubmitted_body('{"a": 1}', _ic(ContentType.JSON))
     with pytest.raises(IngressGuardError) as exc:
