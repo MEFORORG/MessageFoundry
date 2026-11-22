@@ -2118,6 +2118,9 @@ _STDIN_HEREDOC = re.compile(
     re.S,
 )
 
+#: Any such heredoc, whatever its invocation, so :func:`_step_flags` can count the copies it read.
+_ANY_HEREDOC = re.compile(r"<<'(?P<tag>[A-Z]+)'\n(?P<body>.*?)\n(?P=tag)\n", re.S)
+
 
 @functools.cache
 def _step_flags(script: str) -> tuple[str, ...]:
@@ -2131,16 +2134,28 @@ def _step_flags(script: str) -> tuple[str, ...]:
 
     Both sides are read through :func:`_executed_shell`, so a comment quoting an invocation is not
     taken for one, and a script extracted with or without its comment lines matches either way.
+    Every heredoc carrying the script must have a readable invocation, so a copy whose header this
+    cannot parse fails here rather than dropping out of the comparison.
     """
     want = _executed_shell(script)
-    found = {
-        tuple(m.group("flags").split())
+    shells = [
+        _executed_shell(str(step.get("run") or "")) + "\n"
         for job in _jobs().values()
         for step in (job.get("steps") or [])
         if isinstance(step, dict)
-        for m in _STDIN_HEREDOC.finditer(_executed_shell(str(step.get("run") or "")) + "\n")
+    ]
+    headers = [
+        tuple(m.group("flags").split())
+        for shell in shells
+        for m in _STDIN_HEREDOC.finditer(shell)
         if m.group("body") == want
-    }
+    ]
+    copies = sum(m.group("body") == want for shell in shells for m in _ANY_HEREDOC.finditer(shell))
+    assert len(headers) == copies, (
+        f"release.yml carries the script in {copies} heredoc(s) but {len(headers)} invocation(s) "
+        f"could be read; an unreadable one would run under flags nothing here checks"
+    )
+    found = set(headers)
     assert len(found) == 1, (
         f"expected the script to be fed to exactly one interpreter flag list in release.yml, found "
         f"{sorted(found)}: either no step feeds it on stdin any more, or two copies are run "
@@ -3242,6 +3257,7 @@ def _run_probe(
     """
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
+    env.pop("PYTHONSAFEPATH", None)  # it keeps the cwd off sys.path, so the bare arm would fail
     if pythonpath is not None:
         env["PYTHONPATH"] = str(pythonpath)
     return subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
@@ -4507,8 +4523,12 @@ def test_the_draft_refusal_is_one_text_and_the_doc_carries_each_clause() -> None
     assert not missing, "\n".join(missing)
 
 
-#: A context a step-level `if:` can read a variable through, directly or by way of an `env:` entry.
-_STEP_GATE = re.compile(r"\b(?:vars|needs|env|steps)\b", flags=re.IGNORECASE)
+#: The job-level pattern plus the contexts only a step-level `if:` adds: `env` and `steps`, either of
+#: which can carry a variable in from an `env:` entry, and `inputs`, which is empty on a tag push.
+#: Wide on purpose: a `steps.` condition that reads no variable is flagged too.
+_STEP_GATE = re.compile(
+    rf"{_VARIABLE_GATE.pattern}|\b(?:env|steps|inputs)\b", flags=_VARIABLE_GATE.flags
+)
 
 
 @pytest.mark.parametrize("publisher", [_PUBLISH_JOB, _CONSOLE_PUBLISH_JOB])
@@ -4519,18 +4539,16 @@ def test_no_step_of_a_draft_publisher_is_gated_on_a_variable(publisher: str) -> 
     positive control.
 
     Mutation: put `if: vars.PUBLISH_HARNESS == 'true'` on a draft publisher's step. Red here."""
-    jobs = copy.deepcopy(_jobs())
-    steps = [s for s in jobs[publisher]["steps"] if isinstance(s, dict)]
+    job = copy.deepcopy(_jobs()[publisher])
+    steps = [s for s in job["steps"] if isinstance(s, dict)]
     assert steps, f"{publisher} has no steps"
 
     def gated() -> list[object]:
-        # Wider than the job-level pattern: a step's `if:` can also read `env` and `steps`, and
-        # either can carry a variable in from the job's or an earlier step's `env:`.
         return [s.get("name") for s in steps if _STEP_GATE.search(str(s.get("if") or ""))]
 
     assert not gated(), f"{publisher} step(s) {gated()} are gated on a variable; unset, they skip"
-    publish = _release_step(jobs[publisher], "--draft=false")
-    for planted in ("vars.PUBLISH_HARNESS == 'true'", "env.GATE == 'true'"):
+    publish = _release_step(job, "--draft=false")
+    for planted in ("vars.PUBLISH_HARNESS == 'true'", "env.GATE == 'true'", "inputs.go"):
         publish["if"] = planted
         assert gated() == [publish.get("name")], planted
 

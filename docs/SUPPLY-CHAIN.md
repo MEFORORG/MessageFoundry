@@ -149,17 +149,18 @@ Facts the labels leave out:
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
 - **One approval per engine tag.** The toolkit, engine and harness uploads are steps of one
   `publish-pypi` job, so one approval of the `pypi` environment covers all three. The harness
-  upload runs only when the `PUBLISH_HARNESS` variable reads `true`; *The draft* below says what
-  a copy in the `pypi` environment does.
+  upload runs only when the `PUBLISH_HARNESS` variable reads `true` twice: where its build job
+  reads it, outside the `pypi` environment, and where the upload reads it again, inside that
+  environment.
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
-  too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
-  that is the toolkit and the engine only. A separate job publishes it last, so no
+  too, and until every upload `publish-pypi` runs has succeeded. When the harness upload does not
+  run, that is the toolkit and the engine only. A separate job publishes it last, so no
   job adds an asset to a published release. The console's release is a draft too, at least until
-  its `publish-pypi-webconsole` job has succeeded. With `PUBLISH_WEBCONSOLE` set, that job uploads
-  the wheel first. Unset, the console upload is skipped and the console's release is still
-  published once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset.
-  With either variable set, its draft publisher reads it again when it runs and refuses to publish
-  the release unless that run's upload step succeeded. On an engine tag the toolkit and engine
+  its `publish-pypi-webconsole` job has succeeded. The console upload runs under the same two
+  reads of `PUBLISH_WEBCONSOLE`. When it does not run, the console's release is still published
+  once the `pypi` approval is given, as the engine's is without the harness upload. Each draft
+  publisher reads its variable again when it runs, outside the `pypi` environment, and while that
+  read is `true` it refuses to publish the release unless that run's upload step succeeded. On an engine tag the toolkit and engine
   are on PyPI by then. The refusal's text names two causes, a remedy with the upload and one
   without, but not which cause fired, and points here for the routes left past GitHub's re-run
   window. At least these two can fire, alone or together:
@@ -227,9 +228,9 @@ has no SBOM of its own.
 Apart from that, every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
 job in `release.yml` sets `attestations: true`. So the web console wheel (`messagefoundry-webconsole`)
 and the harness wheel get a PyPI-side attestation whenever their PyPI publish runs. Each of those
-publishes runs only when its variable, `PUBLISH_WEBCONSOLE` or `PUBLISH_HARNESS`, reads `true`;
-*The draft* above says what a copy in the `pypi` environment does. That is all they get: their
-release jobs have no Sigstore, SBOM or SLSA step.
+publishes runs only when its variable, `PUBLISH_WEBCONSOLE` or `PUBLISH_HARNESS`, reads `true`
+both outside and inside the `pypi` environment, as *One approval per engine tag* and *The draft*
+above say. That is all they get: their release jobs have no Sigstore, SBOM or SLSA step.
 
 Additional CycloneDX SBOMs — the **VS Code extension** (npm) and the **container image** (Debian base +
 system libs + installed Python) — are produced by the daily/​on-demand `security.yml` workflow and
