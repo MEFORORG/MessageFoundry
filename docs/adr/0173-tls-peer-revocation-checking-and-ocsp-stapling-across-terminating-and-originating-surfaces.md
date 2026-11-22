@@ -1262,8 +1262,8 @@ ruling:
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
 - **Only two runs have results, and the run on the SQL Server test box is still owed.** The
   test needs a SQL Server whose certificate can be revoked. A control connection to a
-  certificate that is not revoked shows that a refusal comes from the revocation. The amendment of
-  2026-11-11 below states what the runs measured and their limits. *(Corrected 2026-11-17, vault
+  certificate that is not revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below states what
+  the runs measured, their limits, and which run is still owed. *(Corrected 2026-11-17, vault
   BACKLOG #3009: this bullet's heading read "Driver 18 was tested on one build on Windows Server
   2022, and other drivers were not tested", which restated the amendment's limits.)*
   *(Until 2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still
@@ -1283,7 +1283,8 @@ ruling:
   amendment does not change the grade. A Manager decided under the owner's delegation of
   2026-11-11 that the five rows keep the grade R6 gives them, that R6's named gap stands as
   named, and that #2194's guard and driver-control options are not reopened now: decision
-  d20261112T022118464-c27c39.)*
+  d20261112T022118464-c27c39, logged at 02:21 UTC on 2026-11-12, the evening of 2026-11-11 in
+  Central time.)*
 
 *(Until 2026-10-11 this paragraph read: "**What is open on the five ODBC hops.** BACKLOG #2194 names
 three outcomes for a hop: a guard, a documented driver control, or an accepted gap. This note
@@ -1322,9 +1323,11 @@ ODBC revocation runbook that reached a result. Their contents beyond this summar
 here. It changes no code. For the grade, see the limit headed *What a result would mean for the
 grade*, under the ruling above, and its note of 2026-11-11.
 
-- **Where it ran.** Two runs with results. The first run's legs ran from 02:22 to 02:25 UTC on
-  2026-10-17, and the second's from 05:18 to 05:19 UTC the same day. The first run's record says it ran on a disposable virtual machine built for the
-  test, not on the SQL Server test box, and that the runbook puts the next run there. The second
+- **Where it ran.** Two runs with results. The first run's legs ran from 02:22 to 02:25 UTC and
+  the second's from 05:18 to 05:19 UTC, both on 2026-10-17. The records are dated in Central
+  time, where the first run fell on the evening of 2026-10-16. The first run's record says it ran
+  on a disposable virtual machine built for the test, not on the SQL Server test box, and that the
+  runbook puts the next run there. The second
   run's record says it ran inside a virtual machine, after a revert to checkpoint
   `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
   `post-3009-acl-2026-10-17`. It writes the machine's name as a placeholder, so it cannot show
@@ -1334,7 +1337,8 @@ grade*, under the ruling above, and its note of 2026-11-11.
   took place on the SQL Server test box", which leaned on a name the second record had replaced
   with a placeholder.)* The run there is still owed, and BACKLOG #3009's step 2 stays open for it:
   a Manager decided so under the owner's delegation of 2026-11-11, decision
-  d20261112T022119877-2ccc8b.
+  d20261112T022119877-2ccc8b, logged at 02:21 UTC on 2026-11-12, the evening of 2026-11-11 in
+  Central time.
 - **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7,
   build 1, revision 1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter,
   build 20348, update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. Both records list
@@ -1370,8 +1374,9 @@ grade*, under the ruling above, and its note of 2026-11-11.
   the pin legs mean for the pin is the amendment of 2026-10-17 below. For the strict legs that
   reading is the second record's own, because the runbook's table has no row for them.
 - **The limits.** At least these.
-  - Only the versions above. Linux, macOS, other Driver 18 builds, and other drivers, which the
-    generic dialect and the `odbc_driver` setting can name, were not measured.
+  - Only the driver, Windows and SQL Server versions above. Linux, macOS, other Driver 18 builds,
+    and other drivers, which the generic dialect and the `odbc_driver` setting can name, were not
+    measured.
   - Only a CRL over HTTP. No OCSP responder was offered, so this does not show that the driver
     never checks revocation.
   - Only a same-machine connection: the client ran on the machine SQL Server ran on, so no
@@ -1381,11 +1386,10 @@ grade*, under the ruling above, and its note of 2026-11-11.
     pool, so the result says nothing about how the engine builds or sends its own strings.
   - Only a throwaway root, with no intermediate CA.
 
-*(Corrected 2026-11-21, vault BACKLOG #3009: this amendment gave the runs' dates in Central time
-beside their UTC times, and its first limit repeated the versions. The note under the fourth limit
-above and this amendment's first bullet each gave a decision's logging time in UTC and in Central
-time, and the third limit above repeated which run is still owed. The UTC run times are kept; the
-rest is removed.)*
+*(Corrected 2026-11-21, vault BACKLOG #3009: the first bullet opened "Two runs with results,
+dated 2026-10-16 and 2026-10-17 in Central time. In UTC, the first run's legs ran", and the first
+limit opened "Only that driver build, only Windows Server 2022, and only SQL Server 2022 RTM.",
+which repeated the versions bullet.)*
 
 *(End of the amendment of 2026-11-11. The next paragraph continues the 2026-10-04 note.)*
 
