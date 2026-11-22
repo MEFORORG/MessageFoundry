@@ -12,7 +12,7 @@ Its consumers want opposite safe directions. The doc-drift probes need a comment
 count (BACKLOG #2056: ``app.js`` names ``localStorage`` in comments, so a raw scan stayed True after
 the real storage calls were deleted). The crypto gate needs a misread NOT to hide code, so it unions
 this view with its per-line view rather than tuning the lexer toward keeping text, and reads the
-verdict :func:`classify_js` gives to judge each token only this view finds.
+verdict :func:`strict_verdicts` gives to judge each token only this view finds.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def blank_js_comments(source: str) -> str:
     closing quote on its line ends at the newline, so one misread cannot run to the end of the file.
     Newlines are kept, so line numbers hold.
     """
-    return classify_js(source)[0]
+    return _scan(source, with_verdicts=False, holes=False)[0]
 
 
 def classify_js(source: str) -> tuple[str, str]:
@@ -64,27 +64,107 @@ def classify_js(source: str) -> tuple[str, str]:
     character of ``source``: :data:`CODE`, :data:`LITERAL` (inside a string, template or regex
     literal, its delimiters included, on the line it opens on), :data:`CONTINUED` (the same, on a
     later line) or :data:`COMMENT`. A newline is kept as itself in both, so the two split into the
-    same lines. The crypto inventory gate reads the verdict at a match's first character
-    (BACKLOG #5578)."""
+    same lines. The crypto inventory gate reads the verdict at a match's first character, as
+    :func:`strict_verdicts` combines it (BACKLOG #5578)."""
+    return _scan(source, with_verdicts=True, holes=False)
+
+
+def template_verdicts(source: str) -> str:
+    """A second verdict per character of ``source``, from a scan that differs from
+    :func:`classify_js`'s in two ways (BACKLOG #5578). A template literal's ``${}`` holes are
+    scanned as code up to the ``}`` that balances their ``{``, nested templates included. A regex
+    read with no closing ``/`` on its line that would swallow an unescaped backtick is read as a
+    division instead, so the backtick opens its template (a TypeScript ``x! / y``)."""
+    return _scan(source, with_verdicts=True, holes=True)[1]
+
+
+def strict_verdicts(first: str, second: str) -> str:
+    """One verdict per character from two verdict strings of one source (:func:`classify_js`'s and
+    :func:`template_verdicts`'s): :data:`CODE` only where both say so, and :data:`CODE` or
+    :data:`LITERAL` only where both say one of those. So the second scan can only withhold a
+    verdict the first gives, never give one it withholds."""
+    if first == second:
+        return first
+    both = (CODE, LITERAL)
+    return "".join(
+        a if a == b else LITERAL if a in both and b in both else CONTINUED
+        for a, b in zip(first, second, strict=True)
+    )
+
+
+def _raw_backtick(source: str, start: int, end: int) -> bool:
+    """Whether ``source[start:end]`` holds a backtick no backslash escapes."""
+    i, end = start, min(end, len(source))
+    while i < end:
+        if source[i] == "\\":
+            i += 2
+            continue
+        if source[i] == "`":
+            return True
+        i += 1
+    return False
+
+
+def _scan(source: str, *, with_verdicts: bool, holes: bool) -> tuple[str, str]:
+    """The scanner behind every entry point. ``with_verdicts=False`` skips building the verdict
+    string, which :func:`blank_js_comments` would only discard; ``holes`` turns on the two
+    differences :func:`template_verdicts` names."""
     out: list[str] = []
     verdicts: list[str] = []
     i, n = 0, len(source)
     prev = ""
+    #: One entry per open ``${}`` hole, innermost last: ``[brace depth inside it, index of the
+    #: template's opening backtick]``. Only ``holes`` fills it.
+    open_holes: list[list[int]] = []
 
-    def emit(text: str, kind: str) -> None:
+    def emit(text: str, kind: str, first: str | None = None) -> None:
+        head = first or kind
         if "\n" not in text:  # almost every segment: one run of one verdict
             out.append(" " * len(text) if kind == COMMENT else text)
-            verdicts.append(kind * len(text))
+            if with_verdicts:
+                verdicts.append(head * len(text))
             return
         lines = text.split("\n")
         out.append("\n".join(" " * len(p) for p in lines) if kind == COMMENT else text)
-        later = CONTINUED if kind == LITERAL else kind
-        verdicts.append("\n".join([kind * len(lines[0]), *(later * len(p) for p in lines[1:])]))
+        if with_verdicts:
+            later = CONTINUED if kind == LITERAL else kind
+            verdicts.append("\n".join([head * len(lines[0]), *(later * len(p) for p in lines[1:])]))
+
+    def template_text(start: int) -> tuple[int, bool]:
+        """Template text from ``start``: ``(end, opens_hole)``, ``end`` just past the closing
+        backtick or the ``${`` that opens a hole, or the end of the source."""
+        j = start
+        while j < n:
+            if source[j] == "\\":
+                j += 2
+            elif source[j] == "`":
+                return j + 1, False
+            elif source[j] == "$" and source[j + 1 : j + 2] == "{":
+                return j + 2, True
+            else:
+                j += 1
+        return n, False
 
     while i < n:
         char, nxt = source[i], source[i + 1 : i + 2]
         end = i + 1
         kind = CODE
+        closes_hole = holes and char == "}" and bool(open_holes) and open_holes[-1][0] == 0
+        if holes and (char == "`" or closes_hole):
+            # A template literal, or its text resumed after a ``${}`` hole closes.
+            opened = open_holes.pop()[1] if closes_hole else i
+            end, opens_hole = template_text(i + 1)
+            later_line = source.find("\n", opened, i) != -1
+            emit(source[i:end], LITERAL, CONTINUED if later_line else None)
+            if opens_hole:
+                open_holes.append([0, opened])
+                prev = "{"
+            else:
+                prev = "`"
+            i = end
+            continue
+        if open_holes and char in "{}":
+            open_holes[-1][0] += 1 if char == "{" else -1
         if char in "'\"`":
             kind = LITERAL
             while end < n and source[end] != char and (char == "`" or source[end] != "\n"):
@@ -118,6 +198,10 @@ def classify_js(source: str) -> tuple[str, str]:
                 elif source[end] == "]":
                     in_class = False
                 end += 1
+            if holes and source[end : end + 1] != "/" and _raw_backtick(source, i + 1, end):
+                # No closing ``/`` on the line, so the regex was a misread division, and the
+                # backtick it would swallow may open a template: read the ``/`` as division.
+                kind, end = CODE, i
             end += 1
         emit(source[i:end], kind)
         if not char.isspace():
