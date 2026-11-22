@@ -29,21 +29,26 @@ from messagefoundry.api import create_app
 from messagefoundry.api.security import (
     _GateRefusal,
     _mfa_refusal,
+    _record_route_refusal,
     _recorded_decision,
+    refuse_unless_step_up_window_live,
     require_paced,
     require_phi_read,
     require_reauth_only,
     require_reauth_only_action,
     require_step_up,
     require_step_up_action,
+    spend_step_up_action,
 )
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
+    STEP_UP_ACTION_CONFIG_RELOAD,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
 )
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
@@ -67,21 +72,20 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine) -> AuthService:
+async def _service(engine: Engine, **overrides: Any) -> AuthService:
     """One administrator; one paced write and one PHI read per window; the new-address check on.
 
     ``require_mfa`` is off so the base gate's factor refusal does not answer first, and the minimum
-    write interval is off so the second write is refused by the count alone."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            require_mfa=False,
-            admin_new_ip_step_up=True,
-            admin_write_min_interval_seconds=0,
-            admin_write_rate_limit_per_actor=1,
-            phi_read_rate_limit_per_actor=1,
-        ),
-    )
+    write interval is off so the second write is refused by the count alone. ``overrides`` replace
+    any of those settings."""
+    settings: dict[str, Any] = {
+        "require_mfa": False,
+        "admin_new_ip_step_up": True,
+        "admin_write_min_interval_seconds": 0,
+        "admin_write_rate_limit_per_actor": 1,
+        "phi_read_rate_limit_per_actor": 1,
+    }
+    service = AuthService(engine.store, AuthSettings(**(settings | overrides)))
     await service.initialize()
     user_id = await create_local_user_chosen(
         service,
@@ -419,3 +423,131 @@ def test_a_gate_refusal_survives_copy_and_pickle_with_its_reason() -> None:
             "throttled",
             {"Retry-After": "3"},
         )
+
+
+# --- A step-up refusal a route body makes after its gate admitted the request (BACKLOG #1197) ---
+#
+# A ``proof_in_route`` gate writes its grant row, then the route body spends the proof
+# (``spend_step_up_action``) or, when only the session window is owed, checks it
+# (``refuse_unless_step_up_window_live``). Each refusal there used to leave the grant row alone.
+
+_ROUTE_ACTION = STEP_UP_ACTION_CONFIG_RELOAD
+
+
+def _route_body_app(
+    engine: Engine, service: AuthService, check: Callable[[Request], Any], ran: list[str]
+) -> FastAPI:
+    """A POST probe gated as purge and reload are, whose body runs ``check`` and then records that
+    it got past it."""
+    app = create_app(engine, auth=service)
+    gate = Depends(
+        require_step_up_action(_ROUTE_ACTION, Permission.USERS_MANAGE, proof_in_route=True)
+    )
+
+    async def probe(request: Request, _: Identity = gate) -> dict[str, str]:
+        await check(request)
+        ran.append("past the check")
+        return {"ok": "1"}
+
+    app.add_api_route(_PROBE, probe, methods=["POST"])
+    return app
+
+
+async def _spend(request: Request) -> None:
+    await spend_step_up_action(request, _ROUTE_ACTION)
+
+
+async def _reauth(app: FastAPI, token: str, purpose: str | None) -> str:
+    body = {"password": PW} if purpose is None else {"password": PW, "purpose": purpose}
+    async with _client(app, _HOME) as c:
+        r = await c.post("/me/reauth", json=body, headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200, r.text
+    return str(r.json()["token"])
+
+
+_GRANT_ROW = (_GRANTED, {"permission": Permission.USERS_MANAGE.value, "path": _PROBE}, _HOME)
+_REFUSAL_ROW = (
+    _REFUSED,
+    {"permission": Permission.USERS_MANAGE.value, "path": _PROBE, "reason": "step_up"},
+    _HOME,
+)
+
+
+async def test_a_refused_spend_in_the_route_body_leaves_a_refusal_row(engine: Engine) -> None:
+    """RED when: ``spend_step_up_action`` refuses without recording it, so the request leaves only
+    its gate's grant row. The control is the same request with the bound proof minted: the spend
+    passes and adds no refusal row."""
+    service = await _service(engine, admin_write_rate_limit_per_actor=10)
+    ran: list[str] = []
+    app = _route_body_app(engine, service, _spend, ran)
+    token = await _login(app)
+
+    refused = await _call(app, "POST", token, _HOME)
+    assert refused.status_code == 403, refused.text
+    assert refused.headers.get("X-Step-Up-Action") == _ROUTE_ACTION
+    assert ran == []
+    assert await _decisions(engine) == [_GRANT_ROW, _REFUSAL_ROW]
+
+    token = await _reauth(app, token, _ROUTE_ACTION)
+    admitted = await _call(app, "POST", token, _HOME)
+    assert admitted.status_code == 200, admitted.text
+    assert ran == ["past the check"]
+    assert await _decisions(engine) == [_GRANT_ROW, _REFUSAL_ROW, _GRANT_ROW]
+
+
+async def test_a_lapsed_window_refused_in_the_route_body_leaves_a_refusal_row(
+    engine: Engine,
+) -> None:
+    """RED when: ``refuse_unless_step_up_window_live`` refuses without recording it. The control is
+    the same request once a plain re-proof has made the window live again."""
+    service = await _service(engine, admin_write_rate_limit_per_actor=10)
+    ran: list[str] = []
+    app = _route_body_app(engine, service, refuse_unless_step_up_window_live, ran)
+    token = await _login(app)
+    await engine.store.mark_session_reauthed(hash_token(token), now=0.0)  # lapse the window
+
+    refused = await _call(app, "POST", token, _HOME)
+    assert refused.status_code == 403, refused.text
+    assert "X-Step-Up-Action" not in refused.headers
+    assert ran == []
+    assert await _decisions(engine) == [_GRANT_ROW, _REFUSAL_ROW]
+
+    token = await _reauth(app, token, None)
+    admitted = await _call(app, "POST", token, _HOME)
+    assert admitted.status_code == 200, admitted.text
+    assert ran == ["past the check"]
+    assert await _decisions(engine) == [_GRANT_ROW, _REFUSAL_ROW, _GRANT_ROW]
+
+
+@pytest.mark.parametrize("check", [_spend, refuse_unless_step_up_window_live])
+async def test_a_failed_refusal_row_write_still_refuses(
+    engine: Engine, check: Callable[[Request], Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal never fails open: when the refusal row cannot be written, the request is still
+    refused and the route body never gets past the check, as in the gate's own decision block."""
+    service = await _service(engine, admin_write_rate_limit_per_actor=10)
+
+    async def broken(*_: object, **__: object) -> None:
+        raise RuntimeError("audit store down")
+
+    monkeypatch.setattr(service, "audit_gate_refused", broken)
+    ran: list[str] = []
+    app = _route_body_app(engine, service, check, ran)
+    token = await _login(app)
+    await engine.store.mark_session_reauthed(hash_token(token), now=0.0)  # lapse the window
+    transport = httpx.ASGITransport(app=app, client=(_HOME, 12345), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.post(_PROBE, headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 500, r.text
+    assert ran == []
+
+
+async def test_a_route_body_refusal_with_no_admitting_gate_logs_its_missing_row(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A route that refuses with no ``proof_in_route`` gate in front has no permission to name, so
+    it writes no row, and says so in the log rather than dropping the row silently."""
+    request = _post_request()
+    with caplog.at_level("WARNING", logger="messagefoundry.api.security"):
+        await _record_route_refusal(request, _GateRefusal(403, "refused", reason="step_up"))
+    assert "no admitting proof_in_route gate" in caplog.text

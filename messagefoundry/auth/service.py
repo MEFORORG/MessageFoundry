@@ -22116,8 +22116,9 @@ class AuthService:
 
         The caller holds ``permission``, so this is not :meth:`audit_permission_denied`: that row
         says the permission was missing, and the denial-burst detector counts it.
-        ``_recorded_decision`` in ``api/security.py`` decides when this row is written. ``client``
-        is required, as for :meth:`audit_self_target_refused`."""
+        ``_record_gate_refusal`` in ``api/security.py`` decides when this row is written, for a
+        gate's own refusals and for the step-up refusals a ``proof_in_route`` route body makes.
+        ``client`` is required, as for :meth:`audit_self_target_refused`."""
         await self._audit(
             "auth.gate_refused",
             actor=identity.username,
