@@ -592,29 +592,41 @@ def field_values(
     Each value comes from :func:`extract_field`, so its numbering, descent and unescaping apply. A
     whole-field read (``comp is None``) and a header's delimiter field yield once per occurrence: the
     first is already the structural text of every repetition, and the second is never split. A
-    repetition the path runs past, or whose escape cannot be read, yields nothing, as ``Peek.field``
-    reads such a value as absent, and the walk goes on.
+    repetition the path runs past, or that ``extract_field`` raises on, yields nothing, as
+    ``Peek.field`` reads such a value as absent, and the walk goes on.
+
+    Two shapes are not widened, because the parse would misread them. A repetition character shared
+    with the component or sub-component separator does not mark a repetition, so only the first is
+    read. The parse splits every line on the first header's separators, so once an occurrence has
+    been read the walk stops at a later header declaring other separators.
 
     ``extract_field`` finds an occurrence by scanning from the top, so calling it with each
     ``occurrence`` would be quadratic in segments. It is called here on a one-segment view of each
-    occurrence instead, and the walk is linear in the message. A blank line is not an occurrence and
-    raises nothing here; a ``Peek``-parsed message holds none.
+    occurrence instead, and the walk is linear in the message. The view holds its own field list, so
+    the component split it caches is freed with it rather than kept for every occurrence. A blank
+    line is not an occurrence and raises nothing here; a ``Peek``-parsed message holds none.
     """
+    seps = msg["seps"]
+    shared_rep = seps[2] in (seps[1], seps[3])
+    seen = False
     for index, seg in enumerate(msg["segments"]):
+        if seen and seg["id"] in HEADER_IDS and _extract_separators(header_line_head(seg)) != seps:
+            return
         if seg["id"] != seg_id or _is_fieldless(msg, index):
             continue
+        seen = True
         _ensure_split(msg, index)
         fields = seg["fields"]
         if fld >= len(fields):
             continue
-        whole = comp is None or is_delimiter_field(seg_id, fld)
-        count = 1 if whole else len(_componentize(msg, index, fld, msg["seps"])["reps"])
         view: ParsedMessage = {
             "_lazy": {},
-            "segments": [seg],
+            "segments": [{"id": seg_id, "fields": list(fields)}],
             "raw": None,
-            "seps": msg["seps"],
+            "seps": seps,
         }
+        whole = comp is None or shared_rep or is_delimiter_field(seg_id, fld)
+        count = 1 if whole else len(_componentize(view, 0, fld, seps)["reps"])
         for repetition in range(1, count + 1):
             try:
                 value = extract_field(view, seg_id, fld, comp, sub, repetition=repetition)

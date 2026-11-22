@@ -171,6 +171,54 @@ def test_the_first_value_agrees_with_peek_field(segments: tuple[str, ...], path:
     assert _values(raw, path)[0] == read
 
 
+# --- Where widening must not invent a match -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("header", "field"),
+    [
+        ("MSH|~|S|F|R|RF|20260101", "AAA~BBB"),  # the default repetition is the declared component
+        ("MSH|~~\\&|S|F|R|RF|20260101", "AAA~BBB"),  # declared the same
+        ("MSH|^&\\&|S|F|R|RF|20260101", "AAA&BBB"),  # repetition and sub-component the same
+    ],
+)
+def test_a_repetition_character_shared_with_another_separator_is_not_walked(
+    header: str, field: str
+) -> None:
+    """Such a character does not mark a repetition, so ``BBB`` is not a second one's component 1."""
+    raw = f"{header}\rPID|1||{field}\r"
+    assert _values(raw, "PID-3.1") == [Peek.parse(raw).field("PID-3.1")]
+    assert _matches(raw, "PID-3.1", "BBB") is False
+
+
+def test_the_walk_stops_at_a_later_header_with_other_separators() -> None:
+    """The parse splits every line on the first header's separators, so text past a header that
+    declares others would be mis-split into values that header's message does not hold."""
+    raw = _body("PID|1||Y", "MSH$^~\\&$OTHER$F$R", "PID|1||Z")
+    assert _values(raw, "PID-3") == ["Y"]
+    assert _matches(raw, "MSH-3", "F") is False
+    assert _values(raw, "MSH-3") == ["S"]
+
+
+def test_a_later_header_with_the_same_separators_does_not_stop_the_walk() -> None:
+    raw = _body("PID|1||Y", MSH, "PID|1||Z")
+    assert _values(raw, "PID-3") == ["Y", "Z"]
+
+
+def test_a_first_occurrence_past_a_differing_header_is_still_read() -> None:
+    """``Peek.field`` reads it, so stopping before it would lose a match ``origin/main`` makes."""
+    raw = _body("MSH$^~\\&$OTHER", "PID|1||Y")
+    assert Peek.parse(raw).field("PID-3") == "Y"
+    assert _matches(raw, "PID-3", "Y") is True
+
+
+def test_the_walk_leaves_no_component_cache_on_the_parsed_message() -> None:
+    raw = _body("OBX|1|ST|A||x~y", "OBX|2|ST|B||p~q")
+    message = Peek.parse(raw).message
+    assert list(_builtin_hl7.field_values(message, "OBX", 5, 1, None)) == ["x", "y", "p", "q"]
+    assert all(isinstance(s["fields"][5], str) for s in message["segments"][1:])
+
+
 # --- Linear cost at the segment cap -------------------------------------------------------------
 
 

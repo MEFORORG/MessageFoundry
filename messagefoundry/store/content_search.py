@@ -213,8 +213,7 @@ def row_matches(spec: SearchSpec, *, raw: str | None, summary: str | None) -> bo
 
     Pure (no I/O, no cipher). Parsing a non-HL7 / unparseable ``raw`` for a field-path query is treated
     as **no match** (tolerant — a malformed body simply doesn't satisfy ``PID-3``), never an error that
-    aborts the scan. A field-path query tests every segment occurrence and field repetition. It sees
-    only the row it is handed, so it widens nothing past the caller's own scope."""
+    aborts the scan. A field-path query tests every segment occurrence and field repetition."""
     if spec.substring is not None:
         needle = spec.substring.casefold()
         if spec.target in (SearchTarget.RAW, SearchTarget.BOTH) and raw is not None:  # noqa: SIM102
