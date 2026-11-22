@@ -4860,7 +4860,8 @@ def _full_open_check(
                 # Only a finding this build could reach by reading another version's cells or
                 # schema differently is offered that reading (`_MISREADABLE_KINDS`).
                 why = (
-                    " (the remedy leads because this build can misread another version's cells)"
+                    " (the remedy leads because this build can misread another version's cells"
+                    " or schema)"
                     if walk_kind[0] in _MISREADABLE_KINDS
                     else ""
                 )
@@ -4962,13 +4963,21 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
-#: What decided a :func:`_decrypt_check` verdict. ``cell`` is a cell's own content (a value that
-#: did not open, a missing marker, a BLOB); ``sqlite_schema`` a statement the snapshot's schema
-#: could not answer (``no such table`` or ``no such column``); ``sqlite`` any other SQLite fault;
-#: ``interrupted`` a schema change mid-walk; ``outage`` a key service that gave no verdict;
-#: ``key_mismatch`` a keyed snapshot read with no key; ``pass`` none.
+#: What decided a :func:`_decrypt_check` verdict. ``cell`` is a sealed value that did not open or
+#: a value with no marker; ``damaged`` a BLOB or a TEXT value SQLite cannot decode, which no
+#: version reads; ``sqlite_schema`` a statement the snapshot's schema could not answer, by
+#: :func:`is_schema_step_error`, other than a virtual table's missing module; ``sqlite`` any other
+#: SQLite fault; ``interrupted`` a schema change mid-walk; ``outage`` a key service that gave no
+#: verdict; ``key_mismatch`` a keyed snapshot read with no key; ``pass`` none.
 WalkKind = Literal[
-    "pass", "cell", "sqlite_schema", "sqlite", "interrupted", "outage", "key_mismatch"
+    "pass",
+    "cell",
+    "damaged",
+    "sqlite_schema",
+    "sqlite",
+    "interrupted",
+    "outage",
+    "key_mismatch",
 ]
 
 #: The kinds a walk under this build can reach by reading another version's cells or schema
@@ -4998,12 +5007,14 @@ class WalkVerdict(tuple[str, str, int]):
 
 def _sqlite_kind(exc: sqlite3.Error) -> WalkKind:
     """``sqlite_schema`` where the store's own schema classifier (:func:`is_schema_step_error`)
-    calls the fault a wrong shape; ``cell`` for a TEXT value SQLite could not decode, which is that
-    cell's own content; else ``sqlite``."""
-    if is_schema_step_error(exc):
+    calls the fault a wrong shape, except a virtual table's missing module, which is an object
+    another tool left rather than another version's schema; ``damaged`` for a TEXT value SQLite
+    could not decode; else ``sqlite``."""
+    text = str(exc)
+    if is_schema_step_error(exc) and "no such module" not in text:
         return "sqlite_schema"
-    if isinstance(exc, sqlite3.OperationalError) and str(exc).startswith("Could not decode to"):
-        return "cell"
+    if isinstance(exc, sqlite3.OperationalError) and text.startswith(_DECODE_ERROR_PREFIX):
+        return "damaged"
     return "sqlite"
 
 
@@ -5078,7 +5089,7 @@ def _decrypt_check(
             elif reading.kind == "blob":
                 # FAIL under any cipher, and never the keyring's: no key makes a BLOB readable.
                 if cipher.encrypts:
-                    return WalkVerdict("FAIL", reading.failure(source="snapshot"), cells, "cell")
+                    return WalkVerdict("FAIL", reading.failure(source="snapshot"), cells, "damaged")
                 first_blob = first_blob or reading.failure(source="snapshot")
             elif reading.kind == "failed":
                 if reading.error is not None and gave_no_verdict(reading.error):
@@ -5101,7 +5112,7 @@ def _decrypt_check(
             elif reading.kind == "opened":
                 cells += 1
         if first_blob is not None:
-            return WalkVerdict("FAIL", first_blob, cells, "cell")
+            return WalkVerdict("FAIL", first_blob, cells, "damaged")
     except sqlite3.Error as exc:
         return WalkVerdict("FAIL", _sqlite_error_reason(exc), cells, _sqlite_kind(exc))
     except CipherWalkInterrupted as exc:  # nothing else writes a snapshot, but never PASS a part

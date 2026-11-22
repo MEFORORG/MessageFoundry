@@ -2118,6 +2118,7 @@ def _incompatible_open(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
         (dr_backup.WalkVerdict("FAIL", "the store's schema changed", 0, "interrupted"), False),
         (dr_backup.WalkVerdict("FAIL", "DatabaseError: malformed", 0, "sqlite"), False),
+        (dr_backup.WalkVerdict("FAIL", "messages.raw id=1 holds a BLOB", 0, "damaged"), False),
     ],
 )
 def test_the_misread_rationale_follows_the_walks_kind(
@@ -2159,7 +2160,7 @@ def test_a_sqlite_fault_is_a_schema_kind_only_when_the_schema_could_not_answer()
     assert set(faults) == {"column", "table", "decode"}, faults
     assert dr_backup._sqlite_kind(faults["column"]) == "sqlite_schema"
     assert dr_backup._sqlite_kind(faults["table"]) == "sqlite_schema"
-    assert dr_backup._sqlite_kind(faults["decode"]) == "cell"
+    assert dr_backup._sqlite_kind(faults["decode"]) == "damaged"
     malformed = sqlite3.DatabaseError("database disk image is malformed")
     assert dr_backup._sqlite_kind(malformed) == "sqlite"
     assert dr_backup._sqlite_kind(sqlite3.OperationalError("database is locked")) == "sqlite"
@@ -2183,7 +2184,7 @@ def test_a_shown_locator_is_bounded_and_cut_on_a_whole_escape() -> None:
     for value in (chr(0xE0001) * 70, "\\" * 40 + "\x00", "a" * 65, chr(0xE0001) * 10**6):
         shown = _shown(value)
         assert len(shown) <= _LOCATOR_LIMIT + 3, (len(shown), shown[:80])
-        if not value[: _LOCATOR_LIMIT + 1].isprintable():
+        if not value[:_LOCATOR_LIMIT].isprintable():
             # Whole escapes only, so the shown text decodes back without an error.
             shown.removesuffix("...").encode("ascii").decode("unicode_escape")
     assert _shown("short id") == "short id"
