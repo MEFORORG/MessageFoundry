@@ -102,10 +102,8 @@ __all__ = [
     "LOCKED_REFUSAL_DETAIL",
     "LOCK_EVENT_ACTIONS",
     "LOCK_NOTICE_ACTION",
-    "LOCK_NOTICE_ID_KEY",
     "LOCK_NOTICE_UNDELIVERED_ACTION",
     "LOGIN_LOCKED_ACTION",
-    "NOTICE_SEND_FAILED_REASON",
     "SCOPE_WITHHELD",
     "audit_detail_for",
     "audit_exclusion_for",
@@ -120,11 +118,6 @@ LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
 #: A lock notice that never left this engine (BACKLOG #2383). Its own name, not
 #: ``auth.security_notice_undelivered``, so the whole row can be hidden like the lock rows.
 LOCK_NOTICE_UNDELIVERED_ACTION: Final = "auth.lock_notice_undelivered"
-#: The detail key on an ``auth.lock_notice`` row of a taken mail, and on the undelivered row the
-#: notifier writes for that notice, holding ``SecurityEvent.notice_id`` (vault BACKLOG #1138).
-LOCK_NOTICE_ID_KEY: Final = "notice_id"
-#: The undelivered row's ``reason`` for a send that raised after the notifier took the notice.
-NOTICE_SEND_FAILED_REASON: Final = "send_failed"
 LOGIN_LOCKED_ACTION: Final = "auth.login_locked"
 ADMIN_UNLOCKED_ACTION: Final = "auth.admin_unlocked"
 #: A directory sign-in refused by a live lock (BACKLOG #3726). It used to share

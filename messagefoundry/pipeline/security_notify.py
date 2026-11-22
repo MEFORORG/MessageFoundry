@@ -20,11 +20,7 @@ import json
 import logging
 from typing import Final, Protocol
 
-from messagefoundry.auth.audit_visibility import (
-    LOCK_NOTICE_ID_KEY,
-    LOCK_NOTICE_UNDELIVERED_ACTION,
-    NOTICE_SEND_FAILED_REASON,
-)
+from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
@@ -816,7 +812,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 )
             # The reason only. The exception's text can quote the relay's reply or the address, and
             # even its class would tell the recipient, in their own feed, that the relay is broken.
-            await self._record_undelivered(event, {"reason": NOTICE_SEND_FAILED_REASON})
+            await self._record_undelivered(event, {"reason": "send_failed"})
 
     async def _record_undelivered(self, event: SecurityEvent, why: dict[str, str]) -> None:
         """Write the audit row that says this notice never left the engine (BACKLOG #2383).
@@ -825,10 +821,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         say which account was never told. The actor is the notice's recipient, so the row also
         reaches that account's ``/me/security-events`` feed. The detail is the notice kind and
         ``why``, plus the holder's username on an issuer's reminder, which says whose credential it
-        was, and the notice's ``notice_id`` on a lock notice. Never the rest of
-        ``event.detail`` or the address: an EMAIL_CHANGED carries an address in its detail. A lock
-        notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG #1131). A failed
-        write is swallowed, like the send it reports on. It is logged by class, and
+        was. Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED carries an address
+        in its detail. A lock notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG
+        #1131). A failed write is swallowed, like the send it reports on. It is logged by class, and
         not at all for a lock notice: that kind writes no other line, so a lone line would say a
         lock landed."""
         if self._audit is None:
@@ -839,9 +834,6 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         holder = event.detail.get("holder")
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER and isinstance(holder, str):
             detail["holder"] = holder
-        # What the lock-notice throttle matches a failed send by (vault BACKLOG #1138 item 2).
-        if event.event_type == ACCOUNT_LOCKED and event.notice_id:
-            detail[LOCK_NOTICE_ID_KEY] = event.notice_id
         try:
             await self._audit.record_audit(
                 action, actor=event.username, detail=json.dumps(detail, sort_keys=True)

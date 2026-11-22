@@ -7334,8 +7334,7 @@ session. Each refusal is also audited, so a campaign is visible in the audit log
 writes `auth.account_locked`, but the mail is **throttled by time** (ADR 0197): at most one per lock
 kind per account per 24 hours, and always one for the first lock after a quiet day. Each mail names
 the lock and its cycle count, and writes its own `auth.lock_notice` row, which is what the throttle
-reads, with the `auth.lock_notice_undelivered` rows of mails whose send failed, which do not count
-toward that one (vault BACKLOG #1138 item 2). With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
+reads. With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
 refusal writes `auth.account_locked` first and does not wait for the task. So a large audit log would
 not push a refused sign-in past its padded slot. The task is queued per account and lock kind within
 one API process. Two locks of one kind landing together there would send one mail. **One throttle
@@ -7938,7 +7937,7 @@ the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
-holder, and a lock notice its `notice_id`. The row never carries the address, the rest of the notice's detail, or the error. The
+holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
@@ -7976,17 +7975,11 @@ again for the row, and only when a send failed. **Still open, at least:**
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
-  because the send fails on the relay's own task. Both rows carry the same random `notice_id`, and
-  the throttle does not let a mail whose `send_failed` row it reads hold the next lock notice of
-  the kind back (vault BACKLOG #1138 item 2). A lock notice is still held back by a mail that
-  failed in at least these cases: the failed-send row was never written, for example because its
-  own write failed, which holds back every later lock notice of the kind for the rest of the 24
-  hours; or the lock's throttle read ran before the send had failed, for example behind a
-  backed-up queue or a relay that hangs until its timeout, which holds back that one notice, and
-  a held-back notice writes no row. The other way, a send can raise after the relay has queued
-  the mail, as the provision-admin paragraph above says. A relay that does so on every send, for
-  example one whose end-of-data reply comes after the timeout, turns off the throttle for the
-  kind: each lock of it is mailed while that lasts.
+  because the send fails on the relay's own task after that row is written. So the throttle holds
+  back the next lock notice of the kind for the rest of its 24 hours. The failure is on the
+  `auth.lock_notice_undelivered` row, which the throttle does not read. *Kept as a residual (vault
+  BACKLOG #3120): closing it would need that row to carry the lock kind and the throttle to read a
+  second action.*
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits at most two seconds for pending notices, then cancels any still pending, each with one

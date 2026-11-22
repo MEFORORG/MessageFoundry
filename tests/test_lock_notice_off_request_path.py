@@ -176,13 +176,6 @@ def _write_overruns(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if "audit writes took" in r.getMessage()]
 
 
-def _without_id(detail: dict[str, Any]) -> dict[str, Any]:
-    """``detail`` without the notice token a taken mail's row carries, checked to be one."""
-    token = detail.pop("notice_id")
-    assert isinstance(token, str) and len(token) == 32, token
-    return detail
-
-
 async def _lock_notice_rows(store: MessageStore, actor: str) -> list[Any]:
     return list(await store.list_audit(actor=actor, action=_LOCK_NOTICE, limit=50))
 
@@ -231,9 +224,7 @@ async def test_the_lock_setting_refusal_stays_in_its_slot_with_a_large_audit_log
         assert reads.off_path == 1, reads.off_path
         assert len(notifier.locks()) == 1, "the notice never went out"
         rows = await _lock_notice_rows(store, user.username)
-        assert [_without_id(json.loads(r["detail"])) for r in rows] == [
-            {"lock": "sign_in", "mailed": True}
-        ]
+        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": True}]
     finally:
         await _close(store, service)
 
@@ -392,7 +383,7 @@ class _RaceSchedule:
                 self.probe.changed()
             return rows
 
-        async def write(user: UserRecord, lock: str, *, handed: bool, notice_id: str) -> None:
+        async def write(user: UserRecord, lock: str, *, handed: bool) -> None:
             await self.probe.until(
                 lambda: self.reads == 2 or self.probe.parked > 0,
                 "the peer to read the throttle or park in the queue",
@@ -404,7 +395,7 @@ class _RaceSchedule:
                     "arrived": self.probe.arrived,
                     "parked": self.probe.parked,
                 }
-            await real_write(user, lock, handed=handed, notice_id=notice_id)
+            await real_write(user, lock, handed=handed)
             if first:
                 self.parked_after_first_write = self.probe.parked
 
@@ -826,76 +817,6 @@ async def test_a_notice_dropped_on_a_full_queue_does_not_hold_the_next_one_back(
         )
         assert relay._queue.qsize() == 1, "the second lock's notice was not queued"
     finally:
-        await _close(store, service)
-
-
-async def _sent_and_recorded(relay: SecurityEventNotifier) -> None:
-    """Wait, bounded, until the relay's drain loop has handled every queued notice, which includes
-    writing a failed send's row."""
-    async with asyncio.timeout(_STALL_SECONDS):
-        while relay.undelivered:
-            await asyncio.sleep(0.01)
-    await asyncio.gather(*relay._recording)
-
-
-@pytest.mark.parametrize(
-    ("outcomes", "sends"),
-    [
-        pytest.param(["fail"], 2, id="a-failed-send-lets-the-next-mail"),
-        pytest.param(["ok"], 1, id="control-a-delivered-mail-holds-the-next"),
-        pytest.param(["fail", "ok"], 2, id="a-later-delivered-mail-still-holds"),
-    ],
-)
-async def test_a_failed_lock_mail_send_does_not_hold_the_next_one_back(
-    monkeypatch: pytest.MonkeyPatch, outcomes: list[str], sends: int
-) -> None:
-    """Vault BACKLOG #1138 item 2. The relay takes a lock's mail, so its row reads
-    ``mailed: true``, and the send then fails on the relay's task. The relay's ``send_failed``
-    row carries the same notice token, so the throttle does not let that mail hold the next lock
-    of the kind back.
-
-    ``outcomes`` is what each send does, one lock per entry, and one more lock follows. The
-    control is a delivered send, which holds the next lock back, so the instrument can see the
-    throttle hold. The third case shows an earlier failed send does not release a later mail
-    that was delivered."""
-    outcomes = list(outcomes)  # extended below; the parameter is shared across runs
-    sent: list[dict[str, Any]] = []
-
-    def send(**kw: Any) -> None:
-        sent.append(kw)
-        if outcomes[len(sent) - 1] == "fail":
-            raise OSError("relay down")
-
-    monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", send)
-    store, service, _fake, user = await _harness()
-    relay = SecurityEventNotifier(
-        host="smtp.example.test", port=25, sender="mf@example.test", audit=store
-    )
-    relay.start()
-    service.attach_security_notifier(relay)
-    try:
-        for cycle in range(1, len(outcomes) + 1):
-            await service._record_lock(user, "sign_in", _lock(cycle), client=None)
-            await service.drain_background()
-            await _sent_and_recorded(relay)
-        assert len(sent) == len(outcomes), "an earlier notice was held back"
-        rows = await _lock_notice_rows(store, user.username)
-        assert [_without_id(json.loads(r["detail"])) for r in rows] == [
-            {"lock": "sign_in", "mailed": True}
-        ] * len(outcomes)
-        taken = sorted(json.loads(r["detail"])["notice_id"] for r in rows)
-        failed = await store.list_audit(actor=user.username, action=_LOCK_NOTICE_UNDELIVERED)
-        failed_ids = [json.loads(r["detail"])["notice_id"] for r in failed]
-        assert len(failed_ids) == outcomes.count("fail")
-        assert set(failed_ids) <= set(taken), "a failed send's row names no taken mail"
-
-        outcomes.append("ok")
-        await service._record_lock(user, "sign_in", _lock(len(outcomes)), client=None)
-        await service.drain_background()
-        await _sent_and_recorded(relay)
-        assert len(sent) == sends
-    finally:
-        await relay.aclose()
         await _close(store, service)
 
 

@@ -141,10 +141,10 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 #: closing at shutdown, is still recorded where only an administrator reads it, as
 #: ``mailed: false`` on the ``auth.lock_notice`` row (vault BACKLOG #3120 for the last two). A full
 #: queue, a closing notifier or a failed send is also recorded on its own
-#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383). How the throttle reads a failed send is
-#: ``AuthService._lock_notice_held_back``'s to state. An instance with no relay at all is reported
-#: at startup by the serve gate, unless enforcement is ``warn`` and the operator waived notices in
-#: writing.
+#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383). A failed send happens after the
+#: ``auth.lock_notice`` row is written at the hand-off, so that row still reads ``mailed: true``; the
+#: residual is stated in ``docs/SECURITY.md``. An instance with no relay at all is reported at startup by
+#: the serve gate, unless enforcement is ``warn`` and the operator waived notices in writing.
 LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
 
 #: What a general-log line calls each notice kind. A log call names the kind through
@@ -239,11 +239,6 @@ class SecurityEvent:
     detail: dict[str, Any] = field(
         default_factory=dict
     )  # PHI-free extras (e.g. role from/to counts)
-    #: A random token naming this notice, set at least on an ``ACCOUNT_LOCKED`` notice: the
-    #: notifier copies it onto the undelivered row it writes for the notice, which is how the
-    #: lock-notice throttle tells which taken mail failed (``AuthService._lock_notice_held_back``,
-    #: vault BACKLOG #1138 item 2). Not a secret, and no mail body reads it.
-    notice_id: str | None = None
 
 
 @runtime_checkable
