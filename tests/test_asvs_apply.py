@@ -3818,3 +3818,51 @@ def test_a_verdict_move_that_empties_the_residual_is_still_refused(
     assert rc == 1
     assert rec.read_bytes() == before
     assert "would LOSE field(s) ['residual']" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("field", "live_value", "echoed"),
+    [
+        ("reviewed_by", "7", 7),
+        ("reviewed_by", '["x"]', ["x"]),
+        ("residual", "7", 7),
+        ("residual", '["a"]', ["a"]),
+        # Python's `==` reads these two as equal; the comparison must hold the type as well.
+        ("residual", "1", True),
+    ],
+)
+def test_an_anchor_repair_will_not_echo_a_value_the_loader_refuses(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+    live_value: str,
+    echoed: object,
+) -> None:
+    """`render` would coerce the echo to a string: a mangled `reviewed_by`, or a `residual` the
+    loader refused before the repair and accepts after it."""
+    old = _FIX_LINE if field == "reviewed_by" else 'residual = "a control exists but ships off"\n'
+    rec = _record(tmp_path)
+    rec.write_text(FIXTURE.replace(old, f"{field} = {live_value}\n", 1), encoding="utf-8")
+    before = rec.read_bytes()
+    repair = _cell_with_repair(**{field: echoed})
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert "so a repair cannot carry it" in capsys.readouterr().out
+
+
+def test_a_carried_reviewed_by_table_must_survive_the_re_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A positive control for the guard on the carried path: an emission that changes the table."""
+    monkeypatch.setattr(
+        "scripts.asvs.apply._reviewed_by_table",
+        lambda _value: '{ reviewer = "someone else", ref = "unrecorded", date = "unrecorded" }',
+    )
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    repair = _repair_omitting("reviewed_by")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert "reviewed_by did not survive the re-parse" in capsys.readouterr().out

@@ -43,9 +43,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # already share a process and a directory. `scorecard.py` is mirrored into the vault byte-for-byte
 # (tests/test_asvs_verifier_vault_contract.py), so this name does not drift out from under us silently.
 #
-# `parse_reviewed_by` is the loader's own check on a structured `reviewed_by` (BACKLOG #2168), taken
-# for the same reason: the writer must refuse exactly what the loader would, and a second copy of the
-# rule is a second place for it to drift.
+# `_reviewed_by_field` and `_str` are the loader's own rules for the two optional ordered fields
+# (BACKLOG #2168, #5867), taken for the same reason: the writer must refuse exactly what the loader
+# would, and a second copy of the rule is a second place for it to drift.
 #
 # `_DATE_RE` is the loader's date shape, taken for that reason too (BACKLOG #2865).
 from scorecard import (  # noqa: E402
@@ -54,7 +54,8 @@ from scorecard import (  # noqa: E402
     UNRECORDED,
     ScorecardError,
     _git,
-    parse_reviewed_by,
+    _reviewed_by_field,
+    _str,
     repo_stamp,
 )
 
@@ -187,8 +188,9 @@ _ORDERED = ("id", "level", "verdict", "residual", "last_verified", "verified_at"
 #: The ordered fields `render` omits when the payload leaves them empty or does not hold them. Every
 #: other ordered field is always written, which is why `main` requires them; `reviewed_by` is
 #: required too unless the run is an anchor repair. A declared repair that omits one keeps the
-#: record's value, even an empty one (`_repair_carry`, BACKLOG #5867), wherever `main` admits the
-#: omission: the closed-cell guard and the `na` rationale check read the payload and still refuse it.
+#: record's value, even an empty one (`_repair_carry`, BACKLOG #5867). Two guards in `main` read an
+#: omitted `residual` as empty: the `na` rationale check refuses it, and the closed-cell guard
+#: refuses it unless the record's `residual` is empty too. Neither refuses an omitted `reviewed_by`.
 _OPTIONAL_ORDERED = ("residual", "reviewed_by")
 
 #: AT LEAST these top-level keys carry free text. **NOT every field that can** -- `posture`,
@@ -251,6 +253,25 @@ def _repair_carry(cell: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
     return {k: live[k] for k in _OPTIONAL_ORDERED if k in live and k not in cell}
 
 
+def _loader_refusal(cell_id: object, key: str, value: object) -> str | None:
+    """Why the loader would refuse `value` for an optional ordered field, by the loader's own rule,
+    or None. Only a malformed table keeps the loader's words: its refusal of a `reviewed_by` of
+    another type quotes the value, and this one names the type alone."""
+    try:
+        if key == "reviewed_by":
+            _reviewed_by_field({"id": cell_id, key: value})
+        else:
+            _str({key: value}, key, f"cell {cell_id!r}")
+    except ScorecardError as err:
+        if key == "reviewed_by" and isinstance(value, dict):
+            return _printable(str(err))
+        return (
+            f"{_printable(str(cell_id))}: {key} is a {type(value).__name__}, which the loader "
+            "refuses, so a repair cannot carry it"
+        )
+    return None
+
+
 #: Keys the WRITER CONSUMES AS INSTRUCTIONS rather than storing as record fields (BACKLOG #1369).
 #:
 #: `--allow-retirement` requires the payload to DECLARE what it is retiring, and `:468` reads that
@@ -279,7 +300,7 @@ def _repair_carry(cell: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
 #: the next write. Cheap and loud against expensive and silent.
 #:
 #: `anchor_repair` was the one it missed. The same function consumes it as an instruction -- it
-#: relaxes the `reviewed_by` guard for exactly one run -- and nothing reads it back, so it
+#: lets one run omit `reviewed_by` and `residual` -- and nothing reads it back, so it
 #: sat in the record FREEZING the cell: a later ordinary residual correction, authored from the live
 #: cell and therefore carrying the flag forward, is refused with "declared anchor_repair but
 #: 'residual' differs from the record". That is the #1333 freeze shape, reintroduced through a
@@ -989,9 +1010,10 @@ def main(argv: list[str] | None = None) -> int:
     for c in payload:
         live = live_cells.get(c.get("id"), {})
         # An ANCHOR REPAIR re-points citations after the code moved; it must not touch anything else.
-        # Declaring it relaxes ONE guard -- `reviewed_by` need not be restated -- and buys that with
-        # byte-identity on every prose field, so an existing empty `reviewed_by` is preserved rather
-        # than invented. Any difference in verdict or prose refuses. The glyph scan still runs.
+        # Declaring it lets the payload omit `reviewed_by` and `residual`, which keeps the record's
+        # values, and buys that with byte-identity on every prose field, so an existing empty value
+        # is preserved rather than invented. A difference in verdict or prose refuses. The glyph scan
+        # still runs.
         anchor_repair = bool(c.get("anchor_repair"))
         if live.get("anchor_repair"):
             # GATED ON THE RECORD, NOT ON THE PAYLOAD, and that is the whole correction. Gating on
@@ -1020,7 +1042,7 @@ def main(argv: list[str] | None = None) -> int:
             # The glyph scan below runs here too, and finds nothing on these fields because they
             # equal the record; it is what covers the evidence a repair DOES rewrite (#1884).
             for f in _PROSE_FIELDS:
-                if c.get(f, live.get(f, "")) != live.get(f, ""):
+                if not _same(c.get(f, live.get(f, "")), live.get(f, "")):
                     problems.append(
                         f"{c.get('id')}: declared anchor_repair but {f!r} differs from the record; "
                         "that is a rescore, not a repair"
@@ -1094,23 +1116,23 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"{c.get('id')}: bad verdict {c.get('verdict')!r}")
         # THE STRUCTURED FORM IS CHECKED BY THE LOADER'S OWN RULE (BACKLOG #2168). Written unchecked,
         # a malformed table would land in the record and make the next load of it fail.
-        # A CARRIED value is held to the loader's rule too (BACKLOG #5867): a repair must not stamp
-        # new anchors on a cell the next load refuses. A blank string or a table naming nobody IS
-        # carried, deliberately: a repair preserves an unrecorded reviewer rather than inventing
-        # one, and the verifier's reviewer check is what reports that cell.
-        carried = _repair_carry(c, live)
-        stated_rb = carried.get("reviewed_by", c.get("reviewed_by"))
-        if isinstance(stated_rb, dict):
-            try:
-                parse_reviewed_by(stated_rb, c.get("id"))
-            except ScorecardError as err:
-                problems.append(_printable(str(err)))
-        for name, v in carried.items():
-            if not isinstance(v, str) and not (name == "reviewed_by" and isinstance(v, dict)):
-                problems.append(
-                    f"{_printable(str(c.get('id')))}: the record's {name} is a {type(v).__name__}, "
-                    "which the loader refuses, so a repair cannot carry it"
-                )
+        #
+        # WHAT A REPAIR WRITES IS HELD TO THE WHOLE RULE, CARRIED OR ECHOED (BACKLOG #5867). A repair
+        # must not stamp new anchors on a cell the next load refuses, and `render` would coerce an
+        # echoed non-string that equals the record, which the byte-identity loop admits. A string is
+        # skipped because a non-blank `reviewed_by` has the legacy refusals below. A blank string or
+        # a table naming nobody IS kept, deliberately: a repair preserves an unrecorded reviewer
+        # rather than inventing one. The verifier's reviewer check reports that cell only when it
+        # is graded and neither an owner closure nor an exception entry covers it.
+        written = c | _repair_carry(c, live)
+        for name in _OPTIONAL_ORDERED:
+            value = written.get(name, "")
+            if isinstance(value, str):
+                continue
+            if anchor_repair or (name == "reviewed_by" and isinstance(value, dict)):
+                refusal = _loader_refusal(c.get("id"), name, value)
+                if refusal:
+                    problems.append(refusal)
         if "review_notes" in c and not isinstance(c["review_notes"], str):
             problems.append(
                 f"{c.get('id')}: review_notes must be a string, got "
@@ -1468,10 +1490,10 @@ def main(argv: list[str] | None = None) -> int:
         # A STRUCTURED reviewed_by MUST COME BACK AS THE TABLE THE PAYLOAD STATED (BACKLOG #2168).
         # The type guard below skips `_ORDERED` because `render` coerces those fields to strings, and
         # this one field is no longer coerced when it is a table, so it is checked here instead.
-        # AFTER the key-set guard, so a DROPPED key is named as dropped rather than as mangled.
-        if isinstance(c.get("reviewed_by"), dict) and not _same(
-            now.get("reviewed_by"), c["reviewed_by"]
-        ):
+        # AFTER the key-set guard, so a DROPPED key is named as dropped rather than as mangled. A
+        # table a repair CARRIED is held to the same check, against the record's value (#5867).
+        stated_rb = _repair_carry(c, was).get("reviewed_by", c.get("reviewed_by"))
+        if isinstance(stated_rb, dict) and not _same(now.get("reviewed_by"), stated_rb):
             print(f"REFUSING: cell {c['id']} reviewed_by did not survive the re-parse as a table")
             return 1
         # ...and the same question about the VALUE rather than the key (#1242). The check above is a
