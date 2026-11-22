@@ -820,6 +820,65 @@ async def test_a_notice_dropped_on_a_full_queue_does_not_hold_the_next_one_back(
         await _close(store, service)
 
 
+async def _sent_and_recorded(relay: SecurityEventNotifier) -> None:
+    """Wait, bounded, until the relay's drain loop has handled every queued notice, which includes
+    writing a failed send's row."""
+    async with asyncio.timeout(_STALL_SECONDS):
+        while relay._undelivered:
+            await asyncio.sleep(0.01)
+    await asyncio.gather(*relay._recording)
+
+
+@pytest.mark.parametrize("send_fails", [True, False])
+async def test_a_failed_lock_mail_send_does_not_hold_the_next_one_back(
+    monkeypatch: pytest.MonkeyPatch, send_fails: bool
+) -> None:
+    """Vault BACKLOG #1138 item 2. The relay takes the first lock's mail, so its row reads
+    ``mailed: true``, and then the send fails on the relay's task. The throttle counts the
+    relay's ``send_failed`` row against it, so the next lock of the kind is mailed again.
+
+    The control is the same run with a send that succeeds: the next lock is held back, so the
+    instrument can see the throttle hold."""
+    sent: list[dict[str, Any]] = []
+
+    def send(**kw: Any) -> None:
+        sent.append(kw)
+        if send_fails:
+            raise OSError("relay down")
+
+    monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", send)
+    store, service, _fake, user = await _harness()
+    relay = SecurityEventNotifier(
+        host="smtp.example.test", port=25, sender="mf@example.test", audit=store
+    )
+    relay.start()
+    service.attach_security_notifier(relay)
+    try:
+        await service._record_lock(user, "sign_in", _lock(1), client=None)
+        await service.drain_background()
+        await _sent_and_recorded(relay)
+        rows = await _lock_notice_rows(store, user.username)
+        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": True}]
+        failed = await store.list_audit(actor=user.username, action=_LOCK_NOTICE_UNDELIVERED)
+        assert [json.loads(r["detail"]) for r in failed] == (
+            [{"lock": "sign_in", "notice": "account_locked", "reason": "send_failed"}]
+            if send_fails
+            else []
+        )
+
+        await service._record_lock(user, "sign_in", _lock(2), client=None)
+        await service.drain_background()
+        await _sent_and_recorded(relay)
+        assert len(sent) == (2 if send_fails else 1), (
+            "a failed send held the next lock mail back"
+            if send_fails
+            else "the throttle did not hold a delivered mail's successor back"
+        )
+    finally:
+        await relay.aclose()
+        await _close(store, service)
+
+
 async def test_the_shipped_notifier_queues_nothing_once_it_has_closed() -> None:
     """Vault BACKLOG #3120: after ``aclose`` nothing drains the queue, so an event ``notify`` put
     there would never be sent. It answers ``False`` instead. The control is the same call on the

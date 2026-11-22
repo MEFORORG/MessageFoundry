@@ -7937,7 +7937,7 @@ the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
-holder. The row never carries the address, the rest of the notice's detail, or the error. The
+holder, and a lock notice its lock kind. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
@@ -7975,11 +7975,11 @@ again for the row, and only when a send failed. **Still open, at least:**
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
-  because the send fails on the relay's own task after that row is written. So the throttle holds
-  back the next lock notice of the kind for the rest of its 24 hours. The failure is on the
-  `auth.lock_notice_undelivered` row, which the throttle does not read. *Kept as a residual (vault
-  BACKLOG #3120): closing it would need that row to carry the lock kind and the throttle to read a
-  second action.*
+  because the send fails on the relay's own task. Its `auth.lock_notice_undelivered` row carries the
+  lock kind, and the throttle counts each such `send_failed` row against one handed row of the kind
+  in its window, so the next lock notice of the kind is not held back by it (vault BACKLOG #1138
+  item 2). A failed-send row that was never written, for example because its own write failed,
+  still leaves the next notice held back for the rest of the 24 hours.
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits at most two seconds for pending notices, then cancels any still pending, each with one

@@ -141,9 +141,9 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 #: closing at shutdown, is still recorded where only an administrator reads it, as
 #: ``mailed: false`` on the ``auth.lock_notice`` row (vault BACKLOG #3120 for the last two). A full
 #: queue, a closing notifier or a failed send is also recorded on its own
-#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383). A failed send happens after the
-#: ``auth.lock_notice`` row is written at the hand-off, so that row still reads ``mailed: true``; the
-#: residual is stated in ``docs/SECURITY.md``. An instance with no relay at all is reported at startup by
+#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383). A failed send happens on the notifier's
+#: task after the hand-off, so the ``auth.lock_notice`` row still reads ``mailed: true``, and the
+#: throttle counts the failed-send row against it (vault BACKLOG #1138 item 2). An instance with no relay at all is reported at startup by
 #: the serve gate, unless enforcement is ``warn`` and the operator waived notices in writing.
 LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
 

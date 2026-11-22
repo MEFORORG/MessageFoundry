@@ -56,6 +56,7 @@ from messagefoundry.auth.audit_visibility import (
     CHANNEL_SCOPE_CHANGED_ACTION,
     DIRECTORY_LOGIN_LOCKED_ACTION,
     LOCK_NOTICE_ACTION,
+    LOCK_NOTICE_UNDELIVERED_ACTION,
     LOCKED_REFUSAL_DETAIL,
     LOGIN_LOCKED_ACTION,
 )
@@ -22324,13 +22325,43 @@ class AuthService:
         A failed read fails OPEN (``False``) and is logged by exception class alone. The line names
         neither the account nor the notice kind (BACKLOG #1131): it runs only when a lock lands,
         and ``GET /logs/tail`` serves the log to ``logs:view``. A traceback would carry the
-        driver's message, which can quote the bound username."""
+        driver's message, which can quote the bound username.
+
+        **A send that failed after its hand-off does not hold the next one back** (vault BACKLOG
+        #1138 item 2). Its ``auth.lock_notice`` row still reads ``mailed: true``, because the send
+        fails on the notifier's task after that row is written. The notifier records the failure on
+        an ``auth.lock_notice_undelivered`` row with ``reason: send_failed`` and the lock kind, so a
+        mailable account is held back only while its handed rows of the kind in the window
+        outnumber its failed sends of the kind. A count, not an order: the failure row can land
+        before or after the row it cancels. An unread failure row only lets a duplicate through."""
         mailable = bool(user.notify_email)
         since = max(time.time() - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
         try:
             async with self._lock_notice_read_slots:
                 rows = await self._store.list_audit(
                     actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
+                )
+                handed = 0
+                for row in rows:
+                    try:
+                        detail = json.loads(row["detail"] or "{}")
+                        kind, mailed = detail.get("lock"), detail.get("mailed", True)
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if kind != lock:
+                        continue
+                    # A row that mailed nothing holds back only another addressless notice.
+                    if not mailable:
+                        return True
+                    if mailed is not False:
+                        handed += 1
+                if not handed:
+                    return False
+                failed = await self._store.list_audit(
+                    actor=user.username,
+                    action=LOCK_NOTICE_UNDELIVERED_ACTION,
+                    since=since,
+                    limit=50,
                 )
         except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
             _log.error(
@@ -22339,16 +22370,16 @@ class AuthService:
                 type(exc).__name__,
             )
             return False
-        for row in rows:
+        for row in failed:
             try:
                 detail = json.loads(row["detail"] or "{}")
-                kind, mailed = detail.get("lock"), detail.get("mailed", True)
+                kind, reason = detail.get("lock"), detail.get("reason")
             except (TypeError, ValueError, AttributeError):
                 continue
-            # A row that mailed nothing holds back only another addressless notice.
-            if kind == lock and (mailed is not False or not mailable):
-                return True
-        return False
+            # A full queue or a closing notifier already wrote ``mailed: false`` on its own row.
+            if kind == lock and reason == "send_failed":
+                handed -= 1
+        return handed > 0
 
     async def _record_lock_notice(self, user: UserRecord, lock: str, *, handed: bool) -> None:
         """Write the ``auth.lock_notice`` row the throttle reads, after the mail.
@@ -22359,11 +22390,10 @@ class AuthService:
         ``mailed: false``, which holds back no later
         mailable notice, so the next lock mails again rather than staying quiet for a day.
 
-        **A send that fails after the hand-off still leaves ``mailed: true``.** It fails on the
-        notifier's own task, after this row is written, and is recorded only on the notifier's
-        ``auth.lock_notice_undelivered`` row (BACKLOG #2383), which the throttle does not read. So
-        the next lock of the kind is held back for the rest of the window. A residual
-        ``docs/SECURITY.md`` states."""
+        **A send that fails after the hand-off still leaves ``mailed: true``** here. It fails on
+        the notifier's own task and is recorded on the notifier's ``auth.lock_notice_undelivered``
+        row (BACKLOG #2383), which the throttle counts against this one
+        (:meth:`_lock_notice_held_back`, vault BACKLOG #1138 item 2)."""
         await self._audit(
             _LOCK_NOTICE_ACTION,
             actor=user.username,
