@@ -328,9 +328,9 @@ _CENSUS: dict[str, Guarded | Exempt] = {
 }
 
 #: The sites :data:`_CENSUS` lists as Exempt, pinned exactly (vault BACKLOG #3512). A Guarded hop
-#: moved to Exempt, with its guard call deleted, can pass every other check here (a relaxed
-#: hop fails its own census below), so this list is the second edit such a change needs, and review sees it. A diff that
-#: edits both still passes.
+#: moved to Exempt, with its guard call deleted, can pass every other check here (a relaxed hop
+#: fails its own census below), so this list is the second edit such a change needs. A diff that
+#: edits both still passes, so review stays the check on what is added here.
 _EXEMPT_SITES = frozenset(
     {
         "messagefoundry/apiclient/client.py::_build_verify_context",
@@ -464,7 +464,7 @@ def _scan() -> _Scan:
 def test_every_site_is_in_the_census() -> None:
     """The check that stops the next unguarded hop: a new site fails here until it is classified."""
     sites = _scan().sites
-    # 42 sites when this floor was set (vault BACKLOG #3512), so 30 lets twelve go with no edit here.
+    # 42 sites when this floor was set (vault BACKLOG #3512), so 30 lets twelve go with no edit.
     # It fails a scan that finds nothing, over which the check below would pass.
     assert len(sites) >= 30, f"the scan found only {len(sites)} sites, floor 30"
     unlisted = sorted(sites - _CENSUS.keys())
@@ -472,7 +472,8 @@ def test_every_site_is_in_the_census() -> None:
         f"verifying client TLS context(s) with no census entry: {unlisted}. Add a guard "
         f"(RevocationHopGuard.capture, refuse_unrevoked_verified_hop for an https hop, or "
         f"mount_strict_reply_adapter for an hvac Vault client, which must not use "
-        f"RevocationHopGuard) and list the site as Guarded, or list it as Exempt with the reason. "
+        f"RevocationHopGuard) and list the site as Guarded, or list it as Exempt with the reason "
+        f"and add it to _EXEMPT_SITES. "
         f"See ADR 0173 and docs/DEPLOYMENT.md, 'Revocation-guard behavior'."
     )
 
@@ -491,7 +492,8 @@ def test_every_guarded_site_calls_a_guard() -> None:
     guarded = {site: entry for site, entry in _CENSUS.items() if isinstance(entry, Guarded)}
     # 15 sites were Guarded when this floor was set, so 10 lets up to five retire with no edit here.
     # It is a floor against a census emptied or turned all Exempt, over which the check below would
-    # pass on nothing. A single hop moved from Guarded to Exempt is caught by the test below.
+    # pass on nothing. A single hop moved from Guarded to Exempt fails the test below, unless
+    # _EXEMPT_SITES moves too; review is the check on that.
     assert len(guarded) >= 10, f"only {len(guarded)} Guarded census entries, floor 10"
     unguarded = [
         f"{site} (guard expected in {entry.by or 'the site itself'}; {entry.note or 'no note'})"
@@ -502,9 +504,12 @@ def test_every_guarded_site_calls_a_guard() -> None:
 
 
 def test_the_exempt_sites_are_the_pinned_list() -> None:
-    """A Guarded hop moved to Exempt fails here, naming it, unless :data:`_EXEMPT_SITES` moves too."""
+    """A Guarded hop moved to Exempt fails here, named, unless :data:`_EXEMPT_SITES` moves too."""
     exempt = {site for site, entry in _CENSUS.items() if isinstance(entry, Exempt)}
-    assert sorted(exempt - _EXEMPT_SITES) == [], "census sites Exempt but not in _EXEMPT_SITES"
+    assert sorted(exempt - _EXEMPT_SITES) == [], (
+        "census sites Exempt but not in _EXEMPT_SITES. Add a site to it only once review has read "
+        "the exemption's reason; a hop moved here from Guarded loses its revocation guard"
+    )
     assert sorted(_EXEMPT_SITES - exempt) == [], (
         "_EXEMPT_SITES names sites the census does not exempt"
     )

@@ -31,9 +31,9 @@ seen:
 * a SECOND call to a callee a file already lists. The inventory is kept per file and token, so a new
   ``hashlib.sha256`` call beside an existing one changes nothing;
 * a call to ANOTHER provider in a module a file already reaches, for a class the file already lists
-  through it. A ``via`` token names the module and the class, not the function, so a call from
-  ``pipeline/cert_expiry.py`` to ``pki.make_self_signed``, which signs, adds no token beside the
-  ``sign_verify:via messagefoundry.pki`` its CRL signature check already holds (vault BACKLOG #3512);
+  through it. A ``via`` token names the module and the class, not the function, so a new call from
+  ``pipeline/cert_expiry.py`` to ``pki.make_self_signed``, which signs, would add no token beside
+  the ``sign_verify:via messagefoundry.pki`` its CRL signature check holds (vault BACKLOG #3512);
 * an algorithm or TLS value held in a VARIABLE. A token carries the algorithm only when the call
   names it, in the callee or as a literal or named constant anywhere in its arguments;
 * a plain ``ctx.options = ...`` or ``setattr(ctx, "options", ...)``. ``options`` is too common a
