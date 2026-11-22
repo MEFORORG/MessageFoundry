@@ -74,7 +74,6 @@ import logging
 import os
 import pkgutil
 import re
-import sqlite3
 import sys
 import traceback
 import weakref
@@ -3127,7 +3126,10 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
 
 def _driver_code(exc: BaseException) -> str | None:
     """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code."""
-    if isinstance(exc, sqlite3.Error):
+    # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
+    # and the CLI defers loading it (tests/test_startup_import_budget.py).
+    sqlite = sys.modules.get("sqlite3")
+    if sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning)):
         # SQLite has no SQLSTATE, and its args[0] is the message itself, which can be a value as
         # short as five characters; only its result-code name, a fixed word, is read.
         name = getattr(exc, "sqlite_errorname", None)

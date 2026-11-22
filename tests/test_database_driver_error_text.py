@@ -200,6 +200,8 @@ def test_a_short_sqlite_message_is_not_read_as_a_sqlstate(name: str | None) -> N
     assert "MRN42" not in text
     kept = f" {name}" if name is not None else ""
     assert f"IntegrityError: [driver message withheld{kept}]" in text
+    # sqlite3.Warning is a sqlite3 driver class that does not derive from sqlite3.Error.
+    assert "MRN42" not in _rendered(_raised(sqlite3.Warning("MRN42")))
 
 
 def test_a_class_chain_that_cannot_be_read_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
