@@ -696,6 +696,65 @@ def test_check_says_none_on_a_clean_graph(tmp_path: Path) -> None:
     assert "no outbound or FhirLookup url carries a credential-like query parameter" in r.detail
 
 
+def _env_url_config(tmp_path: Path, *, value: str | None) -> Path:
+    """A config whose OB_PLAIN url is ``env("plain_url")`` with no default, and settings naming
+    the ``dev`` environment under ``tmp_path``, whose value file holds ``value`` when given."""
+    config = _CONFIG.replace("?sig=SYNTHETIC-4", "?fmt=xml").replace(
+        'outbound("OB_PLAIN", Rest(url="https://p.example.invalid/x?fmt=json"))',
+        'outbound("OB_PLAIN", Rest(url=env("plain_url")))',
+    )
+    config = config.replace("from messagefoundry import ", "from messagefoundry import env, ")
+    cfg = _write(tmp_path, config)
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(
+        _TOML + f'\n[environments]\nbase_dir = "{tmp_path.as_posix()}"\n', encoding="utf-8"
+    )
+    (tmp_path / "environments").mkdir()
+    body = "" if value is None else f'plain_url = "{value}"\n'
+    (tmp_path / "environments" / "dev.toml").write_text(body, encoding="utf-8")
+    return cfg
+
+
+def test_check_reads_an_env_url_against_the_instance_values(tmp_path: Path) -> None:
+    """Vault BACKLOG #3766 item 24: the line reads an ``env()`` URL against the environment values
+    ``build-check`` loads, so one with no ``default=`` is read too. Before, it read defaults only
+    and called this graph clean. The hit names the reading it ran (item 23)."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _env_url_config(tmp_path, value="https://p.example.invalid/x?key=SYNTHETIC-13")
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "OB_PLAIN (key)" in detail and "SYNTHETIC" not in detail
+    assert "against the 'dev' environment's values" in detail
+
+
+def test_control_an_env_url_the_values_do_not_hold_is_not_read(tmp_path: Path) -> None:
+    from messagefoundry.checks import run_checks
+
+    cfg = _env_url_config(tmp_path, value=None)
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "no outbound or FhirLookup url carries" in detail
+    assert "one that neither gives is not read" in detail
+
+
+def test_a_hit_from_a_default_says_the_url_was_read_by_its_default(tmp_path: Path) -> None:
+    """Vault BACKLOG #3766 item 23: the hit's detail carries the reading caveat, as the clean
+    detail does, since a hit can come from a ``default=`` the instance overrides."""
+    from messagefoundry.checks import run_checks
+
+    config = _CONFIG.replace(
+        'Rest(url="https://p.example.invalid/x?sig=SYNTHETIC-4")',
+        'Rest(url=env("keyed_url", default="https://p.example.invalid/x?sig=SYNTHETIC-4"))',
+    ).replace("from messagefoundry import ", "from messagefoundry import env, ")
+    report = run_checks(
+        _write(tmp_path, config), run_lint=False, service_config=tmp_path / "messagefoundry.toml"
+    )
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "OB_KEYED (sig)" in detail
+    assert "else its default=" in detail
+
+
 # --- once per reload (vault BACKLOG #2910) -----------------------------------------------------
 #
 # A reload runs ``build_check`` over the whole new graph, and that check warns. It then rebuilds the

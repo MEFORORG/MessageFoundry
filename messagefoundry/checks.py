@@ -423,7 +423,16 @@ def run_checks(
         # ASVS 14.2.1: an endpoint url carrying a credential in its query string. Advisory here; a
         # build refuses it on some hops -- see the check and
         # transports.egress.warn_url_query_credentials.
-        _check_url_query_credentials(config_dir),
+        _with_source(
+            _check_url_query_credentials(
+                config_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+                project_root=project_root,
+                env=env,
+            ),
+            source_note,
+        ),
         _check_generic_db_tls(config_dir),
         # BACKLOG #5041: a generic hop whose odbc_driver is off the driver allowlist, which the
         # build refuses. Advisory, since build-check is the required gate -- see the check.
@@ -2495,6 +2504,30 @@ def _check_posture(
     )
 
 
+def _instance_env_values(settings: ServiceSettings) -> dict[str, Any]:
+    """The values ``serve`` resolves ``env()`` against under ``settings``: the active environment's
+    value file, with its environment-variable and secrets-directory overlays, or ``{}`` when the
+    settings name no environment. Raises what
+    :func:`~messagefoundry.config.environments.load_environment_values` raises, at least
+    ``ValueError`` for a malformed file and ``OSError`` for one that cannot be read."""
+    import os
+
+    from messagefoundry.config.environments import (
+        load_environment_values,
+        resolve_values_base_dir,
+    )
+
+    env_name = settings.ai.environment
+    if env_name is None:
+        return {}
+    return load_environment_values(
+        base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
+        dir_name=settings.environments.dir,
+        environment=env_name,
+        environ=os.environ,
+    )
+
+
 def _check_build(
     config_dir: str | Path,
     *,
@@ -2520,12 +2553,6 @@ def _check_build(
     this check); a graph that won't load → SKIP (``validate`` already reports that). Only a genuine build/posture refusal on a fully-resolved
     config blocks. With no file but an environment declaration the settings come from the environment
     alone (:func:`_settings_source`, vault BACKLOG #2355)."""
-    import os
-
-    from messagefoundry.config.environments import (
-        load_environment_values,
-        resolve_values_base_dir,
-    )
     from messagefoundry.config.settings import hop_posture_from_ai, insecure_bind_escape
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
@@ -2574,16 +2601,7 @@ def _check_build(
     # Resolve env() against the active environment the same way serve does, so a hop's host/scheme (an
     # env()-supplied value) is built exactly as at runtime rather than left as an unresolved reference.
     try:
-        env_values = (
-            load_environment_values(
-                base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
-                dir_name=settings.environments.dir,
-                environment=env_name,
-                environ=os.environ,
-            )
-            if env_name is not None
-            else {}
-        )
+        env_values = _instance_env_values(settings)
         trust_anchor_policy = settings.tls.policy()
     except (ValueError, OSError) as exc:
         # A malformed environments/<env>.toml (TOMLDecodeError is a ValueError) or an unreadable
@@ -2969,7 +2987,14 @@ def _check_hostname_unchecked(config_dir: str | Path) -> CheckResult:
     )
 
 
-def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
+def _check_url_query_credentials(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+    project_root: str | Path | None = None,
+    env: str | None = None,
+) -> CheckResult:
     """Name every outbound whose endpoint ``url`` carries a credential-like query parameter (ASVS
     14.2.1), with the parameter NAMES and never a value.
 
@@ -2978,11 +3003,15 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
     a heuristic over names. This line stays advisory on every hop. The ``build-check`` leg refuses
     one on a hop the no-escape credential rule covers, but that leg can SKIP (its own detail says
     why), so a passing ``check`` does not prove the hop was judged.
-    Unlike ``build-check``, it does not load the instance's environment values, so an ``env()`` URL
-    is read as its literal ``default=`` and one with no default is not read, which the clean
-    detail says; the construction WARNING and the posture entry read the resolved URL. SKIPs when
-    the graph
-    will not load, like its siblings."""
+
+    An ``env()`` URL is read against the environment values ``build-check`` loads, resolved as
+    ``serve`` resolves them (:func:`_instance_env_values`, vault BACKLOG #3766 item 24), when a
+    settings file or an environment declaration resolves and its values load. Otherwise it is read
+    by its literal ``default=``. Either way one that neither the values nor a default gives is not
+    read, and the detail says which reading ran, on a hit as on a clean graph (item 23). Settings
+    that are present but refused FAIL the line, as ``static-credentials`` does; values that do not
+    load are named, and the line falls back to the defaults. SKIPs when the graph will not load,
+    like its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, query_credential_hops
 
     name = "url-query-credential"
@@ -2992,15 +3021,42 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
         return CheckResult(
             name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
         )
-    found = query_credential_hops(registry)
+    defaults_only = "an env() url is read by its default= only, so one with no default is not read"
+    reading = f"{defaults_only}: no settings file or environment declaration resolved"
+    values: dict[str, Any] | None = None
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    )
+    if toml is not None or env_only:
+        cli: dict[str, dict[str, object]] | None = (
+            {"environments": {"base_dir": str(project_root)}} if project_root is not None else None
+        )
+        try:
+            settings = _load_check_settings(toml, cli=cli, env=env)
+        except _SETTINGS_LOAD_ERRORS as exc:
+            return _settings_refused(name, required=False, exc=exc)
+        try:
+            values = _instance_env_values(settings)
+        except (ValueError, OSError) as exc:
+            # The decoder's message names a line and column, never a value; the type alone is kept.
+            reading = f"{defaults_only}: the environment values did not load ({type(exc).__name__})"
+        else:
+            environment = settings.ai.environment
+            reading = (
+                f"an env() url is read against the {environment!r} environment's values, else "
+                "its default=, so one that neither gives is not read"
+                if environment is not None
+                else f"{defaults_only}: the settings name no environment"
+            )
+    found = query_credential_hops(registry, env_values=values)
     if not found:
         return CheckResult(
             name,
             ok=True,
             required=False,
             detail=(
-                "no outbound or FhirLookup url carries a credential-like query parameter; an "
-                "env() url is read by its default= only, so one with no default is not read here"
+                "no outbound or FhirLookup url carries a credential-like query parameter; "
+                f"{reading}"
             ),
         )
     listed = "; ".join(f"{conn} ({params})" for conn, params in found)
@@ -3011,7 +3067,7 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(found)} connection(s) carry a credential in the endpoint url's query "
             f"string — {listed}. It rides the request line, so the partner's and any proxy's access "
-            "log holds it (ASVS 14.2.1)"
+            f"log holds it (ASVS 14.2.1); {reading}"
         ),
     )
 
