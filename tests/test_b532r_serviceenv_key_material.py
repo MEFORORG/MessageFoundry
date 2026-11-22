@@ -153,8 +153,9 @@ _DIRECTORY_KEY = f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"
 #: how it says to pass the list back, so that string is not passed back with it.
 _REWRITE = (
     "Remove each such string, whatever it holds, since it may hold that value, and do not keep it "
-    "as the directory's entry. The lists must then hold exactly one MEFOR_SECRETS_DIRECTORY "
-    "entry, written as MEFOR_SECRETS_DIRECTORY=<path> on its own"
+    "as the directory's entry. Where the service has a secrets directory, or a step below puts a "
+    "setting in one, the lists must then hold exactly one MEFOR_SECRETS_DIRECTORY entry, written "
+    "as MEFOR_SECRETS_DIRECTORY=<path> on its own"
 )
 _PASS_BACK = (
     "pass back every entry but those refused above and the strings this step and any step above "
@@ -194,6 +195,15 @@ def _assert_written_again(refusal: str) -> None:
             [f"{_KEY}=", f"mefor_secrets_directory=C:\\d;{_KEY_B64}"], id="item-key-beside-a-path"
         ),
         pytest.param([f"{_KEY}=", "mefor_secrets_directory=C:\\d"], id="item-path-only"),
+        pytest.param(
+            [f"{_KEY}=", "MEFOR_VALUE_A", "mefor_secrets_directory=C:\\d"],
+            id="item-past-a-name-alone",
+        ),
+        pytest.param([f"{_KEY}=", _KEY, _DIRECTORY_KEY], id="item-past-the-key-alone"),
+        pytest.param(
+            [f"{_KEY}=", "MEFOR_STORE_PASSWORD", "mefor_secrets_directory=C:\\d"],
+            id="item-past-a-secret-alone",
+        ),
     ],
 )
 def test_a_joined_directory_string_is_removed_and_written_again(entries: list[str]) -> None:
@@ -216,8 +226,42 @@ def test_a_joined_directory_string_keeps_the_create_or_add_back_guidance() -> No
     refusal = service_env_refusal(posture)
     assert refusal is not None and posture.directory_joined
     _assert_written_again(refusal)
-    assert "write it again where a removed string was the only one" in refusal
+    assert (
+        "where the strings removed leave none, write it again among the entries you pass back"
+        in refusal
+    )
+    assert "where they leave more than one, remove the rest" in refusal
     assert _CREATE in refusal
+
+
+def test_a_directory_string_joined_past_a_name_alone_beside_a_secret_is_not_set_none() -> None:
+    """A name written alone between the empty value and the directory string carries the join
+    on, so beside a secret the directory takes the refusal still must not say the lists set
+    none (H3)."""
+    posture = _read(
+        [
+            f"{_KEY}=",
+            "MEFOR_VALUE_A",
+            "mefor_secrets_directory=C:\\d",
+            "MEFOR_AUTH_AD_BIND_PASSWORD=x",
+        ]
+    )
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and posture.directory_joined
+    _assert_written_again(refusal)
+
+
+@pytest.mark.parametrize("prefix", ["", "MEFOR_AI_ENVIRONMENT=prod\n"], ids=["line", "later-line"])
+def test_a_directory_line_in_the_key_string_refuses_as_the_key_alone(prefix: str) -> None:
+    """A key-valued directory line inside the empty key's own string is read as the key's
+    value: it refuses as the key, runs on into nothing, and adds no directory step. The rule
+    for joined strings does not reach this form, which is left as it stands (H3, item (c))."""
+    posture = _read([f"{prefix}{_KEY}=\n{_DIRECTORY_KEY}"])
+    assert posture.listed_keys == (_KEY,), posture.listed
+    assert not posture.value_runs_on and not posture.directory_joined
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert _REWRITE not in refusal
 
 
 def test_two_joined_directory_strings_get_one_directory_step() -> None:
