@@ -319,13 +319,71 @@ def test_the_re_mark_makes_nothing_at_a_dangling_links_target(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Win32 path rewriting is Windows-only")
-def test_a_candidate_whose_name_windows_rewrites_is_not_opened_as_another(win_tmp: Path) -> None:
-    """`mefor-backup-x.` opens as `mefor-backup-x` by its plain path; the held open refuses it
-    rather than read that other directory's lock and marker. The control: the other opens."""
-    os.mkdir(_verbatim(win_tmp, "mefor-backup-x."))
+def test_a_swept_candidate_whose_name_windows_rewrites_gets_the_verbatim_refusal(
+    win_tmp: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A planted `mefor-backup-x.` opens as the abandoned `mefor-backup-x` beside it, which the sweep
+    leaves for its other owner. Red on 9be6759e20a: the held open refused the planted name with a
+    WARNING printing its plain path, which removed by hand would remove `mefor-backup-x`. As on
+    origin/main, it now reaches the teardown's refusal, which names it by its verbatim path and
+    touches neither directory."""
     other = win_tmp / "mefor-backup-x"
     other.mkdir()
-    with pytest.raises(OSError):
-        dr_backup._HeldStagingDir(win_tmp / "mefor-backup-x.")
-    with dr_backup._HeldStagingDir(other) as held_dir:
-        assert not held_dir.has(dr_backup._LOCK_NAME)
+    (other / "archive.tar").write_bytes(_PLAINTEXT)
+    for name in (dr_backup._LOCK_NAME, dr_backup._HELD_MARKER_NAME):
+        (other / name).write_bytes(b"")
+    os.mkdir(_verbatim(win_tmp, "mefor-backup-x."))
+    owner = dr_backup._owner_of(other)
+    assert owner is not None
+    real_owner = dr_backup._owner_of
+
+    def owner_of(path: Path) -> object | None:
+        return "someone-else" if os.fspath(path) == os.fspath(other) else real_owner(path)
+
+    monkeypatch.setattr(dr_backup, "_owner_of", owner_of)
+    with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
+        assert dr_backup._sweep_owned(win_tmp, owner, own=None) == 0
+    refusals = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.ERROR and "Remove-Item -LiteralPath" in r.getMessage()
+    ]
+    assert refusals and all("mefor-backup-x." in m for m in refusals)
+    assert not any("as itself" in r.getMessage() for r in caplog.records)
+    assert (other / "archive.tar").read_bytes() == _PLAINTEXT
+    assert os.path.lexists(_verbatim(win_tmp, "mefor-backup-x."))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows share modes")
+def test_the_held_directory_does_not_refuse_a_siblings_removal(tmp_path: Path) -> None:
+    """A sibling engine shard removes its own live directory while this sweep has it open. Red on
+    9be6759e20a: the open denied delete sharing, so that removal failed with a sharing violation."""
+    staging = tmp_path / "mefor-backup-live"
+    staging.mkdir()
+    with dr_backup._HeldStagingDir(staging):
+        os.rmdir(staging)
+    assert not os.path.lexists(staging)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0, reason="POSIX permissions, as a non-root account"
+)
+def test_without_o_path_a_directory_it_cannot_read_is_still_swept_by_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A platform with no `O_PATH` (macOS) and a directory of this account with no read bit. Red on
+    9be6759e20a: the read-only open was refused, so the sweep left a directory origin/main swept.
+    It now goes by path for that directory, as origin/main did."""
+    root = tmp_path / "root"
+    candidate = _abandoned(root)
+    owner = dr_backup._owner_of(candidate)
+    assert owner is not None
+    monkeypatch.delattr(os, "O_PATH", raising=False)
+    candidate.chmod(0o300)
+    try:
+        with dr_backup._HeldStagingDir(candidate) as held_dir:
+            assert held_dir.fd is None
+            held_dir.mark(dr_backup._HELD_MARKER_NAME)
+        assert dr_backup._proven_abandoned(candidate, owner) is True
+    finally:
+        candidate.chmod(0o700)
