@@ -598,13 +598,47 @@ async def _assert_missing_audit_refused(store: Any, tag: str) -> None:
         ),
         "replay, not callable": lambda: store.replay(dead, audit="not-a-callable"),
     }
-    for label, call in refused.items():
+
+    def silent(_result: Any) -> None:
+        return None
+
+    # An audit that returns no row for a result that changed the store is refused inside the
+    # transaction, so the change rolls back (BACKLOG #5069, the row's second case).
+    silent_runs: dict[str, Callable[[], Awaitable[Any]]] = {
+        "replay, silent": lambda: store.replay(dead, audit=silent),
+        "replay_dead, silent": lambda: store.replay_dead(
+            channel_id=ch, destination_name=dest, audit=silent
+        ),
+        "cancel_queued, silent": lambda: store.cancel_queued(None, purge_dest, audit=silent),
+        "resend_to, silent": lambda: store.resend_to(
+            message_id=done, to=f"OB_NA{tag}", idempotency_key=f"silent-{tag}", audit=silent
+        ),
+        "reingress, silent": lambda: store.reingress(
+            origin_message_id=pending,
+            raw=_RAW,
+            idempotency_key=f"silent-re-{tag}",
+            audit=silent,
+            actor="contract-op",
+        ),
+    }
+    for label, call in {**refused, **silent_runs}.items():
         with pytest.raises(TypeError, match="BACKLOG #5069"):
             await call()
         assert await _statuses(store, dead) == {dest: "dead"}, label
         assert await _statuses(store, done) == {done_dest: "done"}, label
         assert await _statuses(store, pending) == {purge_dest: "pending"}, label
     assert int(await store.count_messages(channel_id=ch, allowed_channels=None)) == 3
+    # Control: the same silent audit on a result that changed nothing is still accepted.
+    assert await store.replay_dead(channel_id=ch, destination_name=f"OB_NZ{tag}", audit=silent) == 0
+    # And the silent resend's key was rolled back with it, so a real resend under it is not a
+    # duplicate.
+    resent = await store.resend_to(
+        message_id=done,
+        to=f"OB_NA{tag}",
+        idempotency_key=f"silent-{tag}",
+        audit=_builder(f"contract.silent_control.{tag}", ch),
+    )
+    assert resent.status == "resent"
 
     inject_ch = f"IB_NI{tag}"
     for origin in (MessageOrigin.OPERATOR_UPLOAD, MessageOrigin.OPERATOR_EDIT):

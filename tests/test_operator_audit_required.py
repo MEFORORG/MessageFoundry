@@ -45,9 +45,13 @@ from messagefoundry.store.store import (
     MessageOrigin,
     MessageStore,
     OperatorAudit,
+    ReingressOutcome,
+    ResendOutcome,
     if_applied,
+    mutation_changed,
     operator_audits,
     require_ingress_audit,
+    require_mutation_audit,
 )
 
 #: The protocol, every backend that implements it, and the engine that wraps them.
@@ -395,6 +399,39 @@ def test_the_ingress_refusal_keys_on_an_operator_origin() -> None:
         require_ingress_audit("not-a-callable", MessageOrigin.PARTNER)  # type: ignore[arg-type]
 
 
+def test_the_mutation_audit_refuses_no_row_for_a_change() -> None:
+    """The five mutations' audit (BACKLOG #5069): a ``None`` row is refused for a result that
+    changed the store, and allowed for one that changed nothing. Control: a real row passes."""
+    row = AuditAppend("test.mutation", actor="test")
+
+    def silent(_result: object) -> None:
+        return None
+
+    changed: list[object] = [
+        1,
+        ResendOutcome("resent", "m", "OB_B", "OB_A", "o1"),
+        ReingressOutcome("resubmitted", "m", "m2", "IB_A"),
+    ]
+    unchanged: list[object] = [
+        0,
+        False,
+        True,
+        ResendOutcome("duplicate", "m", "OB_B", "OB_A", "o1"),
+        ReingressOutcome("duplicate", "m", "m2", "IB_A"),
+    ]
+    guarded = require_mutation_audit(silent, "store.test")
+    for result in changed:
+        assert mutation_changed(result), result
+        with pytest.raises(TypeError, match="BACKLOG #5069"):
+            guarded(result)
+        assert require_mutation_audit(lambda _r: row, "store.test")(result) is row
+    for result in unchanged:
+        assert not mutation_changed(result), result
+        assert guarded(result) is None
+    with pytest.raises(TypeError, match="BACKLOG #5069"):
+        require_mutation_audit(None, "store.test")  # type: ignore[arg-type]
+
+
 def test_every_origin_is_classified() -> None:
     """``OPERATOR_ORIGINS`` is a listed set, so a new ``MessageOrigin`` must be put on one side
     here: an operator origin the list missed would inject with no audit (BACKLOG #5071)."""
@@ -405,7 +442,7 @@ def test_every_origin_is_classified() -> None:
 
 #: Each backend's operator mutations, and the statement each must open with, exactly.
 _ENTRY_GUARDS = {
-    **{m: f"require_operator_audit(audit, 'store.{m}')" for m in sorted(FLOOR[Store])},
+    **{m: f"audit = require_mutation_audit(audit, 'store.{m}')" for m in sorted(FLOOR[Store])},
     "enqueue_ingress": "audit = require_ingress_audit(audit, origin)",
 }
 

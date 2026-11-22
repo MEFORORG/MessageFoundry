@@ -402,6 +402,7 @@ from messagefoundry.store.store import (
     report_unsealed_users,
     report_user_reseal,
     require_ingress_audit,
+    require_mutation_audit,
     require_notify_email,
     require_operator_audit,
     require_role_seal_for_write,
@@ -8440,7 +8441,7 @@ class PostgresStore:
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
         A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
         ``audit``'s row commits with the replay (BACKLOG #2624)."""
-        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
@@ -8532,7 +8533,7 @@ class PostgresStore:
         SKIP-LOCKED/MVCC. Idempotency: the ``resend_log`` INSERT (ON CONFLICT DO NOTHING) runs FIRST and
         the outbound row is created only when it returned a row (ADR 0090 §4). ``audit``'s row
         commits with the resend, a duplicate included (BACKLOG #2624)."""
-        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
@@ -8745,7 +8746,7 @@ class PostgresStore:
         (ADR 0013) the fresh INGRESS row lands at the channel's ingress tail — a new logged receipt, not
         re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies.
         ``audit``'s row commits with the resubmit, a duplicate included (BACKLOG #2624)."""
-        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
@@ -8907,7 +8908,7 @@ class PostgresStore:
         pass-through marker exclusion (:data:`_NOT_PT_MARKER`, BACKLOG #1580) is written twice for the
         same reason, and the same file pins it. ``audit``'s row commits with the replay, zero
         included (BACKLOG #2624)."""
-        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
@@ -8965,7 +8966,7 @@ class PostgresStore:
         even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
         oldest row from that producer, the lane head only when no other inbound feeds the
         destination. Returns the number cancelled."""
-        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
         # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the

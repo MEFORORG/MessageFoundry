@@ -1274,8 +1274,9 @@ class QueueStore(StoreLifecycle, Protocol):
     # by leaving the argument out, and each backend raises TypeError, before any write, on an
     # explicit ``None`` or anything not callable (BACKLOG #5069). ``enqueue_ingress`` keeps an
     # optional ``audit`` because it is also the live receipt path; see its docstring for what holds
-    # the operator inject there. An ``OperatorAudit`` may still RETURN ``None`` for a result,
-    # which records nothing: that is decided, and the reason is on ``store.OperatorAudit``.
+    # the operator inject there. An ``OperatorAudit`` may still RETURN ``None`` for a result that
+    # changed nothing, which records nothing; for a result that changed the store, a ``None``
+    # return raises inside the transaction. Both are decided on ``store.OperatorAudit``.
     async def replay(
         self,
         message_id: str,

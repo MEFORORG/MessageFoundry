@@ -413,6 +413,7 @@ from messagefoundry.store.store import (
     report_unsealed_users,
     report_user_reseal,
     require_ingress_audit,
+    require_mutation_audit,
     require_notify_email,
     require_operator_audit,
     require_role_seal_for_write,
@@ -13142,7 +13143,7 @@ class SqlServerStore:
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
         A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
         ``audit``'s row commits with the replay (BACKLOG #2624)."""
-        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -13267,7 +13268,7 @@ class SqlServerStore:
         ``INSERT … WHERE NOT EXISTS`` + ``rowcount`` is the atomic gate; the outbound row is created only
         when it made a row (ADR 0090 §4). ``audit``'s row commits with the resend, a duplicate included
         (BACKLOG #2624)."""
-        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -13542,7 +13543,7 @@ class SqlServerStore:
         EXISTS`` + ``rowcount`` gate (keyed to ``(origin, "@reingress:<channel>")``) admits exactly one;
         the deterministic content-addressed child id is the partial-rollback defense. ``audit``'s row
         commits with the resubmit, a duplicate included (BACKLOG #2624)."""
-        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -13720,7 +13721,7 @@ class SqlServerStore:
         message from ``ERROR`` to ``ROUTED`` with nothing re-queued. It binds no parameter, so it does
         not disturb the positional ``?`` order ``params`` depends on. The pass-through marker exclusion
         (:data:`_NOT_PT_MARKER`, BACKLOG #1580) rides the same ``clause`` for the same reason."""
-        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[Any] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -13775,7 +13776,7 @@ class SqlServerStore:
         now: float | None = None,
         audit: OperatorAudit[int],
     ) -> int:
-        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
         params: list[Any] = [Stage.OUTBOUND.value, destination_name, OutboxStatus.PENDING.value]
