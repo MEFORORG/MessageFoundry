@@ -38,13 +38,13 @@ _WRAP = bytes(range(0x40, 0x40 + _WRAP_BYTES))
 _GENESIS = audit_genesis_detail("d2e36e3289bcfa5b", _STORE_ID, _WRAP)
 
 
-def _tee(detail: str | None) -> list[str]:
+def _tee(detail: str | None, action: str = AUDIT_KEY_EPOCH_ACTION) -> list[str]:
     handler = _ListHandler()
     logger = logging.getLogger("messagefoundry.audit")
     logger.addHandler(handler)
     try:
         emit_audit_tee(
-            action=AUDIT_KEY_EPOCH_ACTION,
+            action=action,
             actor="system",
             channel_id=None,
             detail=detail,
@@ -105,8 +105,7 @@ def test_a_nested_wrap_is_withheld_and_the_rest_of_the_detail_kept() -> None:
     "detail",
     [
         # A name, a reason or text that only quotes the field name, and parses cleanly, is left
-        # alone. A typed value that also faults the parse, or a detail over the window, can still
-        # be withheld whole.
+        # alone. The tee calls this on key epoch rows only, which no client writes.
         json.dumps({"username": "svc_recovery_wrap", "roles": ["Administrator"]}),
         json.dumps({"error": "no recovery_wrap"}),
         "not JSON: recovery_wrap",
@@ -191,6 +190,31 @@ def test_a_fault_in_the_withholding_warning_does_not_escape_the_tee(monkeypatch)
     (line,) = _tee(deep)
     assert _WRAP.hex() not in line
     assert json.loads(json.loads(line)["detail"]) == {"withheld": "<withheld>"}
+
+
+def test_the_withheld_action_is_the_key_epoch_action() -> None:
+    assert audit_tee._KEY_EPOCH_ACTION == AUDIT_KEY_EPOCH_ACTION
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        json.dumps({"recovery_wrap": _WRAP.hex()}),
+        json.dumps({"username": "1" * 4400 + "recovery_wrap", "reason": "x"}),
+        json.dumps({"username": "u recovery_wrap", "pad": "x" * _REDACT_WINDOW}),
+        "[" * 30_000 + '"recovery_wrap"' + "]" * 30_000,
+    ],
+    ids=["holds-the-key", "a-4400-digit-run", "over-the-window", "too-deep"],
+)
+def test_any_other_rows_detail_ships_as_without_the_withholding(detail: str, monkeypatch) -> None:
+    """A client can write the name into a row; only the engine's key epoch rows are withheld
+    from, so its copy ships as the tee shipped it before the placeholder existed. The control is
+    the same row with the withheld field list emptied, which is that tee's path."""
+    (line,) = _tee(detail, action="user.create")
+    monkeypatch.setattr(audit_tee, "_WITHHELD_DETAIL_FIELDS", frozenset())
+    (control,) = _tee(detail, action="user.create")
+    assert line == control
+    assert "<withheld>" not in line
 
 
 def test_an_observer_is_passed_the_rows_own_detail(monkeypatch) -> None:

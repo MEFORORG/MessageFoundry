@@ -112,6 +112,11 @@ _TEE_FAILURE_LOGGED = False
 #: keeps (``store.store.audit_genesis_detail``). The row keeps it, behind the audit read gates; the
 #: tee's copy does not. ``tests/test_audit_tee_recovery_wrap.py`` holds this name to the writer's.
 _WITHHELD_DETAIL_FIELDS = frozenset({"recovery_wrap"})
+#: The action of the audit chain's genesis and range rows, ``store.store.AUDIT_KEY_EPOCH_ACTION``,
+#: which only the engine writes. Only these rows' details are withheld from. A literal, since
+#: ``store.store`` imports this module; ``tests/test_audit_tee_recovery_wrap.py`` holds it to the
+#: constant.
+_KEY_EPOCH_ACTION = "audit.key_epoch"
 #: What a withheld value ships as, so a reader sees the field exists.
 _DETAIL_WITHHELD = "<withheld>"
 #: What a ``detail`` ships as, whole, when withholding a field in it faults.
@@ -542,12 +547,14 @@ def emit_audit_tee(
     redacting here keeps the off-box guarantee independent of handler config and **identical across
     every backend**.
 
-    **A withheld field ships as a placeholder (owner ruling 2026-11-22).** Where ``detail`` is
-    JSON holding a key in :data:`_WITHHELD_DETAIL_FIELDS` in an object it nests, that key's value
-    ships as ``<withheld>``, before the passes below read it. At least the genesis row of a store
-    minted under ``[store].key_provider = "host"`` holds one, ``recovery_wrap``. The row in
-    ``audit_log`` keeps the value, and the observers are passed it. :func:`_withhold_detail` names
-    at least what it does not match, and says what a fault there ships.
+    **A withheld field ships as a placeholder (owner ruling 2026-11-22).** On a row whose
+    ``action`` is :data:`_KEY_EPOCH_ACTION`, which only the engine writes, where ``detail`` is JSON
+    holding a key in :data:`_WITHHELD_DETAIL_FIELDS` in an object it nests, that key's value ships
+    as ``<withheld>``, before the passes below read it. The genesis row of a store minted under
+    ``[store].key_provider = "host"`` holds one, ``recovery_wrap``. The row in ``audit_log`` keeps
+    the value, and the observers are passed it. :func:`_withhold_detail` names at least what it
+    does not match, and says what a fault there ships. Any other row's ``detail`` is not read for
+    this, so it ships as it did before the placeholder existed.
 
     **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
     ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``
@@ -610,12 +617,16 @@ def emit_audit_tee(
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
-    # The line copies the row's detail with any withheld field's value replaced, before any other
-    # pass reads it; the observers below are passed the row's own.
-    try:
-        tee_detail = _withhold_detail(detail)
-    except Exception:  # noqa: BLE001 - its fault warning can raise; the row is already committed
-        tee_detail = _DETAIL_WITHHELD_WHOLE
+    # On the engine's key epoch rows only, the line copies the row's detail with any withheld
+    # field's value replaced, before any other pass reads it. Every other row's detail is not
+    # parsed here, so text a client writes cannot change its copy. The observers below are passed
+    # the row's own.
+    tee_detail = detail
+    if action == _KEY_EPOCH_ACTION:
+        try:
+            tee_detail = _withhold_detail(detail)
+        except Exception:  # noqa: BLE001 - its fault warning can raise; the row is committed
+            tee_detail = _DETAIL_WITHHELD_WHOLE
     # safe_text(head) + note is safe_text(tee_detail); the note is kept for a scrubbed detail.
     head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
     old_detail = safe_text(head) + note
