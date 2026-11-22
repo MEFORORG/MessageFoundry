@@ -248,10 +248,10 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   refused (the delimiter-class rule below).
 - **The delivery seam** `RegistryRunner._hydrate_payload` runs **before** `connector.send` on both the
   single-item (`_process_delivery_item`) and batch (`_process_delivery_batch`, per member) paths. A cheap
-  gate (`may_hold_doc_ref`: the `DOC_REF_MARKER` substring, or an `MSH-1`/`MSH-2` that names a character
-  of the marker and so escapes it, BACKLOG #5099) short-circuits the common no-handle case to a
-  **byte-identical** passthrough with **no store read** — so below-threshold, no-detach, and Handler-built (never-detached)
-  deliveries are unchanged. When a handle is present it hydrates via `reattach_documents_in_hl7` with an
+  gate (`may_hold_doc_ref`: the `DOC_REF_MARKER` substring, or a header line whose fields 1 and 2 name a
+  character of the marker and so escape it, BACKLOG #5099, #5972) short-circuits the common no-handle case to a
+  **byte-identical** passthrough with **no store read**. A payload the gate opens on is judged by
+  the re-attach, and can be refused even when it holds no handle (below). When a handle is present it hydrates via `reattach_documents_in_hl7` with an
   async reader over `store.read_attachment` (off the event loop, chunk-by-chunk). **Fail-loud:** a missing
   attachment the message holds whose read then fails (`KeyError`, or `StreamingAttachmentsUnsupported`
   at read time) is turned into a retryable `DeliveryError` — exactly like the
@@ -354,8 +354,8 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   the dry-run and the loopback re-ingress run too), and by the detach before it judges the claim
   (`InboundDocRefError`), since a handle in an `OBX-5.5` the header hides is not read as one.
   Each such check looks for the marker in as many distinct forms as later headers' delimiters
-  give, up to a limit that falls with the body's size to a floor
-  (`binary._later_header_forms_limit`). A body whose later headers give more, and whose first
+  give, up to a fixed limit, whatever the body's size
+  (`binary._LATER_HEADER_FORMS_LIMIT`). A body whose later headers give more, and whose first
   line's forms are not found, is refused without those scans, so the check stays linear in the
   body: at least by both listeners, the dry-run and the loopback re-ingress under such a
   header (`HEADER_FORMS_REFUSED_REASON`), and by the streaming detach, under such a
@@ -364,13 +364,12 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   loopback re-ingress refuse a body past that limit under any other header too, whatever it
   holds (`binary.later_header_forms_over_limit`, the same reason), because the delivery
   re-attach looks for each later header's form with a scan of the payload on every attempt. The
-  re-attach bounds its own scans at that limit taken at half the payload's length
-  (`binary._reattach_forms_limit`), so a
-  payload up to twice its received body's length is not refused for a count the listeners
-  admitted, and refuses a payload past it (`UnreattachableDocumentError`): at least a payload a
-  Handler built or grew past that, and an edit-and-resend's outbound body, which meets no
-  listener check. The upload resend and the edit-resend re-route run the same listener check
-  (`admit_resubmitted_body`). A
+  re-attach bounds its own scans at the same limit and refuses a payload past it
+  (`UnreattachableDocumentError`). The count is read from the header lines alone, which the
+  detach does not change, so a skeleton the detach grew is not refused for a count the
+  listeners admitted; a payload a Handler built can be. The upload resend and both edit-resend
+  paths run the same listener check (`admit_resubmitted_body`), the direct path on a body that
+  parses as HL7. A
   body with no `MSH` never reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a

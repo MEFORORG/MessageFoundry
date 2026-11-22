@@ -4236,8 +4236,8 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
 #: the same status the upload route gives a non-text file. A body the listener could not have decoded,
-#: an HL7 body ``Peek.parse`` refuses, or one a ``validation.strict`` inbound's strict hl7apy validation
-#: refuses or times out on, is 422.
+#: an HL7 body ``Peek.parse`` or the document-marker check refuses, or one a ``validation.strict``
+#: inbound's strict hl7apy validation refuses or times out on, is 422.
 _INGRESS_GUARD_STATUS: dict[str, int] = {
     "size": 413,
     "type": 415,
@@ -8964,8 +8964,9 @@ def create_app(
                     await _audit_channel_denied(engine, identity, body.to, client_ip(request))
                     raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
                 # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
-                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling). They
-                # read nothing from the target, and where they sit in the order is ADR 0197
+                # only the engine-wide guards apply here (the NUL rule, the 16 MiB ceiling and, for an
+                # HL7 body, the document-marker check, BACKLOG #5972). They read nothing from the
+                # target, and where they sit in the order is ADR 0197
                 # Amendment D, "The order of the checks", which says what their refusal tells.
                 admitted = await _guard_resubmission(
                     engine,

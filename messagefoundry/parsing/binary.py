@@ -180,7 +180,7 @@ class InboundDocRefError(ValueError):
 
 class HeaderFormsLimitError(InboundDocRefError):
     """A received body's later headers give more distinct forms of the handle marker than the
-    detach looks for in a body of its size (:func:`_later_header_forms_limit`), so it does not
+    detach looks for (:data:`_LATER_HEADER_FORMS_LIMIT`), so it does not
     look for each in the text and refuses the body as if it held one (BACKLOG #5972). Each form costs a substring scan of the whole body, so
     looking for every one would make the check quadratic in the body. A subclass of
     :class:`InboundDocRefError`, so both listeners refuse it the same way. The text names no byte
@@ -436,11 +436,11 @@ _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 _SEGMENT_BREAKS = frozenset("\r\n")
 
 #: The re-attach's refusal of a payload whose later headers give more distinct forms of the
-#: handle marker than :func:`_later_header_forms_limit` allows for its size, so it does not look
-#: for each (BACKLOG #5972).
+#: handle marker than :data:`_LATER_HEADER_FORMS_LIMIT`, so it does not look for each (BACKLOG
+#: #5972).
 _TOO_MANY_HEADER_FORMS_TO_REATTACH = (
     "the later headers name delimiters that escape the document handle marker in more distinct "
-    "ways than are looked for in a payload of its size, so the re-attach cannot check it"
+    "ways than are looked for, so the re-attach cannot check it"
 )
 
 #: The re-attach's refusal of a payload whose later header names other delimiters than its
@@ -450,32 +450,29 @@ _MIXED_HEADER_HANDLE = (
     "handle marker as they escape it, so the re-attach cannot read that handle"
 )
 
-#: The fewest distinct forms of the handle marker, as the later headers of one body escape it,
-#: that the marker checks look for in its text, however large the body (BACKLOG #5972): the
+#: The most distinct forms of the handle marker, as the later headers of one body escape it,
+#: that the marker checks look for in its text, whatever its size (BACKLOG #5972): the
 #: listeners' shared check, the ingress detach and the delivery re-attach. Each form costs a
 #: substring scan of the whole body, the listeners' on the event loop and the re-attach's on
-#: every delivery attempt, so a body whose headers give more than
-#: :func:`_later_header_forms_limit` allows is judged without those scans and refused (fail
-#: closed), and each check stays linear in the body (:func:`later_header_forms_over_limit`,
-#: :func:`_reattach_forms_limit`). A form differs from the first
-#: line's only where a later header names other delimiters that escape a character of the
-#: marker, so an ordinary batch gives none.
+#: every delivery attempt, so a body whose headers give more is judged without those scans and
+#: refused (fail closed), and each check stays linear in the body
+#: (:func:`later_header_forms_over_limit`). The limit does not depend on the length, and the
+#: count is read from the header lines alone, which the detach does not change, so a skeleton
+#: the detach grew past its received body gives the re-attach the count the listeners
+#: admitted. A form differs from the first line's only where a later header names other
+#: delimiters that escape a character of the marker, so an ordinary batch gives none.
 _LATER_HEADER_FORMS_LIMIT = 4
-
-#: The characters of form scans a body may cost before the limit falls to
-#: :data:`_LATER_HEADER_FORMS_LIMIT`: a small body has every form looked for, as before.
-_MARKER_SCAN_BUDGET_CHARS = 64 * 1024 * 1024
 
 #: The verdict of the marker test the checks before the ACK share (:func:`_body_marker_verdict`):
 #: ``"held"`` when the text holds the marker in a form looked for, and ``"over-limit"`` when the
-#: later headers give more forms than :func:`_later_header_forms_limit` allows and none of the
+#: later headers give more forms than :data:`_LATER_HEADER_FORMS_LIMIT` and none of the
 #: first line's forms was found, so the rest were not looked for.
 MarkerVerdict = Literal["held", "over-limit"]
 
 #: The detach's refusal of a body whose later headers give more marker forms than it looks for.
 _TOO_MANY_HEADER_FORMS = (
     "the later headers name delimiters that escape the document handle marker in more distinct "
-    "ways than are looked for in a body of its size; refusing the body as if it held the marker"
+    "ways than are looked for; refusing the body as if it held the marker"
 )
 
 #: The re-attach's refusal of a handle in a payload whose header fills a delimiter it does not
@@ -554,8 +551,8 @@ def marker_under_colliding_delimiters(message: Message, text: str) -> bool:
 
     ``message`` is ``text`` parsed. For a header that does not collide the cost is the header
     read alone; otherwise up to two substring scans of ``text``, plus one per distinct marker form
-    a later header naming other delimiters gives, as many as :func:`_later_header_forms_limit`
-    allows for its size. A body whose later headers give more is refused without those scans
+    a later header naming other delimiters gives, at most :data:`_LATER_HEADER_FORMS_LIMIT`.
+    A body whose later headers give more is refused without those scans
     (fail closed), so the check stays linear in the body. A
     marker hidden behind a hex escape is not looked for, as in
     :func:`marker_under_base64_delimiters`."""
@@ -574,14 +571,14 @@ def colliding_marker_verdict(message: Message, text: str) -> MarkerVerdict | Non
     return _body_marker_verdict(message, text)
 
 
-def later_header_forms_over_limit(message: Message, text: str) -> bool:
-    """Whether the later header lines of ``message``, ``text`` parsed, give more distinct forms
-    of the handle marker than :func:`_later_header_forms_limit` allows for a body of
-    ``len(text)`` characters (BACKLOG #5972). ``ingress_guards.doc_ref_marker_refusal`` refuses
-    such a body before the ACK whatever its first header, because the delivery re-attach looks for
-    each form with a scan of the payload on every attempt (:func:`_reattach_forms_limit`). Reads
-    the parsed header fields only, at most one form past the limit, and scans no text."""
-    return _bounded_later_header_forms(message, _later_header_forms_limit(len(text))) is None
+def later_header_forms_over_limit(message: Message) -> bool:
+    """Whether the later header lines of ``message`` give more distinct forms of the handle
+    marker than :data:`_LATER_HEADER_FORMS_LIMIT` (BACKLOG #5972).
+    ``ingress_guards.doc_ref_marker_refusal`` refuses such a body before the ACK whatever its
+    first header, because the delivery re-attach looks for each form with a scan of the payload on
+    every attempt and refuses a payload past the same limit. Reads the parsed header fields only,
+    at most one form past the limit, and scans no text."""
+    return _bounded_later_header_forms(message) is None
 
 
 def may_hold_doc_ref(text: str) -> bool:
@@ -773,8 +770,8 @@ def iter_obx_documents(
     under ``MSH|~|`` no ``OBX-5.5`` reads, so a sender's handle there is not read as one. Both
     verdicts come before any ``OBX-5`` value is read: a body refused for its header has its
     received text scanned for the marker, up to two substring scans plus one per distinct form a
-    later header naming other delimiters gives, as many as :func:`_later_header_forms_limit`
-    allows for its size, and no value read or splice-scanned. A body whose later headers give more, and whose
+    later header naming other delimiters gives, at most :data:`_LATER_HEADER_FORMS_LIMIT`, and
+    no value read or splice-scanned. A body whose later headers give more, and whose
     first line's forms are not found, is refused without those scans, as
     :class:`HeaderFormsLimitError`, under any header the marker test runs under. A handle hidden behind a hex
     escape, which the engine never writes, is not looked for in the text, so under such a header
@@ -913,12 +910,12 @@ def _body_marker_verdict(message: Message, received: str) -> MarkerVerdict | Non
     the one marker test the detach and the colliding-header listener refusal share (BACKLOG
     #5099, #5972), as a :data:`MarkerVerdict`. The later headers' forms are each looked for once,
     as :func:`_later_header_markers` looks, while they number at most
-    :func:`_later_header_forms_limit` allows for its size; past it the verdict is
+    :data:`_LATER_HEADER_FORMS_LIMIT`; past it the verdict is
     ``"over-limit"`` without those scans (fail closed), so the test costs at most that many scans
     plus two, linear in the body however many headers it has, and reads the header fields once."""
     if _received_holds_marker(message, received):
         return "held"
-    forms = _bounded_later_header_forms(message, _later_header_forms_limit(len(received)))
+    forms = _bounded_later_header_forms(message)
     if forms is None:
         return "over-limit"
     return "held" if any(form in received for form in forms) else None
@@ -1121,31 +1118,11 @@ def _later_header_forms(message: Message) -> Iterator[str]:
         yield escaped
 
 
-def _later_header_forms_limit(text_len: int) -> int:
-    """How many later-header marker forms the marker checks look for in a body of
-    ``text_len`` characters, before the ACK and at the delivery re-attach: as many as :data:`_MARKER_SCAN_BUDGET_CHARS` of scans pays for, and
-    never fewer than :data:`_LATER_HEADER_FORMS_LIMIT` (BACKLOG #5972). A small body has every
-    form a real header could give looked for, so only a large one is refused for its count."""
-    return max(_LATER_HEADER_FORMS_LIMIT, _MARKER_SCAN_BUDGET_CHARS // max(text_len, 1))
-
-
-def _reattach_forms_limit(text_len: int) -> int:
-    """How many later-header marker forms the delivery re-attach looks for in a payload of
-    ``text_len`` characters: :func:`_later_header_forms_limit` at half that length (BACKLOG
-    #5972). The listeners measure their limit on the received body, and a delivery payload derived
-    from it can be longer, for example a re-encode that adds a closing CR, a handle in place of a
-    small document, or a field a Handler adds. The limit never rises with the length, so a payload
-    up to twice its received body's length is never refused here for a form count the listeners
-    admitted. Each form costs a scan of the payload, so a re-attach pays at most about twice the
-    listeners' scan budget per attempt."""
-    return _later_header_forms_limit(max(text_len // 2, 1))
-
-
-def _bounded_later_header_forms(message: Message, limit: int) -> list[str] | None:
-    """:func:`_later_header_forms` while they number at most ``limit``, or ``None`` once one
-    more is given, read no further (BACKLOG #5972)."""
-    forms = list(islice(_later_header_forms(message), limit + 1))
-    return None if len(forms) > limit else forms
+def _bounded_later_header_forms(message: Message) -> list[str] | None:
+    """:func:`_later_header_forms` while they number at most :data:`_LATER_HEADER_FORMS_LIMIT`,
+    or ``None`` once one more is given, read no further (BACKLOG #5972)."""
+    forms = list(islice(_later_header_forms(message), _LATER_HEADER_FORMS_LIMIT + 1))
+    return None if len(forms) > _LATER_HEADER_FORMS_LIMIT else forms
 
 
 def _later_header_markers(message: Message, text: str) -> set[str]:
@@ -1157,16 +1134,14 @@ def _later_header_markers(message: Message, text: str) -> set[str]:
     a batch of many headers naming the same delimiters costs one scan of the text, not one per
     header.
 
-    The forms are bounded: at most :func:`_reattach_forms_limit` allows for ``len(text)``, so
-    this costs at most that many substring scans of ``text``, and reads at most one form past it.
-    Past the limit it raises :class:`UnreattachableDocumentError` without those scans (fail
-    closed), and the row dead-letters as its payload's own refusal. The checks before the ACK
-    refuse a received body past :func:`_later_header_forms_limit` at its own length
-    (:func:`later_header_forms_over_limit`), so a payload no longer than twice its received body
-    is not refused here. At least these can still
-    be: a payload a Handler built or grew past that, and an edit-and-resend's outbound body, which
-    meets no listener check."""
-    forms = _bounded_later_header_forms(message, _reattach_forms_limit(len(text)))
+    The forms are bounded at :data:`_LATER_HEADER_FORMS_LIMIT`, so this costs at most that many
+    substring scans of ``text``, and reads at most one form past it. Past the limit it raises
+    :class:`UnreattachableDocumentError` without those scans (fail closed), and the row
+    dead-letters as its payload's own refusal. The checks before the ACK refuse a body past the
+    same limit (:func:`later_header_forms_over_limit`), so a payload whose header lines are its
+    received body's is not refused here; a payload a Handler built, or gave other header lines,
+    can be."""
+    forms = _bounded_later_header_forms(message)
     if forms is None:
         raise UnreattachableDocumentError(_TOO_MANY_HEADER_FORMS_TO_REATTACH)
     return {form for form in forms if form in text}

@@ -337,6 +337,26 @@ async def test_edit_resend_direct_with_a_nul_is_refused(engine: Engine, tmp_path
     assert row is not None and row[0] == 0
 
 
+async def test_edit_resend_direct_past_the_header_form_limit_is_refused(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # BACKLOG #5972: an HL7 body on the direct path meets the listeners' document-marker check, so
+    # one whose later headers escape the handle marker in more ways than are looked for answers
+    # 422 rather than being committed and dead-lettered at the re-attach.
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
+
+    headers = "".join(
+        f"BHS|:~{chr(0x4E00 + index)}&|A\r" for index in range(_LATER_HEADER_FORMS_LIMIT + 1)
+    )
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path)))
+    mid, r = await _edit_resend(
+        engine,
+        {"raw": EDITED + f"NTE|1||{PHI_MARKER}\r" + headers, "idempotency_key": "k1", "to": "OB2"},
+    )
+    assert r.status_code == 422, r.text
+    await _assert_nothing_committed(engine, mid, r)
+
+
 async def test_upload_resend_into_a_binary_inbound_commits_carriage(
     engine: Engine, tmp_path: Path
 ) -> None:

@@ -2443,9 +2443,9 @@ def test_the_listener_check_scans_a_body_of_many_headers_a_bounded_number_of_tim
     """R1: the check looked for each distinct form a later header gave with its own scan of the
     whole body, on the event loop, so a 4 MB ``MSH|~|`` body of about 10,000 such headers took
     5.7 s; 9,990 is as many as the segment cap admits beside the rest. It now makes at most the
-    limit's scans plus two for a body of that size, and refuses such a body, as it could not look
-    for every form, with a reason that says so."""
-    from messagefoundry.parsing.binary import _later_header_forms_limit
+    limit's scans plus two, and refuses such a body, as it could not look for every form, with a
+    reason that says so."""
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
     from messagefoundry.parsing.peek import Peek
     from messagefoundry.pipeline.ingress_guards import (
         HEADER_FORMS_REFUSED_REASON,
@@ -2457,20 +2457,19 @@ def test_the_listener_check_scans_a_body_of_many_headers_a_bounded_number_of_tim
     counted = _counting(body)
     assert doc_ref_marker_refusal(Peek.parse(body), counted) == (HEADER_FORMS_REFUSED_REASON)
     # The floor shows the instrument saw the first line's scan, so the bound is not vacuous.
-    assert 1 <= counted.scans <= _later_header_forms_limit(len(body)) + 2
+    assert 1 <= counted.scans <= _LATER_HEADER_FORMS_LIMIT + 2
 
 
 @pytest.fixture
-def _floor_limit(monkeypatch: pytest.MonkeyPatch) -> int:
-    """Spend no scan budget, so the limit is its floor for a body of any size and a small test
-    body can sit on either side of it."""
+def _form_limit() -> int:
+    """The form limit, the same for a body of any size, so a small test body can sit on either
+    side of it."""
     from messagefoundry.parsing import binary
 
-    monkeypatch.setattr(binary, "_MARKER_SCAN_BUDGET_CHARS", 0)
     return binary._LATER_HEADER_FORMS_LIMIT
 
 
-def test_the_listener_check_looks_for_every_form_up_to_the_limit(_floor_limit: int) -> None:
+def test_the_listener_check_looks_for_every_form_up_to_the_limit(_form_limit: int) -> None:
     """R1: up to the limit every form is still looked for, so the verdict is the exact one; one
     form past it, the body is refused without the scans, and a marker the first line's forms find
     is still named as held, not as the limit."""
@@ -2481,7 +2480,7 @@ def test_the_listener_check_looks_for_every_form_up_to_the_limit(_floor_limit: i
         doc_ref_marker_refusal,
     )
 
-    limit = _floor_limit
+    limit = _form_limit
     at_limit = _TILDE_HEAD + _headers(limit)
     held = at_limit + f"NTE|1||{_form(limit - 1)}x\r"
     over = _TILDE_HEAD + _headers(limit + 1)
@@ -2497,26 +2496,25 @@ def test_the_listener_check_looks_for_every_form_up_to_the_limit(_floor_limit: i
         assert counted.scans == scans
 
 
-def test_a_small_body_has_every_header_form_looked_for() -> None:
-    """R1: the limit falls with the body's size, so a small body past the floor is still judged
-    exactly: with no marker it is accepted, and with the marker in its last header's form it is
-    refused as held."""
+def test_a_small_body_past_the_limit_is_refused_as_a_large_one_is() -> None:
+    """The limit does not depend on the body's length, so a small body past it is refused for its
+    count as a large one is, whether or not it holds the marker in a later header's form."""
     from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
     from messagefoundry.parsing.peek import Peek
     from messagefoundry.pipeline.ingress_guards import (
-        COLLIDING_DOC_REF_MARKER_REFUSED_REASON,
+        HEADER_FORMS_REFUSED_REASON,
         doc_ref_marker_refusal,
     )
 
     count = _LATER_HEADER_FORMS_LIMIT * 4
     clean = _TILDE_HEAD + _headers(count)
     held = clean + f"NTE|1||{_form(count - 1)}x\r"
-    assert doc_ref_marker_refusal(Peek.parse(clean), clean) is None
-    assert doc_ref_marker_refusal(Peek.parse(held), held) == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    for body in (clean, held):
+        assert doc_ref_marker_refusal(Peek.parse(body), body) == HEADER_FORMS_REFUSED_REASON
 
 
 def test_the_detach_refuses_a_body_of_too_many_header_forms_and_reads_one_at_the_limit(
-    _floor_limit: int,
+    _form_limit: int,
 ) -> None:
     """R1 at the detach, under ordinary delimiters where it alone looks: a body with a document
     and more forms than the limit is refused as :class:`HeaderFormsLimitError`, and at the limit
@@ -2524,7 +2522,7 @@ def test_the_detach_refuses_a_body_of_too_many_header_forms_and_reads_one_at_the
     and a marker the first line's forms find is refused as held."""
     from messagefoundry.parsing.binary import HeaderFormsLimitError
 
-    limit = _floor_limit
+    limit = _form_limit
     document = _hl7(_b64(10))
     at_limit = document + _headers(limit)
     assert [
@@ -2553,12 +2551,12 @@ def test_the_detach_refuses_a_body_of_too_many_header_forms_and_reads_one_at_the
     ids=["streaming-detach", "colliding-listener-check"],
 )
 async def test_the_mllp_listener_names_a_body_of_too_many_header_forms(
-    store: MessageStore, body: str, _floor_limit: int
+    store: MessageStore, body: str, _form_limit: int
 ) -> None:
     """R1: a body refused for more header forms than the limit, by the detach under ordinary
     delimiters or by the listeners' check under a colliding header, gets an AR that names the
     headers, not a marker, an ERROR row, and nothing stored or queued."""
-    assert _floor_limit < 5
+    assert _form_limit < 5
     ic = _streaming_ic()
     assert len(body) >= (ic.stream_threshold_bytes or 0)
     runner = _runner(store, ic)
@@ -2590,8 +2588,7 @@ def test_an_ordinary_header_body_past_the_form_limit_is_refused_by_the_shared_ch
     """The shared check returned ``None`` at once for a first header that does not collide, so a
     body of many later-header forms was ACKed and then cost one scan of the whole payload per
     form at every delivery attempt. It is now refused for its form count under any header, with
-    no scan of the text, at the limit's real size, not only at the floor."""
-    from messagefoundry.parsing.binary import _later_header_forms_limit
+    no scan of the text."""
     from messagefoundry.parsing.peek import Peek
     from messagefoundry.pipeline.ingress_guards import (
         HEADER_FORMS_REFUSED_REASON,
@@ -2599,13 +2596,12 @@ def test_an_ordinary_header_body_past_the_form_limit_is_refused_by_the_shared_ch
     )
 
     body = _lander_probe_body()
-    assert _later_header_forms_limit(len(body)) < 5_040
     counted = _counting(body)
     assert doc_ref_marker_refusal(Peek.parse(body), counted) == HEADER_FORMS_REFUSED_REASON
     assert counted.scans == 0
 
 
-def test_the_shared_check_keeps_its_verdict_at_or_under_the_limit(_floor_limit: int) -> None:
+def test_the_shared_check_keeps_its_verdict_at_or_under_the_limit(_form_limit: int) -> None:
     """At the limit an ordinary-header body is still accepted, and one past it is refused, with
     no scan of the text either way; later headers naming the first line's delimiters give no
     form at all, however many there are."""
@@ -2615,7 +2611,7 @@ def test_the_shared_check_keeps_its_verdict_at_or_under_the_limit(_floor_limit: 
         doc_ref_marker_refusal,
     )
 
-    limit = _floor_limit
+    limit = _form_limit
     same = "".join("BHS|^~\\&|A\r" for _ in range(limit * 3))
     for body, reason in (
         (_ORDINARY_HEAD + _headers(limit), None),
@@ -2628,7 +2624,7 @@ def test_the_shared_check_keeps_its_verdict_at_or_under_the_limit(_floor_limit: 
 
 
 async def test_the_mllp_listener_refuses_an_ordinary_header_body_past_the_form_limit(
-    store: MessageStore, _floor_limit: int
+    store: MessageStore, _form_limit: int
 ) -> None:
     """Past the limit under an ordinary first header, below the streaming threshold so no detach
     runs: an AR naming the headers, an ERROR row carrying the reason, and no ingress row. At the
@@ -2636,7 +2632,7 @@ async def test_the_mllp_listener_refuses_an_ordinary_header_body_past_the_form_l
     from messagefoundry.pipeline.ingress_guards import HEADER_FORMS_REFUSED_REASON
 
     ic = _streaming_ic()
-    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
+    over = _ORDINARY_HEAD + _headers(_form_limit + 1)
     assert len(over) < (ic.stream_threshold_bytes or 0)
     runner = _runner(store, ic)
 
@@ -2650,13 +2646,13 @@ async def test_the_mllp_listener_refuses_an_ordinary_header_body_past_the_form_l
     ]
     assert await _ingress_count(store, ic.name) == 0
 
-    at_limit = _ORDINARY_HEAD + _headers(_floor_limit)
+    at_limit = _ORDINARY_HEAD + _headers(_form_limit)
     assert _ack_code(await runner._handle_inbound(ic, at_limit.encode("utf-8"))) == "AA"
     assert await _ingress_count(store, ic.name) == 1
 
 
 async def test_the_http_listener_refuses_an_ordinary_header_body_past_the_form_limit(
-    store: MessageStore, _floor_limit: int
+    store: MessageStore, _form_limit: int
 ) -> None:
     """The same body on HTTP is refused as permanent, with an ERROR row and no ingress row; at the
     limit it is accepted."""
@@ -2665,14 +2661,14 @@ async def test_the_http_listener_refuses_an_ordinary_header_body_past_the_form_l
     ic = _streaming_ic()
     runner = _runner(store, ic)
 
-    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
+    over = _ORDINARY_HEAD + _headers(_form_limit + 1)
     receipt = await runner._handle_inbound_http(ic, over.encode("utf-8"))
 
     assert receipt.refusal is RefusalKind.PERMANENT
     assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
     assert await _ingress_count(store, ic.name) == 0
 
-    at_limit = _ORDINARY_HEAD + _headers(_floor_limit)
+    at_limit = _ORDINARY_HEAD + _headers(_form_limit)
     accepted = await runner._handle_inbound_http(ic, at_limit.encode("utf-8"))
     assert accepted.refusal is None
     assert await _ingress_count(store, ic.name) == 1
@@ -2693,7 +2689,7 @@ class _CountedForms:
 
 @pytest.mark.parametrize("count_over", [0, 1, 50], ids=["at-limit", "one-over", "far-over"])
 async def test_the_reattach_draws_at_most_one_form_past_the_limit(
-    monkeypatch: pytest.MonkeyPatch, _floor_limit: int, count_over: int
+    monkeypatch: pytest.MonkeyPatch, _form_limit: int, count_over: int
 ) -> None:
     """The re-attach looked for every later-header form with a scan of the payload. It now draws
     at most its limit's forms plus one, scans the text for at most its limit's, and refuses a
@@ -2703,7 +2699,7 @@ async def test_the_reattach_draws_at_most_one_form_past_the_limit(
 
     counter = _CountedForms(binary._later_header_forms)
     monkeypatch.setattr(binary, "_later_header_forms", counter)
-    limit = _floor_limit
+    limit = _form_limit
     body = _ORDINARY_HEAD + _headers(limit + count_over)
     counted = _counting(body)
     if count_over:
@@ -2721,28 +2717,27 @@ async def test_the_reattach_draws_at_most_one_form_past_the_limit(
 async def test_the_reattach_bounds_the_lander_probe_at_its_real_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The probe body itself, at the limit its size gives, with no budget patched: the re-attach
-    draws at most one form past that limit and makes no scan per form."""
+    """The probe body itself: the re-attach draws at most one form past the limit and makes no
+    scan per form."""
     from messagefoundry.parsing import binary
     from messagefoundry.parsing.binary import (
+        _LATER_HEADER_FORMS_LIMIT,
         UnreattachableDocumentError,
-        _reattach_forms_limit,
         reattach_documents_in_hl7,
     )
 
     counter = _CountedForms(binary._later_header_forms)
     monkeypatch.setattr(binary, "_later_header_forms", counter)
     body = _lander_probe_body()
-    assert _reattach_forms_limit(len(body)) < 5_040
     counted = _counting(body)
     with pytest.raises(UnreattachableDocumentError, match="more distinct ways"):
         await reattach_documents_in_hl7(counted, _no_read, bound=frozenset())
     assert counted.scans == 0
-    assert counter.drawn <= _reattach_forms_limit(len(body)) + 1
+    assert counter.drawn <= _LATER_HEADER_FORMS_LIMIT + 1
 
 
 async def test_a_handler_built_payload_past_the_form_limit_dead_letters_at_delivery(
-    store: MessageStore, _floor_limit: int
+    store: MessageStore, _form_limit: int
 ) -> None:
     """A payload that never met the listeners' check, as a Handler's child or an edit-and-resend
     body, is judged at the re-attach: past the limit it is the payload's own refusal and
@@ -2752,7 +2747,7 @@ async def test_a_handler_built_payload_past_the_form_limit_dead_letters_at_deliv
     col = _Collector()
     runner._destinations[DEST] = col  # type: ignore[assignment]
 
-    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
+    over = _ORDINARY_HEAD + _headers(_form_limit + 1)
     assert may_hold_doc_ref(over)
     _mid, rows = await _deliver(store, runner, over)
     assert _dead_lettered_at_once(rows)
@@ -2766,40 +2761,109 @@ async def test_a_handler_built_payload_past_the_form_limit_dead_letters_at_deliv
 
 
 def test_a_payload_longer_than_a_body_the_listeners_admitted_is_not_refused_for_its_forms(
-    monkeypatch: pytest.MonkeyPatch,
+    _form_limit: int,
 ) -> None:
-    """Review round-158ac8b0: the limit falls with the length, so a re-attach measured on a
-    delivery payload one character longer than its received body refused a form count the
-    listeners had admitted. With a budget small enough to put the limit above its floor, a body
-    at the listeners' limit is admitted, and a payload up to twice as long holding it re-attaches;
-    one past the re-attach's own limit is refused."""
+    """Review round-158ac8b0: the limit fell with the length, so a re-attach measured on a
+    delivery payload longer than its received body refused a form count the listeners had
+    admitted. The limit no longer reads the length: a body at the limit is admitted, a payload
+    many times as long holding the same headers re-attaches, and one past the limit is refused."""
     import asyncio
 
-    from messagefoundry.parsing import binary
     from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
     from messagefoundry.parsing.peek import Peek
     from messagefoundry.pipeline.ingress_guards import doc_ref_marker_refusal
 
-    # An odd limit: twice the limit, floored, at twice the length would fall one short of it.
-    probe = _ORDINARY_HEAD + _headers(9)
-    monkeypatch.setattr(binary, "_MARKER_SCAN_BUDGET_CHARS", 9 * len(probe))
-    limit = binary._later_header_forms_limit(len(probe))
-    assert limit == 9 > binary._LATER_HEADER_FORMS_LIMIT
+    probe = _ORDINARY_HEAD + _headers(_form_limit)
     assert doc_ref_marker_refusal(Peek.parse(probe), probe) is None
-    doubled = probe + "NTE|1||" + "y" * (len(probe) - 9) + "\r"
-    for payload in (probe + "NTE|1||x\r", doubled):
-        assert len(payload) <= 2 * len(probe)
-        assert asyncio.run(reattach_documents_in_hl7(payload, _no_read, bound=frozenset())) == (
-            payload
-        )
-    past = _ORDINARY_HEAD + _headers(2 * binary._later_header_forms_limit(len(probe)) + 1)
-    assert len(past) > len(probe)
+    grown = probe + "NTE|1||" + "y" * (64 * len(probe)) + "\r"
+    assert asyncio.run(reattach_documents_in_hl7(grown, _no_read, bound=frozenset())) == grown
+    past = _ORDINARY_HEAD + _headers(_form_limit + 1)
     with pytest.raises(UnreattachableDocumentError, match="more distinct ways"):
         asyncio.run(reattach_documents_in_hl7(past, _no_read, bound=frozenset()))
 
 
+def _tiny_documents_body(forms: int, control_id: str, count: int = 2_000) -> str:
+    """``count`` OBX segments, each an ED Base64 value of four characters, which the detach swaps
+    for a handle some twenty times as long, then ``forms`` later headers that each give a distinct
+    marker form."""
+    head = (
+        f"MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||MDM^T02|{control_id}|P|2.5\r"
+        "EVN|T02|20260101120000\r"
+    )
+    documents = "".join(
+        f"OBX|{occ}|ED|PDF||^Application^PDF^Base64^QQ==||||||F\r" for occ in range(1, count + 1)
+    )
+    return head + documents + _headers(forms)
+
+
+async def _ack_then_deliver(
+    store: MessageStore, runner: RegistryRunner, ic: InboundConnection, body: str
+) -> tuple[str | None, list]:
+    """Send ``body`` to the streaming listener; once it is ACKed, carry the committed skeleton
+    through the router and transform stages to ``DEST`` and deliver it once. Returns the ACK
+    code and the outbound rows, none where the listener refused the body."""
+    code = _ack_code(await runner._handle_inbound(ic, body.encode("utf-8")))
+    if code != "AA":
+        return code, []
+    ingress = await store.claim_next_fifo(ic.name, stage="ingress")
+    assert ingress is not None
+    skeleton, mid = ingress.payload, ingress.message_id
+    # The probe's shape: the detach grew the skeleton past twice the body the listener judged.
+    assert len(skeleton) > 2 * len(body)
+    assert await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=mid,
+        channel_id=ic.name,
+        handlers=[("h", skeleton)],
+        disposition=MessageStatus.ROUTED,
+    )
+    routed = await store.claim_next_fifo(ic.name, stage="routed")
+    assert routed is not None and routed.message_id == mid
+    await store.transform_handoff(
+        routed_id=routed.id,
+        message_id=mid,
+        channel_id=ic.name,
+        deliveries=[(DEST, skeleton)],
+        pt_deliveries=[],
+    )
+    await _deliver_queued(store, runner, mid)
+    return code, list(await store.outbox_for(mid))
+
+
+async def test_a_body_the_listener_acks_is_never_refused_for_its_forms_after_a_detach_grew_it(
+    store: MessageStore,
+) -> None:
+    """Review of d58d873ae09: with a low ``stream_threshold_bytes`` and many tiny ED values the
+    detach grew the skeleton past twice its received body, so the re-attach's limit, taken at half
+    the payload's length, fell below the count the listener had admitted, and an ACKed body
+    dead-lettered. The limit is now one number for both, read from header lines the detach does
+    not change: a body the listener ACKs delivers, and one past the limit is refused before the
+    ACK."""
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
+
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    # 550 forms in a body of about 110,000 characters, whose skeleton is about 280,000.
+    code, rows = await _ack_then_deliver(store, runner, ic, _tiny_documents_body(550, "MSGPROBE"))
+    # The guarantee itself, checked before the refusal, so a limit that still falls with the
+    # length fails here, as the probe did, with the ACKed body dead-lettered.
+    if code == "AA":
+        assert [str(r["status"]) for r in rows] == [OutboxStatus.DONE.value]
+    assert code == "AR"
+
+    code, rows = await _ack_then_deliver(
+        store, runner, ic, _tiny_documents_body(_LATER_HEADER_FORMS_LIMIT, "MSGATLIMIT")
+    )
+    assert code == "AA"
+    assert [str(r["status"]) for r in rows] == [OutboxStatus.DONE.value]
+    assert len(col.deliveries) == 1 and DOC_REF_MARKER not in col.deliveries[0]
+
+
 def test_the_dry_run_and_the_re_ingress_refuse_an_ordinary_header_body_past_the_form_limit(
-    _floor_limit: int,
+    _form_limit: int,
 ) -> None:
     """The dry-run and the loopback re-ingress run the shared check, so they refuse the body the
     listeners refuse, with the same reason, and accept one at the limit."""
@@ -2809,8 +2873,8 @@ def test_the_dry_run_and_the_re_ingress_refuse_an_ordinary_header_body_past_the_
     reg = Registry()
     reg.add_inbound(_plain_ic())
     reg.add_router("r", lambda m: [])
-    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
-    at_limit = _ORDINARY_HEAD + _headers(_floor_limit)
+    over = _ORDINARY_HEAD + _headers(_form_limit + 1)
+    at_limit = _ORDINARY_HEAD + _headers(_form_limit)
 
     result = dry_run(reg, over.encode("utf-8"))
     assert result.disposition is MessageStatus.ERROR
@@ -2822,7 +2886,7 @@ def test_the_dry_run_and_the_re_ingress_refuse_an_ordinary_header_body_past_the_
 
 
 def test_a_resubmitted_body_past_the_form_limit_is_refused_before_it_is_committed(
-    _floor_limit: int,
+    _form_limit: int,
 ) -> None:
     """The upload resend and the edit-resend re-route admit a body through
     ``admit_resubmitted_body``, which ran the listeners' parse but not their marker check, so a
@@ -2833,13 +2897,35 @@ def test_a_resubmitted_body_past_the_form_limit_is_refused_before_it_is_committe
         admit_resubmitted_body,
     )
 
-    over = _ORDINARY_HEAD + _headers(_floor_limit + 1)
+    over = _ORDINARY_HEAD + _headers(_form_limit + 1)
     with pytest.raises(IngressGuardError) as caught:
         admit_resubmitted_body(over, _plain_ic())
     assert caught.value.phase == "ingest"
     assert str(caught.value) == HEADER_FORMS_REFUSED_REASON
-    at_limit = _ORDINARY_HEAD + _headers(_floor_limit)
+    at_limit = _ORDINARY_HEAD + _headers(_form_limit)
     assert admit_resubmitted_body(at_limit, _plain_ic()) == at_limit
+
+
+def test_the_edit_resend_direct_path_refuses_a_body_past_the_form_limit(_form_limit: int) -> None:
+    """Review of d58d873ae09, finding 4: the edit-resend direct path (``to=``, no inbound) ran
+    only the NUL rule and the ceiling, so a body past the form limit was committed to an outbound
+    row and dead-lettered at the re-attach. It now meets the listeners' check where it parses as
+    HL7; a body at the limit, and one that is not HL7, are returned as they came."""
+    from messagefoundry.pipeline.ingress_guards import (
+        HEADER_FORMS_REFUSED_REASON,
+        IngressGuardError,
+        admit_resubmitted_body,
+    )
+
+    over = _ORDINARY_HEAD + _headers(_form_limit + 1)
+    with pytest.raises(IngressGuardError) as caught:
+        admit_resubmitted_body(over, None)
+    assert caught.value.phase == "ingest"
+    assert str(caught.value) == HEADER_FORMS_REFUSED_REASON
+    at_limit = _ORDINARY_HEAD + _headers(_form_limit)
+    assert admit_resubmitted_body(at_limit, None) == at_limit
+    not_hl7 = '{"note": "' + DOC_REF_MARKER + '"}'
+    assert admit_resubmitted_body(not_hl7, None) == not_hl7
 
 
 def test_the_api_answers_a_marker_refused_resubmission_with_422() -> None:

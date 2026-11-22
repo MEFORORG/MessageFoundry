@@ -79,6 +79,7 @@ from messagefoundry.parsing.binary import (
     is_marked,
     later_header_forms_over_limit,
     marker_under_base64_delimiters,
+    may_hold_doc_ref,
 )
 from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.message import Message
@@ -160,7 +161,7 @@ COLLIDING_DOC_REF_MARKER_REFUSED_REASON = (
 )
 
 #: The stored reason for an HL7 body whose later headers escape the handle marker in more
-#: distinct ways than the checks look for in a body of its size, under any first header, so it
+#: distinct ways than the checks look for, under any first header, so it
 #: is refused without a scan per form (BACKLOG #5972): under a header whose filled default
 #: collides, where the first line's forms are not found, and under any other header whatever it
 #: holds, since the delivery re-attach would look for each. It names no byte of the body.
@@ -184,7 +185,7 @@ def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
     may not read as one
     (:func:`~messagefoundry.parsing.binary.marker_under_colliding_delimiters`, BACKLOG #5972),
     and, under any header, one whose later headers give more distinct forms of the marker than
-    are looked for in a body of its size
+    are looked for
     (:func:`~messagefoundry.parsing.binary.later_header_forms_over_limit`, BACKLOG #5972), so the
     delivery re-attach never scans a received body once per form past that limit. Pure, so both
     listeners, the loopback re-ingress and the dry-run run the one check."""
@@ -198,7 +199,7 @@ def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
         return HEADER_FORMS_REFUSED_REASON
     # Under a colliding header the verdict above already counted the forms, within the limit
     # here, so only another header's are counted: from the parsed fields, with no text scan.
-    if not message._delimiters_collide() and later_header_forms_over_limit(message, text):
+    if not message._delimiters_collide() and later_header_forms_over_limit(message):
         return HEADER_FORMS_REFUSED_REASON
     return None
 
@@ -661,6 +662,19 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     return text
 
 
+def _raise_if_marker_refused(peek: Peek, text: str) -> None:
+    """Raise the ``ingest`` refusal where :func:`doc_ref_marker_refusal` refuses ``text``. It reads
+    the header too, so a read fault refuses as the listeners record one; neither reason names a
+    byte of the body."""
+    refused: str | None
+    try:
+        refused = doc_ref_marker_refusal(peek, text)
+    except PEEK_READ_FAULTS:
+        refused = _MARKER_CHECK_FAULT_REASON
+    if refused is not None:
+        raise IngressGuardError(refused, phase="ingest")
+
+
 def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     """Admit an operator-resubmitted body the way the inbound ``ic`` admits a sender's (BACKLOG #1911).
 
@@ -688,8 +702,10 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
 
     ``ic`` is ``None`` only on the edit-resend direct path, which writes an outbound row and so has no
     inbound to guard for; a re-route whose origin inbound is not registered is refused with a 409
-    before this runs. Only the engine-wide rules apply then, the NUL rule and the engine ceiling, and
-    ``raw`` is returned as is. Strict validation is an inbound's setting, so it never applies there
+    before this runs. Only the engine-wide rules apply then, the NUL rule and the engine ceiling,
+    and, for a body that parses as HL7 and that the delivery re-attach's gate opens on
+    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), the **ingest** check; ``raw`` is
+    returned as is. Strict validation is an inbound's setting, so it never applies there
     either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
     rule is ``docs/SECURITY.md`` control 5), so the ceiling is a backstop.
 
@@ -702,6 +718,16 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         if "\x00" in raw:
             raise IngressNulRejected()
         _raise_if_oversize(len(raw))
+        # The delivery re-attach judges a payload its gate opens on, so one that parses as HL7
+        # meets the listeners' document-marker refusal here, rather than being committed and then
+        # dead-lettered (BACKLOG #5972). A body that does not parse is left to the outbound.
+        if not may_hold_doc_ref(raw):
+            return raw
+        try:
+            peek = Peek.parse(raw, max_bytes=DEFAULT_MAX_MESSAGE_BYTES)
+        except HL7PeekError:
+            return raw
+        _raise_if_marker_refused(peek, raw)
         return raw
     # The reason a caught error refused the body, raised once its handler has ended.
     refused: str | None = None
@@ -747,14 +773,8 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             raise IngressGuardError(refused, phase="parse")
         # The listeners' document-marker refusal, after the parse as they run it, so a resubmitted
         # body they would refuse is not committed and then refused by every outbound's re-attach
-        # (BACKLOG #5972). It reads the header too, so a read fault refuses here as the listeners
-        # record one; neither reason names a byte of the body.
-        try:
-            refused = doc_ref_marker_refusal(peek, text)
-        except PEEK_READ_FAULTS:
-            refused = _MARKER_CHECK_FAULT_REASON
-        if refused is not None:
-            raise IngressGuardError(refused, phase="ingest")
+        # (BACKLOG #5972).
+        _raise_if_marker_refused(peek, text)
     else:
         check_declared_type(ic, text_sniff_head(text))
     return text
