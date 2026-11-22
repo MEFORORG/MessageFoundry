@@ -45,7 +45,7 @@ from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.logging_setup import (
     _SHIPPED_READING_MAX_PASSES,
     AUDIT_LOGGER_NAME,
-    FinishedAuditLine,
+    _log_finished_audit_line,
     ensure_logger_sink,
     scrub_log_text,
     sink_readings,
@@ -357,9 +357,11 @@ def _finished_detail(detail: str) -> str:
     # safe_text(head) + note is safe_text(detail); the note is kept for a scrubbed detail.
     head, note = safe_text_bound(detail)
     bounded = safe_text(head) + note
+    # _scrub_field reads the whole window, so text past the 200-character bound, which never ships,
+    # can still hide a clean head here, as it does on the code before BACKLOG #5649. Left as it is:
+    # a name or credential can straddle the bound, and that reading is what catches its head.
     kept = _scrub_field(detail, detail=True)
-    # Judged against the bounded text, the only text that can ship: text past the bound neither
-    # reaches the line nor decides whether its head does.
+    # The bar in _finished is judged against the bounded text alone.
     candidate = bounded if kept is detail else _bounded_detail(kept, note, bounded)
     final = _finished("detail", bounded, candidate)
     if final == _FIELD_REDACTED:
@@ -369,21 +371,27 @@ def _finished_detail(detail: str) -> str:
     return final
 
 
-def _tee_line(record: dict[str, object]) -> FinishedAuditLine:
+def _tee_line(record: dict[str, object]) -> str:
     """``record`` as the finished line, no longer than the handler chain's redaction window.
 
     The chain bounded the whole line, and it no longer reads this one, so the bound moves here.
-    A line over the window has its longest text field cut, with the clamp's note, until it fits.
-    Each field stays present, so the line still parses and keeps its anchors."""
+    A line over the window has its longest text field, by length on the line, cut by
+    :func:`~messagefoundry.redaction.clamp_untrusted`, and this repeats until the line fits. That
+    cut falls at whitespace and appends its note, so a field with no whitespace before the cut
+    ships as the note alone. A field the cut cannot shorten ships as :data:`_FIELD_REDACTED`. If
+    the line is still over the window after one round per text field and one more, every text
+    field that is not ``None`` ships as :data:`_FIELD_REDACTED`. Each key stays present, so the
+    line still parses and keeps its anchors. A cut ``detail`` that was a JSON text may no longer
+    parse as JSON on its own."""
     fields = dict(record)
     for _ in range(len(_TEXT_FIELDS) + 1):
-        line = FinishedAuditLine(json.dumps(fields, ensure_ascii=False))
+        line = scrub_control_chars(json.dumps(fields, ensure_ascii=False))
         excess = len(line) - _REDACT_WINDOW
         if excess <= 0:
             return line
         # By length on the line, where one control can take six characters.
         spelled = {
-            k: len(FinishedAuditLine(json.dumps(fields[k], ensure_ascii=False)))
+            k: len(scrub_control_chars(json.dumps(fields[k], ensure_ascii=False)))
             for k in _TEXT_FIELDS
         }
         key = max(spelled, key=lambda k: spelled[k])
@@ -392,7 +400,7 @@ def _tee_line(record: dict[str, object]) -> FinishedAuditLine:
         cut = clamp_untrusted(value, window=keep)
         fields[key] = cut if len(cut) < len(value) else _FIELD_REDACTED
     hidden = {k: _FIELD_REDACTED for k in _TEXT_FIELDS if record[k] is not None}
-    return FinishedAuditLine(json.dumps({**record, **hidden}, ensure_ascii=False))
+    return scrub_control_chars(json.dumps({**record, **hidden}, ensure_ascii=False))
 
 
 def emit_audit_tee(
@@ -476,8 +484,9 @@ def emit_audit_tee(
     closing quote with it: a typed name of ``password=`` or ``a|b|c`` broke the document, and every
     handler re-ran them over the one shared record. So ``action``, ``actor``, ``channel_id``,
     ``client`` and ``detail`` each go through the same text passes here (:func:`_finished`), and
-    the line is a :class:`~messagefoundry.logging_setup.FinishedAuditLine`, which the handlers' text
-    passes leave alone on this logger. Its control characters are escaped when it is built, with
+    the line is logged through :func:`~messagefoundry.logging_setup._log_finished_audit_line`, the
+    one call whose message the handlers' text passes leave alone; that function says what the
+    check does not stop. Its control characters are escaped when it is built, with
     escapes valid inside a JSON string (:mod:`messagefoundry.controlchars`). A fault in the scrub
     hides the text fields whole and never ships them raw.
 
@@ -500,9 +509,10 @@ def emit_audit_tee(
 
     **Fields are read one at a time.** A pattern that would have needed text from two fields of
     the line no longer sees them together, so a value split across two fields is not redacted as
-    one. The line is bounded by :func:`_tee_line`. A field other than ``detail`` whose JSON
-    spelling passes the redaction window ships whole as ``[redacted]``. A reader that re-redacts the stored line as
-    text, such as ``GET /logs/tail`` or a support bundle, is outside this guarantee.
+    one. The line is bounded by :func:`_tee_line`. A field other than ``detail`` longer than the
+    redaction window ships whole as ``[redacted]``, clean text included, and at least one that
+    fits but whose JSON spelling passes the window can too. A reader that re-redacts the stored
+    line as text, such as ``GET /logs/tail`` or a support bundle, is outside this guarantee.
 
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
@@ -547,7 +557,7 @@ def emit_audit_tee(
         )
         # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
         ensure_logger_sink(audit_logger)
-        audit_logger.info(line)
+        _log_finished_audit_line(audit_logger, line)
     except Exception as exc:  # noqa: BLE001 — the audit row is durable; the off-box tee is best-effort
         # Once per process, and never naming the row (BACKLOG #1131). A line per failed row named
         # its action, and its COUNT tracked the rows, the hidden lock rows included; ``GET

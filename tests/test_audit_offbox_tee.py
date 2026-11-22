@@ -678,9 +678,12 @@ _BELOW_THE_OLD_LINE = (
 def _before_and_after(
     cases: list[dict[str, str | None]], capsys, monkeypatch
 ) -> tuple[list[str], list[str]]:
-    """Each case teed with the field scrub switched off, which is the code before #3045, then as
-    shipped. The log clock is frozen for both, so the two passes cannot straddle a second boundary
-    and differ in the formatter's timestamp (windows-2025, run 44112472272)."""
+    """Each case as the code before #3045 shipped it, then as shipped now. The first pass turns off
+    the field scrub, the ``_finished`` bar and the finished-line skip, so the record is one plain
+    JSON string that the handler filters read as text. Turning off the scrub alone left the bar
+    on both sides, and these guards then could not see the bar removed (BACKLOG #5649). The log
+    clock is frozen for both, so the two passes cannot straddle a second boundary and differ in
+    the formatter's timestamp (windows-2025, run 44112472272)."""
     real_factory = logging.getLogRecordFactory()
 
     def frozen(*args: object, **kwargs: object) -> logging.LogRecord:
@@ -690,10 +693,16 @@ def _before_and_after(
 
     logging.setLogRecordFactory(frozen)
     try:
-        real = audit_tee._scrub_field
-        monkeypatch.setattr(audit_tee, "_scrub_field", lambda value, **_kw: value)
-        before = _tee_lines(cases, capsys)
-        monkeypatch.setattr(audit_tee, "_scrub_field", real)
+        with monkeypatch.context() as old_code:
+            old_code.setattr(audit_tee, "_scrub_field", lambda value, **_kw: value)
+            old_code.setattr(audit_tee, "_finished", lambda _key, written, _scrubbed: written)
+            old_code.setattr(
+                audit_tee, "_tee_line", lambda record: json.dumps(record, ensure_ascii=False)
+            )
+            old_code.setattr(
+                audit_tee, "_log_finished_audit_line", lambda logger, line: logger.info(line)
+            )
+            before = _tee_lines(cases, capsys)
         return before, _tee_lines(cases, capsys)
     finally:
         logging.setLogRecordFactory(real_factory)
@@ -805,16 +814,27 @@ def test_the_values_the_fifth_review_measured_hide_no_less_than_before(
         'q"uote',
     ],
 )
-def test_a_value_with_no_c0_control_ships_byte_identical(value: str, capsys, monkeypatch) -> None:
-    """The C0 field scrub leaves a field with no C0 control to :func:`_finished`, so switching it
-    off changes no line; a domain account's backslash is not read as an escape. Synthetic."""
+def test_a_value_with_no_c0_control_ships_as_the_old_line_did(
+    value: str, capsys, monkeypatch
+) -> None:
+    """A field with no C0 control ships byte-identical to the line before #3045, and a domain
+    account's backslash is not read as an escape. The one allowed difference is a line the old
+    filters broke, the defect BACKLOG #5649 fixes: the new line must parse and show no word the
+    old line hid. Synthetic values."""
     cases: list[dict[str, str | None]] = [
         {"actor": value},
         {"detail": value},
         {"detail": json.dumps({"user": value})},
     ]
     before, after = _before_and_after(cases, capsys, monkeypatch)
-    assert after == before
+    for old, new in zip(before, after, strict=True):
+        if new == old:
+            continue
+        assert not audit_tee._parses(_tee_line(old)), (old, new)
+        json.loads(_tee_line(new))
+        old_words = set(_WORD.findall(_ESCAPE_TEXT.sub(" ", old)))
+        new_words = set(_WORD.findall(_ESCAPE_TEXT.sub(" ", new)))
+        assert not [w for w in _WORD.findall(value) if w in new_words - old_words], (old, new)
 
 
 def test_a_reading_that_hides_one_of_two_equal_words_is_seen() -> None:
@@ -1407,26 +1427,86 @@ def test_no_sink_carries_what_the_general_log_removes(
 
 
 def test_only_the_tee_line_skips_the_text_filters(capsys) -> None:
-    """The bypass must not be reachable by text: a plain string on the audit logger, a finished
-    line on another logger, and a finished line with arguments are all still redacted."""
-    from messagefoundry.logging_setup import FinishedAuditLine
+    """The bypass must not be reachable by text: a plain string on the audit logger, the in-flight
+    line on another logger, and the in-flight line with arguments are all still redacted."""
+    from messagefoundry.logging_setup import _finished_line_in_flight
 
+    other_logger_line, with_args = "password=hunter3", "%s"
     with _handlerless_process():
         configure_logging("INFO", fmt="text")
         capsys.readouterr()
         audit_tee.audit_logger.info('{"actor": "password=hunter2"}')
-        logging.getLogger("messagefoundry.other").warning(FinishedAuditLine("password=hunter3"))
-        audit_tee.audit_logger.info(FinishedAuditLine("%s"), "password=hunter4")
+        token = _finished_line_in_flight.set(other_logger_line)
+        try:
+            logging.getLogger("messagefoundry.other").warning(other_logger_line)
+        finally:
+            _finished_line_in_flight.reset(token)
+        token = _finished_line_in_flight.set(with_args)
+        try:
+            audit_tee.audit_logger.info(with_args, "password=hunter4")
+        finally:
+            _finished_line_in_flight.reset(token)
     out = capsys.readouterr().out
     assert out.count("<redacted>") == 3, out
     for leaked in ("hunter2", "hunter3", "hunter4"):
         assert leaked not in out
 
 
-def test_a_finished_line_stays_one_physical_line_of_escaped_text() -> None:
-    from messagefoundry.logging_setup import FinishedAuditLine
+def test_a_forged_finished_line_is_redacted_by_the_real_filters(capsys) -> None:
+    """BACKLOG #5649: no type or attribute grants the skip. A str subclass, one carrying a copied
+    marker attribute, an equal copy logged while the real line is in flight, and the real object
+    logged again afterwards all reach the filters as text. The control is the tee's own call,
+    which the filters do skip, so the assertions can differ. Synthetic values."""
+    from messagefoundry.logging_setup import _finished_line_in_flight, _log_finished_audit_line
 
-    line = FinishedAuditLine(json.dumps({"a": f"x{chr(0x7F)}y{chr(0x2028)}z"}, ensure_ascii=False))
+    class Subclass(str):
+        __slots__ = ()
+
+    class CopiedAttribute(str):
+        in_flight = _finished_line_in_flight
+
+    genuine = '{"actor": "password=hunter5"}'
+    with _handlerless_process():
+        configure_logging("INFO", fmt="text")
+        capsys.readouterr()
+        _log_finished_audit_line(audit_tee.audit_logger, genuine)
+        control = capsys.readouterr().out
+        audit_tee.audit_logger.info(Subclass('{"actor": "password=hunter7"}'))
+        audit_tee.audit_logger.info(CopiedAttribute('{"actor": "password=hunter8"}'))
+        audit_tee.audit_logger.info(genuine)  # the real object, once its call has returned
+        token = _finished_line_in_flight.set(genuine)
+        try:
+            equal = genuine[:5] + genuine[5:]
+            assert equal == genuine and equal is not genuine
+            audit_tee.audit_logger.info(equal)
+        finally:
+            _finished_line_in_flight.reset(token)
+    forged = capsys.readouterr().out
+    assert "hunter5" in control
+    assert forged.count("<redacted>") == 4, forged
+    for leaked in ("hunter5", "hunter7", "hunter8"):
+        assert leaked not in forged
+
+
+def test_the_finished_line_marker_is_not_a_public_name() -> None:
+    from messagefoundry import logging_setup
+
+    assert not hasattr(logging_setup, "FinishedAuditLine")
+    assert not [name for name in logging_setup.__all__ if "finished" in name.lower()]
+
+
+def test_a_finished_line_stays_one_physical_line_of_escaped_text() -> None:
+    from messagefoundry.logging_setup import _log_finished_audit_line
+
+    lines: list[str] = []
+
+    class _Capture:
+        def info(self, line: str) -> None:
+            lines.append(line)
+
+    document = json.dumps({"a": f"x{chr(0x7F)}y{chr(0x2028)}z"}, ensure_ascii=False)
+    _log_finished_audit_line(_Capture(), document)  # type: ignore[arg-type]
+    (line,) = lines
     assert chr(0x7F) not in line and chr(0x2028) not in line
     assert json.loads(line) == {"a": f"x{chr(0x7F)}y{chr(0x2028)}z"}
 
@@ -1474,8 +1554,9 @@ def test_a_long_credential_does_not_pull_later_text_inside_the_detail_bound() ->
 
 
 @pytest.mark.parametrize("tail", ["code=\tDoe", '&pwd="\n&'])
-def test_text_past_the_detail_bound_does_not_blank_its_head(tail: str) -> None:
-    """Review round 1: the bar read text that never ships, and hid a clean head. Synthetic."""
+def test_the_finished_bar_does_not_blank_a_head_for_text_past_the_bound(tail: str) -> None:
+    """Review round 1: the bar read text that never ships, and hid a clean head. This pins the bar
+    only: ``_scrub_field`` still reads the whole window, as ``_finished_detail`` says. Synthetic."""
     detail = "the operator restarted the listener " * 15 + tail
     assert audit_tee._finished_detail(detail).startswith("the operator restarted")
 

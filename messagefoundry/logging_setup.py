@@ -42,6 +42,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TextIO
 
@@ -98,7 +99,6 @@ __all__ = [
     "build_stderr_handler",
     "configure_logging",
     "configure_stderr_logging",
-    "FinishedAuditLine",
     "ensure_logger_sink",
     "install_filtered_last_resort",
     "scrub_log_text",
@@ -165,27 +165,48 @@ def _scrub_block(text: str) -> str:
     )
 
 
-class FinishedAuditLine(str):
-    """A serialized audit tee document whose fields were each scrubbed BEFORE it was serialized
-    (BACKLOG #5649), so the handlers' passes must not read it as text. They could take a closing
-    quote with a span, and every handler re-runs them over the one shared record.
+#: The one line the tee is logging in this context, for the length of that call. Module-private,
+#: and read by identity, so an equal string, a subclass or a copied attribute does not match it.
+_finished_line_in_flight: ContextVar[str | None] = ContextVar(
+    "messagefoundry_finished_audit_line", default=None
+)
 
-    Building one escapes the log alphabet, in escapes valid inside a JSON string, so the line is
-    safe to frame without the control filter having to rewrite it. It is honoured only as a
-    record's ``msg``, with no ``args``, on :data:`AUDIT_LOGGER_NAME` (:func:`_is_finished_line`),
-    so no text can claim it. Only :func:`~messagefoundry.store.audit_tee.emit_audit_tee` builds
-    one, and it owns the redaction this skips."""
 
-    __slots__ = ()
+def _log_finished_audit_line(logger: logging.Logger, document: str) -> None:
+    """Log ``document``, a serialized audit tee record whose fields were each scrubbed BEFORE it
+    was serialized (BACKLOG #5649), at INFO with the handlers' text passes skipping it, for this
+    call only. Those passes could take a closing quote with a span, and every handler re-runs
+    them over the one shared record. The log alphabet is escaped here, in escapes valid inside a
+    JSON string, so the line is safe to frame without the control filter rewriting it.
 
-    def __new__(cls, document: str) -> FinishedAuditLine:
-        return super().__new__(cls, scrub_control_chars(document))
+    Every handler's filters run synchronously inside ``logger.info``, on this thread, the
+    forwarder's included (:class:`_ForwardQueueHandler` filters on the near side of its queue), so
+    the mark does not need to outlive the call. Logging the same object again afterwards is
+    redacted like any other record.
+
+    **THIS STOPS A MISTAKE AND AN ORDINARY LOG CALL. IT IS NOT A SECURITY BOUNDARY.** A Router or
+    Handler runs in this process under the default ``[sandbox].mode = off``, and in-process Python
+    is not contained here. Code that sets out to can still import this private function and call
+    it, set the context variable, replace the filters, remove the handlers, or write to a sink
+    directly. What the check gives is that no log call, whatever object it passes, skips
+    redaction unless it comes through this function."""
+    line = scrub_control_chars(document)
+    token = _finished_line_in_flight.set(line)
+    try:
+        logger.info(line)
+    finally:
+        _finished_line_in_flight.reset(token)
 
 
 def _is_finished_line(record: logging.LogRecord) -> bool:
-    """Whether ``record``'s message is a :class:`FinishedAuditLine` the text passes must skip."""
+    """Whether ``record``'s message is the very line :func:`_log_finished_audit_line` is logging
+    now, with no ``args``, on :data:`AUDIT_LOGGER_NAME`. Only then do the text passes skip it."""
+    in_flight = _finished_line_in_flight.get()
     return (
-        isinstance(record.msg, FinishedAuditLine) and not record.args and _is_audit_record(record)
+        in_flight is not None
+        and record.msg is in_flight
+        and not record.args
+        and _is_audit_record(record)
     )
 
 
@@ -211,8 +232,9 @@ def _rewrite_record(
 
     ``record.args`` is cleared whenever ``msg`` is rewritten, so the formatter cannot re-apply ``%``
     substitution to text that no longer carries the placeholders. A record that needed no change
-    keeps its lazy ``msg``/``args`` untouched. A :class:`FinishedAuditLine` is not rewritten; the
-    two blocks of its record still are."""
+    keeps its lazy ``msg``/``args`` untouched. The audit tee's finished line
+    (:func:`_is_finished_line`) is not rewritten, because the tee scrubbed it field by field before
+    serializing it; the two blocks of its record still are."""
     if not _is_finished_line(record):
         message = record.getMessage()
         scrubbed = scrub(message)
@@ -260,9 +282,11 @@ class _SafeExcFormatter(logging.Formatter):
 
 
 class RedactionFilter(logging.Filter):
-    """Scrub HL7-shaped PHI from every emitted record — the rendered **message** and the formatted
+    """Scrub HL7-shaped PHI from each emitted record — the rendered **message** and the formatted
     **exception traceback** (chained ``__cause__``/``__context__`` included) — via
-    :func:`~messagefoundry.redaction.redact` (PHI.md §7, Gate #1).
+    :func:`~messagefoundry.redaction.redact` (PHI.md §7, Gate #1). The one message it passes over
+    is the audit tee's finished line, which the tee scrubbed field by field before serializing it
+    (:func:`_is_finished_line`, BACKLOG #5649).
 
     Inbound HL7 is PHI-bearing and a Router/Handler is user code that can ``raise ValueError(f"…{raw}")``;
     an outer-loop ``log.exception(...)`` / ``exc_info=`` (the delivery/router/transform catches, the
@@ -647,7 +671,8 @@ _UNLOGGABLE_REPORTED: set[str] = set()
 
 
 class CredentialQueryScrubFilter(logging.Filter):
-    """Redact credential-bearing **query parameters** from every emitted record (ADR 0142 AC-10).
+    """Redact credential-bearing **query parameters** from each emitted record (ADR 0142 AC-10),
+    passing over only the audit tee's finished line, as :class:`RedactionFilter` says.
 
     The motivating case is uvicorn's access log: ``GET /ui/oidc/callback?code=…&state=…`` is emitted at
     INFO by ``uvicorn.access``, which :func:`configure_logging` deliberately routes to the same stdout
@@ -670,9 +695,10 @@ class CredentialQueryScrubFilter(logging.Filter):
 
 
 class CredentialScrubFilter(logging.Filter):
-    """Redact credential VALUES from every emitted record -- the rendered **message**, the formatted
+    """Redact credential VALUES from each emitted record -- the rendered **message**, the formatted
     **exception traceback**, and ``stack_info`` -- via
-    :func:`~messagefoundry.secretscrub.scrub_credentials` (BACKLOG #1478).
+    :func:`~messagefoundry.secretscrub.scrub_credentials` (BACKLOG #1478). It passes over only the
+    message of the audit tee's finished line, as :class:`RedactionFilter` says.
 
     THE GAP THIS CLOSES. Before it, the three filters :func:`_install_phi_filters` installed carried no
     credential vocabulary between them: seven engine credential shapes passed all three verbatim, with
@@ -693,9 +719,10 @@ class CredentialScrubFilter(logging.Filter):
 
 
 class BinaryCarriageScrubFilter(logging.Filter):
-    """Replace an ``mfb64:v1:`` binary-carriage body in every emitted record -- message, exception
+    """Replace an ``mfb64:v1:`` binary-carriage body in each emitted record -- message, exception
     traceback and ``stack_info`` -- via :func:`~messagefoundry.redaction.redact_binary_carriage`
-    (BACKLOG #5378).
+    (BACKLOG #5378). It passes over only the message of the audit tee's finished line, as
+    :class:`RedactionFilter` says.
 
     ORDER. Installed **after** :class:`CredentialScrubFilter`, the last label pass, and **before**
     :class:`ControlCharScrubFilter`, which must stay last. After, because ``/``, ``+`` and ``=`` are
@@ -1248,8 +1275,8 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     PHI-safety, secret-safety and log-injection guarantees as stdout. Every handler re-runs the
     chain over the ONE shared record, so a later handler filters the earlier one's escaped output.
     That second pass is NOT idempotent for every input: it can redact more than the first did. So
-    the audit tee, whose message is a JSON document, scrubs each field first and logs a
-    :class:`FinishedAuditLine`, whose message these passes do not rewrite (BACKLOG #5649).
+    the audit tee, whose message is a JSON document, scrubs each field first and logs it through
+    :func:`_log_finished_audit_line`, and these passes do not rewrite that message (BACKLOG #5649).
 
     For the forwarder this means the **queue** handler, on the near side of the hand-off, and the
     socket handler behind it carries no chain of its own — see :class:`_ForwardQueueHandler`, which is
