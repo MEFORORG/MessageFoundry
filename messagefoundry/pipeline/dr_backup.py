@@ -43,6 +43,7 @@ import hmac
 import io
 import json
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -6429,7 +6430,13 @@ def _refuse_colliding_config_members(
     Run before the store is extracted, so a refusal costs neither the extract nor a half-finished
     restore. Traversal names are compared like any other: a ``../store.db`` member resolving back onto
     the store is the same collision, and refusing it here beats refusing it after placement. The
-    exclusive create in :func:`_extract_config_members` is the backstop under this, not the control."""
+    exclusive create in :func:`_extract_config_members` is the backstop under this, not the control.
+
+    On a Windows host the question is also asked under Win32 naming, of the member and of each
+    directory above it (:func:`_win32_path_key`). There ``config/store.db-wal.`` compares unequal to
+    ``store.db-wal`` and is then created AS it once the store is placed, and the exclusive create
+    cannot catch that, because no WAL exists yet. A planted WAL would change verified rows on first
+    open, after ``integrity_check`` and the row-count compare."""
     published = {
         _norm_for_compare(p)
         for p in (
@@ -6439,6 +6446,15 @@ def _refuse_colliding_config_members(
     }
     seen: set[str] = set()
     try:
+        win32_root: str | None = None
+        win32_root_key: tuple[str, ...] = ()
+        win32_published: set[tuple[str, ...]] = set()
+        if sys.platform == "win32":
+            win32_root = str(_norm_for_compare(config_dest))
+            win32_root_key = _win32_path_key(win32_root)
+            win32_published = {_win32_path_key(str(p)) for p in published}
+        # Only these depths can match, so a forged very deep name costs one slice per length.
+        win32_depths = {len(k) for k in win32_published}
         with tarfile.open(tar_path, "r:") as tar:
             for member in tar.getmembers():
                 if not _is_config_payload_member(member):
@@ -6454,8 +6470,25 @@ def _refuse_colliding_config_members(
                         "same command without --config-to",
                     )
                 seen.add(member.name)
-                out = config_dest / member.name[len(_CONFIG_PREFIX) :]
-                if _norm_for_compare(out) not in published:
+                rel = member.name[len(_CONFIG_PREFIX) :]
+                out = config_dest / rel
+                exact = _norm_for_compare(out) in published
+                if not exact and win32_root is not None:
+                    key = _win32_path_key(f"{win32_root}\\{rel}")
+                    # A prefix equal to the root's own is the operator's path, not the member's.
+                    if any(
+                        key[:n] in win32_published and key[:n] != win32_root_key[:n]
+                        for n in win32_depths
+                    ):
+                        raise BackupError(
+                            "destination",
+                            f"the archive's config bundle carries a member at {out}, which Windows "
+                            "resolves to or under a path this restore publishes for the store "
+                            f"({dest_store_path}) — it could replace or corrupt the database this "
+                            "restore just verified. Choose a --config-to directory that does not "
+                            "contain the --to path",
+                        )
+                if not exact:
                     continue
                 raise BackupError(
                     "destination",
@@ -6470,6 +6503,21 @@ def _refuse_colliding_config_members(
         # this reads ATTACKER-SUPPLIED member names into ``Path``: a name the platform cannot parse
         # must be a refusal, not a traceback out of a check whose whole job is to refuse.
         raise BackupError("restore", safe_exc(exc)) from exc
+
+
+def _win32_path_key(path: str) -> tuple[str, ...]:
+    """``path`` as Win32 would name it, one lower-cased entry per component. Pure, on every platform.
+
+    Each component loses an alternate-stream suffix and then its trailing dots and spaces. A component
+    of ONLY dots or spaces keeps its spelling: measured on NTFS, ``a/.../b`` is refused rather than
+    collapsed to ``a/b``, so dropping it would fuse two paths that are different. ``lower`` matches
+    :func:`_norm_for_compare`; measured against ``RtlUpcaseUnicodeChar`` over the BMP, it separates no
+    two characters Windows treats as one."""
+    key: list[str] = []
+    for part in ntpath.normpath(path).split("\\"):
+        stem = part.split(":", 1)[0]
+        key.append((stem.rstrip(". ") or stem).lower())
+    return tuple(key)
 
 
 def _dangling_link_refusal(member: tarfile.TarInfo) -> str:

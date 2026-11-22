@@ -1364,6 +1364,77 @@ def test_restore_refuses_a_dangling_link_member_before_the_store_is_extracted(tm
     dr_backup._refuse_colliding_config_members(ok, d / "msg.db", tmp_path / "cfg")
 
 
+# --- A config member that reaches a store path by a Win32 spelling ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "key"),
+    [
+        ("D:\\dr\\store.db-wal", ("d", "dr", "store.db-wal")),
+        ("D:/DR/STORE.DB-WAL", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal.", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal ", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal . .", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal::$DATA", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal:x", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal./x.toml", ("d", "dr", "store.db-wal", "x.toml")),
+        ("D:\\dr\\sub\\..\\store.db-wal.", ("d", "dr", "store.db-wal")),
+        # Measured: a dots-only or spaces-only component stays a component of its own on Windows,
+        # so it must not vanish from the key and fuse its neighbours.
+        ("D:\\dr\\...\\store.db-wal", ("d", "dr", "...", "store.db-wal")),
+        ("D:\\dr\\ \\store.db-wal", ("d", "dr", " ", "store.db-wal")),
+        # Controls: names that are not the protected one keep their own key.
+        ("D:\\dr\\store.db-walnut.toml", ("d", "dr", "store.db-walnut.toml")),
+        ("D:\\dr\\aux.py", ("d", "dr", "aux.py")),
+    ],
+)
+def test_win32_path_key_is_pure_and_matches_win32_naming(path, key) -> None:
+    # Runs on every platform: the normalizer reads no filesystem and no host state.
+    assert dr_backup._win32_path_key(path) == key
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="Win32 path aliasing")
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "name",
+    [
+        "store.db-wal.",
+        "store.db-wal ",
+        "store.db-shm.",
+        "STORE.DB-WAL",
+        "store.db-wal::$DATA",
+        "store.db-wal/x.toml",
+        "store.db-wal./x.toml",
+        "store.db",
+        "store.db.",
+        "store.db/x.toml",
+    ],
+)
+def test_restore_refuses_a_config_member_aliasing_a_store_path(tmp_path, name) -> None:
+    tar = _plain_tar(tmp_path / "forged.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+    assert excinfo.value.kind == "destination"
+    assert list(d.iterdir()) == []
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "name",
+    ["feed.py", "aux.py", "handler.py.", "store.db-walnut.toml", "sub/store.db-wal", "a.db-wal."],
+)
+def test_restore_passes_a_config_member_that_only_resembles_a_store_path(tmp_path, name) -> None:
+    # The control: a name that does not resolve to a protected path is not refused by this check.
+    tar = _plain_tar(tmp_path / "ok.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+
+
 # --- (5b-ter) vault BACKLOG #5233 item 3: the no-config refusal is not a closed list --------------
 
 
