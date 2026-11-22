@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import CipherUnavailableError, generate_key, make_cipher
 from tests import _undecryptable_reply_contract as contract
 from tests._erased_reply_contract import LOOP, children, status_of
 from tests._queue_tag_contract import RawFetch, RawSql
@@ -53,6 +53,56 @@ async def test_undecryptable_reply_contract(store: MessageStore, spoil: contract
     await contract.assert_lane_moves_past_an_undecryptable_reply(
         store, _fetch(store), _raw(store), spoil
     )
+
+
+@pytest.mark.parametrize("case", contract.HANDOFF_CASES, ids=lambda c: c.__name__)
+async def test_handoff_containment_contract(
+    store: MessageStore, case: contract.ContractCase
+) -> None:
+    """BACKLOG #5727: a cell that will never open dead-letters the token; a key service with no
+    verdict, a fault in the engine's own code and a failed seal do not."""
+    await case(store, _fetch(store), _raw(store))
+
+
+async def test_an_outage_re_pends_the_token_and_the_lane_resumes_in_order(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #5727: through the running worker, a key-service outage leaves the head PENDING with
+    its attempt handed back and a future due time, dead-letters nothing, and passes no later row.
+    Once the service answers, both replies re-ingress."""
+    fetch = _fetch(store)
+    head = await contract.captured(store, control="UR-O-HEAD", now=1.0)
+    behind = await contract.captured(store, control="UR-O-BEHIND", now=2.0)
+    [reply] = await fetch("SELECT body FROM response WHERE message_id=?", (head,))
+    runner = contract.runner(store)
+    with contract.faulting_cipher(store) as fault:
+        fault.target, fault.open_error = reply["body"], CipherUnavailableError("synthetic")
+        task = asyncio.ensure_future(runner._response_worker(LOOP))
+        try:
+            async with asyncio.timeout(5.0):
+                while True:
+                    [row] = await fetch(
+                        "SELECT status, attempts, next_attempt_at FROM queue"
+                        " WHERE message_id=? AND stage='response'",
+                        (head,),
+                    )
+                    if row["status"] == OutboxStatus.PENDING.value and row["next_attempt_at"] > 2:
+                        break
+                    await asyncio.sleep(0.005)
+            assert row["attempts"] == 0
+            assert (await contract.token_of(fetch, behind))["status"] == OutboxStatus.PENDING.value
+            assert await children(fetch) == []
+            assert not [e for e in await store.events_for(head) if e["event"] == "dead"]
+            fault.heal()
+            async with asyncio.timeout(5.0):
+                while await status_of(store, behind) != MessageStatus.PROCESSED.value:
+                    await asyncio.sleep(0.02)
+        finally:
+            runner._stop.set()
+            runner._response_work.set()
+            await asyncio.wait_for(task, timeout=5.0)
+    assert await status_of(store, head) == MessageStatus.PROCESSED.value
+    assert len(await children(fetch)) == 2
 
 
 @pytest.mark.parametrize("spoil", contract.SPOILS, ids=lambda s: s.__name__)

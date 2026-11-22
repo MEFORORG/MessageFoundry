@@ -9462,7 +9462,9 @@ class SqlServerStore:
                         REINGRESS_TOKEN_TAG_FAILED,
                         "re-ingress work-row failed its integrity check",
                     )
-                except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                except Exception as exc:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                    if is_transient_open_failure(exc):  # BACKLOG #5727: no verdict on the cell
+                        raise
                     return await _consume_dead(
                         "ingress_handoff(corrupt-ref)",
                         "re-ingress work-row reference is corrupt/unparseable",
@@ -9493,12 +9495,36 @@ class SqlServerStore:
                         "re-ingress reply erased",
                         erased=True,
                     )
-                body = (
-                    self._cipher.decrypt(
-                        art[0], aad=cell_aad("response", "body", origin_msg_id, dest, seq)
+
+                # BACKLOG #5727, as on Postgres (#5689): a reply or origin cell that will never
+                # open dead-letters the token, keeping its reference for a replay. A key service
+                # that gave no verdict, or a fault in the engine's own code, propagates and the
+                # token is retried. Only the decrypts are wrapped: the encrypt's invocation ceiling
+                # stays a hard stop.
+                async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
+                    if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):
+                        raise exc
+                    log.warning(
+                        "ingress_handoff: %s of work-row %s does not decrypt (%s); dead-lettering",
+                        what,
+                        response_row_id,
+                        type(exc).__name__,
                     )
-                    or ""
-                )
+                    return await _consume_dead(
+                        label,
+                        f"re-ingress {what} does not decrypt ({type(exc).__name__})",
+                        f"re-ingress {what} undecryptable",
+                    )
+
+                try:
+                    body = (
+                        self._cipher.decrypt(
+                            art[0], aad=cell_aad("response", "body", origin_msg_id, dest, seq)
+                        )
+                        or ""
+                    )
+                except CipherError as exc:
+                    return await _dead_unopenable(exc, "reply", "ingress_handoff(reply-unopenable)")
                 # (4) Correlation lineage from the origin's metadata (parse once).
                 await cur.execute(
                     "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -9524,6 +9550,10 @@ class SqlServerStore:
                         "ingress_handoff(origin-tag)",
                         str(err),
                         "re-ingress origin failed its integrity check",
+                    )
+                except CipherError as exc:
+                    return await _dead_unopenable(
+                        exc, "origin metadata", "ingress_handoff(origin-unopenable)"
                     )
                 loaded = json.loads(meta_json) if meta_json else {}
                 origin_meta = loaded if isinstance(loaded, dict) else {}

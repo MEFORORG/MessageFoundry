@@ -58,6 +58,7 @@ from tests._replay_settle_contract import (
     assert_replayed_routed_row_settles,
 )
 from tests._store_audit import ALERT_AUDIT, no_operator_audit, no_purge_audit
+from tests._undecryptable_reply_contract import HANDOFF_CASES as UNDECRYPTABLE_HANDOFF_CASES
 from tests._undecryptable_reply_contract import SPOILS as UNDECRYPTABLE_REPLY_SPOILS
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
@@ -6827,6 +6828,22 @@ async def test_undecryptable_reply_contract(store, spoil) -> None:
     )
     try:
         await contract.assert_lane_moves_past_an_undecryptable_reply(sealed, fetch, raw, spoil)
+    finally:
+        await sealed.close()
+
+
+@pytest.mark.parametrize("case", UNDECRYPTABLE_HANDOFF_CASES, ids=lambda c: c.__name__)
+async def test_handoff_containment_contract(store, case) -> None:
+    """BACKLOG #5727: the handoff's containment, the same contract the SQLite suite runs."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    raw, fetch = _raw_adapters(store)
+    sealed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await case(sealed, fetch, raw)
     finally:
         await sealed.close()
 

@@ -275,7 +275,11 @@ from messagefoundry.store.crypto import (
     gave_no_verdict,
 )
 from messagefoundry.store.metadata import user_metadata
-from messagefoundry.store.queue_tag import QueueTagError
+from messagefoundry.store.queue_tag import (
+    PROGRAMMING_ERRORS,
+    QueueTagError,
+    is_transient_open_failure,
+)
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import (
     REINGRESS_PEEK_FAILED,
@@ -12970,12 +12974,17 @@ class RegistryRunner:
             await self.store.dead_letter_now(item.id, REINGRESS_TOKEN_TAG_FAILED)
             return _ItemOutcome.PROCESSED, None
         except CipherError as exc:
+            # BACKLOG #5727: a key service that gave no verdict says nothing about this reply, and
+            # a fault in the engine's own code is not the cell's either. Both take the fault arm,
+            # which re-pends the token with a backoff, so an outage holds the lane and loses nothing.
+            if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):
+                raise
             # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
             # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
             # does an unopenable payload; the token keeps its reference for a replay. The handoff
             # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
-            # any CipherError the handoff raises still takes the fault arm. The Postgres handoff
-            # contains its own decrypt failures that are verdicts on a cell (BACKLOG #5689).
+            # any CipherError the handoff raises still takes the fault arm. Each store's handoff
+            # contains its own decrypt failures that are verdicts on a cell (BACKLOG #5689, #5727).
             log.warning(
                 "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
                 name,
