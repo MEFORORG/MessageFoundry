@@ -66,7 +66,9 @@
 # A job naming an environment that does not exist creates it with no rules, which would publish
 # exactly as before while reading as a control that is not there. Keep the name `pypi`.
 # Keep PUBLISH_HARNESS and PUBLISH_WEBCONSOLE off the environment, as repository or organization
-# variables. A job's `if:` is read before its environment applies, and a step's inside it after, so
+# variables. An organization variable limited to selected repositories that exclude this one reads
+# as unset here, so the upload step is skipped.
+# A job's `if:` is read before its environment applies, and a step's inside it after, so
 # a copy on
 # the environment would let two gates read different values. So each is read three times, the
 # same way for both (vault BACKLOG #2975). Its build job (`release-harness`, `release-webconsole`)
@@ -1980,8 +1982,8 @@ jobs:
           echo "verified $(grep -c . "$manifest") file(s) against the build job's digests"
 
       # GATED on the PUBLISH_WEBCONSOLE variable (repository or organization) reading true, and that
-      # gate is armed: the owner set the variable on 2026-07-29 (read with `gh variable list`,
-      # 2026-09-28), and the first
+      # gate is armed: the owner set the repository variable on 2026-07-29 (read with
+      # `gh variable list` on 2026-09-28), and the first
       # webconsole-v* release through this step claimed the PyPI name that day (BACKLOG #1944).
       # Unset the variable and this step is skipped, while the build + version-check above still run
       # on every console tag, and the console's release still goes public. The variable is read
