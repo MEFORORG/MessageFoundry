@@ -815,6 +815,26 @@ async def test_two_candidates_get_the_plain_remedy(
     assert str(info.value) == _plain(cause)
 
 
+async def test_a_last_rank_only_match_gets_the_plain_remedy(tmp_path: Path) -> None:
+    # A broken TEMP view "vv x" is outside the main schema the match reads, so the only name the
+    # text fits is the healthy "vv", with the remainder " x: ...". That is no form SQLite writes
+    # after the object it names, so "vv" is not named and the remedy is main's plain one.
+    path = tmp_path / "temp.db"
+    _sql(path, "CREATE TABLE t (a)", "CREATE VIEW vv AS SELECT a FROM t")
+    async with _connected(path) as db:
+        await db.execute('CREATE TEMP VIEW "vv x" AS SELECT missing FROM t')
+        with pytest.raises(SchemaMismatchError) as info:
+            await run_schema_step(
+                db,
+                db.execute("ALTER TABLE t RENAME TO t2"),
+                path=_SERVICE_PATH,
+                counts_under_dek=False,
+            )
+    cause = "error in view vv x: no such column: missing"
+    assert info.value.cause == cause
+    assert str(info.value) == _plain(cause)
+
+
 @pytest.mark.parametrize(
     ("kind", "names", "cause", "found"),
     [

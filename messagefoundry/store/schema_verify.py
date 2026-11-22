@@ -493,11 +493,10 @@ async def _foreign_objects(db: aiosqlite.Connection, cause: str) -> tuple[tuple[
     messages are measured and a list that missed one would name a healthy object alone. The
     " after " rank is itself a one-entry suffix assumption, with a residual of the same kind: a
     suffix SQLite writes that does not start " after " would rank the culprit last, and then at
-    least a healthy first-rank name, or the longest last-rank name, could be named alone. Under a
+    least a healthy first-rank name could be named alone. Under a
     suffix " during x", for one, which no test here has measured, a healthy ``vv during x`` beside
     a broken ``vv`` would be named for "error in view vv during x: ...". So where names collide the
-    ambiguity remains, and more than one name is returned, which gets the plain remedy. With no
-    first-rank name, the longest last-rank name is the one returned.
+    ambiguity remains, and more than one name is returned, which gets the plain remedy.
 
     The colon and " after " share a rank because a quoted name may hold either: with ``vv`` and
     ``vv: x``, "error in view vv: x after rename: ..." must not name ``vv`` alone. Where any name
@@ -515,13 +514,11 @@ async def _foreign_objects(db: aiosqlite.Connection, cause: str) -> tuple[tuple[
         async with db.execute(_FOREIGN_OBJECTS_SQL) as cur:
             objects = [(str(kind), str(name)) for kind, name in await cur.fetchall()]
         first: list[tuple[str, str]] = []
-        last: list[tuple[str, str]] = []
         for kind, name in objects:
             rest = cause.removeprefix(f"error in {kind} {name}")
-            if rest != cause and rest[:1] in (":", " "):
-                exact = rest.startswith((": ", " after "))
-                (first if exact else last).append((kind, name))
-        named = first or ([max(last, key=lambda o: len(o[1]))] if last else [])
+            if rest != cause and rest.startswith((": ", " after ")):
+                first.append((kind, name))
+        named = first
         if not named:
             return ()
         views = [name.lower() for kind, name in named if kind == "view"]
