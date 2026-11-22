@@ -1785,6 +1785,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #2593: message cells and preset criteria open under their row tag.
             "cipher:via messagefoundry.store.cell_tag",
             "compare:hmac.compare_digest",
+            # BACKLOG #1167: passkey_set_matches and the passkey id-hash filter.
+            "compare:via messagefoundry.credential",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
