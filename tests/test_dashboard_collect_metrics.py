@@ -890,7 +890,7 @@ def _asvs_ctx(tmp_path: Path, printed: str) -> Any:
 
 
 def test_asvs_reads_counts_and_the_ref_pair(tmp_path: Path) -> None:
-    printed = "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 4: 3 pass, 1 na\n"
+    printed = "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 4: 3 pass, 1 na, 0 needs-review, 0 unverified\n"
     m = cm.Metric("asvs", "", "", "", "")
     cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
     assert (m.value, m.status) == (100.0, "good")
@@ -905,12 +905,35 @@ def test_asvs_value_is_floored_like_the_ci_series(tmp_path: Path) -> None:
     m = cm.Metric("asvs", "", "", "", "")
     cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
     assert m.value == 66.6
+    # No needs-review or unverified count on the cells line: the read is partial.
+    assert "needs-review or unverified" in m.detail["partial_error"]
 
 
-def test_the_scorecard_tool_runs_isolated(tmp_path: Path) -> None:
-    # The default runner for the tool is run_child: -I -X utf8 under the allowlisted env.
+def test_the_scorecard_tool_runs_isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = cm.Context(vault=tmp_path, through=dt.date(2026, 11, 18), weeks=2, workdir=tmp_path)
-    assert ctx.run_tool is cm.run_child
+    assert ctx.run_tool is cm.run_tool_child
+    # What run_tool_child hands the process: -I -X utf8, and the allowlist plus home variables only.
+    monkeypatch.setenv("GH_TOKEN", "x")
+    monkeypatch.setenv("GIT_DIR", "x")
+    monkeypatch.setenv("PYTHONPATH", "x")
+    monkeypatch.setenv("USERPROFILE", "u")
+    got: list[tuple[Sequence[str], dict[str, str] | None]] = []
+
+    def fake_bytes(argv: Sequence[str], cwd: Path | None = None, *, env: Any = None) -> bytes:
+        got.append((argv, env))
+        return b""
+
+    monkeypatch.setattr(cm, "run_bytes", fake_bytes)
+    cm.run_tool_child(["tool.py"], tmp_path)
+    cm.run_child(["driver.py"], tmp_path)
+    (tool_argv, tool_env), (_, child) = got
+    assert list(tool_argv[1:]) == ["-I", "-X", "utf8", "tool.py"]
+    assert tool_env is not None and child is not None
+    for key in ("GH_TOKEN", "GIT_DIR", "PYTHONPATH"):
+        assert key not in tool_env and key not in child
+    assert tool_env["USERPROFILE"] == "u"
+    assert "USERPROFILE" not in child  # the vault code gets no profile variable
+    monkeypatch.undo()
     seen: list[Sequence[str]] = []
 
     def run_tool(argv: Sequence[str], cwd: Path | None) -> str:
@@ -923,7 +946,8 @@ def test_the_scorecard_tool_runs_isolated(tmp_path: Path) -> None:
     m = cm.Metric("asvs", "", "", "", "")
     cm.c_asvs(ctx, m)
     assert m.value == 100.0
-    # run_child supplies the interpreter, so the argv starts at the script.
+    # c_asvs went through run_tool, never ctx.run (which fails here); the runner supplies the
+    # interpreter, so the argv starts at the script.
     assert seen and str(seen[0][0]).endswith("scorecard.py")
 
 
@@ -1167,7 +1191,7 @@ def test_release_distance_reads_the_engine_repo(tmp_path: Path) -> None:
 
 
 def test_asvs_from_an_archive_names_the_archived_commit(tmp_path: Path) -> None:
-    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 1: 1 pass\n"
+    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 1: 1 pass, 0 needs-review, 0 unverified\n"
     ctx = _asvs_ctx(tmp_path, printed)
     ctx.archive_ref = "1a0c10fd3485"
     m = cm.Metric("asvs", "", "", "", "")

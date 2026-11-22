@@ -136,6 +136,8 @@ $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-StaleTemp' }, $true)
 Invoke-Expression $fn.Extent.Text
+# The sweep ages a directory by creation time, which Python cannot set; backdate the -old ones.
+Get-ChildItem -LiteralPath $base -Directory -Filter '*-old' | ForEach-Object { $_.CreationTimeUtc = [DateTime]::UtcNow.AddYears(-20) }
 $r = @(Remove-StaleTemp $base 'mf-dashboard-build-')
 [pscustomobject]@{ result = $r } | ConvertTo-Json -Compress
 """
@@ -169,10 +171,16 @@ def _stale_dir(tmp_path: Path, name: str) -> Path:
     old = tmp_path / name
     old.mkdir()
     (old / "metrics.json").write_text("{}", encoding="utf-8")
-    os.utime(old, (1_000_000.0, 1_000_000.0))
     return old
 
 
+_WIN_ONLY = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="creation time is settable, and an open file blocks deletion, only on Windows",
+)
+
+
+@_WIN_ONLY
 def test_build_sweep_removes_a_stale_directory(tmp_path: Path) -> None:
     old = _stale_dir(tmp_path, "mf-dashboard-build-old")
     fresh = tmp_path / "mf-dashboard-build-new"
@@ -182,11 +190,16 @@ def test_build_sweep_removes_a_stale_directory(tmp_path: Path) -> None:
     assert fresh.exists()  # a live run's directory is never swept
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="an open file blocks deletion only on Windows")
+@_WIN_ONLY
 def test_build_sweep_failure_is_reported(tmp_path: Path) -> None:
     old = _stale_dir(tmp_path, "mf-dashboard-build-old")
+    (old / "other.json").write_text("{}", encoding="utf-8")
     # An open handle without FILE_SHARE_DELETE: Remove-Item cannot delete the file.
     with (old / "metrics.json").open(encoding="utf-8"):
+        assert _sweep(tmp_path) == [False]
+        # The first sweep removed other.json, which moved the directory's last-write time to now;
+        # the next run must still see the leftover, so the sweep reads its creation time.
+        os.utime(old)
         assert _sweep(tmp_path) == [False]
     assert old.exists()
 

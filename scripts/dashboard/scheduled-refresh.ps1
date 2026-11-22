@@ -22,11 +22,11 @@ Work trees come and go, so this runner reads none of them. It:
    the last 200 lines, and removes the temporary directory.
 
 A failure exits non-zero and leaves the previous index.html in place: the page is replaced
-atomically, and only by a render that succeeded. Each Python process runs with -I: the collector
-and renderer build.ps1 starts, and the collector's two children (the vault census driver and
-scripts/asvs/scorecard.py), which also get -X utf8 and an allowlisted environment with no token or
-GIT_* variable. -I is not a sandbox; collect_metrics.py's docstring says what the vault code can
-still do. gh uses the account's own
+atomically, and only by a render that succeeded. Each Python process this runner and build.ps1
+start runs with -I: the interpreter probe, the renderer, the collector, and the collector's two
+children (the vault census driver and scripts/asvs/scorecard.py), which also get -X utf8 and an
+allowlisted environment with no token or GIT_* variable. -I is not a sandbox; collect_metrics.py's
+docstring says what the vault code can still do. gh uses the account's own
 existing authentication; this script holds no secret and logs none.
 
 .EXAMPLE
@@ -67,7 +67,7 @@ function Resolve-Python([string[]]$Given) {
     $parts = @($Given | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($parts.Count -gt 0) { return , $parts }
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py -3.14 -c "pass" 2>$null
+        & py -3.14 -I -c "pass" 2>$null
         if ($LASTEXITCODE -eq 0) { return , @('py', '-3.14') }
     }
     return , @('python')
@@ -75,7 +75,9 @@ function Resolve-Python([string[]]$Given) {
 
 function Remove-StaleTemp([string]$Base, [string]$Prefix) {
     # A run killed by the task's time limit skips its finally. Two hours is past any live run.
-    # build.ps1 holds the same sweep for its own prefix; this file must stand alone once installed.
+    # build.ps1 holds a stricter sweep for its own prefix, which fails its run, because that
+    # directory holds a private snapshot. This one only reports: mf-dashboard-src-* holds the
+    # archived engine scripts. This file must stand alone once installed.
     $cutoff = [DateTime]::UtcNow.AddHours(-2)
     Get-ChildItem -LiteralPath $Base -Directory -Filter "$Prefix*" -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTimeUtc -lt $cutoff -and -not $_.LinkType } |

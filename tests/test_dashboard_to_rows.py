@@ -137,8 +137,9 @@ def test_metric_rows_contract() -> None:
         assert set(row) == METRIC_KEYS
     # The headline row carries its pair in ref alone, so the tile never shows it twice.
     assert rows["asvs"]["note"] == (
-        "Pass cells over cells not marked n/a. 1 needs-review and 1 unverified cells are in that "
-        "denominator and are not passes."
+        "Pass cells over cells not marked n/a. 1 needs-review and 1 unverified cells, which carry "
+        "no verdict, are in that denominator and are not passes. Cells decided with no "
+        "last_verified count as decided; scorecard.py --status reports them."
     )
     assert rows["asvs"]["value"] == 50.0
     assert (rows["asvs.needs-review"]["value"], rows["asvs.unverified"]["value"]) == (1, 1)
@@ -327,7 +328,7 @@ def test_every_asvs_row_carries_the_ref_pair() -> None:
     assert all(r["ref"] == "" for r in rows.values() if r not in asvs)
 
 
-def test_asvs_without_unexamined_counts_has_no_headline() -> None:
+def test_asvs_without_no_verdict_counts_has_no_headline() -> None:
     snap = _snapshot()
     snap["metrics"][3]["detail"]["counts"] = {"total": 2, "pass": 1, "fail": 1}
     rows = _rows(snap)
@@ -335,7 +336,21 @@ def test_asvs_without_unexamined_counts_has_no_headline() -> None:
     assert rows["asvs"]["status"] == "unknown"
     assert rows["asvs"]["error"] == tr.NO_ASVS_HEADLINE
     assert rows["asvs.needs-review"]["value"] is None
+    assert rows["asvs.needs-review"]["error"] == tr.NO_ASVS_HEADLINE  # a null fact is not mute
     assert rows["asvs.pass"]["value"] == 1  # the counts themselves still show
+    # An earlier reason is kept, after the reason the headline was withheld.
+    snap["metrics"][3]["detail"]["partial_error"] = "no engine= ref"
+    assert _rows(snap)["asvs"]["error"] == f"{tr.NO_ASVS_HEADLINE}; partial: no engine= ref"
+    del snap["metrics"][3]["detail"]["partial_error"]
+    # A present null is no measurement: the headline is withheld, never qualified with a zero.
+    snap["metrics"][3]["detail"]["counts"] = {
+        "total": 2,
+        "pass": 1,
+        "fail": 1,
+        "needs-review": None,
+        "unverified": 0,
+    }
+    assert _rows(snap)["asvs"]["value"] is None
     # One of the two present: the other is 0, since the cells line sums to its total.
     snap["metrics"][3]["detail"]["counts"] = {"total": 3, "pass": 1, "fail": 1, "unverified": 1}
     rows = _rows(snap)
@@ -349,4 +364,6 @@ def test_asvs_provenance_row_quotes_the_tools_own_lines() -> None:
     snap["metrics"][3]["detail"]["provenance"] = lines
     assert _rows(snap)["asvs.provenance"]["value"] == "; ".join(lines)
     del snap["metrics"][3]["detail"]["provenance"]
-    assert _rows(snap)["asvs.provenance"]["value"] is None
+    row = _rows(snap)["asvs.provenance"]
+    assert row["value"] is None
+    assert row["error"] == "the snapshot holds no scorecard provenance lines"

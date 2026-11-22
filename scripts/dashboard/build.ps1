@@ -50,7 +50,7 @@ function Resolve-Python([string[]]$Given) {
     $parts = @($Given | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($parts.Count -gt 0) { return , $parts }
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py -3.14 -c "pass" 2>$null
+        & py -3.14 -I -c "pass" 2>$null
         if ($LASTEXITCODE -eq 0) { return , @('py', '-3.14') }
     }
     return , @('python')
@@ -60,11 +60,12 @@ function Remove-StaleTemp([string]$Base, [string]$Prefix) {
     # A run killed by the task's time limit skips its finally, so its private snapshot outlives
     # it. Two hours is past any live run. $false when one that should have gone is still there:
     # it holds a private snapshot and vault files, so the caller fails the run, as the collector
-    # does for its own sweep.
+    # does for its own sweep. Aged by creation time: a sweep that removes only part of a directory
+    # moves its last-write time to now, which would hide the leftover from the next run.
     $cutoff = [DateTime]::UtcNow.AddHours(-2)
     $ok = $true
     foreach ($old in @(Get-ChildItem -LiteralPath $Base -Directory -Filter "$Prefix*" -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTimeUtc -lt $cutoff -and -not $_.LinkType })) {
+            Where-Object { $_.CreationTimeUtc -lt $cutoff -and -not $_.LinkType })) {
         Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $old.FullName) {
             [Console]::Error.WriteLine("ERROR: could not sweep stale $($old.FullName)")

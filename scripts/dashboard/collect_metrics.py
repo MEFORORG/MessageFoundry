@@ -404,7 +404,9 @@ def run_bytes(
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", "replace").strip()
         raise CollectError(
-            f"{' '.join(argv[:4])} exited {proc.returncode}: {stderr[-400:]}", stderr=stderr
+            # Six words, so `python -I -X utf8 <script> <arg>` still names the script it ran.
+            f"{' '.join(argv[:6])} exited {proc.returncode}: {stderr[-400:]}",
+            stderr=stderr,
         )
     return proc.stdout
 
@@ -442,19 +444,33 @@ _CHILD_ENV_KEEP = (
 )
 
 
-def child_env() -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k.upper() in _CHILD_ENV_KEEP}
+#: Added for the engine's own scorecard tool only: its git probes read the user's global gitconfig
+#: (safe.directory, core.excludesFile) through these, so its engine= stamp matches a plain run.
+_HOME_ENV_KEEP = ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
+
+
+def child_env(*, home: bool = False) -> dict[str, str]:
+    keep = _CHILD_ENV_KEEP + (_HOME_ENV_KEEP if home else ())
+    env = {k: v for k, v in os.environ.items() if k.upper() in keep}
     return {**env, "LC_ALL": "C"}
 
 
-def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:
-    """Run a Python child, the vault census driver or the scorecard tool: ``python -I -X utf8``
-    under :func:`child_env`, from ``cwd``, so a relative write by the vault code never lands in the
-    caller's work tree."""
+def _run_python(argv: Sequence[str], cwd: Path | None, env: dict[str, str]) -> str:
     # -X utf8, not PYTHONUTF8: -I ignores every PYTHON* variable.
-    return run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=child_env()).decode(
-        "utf-8"
-    )
+    return run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=env).decode("utf-8")
+
+
+def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:
+    """Run the vault census driver: ``python -I -X utf8`` under :func:`child_env`, from ``cwd``
+    (the archive root), so a relative write by the vault code never lands in the caller's work
+    tree."""
+    return _run_python(argv, cwd, child_env())
+
+
+def run_tool_child(argv: Sequence[str], cwd: Path | None = None) -> str:
+    """Run the engine's scorecard tool: ``python -I -X utf8`` under :func:`child_env` plus the
+    home variables its git probes need, from ``cwd`` (the engine tree, which it stamps)."""
+    return _run_python(argv, cwd, child_env(home=True))
 
 
 def fetch_url(url: str) -> bytes:
@@ -555,8 +571,8 @@ class Context:
     run_raw: BytesRunner = run_bytes
     #: Runs the vault census driver in a child process; see :func:`run_child`.
     run_vault: Callable[[Sequence[str], Path | None], str] = run_child
-    #: Runs the engine's scorecard tool the same way; see :func:`run_child`.
-    run_tool: Callable[[Sequence[str], Path | None], str] = run_child
+    #: Runs the engine's scorecard tool isolated too; see :func:`run_tool_child`.
+    run_tool: Callable[[Sequence[str], Path | None], str] = run_tool_child
     fetch: Fetcher = fetch_url
     #: False when the caller already fetched both repositories' main this run.
     git_fetch: bool = True
@@ -964,7 +980,7 @@ def c_asvs(ctx: Context, m: Metric) -> None:
         # that tree from this commit, and says so.
         engine_ref = f"{ctx.archive_ref}+archive"
         tool = f"scripts/asvs/scorecard.py from a git archive of engine commit {ctx.archive_ref}"
-    m.value = floor_pct(counts.get("pass", 0), applicable) if applicable else None
+    m.value = None if pass_pct is None else floor_pct(counts.get("pass", 0), applicable)
     # Banded on the raw rate, so a value just under a threshold never rounds up into it.
     m.status = status_pct(pass_pct, "asvs")
     if pass_pct is None:
@@ -972,8 +988,9 @@ def c_asvs(ctx: Context, m: Metric) -> None:
 
     m.detail = {
         "counts": counts,
-        "value_means": "pass cells over cells not marked na; needs-review and unverified cells "
-        "are in that denominator and are not passes",
+        "value_means": "pass cells over cells not marked na; needs-review and unverified cells, "
+        "which carry no verdict, are in that denominator and are not passes; cells decided "
+        "with no last_verified count as decided",
         "provenance": provenance,
         "scorecard_sha": v.sha,
         "engine_ref": engine_ref,
@@ -982,6 +999,9 @@ def c_asvs(ctx: Context, m: Metric) -> None:
         "history": "none: --status reads one ref and keeps no history",
         "state_as_of": "run time; --through does not apply",
     }
+    if not {"needs-review", "unverified"} <= counts.keys():
+        # The headline is shown only beside these counts; a cells line without them is drift.
+        add_partial(m.detail, "scorecard cells line lacks a needs-review or unverified count")
     if engine_ref is None:
         # A score is quoted only beside its ref pair; without the engine half it cannot be.
         add_partial(m.detail, "scorecard provenance printed no engine= ref")

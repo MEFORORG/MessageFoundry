@@ -16,10 +16,10 @@ the caller archived, because the tool itself then prints ``NO-GIT``. The tool's 
 lines are a separate row, ``asvs.provenance``.
 
 THE ASVS HEADLINE IS NEVER SHOWN ALONE. It is pass cells over cells not marked n/a, so
-needs-review and unverified cells sit in its denominator; their counts are rows beside it and are
-named in its note. When the snapshot holds neither count, the headline is null, following
-``scripts/asvs/scorecard.py``'s caveat that there is no headline score while unexamined cells may
-exist.
+needs-review and unverified cells, which carry no verdict, sit in its denominator; their counts are
+rows beside it and are named in its note. When the snapshot holds neither count, the headline is
+null. ``scripts/asvs/scorecard.py`` itself prints no single headline score at all, and this rate
+is not one it gives: it does not separate cells decided with no ``last_verified``.
 
 A VALUE THAT IS NOT IN THE SNAPSHOT IS ``null``, never ``0`` or NaN: a metric that errored has no
 detail, and its facts read null rather than as a quiet zero.
@@ -106,40 +106,43 @@ def asvs_pair(snap: Snapshot) -> str:
     return str(cm.asvs_ref_pair(snap.detail("asvs")))
 
 
-#: The verdicts in the headline's denominator that are not passes and carry no verdict reached.
-UNEXAMINED = (("needs-review", "Needs review"), ("unverified", "Unverified"))
+#: The two states in the headline's denominator that carry no verdict (scorecard.py: neither
+#: belongs in a numerator). Not the tool's "unexamined" set: a needs-review cell was examined.
+NO_VERDICT = (("needs-review", "Needs review"), ("unverified", "Unverified"))
 
 NO_ASVS_HEADLINE = (
-    "no headline: the snapshot holds no needs-review or unverified count, and scorecard.py gives "
-    "no headline score while unexamined cells may exist"
+    "no headline: the snapshot holds no needs-review and unverified counts, so the pass rate "
+    "cannot be shown beside the cells in its denominator that carry no verdict"
 )
 
 
-def unexamined_counts(detail: dict[str, Any]) -> dict[str, int] | None:
+def no_verdict_counts(detail: dict[str, Any]) -> dict[str, int] | None:
     """The ASVS detail's needs-review and unverified counts, one the counts omit read as 0 (the
-    collector's cells line sums to its total); ``None`` when it holds neither, so the headline
-    cannot be qualified."""
+    collector's cells line sums to its total); ``None`` when it holds neither, or one is not a
+    number, so the headline cannot be qualified."""
     counts = _dict(detail.get("counts"))
-    if not any(key in counts for key, _ in UNEXAMINED):
+    if not any(key in counts for key, _ in NO_VERDICT):
         return None
     try:
-        return {key: int(counts.get(key) or 0) for key, _ in UNEXAMINED}
+        # A present null stays unreadable: it is no measurement, never a quiet zero.
+        return {key: int(counts.get(key, 0)) for key, _ in NO_VERDICT}
     except (TypeError, ValueError):
         return None
 
 
-def _unexamined(key: str) -> Callable[[dict[str, Any]], Any]:
-    return lambda d: (unexamined_counts(d) or {}).get(key)
+def _no_verdict(key: str) -> Callable[[dict[str, Any]], Any]:
+    return lambda d: (no_verdict_counts(d) or {}).get(key)
 
 
 def asvs_note(snap: Snapshot) -> str:
     base = "Pass cells over cells not marked n/a."
-    unexamined = unexamined_counts(snap.detail("asvs"))
-    if unexamined is None:
+    counts = no_verdict_counts(snap.detail("asvs"))
+    if counts is None:
         return base
     return (
-        f"{base} {unexamined['needs-review']} needs-review and {unexamined['unverified']} "
-        "unverified cells are in that denominator and are not passes."
+        f"{base} {counts['needs-review']} needs-review and {counts['unverified']} unverified "
+        "cells, which carry no verdict, are in that denominator and are not passes. Cells "
+        "decided with no last_verified count as decided; scorecard.py --status reports them."
     )
 
 
@@ -213,7 +216,7 @@ def facts(weeks: int) -> list[Fact]:
         ("asvs", "pass", "Pass", _count("pass")),
         ("asvs", "partial", "Partial", _count("partial")),
         ("asvs", "fail", "Fail", _count("fail")),
-        *[("asvs", key, label, _unexamined(key)) for key, label in UNEXAMINED],
+        *[("asvs", key, label, _no_verdict(key)) for key, label in NO_VERDICT],
         ("asvs", "provenance", "Tool provenance", _provenance),
         ("dependency_vulns", "critical_high", "Critical + high", _critical_high),
         (
@@ -250,16 +253,29 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
         }
         for m in snap.metrics
     ]
+    qualified = no_verdict_counts(snap.detail("asvs")) is not None
     headline = next((r for r in rows if r["id"] == "asvs"), None)
-    if headline is not None and unexamined_counts(snap.detail("asvs")) is None:
-        # No count to qualify it with: no headline, as scorecard.py's own caveat says.
-        headline.update(value=None, status="unknown", error=headline["error"] or NO_ASVS_HEADLINE)
+    if headline is not None and not qualified:
+        # No count to qualify it with: no headline. Its reason leads, beside any earlier one.
+        prior = headline["error"]
+        headline.update(
+            value=None,
+            status="unknown",
+            error=f"{NO_ASVS_HEADLINE}; {prior}" if prior else NO_ASVS_HEADLINE,
+        )
+    # A null ASVS fact whose metric has no error of its own still says why it is null.
+    own_reason = {
+        **{k: NO_ASVS_HEADLINE for k, _ in NO_VERDICT if not qualified},
+        "provenance": "the snapshot holds no scorecard provenance lines",
+    }
     for mid, key, label, read in facts(len(snap.weeks)):
         if mid not in snap.by_id:
             continue
         value = read(snap.detail(mid))
         # A null fact carries its metric's reason, so a dashboard showing it alone is not mute.
         reason = None if value is not None else error(snap.by_id[mid])
+        if value is None and mid == "asvs":
+            reason = reason or own_reason.get(key)
         if value is None and key == "dep_mttr_days":
             raw = _dict(_dict(snap.detail(mid).get("kpis")).get("row")).get(key)
             reason = reason or (raw if isinstance(raw, str) and raw else None)

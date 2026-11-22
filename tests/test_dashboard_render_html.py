@@ -211,7 +211,7 @@ def test_the_asvs_ref_pair_sits_beside_its_value() -> None:
     assert "<dt>Unverified</dt><dd>0</dd>" in tile
 
 
-def test_the_asvs_headline_is_withheld_without_unexamined_counts() -> None:
+def test_the_asvs_headline_is_withheld_without_no_verdict_counts() -> None:
     snap = _snapshot()
     snap["metrics"][3]["detail"]["counts"] = {"total": 2, "pass": 1, "fail": 1}
     page = rh.render(snap)
