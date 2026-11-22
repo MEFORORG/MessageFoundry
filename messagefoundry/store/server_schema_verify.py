@@ -460,11 +460,13 @@ def _clause(segment: str) -> str:
     return segment[:i].strip()
 
 
-def _statement_end(text: str, start: int) -> int:
+def _statement_end(text: str, start: int, dialect: Dialect | None) -> int:
     """Where the statement that ``text[start:]`` continues ends: a top-level ``;``, an unmatched
     ``)``, a word that starts the next statement, or the end. Unlike :func:`_clause` it reads on
-    through ``ELSE`` and ``END``, which a ``CASE`` in an index predicate holds, and through a data
-    word, so it may read into a following block or statement."""
+    through ``ELSE`` and ``END``, which a ``CASE`` in an index predicate holds, so it may read into a
+    following block. Off SQL Server it reads through a data word too, which PostgreSQL takes as a
+    column's name, so it may also read into a following statement; on SQL Server a data word is
+    reserved and ends it."""
     depth, i = 0, start
     while i < len(text):
         if (end := _quoted_end(text, i)) is not None:
@@ -487,9 +489,10 @@ def _statement_end(text: str, start: int) -> int:
             word = re.match(r"[\w$]+", text[i:])
             assert word is not None
             lower = word.group(0).lower()
-            # A data word does not end it: PostgreSQL takes merge or delete as a column's name.
-            if lower in ("if", "begin", "exec", "execute", "declare", "go", "create") or (
-                lower in ("alter", "drop") and _DDL_OBJECT.match(text, i + len(lower))
+            if (
+                lower in ("if", "begin", "exec", "execute", "declare", "go", "create")
+                or (dialect == "sqlserver" and lower in _DATA_STATEMENT)
+                or (lower in ("alter", "drop") and _DDL_OBJECT.match(text, i + len(lower)))
             ):
                 break
             i += len(lower)
@@ -1013,7 +1016,7 @@ class _Reader:
             tail = " " + tail  # so the scan never starts at index 0
             # Nested dynamic SQL's quotes can defeat the scan: keep it all, which only raises more.
             with contextlib.suppress(ValueError):
-                tail = tail[: _statement_end(tail, 1)]
+                tail = tail[: _statement_end(tail, 1, self.dialect)]
             definition = text[m.end() : end] + tail
             self.opaque[(shape.table, name)] = (
                 frozenset(_ident(w) for w in _TOKEN.findall(definition)),

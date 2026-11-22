@@ -504,3 +504,17 @@ def test_opaque_words_are_kept_per_table_on_sqlserver() -> None:
             ),
             "sqlserver",
         )
+
+
+def test_a_sqlserver_data_statement_ends_an_unterminated_predicate() -> None:
+    """On SQL Server UPDATE is reserved, so it starts the next statement, whose words are not the
+    index's."""
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT NULL, c INT NULL, d INT NULL)",
+            "CREATE INDEX ix ON t (a) WHERE c > 0\nUPDATE t SET d = 1",
+            "ALTER TABLE t DROP COLUMN d",
+        ),
+        "sqlserver",
+    )
+    assert "ix" in shape.named_indexes
