@@ -12017,7 +12017,8 @@ _CONFIG_MODULE_SUFFIX_LEN: Final = 13
 #: Why the loader's diagnostic for author code carries no exception text.
 _WITHHELD: Final = "its message is withheld: it can carry a value the module held"
 
-#: What :func:`_failure_detail` adds when :func:`_in_dir` could not resolve a file's folder.
+#: What :func:`_failure_detail` adds when a folder :func:`_in_dir` could not resolve may make the
+#: location short; its docstring says when.
 _FOLDER_UNRESOLVED: Final = ", and the folder of at least one source file could not be resolved"
 
 
@@ -12142,9 +12143,9 @@ def _failure_detail(
     the config module's import of it. A file name and a line number are layout, not data.
 
     A file whose folder could not be resolved (:func:`_in_dir`) is not named. When one is a frame
-    deeper than the last config-directory frame, or is the file a SyntaxError names, the detail ends
-    with :data:`_FOLDER_UNRESOLVED`, because the location may then be short (vault BACKLOG #3765,
-    LF10)."""
+    deeper than the last config-directory frame, is any frame when no frame is in the config
+    directory, or is the file a SyntaxError names, the detail ends with :data:`_FOLDER_UNRESOLVED`,
+    because the location may then be short (vault BACKLOG #3765, LF10)."""
     located: tuple[str, int] | None = None
     filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
     lineno = getattr(exc, "lineno", None)
