@@ -16374,10 +16374,12 @@ class SqlServerStore:
         # reach or purge. This leg is CI-only, so an asymmetry between the three backends
         # surfaces first in CI rather than here.
         await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
-        # BACKLOG #5671: only this uploader's next reserve sweeps its stale rows, and a deleted
-        # account makes none. This delete reaches a row through the uploader index and a release
-        # through the clustered key, the opposite order, so it takes the applock they both take
-        # (vault BACKLOG #3180). Neither waits on the account row while holding that applock.
+        # BACKLOG #5671: only this uploader's next reserve sweeps its stale rows, so a removed
+        # account's rows would otherwise stay. A reserve checks no account, so an upload already
+        # past authentication can still add one. This delete reaches a row through the uploader
+        # index and a release through the clustered key, the opposite order, so it takes the
+        # applock they both take (vault BACKLOG #3180). Unlike them it asks while holding row
+        # locks, the account's among them, so no holder of this applock may wait on those rows.
         await self._applock(cur, _upload_quota_lock(user_id))
         await cur.execute("DELETE FROM upload_reservation WHERE uploader_id=?", (user_id,))
         await cur.execute("DELETE FROM users WHERE id=?", (user_id,))

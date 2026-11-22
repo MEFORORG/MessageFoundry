@@ -20932,8 +20932,9 @@ class MessageStore:
         # and counted by nothing. `owner` holds the user_id, not the username, which is what
         # makes this a single keyed DELETE rather than a name lookup.
         await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
-        # BACKLOG #5671: only this uploader's next reserve sweeps its stale rows, and a deleted
-        # account makes none. A later release or touch of a removed row is a no-op.
+        # BACKLOG #5671: only this uploader's next reserve sweeps its stale rows, so a removed
+        # account's rows would otherwise stay. A later release or touch of one is a no-op. A
+        # reserve checks no account, so an upload already past authentication can still add one.
         await self._db.execute("DELETE FROM upload_reservation WHERE uploader_id=?", (user_id,))
         await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
 

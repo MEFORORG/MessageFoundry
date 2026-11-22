@@ -335,8 +335,7 @@ async def test_server_delete_user_takes_the_upload_lock_before_the_reservations(
 
     delete = f"DELETE FROM upload_reservation WHERE uploader_id={mark}"
     assert "users" in events[0]
-    if backend == "postgres":
-        assert events[0] == "SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE"
+    assert ("XLOCK" if backend == "sqlserver" else "FOR NO KEY UPDATE") in events[0]
     assert events.index(lock) == events.index(delete) - 1
     assert events.index(delete) < events.index(f"DELETE FROM users WHERE id={mark}")
 

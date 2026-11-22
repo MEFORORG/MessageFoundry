@@ -11293,10 +11293,11 @@ class PostgresStore:
         # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
         # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
         await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
-        # BACKLOG #5671: only this uploader's next reserve sweeps its stale rows, and a deleted
-        # account makes none. The reserve's sweep also deletes several of these rows, so take its
-        # per-uploader lock: two multi-row deletes must not cross. A reserve holds that lock and
-        # never waits on the account row, so holding the account row here cannot close a cycle.
+        # BACKLOG #5671: only this uploader's next reserve sweeps its stale rows, so a removed
+        # account's rows would otherwise stay. A reserve checks no account, so an upload already
+        # past authentication can still add one. The reserve's sweep also deletes several of these
+        # rows, so take its per-uploader lock: two multi-row deletes must not cross. This waits for
+        # that lock holding the account row, so no holder of the lock may wait on the account row.
         await self._advisory_lock(conn, _LOCK_CLASS_UPLOAD_QUOTA, f"upload_quota:{user_id}")
         await conn.execute("DELETE FROM upload_reservation WHERE uploader_id=$1", user_id)
         await conn.execute("DELETE FROM users WHERE id=$1", user_id)
