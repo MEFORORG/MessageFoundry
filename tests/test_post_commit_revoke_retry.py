@@ -909,7 +909,7 @@ def test_the_cli_reports_whether_the_given_up_runs_page_was_delivered(
 
     async def granted_then_missed(*_a: object, **_k: object) -> object:
         raise FirstAdministratorGrantedSessionsLive(
-            "synthetic sessions live", username="site-admin"
+            "synthetic sessions live", username="site-admin", administrators_at_check=("ops-b",)
         )
 
     async def page(*_a: object, username: str, granted_by: str) -> bool:
@@ -930,5 +930,9 @@ def test_the_cli_reports_whether_the_given_up_runs_page_was_delivered(
         assert body["administrator_granted_alerted"] is delivered
     else:
         assert "synthetic sessions live" in captured.err
-        warned = "no [alerts] transport confirmed delivery" in captured.err
-        assert warned is not delivered
+        if delivered:
+            assert "accepted the administrator_granted alert" in captured.out
+        else:
+            # The granted run's WARNING, naming the other Administrators the check found.
+            assert "no [alerts] transport confirmed delivery" in captured.out
+            assert "Tell the site's other Administrators yourself: 'ops-b'" in captured.out

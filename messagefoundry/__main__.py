@@ -10959,17 +10959,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except FirstAdministratorGrantedSessionsLive as exc:
         # Vault BACKLOG #3023 residual (4): the role is granted, so it pages as any grant does,
         # then the command exits non-zero with the text naming the host command that ends the
-        # earlier holder's session. Whether the page was delivered is reported too: the JSON's
-        # administrator_granted_alerted, and a WARNING when it was not. Unlike a granted run's,
-        # that WARNING names no other Administrator, since this refusal does not carry them
-        # (vault BACKLOG #3023 items 11 and 30).
+        # earlier holder's session. Whether the page was delivered is reported as a granted run
+        # reports it: the JSON's administrator_granted_alerted, and the same line in text (vault
+        # BACKLOG #3023 items 11 and 30).
         alerted = page_granted(exc.username)
-        if not alerted and not args.json:
-            print(
-                "WARNING: no [alerts] transport confirmed delivery of the administrator_granted "
-                "alert for this grant, so it went to the log and nobody may have been paged.",
-                file=sys.stderr,
-            )
+        if not args.json:
+            _safe_print(_administrator_granted_alert_line(alerted, exc.administrators_at_check))
         return _emit_error(
             str(exc),
             as_json=args.json,
@@ -11131,25 +11126,32 @@ def _provision_admin(args: argparse.Namespace) -> int:
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")
     # Vault BACKLOG #3849 B5.
+    _safe_print(_administrator_granted_alert_line(alerted, outcome.administrators_at_check))
+    return 0
+
+
+def _administrator_granted_alert_line(alerted: bool, administrators: Sequence[str]) -> str:
+    """What ``provision-admin`` says about its ``administrator_granted`` page (vault BACKLOG #3849
+    B5), on a granted run and on one whose post-grant revoke was given up on (vault BACKLOG #3023
+    items 11 and 30): accepted, a WARNING naming the other enabled Administrators the run's check
+    found, or a plain note when there were none."""
     if alerted:
-        _safe_print(
+        return (
             "An [alerts] transport accepted the administrator_granted alert for this grant. A "
             "transport that failed shows as a WARNING above."
         )
-    elif outcome.administrators_at_check:
-        _safe_print(
+    if administrators:
+        return (
             "WARNING: no [alerts] transport confirmed delivery of the administrator_granted alert "
             "for this grant (none is configured, a rule routes it to none, or a WARNING or ERROR "
             "above says why), so it went to the log and nobody may have been paged. Tell the "
             "site's other Administrators yourself: "
-            + ", ".join(repr(name) for name in outcome.administrators_at_check)
+            + ", ".join(repr(name) for name in administrators)
         )
-    else:
-        _safe_print(
-            "No [alerts] transport confirmed delivery of the administrator_granted alert for this "
-            "grant, so it went to the log."
-        )
-    return 0
+    return (
+        "No [alerts] transport confirmed delivery of the administrator_granted alert for this "
+        "grant, so it went to the log."
+    )
 
 
 def _admin_set_notify_email(args: argparse.Namespace) -> int:

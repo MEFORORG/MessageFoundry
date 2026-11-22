@@ -6853,11 +6853,11 @@ async def test_a_rename_whose_seal_is_refused_at_the_write_does_not_end_the_pass
 
 # --- vault BACKLOG #3069 item 1: a Vault transit answer at the rename's reads ---------------------
 
-#: The two answers a checked read raises (a Forged record reads as ``refused`` instead) and the
-#: phrase the ERROR line names it by. Only an Outage pages.
+#: The two answers a checked read raises (a Forged record reads as ``refused`` instead). An
+#: Unverifiable answer skips that one rename; an Outage is paged once and ends the pass.
 _READ_ANSWERS = [
-    pytest.param(lambda: TransitSealUnverifiableError("user", 1, 2), "could not verify", id="unv"),
-    pytest.param(TransitSealUnavailableError, "did not answer", id="outage"),
+    pytest.param(lambda: TransitSealUnverifiableError("user", 1, 2), id="unv"),
+    pytest.param(TransitSealUnavailableError, id="outage"),
 ]
 
 #: At least these checked reads of one rename: the loop's read of the new name's holder, the
@@ -6883,19 +6883,23 @@ def _seal_answer_at_next_check(service: AuthService, answer: Callable[[], Except
 
 
 @pytest.mark.parametrize("read", _RENAME_READS)
-@pytest.mark.parametrize(("answer", "phrase"), _READ_ANSWERS)
-async def test_a_transit_answer_at_a_rename_read_does_not_end_the_pass(
+@pytest.mark.parametrize("answer", _READ_ANSWERS)
+async def test_a_transit_answer_at_a_rename_read(
     caplog: pytest.LogCaptureFixture,
     read: str,
     answer: Callable[[], Exception],
-    phrase: str,
 ) -> None:
     """Vault BACKLOG #3069 item 1. Vault transit could not verify, or did not answer for, the
-    record one of ``jdoe``'s rename reads checked. The reconcile loop logs it at ERROR, pages an
-    Outage as the write's seal arm does (note T2), skips that rename, and the pass returns its
-    plan with ``asmith``'s rename applied (the plan's order is not fixed, so that rename may run
-    first). RED when: the answer escapes the pass. Called the way the login path
-    calls it, the answer is raised."""
+    record one of ``jdoe``'s rename reads checked.
+
+    Unverifiable: the loop logs it at ERROR, pages nothing, skips that rename, and the pass returns
+    its plan with ``asmith``'s rename applied (the plan's order is not fixed, so that rename may
+    run first). RED when: the answer escapes the pass, or it pages.
+
+    Outage (Manager decision, 2026-11-22): the key service is down, so the loop pages it once and
+    the pass ends with it, as on main. RED when: the pass goes on, or the Outage is not paged once.
+
+    Called the way the login path calls it, either answer is raised."""
     store, service, notifier = await _two_renamed_accounts()
     try:
         pages: list[str] = []
@@ -6946,22 +6950,30 @@ async def test_a_transit_answer_at_a_rename_read_does_not_end_the_pass(
         store.get_user_by_username = by_name  # type: ignore[method-assign]
         store.set_user_username = rename  # type: ignore[method-assign]
         service._refresh_cached_username = refresh  # type: ignore[method-assign]
+        outage = answer is TransitSealUnavailableError
         with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
-            plan = await service.reconcile_directory_sessions()
+            if outage:
+                with pytest.raises(TransitSealUnavailableError):
+                    await service.reconcile_directory_sessions()
+            else:
+                plan = await service.reconcile_directory_sessions()
         assert reached == [read], "the read was not reached"
-        assert plan.aborted is None and len(plan.renames) == 2
-        assert await real_by_name("asmith-new") is not None, "the other rename was skipped"
         still = await real_by_id(jdoe.id)
         assert still is not None and still.username == "jdoe"
-        assert _logged_at_error(caplog, f"account {jdoe.id} (renaming to jdoe-new)", phrase)
-        if answer is TransitSealUnavailableError:
-            assert pages, "the Outage did not page through the seal pager"
-        told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
-        assert told == ["asmith-new"]
+        if outage:
+            assert len(pages) == 1, "the Outage was not paged exactly once"
+        else:
+            assert plan.aborted is None and len(plan.renames) == 2
+            assert await real_by_name("asmith-new") is not None, "the other rename was skipped"
+            assert _logged_at_error(
+                caplog, f"account {jdoe.id} (renaming to jdoe-new)", "could not verify"
+            )
+            assert pages == [], "an Unverifiable read answer paged"
+            told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+            assert told == ["asmith-new"]
 
         if read == "pre-read":
             armed.append(True)
-            renaming.append(jdoe.id)
             with pytest.raises(type(answer())):
                 await real_refresh(
                     user_id=jdoe.id,
