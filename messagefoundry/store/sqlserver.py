@@ -9507,10 +9507,10 @@ class SqlServerStore:
                 # example a key the store lacks, so the token keeps its reference and a replay can
                 # recover it. A key service that gave no verdict leaves as a QueueOpenFault, raised
                 # outside the handler so it carries no chain to the raw key-service error, and the
-                # token is retried. An engine fault propagates from the reply cell. It need not
-                # from the others: an AADComponentError on a token reference or on origin metadata
-                # dead-letters the token as a corrupt cell. Only the decrypts are wrapped: the
-                # encrypt's invocation ceiling stays a hard stop.
+                # token is retried. An engine fault propagates from the reply cell. On a token
+                # reference or origin metadata it can dead-letter the token instead: whether an
+                # AADComponentError there reads as a corrupt cell depends on the cipher. Only the
+                # decrypts are wrapped: the encrypt's invocation ceiling stays a hard stop.
                 async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
                     log.warning(
                         "ingress_handoff: %s of work-row %s does not decrypt (%s); dead-lettering",

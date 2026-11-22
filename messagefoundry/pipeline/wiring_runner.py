@@ -13077,7 +13077,7 @@ class RegistryRunner:
             # BACKLOG #5727: the fault arm logs this fault with its traceback. Drop the handoff's
             # frames, whose arguments carry values from the reply, and this frame's own copies,
             # before it goes on. The token is still re-pended by the fault arm.
-            del body, control_id, summary, refused
+            del body, control_id, message_type, summary, refused
             raise handoff_fault.with_traceback(None)
         if produced:
             # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op

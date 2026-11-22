@@ -275,8 +275,9 @@ async def worker_read_outage_retries(store: Any, fetch: RawFetch, _raw: RawSql) 
 
 #: A reply the HL7 loopback's peek refuses, so the worker holds a bounded view of it as well.
 REFUSED_REPLY = "SYNTHETIC-REFUSED-REPLY not an HL7 message"
-#: The control id the worker peeks out of ``REPLY``, a value derived from the reply body.
-REPLY_CONTROL_ID = "RSP1"
+#: A reply with its MSH fields in place, and the control id and message type the worker peeks.
+PEEKED_REPLY = "MSH|^~\\&|PARTNER|F|R|RF|20260101||ACK^A01|RSPCTRL|P|2.5.1\rMSA|AA|OUT1\r"
+PEEKED_VALUES = ("RSPCTRL", "ACK^A01")
 
 
 def _holds(value: Any, needles: tuple[str, ...], depth: int = 4) -> bool:
@@ -322,13 +323,13 @@ def _engine_frames_holding(
     return walked, holding
 
 
-def _fault_reaches_no_reply(which: str, *, reply: str = REPLY) -> ContractCase:
+def _fault_reaches_no_reply(which: str, *, reply: str = PEEKED_REPLY) -> ContractCase:
     """A no-verdict fault at ``which`` leaves the step with no chain to the key-service error and
     no traceback frame holding the reply or a value peeked from it. ``worker`` is the step's own
     read; the others are the handoff's opens, after the step has read the reply."""
 
     async def case(store: Any, fetch: RawFetch, raw: RawSql) -> None:
-        needles = (reply, REPLY_CONTROL_ID) if reply == REPLY else (reply,)
+        needles = (reply, *PEEKED_VALUES) if reply == PEEKED_REPLY else (reply,)
         # CONTROL: the instrument finds the reply in the shapes the step holds it in.
         assert _holds({"k": [reply]}, needles) and not _holds({"k": ["other"]}, needles)
         mid = await captured(store, control="FR-HEAD", now=1.0, reply=reply)
@@ -367,7 +368,7 @@ def _fault_reaches_no_reply(which: str, *, reply: str = REPLY) -> ContractCase:
             await step._process_response_item(LOOP, item)
         assert len(await children(fetch)) == 1
 
-    suffix = "" if reply == REPLY else "_refused"
+    suffix = "" if reply == PEEKED_REPLY else "_refused"
     case.__name__ = f"fault_at_{which}{suffix}_reaches_no_reply"
     return case
 
