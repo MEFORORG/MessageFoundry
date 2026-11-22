@@ -502,8 +502,10 @@ def test_the_control_id_scheme_is_a_one_place_constant() -> None:
     # The prefix is now a SENDER↔ROUTER contract (the graph decodes what the sender stamps) across PROCESS
     # boundaries. It used to be re-spelled as `ControlIds(prefix="SC")` in FIVE places (four senders + the
     # shape); change four of the five and the router raises on every message, voiding the whole run. There is
-    # now exactly ONE definition (harness.load.ids.SHARDCERT_IDS) and everything imports it.
-    for module in ("harness/load/shardcert.py", "harness/config/shardcert/_shape.py"):
+    # now ONE definition (harness.load.ids.SHARDCERT_IDS), which the senders import. The graph's _shape
+    # holds a parser copy so it loads without the harness package (BACKLOG #5854), and
+    # tests/test_harness_graph_engine_only.py holds that copy equal to this definition.
+    for module in ("harness/load/shardcert.py",):
         src = (_REPO_ROOT / module).read_text(encoding="utf-8")
         assert 'ControlIds(prefix="SC")' not in src, (
             f"{module} re-spells the shardcert control-id scheme — import SHARDCERT_IDS instead"

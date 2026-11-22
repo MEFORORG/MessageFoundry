@@ -101,10 +101,12 @@ The graph is synthetic and generic — no real partner/site/host/volume.
 from __future__ import annotations
 
 import os
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import wraps
+from typing import Final
 
-from harness.config._refusal import prints_its_refusal
-from harness.load.ids import SHARDCERT_IDS
 from messagefoundry.parsing.message import Message, RawMessage
 
 CHEAP = "cheap"
@@ -127,6 +129,44 @@ _M64 = (1 << 64) - 1
 # is still fed through _mix64, so the D picks stay non-linear + seed-free (same rationale as _mix64).
 # Deliberately DISTINCT from _mix64's internal add-constant (a different avalanche input per pick).
 _FANOUT_STRIDE = 0xD1B54A32D192ED03
+
+
+# A copy of harness/config/_refusal.py, because this file is served to its graph as a bare sibling
+# helper and must not need the harness package (BACKLOG #5854).
+# tests/test_harness_graph_engine_only.py holds the two equal.
+def prints_its_refusal[R](read_shape: Callable[[], R]) -> Callable[[], R]:
+    """Wrap ``read_shape`` so a ``ValueError`` it raises is printed to stderr, then raised as is."""
+
+    @wraps(read_shape)
+    def reading() -> R:
+        try:
+            return read_shape()
+        except ValueError as exc:
+            print(f"harness shape refused: {exc}", file=sys.stderr, flush=True)
+            raise
+
+    return reading
+
+
+@dataclass(frozen=True)
+class _ControlIdScheme:
+    """The parsing half of ``harness.load.ids.ControlIds``, copied for the same reason as the
+    decorator above. The senders stamp with the original; the same test holds the two equal."""
+
+    prefix: str
+    width: int
+
+    def parse(self, control_id: str | None) -> int | None:
+        """Recover the sequence number from a control id, or ``None`` if it isn't one of ours."""
+        if not control_id or not control_id.startswith(self.prefix):
+            return None
+        tail = control_id[len(self.prefix) :]
+        if not tail.isdigit():
+            return None
+        return int(tail)
+
+
+SHARDCERT_IDS: Final = _ControlIdScheme(prefix="SC", width=12)
 
 
 def _mix64(x: int) -> int:

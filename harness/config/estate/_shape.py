@@ -33,9 +33,10 @@ Everything is **synthetic and generic** — it models the *shape* of a mixed est
 from __future__ import annotations
 
 import os
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-
-from harness.config._refusal import prints_its_refusal
+from functools import wraps
 
 # Transform cost modes (mirrors connscale): cheapest pass-through + an optional whole-field rewrite.
 CHEAP = "cheap"  # pass-through: deliver the receipt unchanged (the cheapest possible graph)
@@ -47,6 +48,23 @@ _MAX_PORT = 65535
 _MIN_COUNT = 1
 _MAX_COUNT = 5000  # generous headroom over the 1500 ceiling; a typo of 50000 fails loud
 _MAX_FANOUT = 256  # a hub fanning to hundreds of outbounds is already far past any real estate
+
+
+# A copy of harness/config/_refusal.py, because this file is served to its graph as a bare sibling
+# helper and must not need the harness package (BACKLOG #5850).
+# tests/test_harness_graph_engine_only.py holds the two equal.
+def prints_its_refusal[R](read_shape: Callable[[], R]) -> Callable[[], R]:
+    """Wrap ``read_shape`` so a ``ValueError`` it raises is printed to stderr, then raised as is."""
+
+    @wraps(read_shape)
+    def reading() -> R:
+        try:
+            return read_shape()
+        except ValueError as exc:
+            print(f"harness shape refused: {exc}", file=sys.stderr, flush=True)
+            raise
+
+    return reading
 
 
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:

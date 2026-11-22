@@ -18,6 +18,8 @@ Synthetic + generic; reuses the load graph's ``_shape`` for the entry port and s
 
 from __future__ import annotations
 
+# Needs the harness package (a checkout or the harness wheel): the helper is in another directory,
+# and the config loader serves a bare import only from this one (BACKLOG #5853).
 from harness.config.load._shape import NO_PER_HOST_CAP, load_shape
 from messagefoundry import MLLP, PassThrough, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy

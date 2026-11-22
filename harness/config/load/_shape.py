@@ -11,7 +11,8 @@ Knobs (all optional, with safe defaults so ``serve`` works with none set):
 * ``MEFOR_LOAD_FANOUT``         — sink destinations per ADT message (default 20).
 * ``MEFOR_LOAD_RESULTS_FANOUT`` — destinations per results/other message (default 4).
 * ``MEFOR_LOAD_TRANSFORM``      — ``cheap`` | ``edit`` | ``slow`` (default ``edit``).
-* ``MEFOR_LOAD_TRANSFORM_MS``   — CPU spin per transform when ``slow`` (default 1.0 ms).
+* ``MEFOR_LOAD_TRANSFORM_MS``   — CPU spin per transform when ``slow`` (default 1.0 ms, at most
+  60000; a non-finite value is refused).
 * ``MEFOR_LOAD_SINK_HOST``      — sink host every destination delivers to (default 127.0.0.1).
 * ``MEFOR_LOAD_SINK_PORT``      — base sink port (default 2700).
 * ``MEFOR_LOAD_SINK_PORTS``     — contiguous sink ports to round-robin across (default 1).
@@ -34,10 +35,12 @@ hub plus results/orders hubs), never a real site. See ``docs/LOAD-TESTING.md``.
 from __future__ import annotations
 
 import os
+import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import wraps
 
-from harness.config._refusal import prints_its_refusal
 from messagefoundry.parsing.message import Message, RawMessage
 
 # Transform cost modes.
@@ -45,6 +48,10 @@ CHEAP = "cheap"  # pass-through: deliver the raw receipt unchanged
 EDIT = "edit"  # representative whole-field rewrites via the Message model
 SLOW = "slow"  # edit + a deterministic CPU spin, to find the transform-cost ceiling on one core
 _TRANSFORMS = frozenset({CHEAP, EDIT, SLOW})
+
+# One minute per transform. The spin runs on the event loop once per destination handler, so this
+# bounds the stall rather than preventing one; without it a huge value hangs like inf (BACKLOG #5851).
+_MAX_TRANSFORM_MS = 60_000.0
 
 #: ``max_connections_per_host=NO_PER_HOST_CAP`` turns the shipped per-peer connection cap off on a
 #: harness MLLP hub (BACKLOG #1725). It lives here rather than in one graph because **every** graph
@@ -60,6 +67,23 @@ _TRANSFORMS = frozenset({CHEAP, EDIT, SLOW})
 NO_PER_HOST_CAP = None
 
 
+# A copy of harness/config/_refusal.py, because this file is served to its graph as a bare sibling
+# helper and must not need the harness package (BACKLOG #5852).
+# tests/test_harness_graph_engine_only.py holds the two equal.
+def prints_its_refusal[R](read_shape: Callable[[], R]) -> Callable[[], R]:
+    """Wrap ``read_shape`` so a ``ValueError`` it raises is printed to stderr, then raised as is."""
+
+    @wraps(read_shape)
+    def reading() -> R:
+        try:
+            return read_shape()
+        except ValueError as exc:
+            print(f"harness shape refused: {exc}", file=sys.stderr, flush=True)
+            raise
+
+    return reading
+
+
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     raw = os.environ.get(name)
     if not raw:
@@ -73,7 +97,7 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     return value
 
 
-def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
     raw = os.environ.get(name)
     if not raw:
         return default
@@ -81,8 +105,9 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         value = float(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number, got {raw!r}") from exc
-    if value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    # Written as one positive range test because nan fails it, where `value < minimum` would not.
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be within [{minimum}, {maximum}], got {value}")
     return value
 
 
@@ -127,7 +152,9 @@ def load_shape() -> Shape:
         fanout=_env_int("MEFOR_LOAD_FANOUT", 20, minimum=1),
         results_fanout=_env_int("MEFOR_LOAD_RESULTS_FANOUT", 4, minimum=1),
         transform=transform,
-        transform_ms=_env_float("MEFOR_LOAD_TRANSFORM_MS", 1.0, minimum=0.0),
+        transform_ms=_env_float(
+            "MEFOR_LOAD_TRANSFORM_MS", 1.0, minimum=0.0, maximum=_MAX_TRANSFORM_MS
+        ),
         sink_host=os.environ.get("MEFOR_LOAD_SINK_HOST", "127.0.0.1") or "127.0.0.1",
         sink_port=_env_int("MEFOR_LOAD_SINK_PORT", 2700, minimum=1),
         sink_ports=_env_int("MEFOR_LOAD_SINK_PORTS", 1, minimum=1),
