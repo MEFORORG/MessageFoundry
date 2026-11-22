@@ -797,16 +797,16 @@ _PR_INLINE_TAG = re.compile(
 #: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
 #: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
 _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
-#: The floor. The baseline reading is one pass of :func:`scan_pr_body` and reads every line as
-#: origin/main did before BACKLOG #5582 changed the reading: the rewrites above found more, and missed
-#: some main caught, three review rounds running. It takes the quote marker out with the pattern below,
-#: as main did, and reads links and splits sentences with :func:`_pr_base_link_sub` and
+#: The floor. The baseline reading is one pass of :func:`scan_pr_body`. It strips quote markers,
+#: reads links and splits sentences as origin/main did before BACKLOG #5582 changed those steps: the
+#: rewrites above found more, and missed some main caught, three review rounds running. It takes the
+#: quote marker out with the pattern below, as main did, and reads links and splits sentences with
+#: :func:`_pr_base_link_sub` and
 #: :func:`_pr_base_split_spans`, which give the output of main's link and split patterns in linear
 #: time; those patterns backtrack on a long run, and tests/test_scan_forbidden.py keeps them as its
 #: oracles and pins the two functions equal to them. Do not
 #: tighten any of the three: a change to one is a change to the floor. The pass runs this module's
-#: table model, whose loose reading keeps a table's ASVS columns wherever main kept them but past a
-#: blank line under a header that has had a data row (_pr_loose_columns).
+#: table model (_pr_loose_columns).
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
 #: The lookahead class of main's full-stop split.
 _PR_BASE_SPLIT_LOOKAHEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ*`[(\"'#>-")
@@ -1186,7 +1186,7 @@ def _pr_table_starts(
     else, a lone ">" between rows does not end the run, as main read no blank line at all.
 
     These runs bound only the GFM reading (_pr_table_columns), whose columns can only add marks; the
-    loose reading (_pr_loose_columns) does not read them."""
+    loose reading (_pr_loose_columns), which keeps every mark main kept, does not read them."""
 
     starts = []
     # Whether every row since the last unit that is not a row opens with a quote marker.
@@ -1254,29 +1254,24 @@ def _pr_table_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
     return columns
 
 
-def _pr_loose_columns(units: _PrUnits, blanks: list[int]) -> list[set[int]]:
+def _pr_loose_columns(units: _PrUnits) -> list[set[int]]:
     """For each unit, the ASVS columns as main read them, united with the GFM reading above: every
-    row above a dash-shaped unit is re-read as a header, and its cells are split at every pipe.
-
-    A unit that is not a row ends this reading, as on main. So does a blank line (``blanks``, as
-    _pr_lines counts one) between two rows once the header has had a data row: the pipe lines below
-    it are another block, which the header above does not name (BACKLOG #3364 step 9). That drops a
-    mark main kept, on purpose. A blank line above the first data row, or a
-    quote-marker-only line anywhere, ends nothing, as on main: a header with no rows yet is read as
-    heading the rows below it."""
+    row above a dash-shaped unit is re-read as a header, and its cells are split at every pipe. Only
+    a unit that is not a row ends this reading, as on main, so a blank line or a quote-marker-only
+    line between rows ends nothing here and every mark main kept is kept. Step 9, which ended this
+    reading at such a line, was removed; the false positive it quieted stays open on BACKLOG #3364."""
     columns: list[set[int]] = []
     current: set[int] = set()
-    # Whether a data row has been read under the current header.
-    has_rows = False
-    for index, (marks, text, is_row) in enumerate(units):
-        # A data row above implies the unit above is a row, as any other unit clears it.
-        if not is_row or (has_rows and _pr_between(blanks, units[index - 1][0][0][1], marks[0][1])):
-            current, has_rows = set(), False
-        if is_row and not _pr_is_delimiter(text):
-            if index + 1 < len(units) and _pr_is_delimiter(units[index + 1][1]):
-                current, has_rows = _pr_asvs_columns(text, loose=True), False
-            elif current:
-                has_rows = True
+    for index, (_, text, is_row) in enumerate(units):
+        if not is_row:
+            current = set()
+        if (
+            is_row
+            and not _pr_is_delimiter(text)
+            and index + 1 < len(units)
+            and _pr_is_delimiter(units[index + 1][1])
+        ):
+            current = _pr_asvs_columns(text, loose=True)
         columns.append(current)
     return columns
 
@@ -1335,8 +1330,9 @@ def scan_pr_body(body: str) -> list[str]:
     Reasons only, never the matched text. One hit per kind per LINE: sentences of one paragraph that
     restate a verdict on the same line report it once, rather than storming.
 
-    Read three times, and the hits are the union (BACKLOG #5582). The baseline reads the lines as
-    origin/main did before BACKLOG #5582 (see ``_PR_BASE_QUOTE``). The second reads each link as its text and each inline tag as no
+    Read three times, and the hits are the union (BACKLOG #5582). The baseline strips quote markers,
+    reads links and splits sentences as origin/main did before BACKLOG #5582 (see
+    ``_PR_BASE_QUOTE``). The second reads each link as its text and each inline tag as no
     edge, and the third keeps each link's target beside it, so a code path only a target names is
     seen; from the third only a map counts. Each reading builds its own units from one line model
     (:func:`_pr_lines`), so every reading keeps each line where it was and the hits merge by (line,
@@ -1377,7 +1373,7 @@ def _pr_scan_units(
     """Scan every unit with its own runs of rows and columns; return the runs and both columns."""
     starts = _pr_table_starts(units, *gfm)
     asvs = _pr_table_columns(units, starts)
-    loose = _pr_loose_columns(units, gfm[0])
+    loose = _pr_loose_columns(units)
     for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
         _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
     return starts, asvs, loose
@@ -1404,7 +1400,7 @@ def _pr_scan_reading(
         for unit, unit_asvs, unit_loose, plain, plain_asvs, plain_loose in zip(
             deleted,
             _pr_table_columns(deleted, starts),
-            _pr_loose_columns(deleted, gfm[0]),
+            _pr_loose_columns(deleted),
             units,
             asvs,
             loose,
