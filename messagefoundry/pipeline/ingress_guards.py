@@ -189,7 +189,13 @@ def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
     (:func:`~messagefoundry.parsing.binary.later_header_forms_over_limit`, BACKLOG #5972), so the
     delivery re-attach never scans a received body once per form past that limit. Pure, so both
     listeners, the loopback re-ingress and the dry-run run the one check."""
-    message = Message(peek.message)
+    return _message_marker_refusal(Message(peek.message), text)
+
+
+def _message_marker_refusal(message: Message, text: str) -> str | None:
+    """:func:`doc_ref_marker_refusal` over an already-parsed ``message``, so the edit-resend direct
+    path runs the same check on a body only the delivery re-attach's ``Message.parse`` accepts,
+    such as an FHS- or BHS-led batch (BACKLOG #5972)."""
     if marker_under_base64_delimiters(message, text):
         return DOC_REF_MARKER_REFUSED_REASON
     verdict = colliding_marker_verdict(message, text)
@@ -665,12 +671,13 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
 
 def _raise_if_marker_refused(peek: Peek, text: str) -> None:
     """Raise the ``ingest`` refusal where :func:`doc_ref_marker_refusal` refuses ``text``. It reads
-    the header too, so a read fault is refused as well; neither reason names a byte of the body."""
+    the header too, so a read fault is refused as well, naming the fault's type alone; no reason it
+    raises names a byte of the body."""
     refused: str | None
     try:
         refused = doc_ref_marker_refusal(peek, text)
-    except PEEK_READ_FAULTS:
-        refused = _MARKER_CHECK_FAULT_REASON
+    except PEEK_READ_FAULTS as exc:
+        refused = f"{_MARKER_CHECK_FAULT_REASON} ({type(exc).__name__})"
     if refused is not None:
         raise IngressGuardError(refused, phase="ingest")
 
@@ -708,9 +715,9 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     before this runs. The engine-wide rules apply then, at least the NUL rule and the engine
     ceiling, and, for a body that the delivery re-attach's gate opens on
     (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), at least these: the listeners'
-    whole **ingest** check on a body ``Peek.parse`` accepts; a **parse** refusal of a body past
-    ``Peek.parse``'s segment cap, or one the parser faults on; and the form limit on one within
-    that cap that only the re-attach's own parse (``Message.parse``) accepts. ``raw`` is returned
+    whole **ingest** check on a body ``Peek.parse`` accepts, and on one within its segment cap
+    that only the re-attach's own parse (``Message.parse``) accepts; a **size** refusal of a body
+    past ``Peek.parse``'s segment cap; and a **parse** refusal of one the parser faults on. ``raw`` is returned
     as is. Strict validation is an inbound's setting, so it never applies there either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
     rule is ``docs/SECURITY.md`` control 5), so the ceiling is a backstop.
 
@@ -728,11 +735,10 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         # The delivery re-attach judges a payload its gate opens on, so one that parses as HL7
         # meets the listeners' document-marker refusal here, rather than being committed and then
         # dead-lettered (BACKLOG #5972). A body the parser refuses within the segment cap is left to
-        # the outbound, but a
-        # fault in the parser refuses the body, as the re-attach re-raises one rather than admit
-        # what it could not read. A body Peek.parse refuses past its segment cap is refused. Another
-        # body it refuses, such as an FHS- or BHS-led batch, is parsed again as the re-attach parses
-        # it and refused past the form limit, so it is not committed past that limit.
+        # the outbound, but a fault in the parser refuses the body, as the re-attach re-raises one
+        # rather than admit what it could not read. A body Peek.parse refuses past its segment cap
+        # is refused. Another body it refuses, such as an FHS- or BHS-led batch, is parsed again as
+        # the re-attach parses it and meets the same marker refusal on that parse.
         if not may_hold_doc_ref(raw):
             return raw
         # Raised once its handler has ended, so the parser's error is on no chain.
@@ -759,7 +765,9 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         except HL7PeekError as exc:
             over_cap = str(exc)
         if over_cap is not None:
-            raise IngressGuardError(over_cap, phase="parse")
+            # The size phase, as the re-route answers the same body (an over-cap body is not a
+            # malformed one).
+            raise IngressGuardError(over_cap, phase="size")
         try:
             message = Message.parse(raw)
         except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
@@ -770,14 +778,13 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             faulted = f"parse error: peek read failed ({type(exc).__name__})"
         if faulted is not None:
             raise IngressGuardError(faulted, phase="parse")
+        marker_refused: str | None
         try:
-            over_limit = later_header_forms_over_limit(message)
-        except PEEK_READ_FAULTS:
-            faulted = _MARKER_CHECK_FAULT_REASON
-        if faulted is not None:
-            raise IngressGuardError(faulted, phase="ingest")
-        if over_limit:
-            raise IngressGuardError(HEADER_FORMS_REFUSED_REASON, phase="ingest")
+            marker_refused = _message_marker_refusal(message, raw)
+        except PEEK_READ_FAULTS as exc:
+            marker_refused = f"{_MARKER_CHECK_FAULT_REASON} ({type(exc).__name__})"
+        if marker_refused is not None:
+            raise IngressGuardError(marker_refused, phase="ingest")
         return raw
     # The reason a caught error refused the body, raised once its handler has ended.
     refused: str | None = None
