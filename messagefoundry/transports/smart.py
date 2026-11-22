@@ -352,13 +352,12 @@ class _TokenEndpointProvider(abc.ABC):
             token_url, cls._URL_SETTING, use=cls._CREDENTIAL_SETTINGS, error=cls._ERROR
         )
         # BACKLOG #5911: a token URL http.client could never send fails the connection here, not
-        # each mint. The POST goes to the URL with no path appended, so it is judged as urllib
-        # sends it.
+        # each mint.
         if unsendable_request_target(token_url, sent_as_is=True):
             raise cls._ERROR(
                 f"{cls._URL_SETTING} must be ASCII with no whitespace or control character "
                 "once the whitespace around it is stripped (http.client sends it as ASCII); "
-                "percent-encode it, and give an internationalized host in its IDNA form"
+                "give an internationalized host in its IDNA form"
             )
         # The token POST carries a credential, so an off-box cleartext hop is refused with no
         # escape, as the delivery cells' credentials are (vault BACKLOG #3533 item 4): neither
