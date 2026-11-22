@@ -74,6 +74,15 @@ class RelayConfig:
         False
     )
 
+    def __post_init__(self) -> None:
+        # Refuse these here, before any listener binds: a zero/negative attempt count would skip the
+        # Corepoint forward loop, so an ACKed Epic message would never be sent and fail-closed would
+        # not trip; a zero/negative bound makes asyncio.Queue unbounded.
+        for name in ("corepoint_attempts", "mefor_queue_max"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
 
 class ForwardError(Exception):
     """A transport-level failure forwarding to a downstream (connect / I/O / timeout / peer-close)."""
@@ -545,7 +554,8 @@ class TeeRelay:
                 )
                 if attempt < cfg.corepoint_attempts:
                     await asyncio.sleep(cfg.corepoint_retry_delay)
-        assert last is not None  # corepoint_attempts >= 1, so the loop ran and set `last`
+        if last is None:  # unreachable: RelayConfig refuses corepoint_attempts < 1
+            raise ForwardError("no Corepoint forward attempt was made")
         raise last
 
     # -- Listener B: Corepoint copies -> MEFOR -------------------------------
