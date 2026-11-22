@@ -999,3 +999,50 @@ def test_admin_reset_totp_unauditable_write_says_what_the_open_may_have_changed(
     out = _run(["admin-reset-totp", "--username", "ops", "--service-config", str(settings)], capsys)
     assert "synthetic unauditable write" in out, out
     assert _OWN_WRITES in out and "nothing was written" not in out.lower(), out
+
+
+# Manager follow-up on round-9210f623f2 findings 1 to 4 (BACKLOG #5067).
+
+
+@pytest.mark.parametrize("wrote", [True, False], ids=["write-started", "before-the-write"])
+def test_a_locked_store_after_the_write_open_is_no_cannot_open(
+    wrote: bool, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A "database is locked" from the service, after the write's open returned, is no "cannot
+    open the store": once the write started it says so and to keep the entry; before it, to delete
+    it. Exit 1, as an integrity refusal exits.
+
+    Mutation: send that arm to ``_emit_store_open_error`` again; it then says cannot open."""
+    _service_raises(monkeypatch, sqlite3.OperationalError("database is locked"), wrote=wrote)
+    code = main(_provision_sqlite(shell))
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code == 1, out
+    assert "the store failed after it opened (OperationalError)" in out, out
+    assert "cannot open the store" not in out, out
+    if wrote:
+        assert "The write had started" in out and _KEEP_ENTRY in out, out
+    else:
+        assert _UNUSED_ENTRY in out and _OWN_WRITES in out, out
+
+
+def test_a_transit_keyed_open_names_the_genesis_record(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Under ``vault_transit`` with no local key the store is keyed in Vault, so a refusal after
+    the pre-check's open names the genesis record a keyed open may write.
+
+    Mutation: read "keyed" from ``_store_key_configured`` alone again."""
+    from messagefoundry.__main__ import _open_is_keyed, _opened_left_behind
+    from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    transit = ServiceSettings(
+        store=StoreSettings(path="synthetic.db", cipher_provider="vault_transit")
+    )
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    assert _open_is_keyed(transit)
+    left = _opened_left_behind(
+        KeyProviderError("synthetic"), transit.store, keyed=_open_is_keyed(transit)
+    )
+    assert "the audit chain's genesis record" in left, left

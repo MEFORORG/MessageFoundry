@@ -7777,7 +7777,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
             # What the open may have changed before it, as for a keyless-chain refusal (#5067).
-            left = _open_refusal_left_behind(extra, settings.store) or "Nothing was written"
+            left = _opened_left_behind(extra, settings.store, keyed=_open_is_keyed(settings))
             _emit_error(f"{_sentence(codec_safe_str(extra))} {left}.", as_json=args.json)
             return 2
         # #1670: a path that is not a database, or a server the driver could not reach. A refusal
@@ -7808,7 +7808,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         return _emit_error(
             f"the store refused to read the account {wanted!r} ({type(extra).__name__}). "
             # After a full open, which may have written (BACKLOG #5067).
-            f"{_opened_left_behind(extra, settings.store, keyed=_store_key_configured(settings))}. "
+            f"{_opened_left_behind(extra, settings.store, keyed=_open_is_keyed(settings))}. "
             "Check the store key and the database, then re-run",
             as_json=args.json,
         )
@@ -10070,6 +10070,14 @@ def _open_steps_left_behind(store: StoreSettings, *, keyed: bool) -> str:
     )
 
 
+def _open_is_keyed(settings: ServiceSettings) -> bool:
+    """Whether a store open under ``settings`` is keyed, for what it may write
+    (:func:`_open_steps_left_behind`): a configured store key (:func:`_store_key_configured`), or
+    the ``vault_transit`` cipher, which keys the store in Vault with no local key (BACKLOG
+    #5067)."""
+    return _store_key_configured(settings) or settings.store.cipher_provider == "vault_transit"
+
+
 def _opened_left_behind(exc: BaseException, store: StoreSettings, *, keyed: bool) -> str:
     """What a refusal raised after an open returned left behind (BACKLOG #5067): what
     :func:`_open_refusal_left_behind` says for ``exc``, else :func:`_open_steps_left_behind`, so
@@ -10727,7 +10735,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # Through codec_safe_str, as every open refusal this command prints (#2532, #5067). One
         # from the existing store's open, or a read after it, can follow the open's own writing
         # steps, so the text names them (#5067).
-        left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
         _emit_error(f"{_sentence(codec_safe_str(exc))} {left}", as_json=args.json)
         return 2
     except _InvocationBoundOpenRefused as refused:
@@ -10740,8 +10748,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return 2
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         # It follows a full open, which may have changed the database (BACKLOG #5067).
-        chain_left = _open_refusal_left_behind(exc, settings.store)
-        _emit_error(str(exc) if chain_left is None else f"{exc} {chain_left}", as_json=args.json)
+        chain_left = _opened_left_behind(exc, settings.store, keyed=False)
+        _emit_error(f"{exc} {chain_left}", as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # A store key that could not be resolved (the comment above `key_unresolved`). Or the
@@ -10757,7 +10765,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 exc,
                 settings.store,
                 opened=precheck_opened,
-                keyed=_store_key_configured(settings),
+                keyed=_open_is_keyed(settings),
             ),
             as_json=args.json,
         )
@@ -10769,7 +10777,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # command's refusal code. 2 stays "the store could not be opened".
         return _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        if not precheck_opened:
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        # A read after the pre-check's open returned (BACKLOG #5067): no "cannot open", and no key
+        # was shown yet. The class only: a driver's message can quote a stored value.
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        return _emit_error(
+            f"the store failed after it opened ({type(exc).__name__}). Refusing to provision. "
+            f"{left}",
+            as_json=args.json,
+        )
     except FileExistsError as exc:
         # Vault BACKLOG #3411: a host blob or a handoff is already in the custody directory.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
@@ -11128,7 +11145,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 settings.store,
                 kept=kept_key,
                 opened=store_opened,
-                keyed=_store_key_configured(settings),
+                keyed=_open_is_keyed(settings),
             ),
         )
         _emit_error(text, as_json=args.json)
@@ -11146,7 +11163,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 settings.store,
                 kept=kept_key,
                 opened=store_opened,
-                keyed=_store_key_configured(settings),
+                keyed=_open_is_keyed(settings),
             ),
         )
         _emit_error(text, as_json=args.json)
@@ -11168,7 +11185,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # not a path that is not a database. A lost username race arrives as the refusal above.
         return refused_write(exc)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        if not store_opened:
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        # After the open returned, such as a lock during the writes (BACKLOG #5067): the store
+        # opened, so this is no "cannot open". Exit 1, this command's refusal, as an integrity
+        # refusal exits. The class only: a driver's message can quote a stored value.
+        refusal = f"the store failed after it opened ({type(exc).__name__})"
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        return _emit_error(
+            after_the_key(refusal, f"{refusal}. Refusing to provision. {left}"),
+            as_json=args.json,
+        )
     except Exception as exc:
         # The server backends' integrity refusals, which share no class with sqlite3's. Matched by
         # MRO name as the service matches them; anything else propagates as it did before.
@@ -11411,7 +11438,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # `codec_safe_str`, as the sibling commands print it (BACKLOG #2532).
             from messagefoundry.redaction import codec_safe_str
 
-            left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+            left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
             return ("open-refused", wanted, f"{_sentence(codec_safe_str(exc))} {left}")
         except bound_open_errors as exc:
             # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
@@ -11446,8 +11473,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             except store_errors as exc:
                 # Any other refusal of the append, such as a running engine holding the write lock
                 # or a pool acquire that timed out. A busy store is not "could not start", so it
-                # keeps exit 1. Nothing has been written yet.
-                return ("audit-refused", user.username, str(exc))
+                # keeps exit 1. The command has written nothing yet, but the open may have, so the
+                # text names it (BACKLOG #5067).
+                left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+                return ("audit-refused", user.username, f"{_sentence(str(exc))} {left}")
             try:
                 await store.set_user_notify_email(user.id, email=address)
             except BaseException as exc:
@@ -11518,8 +11547,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         "--username <name> --email <address>` creates one",
         "has-address": f"the account {username!r} already has a notification address; this command "
         "only fills a missing one -- change it from the web console, which notifies the old address",
-        "audit-refused": f"{extra}. Nothing was written: the audit row goes first, and the store "
-        "refused it. If the engine is running, stop it and re-run",
+        "audit-refused": f"{extra}. The audit row goes first, and the store refused it, so the "
+        "address is not set. If the engine is running, stop it and re-run",
         "write-failed": f"the audit row for {username!r} was written, but setting the address "
         f"failed ({extra}); the address is NOT set. Stop the engine and re-run",
     }
@@ -11672,6 +11701,10 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         *store_driver_errors(),
     )
 
+    # Set once an open below has returned, and cleared before the next one, so open_refused can
+    # tell a refusal from a store that had opened (BACKLOG #5067).
+    store_returned = False
+
     def open_refused(exc: Exception, *, hint: str = "") -> int:
         """The exit for a refusal raised while a store was opened or checked, before this
         command's own writes.
@@ -11679,20 +11712,23 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         families are the engine's own and name settings, files, tables or key ids, never a value.
         Each goes through ``codec_safe_str``: a key source's codec error quotes a byte of what it
         decoded (BACKLOG #2532). A short server schema, a key or cipher refusal and a keyless-chain
-        refusal say what the open may have changed before them (BACKLOG #5067)."""
-        left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+        refusal say what the open may have changed before them (BACKLOG #5067). So does any refusal
+        raised once an open returned (``store_returned``), never "nothing was written"."""
+        if store_returned:
+            left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        else:
+            left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
         if isinstance(exc, could_not_start):
             _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.{hint}", as_json=args.json)
             return 2
         if isinstance(exc, (StoreKeylessError, CipherError)):
             return _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.{hint}", as_json=args.json)
-        if isinstance(exc, sqlite3.DatabaseError) and not hint:  # #1670: not a database
-            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-        # After the key was shown the store had already opened once, so this is no "cannot open".
-        # The class only: a driver's message can quote a stored value (ASVS 16.5.4).
+        if isinstance(exc, sqlite3.DatabaseError) and not hint and not store_returned:
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)  # #1670
+        # The store had already opened once, so this is no "cannot open". The class only: a
+        # driver's message can quote a stored value (ASVS 16.5.4).
         _emit_error(
-            f"the store failed before the replacement ({type(exc).__name__}); nothing was "
-            f"written.{hint}",
+            f"the store failed before the replacement ({type(exc).__name__}). {left}.{hint}",
             as_json=args.json,
         )
         return 2
@@ -11778,7 +11814,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     async def check() -> _ResetTarget | str:
         """The account to replace, pinned, or why not. Read before any key is shown."""
+        nonlocal store_returned
         store = await opened()
+        store_returned = True
         try:
             user = await store.get_user_by_username(wanted)
             if user is None:
@@ -11870,7 +11908,10 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     async def run() -> str | None:
         """The swap, its session sweep and its audit row in one transaction, or why not."""
+        nonlocal store_returned
+        store_returned = False
         store = await opened()
+        store_returned = True
         try:
             user = await store.get_user_by_username(wanted)
             if user is None or user.id != target.user_id:

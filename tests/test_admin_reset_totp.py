@@ -1108,3 +1108,36 @@ def test_a_hop_refusal_at_the_open_is_could_not_start(
     monkeypatch.setattr(store_base, "open_store", refused)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
     assert "Nothing was written" in _error(capsys)
+
+
+def test_a_store_failure_after_the_write_open_says_what_the_open_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: a store failure after the write's open returned, before the swap, follows a
+    full open, which may have written, so it does not say nothing was written.
+
+    Mutation: print "nothing was written" again in ``open_refused``'s last branch."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "busy-after-open.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    prompted: list[bool] = []
+    real_open = MessageStore.open_totp_secret
+    real_enrol = cli._enrol_totp_at_terminal
+
+    def open_or_fail(self: MessageStore, user_id: str, cell: str | None) -> str | None:
+        if prompted:
+            raise RuntimeError("synthetic busy store")
+        return real_open(self, user_id, cell)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(MessageStore, "open_totp_secret", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "the store failed before the replacement (RuntimeError)" in error, error
+    assert "did not land, but the open may" in error and "delete it" in error, error
+    assert "nothing was written" not in error.lower(), error

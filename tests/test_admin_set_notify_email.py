@@ -666,6 +666,9 @@ def test_a_busy_store_that_refuses_the_audit_row_keeps_exit_1(
         )
     error = _error(capsys)
     assert "audit row goes first" in error and str(raised) in error
+    # The append follows a full open, which may have written (BACKLOG #5067).
+    assert "did not land, but the open may" in error
+    assert "nothing was written" not in error.lower(), error
     assert _notify_email(db, _ADMIN) is None
     assert _audit_rows(db) == []
 
