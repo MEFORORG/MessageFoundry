@@ -163,7 +163,9 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     frame, and an echoed control id that held a frame byte simply stops matching. A space is what
     the ACK builder already puts in place of an echoed CR or LF. The replacement is on bytes, for the
     reason :func:`frame_for_delivery` checks bytes. The reply is encoded by :func:`encode_reply`,
-    which says what it does with a charset that cannot hold it."""
+    which says what it does with a charset that cannot hold it. This drops the flag saying whether
+    characters were replaced, so a listener calls :func:`frame_reply_reporting` instead and writes
+    the ``reply_replaced`` event from it (BACKLOG #5799)."""
     return frame_reply_reporting(codec, reply, encoding, connection=connection)[0]
 
 

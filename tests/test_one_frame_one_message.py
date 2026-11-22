@@ -694,6 +694,11 @@ def test_the_reporting_variants_flag_a_replaced_reply_every_time() -> None:
     assert not framing_mod.frame_reply_reporting(MLLP_CODEC, CLEAN, "ascii")[1]
     assert not framing_mod.encode_reply_reporting(reply, "utf-8")[1]
     assert not framing_mod.encode_reply_reporting(reply, "not-a-real-codec")[1]
+    # A frame byte turned into a space is not a charset replacement, and sets no flag.
+    framed, replaced = framing_mod.frame_reply_reporting(
+        MLLP_CODEC, MSH + CR + "MSA|AA|C" + SB + "1" + CR, "ascii"
+    )
+    assert not replaced and framed.count(b"\x0b") == 1
 
 
 @pytest.mark.parametrize(
