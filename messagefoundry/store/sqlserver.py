@@ -12906,7 +12906,9 @@ class SqlServerStore:
         incomplete-write chunk groups (a future incremental writer that crashed before finalizing the
         header). Returns the number of attachments reclaimed. Idempotent: a second run finds nothing."""
         headers = 0
+        committed_headers = 0
         incomplete = 0
+        skipped = 0
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
@@ -12929,11 +12931,13 @@ class SqlServerStore:
                             )
                     if headers:
                         await self._commit(conn)
+                        committed_headers = headers
                     else:
                         await self._commit_read(conn)
-                    # Header-less groups (incomplete writes), in a second transaction so no header
-                    # lock is held while waiting on an applock. A put holds its content address's
-                    # applock until it commits header and chunks together, so a header re-read
+                    # Header-less groups (incomplete writes), in a second transaction so the header
+                    # locks are released first and a failure here keeps the deletes above. A put
+                    # holds its content address's applock until it commits header and chunks
+                    # together, so a header re-read
                     # under that applock tells a real orphan from a put that just landed. A single
                     # anti-join could not: under RCSI its subquery reads a statement snapshot.
                     await cur.execute(
@@ -12947,6 +12951,7 @@ class SqlServerStore:
                         try:
                             await self._applock(cur, f"mefor:attachment:{ref}", timeout_ms=0)
                         except _ApplockTimeout:
+                            skipped += 1
                             continue
                         await cur.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
                         if await cur.fetchall():
@@ -12962,9 +12967,14 @@ class SqlServerStore:
             except Exception:
                 # The transaction may hold applocks. After the cursor closes, as put_attachment.
                 await self._rollback_or_discard(conn)
-                if headers:  # the first transaction may have committed these before the failure
-                    log.warning("attachment sweep failed after %d refcount-0 deletes", headers)
+                if committed_headers:
+                    log.warning(
+                        "attachment sweep failed after committing %d refcount-0 deletes",
+                        committed_headers,
+                    )
                 raise
+        if skipped:
+            log.info("attachment sweep skipped %d chunk group(s) with a live put", skipped)
         reclaimed = headers + incomplete
         if reclaimed:
             log.info(

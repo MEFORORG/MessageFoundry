@@ -566,6 +566,25 @@ async def test_sweep_rechecks_an_orphan_under_the_put_applock() -> None:
     assert cur.log.index(("applock", locks[1])) < cur.log.index(("chunks", dead))
 
 
+@pytest.mark.parametrize(
+    ("headers", "chunks", "counted"),
+    [
+        ({}, set(), 0),  # nothing to do: both transactions are reads
+        ({"a" * 64: 0}, {"a" * 64}, 1),  # refcount-0 only
+        ({}, {"d" * 64}, 1),  # header-less only
+        ({"a" * 64: 0}, {"a" * 64, "d" * 64}, 2),  # one write commit per pass that changed rows
+    ],
+    ids=["idle", "refcount-0", "header-less", "both"],
+)
+async def test_sweep_counts_only_commits_that_changed_rows(
+    headers: dict[str, int], chunks: set[str], counted: int
+) -> None:
+    cur = _SweepCursor(dict(headers), set(chunks))
+    store, commits = _store(cur)
+    await store.sweep_orphan_attachments()
+    assert len(commits) == counted
+
+
 async def test_sweep_skips_an_orphan_whose_put_is_live_without_waiting() -> None:
     """A held applock is a live put: the sweep neither waits on it nor deletes its chunks."""
     held, dead = "a" * 64, "d" * 64
