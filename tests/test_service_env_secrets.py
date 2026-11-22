@@ -627,10 +627,22 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
             False,
             id="directory-listed",
         ),
+        # A joined directory string that no step keeps goes with the run-on (Lander ruling on
+        # PR 3142, F1), in either spelling.
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1"],
-            False,
+            True,
             id="directory-joined",
+        ),
+        pytest.param(
+            ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory ==", "MEFOR_VALUE_B=1"],
+            True,
+            id="directory-joined-spaced",
+        ),
+        pytest.param(
+            ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory=C:\\d", "MEFOR_VALUE_B=1"],
+            False,
+            id="directory-path-kept",
         ),
         pytest.param([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"], False, id="store-key"),
     ],
@@ -640,8 +652,8 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
 ) -> None:
     """origin/main's step for a secrets directory that exists but the lists no longer name,
     restored by the Lander's hold on PR 3142 (comment 7085002242): printed once, after the Put
-    step and the removal, where the lists set no MEFOR_SECRETS_DIRECTORY and no string
-    joined to a value sets one. A store key alone goes to a key file and gets none."""
+    step and the removal, where the lists set no MEFOR_SECRETS_DIRECTORY and the remedy keeps
+    no joined path entry. A store key alone goes to a key file and gets none."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     assert refusal.count(ADD_BACK) == (1 if adds_back else 0)

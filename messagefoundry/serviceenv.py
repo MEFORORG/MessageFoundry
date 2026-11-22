@@ -171,12 +171,6 @@ class ServiceEnvPosture:
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
-    #: Whether a string read as part of a value that runs on sets ``MEFOR_SECRETS_DIRECTORY`` on
-    #: its first line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether
-    #: or not :func:`_names` keeps the variable it was joined to.
-    #: NSSM may read that string as its own variable, so the refusal must not say that the
-    #: lists set no secrets directory. The remedy alone reads this, never the refusal itself.
-    directory_joined: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -635,9 +629,6 @@ class _Variable:
     directory_only: bool = False
     #: Whether it runs on into such an entry that sets the directory to a path. Remedy only.
     keeps_directory: bool = False
-    #: Whether it runs on, and the string its value takes first sets ``MEFOR_SECRETS_DIRECTORY``
-    #: on its first line (:func:`_sets_directory_first`). Remedy only.
-    holds_directory: bool = False
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
@@ -913,19 +904,6 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             key = (index, variable.written, line_on_string, variable.broken)
             joined_break = key in joined_breaks
             ran_on = (key in ran or joined_break) and bool(variable.value.strip())
-            # Its value takes the next string's first line, which may set the directory, past any
-            # string of equals signs alone, which keeps the value running on (_still_blank).
-            holds = False
-            if ran_on:
-                taken = next(
-                    (
-                        strings[i]
-                        for i in range(index + 1, len(strings))
-                        if not _still_blank(strings[i])
-                    ),
-                    "",
-                )
-                holds = _sets_directory_first(taken)
             read.append(
                 replace(
                     variable,
@@ -934,18 +912,9 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     runs_on=ran_on,
                     directory_only=ran_on and any_after[index + 1] and only_after[index + 1],
                     keeps_directory=ran_on and path_after[index + 1],
-                    holds_directory=holds,
                 )
             )
     return read
-
-
-def _sets_directory_first(entry: str) -> bool:
-    """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
-    regard to case, as Windows compares names."""
-    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
-    written, equals, _rest = first.partition("=")
-    return bool(equals) and written.strip().upper() == _DIRECTORY_VARIABLE
 
 
 def _directory_entry_value(entry: str) -> str | None:
@@ -1093,9 +1062,6 @@ def read_service_env_posture(
         # entry may hold key material, so nothing says to keep any entry (sixth hold, H1).
         directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
         and all(v.directory_only for v in variables if v.runs_on and _names([v])),
-        # Not filtered through ``_names``: the directory string is in the lists whichever
-        # variable it was joined to, so one ``_names`` drops counts too.
-        directory_joined=any(variable.holds_directory for variable in variables),
     )
 
 
@@ -1310,12 +1276,12 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     if (
         (others or values)
         and _DIRECTORY_VARIABLE not in posture.listed
-        and not posture.directory_joined
+        and not posture.directory_path_joined
     ):
         # After the removal and the run-on sentence, as on origin/main, so the list it says
-        # to pass back is the one those steps left.
-        # A joined directory string may still be set in the lists, so "add it back" would
-        # be false there.
+        # to pass back is the one those steps left. A joined directory string is removed with
+        # the value it is joined to unless the step below keeps it, so only a kept one makes
+        # "add it back" false (Lander ruling on PR 3142, F1).
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
