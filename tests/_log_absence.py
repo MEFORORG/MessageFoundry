@@ -28,15 +28,50 @@ def assert_capture_sees(
     caplog: pytest.LogCaptureFixture, logger: str | logging.Logger, level: int = logging.WARNING
 ) -> None:
     """Fail unless ``caplog`` captures a ``level`` record sent through ``logger``, then take it out
-    of ``caplog.records`` so the absence check after this call is unchanged."""
+    of ``caplog.records`` and ``caplog.text`` so the absence check after this call is unchanged.
+
+    Every other handler the record would reach on its way up, pytest's report handler among them,
+    drops it, so the probe line is not written anywhere but the capture it tests (vault BACKLOG
+    #3766 item 35)."""
     log = logger if isinstance(logger, logging.Logger) else logging.getLogger(logger)
-    log.log(level, "log-absence capture probe", extra={_PROBE_ATTR: True})
+    others = [h for h in _handlers_reached(log) if h is not caplog.handler]
+    for handler in others:
+        handler.addFilter(_drop_probe)
+    try:
+        log.log(level, "log-absence capture probe", extra={_PROBE_ATTR: True})
+    finally:
+        for handler in others:
+            handler.removeFilter(_drop_probe)
     probes = [r for r in caplog.records if getattr(r, _PROBE_ATTR, False)]
     assert len(probes) == 1, (
         f"caplog did not capture a {logging.getLevelName(level)} record sent through "
         f"{log.name!r}, so an absence check over that logger would pass on nothing"
     )
     caplog.records.remove(probes[0])
+    # The capture's text stream holds the formatted line too; take that one line back out.
+    stream = caplog.handler.stream
+    line = caplog.handler.format(probes[0]) + caplog.handler.terminator
+    text = stream.getvalue()
+    at = text.rfind(line)
+    if at >= 0:
+        stream.seek(0)
+        stream.truncate()
+        stream.write(text[:at] + text[at + len(line) :])
+
+
+def _drop_probe(record: logging.LogRecord) -> bool:
+    return not getattr(record, _PROBE_ATTR, False)
+
+
+def _handlers_reached(log: logging.Logger) -> list[logging.Handler]:
+    """The handlers a record logged through ``log`` meets, walking up while each logger
+    propagates, as :meth:`logging.Logger.callHandlers` does."""
+    out: list[logging.Handler] = []
+    node: logging.Logger | None = log
+    while node is not None:
+        out.extend(node.handlers)
+        node = node.parent if node.propagate else None
+    return out
 
 
 def assert_no_records(

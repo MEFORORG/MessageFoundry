@@ -913,17 +913,43 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     markers = ("BACKLOG #2967 capture marker, before", "BACKLOG #2967 capture marker, after")
     # Every RemoteFileSource logs through the one module logger, so its name alone would also take a
     # line another source logged meanwhile, from its own poller task, and fail this test for it. A
-    # record logged on another task is not this poll's. One with no task is kept, since this poll's
-    # worker threads log with none (vault BACKLOG #3766 item 9).
+    # record logged on another task is not this poll's (vault BACKLOG #3766 item 9). One with no
+    # task is kept only from a thread that ran one of this poll's asyncio.to_thread jobs, since its
+    # worker threads log with none; any other source's worker line is dropped (item 30). A pooled
+    # thread can serve both, so a line another source logged on one of ours is still kept.
     poll_task = asyncio.current_task()
     assert poll_task is not None
-    our_tasks = (None, poll_task.get_name())
+    our_threads: set[int] = set()
+    to_thread = asyncio.to_thread
+
+    async def _tracked_to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        if asyncio.current_task() is not poll_task:
+            return await to_thread(func, *args, **kwargs)
+
+        def run() -> Any:
+            our_threads.add(threading.get_ident())
+            return func(*args, **kwargs)
+
+        return await to_thread(run)
+
+    # remotefile calls asyncio.to_thread through the module, so the patch is on asyncio itself.
+    monkeypatch.setattr(asyncio, "to_thread", _tracked_to_thread)
 
     def ours(r: logging.LogRecord) -> bool:
-        return r.name == connector_log.name and r.taskName in our_tasks
+        if r.name != connector_log.name:
+            return False
+        if r.taskName is None:
+            return r.thread in our_threads
+        return r.taskName == poll_task.get_name()
 
     connector_log.warning(markers[0])
     await src._poll_once()
+    # The item 30 control: a line from a thread that ran none of this poll's jobs, as another
+    # source's worker would log, logs with no task and must not read as this poll's failure.
+    other = threading.Thread(target=connector_log.warning, args=("another source's worker line",))
+    other.start()
+    other.join()
+    assert any(r.getMessage() == "another source's worker line" for r in caplog.records)
     connector_log.warning(markers[1])
     assert len(caplog.records) >= 2, "the capture missed a marker: it cannot see the connector"
     # The markers are logged on this task, so they pass through the same filter as the failures.

@@ -41,6 +41,35 @@ def test_a_visible_logger_passes_and_the_probe_is_taken_out(
         assert not [r for r in caplog.records if r.name == _NAME and "probe" in r.getMessage()]
 
 
+def test_the_probe_leaves_no_text_and_reaches_no_other_handler(
+    caplog: pytest.LogCaptureFixture, probe_logger: logging.Logger
+) -> None:
+    """Vault BACKLOG #3766 item 35: the probe line stayed in ``caplog.text`` and reached every
+    other handler on its way up. The code's own record, on both sides of it, is the control."""
+
+    class _Keep(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.messages.append(record.getMessage())
+
+    other = _Keep()
+    probe_logger.addHandler(other)
+    try:
+        with caplog.at_level(logging.WARNING, logger=_NAME):
+            probe_logger.warning("before the probe")
+            assert_capture_sees(caplog, _NAME)
+            probe_logger.warning("after the probe")
+    finally:
+        probe_logger.removeHandler(other)
+    assert other.messages == ["before the probe", "after the probe"]
+    assert "capture probe" not in caplog.text
+    assert "before the probe" in caplog.text and "after the probe" in caplog.text
+    assert not other.filters  # the drop filter is taken off again
+
+
 def _propagate_off(log: logging.Logger) -> None:
     log.propagate = False
 
