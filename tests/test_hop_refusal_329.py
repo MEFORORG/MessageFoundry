@@ -22,6 +22,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
@@ -34,6 +35,7 @@ from messagefoundry.config.settings import (
     EgressSettings,
     SecurityEnforcement,
     SecuritySettings,
+    load_settings,
 )
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.pipeline import Engine
@@ -166,12 +168,78 @@ def test_webhook_cleartext_is_refused_in_every_posture_even_with_escape(
 def test_webhook_notifier_refuses_cleartext_in_every_posture(
     posture: HopPosture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The settings route meets the same refusal; the warn posture used to build here.
+    # The notifier's own refusal, its second line; the warn posture used to build here. The section
+    # is built with model_construct because settings load (#3533 item 14) refuses this URL first,
+    # with a message of its own.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with pytest.raises(ValueError, match="cleartext http"):
         notifier_from_settings(
-            AlertsSettings(webhook_url="http://hooks.example/x"), posture=posture
+            AlertsSettings.model_construct(webhook_url="http://hooks.example/x"), posture=posture
         )
+
+
+_WEBHOOK_TOKEN = "T0KEN-in-the-path"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"http://hooks.example/{_WEBHOOK_TOKEN}",
+        f"HTTP://hooks.example/{_WEBHOOK_TOKEN}",
+        f"ftp://hooks.example/{_WEBHOOK_TOKEN}",
+        f"hooks.example/{_WEBHOOK_TOKEN}",
+        # urlsplit's own ValueError quotes the netloc; the refusal must not pass it on.
+        f"https://svc:{_WEBHOOK_TOKEN}\uff03x@hooks.example/x",
+        f"https://svc:pw@[{_WEBHOOK_TOKEN}]/x",
+        # urlsplit drops these, so it would read the scheme as https.
+        f"ht\ttps://hooks.example/{_WEBHOOK_TOKEN}",
+        f"https\n://hooks.example/{_WEBHOOK_TOKEN}",
+        # Surrounding whitespace is ignored, so an http URL inside it is still refused.
+        f" http://hooks.example/{_WEBHOOK_TOKEN}\n",
+    ],
+    ids=[
+        "http",
+        "upper-http",
+        "ftp",
+        "no-scheme",
+        "nfkc-netloc",
+        "bad-bracket",
+        "tab",
+        "lf",
+        "space-http",
+    ],
+)
+def test_a_non_https_webhook_is_refused_at_load_without_echoing_it(url: str) -> None:
+    # Vault BACKLOG #3533 item 14: settings load refuses it, so check and the serve pre-flight do
+    # too, not only the notifier build. The path can hold the webhook's token, so the message
+    # repeats no part of the URL.
+    with pytest.raises(ValidationError, match="must be a well-formed https URL") as info:
+        AlertsSettings(webhook_url=url)
+    text = str(info.value)
+    assert _WEBHOOK_TOKEN not in text and "hooks.example" not in text
+    assert "ftp" not in text.lower()
+    as_json = info.value.json()
+    assert _WEBHOOK_TOKEN not in as_json and "hooks.example" not in as_json
+
+
+def test_a_non_https_webhook_is_refused_by_the_settings_loader(tmp_path: Path) -> None:
+    config = tmp_path / "messagefoundry.toml"
+    config.write_text(
+        f'[alerts]\nwebhook_url = "http://hooks.example/{_WEBHOOK_TOKEN}"\n', encoding="utf-8"
+    )
+    with pytest.raises(ValidationError, match="must be a well-formed https URL") as info:
+        load_settings(config_path=config, environ={})
+    assert _WEBHOOK_TOKEN not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [None, "", "https://hooks.example/x", "HTTPS://hooks.example/x", " https://hooks.example/x\n"],
+)
+def test_an_https_or_unset_webhook_loads(url: str | None) -> None:
+    # Negative control: an https URL loads, inside surrounding whitespace too (urllib's dial strips
+    # it), and an empty value stays "not configured".
+    assert AlertsSettings(webhook_url=url).webhook_url == url
 
 
 def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:

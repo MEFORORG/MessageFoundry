@@ -6420,6 +6420,38 @@ class AlertsSettings(_Section):
             return [addr.strip() for addr in v.split(",") if addr.strip()]
         return v
 
+    @field_validator("webhook_url")
+    @classmethod
+    def _webhook_url_is_https(cls, v: str | None) -> str | None:
+        """Vault BACKLOG #3533 item 14: refuse a non-https webhook at load, not only at notifier build.
+
+        ``WebhookTransport`` refuses the same URL when the API lifespan builds the notifier, so a
+        settings load, ``check`` and the serve pre-flight passed it before. An empty value stays
+        "not configured", as every consumer reads it. The path can hold the webhook's token, so the
+        message carries nothing of the value: urlsplit's own ``ValueError`` quotes the netloc, so it
+        is caught and not chained. Surrounding whitespace is ignored, as urllib's dial strips it. A
+        control character or lone surrogate left inside is refused: urlsplit drops every tab, CR
+        and LF, so the scheme it reports need not be the one urllib dials. This check's own split
+        is uncached (vault BACKLOG #5287); the notifier build still splits through the cached one.
+        """
+        if not v:
+            return v
+        import inspect
+
+        candidate = v.strip()
+        scheme: str | None = None
+        if not has_control_char(candidate) and not has_lone_surrogate(candidate):
+            try:
+                scheme = inspect.unwrap(urlsplit)(candidate).scheme
+            except ValueError:
+                scheme = None
+        if scheme != "https":
+            raise ValueError(
+                "[alerts].webhook_url must be a well-formed https URL; the value is not repeated "
+                "here, since its path can carry the webhook's token. Refused, with no escape"
+            )
+        return v
+
     @model_validator(mode="after")
     def _refuse_a_login_over_an_unauthenticated_hop(self) -> AlertsSettings:
         """Vault BACKLOG #3533 item 3: a login never crosses a hop that does not authenticate the relay.
