@@ -5,7 +5,8 @@
 Two defects at the time this file was written: Replay stayed enabled during a ``load()``, so a press
 replayed the previously shown message under the newly selected row; and a fetch that raised
 something other than ``ApiError`` had no ``on_error`` callback, so the previous message stayed on
-screen with nothing said. Both tests drive the real ``AsyncRunner`` so the submit wiring is covered.
+screen with nothing said. The tests drive the real ``AsyncRunner`` so the submit wiring is covered.
+Each pool gets two threads, because one fetch is held open while another must run beside it.
 """
 
 from __future__ import annotations
@@ -43,9 +44,10 @@ def _detail(message_id: str) -> Any:
 
 
 class _FakeClient:
-    """Opens ``m0`` at once; ``m1`` waits on ``release`` and then returns, or raises an OSError
-    when ``fails``. A fresh exception per call: a stored one would keep its traceback, and with it
-    the panel's frame, alive in a Qt reference cycle."""
+    """Opens ``m0`` at once; ``m1`` waits on ``release`` and then returns, or raises a RuntimeError
+    when ``fails``. The real client wraps transport errors in ApiError, so a non-ApiError raise is a
+    contract break such as a closed client. A fresh exception per call: a stored one would keep its
+    traceback, and with it the panel's frame, alive in a Qt reference cycle."""
 
     def __init__(self, *, fails: bool = False) -> None:
         self.release = threading.Event()
@@ -56,11 +58,17 @@ class _FakeClient:
         if message_id != "m0":
             self.release.wait(5.0)
             if self._fails:
-                raise OSError("connection reset")
+                raise RuntimeError("client closed")
         return _detail(message_id)
 
     def replay(self, message_id: str) -> None:
         self.replayed.append(message_id)
+
+
+def _panel(client: _FakeClient) -> MessageDetailPanel:
+    panel = MessageDetailPanel(client)  # type: ignore[arg-type]
+    panel._runner._pool.setMaxThreadCount(2)  # a held m1 fetch must not queue m0 behind it
+    return panel
 
 
 def _pump_until(qapp: Any, predicate: Any, timeout: float = 5.0) -> None:
@@ -76,7 +84,7 @@ def test_replay_is_not_offered_while_a_newer_open_is_loading(qapp: Any) -> None:
     """m0 open with Replay enabled is the control; selecting m1 must withdraw Replay until m1
     lands, and a press in that window must replay nothing."""
     client = _FakeClient()
-    panel = MessageDetailPanel(client)  # type: ignore[arg-type]
+    panel = _panel(client)
     try:
         panel.load("m0")
         _pump_until(qapp, panel._replay.isEnabled)
@@ -84,6 +92,7 @@ def test_replay_is_not_offered_while_a_newer_open_is_loading(qapp: Any) -> None:
 
         panel.load("m1")
         assert not panel._replay.isEnabled()
+        assert "CTL-m0" not in panel._summary.text()  # m0 is not left under the m1 selection
         panel._on_replay()  # a press that slipped through must not target m0
         assert client.replayed == []
 
@@ -98,10 +107,10 @@ def test_replay_is_not_offered_while_a_newer_open_is_loading(qapp: Any) -> None:
 
 
 def test_a_non_api_error_fetch_clears_the_previous_message_and_reports(qapp: Any) -> None:
-    """A transport failure (here OSError, not ApiError) while opening m1 must not leave m0 under
-    the new selection, and must say something. m0 rendered first is the control."""
+    """A raise other than ApiError while opening m1 must not leave m0 under the new selection, and
+    must say something. m0 rendered first is the control."""
     client = _FakeClient(fails=True)
-    panel = MessageDetailPanel(client)  # type: ignore[arg-type]
+    panel = _panel(client)
     errors: list[str] = []
     panel.error.connect(errors.append)
     try:
@@ -115,7 +124,7 @@ def test_a_non_api_error_fetch_clears_the_previous_message_and_reports(qapp: Any
         assert panel._message_id is None
         assert not panel._replay.isEnabled()
         assert not panel._show_body.isEnabled()
-        assert "OSError" in errors[0]
+        assert "RuntimeError" in errors[0]
     finally:
         client.release.set()
         panel.stop()
@@ -124,19 +133,28 @@ def test_a_non_api_error_fetch_clears_the_previous_message_and_reports(qapp: Any
 def test_a_failed_open_superseded_by_a_newer_one_is_dropped(qapp: Any) -> None:
     """A late failure from an open the operator has moved past must not clear the newer open."""
     client = _FakeClient(fails=True)
-    panel = MessageDetailPanel(client)  # type: ignore[arg-type]
+    panel = _panel(client)
     errors: list[str] = []
     panel.error.connect(errors.append)
+    raised: list[str] = []
+    real_open_raised = panel._open_raised
+
+    def _recording(message_id: str, open_seq: int, exc: BaseException) -> None:
+        raised.append(message_id)
+        real_open_raised(message_id, open_seq, exc)
+
+    panel._open_raised = _recording  # type: ignore[method-assign]
     try:
         panel.load("m1")  # blocks, then fails
         panel.load("m0")  # supersedes it and lands
         _pump_until(qapp, lambda: "CTL-m0" in panel._summary.text())
         client.release.set()
-        panel._runner._pool.waitForDone(5000)
-        for _ in range(20):
-            qapp.processEvents()
+        assert panel._runner._pool.waitForDone(5000)
+        # Control: the failure was delivered, so the screen below is a drop, not a no-show.
+        _pump_until(qapp, lambda: raised == ["m1"])
         assert "CTL-m0" in panel._summary.text()
         assert errors == []
     finally:
         client.release.set()
         panel.stop()
+        del panel._open_raised  # the wrapper holds the panel: break that cycle on this thread

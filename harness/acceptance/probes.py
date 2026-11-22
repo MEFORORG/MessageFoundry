@@ -30,10 +30,29 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _log = logging.getLogger(__name__)
 
-#: Default listener ports referenced by section A5 (informational bindability check). One entry per
-#: listener the A5 row names (BACKLOG #5849). Raw TCP has no transport default port, so its entry is
-#: the harness's own TCP inbound default, ``IB_Harness_TCP`` in ``harness/config/tcp_x12.py``.
-_DEFAULT_PORTS: dict[str, int] = {"MLLP": 2575, "DICOM": 11112, "TCP": 2580, "API": 8765}
+#: Listener ports referenced by section A5 (informational bindability check), one entry per listener
+#: the A5 row names (BACKLOG #5849). An int is a fixed reference port. A str names a harness endpoint
+#: (:mod:`harness.endpoints`), resolved when the probe runs, so an environment override is the port
+#: reported: TCP is ``IB_Harness_TCP``, the raw-TCP inbound in ``harness/config/tcp_x12.py``.
+_DEFAULT_PORTS: dict[str, int | str] = {
+    "MLLP": 2575,
+    "DICOM": 11112,
+    "TCP": "tcp_in",
+    "API": 8765,
+}
+
+
+def _resolve_port(entry: int | str) -> object:
+    """An int as given; an endpoint key as its resolved port or, where that value is not a port,
+    the raw value, which ``port_state`` reports as an invalid port rather than this probe raising."""
+    if isinstance(entry, int):
+        return entry
+    from harness import endpoints
+
+    try:
+        return endpoints.port(entry)
+    except ValueError:
+        return endpoints.value(entry)
 
 
 class _ChainCut(Exception):
@@ -230,7 +249,8 @@ def probe_firewall_ports() -> ProbeResult:
     :mod:`messagefoundry.verify`, whose runner loads the engine's transports and config."""
     from messagefoundry.verify_leaf import port_state
 
-    parts = [f"{name} {port}: {port_state(port)}" for name, port in _DEFAULT_PORTS.items()]
+    ports = {name: _resolve_port(entry) for name, entry in _DEFAULT_PORTS.items()}
+    parts = [f"{name} {port}: {port_state(port)}" for name, port in ports.items()]
     return ProbeResult(
         Status.MANUAL,
         "confirm inbound firewall rules admit these ports from partner hosts",

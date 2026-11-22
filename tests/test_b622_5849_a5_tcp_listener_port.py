@@ -16,6 +16,7 @@ import pytest
 
 from harness.acceptance import probes
 from harness.acceptance.matrix import MATRIX, Status
+from harness.endpoints import Endpoint
 from harness.endpoints import tcp as tcp_endpoints
 
 
@@ -30,10 +31,30 @@ def test_every_listener_row_a5_names_is_in_the_probe_port_map() -> None:
     assert sorted(probes._DEFAULT_PORTS) == sorted(named)
 
 
-def test_the_tcp_port_is_the_harness_tcp_inbound_default() -> None:
-    # Read from the endpoint registry, so a moved IB_Harness_TCP default fails here.
-    tcp_in = next(e for e in tcp_endpoints.ENDPOINTS if e.key == "tcp_in")
-    assert probes._DEFAULT_PORTS["TCP"] == int(tcp_in.default)
+def _tcp_in() -> Endpoint:
+    return next(e for e in tcp_endpoints.ENDPOINTS if e.key == "tcp_in")
+
+
+def _tcp_evidence() -> str:
+    result = probes.probe_firewall_ports()
+    assert result.status is Status.MANUAL
+    return next(p for p in result.evidence.split("; ") if p.startswith("TCP "))
+
+
+def test_the_tcp_port_is_the_harness_tcp_inbound_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_tcp_in().env, raising=False)
+    assert _tcp_evidence().startswith(f"TCP {_tcp_in().default}: ")
+
+
+def test_the_tcp_port_follows_the_endpoint_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Under an override IB_Harness_TCP binds the override, so that is the port A5 must report.
+    monkeypatch.setenv(_tcp_in().env, "3580")
+    assert _tcp_evidence().startswith("TCP 3580: ")
+
+
+def test_a_malformed_tcp_override_is_reported_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_tcp_in().env, "not-a-port")
+    assert _tcp_evidence().startswith("TCP not-a-port: invalid port")
 
 
 def test_a5_reports_a_held_tcp_port_as_in_use(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -44,7 +65,6 @@ def test_a5_reports_a_held_tcp_port_as_in_use(monkeypatch: pytest.MonkeyPatch) -
         held.bind(("127.0.0.1", 0))
         held.listen()
         port = held.getsockname()[1]
-        monkeypatch.setitem(probes._DEFAULT_PORTS, "TCP", port)
-        result = probes.probe_firewall_ports()
-    assert result.status is Status.MANUAL
-    assert f"TCP {port}: in use/bound" in result.evidence.split("; ")
+        monkeypatch.setenv(_tcp_in().env, str(port))
+        evidence = _tcp_evidence()
+    assert evidence == f"TCP {port}: in use/bound"
