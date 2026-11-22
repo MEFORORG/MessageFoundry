@@ -1011,8 +1011,9 @@ def main(argv: list[str] | None = None) -> int:
         live = live_cells.get(c.get("id"), {})
         # An ANCHOR REPAIR re-points citations after the code moved; it must not touch anything else.
         # Declaring it lets the payload omit `reviewed_by` and `residual`, which keeps the record's
-        # values, and buys that with byte-identity on every prose field, so an existing empty value
-        # is preserved rather than invented. A difference in verdict or prose refuses. The glyph scan
+        # values, and buys that with byte-identity on every prose field, so an omitted empty value
+        # is preserved rather than invented. A stated empty value is not carried, and the key-set
+        # guard refuses it as field loss. A difference in verdict or prose refuses. The glyph scan
         # still runs.
         anchor_repair = bool(c.get("anchor_repair"))
         if live.get("anchor_repair"):
@@ -1117,16 +1118,17 @@ def main(argv: list[str] | None = None) -> int:
         # THE STRUCTURED FORM IS CHECKED BY THE LOADER'S OWN RULE (BACKLOG #2168). Written unchecked,
         # a malformed table would land in the record and make the next load of it fail.
         #
-        # WHAT A REPAIR WRITES IS HELD TO THE WHOLE RULE, CARRIED OR ECHOED (BACKLOG #5867). A repair
-        # must not stamp new anchors on a cell the next load refuses, and `render` would coerce an
-        # echoed non-string that equals the record, which the byte-identity loop admits. A string is
-        # skipped because a non-blank `reviewed_by` has the legacy refusals below. A blank string or
-        # a table naming nobody IS kept, deliberately: a repair preserves an unrecorded reviewer
-        # rather than inventing one. The verifier's reviewer check reports that cell only when it
-        # is graded and neither an owner closure nor an exception entry covers it.
-        written = c | _repair_carry(c, live)
+        # A REPAIR'S `residual` AND `reviewed_by` ARE HELD TO THE LOADER'S RULE, CARRIED OR ECHOED
+        # (BACKLOG #5867). `render` would coerce an echoed non-string that equals the record, which
+        # the byte-identity loop admits. This covers these two fields only: a repair can still carry
+        # another field the next load refuses. A string is skipped because a non-blank `reviewed_by`
+        # has the legacy refusals below. A blank string or a table naming nobody IS kept,
+        # deliberately: a repair preserves an unrecorded reviewer rather than inventing one. The
+        # verifier's reviewer check reports that cell only when it is graded and neither an owner
+        # closure nor an exception entry covers it.
+        to_write = c | _repair_carry(c, live)
         for name in _OPTIONAL_ORDERED:
-            value = written.get(name, "")
+            value = to_write.get(name, "")
             if isinstance(value, str):
                 continue
             if anchor_repair or (name == "reviewed_by" and isinstance(value, dict)):
