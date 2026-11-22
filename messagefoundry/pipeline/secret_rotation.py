@@ -77,7 +77,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MonitoredSecret",
-    "ROTATION_CLOSED_WITHOUT_ROLL_ACTION",
     "ROTATION_RECORD_ID",
     "RefusedSecret",
     "SecretCheck",
@@ -259,10 +258,6 @@ def dek_fingerprint(key_id: str) -> str:
 ROTATION_RECORD_ID = "rotate-key:incomplete"
 _ROTATION_RECORD_CLOSED = ""
 
-#: The audit action ``rotate-key --close-without-roll`` writes when it closes the rotation record
-#: over an audit chain no run can roll (BACKLOG #4935).
-ROTATION_CLOSED_WITHOUT_ROLL_ACTION = "store.rotation_closed_without_roll"
-
 
 def _record_open(record: SecretRotationMetaRow | None) -> TypeGuard[SecretRotationMetaRow]:
     """Whether the rotation record ``record`` stands open, naming some key or unreadable."""
@@ -313,7 +308,7 @@ async def open_rotation_record(
     does not, so no start stamps it. ``False`` where the stamp already names ``key_id``, a record
     naming it too included, as a run killed between its stamp and its close leaves them, and where
     it kept a record open for another key. ``rotate-key`` reads it before it names a way out of the
-    record, and before ``--close-without-roll`` closes it (BACKLOG #4934, #4935)."""
+    record (BACKLOG #4934, #4935)."""
     fingerprint = dek_fingerprint(key_id)
     rows = await meta_store.get_secret_rotation_meta()
     record = rows.get(ROTATION_RECORD_ID)
@@ -335,8 +330,7 @@ async def open_rotation_record(
 
 async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -> None:
     """Close the rotation record, once a whole ``rotate-key`` run is done and stamped (BACKLOG
-    #3737), or, under ``--close-without-roll``, before the stamp of a run whose roll refused for
-    good (BACKLOG #4935), so a run stopped between the two leaves the key unstamped. The row is blanked, not deleted: the store protocol has no delete, and a blank reads as
+    #3737). The row is blanked, not deleted: the store protocol has no delete, and a blank reads as
     no rotation in progress. Writes nothing where none is open."""
     record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
     if _record_open(record):
@@ -593,8 +587,7 @@ async def reconcile_rotation_meta(
     BACKLOG #2242 re-key rule).
 
     **A changed DEK is not stamped while the rotation record names it (BACKLOG #3737).** ``rotate-key``
-    opens that record before either data pass and closes it when a whole run is done, or when an
-    operator closes it with ``--close-without-roll`` over a chain no run can roll (BACKLOG #4935). The
+    opens that record before either data pass and closes it only when a whole run is done. The
     DEK row is left as it is, and this start reads its dates.
 
     **A changed DEK the audit chain has not rolled to opens that record here (BACKLOG #4942,
@@ -609,9 +602,7 @@ async def reconcile_rotation_meta(
     stamps only where ``audit_rolled`` is not ``False``: ``None``, a store with no keyed chain to
     ask, such as one whose rows open with no genesis row, or ``True``, a chain already rolled to
     the key. So on a store with a keyed chain a stamp says the chain was rolled to the key, by a
-    run or by its genesis row, unless a ``store.rotation_closed_without_roll`` audit row records
-    that an operator closed the record without a roll (BACKLOG #4935); elsewhere it proves only a
-    changed key.
+    run or by its genesis row, and elsewhere it proves only a changed key.
 
     It then arms the **ENFORCE escalation**: under ``[security].enforcement=ENFORCE``, a DEK older than
     ``store_key_max_age_days + enforce_grace_days`` emits its ``secret_rotation_due`` alert with
