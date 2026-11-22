@@ -54,8 +54,9 @@ class IntakeContext:
     """Who handed the engine one body, as the source saw it.
 
     It holds no socket address, neither the peer's nor the engine's own, by the owner's ruling of
-    2026-11-22 ("No IP in metadata"). A File source's path keeps the configured directory's
-    spelling, so a UNC directory spelled by IP would carry that IP. The connection-event log,
+    2026-11-22 ("No IP in metadata"). A value it records verbatim can still contain an IP, and
+    nothing filters one out: at least a certificate subject such as ``CN=10.20.30.40``, and a
+    File path under a UNC directory spelled by IP. The connection-event log,
     where capture is on, is where a peer address is kept, under
     ``[retention].connection_event_retention_hours``, and the message row's ``channel_id`` names
     the inbound connection that took it. A listen source fills how it admitted the peer; a poll

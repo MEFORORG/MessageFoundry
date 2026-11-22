@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The intake context: a stored message records how its sender was admitted (vault BACKLOG #2607).
 
-Before this, ``InboundHandler`` took the body and nothing else, so a stored message carried no
-address, port or certificate subject; only the connection-event log named a peer, with no message
+Before this, ``InboundHandler`` took the body and nothing else, so a stored message did not record
+how its sender was admitted; only the connection-event log named a peer, with no message
 id on inbound rows. These cases drive real MLLP, raw-TCP and file sources into the runner's own
 handler over a real SQLite store, and read the intake context back from the message's metadata.
 
