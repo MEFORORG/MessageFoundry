@@ -368,12 +368,14 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
     try:
         for i in range(3):
             (inbox / f"m{i}.hl7").write_bytes(ADT.format(cid=f"MSG{i}").encode("utf-8"))
-            await asyncio.sleep(0.05)  # keep arrival order deterministic
+            # Arrival order: the next file is written only once this one is stored, which a fixed
+            # sleep did not ensure on a runner whose poll ran late (BACKLOG #3456).
+            await _until(lambda n=i + 1: _n_messages(store, n))
         # Poll the ACTUAL asserted condition — all 3 messages finalized to PROCESSED — not a proxy like
         # "N outbound rows DONE" (each message fans out to 2, so that proxy trips at 1.5 messages; it
         # false-greened on a fast runner and flaked on a slow one — mf-ci-test-flakes).
         try:
-            await _until(lambda: _n_processed(store, 3))
+            await _until(lambda: _n_messages(store, 3, MessageStatus.PROCESSED.value))
         except AssertionError as exc:
             # Print how far each message got. ROUTED covers both transform and delivery, so this
             # separates intake from the later stages, not transform from delivery.
@@ -391,15 +393,10 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
     assert [row["control_id"] for row in await cur.fetchall()] == ["MSG0", "MSG1", "MSG2"]
 
 
-async def _n_processed(store: MessageStore, n: int) -> bool:
-    return (
-        len(
-            await store.list_messages(
-                channel_id="file_in", status=MessageStatus.PROCESSED.value, allowed_channels=None
-            )
-        )
-        >= n
-    )
+async def _n_messages(store: MessageStore, n: int, status: str | None = None) -> bool:
+    """At least ``n`` messages on the inbound, any status when ``status`` is None."""
+    msgs = await store.list_messages(channel_id="file_in", status=status, allowed_channels=None)
+    return len(msgs) >= n
 
 
 # --- env-flag plumbing (AC-12) ----------------------------------------------

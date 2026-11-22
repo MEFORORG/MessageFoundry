@@ -2335,10 +2335,48 @@ async def test_adr0070_7_reload_resumes_idempotently(store: Any) -> None:
         await d.stop()
 
 
-async def test_adr0070_8_correlated_outage_single_reload_rearms_all(store: Any) -> None:
-    """ADR 0070 test 8: N lanes STOP under one (store-down-style) root cause; each emits its own
-    connection_stopped (ADR-0044 durable dedup collapses them to one operator signal downstream), and a
-    SINGLE ``notify_work`` reload broadcast re-arms ALL of them with the streak reset."""
+async def _drive_lanes_to_stop(
+    d: StageDispatcher, mc: ManualClock, lanes: list[str], *, timeout: float = 30.0
+) -> None:
+    """Fire every due park timer until each of ``lanes`` is STOPPED, bounded by real time.
+
+    The loop this replaced ran 30 rounds and never re-readied a lane, and it failed on the SQL
+    Server 2025 leg (BACKLOG #3456, four hits). Each captured log shows the same pattern: all four
+    lanes fault once, and only ``IB_OUTAGE_3`` faults again. A lane parked after its first fault
+    whose re-claim comes back EMPTY takes T12: ``phase=IDLE`` with no timer. The sweep that would
+    re-ready it is disabled here, so no clock advance re-claims it. That fits what `_wait_lane`
+    stands in for (a swallowed 1222). The logs do not show it as the cause: the dispatcher's
+    lock-timeout line is INFO and was not captured. So a stranded lane is re-readied under the
+    same capped, warned allowance, and the loop's bound is a wall-clock ceiling, not a round count.
+    """
+
+    def all_stopped() -> bool:
+        return all(d.phase(ln) is _LanePhase.STOPPED for ln in lanes)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if all_stopped():
+            return
+        for ln in lanes:
+            # IDLE is never a waypoint on this path (PARKED -> READY -> CLAIMING -> PROCESSING ->
+            # PARKED or STOPPED), so an IDLE lane with no timer is a stranding.
+            if _terminal_idle(d, ln):
+                await _stand_in_for_sweep(d, ln)
+        mc.advance(120.0)  # past every lane's capped backoff, so every armed park timer fires
+        await _settle(rounds=4)
+    if all_stopped():
+        return
+    phases = {ln: d.phase(ln) for ln in lanes}
+    raise _WaitTimeout(
+        f"not every lane STOPPED within {timeout:g}s: {phases!r}\n"
+        + await _expiry_report(all_stopped)
+    )
+
+
+async def _correlated_outage_rearms_all(store: Any, *, abort_second_claim: bool) -> None:
+    """The body of ADR 0070 test 8. ``abort_second_claim`` aborts the claim that follows the
+    first fault on a store lock timeout, the shape SQL Server returns on a 1222."""
     mc = ManualClock(1000.0)
     stub = RecordingStub(store, mc.time)
     stub.set_policy(_always_raise)  # the shared root cause: every lane's handoff raises
@@ -2346,22 +2384,26 @@ async def test_adr0070_8_correlated_outage_single_reload_rearms_all(store: Any) 
     lanes = [f"IB_OUTAGE_{i}" for i in range(4)]
     for lane in lanes:
         await _seed(store, lane, [100.0])
-    d = _make(store, stub, set(), clock=mc, alert_sink=alert, infra_fault_stop_after=2)
+    shim = _ClaimShim(
+        store, lanes[0], mode="lock_timeout_once", extra_lanes=frozenset(lanes[1:]), times=0
+    )  # armed by hand below
+    d = _make(shim, stub, set(), clock=mc, alert_sink=alert, infra_fault_stop_after=2)
     await d.start()
     try:
         for lane in lanes:
             d.mark_ready(lane)
-        # Drive every lane to STOP (stop_after=2 → two faults each). GENEROUSLY bounded, not a fixed
-        # round count: the slow SQL Server 2025 async needs more advance/settle rounds than
-        # SQLite/SS-2022 to march all four lanes through both faults + the STOP latch. Each round fires
-        # the (due) park timers and settles; once a lane STOPs it stays STOPPED, so the loop just needs
-        # enough rounds for the slowest lane — 30 is far past the ~2 a fast backend takes.
-        for _ in range(30):
-            if all(d.phase(ln) == _LanePhase.STOPPED for ln in lanes):
-                break
-            mc.advance(120.0)  # past every lane's capped backoff → fire all park timers
-            await _settle(rounds=20)
-        assert all(d.phase(ln) == _LanePhase.STOPPED for ln in lanes)
+        if abort_second_claim:
+            for lane in lanes:
+                await _wait_lane(d, lane, _LanePhase.PARKED)  # each lane's first fault
+            shim._remaining = 1
+        # Drive every lane to STOP (stop_after=2 → two faults each).
+        await _drive_lanes_to_stop(d, mc, lanes)
+        if abort_second_claim:
+            assert shim._remaining == 0, "the armed abort never reached a claim"
+            assert d.claim_lock_timeouts >= 1
+            assert any(_sweep_standins(ln) for ln in lanes), (
+                "the abort stranded no lane, so this arm did not exercise the stand-in"
+            )
         # Each stopped lane emitted its own connection_stopped (the dedup is downstream, ADR 0044).
         assert {name for name, _ in alert.stopped} == set(lanes)
 
@@ -2380,6 +2422,27 @@ async def test_adr0070_8_correlated_outage_single_reload_rearms_all(store: Any) 
         assert d.busy_violations == 0
     finally:
         await d.stop()
+
+
+async def test_adr0070_8_correlated_outage_single_reload_rearms_all(store: Any) -> None:
+    """ADR 0070 test 8: N lanes STOP under one (store-down-style) root cause; each emits its own
+    connection_stopped (ADR-0044 durable dedup collapses them to one operator signal downstream), and a
+    SINGLE ``notify_work`` reload broadcast re-arms ALL of them with the streak reset."""
+    await _correlated_outage_rearms_all(store, abort_second_claim=False)
+
+
+async def test_adr0070_8_correlated_outage_survives_an_aborted_reclaim(store: Any) -> None:
+    """Test 8 with the claim after every lane's first fault aborted on a lock timeout, which
+    strands the lanes it covered in terminal IDLE. The 30-round loop `_drive_lanes_to_stop`
+    replaced fails this arm, because nothing re-claims a stranded lane, and each lane then shows
+    one fault, as three of the four did in the SQL Server 2025 logs.
+
+    SQLite only: the abort is injected, so the backend adds nothing, and a server's own 1222 on
+    top of it would spend a lane's single stand-in twice."""
+    if store._test_backend != "sqlite":
+        pytest.skip("the injected abort is backend-independent; one real 1222 more breaks the cap")
+    with pytest.warns(UserWarning, match="sweep stand-in"):
+        await _correlated_outage_rearms_all(store, abort_second_claim=True)
 
 
 async def test_adr0070_9_content_retry_is_not_an_infra_fault(store: Any) -> None:
