@@ -7,8 +7,9 @@ WHY A CHILD PROCESS. The census code is the vault's ``scripts/docs/ledger_weekly
 its sibling ``backlog_status_check.py``, read from vault ``origin/main``, which merges with no
 approval. ``collect_metrics.py`` therefore never imports it into the process that holds the ``gh``
 session. It runs this driver with ``python -I`` and an allowlisted environment that carries no
-token and no ``GIT_*`` variable, and reads back only the JSON below. That keeps a token variable
-from being handed to it and nothing more; it is no sandbox. The child runs with the full power of
+token and no ``GIT_*`` variable, and reads back only the JSON below. That environment is the
+allowlist ``collect_metrics.py``'s docstring describes; it withholds variables and nothing more,
+and it is no sandbox. The child runs with the full power of
 the same user: it can read and write any file that user can, a ``gh`` credential file among them,
 and so alter the engine files run after it. ``collect_metrics.py``'s docstring states the trust
 this takes.

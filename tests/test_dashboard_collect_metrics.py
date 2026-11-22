@@ -671,15 +671,19 @@ def test_remove_tree_reports_a_failure(
     assert "ERROR: could not remove temporary" in capsys.readouterr().err
 
 
-def test_sweep_removes_only_stale_prefixed_dirs(tmp_path: Path) -> None:
-    import os
+def _backdate(monkeypatch: pytest.MonkeyPatch, *stale: Path) -> None:
+    # Creation time cannot be set from Python, so the sweep's age read is faked for these.
+    real = cm._created
+    monkeypatch.setattr(cm, "_created", lambda p: 1_000_000.0 if p in stale else real(p))
 
+
+def test_sweep_removes_only_stale_prefixed_dirs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     old, fresh, other = tmp_path / "mf-metrics-old", tmp_path / "mf-metrics-new", tmp_path / "keep"
     for d in (old, fresh, other):
         d.mkdir()
-    long_ago = 1_000_000.0
-    os.utime(old, (long_ago, long_ago))
-    os.utime(other, (long_ago, long_ago))
+    _backdate(monkeypatch, old, other)
     assert cm.sweep_stale(tmp_path, "mf-metrics-") is True
     assert sorted(p.name for p in tmp_path.iterdir()) == ["keep", "mf-metrics-new"]
 
@@ -687,13 +691,38 @@ def test_sweep_removes_only_stale_prefixed_dirs(tmp_path: Path) -> None:
 def test_a_stale_dir_that_will_not_go_fails_the_sweep(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import os
-
     old = tmp_path / "mf-metrics-old"
     old.mkdir()
-    os.utime(old, (1_000_000.0, 1_000_000.0))
+    _backdate(monkeypatch, old)
     monkeypatch.setattr(cm, "remove_tree", lambda path: False)
     assert cm.sweep_stale(tmp_path, "mf-metrics-") is False
+
+
+@pytest.mark.skipif(
+    not hasattr(Path(__file__).stat(), "st_birthtime"), reason="no creation time on this platform"
+)
+def test_sweep_ages_by_creation_not_modified_time(tmp_path: Path) -> None:
+    import os
+
+    d = tmp_path / "mf-metrics-x"
+    d.mkdir()
+    # A modified time far in the past does not make a new directory stale, and a partial sweep
+    # that moves the modified time to now would not make an old one fresh.
+    os.utime(d, (1_000_000.0, 1_000_000.0))
+    st: Any = d.stat()  # st_birthtime is not in every platform's stub
+    assert cm._created(d) == st.st_birthtime != st.st_mtime
+    assert cm.sweep_stale(tmp_path, "mf-metrics-") is True
+    assert d.exists()
+
+
+def test_census_child_output_that_is_not_utf8_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cm, "run_bytes", lambda argv, cwd=None, *, env=None: b'{"a": "\xff"}')
+    with pytest.raises(cm.CollectError, match="driver.py wrote non-UTF-8 output"):
+        cm.run_child(["driver.py"], tmp_path)
+    # Only the census child is strict; the scorecard tool keeps the lenient decode.
+    assert cm.run_tool_child(["tool.py"], tmp_path) == '{"a": "\ufffd"}'
 
 
 def test_child_runs_in_utf8_mode() -> None:

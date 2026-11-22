@@ -28,8 +28,9 @@ recorded. That is NO SANDBOX, and the environment scrub does not limit what that
 child runs with the full power of the user who runs this script. It can run ``gh`` or ``git`` with
 the user's stored credentials (keyring, ``hosts.yml``), read and write any file that user can, and
 so alter the engine files this process runs after it, such as ``scripts/ci/check_stalled_prs.py``,
-``scripts/asvs/scorecard.py``, ``render_html.py`` and this script. The scrub only keeps a token
-variable and a ``GIT_*`` variable from being handed to it. Running this script therefore trusts
+``scripts/asvs/scorecard.py``, ``render_html.py`` and this script. The scrub is an allowlist: the
+child gets only the variables named in ``_CHILD_ENV_KEEP``, plus ``LC_ALL``, so every other variable,
+any token and ``GIT_*`` variable among them, is withheld. Running this script therefore trusts
 vault ``origin/main`` as fully as the engine code itself. Pinning the vault code to a reviewed
 commit would narrow that trust; it is not done here.
 
@@ -444,8 +445,11 @@ _CHILD_ENV_KEEP = (
 )
 
 
-#: Added for the engine's own scorecard tool only: its git probes read the user's global gitconfig
-#: (safe.directory, core.excludesFile) through these, so its engine= stamp matches a plain run.
+#: Added for the engine's own scorecard tool only: its git probes find the user's global gitconfig
+#: (safe.directory, core.excludesFile) through these. That covers only a gitconfig under the home
+#: directory: XDG_CONFIG_HOME, GIT_CONFIG_GLOBAL and PROGRAMDATA are still dropped, so a gitconfig
+#: found only through one of them is not read, and the engine= stamp can then differ from a plain
+#: run.
 _HOME_ENV_KEEP = ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
 
 
@@ -455,18 +459,26 @@ def child_env(*, home: bool = False) -> dict[str, str]:
     return {**env, "LC_ALL": "C"}
 
 
-def _run_python(argv: Sequence[str], cwd: Path | None, env: dict[str, str]) -> str:
+def _run_python(
+    argv: Sequence[str], cwd: Path | None, env: dict[str, str], *, strict: bool = False
+) -> str:
     # -X utf8, not PYTHONUTF8: -I ignores every PYTHON* variable.
-    return run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=env).decode(
-        "utf-8", "replace"
-    )
+    out = run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=env)
+    if not strict:
+        return out.decode("utf-8", "replace")
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # Six words, as in run_bytes, so the message names the script that ran.
+        raise CollectError(f"{' '.join(argv[:6])} wrote non-UTF-8 output: {exc}") from None
 
 
 def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:
     """Run the vault census driver: ``python -I -X utf8`` under :func:`child_env`, from ``cwd``
     (the archive root), so a relative write by the vault code never lands in the caller's work
-    tree."""
-    return _run_python(argv, cwd, child_env())
+    tree. Its output is decoded strictly: bytes that are not UTF-8 fail the census rather than
+    reach it as replacement characters."""
+    return _run_python(argv, cwd, child_env(), strict=True)
 
 
 def run_tool_child(argv: Sequence[str], cwd: Path | None = None) -> str:
@@ -1411,6 +1423,17 @@ def remove_tree(path: Path) -> bool:
 STALE_SECONDS = 2 * 3600
 
 
+def _created(path: Path) -> float:
+    """``path``'s creation time where the platform records one, else its modified time.
+
+    Creation time, as build.ps1 and scheduled-refresh.ps1 age theirs: a sweep that removes only
+    part of a directory moves its modified time to now, which would hide the leftover from the
+    next run. Linux's ``os.stat`` has no ``st_birthtime``, so there the modified time stands in.
+    """
+    st = path.stat()
+    return float(getattr(st, "st_birthtime", st.st_mtime))
+
+
 def sweep_stale(base: Path, prefix: str, now: float | None = None) -> bool:
     """Remove ``base/<prefix>*`` directories older than :data:`STALE_SECONDS`. False when one that
     should have gone is still there: it holds private vault files, so the caller fails the run."""
@@ -1418,7 +1441,7 @@ def sweep_stale(base: Path, prefix: str, now: float | None = None) -> bool:
     ok = True
     for old in base.glob(f"{prefix}*"):
         try:
-            if old.is_dir() and not old.is_symlink() and old.stat().st_mtime < cutoff:
+            if old.is_dir() and not old.is_symlink() and _created(old) < cutoff:
                 ok = remove_tree(old) and ok
         except OSError as exc:
             print(f"ERROR: could not sweep {old}: {type(exc).__name__}: {exc}", file=sys.stderr)
