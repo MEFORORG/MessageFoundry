@@ -660,10 +660,12 @@ class QueueStore(StoreLifecycle, Protocol):
         (:meth:`reschedule_claimed`), and is retried no sooner than that, for as long as the
         failure lasts, with no cap and no alert of its own. A tag failure whose dead-letter write
         failed is still alerted, and its audit row attempted. On the server backends, which contain only
-        ``CipherError``, any other error propagates and leaves the row ``inflight`` until
-        :meth:`reset_stale_inflight` or, on Postgres, its lease expiry re-pends it; the SQLite
-        claims dead-letter it as an unopenable row. :meth:`claim_ready` and
-        :meth:`claim_next_fifo_batch` settle a row the same way.
+        ``CipherError``, any other error from the open propagates; the SQLite claims dead-letter it
+        as an unopenable row. An ``Exception`` that escapes the settling, or that open on a server
+        backend, first releases the claimed rows not yet settled to ``pending`` with ``attempts``
+        undone (BACKLOG #5723). If that release fails, or a cancellation escapes instead, they stay
+        ``inflight`` until :meth:`reset_stale_inflight` or, on Postgres, their lease expiry re-pends
+        them. :meth:`claim_ready` and :meth:`claim_next_fifo_batch` settle a row the same way.
 
         On the Postgres backend (active-passive HA) the claim also reclaims this lane's stranded head —
         a crashed/fenced prior leader's expired-lease ``inflight`` row — in the same transaction before

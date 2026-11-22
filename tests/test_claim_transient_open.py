@@ -16,12 +16,14 @@ is still dead-lettered and reported (the control). SQLite; the server backends m
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import pathlib
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable
+import types
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -972,3 +974,310 @@ async def test_a_failed_id_list_does_not_replace_the_claims_error() -> None:
     store = type("S", (), {"release_claimed": staticmethod(release_claimed)})()
     await release_unreturned(store, [[{"no_id": 1}]])  # must not raise
     assert called == []
+
+
+# --- a per-lane claim that raises leaves no row stranded (BACKLOG #5723) ---------------------------
+
+
+@_CLAIMS
+async def test_a_failed_set_aside_releases_the_claimed_rows(
+    tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row one opens; the outage hits row two, and the set-aside write fails too. The error still
+    reaches the worker, and no row stays ``inflight``, row one included, which the caller never
+    receives. (A single-row claim takes row one alone, so its outage is on that row.)"""
+    store, cipher, db = await _open(tmp_path)
+    try:
+        cipher.healthy_opens = 0 if claim is _claim_next_fifo else 1
+
+        async def failing(*_a: Any, **_kw: Any) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(store, "_set_aside_claimed", failing)
+        with pytest.raises(sqlite3.OperationalError):
+            await claim(store)
+        assert _rows(db) == [("pending", 0), ("pending", 0)]
+    finally:
+        await store.close()
+
+
+@_CLAIMS
+async def test_a_raising_dead_letter_releases_the_claimed_rows(
+    tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A programming error from ``dead_letter_now`` stays loud, and releases the batch first."""
+    store, _cipher, db = await _open(tmp_path)
+    try:
+        _side(db, "UPDATE queue SET handler_name='MOVED' WHERE destination_name=?", (_DEST,))
+        monkeypatch.setattr(store, "dead_letter_now", _broken_dead_letter)
+        with pytest.raises(TypeError):
+            await claim(store)
+        assert _rows(db) == [("pending", 0), ("pending", 0)]
+    finally:
+        await store.close()
+
+
+@_CLAIMS
+async def test_a_lock_error_from_the_dead_letter_and_the_set_aside_releases_the_rows(
+    tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock error from ``dead_letter_now`` is a store fault, so the claim tries to set the row
+    aside. When that write fails as well, the rows are still released."""
+    store, _cipher, db = await _open(tmp_path)
+    try:
+        _side(db, "UPDATE queue SET handler_name='MOVED' WHERE destination_name=?", (_DEST,))
+
+        async def locked(*_a: Any, **_kw: Any) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(store, "dead_letter_now", locked)
+        monkeypatch.setattr(store, "_set_aside_claimed", locked)
+        with pytest.raises(sqlite3.OperationalError):
+            await claim(store)
+        assert _rows(db) == [("pending", 0), ("pending", 0)]
+    finally:
+        await store.close()
+
+
+@_CLAIMS
+async def test_a_cancelled_per_lane_claim_leaves_its_rows_inflight(
+    tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: a cancellation releases nothing (ADR 0066 teardown, ADR 0157 C1)."""
+    store, cipher, db = await _open(tmp_path)
+    try:
+        cipher.healthy_opens = 0
+
+        async def cancelled(*_a: Any, **_kw: Any) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(store, "_set_aside_claimed", cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            await claim(store)
+        assert _rows(db)[0] == ("inflight", 1)
+    finally:
+        await store.close()
+
+
+async def test_claim_ready_does_not_release_a_row_it_already_set_aside(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``claim_ready`` goes on past a set-aside row, so a later error must not release that row: by
+    then its backoff may have passed and another claim may hold it."""
+    from messagefoundry.store.queue_tag import QueueTagError  # noqa: PLC0415
+
+    store, _cipher, _db = await _open(tmp_path)
+    try:
+        released: list[str] = []
+        set_aside: list[str] = []
+
+        async def recording(ids: Any, now: float | None = None) -> None:
+            released.extend(ids)
+
+        async def aside(tail: Any, _now: Any) -> None:
+            set_aside.extend(r["id"] for r in tail)
+
+        async def open_row(_row: Any) -> Any:
+            raise CipherUnavailableError("down") if not set_aside else QueueTagError("t")
+
+        monkeypatch.setattr(store, "release_claimed", recording)
+        monkeypatch.setattr(store, "_set_aside_claimed", aside)
+        monkeypatch.setattr(store, "_outbox_item_from_row", open_row)
+        monkeypatch.setattr(store, "dead_letter_now", _broken_dead_letter)
+        with pytest.raises(TypeError):
+            await store.claim_ready(10, destination_name=_DEST)
+        assert len(set_aside) == 1 and len(released) == 1 and released != set_aside
+    finally:
+        await store.close()
+
+
+class _FakeServerClaim:
+    """The claim's database half for a server store built with no pool: every claim "commits" the
+    given rows, so the decode that follows runs offline. Only the hosted legs run the real SQL."""
+
+    _COLUMNS = (
+        "id",
+        "message_id",
+        "channel_id",
+        "destination_name",
+        "handler_name",
+        "payload",
+        "attempts",
+        "seq",
+        "created_at",
+    )
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.description: list[tuple[str]] = []
+        self._result: list[tuple[Any, ...]] = []
+
+    @contextlib.asynccontextmanager
+    async def transaction(self, **_kw: Any) -> AsyncIterator[None]:  # asyncpg's connection
+        yield
+
+    async def execute(self, sql: str, *_args: Any) -> None:
+        if sql.startswith("SELECT TOP"):  # the SQL Server batch claim's lock read
+            self.description = [("id",), ("next_attempt_at",), ("seq",)]
+            self._result = [(r["id"], 0.0, r["seq"]) for r in self.rows]
+        else:
+            self.description = [(c,) for c in self._COLUMNS]
+            self._result = [tuple(r[c] for c in self._COLUMNS) for r in self.rows]
+
+    async def fetchrow(self, *_a: Any) -> dict[str, Any]:
+        return self.rows[0]
+
+    async def fetch(self, *_a: Any) -> list[dict[str, Any]]:
+        return self.rows
+
+    async def fetchall(self) -> list[tuple[Any, ...]]:  # the SQL Server cursor
+        return self._result
+
+
+def _server_claim_store(
+    backend: str, rows: list[dict[str, Any]], fail_with: BaseException | None = None
+) -> tuple[Any, list[str]]:
+    """A server store whose claims return ``rows``, recording the ids it releases."""
+    from tests.test_sqlserver_sync_handoff_offline import _acm  # noqa: PLC0415
+
+    store = _server_store(backend, _FakeServer(fail_with))
+    fake = _FakeServerClaim(rows)
+    released: list[str] = []
+
+    async def release_claimed(ids: Any, now: float | None = None) -> None:
+        released.extend(ids)
+
+    async def fetchall(*_a: Any) -> list[dict[str, Any]]:
+        return rows
+
+    async def commit(_conn: Any) -> None:
+        return None
+
+    store.release_claimed = release_claimed
+    store._leader_epoch = None
+    store._lease_key = None
+    store._owner = "node"
+    store._settings = types.SimpleNamespace(lease_ttl_seconds=30.0)
+    store._acquire = store._timed_acquire = store._cursor = _acm(fake)
+    store._commit = commit
+    store._fetchall = fetchall
+    return store, released
+
+
+def _set_open(store: Any, backend: str, opened: Callable[[Any], str]) -> None:
+    if backend == "sqlserver":
+        store._open_claimed = lambda d, _stage: opened(d)
+    else:
+        store._outbox_item = lambda r: OutboxItem.from_row(r, opened(r))
+
+
+async def _claim_ready_server(store: Any) -> list[Any]:
+    result: list[Any] = await store.claim_ready(10, stage="ingress", channel_id="L")
+    return result
+
+
+async def _claim_next_fifo_server(store: Any) -> list[Any]:
+    one = await store.claim_next_fifo("L", stage="ingress")
+    return [] if one is None else [one]
+
+
+async def _claim_next_fifo_batch_server(store: Any) -> list[Any]:
+    result: list[Any] = await store.claim_next_fifo_batch("L", stage="ingress", limit=10)
+    return result
+
+
+_SERVER_CLAIMS = pytest.mark.parametrize(
+    "claim",
+    [_claim_ready_server, _claim_next_fifo_server, _claim_next_fifo_batch_server],
+    ids=_IDS,
+)
+
+
+def _claim_rows(claim: Claim) -> list[dict[str, Any]]:
+    """Two rows, or the one a single-row claim takes."""
+    rows = [{**_server_row("L", n), "payload": "sealed"} for n in (1, 2)]
+    return rows[:1] if claim is _claim_next_fifo_server else rows
+
+
+@_SERVER_CLAIMS
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+@pytest.mark.parametrize("failure", ["open-other", "dead-letter-bug", "set-aside"])
+async def test_a_server_per_lane_claim_releases_on_an_escaping_error(
+    backend: str, claim: Claim, failure: str
+) -> None:
+    """The last claimed row fails three ways, on each server claim: an open error that is not a
+    :class:`CipherError`, an engine bug from ``dead_letter_now``, and a failed set-aside write.
+    The error propagates and every claimed row is handed to ``release_claimed``."""
+    from messagefoundry.store.queue_tag import QueueTagError  # noqa: PLC0415
+
+    rows = _claim_rows(claim)
+    bug = TypeError("bug") if failure == "dead-letter-bug" else None
+    store, released = _server_claim_store(backend, rows, bug)
+    at_open: dict[str, Exception] = {
+        "open-other": ValueError("not a cipher error"),
+        "dead-letter-bug": QueueTagError("t"),
+        "set-aside": CipherUnavailableError("down"),
+    }
+    expected: dict[str, type[Exception]] = {
+        "open-other": ValueError,
+        "dead-letter-bug": TypeError,
+        "set-aside": OSError,
+    }
+
+    def opened(row: Any) -> str:
+        if row["id"] == rows[-1]["id"]:
+            raise at_open[failure]
+        return "body"
+
+    async def failing_reschedule(*_a: Any, **_kw: Any) -> None:
+        raise OSError("connection reset")
+
+    _set_open(store, backend, opened)
+    store.reschedule_claimed = failing_reschedule
+    with pytest.raises(expected[failure]):
+        await claim(store)
+    assert sorted(released) == sorted(r["id"] for r in rows)
+
+
+@_SERVER_CLAIMS
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_a_cancelled_server_per_lane_claim_releases_nothing(
+    backend: str, claim: Claim
+) -> None:
+    store, released = _server_claim_store(backend, _claim_rows(claim))
+
+    def opened(_row: Any) -> str:
+        raise CipherUnavailableError("down")
+
+    async def cancelled(*_a: Any, **_kw: Any) -> None:
+        raise asyncio.CancelledError
+
+    _set_open(store, backend, opened)
+    store.reschedule_claimed = cancelled
+    with pytest.raises(asyncio.CancelledError):
+        await claim(store)
+    assert released == []
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_server_claim_ready_does_not_release_a_row_it_already_set_aside(
+    backend: str,
+) -> None:
+    from messagefoundry.store.queue_tag import QueueTagError  # noqa: PLC0415
+
+    rows = [{**_server_row("L", n), "payload": "sealed"} for n in (1, 2)]
+    store, released = _server_claim_store(backend, rows, TypeError("bug"))
+
+    def opened(row: Any) -> str:
+        if row["id"] == rows[0]["id"]:
+            raise CipherUnavailableError("down")
+        raise QueueTagError("t")
+
+    async def reschedule(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    _set_open(store, backend, opened)
+    store.reschedule_claimed = reschedule
+    with pytest.raises(TypeError):
+        await _claim_ready_server(store)
+    assert released == [rows[1]["id"]]

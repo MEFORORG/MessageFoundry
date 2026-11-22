@@ -15102,14 +15102,22 @@ class MessageStore:
         # the batch INFLIGHT and, with the worker re-raising, silently stop the destination from
         # draining (review H-1). Dead-letter the bad row and deliver the rest.
         items: list[OutboxItem] = []
-        for row in rows:
-            try:
-                items.append(await self._outbox_item_from_row(row))
-            except Exception as exc:
-                # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
-                # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
-                if await self._dead_letter_unopenable(row, exc) is not None:
-                    await self._set_aside_claimed([row], now)
+        settled: set[str] = set()  # dead-lettered or set aside: not this claim's to release
+        try:
+            for row in rows:
+                try:
+                    items.append(await self._outbox_item_from_row(row))
+                except Exception as exc:
+                    # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it
+                    # never tries to join a group batch (Hazard A — a claim's dead-letter must not group).
+                    if await self._dead_letter_unopenable(row, exc) is not None:
+                        await self._set_aside_claimed([row], now)
+                    settled.add(row["id"])
+        except Exception:
+            # Nothing is returned, so no claimed row may stay inflight behind the error (#5723). A
+            # cancellation is not caught and leaves them inflight; release_unreturned says why.
+            await release_unreturned(self, [[r for r in rows if r["id"] not in settled]])
+            raise
         return items
 
     async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
@@ -15207,9 +15215,9 @@ class MessageStore:
         mode: under ``"pooled"`` at least an unordered lane and a batch window's extra members
         are claimed through them. None of their callers binds ``infra_fault_policy``, so such a
         row is retried for as long as the fault lasts, with no cap or alert; only
-        ``claim_fifo_heads`` hands a fault to T17. If this write fails too,
-        its error propagates out of the claim and the rows stay ``inflight`` until
-        ``reset_stale_inflight`` at the next start."""
+        ``claim_fifo_heads`` hands a fault to T17. If this write fails too, its error propagates
+        to the claim, which releases its unsettled rows and re-raises (BACKLOG #5723); a release
+        that also fails leaves them ``inflight`` until ``reset_stale_inflight`` at the next start."""
         log.warning(
             "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
             " dead-lettered, for a reason the claim could not settle",
@@ -15339,8 +15347,12 @@ class MessageStore:
             # is audited and alerted too (BACKLOG #2593), and so is one that is corrupt rather than
             # drift, its audit row naming that cause (BACKLOG #5884).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
-            if await self._dead_letter_unopenable(claimed, exc) is not None:
-                await self._set_aside_claimed([claimed], now)
+            try:
+                if await self._dead_letter_unopenable(claimed, exc) is not None:
+                    await self._set_aside_claimed([claimed], now)
+            except Exception:
+                await release_unreturned(self, [[claimed]])  # never strand the head (#5723)
+                raise
             return None
 
     async def claim_next_fifo_batch(
@@ -15418,13 +15430,19 @@ class MessageStore:
         # A row that is not refused for its own content stops the list and is set aside (#5735).
         items: list[OutboxItem] = []
         ordered = list(claimed_rows)
-        for i, row in enumerate(ordered):
-            try:
-                items.append(await self._outbox_item_from_row(row))
-            except Exception as exc:
-                if await self._dead_letter_unopenable(row, exc) is not None:
-                    await self._set_aside_claimed(ordered[i:], now)
-                    break  # set aside with the rest of the lane: never deliver past it (#5735)
+        try:
+            for i, row in enumerate(ordered):
+                try:
+                    items.append(await self._outbox_item_from_row(row))
+                except Exception as exc:
+                    if await self._dead_letter_unopenable(row, exc) is not None:
+                        await self._set_aside_claimed(ordered[i:], now)
+                        break  # set aside with the rest of the lane: never deliver past it (#5735)
+        except Exception:
+            # Nothing is returned, so release the batch (#5723); a dead-lettered row is not
+            # inflight and stays as it is. A cancellation leaves the rows inflight.
+            await release_unreturned(self, [ordered])
+            raise
         return items
 
     async def claim_fifo_heads(

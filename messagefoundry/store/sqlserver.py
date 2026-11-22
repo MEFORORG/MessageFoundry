@@ -11077,26 +11077,34 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         items = []
-        for row in rows:
-            d = dict(zip(columns, row))  # noqa: B905
-            try:
-                payload = self._open_claimed(d, stage)
-            except CipherError as exc:
-                if await self._dead_letter_unopenable(d, stage, exc) is not None:
-                    await self._set_aside_claimed([d], now)
-                continue
-            items.append(
-                OutboxItem(
-                    id=d["id"],
-                    message_id=d["message_id"],
-                    channel_id=d["channel_id"],
-                    destination_name=d["destination_name"],
-                    handler_name=d["handler_name"],
-                    payload=payload,
-                    attempts=d["attempts"],
-                    stage=stage,
+        decoded = [dict(zip(columns, row)) for row in rows]  # noqa: B905
+        settled: set[str] = set()  # dead-lettered or set aside: not this claim's to release
+        try:
+            for d in decoded:
+                try:
+                    payload = self._open_claimed(d, stage)
+                except CipherError as exc:
+                    if await self._dead_letter_unopenable(d, stage, exc) is not None:
+                        await self._set_aside_claimed([d], now)
+                    settled.add(d["id"])
+                    continue
+                items.append(
+                    OutboxItem(
+                        id=d["id"],
+                        message_id=d["message_id"],
+                        channel_id=d["channel_id"],
+                        destination_name=d["destination_name"],
+                        handler_name=d["handler_name"],
+                        payload=payload,
+                        attempts=d["attempts"],
+                        stage=stage,
+                    )
                 )
-            )
+        except Exception:
+            # Nothing is returned, so no claimed row may stay inflight behind the error (#5723). A
+            # cancellation is not caught and leaves them inflight; release_unreturned says why.
+            await release_unreturned(self, [[d for d in decoded if d["id"] not in settled]])
+            raise
         return items
 
     def _open_claimed(self, d: dict[str, Any], stage: str) -> str:
@@ -11151,9 +11159,9 @@ class SqlServerStore:
     async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]], now: float | None) -> None:
         """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
         (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
-        too, its error propagates out of the claim, and on
-        this backend only ``reset_stale_inflight`` at the next start re-pends the rows: a claim
-        here sets no lease."""
+        too, its error propagates to the claim, which releases its unsettled rows and re-raises
+        (BACKLOG #5723). If the release fails as well, on this backend only
+        ``reset_stale_inflight`` at the next start re-pends the rows: a claim here sets no lease."""
         log.warning(
             "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
             " dead-lettered, for a reason the claim could not settle",
@@ -11306,11 +11314,15 @@ class SqlServerStore:
         if row is None or d is None:
             return None
         try:
-            payload = self._open_claimed(d, stage)
-        except CipherError as exc:
-            if await self._dead_letter_unopenable(d, stage, exc) is not None:
-                await self._set_aside_claimed([d], now)
-            return None
+            try:
+                payload = self._open_claimed(d, stage)
+            except CipherError as exc:
+                if await self._dead_letter_unopenable(d, stage, exc) is not None:
+                    await self._set_aside_claimed([d], now)
+                return None
+        except Exception:
+            await release_unreturned(self, [[d]])  # never strand the head (#5723)
+            raise
         return OutboxItem(
             id=d["id"],
             message_id=d["message_id"],
@@ -11455,26 +11467,32 @@ class SqlServerStore:
         # read as created_at. The worker then iterates strictly oldest-first (it never re-sorts).
         decoded = sorted((dict(zip(columns, r)) for r in rows), key=lambda d: d["seq"])  # noqa: B905
         items: list[OutboxItem] = []
-        for i, d in enumerate(decoded):
-            try:
-                payload = self._open_claimed(d, stage)
-            except CipherError as exc:
-                if await self._dead_letter_unopenable(d, stage, exc) is not None:
-                    await self._set_aside_claimed(decoded[i:], now)
-                    break  # set aside with the rest of the lane: never deliver past it (#5735)
-                continue
-            items.append(
-                OutboxItem(
-                    id=d["id"],
-                    message_id=d["message_id"],
-                    channel_id=d["channel_id"],
-                    destination_name=d["destination_name"],
-                    handler_name=d["handler_name"],
-                    payload=payload,
-                    attempts=d["attempts"],
-                    stage=stage,
+        try:
+            for i, d in enumerate(decoded):
+                try:
+                    payload = self._open_claimed(d, stage)
+                except CipherError as exc:
+                    if await self._dead_letter_unopenable(d, stage, exc) is not None:
+                        await self._set_aside_claimed(decoded[i:], now)
+                        break  # set aside with the rest of the lane: never deliver past it (#5735)
+                    continue
+                items.append(
+                    OutboxItem(
+                        id=d["id"],
+                        message_id=d["message_id"],
+                        channel_id=d["channel_id"],
+                        destination_name=d["destination_name"],
+                        handler_name=d["handler_name"],
+                        payload=payload,
+                        attempts=d["attempts"],
+                        stage=stage,
+                    )
                 )
-            )
+        except Exception:
+            # Nothing is returned, so release the batch (#5723); a dead-lettered row is not
+            # inflight and stays as it is. A cancellation leaves the rows inflight.
+            await release_unreturned(self, [decoded])
+            raise
         return items
 
     async def claim_fifo_heads(

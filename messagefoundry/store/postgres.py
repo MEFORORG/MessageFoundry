@@ -5309,12 +5309,20 @@ class PostgresStore:
         )
         rows = await self._fetchall(sql, *claim_args)
         items: list[OutboxItem] = []
-        for row in rows:
-            try:
-                items.append(self._outbox_item(row))
-            except CipherError as exc:
-                if await self._dead_letter_unopenable(row, exc) is not None:
-                    await self._set_aside_claimed([row], now)
+        settled: set[str] = set()  # dead-lettered or set aside: not this claim's to release
+        try:
+            for row in rows:
+                try:
+                    items.append(self._outbox_item(row))
+                except CipherError as exc:
+                    if await self._dead_letter_unopenable(row, exc) is not None:
+                        await self._set_aside_claimed([row], now)
+                    settled.add(row["id"])
+        except Exception:
+            # Nothing is returned, so no claimed row may stay inflight behind the error (#5723). A
+            # cancellation is not caught and leaves them inflight; release_unreturned says why.
+            await release_unreturned(self, [[r for r in rows if r["id"] not in settled]])
+            raise
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -5463,7 +5471,11 @@ class PostgresStore:
                         )
                         await self._maybe_finalize_message(conn, row["message_id"], now)
                         row = None
-        item, _set_aside = await self._fifo_item_or_dead_letter(row, tail=[row], now=now)
+        try:
+            item, _set_aside = await self._fifo_item_or_dead_letter(row, tail=[row], now=now)
+        except Exception:
+            await release_unreturned(self, [[row]])  # never strand the head (#5723)
+            raise
         return item
 
     async def claim_next_fifo_batch(
@@ -5567,12 +5579,20 @@ class PostgresStore:
         # dead-lettered (its own txn) and dropped; the surviving tail keeps its order.
         ordered = sorted(rows, key=lambda r: r["seq"])
         items: list[OutboxItem] = []
-        for i, row in enumerate(ordered):
-            item, set_aside = await self._fifo_item_or_dead_letter(row, tail=ordered[i:], now=now)
-            if set_aside:
-                break  # set aside with the rest of the lane: never deliver past it (#5735)
-            if item is not None:
-                items.append(item)
+        try:
+            for i, row in enumerate(ordered):
+                item, set_aside = await self._fifo_item_or_dead_letter(
+                    row, tail=ordered[i:], now=now
+                )
+                if set_aside:
+                    break  # set aside with the rest of the lane: never deliver past it (#5735)
+                if item is not None:
+                    items.append(item)
+        except Exception:
+            # Nothing is returned, so release the batch (#5723); a dead-lettered row is not
+            # inflight and stays as it is. A cancellation leaves the rows inflight.
+            await release_unreturned(self, [ordered])
+            raise
         return items
 
     async def claim_fifo_heads(
@@ -5927,8 +5947,9 @@ class PostgresStore:
     async def _set_aside_claimed(self, tail: Sequence[Any], now: float | None) -> None:
         """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
         (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
-        too, its error propagates out of the claim; the rows'
-        lease and startup recovery re-pend them."""
+        too, its error propagates to the claim, which releases its unsettled rows and re-raises
+        (BACKLOG #5723); if the release fails as well, the rows' lease and startup recovery
+        re-pend them."""
         log.warning(
             "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
             " dead-lettered, for a reason the claim could not settle",
