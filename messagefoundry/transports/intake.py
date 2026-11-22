@@ -34,7 +34,7 @@ __all__ = [
     "IntakeContext",
     "deliver",
     "intake_handler",
-    "peer_address",
+    "socket_address",
     "socket_intake",
 ]
 
@@ -57,17 +57,15 @@ class IntakeAuth(StrEnum):
 class IntakeContext:
     """Who handed the engine one body, as the source saw it.
 
-    A listen source fills the peer fields from the accepted socket; a poll source has no peer and
-    fills :attr:`source` with where it read the body. A ``None`` field is left out of the stored
-    record; what ``None`` means is on each field."""
+    It holds no peer address or port, by the owner's ruling of 2026-11-22 ("No IP in metadata"):
+    the peer's address stays in the connection-event log, under
+    ``[retention].connection_event_retention_hours``. A listen source fills how it admitted the
+    peer; a poll source has no peer and fills :attr:`source` with where it read the body. A
+    ``None`` field is left out of the stored record; what ``None`` means is on each field."""
 
     #: The source's transport, lower case, such as ``"mllp"``, ``"tcp"`` or ``"file"``.
     transport: str
-    #: The peer's address as the accepted socket reports it.
-    peer_host: str | None = None
-    #: The peer's port, so two connections from one translated address are told apart.
-    peer_port: int | None = None
-    #: The local ``host:port`` of the socket that accepted the connection.
+    #: The engine's own local ``host:port`` of the socket that accepted the connection.
     listener: str | None = None
     #: The verified client certificate's subject, RFC 4514, when one was required and verified.
     cert_subject: str | None = None
@@ -88,9 +86,9 @@ class IntakeContext:
         }
 
 
-def peer_address(name: object) -> tuple[str | None, int | None]:
-    """The host and port of a socket address as ``get_extra_info("peername")`` or ``"sockname"``
-    reports it, or ``(None, None)`` for a shape that carries neither (a UNIX socket, say)."""
+def socket_address(name: object) -> tuple[str | None, int | None]:
+    """The host and port of a socket address as ``get_extra_info("sockname")`` reports it, or
+    ``(None, None)`` for a shape that carries neither (a UNIX socket, say)."""
     if isinstance(name, tuple) and len(name) >= 2 and isinstance(name[0], str):
         port = name[1] if isinstance(name[1], int) and not isinstance(name[1], bool) else None
         return name[0], port
@@ -98,7 +96,7 @@ def peer_address(name: object) -> tuple[str | None, int | None]:
 
 
 def _host_port(name: object) -> str | None:
-    host, port = peer_address(name)
+    host, port = socket_address(name)
     if host is None or port is None:
         return None
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
@@ -117,11 +115,8 @@ def socket_intake(
     ``auth_mode`` and ``cert_subject`` come from the listener, which knows its own TLS setup; this
     module reads no certificate. ``address_allowlist`` is ``True`` when the listener has a source
     address allowlist, which the peer passed to get here."""
-    peer_host, peer_port = peer_address(peer.get_extra_info("peername"))
     return IntakeContext(
         transport=transport,
-        peer_host=peer_host,
-        peer_port=peer_port,
         listener=_host_port(peer.get_extra_info("sockname")),
         cert_subject=cert_subject,
         auth_mode=auth_mode,
