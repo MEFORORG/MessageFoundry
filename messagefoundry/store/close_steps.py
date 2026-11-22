@@ -28,7 +28,9 @@ log = logging.getLogger(__name__)
 #: worker, which gets at least a second even with the deadline spent. With every worker wedged, a
 #: cancelled SQLite close can take about 16 s at the current read pool size: this deadline, the
 #: committer's 5 s rollback bound, a second per reader, and two for the writer, which is interrupted
-#: only after its first.
+#: only after its first. That figure assumes each step yields to a cancel. The AES-GCM settlement
+#: does not while its add is running (``gcm_bound._add_then_grant``), so a close waits there for the
+#: backend's own timeouts, and on a wedged SQLite worker with no bound at all.
 CANCELLED_CLOSE_GRACE_SECONDS: Final[float] = 5.0
 
 #: The least any step is given past that bound, so that it still starts.

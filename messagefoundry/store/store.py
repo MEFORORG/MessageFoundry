@@ -13900,8 +13900,10 @@ class MessageStore:
         ``last_close`` marks the connection whose close runs SQLite's WAL checkpoint. An interrupt
         would abort that checkpoint and leave a ``-wal`` file holding committed rows, so this
         connection is stopped first and interrupted only if its worker outlives that wait, with one
-        more second to exit. A checkpoint still running at that point is aborted too; its rows stay
-        in the ``-wal`` file for the next open to recover.
+        more second to exit. That interrupt reaches a statement still ahead of the stop. It cannot
+        reach a checkpoint already running inside SQLite's close: the driver refuses it as a closed
+        database, which is logged, and the checkpoint runs on. The close then returns with that
+        non-daemon worker alive, so interpreter exit waits for the checkpoint.
 
         NOT BOUNDED: a single cancel landing inside a real ``await conn.close()`` on a busy
         connection, reader or writer. aiosqlite's own ``finally`` then parks on its stop with no

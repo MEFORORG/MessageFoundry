@@ -6035,7 +6035,8 @@ class SqlServerStore:
             # Off the loop: a pyodbc close on a dead server blocks, and on the loop the bound could
             # not fire. This lets the close return; it does not stop the thread, so a blocked pyodbc
             # close can still delay process exit. A job still queued at the bound is dropped, and
-            # those pools are then not closed.
+            # those pools are then not closed; if the pool wait is cut too, a repeat close returns
+            # at the guard above and does not retry them.
             await steps.run(
                 asyncio.to_thread(self.close_sync_handoff_pool), "the sync handoff pools"
             )
