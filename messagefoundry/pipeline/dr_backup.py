@@ -4853,17 +4853,18 @@ def _full_open_check(
         if walked_cells:
             # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
             if walked[0] != "PASS":
-                # Only a finding about a cell's content can be this build misreading another
-                # version's cells; a key mismatch or a key-service outage cannot.
+                # A key mismatch or a key-service outage is not this build reading the cells, so
+                # it is not offered that reading; a FAIL that read them, a SQLite fault included,
+                # may be.
                 why = (
                     " (the remedy leads because this build can misread another version's cells)"
-                    if walked[0] == "FAIL" and _CELL_FINDING.match(walked[1])
+                    if walked[0] == "FAIL" and not walked[1].startswith(_OUTAGE_LEAD)
                     else ""
                 )
-                # Whole, as every other arm returns it: the walk's reason is already redacted.
+                # Redacted, but not cut to safe_text's default, so its tail survives.
                 walk = (
                     f"Before the open, the walk of the cells this build knows reported {walked[0]}"
-                    f"{why}: {walked[1]}"
+                    f"{why}: {safe_text(walked[1], limit=_WALK_REASON_LIMIT)}"
                 )
             elif walked[2]:
                 walk = (
@@ -4900,10 +4901,9 @@ def _full_open_check(
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
 _INCOMPATIBLE_REASON_LIMIT = 600
 
-#: How a walk reason built from a cell's reading opens: ``table.column`` and a space
-#: (:meth:`~messagefoundry.store.cipher_cells.CellReading.failure`, and the unmarked line in
-#: :func:`_decrypt_check`). An outage, an interrupted walk and a SQLite fault open otherwise.
-_CELL_FINDING = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+ ")
+#: The most characters of a walk's reason the incompatible-snapshot refusal quotes. Its parts are
+#: already bounded where they are made, so this only keeps a defect from making it unbounded.
+_WALK_REASON_LIMIT = 2000
 
 #: How :func:`_decrypt_check` opens the reason for a decrypt the key service gave no verdict on.
 _OUTAGE_LEAD = "the key service did not return a usable answer"
@@ -4942,8 +4942,8 @@ def _incompatible_snapshot(
         f" {tail}",
         limit=_INCOMPATIBLE_REASON_LIMIT,
     )
-    # Appended after the cut, so a long differences list cannot cut it away. It is built from
-    # readings already redacted where they were made.
+    # Appended after the cut, so a long differences list cannot cut it away. The caller redacts
+    # it (`safe_text`) before it comes here.
     return f"{head} {walk}" if walk else head
 
 
