@@ -99,6 +99,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
@@ -3852,6 +3853,13 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
 
+def passkey_set_matches(creds: Iterable[WebAuthnCredential], cred_digest: str) -> bool:
+    """Whether ``creds`` digest to ``cred_digest``, the digest the account's seal covers, compared
+    with :func:`~messagefoundry.credential.constant_time_equal` rather than ``==`` (ASVS 11.2.4,
+    BACKLOG #1167). Shared by the three store backends."""
+    return constant_time_equal(passkey_digest(creds), cred_digest)
+
+
 def global_epoch_or_refuse(value: Any) -> int:
     """``value``, the global session epoch a read returned, as an int; a store with no row reads
     ``None`` and is refused with :data:`GLOBAL_SESSION_EPOCH_MISSING` (BACKLOG #5091).
@@ -4388,7 +4396,7 @@ def discoverable_way_past(
     :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
     match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
     written or flipped outside the store must not count. The census asks it too."""
-    if sealed and passkey_digest(passkeys) != cred_digest:
+    if sealed and not passkey_set_matches(passkeys, cred_digest):
         return False
     counts = passkey_counts or passkey_is_way_past
     return any(counts(c) for c in passkeys)
@@ -4716,8 +4724,12 @@ def removal_keeps_way_past(
     row = record.row
     if not drop_totp and _totp_is_way_past(record, totp_counts):
         return True
-    remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
-    trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
+    remaining = [
+        c
+        for c in passkeys
+        if drop_passkey is None or not constant_time_equal(c.credential_id_hash, drop_passkey)
+    ]
+    trusted = not sealed or passkey_set_matches(passkeys, row.cred_digest)
     counts = passkey_counts or passkey_is_way_past
     return trusted and any(counts(c) for c in remaining)
 
@@ -20060,7 +20072,9 @@ class MessageStore:
             if (
                 self._row_sealer is not None
                 and not removes_all
-                and passkey_digest(await self._account_passkeys(user_id)) != current.row.cred_digest
+                and not passkey_set_matches(
+                    await self._account_passkeys(user_id), current.row.cred_digest
+                )
             ):
                 raise RowSealError(USER_KIND)
         # With no account the statement runs as it always did: an INSERT meets the foreign key and

@@ -6621,10 +6621,13 @@ class AuthService:
         # TOTP on makes, reachable with neither factor: its refusal would escape ``login`` as an
         # unpadded 500, and a pool wait can outlast the pad, so either would name the account as
         # enrolled to anyone who knows the username. It would also add a locked round trip on the
-        # account's row to every wrong code. So a wrong code makes the store calls a password-only
-        # sign-in makes. A refusal here still escapes unpadded, as before, but only on a code that
-        # matched a step, which already tells its sender the account is enrolled. The ``int``
-        # signature of ``consume_totp_step`` keeps this short-circuit the only form that type-checks.
+        # account's row to every wrong code. So a wrong code makes no ``consume_totp_step`` call. It
+        # still opens the TOTP cell above (``open_totp_secret``), and under a Transit cipher that
+        # open is a round trip to the cipher service: a timing difference this line does not
+        # settle. A refusal here still escapes unpadded, as before, but only on a code that matched
+        # a step. The ``int`` parameter refuses an unconditional call on ``step`` itself, not a
+        # coerced one such as ``step or 0``; ``tests/test_constant_time_frame_totp_passkey.py``
+        # pins the short-circuit.
         code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
@@ -18767,8 +18770,10 @@ class AuthService:
                 # a replay, or a second use inside the same step. Returning here cost no argon2
                 # work, while a WRONG code falls through to the recovery-code walk below. Both answer
                 # False, so the wall clock was the only thing telling them apart. So fall through
-                # to the SAME walk (same store read, same hashes, same slot count) and refuse after
-                # it. A success stays fast: it already reveals its outcome.
+                # to the SAME walk (same hashes, same slot count) and refuse after it. A success
+                # stays fast: it already reveals its outcome. The two still differ by at least one
+                # store call: a wrong code matched no step, so it never reached
+                # ``consume_totp_step``, and ``verify_mfa`` re-reads more for a matched code.
                 totp_refused = True
         normalized = code.upper()  # recovery codes are minted uppercase
         # The hashes the account's seal covered, not a second read nobody checked (BACKLOG #2592).
@@ -19986,7 +19991,7 @@ class AuthService:
             )
             if isinstance(fresh, Elevation):
                 return fresh
-            settled = fresh.cred_digest == user.cred_digest
+            settled = constant_time_equal(fresh.cred_digest, user.cred_digest)
             user = fresh
             if settled or standing != "held":
                 break

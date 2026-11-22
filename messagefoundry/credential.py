@@ -120,7 +120,9 @@ def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
     such as a session token hash, a credential-id hash or a config fingerprint, not for a presented
     credential, which is :func:`constant_time_match`'s job. It differs from that function in two
     ways, both on purpose: two empty values ARE equal here, and nothing is digested first, so a
-    difference in LENGTH still shows. Every caller compares fixed-width digests.
+    difference in LENGTH still shows. Callers compare fixed-width digests, or a passkey-set
+    digest, which is ``""`` for an account with no passkeys (``store.passkey_digest``): where one
+    of those is compared, the length shows whether a digest is empty, and nothing more.
 
     Total: ``surrogatepass`` encodes any ``str`` CPython can hold, so a caller's string can never
     raise ``TypeError`` out of the compare, and two distinct strings never map to the same bytes.

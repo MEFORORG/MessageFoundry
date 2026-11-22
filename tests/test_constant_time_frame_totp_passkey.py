@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""ASVS 11.2.4 (BACKLOG #1167): two short-circuits removed, each pinned by a count, and one kept.
+"""ASVS 11.2.4 (BACKLOG #1167): frame decrypts and a passkey walk pinned by a count, and one kept.
 
-1. ``backup_codec.decrypt_stream`` runs BOTH AAD tries on every frame, the final one included.
+1. ``backup_codec.decrypt_stream`` runs ONE decrypt per frame, under the AAD the frame's position
+   in the stream names, so the count is the frame count and no AAD is tried and discarded.
 2. ``AuthService._check_both_factors`` KEEPS its short-circuit: ``consume_totp_step`` is asked only
    once a code matched a step. The comment above that line says why.
 3. ``finish_webauthn_assertion`` compares every held passkey, each in constant time.
@@ -34,7 +35,7 @@ from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin
 from tests._totp_clock import pin_totp_clock
 
-# --- 1. decrypt_stream: both tries on every frame -------------------------------------------------
+# --- 1. decrypt_stream: one decrypt per frame, chosen by position ---------------------------------
 
 
 class _CountingAes:
@@ -66,10 +67,11 @@ def _counted(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
     return tries
 
 
-def test_every_frame_takes_both_tries_and_the_payload_is_unchanged(
+def test_every_frame_takes_one_decrypt_under_its_own_aad(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RED when: the frame loop gets its ``break`` back, so a non-final frame takes one try."""
+    """RED when: the frame loop tries more than one AAD on a frame, or picks the AAD by which
+    one authenticates rather than by where the stream ends."""
     key = os.urandom(32)
     payload = os.urandom(9000)  # three frames at 4096 bytes: two non-final, one final
     blob = _archive(key, payload)
@@ -80,8 +82,39 @@ def test_every_frame_takes_both_tries_and_the_payload_is_unchanged(
 
     assert out.getvalue() == payload
     digest = hashlib.sha256(bc.read_header(io.BytesIO(blob)).to_json_bytes()).digest()
-    # Frame by frame: the non-final AAD, then the final one, for all three frames.
-    assert tries == [bc._aad(digest, i, final=f) for i in range(3) for f in (False, True)]
+    # Two non-final frames, then the final one, one decrypt each.
+    assert tries == [bc._aad(digest, i, final=i == 2) for i in range(3)]
+
+
+@pytest.mark.parametrize(
+    ("cut", "refusal", "written"),
+    [
+        ("after a non-final frame", r"truncated \.mfbak archive \(no final frame\)", 0),
+        ("bytes appended after the final", "trailing bytes after the final", 8192),
+    ],
+)
+def test_the_frame_position_cannot_pass_a_cut_or_padded_archive(
+    cut: str, refusal: str, written: int
+) -> None:
+    """The AAD is chosen by where the stream ends. A stream cut right after a non-final frame reads
+    that frame as final, and one that runs on past the final frame reads it as non-final, so each
+    fails its tag, is named for what it is, and writes no plaintext of the frame it refused.
+
+    RED when: the loop picks the AAD by which one authenticates, so the refused frame is written."""
+    key = os.urandom(32)
+    payload = os.urandom(9000)
+    blob = _archive(key, payload)
+    off = len(bc.MAGIC) + 1
+    (hdrlen,) = bc._U32.unpack(blob[off : off + bc._U32.size])
+    first_frame_end = off + bc._U32.size + hdrlen + bc._NONCE_BYTES + bc._U32.size + 4096 + 16
+    stream = {
+        "after a non-final frame": blob[:first_frame_end],
+        "bytes appended after the final": blob + b"EXTRA",
+    }[cut]
+    out = io.BytesIO()
+    with pytest.raises(bc.BackupCodecError, match=refusal):
+        bc.decrypt_stream(io.BytesIO(stream), out, key)
+    assert out.getvalue() == payload[:written]
 
 
 def test_a_tampered_frame_still_fails_closed() -> None:

@@ -397,6 +397,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     parse_recovery_code_hashes,
     passkey_digest,
+    passkey_set_matches,
     password_change,
     raise_account_epoch,
     read_newest_keyed_audit_row,
@@ -15506,8 +15507,9 @@ class SqlServerStore:
             if (
                 self._row_sealer is not None
                 and not removes_all
-                and passkey_digest(await self._account_passkeys(cur, user_id))
-                != current.row.cred_digest
+                and not passkey_set_matches(
+                    await self._account_passkeys(cur, user_id), current.row.cred_digest
+                )
             ):
                 raise RowSealError(USER_KIND)
         await cur.execute(statement, params)
