@@ -12017,6 +12017,9 @@ _CONFIG_MODULE_SUFFIX_LEN: Final = 13
 #: Why the loader's diagnostic for author code carries no exception text.
 _WITHHELD: Final = "its message is withheld: it can carry a value the module held"
 
+#: What :func:`_failure_detail` adds when :func:`_in_dir` could not resolve a file's folder.
+_FOLDER_UNRESOLVED: Final = ", and the folder of at least one source file could not be resolved"
+
 
 def _module_failure(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
@@ -12082,7 +12085,8 @@ def _is_a_signal(exc: BaseException, path: Path) -> bool:
 
 def _raised_in_the_config_dir(exc: BaseException, path: Path) -> bool:
     file = raise_statement_file(exc)
-    return file is not None and _in_dir(file, path.parent.resolve())
+    # A folder that could not be resolved counts as outside, as it did when _in_dir said False.
+    return file is not None and _in_dir(file, path.parent.resolve()) is True
 
 
 def _read_fault(path: Path, fault: BaseException) -> None:
@@ -12134,25 +12138,35 @@ def _failure_detail(
     is not ``own_file``), and each identifier the exception claims that the source line spells.
 
     The file is the deepest frame in the config directory, so a failing helper is named rather than
-    the config module's import of it. A file name and a line number are layout, not data."""
+    the config module's import of it. A file name and a line number are layout, not data.
+
+    A file whose folder could not be resolved is not named, and the detail ends with
+    :data:`_FOLDER_UNRESOLVED` instead, so the location given may not be the deepest one. That is a
+    fixed sentence, not a log line: this runs while a helper's ImportError is judged, where a log
+    call would run a handler a module added (vault BACKLOG #3765, LF10)."""
     located: tuple[str, int] | None = None
     filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
     lineno = getattr(exc, "lineno", None)
-    if isinstance(filename, str) and isinstance(lineno, int) and _in_dir(filename, config_dir):
-        located = (filename, lineno)
-    else:
+    unresolved = False
+    if isinstance(filename, str) and isinstance(lineno, int):
+        in_dir = _in_dir(filename, config_dir)
+        unresolved = in_dir is None
+        if in_dir is True:
+            located = (filename, lineno)
+    if located is None:
         # One resolve per distinct file: a RecursionError walks about a thousand frames of one file.
-        seen: dict[str, bool] = {}
+        seen: dict[str, bool | None] = {}
         for frame, frame_line in traceback.walk_tb(exc.__traceback__):
             name = frame.f_code.co_filename
             if name not in seen:
                 seen[name] = _in_dir(name, config_dir)
-            if seen[name]:
+                unresolved = unresolved or seen[name] is None
+            if seen[name] is True:
                 located = (name, frame_line)
     detail = _type_name(exc)
     # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
     if located is None or not isinstance(located[1], int):
-        return detail
+        return detail + _FOLDER_UNRESOLVED if unresolved else detail
     source_file, line = located
     if Path(source_file).name != own_file:
         detail += f" in {Path(source_file).name}"
@@ -12168,7 +12182,7 @@ def _failure_detail(
         ]
         if idents:
             detail += " naming " + ", ".join(repr(ident) for ident in idents)
-    return detail
+    return detail + _FOLDER_UNRESOLVED if unresolved else detail
 
 
 def _claimed_identifiers(exc: BaseException) -> tuple[object, ...]:
@@ -12243,9 +12257,14 @@ def _source_name(name: object) -> str | None:
     return name
 
 
-def _in_dir(filename: str, directory: Path) -> bool:
+def _in_dir(filename: str, directory: Path) -> bool | None:
     """Whether ``filename`` sits directly in ``directory`` -- config modules and their helpers are
-    siblings -- compared resolved.
+    siblings -- compared resolved, or ``None`` when its folder could not be resolved.
+
+    Both callers read ``None`` as no match, and the names are not compared as text instead: a module
+    can forge a code object's ``co_filename``. Nothing is logged here, because this runs while an
+    interrupt is judged (:func:`_is_a_signal`) and while a helper's ImportError is judged, and a log
+    call would run a handler a module added. :func:`_failure_detail` says so in its diagnostic.
 
     Only an absolute filename counts. The loader's modules record one (the import machinery makes the
     spec's path absolute, even for a config directory given as a relative path), while ``<string>``,
@@ -12259,7 +12278,7 @@ def _in_dir(filename: str, directory: Path) -> bool:
         # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
         return candidate.parent.resolve() == directory
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def _textless_import_error(exc: ImportError) -> ImportError:

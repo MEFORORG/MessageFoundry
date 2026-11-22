@@ -2237,3 +2237,60 @@ def test_a_raise_outside_the_engine_counts_only_for_the_loaders_rule() -> None:
 def test_an_exception_never_raised_has_no_origin() -> None:
     assert not raised_by_the_engine(ValueError("x"))
     assert not worded_by_the_engine(ValueError("x"))
+
+
+#: A folder name ``Path.resolve`` refuses under :func:`unresolvable` (vault BACKLOG #3765, LF10).
+_UNRESOLVABLE = "mefor_unresolvable_3765"
+
+
+@pytest.fixture
+def unresolvable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """An absolute file name, outside the config dir, whose folder cannot be resolved.
+
+    No portable name makes ``resolve`` fail on every platform, so it is made to fail for this one."""
+    real = Path.resolve
+
+    def resolve(self: Path, strict: bool = False) -> Path:
+        if _UNRESOLVABLE in self.parts:
+            raise OSError("unresolvable folder")
+        return real(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    return str(tmp_path.parent / _UNRESOLVABLE / "forged.py")
+
+
+def _forged(source: str, filename: str) -> str:
+    """Module code that runs ``source`` in a frame whose ``co_filename`` is ``filename``."""
+    return f"exec(compile({source!r}, '<forged>', 'exec').replace(co_filename={filename!r}))\n"
+
+
+def test_a_folder_that_cannot_be_resolved_is_said_in_the_diagnostic(
+    tmp_path: Path, unresolvable: str
+) -> None:
+    # Main swallowed the failed resolve, so the diagnostic gave no sign the location could be short.
+    _write(
+        tmp_path, "feed.py", "x = 1\n" + _forged(f"raise RuntimeError({NEEDLE!r})", unresolvable)
+    )
+    (msg,) = _messages(tmp_path)
+    assert "RuntimeError at line 2, and the folder of at least one source file could not" in msg
+    assert NEEDLE not in msg and _UNRESOLVABLE not in msg
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_an_interrupt_raised_in_a_folder_that_cannot_be_resolved_stops_the_load(
+    tmp_path: Path, unresolvable: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # As on main: an unresolved folder is not the config dir, so the `raise` there proves nothing.
+    _write(tmp_path, "feed.py", _forged(f"raise KeyboardInterrupt({NEEDLE!r})", unresolvable))
+    _assert_the_load_stops(tmp_path, caplog)
+
+
+def test_an_optional_helper_failing_in_a_folder_that_cannot_be_resolved_is_still_tolerated(
+    tmp_path: Path, unresolvable: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write(tmp_path, "_opt.py", _forged(f"import {IDENT}", unresolvable))
+    body = "def later():\n    try:\n        import _opt\n    except ImportError:\n        pass\n"
+    _write(tmp_path, "feed.py", body)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
+        assert _messages(tmp_path) == []
+    assert "is left to the ImportError guard" in caplog.text
