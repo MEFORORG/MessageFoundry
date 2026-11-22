@@ -14,7 +14,7 @@ OneDrive\Desktop\MEFOR\dashboard when OneDrive\Desktop\MEFOR exists, else %USERP
 
 The dashboard directory is checked first (render_html.py --print-out-dir), so a refused directory
 stops the run before anything is collected. The collector's own work directory is put inside this
-script's temporary directory, and leftover mf-dashboard-* directories older than two hours, from a
+script's temporary directory, and leftover mf-dashboard-build-* directories older than two hours, from a
 run that was killed, are swept first.
 
 Exit status: 0 when every metric was read; 3 when the page was written but a metric or part could
@@ -45,7 +45,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Resolve-Python([string[]]$Given) {
-    if ($Given.Count -gt 0) { return , $Given }
+    # `pwsh -File` passes -Python py,-3.14 as ONE string, because it does not split arrays.
+    $parts = @($Given | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($parts.Count -gt 0) { return , $parts }
     if (Get-Command py -ErrorAction SilentlyContinue) {
         & py -3.14 -c "pass" 2>$null
         if ($LASTEXITCODE -eq 0) { return , @('py', '-3.14') }
@@ -83,8 +85,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $base = [IO.Path]::GetTempPath()
-Remove-StaleTemp $base 'mf-dashboard-'
-$tmp = Join-Path $base ('mf-dashboard-' + [guid]::NewGuid().ToString('N'))
+Remove-StaleTemp $base 'mf-dashboard-build-'
+$tmp = Join-Path $base ('mf-dashboard-build-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $snapshot = Join-Path $tmp 'metrics.json'
 $code = 0

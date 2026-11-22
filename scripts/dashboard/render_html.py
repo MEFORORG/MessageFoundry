@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import html
 import io
+import math
 import os
 import sys
 from collections.abc import Mapping, Sequence
@@ -82,7 +83,15 @@ def fmt(value: Any, unit: str = "") -> str:
     if isinstance(value, bool):
         text = "yes" if value else "no"
     elif isinstance(value, float):
-        text = f"{value:,.1f}".rstrip("0").rstrip(".") if value != int(value) else f"{value:,.0f}"
+        if not math.isfinite(value):
+            return '<span class="nodata">no data</span>'
+        if value.is_integer():
+            text = f"{value:,.0f}"
+        elif abs(value) < 0.05:
+            # One decimal would show a nonzero value as 0; keep two significant digits instead.
+            text = f"{value:.2g}"
+        else:
+            text = f"{value:,.1f}".rstrip("0").rstrip(".")
     elif isinstance(value, int):
         text = f"{value:,}"
     else:

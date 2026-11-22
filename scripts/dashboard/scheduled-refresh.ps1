@@ -10,7 +10,8 @@ Work trees come and go, so this runner reads none of them. It:
 1. fetches main ONLY, once per repository per run (`fetch --no-tags origin
    +refs/heads/main:refs/remotes/origin/main`, in the engine checkout and then the vault), which
    moves only refs/remotes/origin/main and touches no work tree, and tells the collector not to
-   fetch again; a failed fetch is a warning, and the run goes on with the refs already there;
+   fetch again; a failed fetch is an error: the run goes on with the refs already there, and a
+   page that otherwise built clean exits 3, so stale numbers never pass as current;
 2. checks -Ref (a 40-hex commit, or origin/<branch>, which must already be fetched), resolves it
    to a commit and `git archive`s all of scripts/ at it into a fresh directory under TEMP, outside
    every work tree, so a new import in the build needs no change here; leftover directories from
@@ -58,7 +59,9 @@ function Invoke-Git([string[]]$GitArgs) {
 }
 
 function Resolve-Python([string[]]$Given) {
-    if ($Given.Count -gt 0) { return , $Given }
+    # `pwsh -File` passes -Python py,-3.14 as ONE string, because it does not split arrays.
+    $parts = @($Given | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($parts.Count -gt 0) { return , $parts }
     if (Get-Command py -ErrorAction SilentlyContinue) {
         & py -3.14 -c "pass" 2>$null
         if ($LASTEXITCODE -eq 0) { return , @('py', '-3.14') }
@@ -121,6 +124,7 @@ $sha = 'unresolved'
 $url = ''
 $outDir = ''
 $refused = $false
+$fetchFailed = $false
 $code = 1
 try {
     New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -129,10 +133,15 @@ try {
             Invoke-Git @('-C', $repo, 'fetch', '--quiet', '--no-tags', 'origin',
                 '+refs/heads/main:refs/remotes/origin/main') | Out-Null
         } catch {
-            [Console]::Error.WriteLine("WARNING: fetch failed in $repo, using the refs already there: $($_.Exception.Message)")
+            # The run goes on with the refs already there, but it ends red: stale numbers published
+            # under exit 0 would read as current.
+            $fetchFailed = $true
+            [Console]::Error.WriteLine("ERROR: fetch failed in $repo, using the refs already there: $($_.Exception.Message)")
         }
     }
-    $sha = (Invoke-Git @('-C', $EngineRepo, 'rev-parse', '--verify', "$Ref^{commit}") | Select-Object -First 1).Trim()
+    # Explicit, so a local branch or tag named origin/main cannot shadow the remote-tracking ref.
+    $full = if ($Ref -like 'origin/*') { "refs/remotes/$Ref" } else { $Ref }
+    $sha = "$(@(Invoke-Git @('-C', $EngineRepo, 'rev-parse', '--verify', "$full^{commit}")) | Select-Object -First 1)".Trim()
     if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw "-Ref resolved to '$sha', not a commit" }
     $tar = Join-Path $tmp 'src.tar'
     Invoke-Git (@('-C', $EngineRepo, 'archive', '--format=tar', '-o', $tar, $sha, '--') + $ArchivePaths) | Out-Null
@@ -154,6 +163,7 @@ try {
     $build = Join-Path $src 'scripts\dashboard\build.ps1'
     $output = @(& $build -Vault $Vault -Weeks $Weeks -EngineRepo $EngineRepo -ArchiveRef $sha -Python $py -NoFetch)
     $code = $LASTEXITCODE
+    if ($code -eq 0 -and $fetchFailed) { $code = 3 }
     $output | ForEach-Object { Write-Output $_ }
     # file:///C:/... for a drive, file://server/share/... for a UNC path.
     $url = @($output | Where-Object { "$_" -like 'file://*' } | Select-Object -Last 1) -join ''

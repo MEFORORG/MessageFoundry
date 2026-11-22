@@ -10,8 +10,9 @@ The task runs scheduled-refresh.ps1 through `pwsh -NoProfile -File` at each of -
 PINNED TO ONE COMMIT. -Ref (a 40-hex commit, or origin/<branch> as already fetched in -EngineRepo)
 is resolved to its full commit sha here, and only that sha reaches the task: the runner is
 extracted from that commit with `git archive`, never copied from the work tree this script sits
-in, and the task passes `-Ref <sha>`, so every run builds the reviewed scripts of that commit. To
-move the dashboard to newer code, run this again with the new -Ref.
+in, and the task passes `-Ref <sha>`, so every run builds the scripts of that one commit. Pinning
+proves which code runs, not that it was reviewed: pin a merged main commit for that. To move the
+dashboard to newer code, run this again with the new -Ref.
 
 The runner goes to -RunnerDir (default %USERPROFILE%\.mefor\dashboard), a path no work tree owns.
 Not under AppData: run from a packaged (MSIX) app such as Claude Desktop, a write to %LOCALAPPDATA%
@@ -81,9 +82,13 @@ function Resolve-PinnedSha([string]$Repo, [string]$Given) {
     if (-not ($Given -cmatch '^[0-9a-f]{40}$' -or ($Given -cmatch '^origin/[A-Za-z0-9._/-]+$' -and $Given -notlike '*..*'))) {
         throw "-Ref '$Given' is neither a 40-hex commit nor origin/<branch>"
     }
-    $sha = (& git -C $Repo rev-parse --verify "$Given^{commit}" | Select-Object -First 1)
+    # origin/<branch> names the remote-tracking ref explicitly: git's own lookup order would let a
+    # local branch or tag named origin/main shadow it.
+    $full = if ($Given -like 'origin/*') { "refs/remotes/$Given" } else { $Given }
+    # Captured whole before any Select-Object, which can stop the pipeline before $LASTEXITCODE is set.
+    $out = @(& git -C $Repo rev-parse --verify "$full^{commit}")
     if ($LASTEXITCODE -ne 0) { throw "-Ref '$Given' does not resolve in $Repo" }
-    $sha = "$sha".Trim()
+    $sha = "$($out | Select-Object -First 1)".Trim()
     if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw "-Ref '$Given' resolved to '$sha', not a commit" }
     return $sha
 }

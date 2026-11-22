@@ -144,7 +144,7 @@ def facts(weeks: int) -> list[Fact]:
     return [
         ("backlog_burn", "open_total", "Open rows", _key("open_total")),
         ("backlog_burn", "open_active", "Active", _key("open_active")),
-        ("backlog_burn", "open_unclassified", "No verdict", _key("open_unclassified")),
+        ("backlog_burn", "open_unclassified", "Other or no verdict", _key("open_unclassified")),
         ("backlog_burn", "open_deferred", "Deferred", _key("open_deferred")),
         ("backlog_burn", "filed_window", f"Filed, {weeks} weeks", _key("filed_window")),
         ("backlog_burn", "closed_window", f"Closed, {weeks} weeks", _key("closed_window")),

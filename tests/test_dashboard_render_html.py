@@ -212,3 +212,22 @@ def test_print_out_dir_refuses_a_work_tree(
     assert rh.main(["--print-out-dir", "--out-dir", str(tmp_path / "x")]) == 0
     assert capsys.readouterr().out.strip() == str((tmp_path / "x").resolve())
     assert not (tmp_path / "x").exists()  # nothing written
+
+
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [
+        (float("inf"), "no data"),
+        (float("nan"), "no data"),
+        (0.04, "0.04"),
+        (-0.04, "-0.04"),
+        (2.0, "2"),
+    ],
+)
+def test_fmt_never_raises_or_shows_a_nonzero_as_zero(value: float, shown: str) -> None:
+    assert shown in rh.fmt(value)
+
+
+def test_an_overflowing_number_renders() -> None:
+    snap = {"weeks": WEEKS, "metrics": [_metric("ci_main", value=float("inf"))]}
+    assert "no data" in rh.render(snap)

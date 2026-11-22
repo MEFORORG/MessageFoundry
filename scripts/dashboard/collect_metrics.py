@@ -25,15 +25,17 @@ THE VAULT'S CODE RUNS IN A CHILD PROCESS. The ledger census is the vault's own
 ``_vault_census.py`` under ``python -I`` with an allowlisted environment that holds no token and no
 ``GIT_*`` variable, never imported into this process. The vault commit it ran at is recorded.
 
-STDOUT CARRIES NO VALUE. The console summary is each metric's id, status and whether it holds an
-error; the values, the counts and the error text are only in the snapshot.
+STDOUT CARRIES NO RAW VALUE. The console summary is each metric's id, status and whether it holds
+an error; the values, the counts and the error text are only in the snapshot. A status is a banded
+function of its value (the ASVS band among them), so stdout is still not for a public place.
 
 A METRIC THAT COULD NOT BE READ IS ``null``, NEVER ``0``. Each collector runs isolated: one that
 raises leaves its metric at ``value: null``, ``status: "unknown"`` and its ``error`` text, and the
 others still run. A zero would read exactly like a quiet week.
 
 WHAT IT WRITES outside ``--out``, at least: unless ``--no-fetch``, two
-``git fetch --no-tags origin main``, one in the vault and one in the engine checkout. Each moves ``refs/remotes/origin/main`` and also writes
+``git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main``, one in the vault and one
+in the engine checkout. Each moves only ``refs/remotes/origin/main``, and also writes
 ``FETCH_HEAD`` and fetched objects, and may start git's own auto-maintenance. No local tag or branch
 is created; the release tag is resolved with ``git ls-remote``. Importing the stalled-PR checker can
 write ``__pycache__`` in the tree this script sits in. Vault files and downloads go to a fresh
@@ -91,7 +93,8 @@ KORUS_REPO = "MEFORORG/korus"
 MERGED_REPOS = (ENGINE_REPO, VAULT_REPO, KORUS_REPO)
 
 PYPI_URL = "https://pypi.org/pypi/messagefoundry/json"
-#: Generic on purpose: no user, host or project detail leaves this machine in the request.
+#: Generic on purpose: no user or host detail rides in the header. The URL itself names the
+#: package, which is public.
 USER_AGENT = "project-metrics-collector/1"
 HTTP_TIMEOUT = 20.0
 
@@ -101,6 +104,9 @@ CMD_TIMEOUT = 180.0
 #: ``gh`` list ceilings. A result count EQUAL to one is a truncation signal, not a population, so
 #: the collector refuses it rather than under-report.
 PR_LIST_LIMIT = 1000
+
+#: The one ref a fetch moves: main, into its remote-tracking ref, and nothing else.
+MAIN_REFSPEC = "+refs/heads/main:refs/remotes/origin/main"
 
 #: The vault paths archived from ``origin/main`` before the ledger files are known.
 #: ``ledger_weekly_report.py`` imports its sibling ``backlog_status_check.py`` by bare name, so all
@@ -397,6 +403,14 @@ def run_probe(argv: Sequence[str], cwd: Path | None = None) -> str:
     return run_bytes(argv, cwd, env=probe_env()).decode("utf-8", "replace")
 
 
+def run_real_probe(argv: Sequence[str], cwd: Path | None = None) -> str:
+    """The caller's own environment, for the ``--out`` guard, with only discovery across
+    filesystems turned on and the C locale: otherwise git stops at a mount point with a message
+    :data:`_NO_REPO` does not match, and every directory below one would read as "cannot tell"."""
+    env = {**os.environ, "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1", "LC_ALL": "C", "LANGUAGE": "C"}
+    return run_bytes(argv, cwd, env=env).decode("utf-8", "replace")
+
+
 #: The environment the vault's census code runs under: what a Windows or POSIX Python needs to
 #: start, and nothing else. No token (GH_TOKEN, GITHUB_TOKEN), no GIT_* and no profile variable.
 _CHILD_ENV_KEEP = (
@@ -416,9 +430,10 @@ def child_env() -> dict[str, str]:
     return {**env, "LC_ALL": "C", "PYTHONUTF8": "1"}
 
 
-def run_child(argv: Sequence[str]) -> str:
-    """Run the vault census driver: ``python -I`` under :func:`child_env`."""
-    return run_bytes([sys.executable, "-I", *argv], None, env=child_env()).decode("utf-8")
+def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:
+    """Run the vault census driver: ``python -I`` under :func:`child_env`, from ``cwd`` (the
+    archive root), so a relative write by the vault code never lands in the caller's work tree."""
+    return run_bytes([sys.executable, "-I", *argv], cwd, env=child_env()).decode("utf-8")
 
 
 def fetch_url(url: str) -> bytes:
@@ -437,8 +452,9 @@ def is_transient(error: CollectError) -> bool:
     A call that hit :data:`CMD_TIMEOUT` is not: a hung ``gh`` would hang again, and two more full
     timeouts would cost minutes for an answer already known.
     """
-    text = str(error)
-    return "TimeoutExpired" not in text and _TRANSIENT.search(text) is not None
+    # What the command SAID, never its argv; the message only for a command that could not run.
+    text = error.stderr or str(error)
+    return "TimeoutExpired" not in str(error) and _TRANSIENT.search(text) is not None
 
 
 def gh_json(ctx: Context, args: Sequence[str]) -> Any:
@@ -449,7 +465,8 @@ def gh_json(ctx: Context, args: Sequence[str]) -> Any:
         except CollectError as exc:
             if attempt == GH_ATTEMPTS or not is_transient(exc):
                 raise
-            time.sleep(ctx.gh_backoff)
+            # 2 s, then 8 s: a secondary rate limit needs more than a constant short wait.
+            time.sleep(ctx.gh_backoff * 4 ** (attempt - 1))
     try:
         return json.loads(text) if text.strip() else None
     except json.JSONDecodeError as exc:
@@ -516,7 +533,7 @@ class Context:
     run: Runner = run_cmd
     run_raw: BytesRunner = run_bytes
     #: Runs the vault census driver in a child process; see :func:`run_child`.
-    run_vault: Callable[[Sequence[str]], str] = run_child
+    run_vault: Callable[[Sequence[str], Path | None], str] = run_child
     fetch: Fetcher = fetch_url
     #: False when the caller already fetched both repositories' main this run.
     git_fetch: bool = True
@@ -544,7 +561,14 @@ class Context:
                 self._vault = _read_vault(self)
             except CollectError as exc:
                 self._vault = exc
-            except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                AttributeError,
+                tarfile.TarError,
+            ) as exc:
                 # Cached too: a retry would only fail again, slower.
                 self._vault = CollectError(f"vault read failed: {type(exc).__name__}: {exc}")
         if isinstance(self._vault, CollectError):
@@ -570,8 +594,8 @@ def _archive_into(ctx: Context, vault: str, sha: str, paths: Sequence[str], root
         tar.extractall(root, filter="data")
 
 
-def _driver(ctx: Context, *args: str) -> dict[str, Any]:
-    out = json.loads(ctx.run_vault([str(VAULT_DRIVER), *args]))
+def _driver(ctx: Context, mode: str, root: Path, *rest: str) -> dict[str, Any]:
+    out = json.loads(ctx.run_vault([str(VAULT_DRIVER), mode, str(root), *rest], root))
     if not isinstance(out, dict):
         raise CollectError(f"the vault census driver printed {type(out).__name__}")
     return out
@@ -580,8 +604,10 @@ def _driver(ctx: Context, *args: str) -> dict[str, Any]:
 def _read_vault(ctx: Context) -> VaultRead:
     vault = str(ctx.vault)
     if ctx.git_fetch:
-        ctx.run(["git", "-C", vault, "fetch", "-q", "--no-tags", "origin", "main"], None)
-    sha = ctx.run(["git", "-C", vault, "rev-parse", "--verify", "origin/main^{commit}"], None)
+        ctx.run(["git", "-C", vault, "fetch", "-q", "--no-tags", "origin", MAIN_REFSPEC], None)
+    sha = ctx.run(
+        ["git", "-C", vault, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], None
+    )
     sha = sha.strip()
     if not _SHA40.fullmatch(sha):
         raise CollectError(f"vault origin/main resolved to {sha!r}, not a commit sha")
@@ -591,7 +617,7 @@ def _read_vault(ctx: Context) -> VaultRead:
     # macOS /var) makes every label absolute, which its floors read as dropped files.
     root = Path(tempfile.mkdtemp(prefix="vault-", dir=ctx.workdir)).resolve()
     _archive_into(ctx, vault, sha, VAULT_PATHS, root)
-    globs = _driver(ctx, "globs", str(root)).get("ledger_file_globs")
+    globs = _driver(ctx, "globs", root).get("ledger_file_globs")
     if not isinstance(globs, list) or not all(isinstance(g, str) for g in globs):
         raise CollectError("the vault census driver printed no ledger globs")
     # -z: a path git would otherwise quote (a space, a non-ASCII byte) comes back as written.
@@ -607,7 +633,7 @@ def _read_vault(ctx: Context) -> VaultRead:
         raise CollectError(f"no ledger file matches the checker's globs at vault {sha}")
     _archive_into(ctx, vault, sha, ledger, root)
 
-    got = _driver(ctx, "census", str(root), ctx.through.isoformat())
+    got = _driver(ctx, "census", root, ctx.through.isoformat())
     census = Census(
         rows=int(got["rows"]),
         weeks={str(w): {str(k): int(v) for k, v in c.items()} for w, c in got["weeks"].items()},
@@ -1087,7 +1113,7 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
     tag = f"v{version}"
     root = str(ctx.engine_repo)
     if ctx.git_fetch:
-        ctx.run(["git", "-C", root, "fetch", "-q", "--no-tags", "origin", "main"], None)
+        ctx.run(["git", "-C", root, "fetch", "-q", "--no-tags", "origin", MAIN_REFSPEC], None)
     # ls-remote, not a tag fetch: it creates no local ref. An annotated tag also prints its peeled
     # commit as `<ref>^{}`, which is preferred.
     listed = ctx.run(["git", "-C", root, "ls-remote", "origin", f"refs/tags/{tag}*"], None)
@@ -1100,7 +1126,11 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
         raise CollectError(f"origin carries no tag {tag} for PyPI version {version}")
     if not _SHA40.fullmatch(sha):
         raise CollectError(f"tag {tag} resolved to {sha!r}, not a commit sha")
-    count = int(ctx.run(["git", "-C", root, "rev-list", "--count", f"{sha}..origin/main"], None))
+    count = int(
+        ctx.run(
+            ["git", "-C", root, "rev-list", "--count", f"{sha}..refs/remotes/origin/main"], None
+        )
+    )
     m.value = count
     m.status = status_max(count, "release_distance")
     m.detail = {
@@ -1238,7 +1268,7 @@ def snapshot(
 _NO_REPO = re.compile(r"fatal: not a git repository \(or any of the parent directories\): \.git")
 
 #: The probes :func:`refuse_dir_reason` runs: GIT_* dropped, then the caller's own environment.
-PROBES: tuple[Runner, ...] = (run_probe, run_cmd)
+PROBES: tuple[Runner, ...] = (run_probe, run_real_probe)
 
 
 def refuse_reason(out: Path, runs: Sequence[Runner] = PROBES) -> str | None:
@@ -1252,7 +1282,7 @@ def refuse_dir_reason(parent: Path, runs: Sequence[Runner] = PROBES) -> str | No
 
     Each runner in ``runs`` asks git from ``parent``; any one that finds a repository, or cannot
     answer, refuses. The default pair is :func:`run_probe`, so no ``GIT_*`` variable in the
-    caller's environment can hide a repository, and :func:`run_cmd`, so a ``GIT_DIR`` or
+    caller's environment can hide a repository, and :func:`run_real_probe`, so a ``GIT_DIR`` or
     ``GIT_WORK_TREE`` the caller set is seen too. What this does not catch is in the module
     docstring. The caller passes the directory it will write into, already resolved.
     """

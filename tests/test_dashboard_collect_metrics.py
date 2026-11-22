@@ -275,7 +275,7 @@ def test_release_distance_with_fakes(tmp_path: Path) -> None:
     assert m.detail["tag"] == "v1.2.3"
     assert m.detail["tag_commit"] == B40
     assert m.detail["uploaded"] == "2026-10-01T00:00:00Z"
-    assert seen[-1][-1] == f"{B40}..origin/main"
+    assert seen[-1][-1] == f"{B40}..refs/remotes/origin/main"
     # No local tag is created: nothing fetches into refs/tags.
     assert not any("refs/tags/" in a and ":" in a for argv in seen for a in argv)
 
@@ -812,7 +812,9 @@ def test_the_vault_child_gets_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_a_census_that_never_clipped_is_refused(tmp_path: Path) -> None:
-    def driver(argv: Sequence[str]) -> str:
+    def driver(argv: Sequence[str], cwd: Path | None = None) -> str:
+        # The vault code runs from the archive root, never the caller's work tree.
+        assert cwd is not None and str(cwd) == argv[2]
         if argv[1] == "globs":
             return json.dumps({"ledger_file_globs": ["docs/BACKLOG*.md"]})
         return json.dumps(
@@ -901,13 +903,20 @@ def _main_metrics(*, partial: bool) -> list[Any]:
     return [asvs, other]
 
 
-def test_main_writes_the_snapshot_and_prints_the_ref_pair(
+def _WD(tmp_path: Path) -> list[str]:
+    # The work dir under tmp_path, so no test probes or sweeps the real temp directory.
+    return ["--work-dir", str(tmp_path)]
+
+
+def test_main_writes_the_snapshot_and_prints_no_value(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
     monkeypatch.setattr(cm, "collect", lambda ctx: _main_metrics(partial=False))
     out = tmp_path / "snap.json"
-    rc = cm.main(["--vault", str(tmp_path), "--out", str(out), "--through", "2026-11-18"])
+    rc = cm.main(
+        ["--vault", str(tmp_path), *_WD(tmp_path), "--out", str(out), "--through", "2026-11-18"]
+    )
     assert rc == 0
     snap = json.loads(out.read_text(encoding="utf-8"))
     assert [m["id"] for m in snap["metrics"]] == ["asvs", "prs_merged"]
@@ -927,7 +936,9 @@ def test_main_never_prints_values_or_errors(
 
     monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
     monkeypatch.setattr(cm, "collect", metrics)
-    assert cm.main(["--vault", str(tmp_path), "--out", str(tmp_path / "s.json")]) == 3
+    assert (
+        cm.main(["--vault", str(tmp_path), *_WD(tmp_path), "--out", str(tmp_path / "s.json")]) == 3
+    )
     printed = capsys.readouterr().out
     assert "50.0" not in printed and "stderr" not in printed and "TimeoutExpired" not in printed
     assert "prs_merged: status=good read=partial" in printed
@@ -948,11 +959,17 @@ def test_main_puts_its_work_dir_under_work_dir_and_refuses_a_repo(
     base = tmp_path / "work"
     base.mkdir()
     out = str(tmp_path / "s.json")
-    assert cm.main(["--vault", str(tmp_path), "--out", out, "--work-dir", str(base)]) == 0
+    assert (
+        cm.main(["--vault", str(tmp_path), *_WD(tmp_path), "--out", out, "--work-dir", str(base)])
+        == 0
+    )
     assert seen[0].parent == base.resolve() and seen[0].name.startswith("mf-metrics-")
     assert list(base.iterdir()) == []  # removed at exit
     inside = Path(__file__).resolve().parent
-    assert cm.main(["--vault", str(tmp_path), "--out", out, "--work-dir", str(inside)]) == 1
+    assert (
+        cm.main(["--vault", str(tmp_path), *_WD(tmp_path), "--out", out, "--work-dir", str(inside)])
+        == 1
+    )
     assert len(seen) == 1  # nothing collected for a refused work dir
 
 
@@ -962,7 +979,9 @@ def test_main_fails_when_its_work_dir_will_not_go(
     monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
     monkeypatch.setattr(cm, "collect", lambda ctx: _main_metrics(partial=False))
     monkeypatch.setattr(cm, "remove_tree", lambda path: False)
-    assert cm.main(["--vault", str(tmp_path), "--out", str(tmp_path / "s.json")]) == 3
+    assert (
+        cm.main(["--vault", str(tmp_path), *_WD(tmp_path), "--out", str(tmp_path / "s.json")]) == 3
+    )
 
 
 def test_release_and_run_ids_are_validated(tmp_path: Path) -> None:
@@ -981,7 +1000,7 @@ def test_main_exits_3_on_a_partial_failure(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
     monkeypatch.setattr(cm, "collect", lambda ctx: _main_metrics(partial=True))
     out = tmp_path / "snap.json"
-    assert cm.main(["--vault", str(tmp_path), "--out", str(out)]) == 3
+    assert cm.main(["--vault", str(tmp_path), *_WD(tmp_path), "--out", str(out)]) == 3
     assert out.exists()  # written before the exit status goes red
 
 
@@ -989,11 +1008,18 @@ def test_main_refuses_and_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_pa
     monkeypatch.setattr(cm, "refuse_reason", lambda out: "inside a git repository")
     monkeypatch.setattr(cm, "collect", lambda ctx: pytest.fail("collect ran on a refused --out"))
     out = tmp_path / "snap.json"
-    assert cm.main(["--vault", str(tmp_path), "--out", str(out)]) == 1
+    assert cm.main(["--vault", str(tmp_path), *_WD(tmp_path), "--out", str(out)]) == 1
     assert not out.exists()
-    assert cm.main(["--vault", str(tmp_path), "--out", str(out), "--weeks", "1"]) == 1
+    assert (
+        cm.main(["--vault", str(tmp_path), *_WD(tmp_path), "--out", str(out), "--weeks", "1"]) == 1
+    )
     monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
-    assert cm.main(["--vault", str(tmp_path), "--out", str(out), "--through", "2999-01-01"]) == 1
+    assert (
+        cm.main(
+            ["--vault", str(tmp_path), *_WD(tmp_path), "--out", str(out), "--through", "2999-01-01"]
+        )
+        == 1
+    )
 
 
 def test_ci_red_failure_degrades_only_that_count(tmp_path: Path) -> None:
@@ -1113,3 +1139,30 @@ def test_asvs_ignores_an_archive_ref_that_is_no_sha(tmp_path: Path) -> None:
     cm.c_asvs(ctx, m)
     assert m.detail["engine_ref"] == "NO-GIT"
     assert "no attributable ref" in m.detail["partial_error"]
+
+
+def test_transient_reads_stderr_not_argv() -> None:
+    # An argv token that looks transient never makes a 404 retry; the stderr decides.
+    err = cm.CollectError("gh api repos/x/timeout exited 1: HTTP 404", stderr="HTTP 404: Not Found")
+    assert not cm.is_transient(err)
+    assert cm.is_transient(cm.CollectError("gh api x exited 1", stderr="HTTP 502 Bad Gateway"))
+
+
+def test_the_real_env_probe_sees_across_mounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert (cm.run_probe, cm.run_real_probe) == cm.PROBES
+    seen: list[dict[str, str] | None] = []
+
+    def fake(argv: object, cwd: object = None, *, env: dict[str, str] | None = None) -> bytes:
+        seen.append(env)
+        return b""
+
+    monkeypatch.setenv("GIT_DIR", "kept")
+    monkeypatch.setattr(cm, "run_bytes", fake)
+    cm.run_real_probe(["git", "status"])
+    env = seen[0]
+    assert env is not None and env["GIT_DISCOVERY_ACROSS_FILESYSTEM"] == "1"
+    assert env["GIT_DIR"] == "kept"  # the caller's own environment, otherwise untouched
+
+
+def test_fetches_name_main_only() -> None:
+    assert cm.MAIN_REFSPEC == "+refs/heads/main:refs/remotes/origin/main"

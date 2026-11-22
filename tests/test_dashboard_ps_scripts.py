@@ -157,3 +157,17 @@ def test_runner_validates_ref_and_fetches_main_only() -> None:
     assert "-NoFetch" in text
     assert "is neither a 40-hex commit nor origin/<branch>" in text
     assert "-like 'file://*'" in text
+
+
+def test_refs_are_explicit_and_python_splits_on_commas() -> None:
+    for name in ("install-schedule.ps1", "scheduled-refresh.ps1"):
+        assert '"refs/remotes/$' in (_DIR / name).read_text(encoding="utf-8"), name
+    for name in ("build.ps1", "scheduled-refresh.ps1"):
+        assert "\"$_\" -split ','" in (_DIR / name).read_text(encoding="utf-8"), name
+    build = (_DIR / "build.ps1").read_text(encoding="utf-8")
+    assert "'mf-dashboard-build-'" in build and "'mf-dashboard-'" not in build
+
+
+def test_a_failed_fetch_turns_a_clean_run_red() -> None:
+    text = (_DIR / "scheduled-refresh.ps1").read_text(encoding="utf-8")
+    assert "if ($code -eq 0 -and $fetchFailed) { $code = 3 }" in text
