@@ -72,7 +72,8 @@ def _refuse_hostless_or_off_allowlist(url: str, allowed_hosts: Sequence[str]) ->
 def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> str:
     """Refuse a webhook URL on the checks that read no secret, no posture and log nothing, and
     return the value it judged: ``url`` with :data:`_STRIPPED_BY_BOTH` stripped from each end. A
-    caller that dials the URL dials that value, so no later reader sees other whitespace.
+    caller that dials the URL dials that value, so the end whitespace stripped here reaches no
+    later reader. Whitespace inside the URL, such as a space in the path, is not refused here.
 
     No refusal here prints the URL (BACKLOG #1793): a Slack or Teams hook carries its secret in the
     PATH, and a userinfo URL carries a password. The userinfo screen runs before any check that

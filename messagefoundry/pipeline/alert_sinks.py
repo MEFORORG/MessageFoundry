@@ -843,8 +843,7 @@ class WebhookTransport:
             method="POST",
         )
         # Bounded so the drain cannot be turned into a memory exhaustion by a webhook host that
-        # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily for the
-        # same reason as the length gate above.
+        # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily.
         from messagefoundry.transports.bounded_read import drain_2xx_reply
 
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).

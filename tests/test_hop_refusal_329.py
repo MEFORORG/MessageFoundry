@@ -257,9 +257,9 @@ def test_a_listed_webhook_host_loads() -> None:
 
 
 def test_the_build_dials_the_value_it_judged() -> None:
-    # The screen strips surrounding ASCII whitespace; the revocation guard and the dial read the
-    # stripped value too, so a loopback host behind a trailing space is still loopback, which an
-    # enforcing posture lets cross without an attestation.
+    # The screen strips surrounding ASCII whitespace, and the transport keeps the stripped value.
+    # The whitespace here sits outside the host, so this does not show which value the
+    # revocation guard read; it pins the stored URL.
     transport = WebhookTransport(
         " https://localhost/x \n", allowed_hosts=("localhost",), posture=PROD_PHI
     )
