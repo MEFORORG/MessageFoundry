@@ -77,6 +77,7 @@ from messagefoundry.parsing.binary import (
     BinaryCarriageError,
     colliding_marker_verdict,
     is_marked,
+    later_header_forms_over_limit,
     marker_under_base64_delimiters,
 )
 from messagefoundry.parsing.binary import decode as decode_carriage
@@ -95,9 +96,9 @@ from messagefoundry.transports.framing import declared_encoding
 
 __all__ = [
     "COLLIDING_DOC_REF_MARKER_REFUSED_REASON",
-    "COLLIDING_HEADER_FORMS_REFUSED_REASON",
     "DOC_REF_MARKER_REFUSED_REASON",
     "FRAME_BYTE_REJECTED_REASON",
+    "HEADER_FORMS_REFUSED_REASON",
     "INGRESS_MAX_BYTES",
     "MULTIPLE_MESSAGES_REJECTED_REASON",
     "NUL_REJECTED_REASON",
@@ -157,14 +158,14 @@ COLLIDING_DOC_REF_MARKER_REFUSED_REASON = (
     "it does not name with one it already uses"
 )
 
-#: The stored reason for an HL7 body under such a header whose later headers escape the handle
-#: marker in more distinct ways than the check looks for, and whose first line's forms are not
-#: found, so it is refused without a scan per form (BACKLOG #5972). It names no byte of the
-#: body.
-COLLIDING_HEADER_FORMS_REFUSED_REASON = (
-    "document handle check refused the body: its header fills a delimiter it does not name with "
-    "one it already uses, and its later headers escape the handle marker in too many ways to look "
-    "for each"
+#: The stored reason for an HL7 body whose later headers escape the handle marker in more
+#: distinct ways than the checks look for in a body of its size, under any first header, so it
+#: is refused without a scan per form (BACKLOG #5972): under a header whose filled default
+#: collides, where the first line's forms are not found, and under any other header whatever it
+#: holds, since the delivery re-attach would look for each. It names no byte of the body.
+HEADER_FORMS_REFUSED_REASON = (
+    "document handle check refused the body: its later headers escape the handle marker in too "
+    "many ways to look for each"
 )
 
 
@@ -175,17 +176,23 @@ def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
     (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`, BACKLOG #5099), and
     one that holds it under a header whose filled default collides, where a handle in ``OBX-5.5``
     may not read as one
-    (:func:`~messagefoundry.parsing.binary.marker_under_colliding_delimiters`, BACKLOG #5972).
-    Pure, so both listeners, the loopback re-ingress and the dry-run run the one check."""
+    (:func:`~messagefoundry.parsing.binary.marker_under_colliding_delimiters`, BACKLOG #5972),
+    and, under any header, one whose later headers give more distinct forms of the marker than
+    are looked for in a body of its size
+    (:func:`~messagefoundry.parsing.binary.later_header_forms_over_limit`, BACKLOG #5972), so the
+    delivery re-attach never scans a received body once per form past that limit. Pure, so both
+    listeners, the loopback re-ingress and the dry-run run the one check."""
     message = Message(peek.message)
     if marker_under_base64_delimiters(message, text):
         return DOC_REF_MARKER_REFUSED_REASON
     # One call names the reason, so the header fields are read once.
     verdict = colliding_marker_verdict(message, text)
-    if verdict == "over-limit":
-        return COLLIDING_HEADER_FORMS_REFUSED_REASON
     if verdict == "held":
         return COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    # A colliding header's own over-limit verdict, or any header's: the form count alone, read
+    # from the parsed header fields with no scan of the text.
+    if verdict == "over-limit" or later_header_forms_over_limit(message, text):
+        return HEADER_FORMS_REFUSED_REASON
     return None
 
 

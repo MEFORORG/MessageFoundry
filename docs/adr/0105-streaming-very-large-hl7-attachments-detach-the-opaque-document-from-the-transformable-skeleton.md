@@ -358,9 +358,15 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   (`binary._later_header_forms_limit`). A body whose later headers give more, and whose first
   line's forms are not found, is refused without those scans, so the check stays linear in the
   body: at least by both listeners, the dry-run and the loopback re-ingress under such a
-  header (`COLLIDING_HEADER_FORMS_REFUSED_REASON`), and by the streaming detach, under such a
+  header (`HEADER_FORMS_REFUSED_REASON`), and by the streaming detach, under such a
   header before it reads any `OBX` and under any other where it would detach a document
-  (`HeaderFormsLimitError`, an `InboundDocRefError`). A
+  (`HeaderFormsLimitError`, an `InboundDocRefError`). Both listeners, the dry-run and the
+  loopback re-ingress refuse a body past that limit under any other header too, whatever it
+  holds (`binary.later_header_forms_over_limit`, the same reason), because the delivery
+  re-attach looks for each later header's form with a scan of the payload on every attempt. The
+  re-attach bounds its own scans by the same limit, and refuses a payload past it
+  (`UnreattachableDocumentError`), which only a payload that did not pass that check can be,
+  such as a child a Handler built or an edit-and-resend's outbound body. A
   body with no `MSH` never reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a

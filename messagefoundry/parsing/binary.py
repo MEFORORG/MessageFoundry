@@ -120,6 +120,7 @@ __all__ = [
     "marker_under_base64_delimiters",
     "marker_under_colliding_delimiters",
     "colliding_marker_verdict",
+    "later_header_forms_over_limit",
     "MarkerVerdict",
     "HeaderFormsLimitError",
     "make_doc_ref",
@@ -432,6 +433,14 @@ _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 #: The same two characters end the parser's read of a header line.
 _SEGMENT_BREAKS = frozenset("\r\n")
 
+#: The re-attach's refusal of a payload whose later headers give more distinct forms of the
+#: handle marker than :func:`_later_header_forms_limit` allows for its size, so it does not look
+#: for each (BACKLOG #5972).
+_TOO_MANY_HEADER_FORMS_TO_REATTACH = (
+    "the later headers name delimiters that escape the document handle marker in more distinct "
+    "ways than are looked for in a payload of its size, so the re-attach cannot check it"
+)
+
 #: The re-attach's refusal of a payload whose later header names other delimiters than its
 #: first line, and holds the handle marker as those escape it (BACKLOG #5972).
 _MIXED_HEADER_HANDLE = (
@@ -440,11 +449,13 @@ _MIXED_HEADER_HANDLE = (
 )
 
 #: The fewest distinct forms of the handle marker, as the later headers of one body escape it,
-#: that the checks before the ACK look for in its text, however large the body (BACKLOG #5972):
-#: the listeners' shared check under a colliding header and the ingress detach. Each form costs
-#: a substring scan of the whole body, the listeners' on the event loop, so a body whose headers
-#: give more than :func:`_later_header_forms_limit` allows is judged without those scans and
-#: refused (fail closed), and the check stays linear in the body. A form differs from the first
+#: that the marker checks look for in its text, however large the body (BACKLOG #5972): the
+#: listeners' shared check, the ingress detach and the delivery re-attach. Each form costs a
+#: substring scan of the whole body, the listeners' on the event loop and the re-attach's on
+#: every delivery attempt, so a body whose headers give more than
+#: :func:`_later_header_forms_limit` allows is judged without those scans and refused (fail
+#: closed), and each check stays linear in the body. The listeners' shared check refuses such a
+#: body before the ACK whatever its first header (:func:`later_header_forms_over_limit`). A form differs from the first
 #: line's only where a later header names other delimiters that escape a character of the
 #: marker, so an ordinary batch gives none.
 _LATER_HEADER_FORMS_LIMIT = 4
@@ -559,6 +570,18 @@ def colliding_marker_verdict(message: Message, text: str) -> MarkerVerdict | Non
     if not message._delimiters_collide():
         return None
     return _body_marker_verdict(message, text)
+
+
+def later_header_forms_over_limit(message: Message, text: str) -> bool:
+    """Whether the later header lines of ``message``, ``text`` parsed, give more distinct forms
+    of the handle marker than :func:`_later_header_forms_limit` allows for a body of
+    ``len(text)`` characters (BACKLOG #5972). Both listeners, the dry-run and the loopback
+    re-ingress refuse such a body before the ACK, whatever its first header, through
+    ``ingress_guards.doc_ref_marker_refusal``: the delivery re-attach looks for each form with a
+    scan of the payload on every attempt, so a body past the limit would be ACKed and then cost
+    a scan per form, or be refused, at delivery. Reads the parsed header fields only, at most
+    one form past the limit, and scans no text."""
+    return _bounded_later_header_forms(message, _later_header_forms_limit(len(text))) is None
 
 
 def may_hold_doc_ref(text: str) -> bool:
@@ -1091,8 +1114,8 @@ def _later_header_forms(message: Message) -> Iterator[str]:
 
 
 def _later_header_forms_limit(text_len: int) -> int:
-    """How many later-header marker forms the checks before the ACK look for in a body of
-    ``text_len`` characters: as many as :data:`_MARKER_SCAN_BUDGET_CHARS` of scans pays for, and
+    """How many later-header marker forms the marker checks look for in a body of
+    ``text_len`` characters, before the ACK and at the delivery re-attach: as many as :data:`_MARKER_SCAN_BUDGET_CHARS` of scans pays for, and
     never fewer than :data:`_LATER_HEADER_FORMS_LIMIT` (BACKLOG #5972). A small body has every
     form a real header could give looked for, so only a large one is refused for its count."""
     return max(_LATER_HEADER_FORMS_LIMIT, _MARKER_SCAN_BUDGET_CHARS // max(text_len, 1))
@@ -1112,11 +1135,21 @@ def _later_header_markers(message: Message, text: str) -> set[str]:
     a Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
     read as one and would reach the wire unresolved. Each distinct form is scanned for once, so
     a batch of many headers naming the same delimiters costs one scan of the text, not one per
-    header. Every distinct form is looked for, with no limit, so this costs one scan of the text
-    per form wherever it runs, a thread included, which bounds no CPU. At least the delivery
-    re-attach calls it; the checks before the ACK use :func:`_body_marker_verdict`, which bounds
-    the forms."""
-    return {form for form in _later_header_forms(message) if form in text}
+    header.
+
+    The forms are bounded as the checks before the ACK bound them: at most
+    :func:`_later_header_forms_limit` allows for ``len(text)``, so this costs at most that many
+    substring scans of ``text``, and reads at most one form past it. Past the limit it raises
+    :class:`UnreattachableDocumentError` without those scans (fail closed). A received body past
+    the limit never gets here: both listeners, the dry-run and the loopback re-ingress refuse it
+    before the ACK (:func:`later_header_forms_over_limit`). A payload that did not come through
+    that check, such as a child a Handler built, an edit-and-resend's outbound body or an upload
+    resend, is judged here instead, and one past the limit dead-letters at delivery as its own
+    payload's refusal."""
+    forms = _bounded_later_header_forms(message, _later_header_forms_limit(len(text)))
+    if forms is None:
+        raise UnreattachableDocumentError(_TOO_MANY_HEADER_FORMS_TO_REATTACH)
+    return {form for form in forms if form in text}
 
 
 def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:

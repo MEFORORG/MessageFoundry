@@ -186,7 +186,7 @@ from messagefoundry.pipeline.dryrun import (
     UserCodeCalledSysExit as UserCodeCalledSysExit,  # re-exported, one definition (BACKLOG #5105)
 )
 from messagefoundry.pipeline.ingress_guards import (
-    COLLIDING_HEADER_FORMS_REFUSED_REASON,
+    HEADER_FORMS_REFUSED_REASON,
     STRICT_VALIDATE_TIMEOUT_SECONDS,
     IngressBodyRejected,
     IngressCodecUnusable,
@@ -10677,7 +10677,7 @@ class RegistryRunner:
                     # Judged without a scan per form, so no marker is named (BACKLOG #5972).
                     text=(
                         "too many header delimiter sets to check"
-                        if marker_refused == COLLIDING_HEADER_FORMS_REFUSED_REASON
+                        if marker_refused == HEADER_FORMS_REFUSED_REASON
                         else "handle marker refused by its delimiters"
                     ),
                     ack_mode=ack_mode,
