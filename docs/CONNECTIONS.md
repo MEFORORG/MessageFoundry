@@ -2401,8 +2401,10 @@ Two limits follow from this:
   file and a share Windows could not reach, saying the file must be a plain local path, not a
   share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
   file's own name can pass the walk, since Windows answers it from the folder's listing; the
-  read then refuses it as a file that could not be read. A missing name, other than such a share,
-  ends the walk and is left to libpq.
+  read then refuses it as a file that could not be read. A missing name, which Windows reports as
+  code 2 or 3, ends the walk and is left to libpq. Another code Windows raises as not found is not
+  read as a missing name: a share it could not reach is refused as above, and at least codes 161
+  and 206 stop the walk, and the build is refused.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder, which the engine asks the shell for as libpq does, through the ANSI

@@ -2071,6 +2071,7 @@ def database_ca_anchor_spec(
         driver_file_rule,
         driver_file_spellings,
         file_keyword_verdicts,
+        judging_file_keyword,
         odbc_param_text,
     )
 
@@ -2087,8 +2088,9 @@ def database_ca_anchor_spec(
         odbc_param_text(keyword, value, connection=name)
     ca: tuple[object, Mapping[str, bool | None]] | None = None
     for keyword, value in values.items():
-        verdicts = file_keyword_verdicts(value)
-        rule = driver_file_rule(keyword, value, verdicts)
+        with judging_file_keyword(f"{kind} '{name}' odbc_params {keyword}"):
+            verdicts = file_keyword_verdicts(value)
+            rule = driver_file_rule(keyword, value, verdicts)
         if rule is not None:
             raise ValueError(f"{kind} '{name}' odbc_params {keyword} {rule}")
         if keyword == "sslca":

@@ -60,6 +60,7 @@ import sys
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -991,9 +992,15 @@ def _windows_path_verdict(
         try:
             kind, target = probe(part)
         except (FileNotFoundError, NotADirectoryError) as exc:
-            if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+            winerror = getattr(exc, "winerror", None)
+            if winerror in _WINDOWS_UNREACHABLE:
                 raise _LeavesHost("the path is on a share Windows could not reach") from None
-            raise _PathEnds from None
+            if isinstance(exc, NotADirectoryError) or winerror in _MISSING_WINERRORS:
+                raise _PathEnds from None
+            # Another not-found code, at least 161 or 206, may come from a name that is there,
+            # so the walk stops on it with a cause, as on any read it could not make.
+            stopped_unread = True
+            raise
         except OSError as exc:
             # windows_chain ends the walk here with a cause the verdict below reads as None. Only
             # a failure the system reported counts as unread, not _win_probe's own refusal of a
@@ -1034,15 +1041,36 @@ def _windows_path_verdict(
     return False
 
 
+#: The setting whose path a walk is judging, as its refusal names it: the connection and the
+#: keyword (:func:`judging_file_keyword`), or ``None`` outside such a judgement.
+_JUDGED_SETTING: ContextVar[str | None] = ContextVar("database_judged_setting", default=None)
+
+
+@contextlib.contextmanager
+def judging_file_keyword(setting: str) -> Iterator[None]:
+    """Name ``setting`` on every line :func:`_not_cleared` logs inside the block, so the WARNING
+    says which connection and keyword it is about (vault BACKLOG #5197, engine PR 2738 finding 3).
+    ``setting`` names no path."""
+    token = _JUDGED_SETTING.set(setting)
+    try:
+        yield
+    finally:
+        _JUDGED_SETTING.reset(token)
+
+
 def _not_cleared(kind: str, detail: object) -> None:
     """Log why the walk did not clear a file keyword path, or what it found leads off the host:
     ``kind``, which names no path, at WARNING, so the operator who meets the refusal sees a reason,
     and ``detail``, which can name the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197
-    item 22)."""
+    item 22). Inside :func:`judging_file_keyword`, both lines name the setting it was given."""
+    setting = _JUDGED_SETTING.get()
+    about = f" for {setting}" if setting else ""
     logger.warning(
-        "DATABASE file keyword path not cleared: %s (the path, if any, is logged at DEBUG)", kind
+        "DATABASE file keyword path not cleared%s: %s (the path, if any, is logged at DEBUG)",
+        about,
+        kind,
     )
-    logger.debug("DATABASE file keyword path not cleared: %s", detail)
+    logger.debug("DATABASE file keyword path not cleared%s: %s", about, detail)
 
 
 #: A link target :func:`is_remote_spelling` matches that :func:`_windows_path_verdict` does not
@@ -1165,8 +1193,9 @@ def _refuse_remote_paths(
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
-        verdicts[name] = file_keyword_verdicts(value)
-        _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
+        with judging_file_keyword(f"{hop_name_prefix(connection)}odbc_params {name}"):
+            verdicts[name] = file_keyword_verdicts(value)
+            _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
     return verdicts
 
 
@@ -1255,7 +1284,7 @@ def _capath_folder_clear(folder: str) -> bool:
                 # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
                 _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
                 return False
-            if isinstance(exc, FileNotFoundError) and winerror not in _CAPATH_MISSING_WINERRORS:
+            if isinstance(exc, FileNotFoundError) and winerror not in _MISSING_WINERRORS:
                 # CPython raises other Windows codes as not found too, at least 161
                 # ERROR_BAD_PATHNAME and 206 ERROR_FILENAME_EXCED_RANGE, where a folder may be
                 # there. Nothing in it was judged, so it is refused as an unlistable folder is.
@@ -1406,10 +1435,16 @@ _WINDOWS_INVALID_NAME = 123
 #: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
 #: CPython raises as ``FileNotFoundError`` though a file may be there.
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
-#: The not-found answers at an ``sslcapath`` folder's open that mean no folder is there
-#: (:func:`_capath_folder_clear`): 2 ``ERROR_FILE_NOT_FOUND`` and 3 ``ERROR_PATH_NOT_FOUND``, and
-#: ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT is off Windows.
-_CAPATH_MISSING_WINERRORS = frozenset({None, 2, 3})
+#: The not-found answers that mean no file or folder is there: 2 ``ERROR_FILE_NOT_FOUND`` and 3
+#: ``ERROR_PATH_NOT_FOUND``, and ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT
+#: is off Windows. Read at an ``sslcapath`` folder's open (:func:`_capath_folder_clear`), by the
+#: walk's probe (:func:`_windows_path_verdict`) and at a driver file's read
+#: (:func:`_names_no_file`). CPython raises other Win32 codes as ``FileNotFoundError`` too, at
+#: least 15, 18, 161 and 206, and none of those is read as a missing name. Measured on Windows 11
+#: with CPython 3.14 (vault BACKLOG #5197): ``lstat`` and ``scandir`` gave only 2 or 3 for at least a
+#: missing file, a missing folder, a path through a file, a drive letter with no volume, a missing
+#: volume GUID and a missing ``\\?\GLOBALROOT`` device.
+_MISSING_WINERRORS = frozenset({None, 2, 3})
 #: The ``stat`` failures of libpq's root certificate that leave it to libpq, by ``errno`` off
 #: Windows: no file is there, or libpq, running as the same identity, cannot ``stat`` it either and
 #: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
@@ -1704,7 +1739,8 @@ def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
     """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load."""
     what = "root certificate file"
     unread: dict[str, str] = {}
-    verdicts = file_keyword_verdicts(path, unread)
+    with judging_file_keyword(setting):
+        verdicts = file_keyword_verdicts(path, unread)
     if names_another_host(path, verdicts):
         cause = unread.get(path.strip())
         if cause is not None and True not in verdicts.values():
@@ -1758,7 +1794,11 @@ def _driver_file_spellings(
     value = named.get(keyword)
     if not _sent_text(value):
         return
-    given = file_keyword_verdicts(value) if verdicts is None else verdicts[keyword]
+    if verdicts is None:
+        with judging_file_keyword(setting):
+            given = file_keyword_verdicts(value)
+    else:
+        given = verdicts[keyword]
     if names_another_host(value, given):
         raise error(
             f"{setting}: the {what} is not a plain local path on this host, so it was not read "
@@ -1883,16 +1923,18 @@ def _names_no_file(exc: OSError) -> bool:
     """Whether a failure to read one spelling of a driver file says no file is there, so the
     driver cannot load it either, rather than that a file is there the engine cannot check.
 
-    A missing name counts, unless Windows reports it for a share it could not reach (53 and 67,
-    as :mod:`messagefoundry.config.key_file_access` reads them): the driver may reach that file
-    at a later connect. So does Windows' ``ERROR_INVALID_NAME``, a padded path for one, and only
+    A missing name counts: :data:`_MISSING_WINERRORS`, or ENOENT off Windows. Another code
+    Windows raises as not found does not (vault BACKLOG #5197): 53 and 67, a share it could not
+    reach (as :mod:`messagefoundry.config.key_file_access` reads them), where the driver may reach
+    that file at a later connect, and at least 161 and 206, which may come from a file that is
+    there. Windows' ``ERROR_INVALID_NAME`` counts too, a padded path for one, and only
     by that Win32 code: CPython maps every Win32 error it has no errno for to EINVAL, so testing
     errno would leave a real read failure unchecked. On POSIX an EINVAL is refused too, even from
     a filesystem that rejects a padded spelling with it, because errno cannot tell that from a
     failed read; that refuses the build rather than check the trimmed spelling."""
     winerror = getattr(exc, "winerror", None)
     if isinstance(exc, FileNotFoundError):
-        return winerror not in _WINDOWS_UNREACHABLE
+        return winerror in _MISSING_WINERRORS
     return winerror == _WINDOWS_INVALID_NAME
 
 
