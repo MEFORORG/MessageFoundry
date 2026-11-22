@@ -1673,11 +1673,16 @@ class FirstAdministratorGrantedSessionsLive(FirstAdministratorRefused):
     """The run granted the Administrator role to ``username``, then gave up on the revoke that
     ends the account's earlier sessions (vault BACKLOG #3023 residual (4)). Not a decline: the
     grant stands, so the command still raises the ``administrator_granted`` alert before it exits
-    non-zero with this operator-facing message."""
+    non-zero with this operator-facing message. ``administrators_at_check`` is the other enabled
+    Administrators the run's check found, as on :class:`ProvisionedAdministrator`, so the command
+    can name them when the page was not delivered (vault BACKLOG #3023 items 11 and 30)."""
 
-    def __init__(self, message: str, *, username: str) -> None:
+    def __init__(
+        self, message: str, *, username: str, administrators_at_check: tuple[str, ...] = ()
+    ) -> None:
         super().__init__(message)
         self.username = username
+        self.administrators_at_check = administrators_at_check
 
 
 class LastAdministratorRefused(RuntimeError):
@@ -3678,8 +3683,12 @@ _PROVISION_REVOKE_RETRY: Final = _RevokeRetry(
 )
 
 
-#: How long ``provision-admin``'s revoke re-ran before it was given up on, for its texts.
-_PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes"
+#: How ``provision-admin``'s revoke was re-run before it was given up on, for its texts. It names
+#: the budget, not a duration: an attempt itself is unbounded, and a re-run may start up to one
+#: pause past the budget (vault BACKLOG #3023 items 16, 31 and 39).
+_PROVISION_REVOKE_GAVE_UP: Final = (
+    f"on every attempt, re-run on a {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g}-minute budget"
+)
 
 
 #: What ``provision-admin`` tells the operator to do when a revoke after a grant that may have
@@ -3688,8 +3697,8 @@ _PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PR
 _PROVISION_REVOKE_RECOVERY: Final = (
     "Running provision-admin again does not help: it refuses an account that holds the role. Once "
     "the store answers again, run 'messagefoundry admin-revoke-sessions' on this host, with the "
-    "--service-config or --db this command used: it ends every account's sessions, that one's "
-    "included"
+    "--service-config or --db this command used: it ends the sessions it finds, of any account. "
+    "docs/SECURITY.md, Limits of the session sweep, says what it may miss"
 )
 #: Said after :data:`_PROVISION_REVOKE_RECOVERY` where the give-up wrote its miss row.
 _PROVISION_REVOKE_MISS_ROW: Final = (
@@ -4480,6 +4489,9 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        # Whether this reconcile pass's renames already paged a Vault transit Outage, so the
+        # write's seal arm and the loop's read arm page one outage once (vault BACKLOG #3069).
+        self._rename_outage_paged = False
         #: Latched LDAP referral (BACKLOG #2538). Its own latch, like the hold's, because a pass with
         #: a referral beside other answers is not aborted and so clears `_reconcile_alert`. Set on a
         #: pass with a referral. Cleared by `_mark_reconcile_clears` on the referral clear's test.
@@ -5640,6 +5652,7 @@ class AuthService:
         raise FirstAdministratorGrantedSessionsLive(
             _provision_revoke_missed_text(username, enrolled=totp_secret is not None),
             username=username,
+            administrators_at_check=standing_admins,
         ) from missed
 
     async def _unexpected_grant_refusal(
@@ -6478,7 +6491,14 @@ class AuthService:
             )
         except _BindingChangedMidLogin:
             # BACKLOG #2733: the account was deleted after the load above, so no session was
-            # minted. The answer, and its deferred row, are an unknown account's.
+            # minted. The answer, and its deferred row, are an unknown account's. The log line
+            # says what happened, which that row does not (vault BACKLOG #2733 item 7).
+            _log.info(
+                "a local sign-in for account id %s was refused because the account was deleted "
+                "before its session was minted; it is answered and audited as an unknown account "
+                "(vault BACKLOG #2733)",
+                user.id,
+            )
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         await self._record_login_address(
@@ -8764,14 +8784,15 @@ class AuthService:
                 # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
                 # YET, which is the race this closes: an admin unbinding this account mid-login
                 # revokes what is live at that instant, and without the guard this login's own
-                # INSERT lands just after it. The password leg passes no guard, so it skips the
-                # binding comparison; its account read still runs, for the session epoch.
+                # INSERT lands just after it. The local password sign-in (`_login_local`), which
+                # does not reach this mint, passes no guard, so it skips the binding comparison;
+                # its account read still runs, for the session epoch.
                 #
-                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so the
-                # sentence above holds for the password leg only. The refusal further up read
-                # the row before this mint, and a bind can commit between the two: its sweep
-                # runs in the bind's own transaction and cannot see a session inserted after
-                # it. So the insert itself requires an unbound row, under the lock the bind
+                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so both
+                # legs that reach this mint pass one (vault BACKLOG #2733 item 9). The refusal
+                # further up read the row before this mint, and a bind can commit between the two:
+                # its sweep runs in the bind's own transaction and cannot see a session inserted
+                # after it. So the insert itself requires an unbound row, under the lock the bind
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
@@ -10187,7 +10208,8 @@ class AuthService:
                 applied.append(revocation)
             if outcome == "reported":
                 reported.append(revocation)
-        for refresh in plan.renames:
+        self._rename_outage_paged = False
+        for i, refresh in enumerate(plan.renames):
             # BACKLOG #1532. Applied only on a pass that was NOT aborted, with every other write the
             # plan carries: the reconciler's invariant is that an aborted pass leaves the store
             # byte-identical, and a rename is a store write like any other.
@@ -10197,15 +10219,42 @@ class AuthService:
             # row, so renaming first would put two different names on one account's records for one
             # pass -- reachable whenever an account is renamed and role-demoted in the same pass.
             # Both reads see the pre-rename name this way, and the rename still lands on this pass.
-            await self._refresh_cached_username(
-                user_id=refresh.user_id,
-                old_username=refresh.old_username,
-                new_username=refresh.new_username,
-                held=await self._load_user_by_username(refresh.new_username),
-                from_plan=True,
-                # BACKLOG #3018: a refused audit write here must not skip the renames after it.
-                audit_soft=True,
-            )
+            #
+            # Vault BACKLOG #3069 item 1: one catch around the held read here and the refresh. An
+            # Unverifiable answer at a checked read in either is about one record, so it skips
+            # this rename and the pass goes on (see _rename_read_seal_answer). An Outage is the
+            # key service being down, which every later rename would meet again, so it is paged
+            # once and the rename loop stops; the recorders below still run and the plan is
+            # returned, so the revocations already applied keep their alerts (Manager decisions,
+            # 2026-11-22). Before this catch the Outage raised out of the pass, unpaged, and those
+            # alerts were lost.
+            try:
+                await self._refresh_cached_username(
+                    user_id=refresh.user_id,
+                    old_username=refresh.old_username,
+                    new_username=refresh.new_username,
+                    held=await self._load_user_by_username(refresh.new_username),
+                    from_plan=True,
+                    # BACKLOG #3018: a refused audit write here must not skip the renames after it.
+                    audit_soft=True,
+                )
+            except TransitSealUnverifiableError as exc:
+                self._rename_read_seal_answer(
+                    exc, user_id=refresh.user_id, new_username=refresh.new_username
+                )
+            except TransitSealUnavailableError as exc:
+                _log.error(
+                    "directory reconcile: account %s (renaming to %s): Vault transit did not "
+                    "answer for a record one of the rename's reads checked, so this rename and "
+                    "the %d after it were not applied on this pass; the rest of the pass goes on "
+                    "(vault BACKLOG #3069)",
+                    refresh.user_id,
+                    scrub_log_argument(refresh.new_username),
+                    len(plan.renames) - i - 1,
+                    exc_info=exc,
+                )
+                self._page_rename_outage()
+                break
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
         await self._record_reconcile_referral(plan, first=referral)
@@ -10603,6 +10652,43 @@ class AuthService:
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"
 
+    def _page_rename_outage(self) -> None:
+        """Page a Vault transit Outage a reconcile pass's renames met, once per pass: the write's
+        seal arm and the loop's read arm share the flag, which the pass clears before its renames
+        (vault BACKLOG #3069)."""
+        if not self._rename_outage_paged:
+            self._rename_outage_paged = True
+            self._user_seal_outage("rename")
+
+    def _rename_read_seal_answer(
+        self,
+        exc: TransitSealUnverifiableError,
+        *,
+        user_id: str,
+        new_username: str,
+    ) -> None:
+        """Answer an Unverifiable answer that one of a reconciler rename's checked reads raised:
+        Vault transit could not verify the record it read (vault BACKLOG #3069 item 1). The loop
+        then skips that one rename and goes on, as the write's seal arm in
+        :meth:`_refresh_cached_username` does (note T2), though unlike that arm it pages and audits
+        nothing (below): a raise would end the pass and every rename after it. The checked reads it was written for run before the
+        rename's write lands, or after a write that wrote nothing, which is why the line says the
+        rename was not applied. A record that fails its seal is mostly not raised by these reads:
+        it comes back refused, for the refresh to handle as it already does. A row whose id cannot
+        be read is still raised (:func:`read_user_or_unreadable`) and is not caught here.
+
+        Logged at ERROR. It is not reported under an account here: the answer does not say which
+        record raised it, and the rename reads more than one, so this line names the account being
+        renamed and no other."""
+        _log.error(
+            "directory reconcile: account %s (renaming to %s): Vault transit could not verify the "
+            "integrity seal of a record one of the rename's reads checked, so the rename was not "
+            "applied; the pass goes on (vault BACKLOG #3069)",
+            user_id,
+            scrub_log_argument(new_username),
+            exc_info=exc,
+        )
+
     async def _refresh_cached_username(
         self,
         *,
@@ -10628,7 +10714,10 @@ class AuthService:
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
         has. It also lets a store fault on the ``held`` re-read skip the rename rather than raise
         (BACKLOG #3070; the reason is at that read), and a seal refusal at the write be logged and
-        reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm).
+        reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm). A
+        Vault transit answer at one of its checked reads still raises out of it; the reconcile loop
+        absorbs an Unverifiable one (:meth:`_rename_read_seal_answer`, item 1) and stops its
+        renames on an Outage.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -10971,7 +11060,7 @@ class AuthService:
             elif isinstance(exc, RowSealUnverifiableError):
                 await self._user_seal_unverifiable(user_id, exc)
             else:
-                self._user_seal_outage("rename")
+                self._page_rename_outage()
             return
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it

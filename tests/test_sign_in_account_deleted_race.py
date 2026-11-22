@@ -12,6 +12,7 @@ error left the service as an unhandled exception, which the API answers with a 5
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -103,5 +104,29 @@ async def test_control_an_undisturbed_sign_in_still_mints_a_session(
         assert outcome.ok and outcome.token is not None
         assert slots == []
         assert await store.list_audit(action="auth.login_failed") == []
+    finally:
+        await store.close()
+
+
+async def test_the_refusal_says_in_the_log_that_the_account_was_deleted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #2733 item 7. The failure row reads as an unknown account's, so the log line is
+    where an operator learns the account was deleted under the sign-in. RED when: the branch that
+    refuses it writes no log line."""
+    service, store = await _service()
+    try:
+        admin = await create_admin(service)
+        _delete_before_insert(monkeypatch, store)
+        _pad_slots(monkeypatch)
+
+        with caplog.at_level(logging.INFO, logger="messagefoundry.auth.service"):
+            outcome = await service.login(admin.username, admin.password)
+
+        assert not outcome.ok
+        assert any(
+            admin.user_id in r.getMessage() and "deleted before its session" in r.getMessage()
+            for r in caplog.records
+        )
     finally:
         await store.close()
