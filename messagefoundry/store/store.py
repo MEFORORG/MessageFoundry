@@ -13900,10 +13900,13 @@ class MessageStore:
         ``last_close`` marks the connection whose close runs SQLite's WAL checkpoint. An interrupt
         would abort that checkpoint and leave a ``-wal`` file holding committed rows, so this
         connection is stopped first and interrupted only if its worker outlives that wait, with one
-        more second to exit. That interrupt reaches a statement still ahead of the stop. It cannot
-        reach a checkpoint already running inside SQLite's close: the driver refuses it as a closed
-        database, which is logged, and the checkpoint runs on. The close then returns with that
-        non-daemon worker alive, so interpreter exit waits for the checkpoint.
+        more second to exit. That interrupt reaches a statement still ahead of the stop, and a
+        ``SELECT 1`` queued before the stop clears its flag so the checkpoint still runs. An
+        interrupt landing after that ``SELECT 1`` and before SQLite's close starts would still abort
+        the checkpoint, leaving the rows in the ``-wal`` file for the next open. It cannot reach a
+        checkpoint already running inside the close: the driver refuses it as a closed database,
+        which is logged, and the checkpoint runs on. The close then returns with that non-daemon
+        worker alive, so interpreter exit waits for the checkpoint.
 
         NOT BOUNDED: a single cancel landing inside a real ``await conn.close()`` on a busy
         connection, reader or writer. aiosqlite's own ``finally`` then parks on its stop with no
@@ -13925,6 +13928,12 @@ class MessageStore:
                 if raw is not None:
                     if last_close:
                         interrupt_late = raw.interrupt
+                        # SQLite clears the interrupt flag when a statement starts with none
+                        # active, so this one, ahead of the stop, keeps it out of the close. On
+                        # the worker, which discards a failure of a job that has no future.
+                        tx = getattr(conn, "_tx", None)
+                        if tx is not None:
+                            tx.put_nowait((None, lambda: raw.execute("SELECT 1").fetchall()))
                     else:
                         _force_failed_open_release(raw.interrupt, after=after)
                 _force_failed_open_release(

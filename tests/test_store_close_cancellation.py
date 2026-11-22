@@ -383,10 +383,15 @@ async def test_a_cancelled_close_of_an_idle_writer_still_checkpoints(tmp_path: P
 async def test_a_statement_running_on_the_writer_does_not_outlive_a_cancelled_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The writer is interrupted only once its stop has had the bound, and then it still is."""
+    """The writer is interrupted only once its stop has had the bound, and then it still is. The
+    interrupt's flag must not carry into the close, or the last-close checkpoint aborts."""
     monkeypatch.setattr("messagefoundry.store.close_steps.CANCELLED_CLOSE_GRACE_SECONDS", 0.1)
-    store = await MessageStore.open(tmp_path / "busywriter.db")
+    db = tmp_path / "busywriter.db"
+    store = await MessageStore.open(db)
+    await _committed_rows(store)
     workers = _workers(store)
+    raw = store._db._connection
+    assert raw is not None
     entered = _inject(store, "settle")
     endless = asyncio.ensure_future(
         store._db.execute(
@@ -397,10 +402,16 @@ async def test_a_statement_running_on_the_writer_does_not_outlive_a_cancelled_cl
     task = asyncio.ensure_future(store.close())
     await asyncio.wait_for(entered.wait(), 5)
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(asyncio.shield(task), 10)
-    await asyncio.gather(endless, return_exceptions=True)
-    assert [w.name for w in workers if w.is_alive()] == []
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), 10)
+        await asyncio.gather(endless, return_exceptions=True)
+        assert [w.name for w in workers if w.is_alive()] == []
+    finally:
+        if workers[-1].is_alive():  # a failure above must not leave the statement running
+            raw.interrupt()
+    assert not Path(f"{db}-wal").exists()
+    assert _rows_in_a_copy_of_only_the_db(db, tmp_path / "copy") == _SYNTH_ROWS
 
 
 # --- a cancel of the close, told from a cancelled future ------------------------------------------
