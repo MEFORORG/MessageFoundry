@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A Transit ``plaintext`` that is not strict base64 is refused as that value's own error (BACKLOG
-#5964). Non-strict decoding drops characters outside the alphabet, so ``!!!!`` would have opened as
-an empty cell and a stray character would have opened as a value Transit never returned. These
-tests pin the plain :class:`CipherError` such a reply has today; they do not decide whether it
-should instead read as an outage. Synthetic data only."""
+"""A Transit ``plaintext`` that is not base64 once ASCII whitespace is removed is refused as that
+value's own error (BACKLOG #5964). Non-strict decoding drops every character outside the alphabet,
+so ``!!!!`` would have opened as an empty cell and a stray character as a value Transit never
+returned. Whitespace alone still opens, because a hop that rewraps a reply leaves the same bytes.
+These tests pin the plain :class:`CipherError` a refused reply has today; they do not decide
+whether it should instead read as an outage. Synthetic data only."""
 
 from __future__ import annotations
 
@@ -18,25 +19,40 @@ pytest.importorskip("hvac", reason="Transit tests need the [vault] extra")
 
 from messagefoundry.store import crypto
 from messagefoundry.store.crypto import CipherError, cell_aad, gave_no_verdict
+from messagefoundry.store.crypto_transit import _plaintext
 from tests.test_transit_batch import _BatchTransit, _cipher, _sealed
 
-#: Replies that are not strict base64. A non-strict decode opens every one of them as a value.
+#: Replies refused here that a non-strict decode opens as a value. Form feed and vertical tab are
+#: ASCII whitespace outside the four characters removed.
 _NOT_STRICT = {
     "only-non-alphabet": "!!!!",
     "url-safe-alphabet": "-_-_",
     "stray-inside": "dmFs!dWU=",
-    "leading-space": " dmFsdWU=",
-    "trailing-newline": "dmFsdWU=\n",
-    "embedded-newline": "dmFs\ndWU=",
+    "form-feed": "dmFs\fdWU=",
+    "vertical-tab": "dmFs\vdWU=",
     "only-padding": "====",
     "excess-padding": "QQ===",
     "padding-after-full-group": "QUJD=",
     "data-after-padding": "QQ==QQ==",
 }
+#: Unicode spaces, which must not be removed as whitespace is.
+_NON_ASCII_SPACES = {
+    "no-break-space": f"dmFs{chr(0xA0)}dWU=",
+    "em-space": f"dmFs{chr(0x2003)}dWU=",
+    "next-line": f"dmFs{chr(0x85)}dWU=",
+}
 #: Valid base64 of bytes that are not UTF-8.
 _NOT_UTF8 = base64.b64encode(b"synthetic \xff").decode("ascii")
 _each_bad_reply = pytest.mark.parametrize(
-    "reply", [*_NOT_STRICT.values(), _NOT_UTF8], ids=[*_NOT_STRICT, "not-utf8"]
+    "reply",
+    [*_NOT_STRICT.values(), *_NON_ASCII_SPACES.values(), _NOT_UTF8],
+    ids=[*_NOT_STRICT, *_NON_ASCII_SPACES, "not-utf8"],
+)
+#: ``value`` with space, tab, CR or LF added: the same bytes.
+_each_wrapped_reply = pytest.mark.parametrize(
+    "reply",
+    [" dmFsdWU=", "dmFsdWU=\n", "dmFs\ndWU=", "\tdmFsdWU=\r\n", "dmFsdWU\n="],
+    ids=["leading-space", "trailing-newline", "embedded-newline", "tab-crlf", "inside-padding"],
 )
 
 
@@ -97,6 +113,21 @@ def test_a_bad_reply_mid_batch_leaves_every_other_result_alone(reply: str) -> No
     ]
     assert transit.decrypt_requests == 2  # both batches sent, none retried alone
     assert cipher._batch_alone is False
+
+
+@_each_wrapped_reply
+def test_a_whitespace_wrapped_reply_opens_to_the_same_value(reply: str) -> None:
+    transit = _PlantingTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    _plant(transit, items[1][0], reply)
+    assert cipher.decrypt(items[1][0], aad=items[1][1]) == "value"
+    assert cipher.decrypt_many(items) == ["value 0", "value", "value 2"]
+
+
+@pytest.mark.parametrize("value", [None, 7, 1.5, ["QQ=="], {"a": 1}], ids=repr)
+def test_a_value_that_is_not_text_is_none_and_never_raises(value: object) -> None:
+    assert _plaintext(value) is None
 
 
 @pytest.mark.parametrize("text", ["", "a", "ab", "abc", "~~~", "???", "café"])
