@@ -82,11 +82,11 @@ suite("configEditorModel — config-dir scope guard (F3)", () => {
 
   test("Windows paths + an absolute config dir, case-insensitively", () => {
     assert.strictEqual(
-      isUnderConfigDir("C:\\WS\\Config\\connections.toml", "C:\\ws", "C:\\ws\\config"),
+      isUnderConfigDir("C:\\WS\\Config\\connections.toml", "C:\\ws", "C:\\ws\\config", "win32"),
       true,
     );
     assert.strictEqual(
-      isUnderConfigDir("C:\\ws\\elsewhere\\connections.toml", "C:\\ws", "C:\\ws\\config"),
+      isUnderConfigDir("C:\\ws\\elsewhere\\connections.toml", "C:\\ws", "C:\\ws\\config", "win32"),
       false,
     );
   });

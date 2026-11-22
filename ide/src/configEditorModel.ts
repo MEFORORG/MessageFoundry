@@ -4,6 +4,7 @@
 // from its file path, deciding whether it opens read-only in the grid, and the small guard that stops
 // the webview↔document update loop. Separated from configEditors.ts so this mapping is unit-testable
 // node-side (no Extension Host). No vscode, no I/O.
+import * as path from "node:path";
 
 /**
  * The bare code-set name for a file path — its basename without the .csv/.toml extension. A code set
@@ -52,20 +53,28 @@ export function shouldPushDocumentChange(opts: {
  * shown — and saved — as the config-dir file. When this returns false the provider falls back to the
  * plain text editor instead of silently editing a different file.
  *
- * `configDir` may be workspace-relative (the default `samples/config`) or absolute; relative is
- * resolved against `workspaceDir`. Path comparison is separator- and case-insensitive so it holds for
- * Windows (`\\`, case-insensitive) and POSIX paths alike.
+ * `configDir` may be workspace-relative (the default `samples/config`, or `./samples/config`, `.`) or
+ * absolute, a root such as `/` included; relative is resolved against `workspaceDir`, and dot segments
+ * on both sides are resolved before comparing. Case is folded only on `win32` and `darwin`, whose
+ * default filesystems are case-insensitive; elsewhere a wrong-cased path names a different file, so
+ * it is outside the config dir (BACKLOG #5832). A case-sensitive volume on `darwin` is the accepted
+ * miss. `platform` defaults to the host's; it is a parameter so tests pin each rule on any runner.
  */
 export function isUnderConfigDir(
   documentFsPath: string,
   workspaceDir: string,
   configDir: string,
+  platform: NodeJS.Platform = process.platform,
 ): boolean {
-  const norm = (p: string): string => p.replace(/[\\/]+/g, "/").replace(/\/+$/, "");
-  const isAbsolute = (p: string): boolean => /^[/\\]/.test(p) || /^[a-zA-Z]:[/\\]/.test(p);
-  const base = norm(isAbsolute(configDir) ? configDir : `${workspaceDir}/${configDir}`).toLowerCase();
-  const file = norm(documentFsPath).toLowerCase();
-  return file === base || file.startsWith(`${base}/`);
+  const p = platform === "win32" ? path.win32 : path.posix;
+  const caseInsensitive = platform === "win32" || platform === "darwin";
+  const fold = (s: string): string => (caseInsensitive ? s.toLowerCase() : s);
+  const base = fold(p.resolve(workspaceDir, configDir));
+  const file = fold(p.resolve(documentFsPath));
+  // `relative` is "" for the dir itself, absolute across Windows drives, and starts with a `..`
+  // SEGMENT when outside -- not merely those characters, so a child dir named "..x" is still inside.
+  const rel = p.relative(base, file);
+  return !p.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${p.sep}`);
 }
 
 /** A connection summary the connections customEditor lists (name/direction/transport) — the fields it
