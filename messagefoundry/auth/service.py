@@ -5161,9 +5161,10 @@ class AuthService:
     ) -> ProvisionedAdministrator:
         """Create the first administrator from an operator-supplied name and credential (#1136).
 
-        ``on_first_write`` is called once, right before this method's first store write, after
-        every read and check that comes before the writes (BACKLOG #5067). A caller uses it to
-        tell a refusal raised before any write from one that may follow a written row.
+        ``on_first_write`` is called once, right before this method's first account write: the
+        row's create, or on a repair the clear of the earlier holder's factors (BACKLOG #5067). A
+        caller uses it to tell a refusal raised before any account write from one that may follow
+        one. A read before it can still write an audit row of its own, such as a seal failure's.
 
         **IT ENROLS TOTP FROM BIRTH (ADR 0197 Amendment A, N-A, AC-A5).** ``totp_secret`` is the
         secret the command generated and showed at the terminal, and ``totp_code`` the code the

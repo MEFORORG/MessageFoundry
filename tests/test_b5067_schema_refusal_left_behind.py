@@ -17,6 +17,7 @@ Not server-gated: the store open is replaced, so no driver or server runs.
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 import types
 from collections.abc import Callable
@@ -37,7 +38,9 @@ _ROLLED_BACK = "rolled its schema batch back and wrote no schema marker"
 _BOUND_NO_ROW = "No account or audit row was written"
 _BOUND_MAY_HAVE = "may already have changed the database"
 _UNUSED_ENTRY = "If you added the entry this run showed to the authenticator app, delete it"
-_OWN_WRITES = "own writes did not run, but the open may already have changed the database"
+_OWN_WRITES = (
+    "change this command makes did not land, but the open may already have changed the database"
+)
 _KEEP_ENTRY = "keep it for now: its seed may be stored"
 
 #: ``(backend, schema_management)`` -> whether the refusal names the database setting.
@@ -197,6 +200,8 @@ def test_provision_admin_keyless_refusal_at_the_write_names_the_entry(
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert "[store].synthetic_setting" in out, out
     assert _UNUSED_ENTRY in out, out
+    # It follows a full open, so it says what that open may have changed (BACKLOG #5067).
+    assert _OWN_WRITES in out and _RCSI in out, out
 
 
 @pytest.mark.parametrize("kind", ["keyless", "cipher"])
@@ -359,9 +364,11 @@ def test_the_invocation_bound_carrier_keeps_its_failure_through_str_and_pickle()
 def test_provision_admin_names_no_entry_once_the_write_has_started(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A refusal the write's arms catch, raised once the service's write has started, names no
-    entry: the seed may then be stored, and deleting the entry would leave the Administrator
-    without its factor. A real SQLite store, so the open succeeds and the write is reached.
+    """A refusal the write's arms catch, raised once the service's write has started, never says
+    to delete the entry: the seed may then be stored, and deleting the entry would leave the
+    Administrator without its factor. A real SQLite store, so the open succeeds and the write is
+    reached. ``test_a_refusal_once_the_write_started_says_to_keep_the_shown_entry`` reads the
+    advice it gives instead.
 
     Mutation: drop the ``write_started`` branch from ``after_the_key``; the hint is then
     printed."""
@@ -780,3 +787,89 @@ def test_admin_reset_totp_keyless_chain_refusal_says_what_the_open_may_have_chan
     assert "[store].synthetic" in out, out
     assert _OWN_WRITES in out and _RCSI in out, out
     assert "nothing was written" not in out.lower(), out
+
+
+def test_a_key_refusal_from_a_read_after_the_write_open_says_what_the_open_may_have_changed(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key-resolution refusal from the service's reads, before its first account write, comes
+    after the write's ``create=True`` open has returned, which may have created the store. So the
+    text names that, and still says the entry's seed was never stored.
+
+    Mutation: pass ``opened=False`` from the write's key-resolution arm; it then says nothing was
+    written."""
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    _service_raises(monkeypatch, KeyProviderError("synthetic key service refusal"), wrote=False)
+    out = _run(_provision_sqlite(shell), capsys)
+    assert "synthetic key service refusal" in out, out
+    assert _OWN_WRITES in out and "the schema, which the open creates or migrates" in out, out
+    assert "nothing was written" not in out.lower(), out
+    assert _UNUSED_ENTRY in out, out
+
+
+def test_an_integrity_refusal_once_the_write_started_says_to_keep_the_shown_entry(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Closing step 2 at the integrity arm, which any write can reach: the shown entry is named,
+    with the advice to keep it. Exit 1, this command's refusal.
+
+    Mutation: drop the ``keep_the_entry`` call from ``refused_write``."""
+    _service_raises(monkeypatch, sqlite3.IntegrityError("synthetic constraint"), wrote=True)
+    code = main(_provision_sqlite(shell))
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code == 1, out
+    assert "the store refused one of this command's writes (IntegrityError)" in out, out
+    assert _KEEP_ENTRY in out and _UNUSED_ENTRY not in out, out
+
+
+async def test_the_service_calls_on_first_write_before_a_repair_clears_the_factors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repair branch: ``on_first_write`` fires before the earlier holder's factors are
+    cleared, the branch's first account write.
+
+    Mutation: move the repair branch's ``on_first_write`` call below ``disable_totp``."""
+    from messagefoundry.auth.identity import AuthProvider
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.store.store import MessageStore
+    from tests._admin_account import PROVISION_EMAIL, provision_totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        # A roleless local row, which the command takes over.
+        await store.create_user(
+            user_id="u-roleless",
+            username="site-admin",
+            auth_provider=AuthProvider.LOCAL.value,
+            display_name=None,
+            email=None,
+            password_hash=None,
+            must_change_password=True,
+            password_generated=False,
+            audits=(),
+        )
+        service = AuthService(store, AuthSettings())
+        fired: list[str] = []
+        disable_totp = store.disable_totp
+
+        async def recording_disable(*args: Any, **kwargs: Any) -> Any:
+            fired.append("disable_totp")
+            return await disable_totp(*args, **kwargs)
+
+        monkeypatch.setattr(store, "disable_totp", recording_disable)
+        outcome = await service.provision_first_administrator(
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            on_first_write=lambda: fired.append("first write"),
+            **provision_totp(),
+        )
+        assert outcome.repaired is True
+        assert fired[:2] == ["first write", "disable_totp"], fired
+        assert fired.count("first write") == 1, fired
+    finally:
+        await store.close()

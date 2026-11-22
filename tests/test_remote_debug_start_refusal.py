@@ -628,20 +628,24 @@ def test_a_real_start_with_disable_remote_debug_gets_past_this_gate(tmp_path: Pa
     assert "no MEFOR_STORE_ENCRYPTION_KEY" in proc.stderr, proc.stderr[-2000:]
 
 
-def test_serve_lists_the_reading_its_gate_read(
+def test_serve_lists_a_reading_taken_after_its_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Vault BACKLOG #3795 item 15: ``serve`` reads the posture once, and its loosening list gets
-    the reading the start gate decided on, not a second one. The gates in between are stood down
-    and the start is stopped at the list's build.
+    """Vault BACKLOG #3795 item 15, kept as designed: ``serve`` reads the posture again for its
+    loosening list, because the refused-script count is a snapshot, and a refusal after the gate
+    must still be counted there. The gates in between are stood down and the start is stopped
+    at the list's build.
 
-    Mutation: pass ``remote_debug_posture()`` to the list again; it then gets a second reading."""
+    Mutation: pass the gate's reading to the list; the list then shows the older count."""
     readings: list[RemoteDebugPosture] = []
     listed: list[object] = []
 
     def reading() -> RemoteDebugPosture:
-        readings.append(RemoteDebugPosture(interpreter_enabled=False, guard_installed=True))
-        return readings[-1]
+        posture = RemoteDebugPosture(
+            interpreter_enabled=False, guard_installed=True, refused_scripts=len(readings)
+        )
+        readings.append(posture)
+        return posture
 
     def stop_at_the_list(*_args: object, **kwargs: object) -> NoReturn:
         listed.append(kwargs["remote_debug"])
@@ -658,7 +662,7 @@ def test_serve_lists_the_reading_its_gate_read(
         # main's last-resort handler turns the stop into a non-zero exit.
         assert cli.main(["serve", "--config", str(_SAMPLES_CONFIG), "--env", "dev"]) != 0
     assert listed, "the start stopped before the loosening list, so this arm proves nothing"
-    assert len(readings) == 1 and listed == readings, (readings, listed)
+    assert len(readings) == 2 and listed == readings[1:], (readings, listed)
 
 
 #: ``supervise`` in a real interpreter, with the start-up code gate pinned clean as

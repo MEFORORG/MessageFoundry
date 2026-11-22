@@ -895,7 +895,7 @@ def test_a_store_the_probe_cannot_open_is_could_not_start(
     assert main([*argv, "--db", str(db), "--json"]) == 2
     message = json.loads(capsys.readouterr().out)["error"]
     # What the open may have changed before it, never "nothing was written" (BACKLOG #5067).
-    assert "a row this open cannot read" in message and "own writes did not run" in message
+    assert "a row this open cannot read" in message and "did not land, but the open may" in message
 
 
 def test_a_store_sealed_under_another_key_is_could_not_start(
@@ -933,7 +933,7 @@ def test_a_store_sealed_under_another_key_is_could_not_start(
     message = json.loads(capsys.readouterr().out)["error"]
     assert rc == 2, message
     # The CipherError arm's text, not another could-not-start refusal that also exits 2.
-    assert "no configured key decrypts" in message and "own writes did not run" in message
+    assert "no configured key decrypts" in message and "did not land, but the open may" in message
 
 
 # --- BACKLOG #2034: the trust-anchor enforcement dial reaches this command -----------------------
