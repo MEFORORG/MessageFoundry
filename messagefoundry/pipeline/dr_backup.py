@@ -97,6 +97,7 @@ from messagefoundry.store.cipher_cells import (
 from messagefoundry.store.crypto import (
     StoreKeylessError,
     _decode_key,
+    gave_no_verdict,
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
@@ -280,10 +281,13 @@ class VerifyResult:
     row_counts: dict[str, int] = field(default_factory=dict)
     manifest_counts: dict[str, int] = field(default_factory=dict)
     reason: str | None = None
-    #: How many cipher-covered cells the FULL verify decrypted AND authenticated in the snapshot. A
-    #: count, never a plaintext. ``0`` on a lightweight verify (it does not run the pass) and on an
-    #: unencrypted store (there is nothing sealed to open) — so it distinguishes "read the PHI" from
-    #: "opened the file", which is the whole difference a full verify is meant to prove.
+    #: How many cipher-covered cells the FULL verify decrypted AND authenticated in the snapshot as
+    #: the archive holds it, before its open. A count, never a plaintext. ``0`` on a lightweight
+    #: verify (it does not run the pass) and on an unencrypted store (there is nothing sealed to
+    #: open) — so it distinguishes "read the PHI" from "opened the file", which is the whole
+    #: difference a full verify is meant to prove. A cell only the walk after the open reads, one a
+    #: migration makes readable, is authenticated toward the verdict but not counted here
+    #: (:func:`_full_open_check`).
     decrypted_cells: int = 0
 
     @property
@@ -4779,9 +4783,13 @@ def _full_open_check(
         return "FAIL", "no live store settings were supplied for the full restore-verify", 0
     snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
 
+    # Whether the last `_walk` returned `_decrypt_check`'s own verdict, rather than one for a raise.
+    walk_read: list[bool] = [False]
+
     def _walk() -> tuple[str, str, int]:
+        walk_read[0] = False
         try:
-            return _decrypt_check(snap, snap_settings, posture=posture)
+            result = _decrypt_check(snap, snap_settings, posture=posture)
         except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
             # Its cipher build and its read-only connect are the open's own, so a failure there (a
             # key provider or DPAPI, a cipher config or a refused hop, a file the connect cannot
@@ -4789,14 +4797,16 @@ def _full_open_check(
             # open it is still behind an incompatible snapshot's verdict, so the open runs and the
             # order below decides; after the open it is the verdict.
             return "FAIL", safe_exc(exc), 0
+        walk_read[0] = True
+        return result
 
     # The cells are read FIRST, from the snapshot as the archive holds it (BACKLOG #1719). The open
     # below is a keyed open, and its at-open sweep seals what it reads as legacy plaintext: under
     # the opt-out, or on a surface no keyed open recorded, that includes a value whose marker is
     # damaged, which would then open cleanly and PASS. Read first, the walk judges that value as
-    # it was archived, and the verdict matches `cipher-audit`'s on the same store. A second walk
-    # after the open reads the cells a migration adds or renames, which this one cannot see.
+    # it was archived, and the verdict matches `cipher-audit`'s on the same store.
     walked = _walk()
+    walked_cells = walk_read[0]
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
@@ -4834,7 +4844,29 @@ def _full_open_check(
     try:
         ok, msg = run_guarded(_open())
     except SchemaMismatchError as exc:
-        return "FAIL", _incompatible_snapshot(exc, engine_version), 0
+        # The walk's finding rides along, so it is not lost behind the remedy (BACKLOG #1719 item
+        # 3). A walk that raised, whether in its cipher build, its connect or partway through,
+        # returned no finding of its own, so it says nothing here.
+        walk = None
+        if walked_cells:
+            # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
+            if walked[0] != "PASS":
+                walk = (
+                    f"Before the open, the walk of the cells this build knows reported {walked[0]}"
+                    " (the remedy leads because this build can misread another version's cells): "
+                    f"{safe_text(walked[1])}"
+                )
+            elif walked[2]:
+                walk = (
+                    "Before the open, the walk of the cells this build knows passed: every sealed"
+                    " value it read decrypted and authenticated."
+                )
+            else:
+                walk = (
+                    "Before the open, the walk of the cells this build knows passed, holding no"
+                    " sealed value to decrypt."
+                )
+        return "FAIL", _incompatible_snapshot(exc, engine_version, walk=walk), 0
     except StoreKeylessError as exc:
         # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
         # encrypted store. Same cause, same verdict — an absent keyring, not a bad archive — as
@@ -4860,12 +4892,15 @@ def _full_open_check(
 _INCOMPATIBLE_REASON_LIMIT = 600
 
 
-def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str:
+def _incompatible_snapshot(
+    exc: SchemaMismatchError, engine_version: str, *, walk: str | None = None
+) -> str:
     """The restore-verify refusal of a snapshot this build's schema cannot open (BACKLOG #2101).
 
     The store's own message tells an operator to move the store aside and recreate it, and for an
     encrypted store to change its key first. Neither applies to an archive, so this names the
-    version to restore it with instead. The remedy leads and the differences follow, so a short
+    version to restore it with instead. The remedy leads, the differences follow, and ``walk``,
+    the cell walk's sentence when one read the cells before the open, comes last, so a short
     display loses only the detail."""
     # The manifest is inside the authenticated archive, but it is still a string this build did not
     # write, so only a short, printable version label is quoted back.
@@ -4877,10 +4912,13 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
         tail = f"The schema step failed: {exc.cause or ''}."
     # Redacted and bounded like every other arm's reason (safe_exc there): the tail is driver text
     # and a difference list with no length of its own. The remedy leads, so a cut loses only detail.
+    after = f" {walk}" if walk else ""
     return safe_text(
         "the archive's store is from an incompatible version, so this build cannot open it: restore"
-        f" it with {wrote}. The archive opened and passed its integrity and row-count checks. {tail}",
-        limit=_INCOMPATIBLE_REASON_LIMIT,
+        f" it with {wrote}. The archive opened and passed its integrity and row-count checks."
+        f" {tail}{after}",
+        # The walk's sentence is bounded where it is made, and adds its own length to the cut.
+        limit=_INCOMPATIBLE_REASON_LIMIT + len(after),
     )
 
 
@@ -4916,9 +4954,8 @@ def _decrypt_check(
     key opened, then a failure. Under a key no keyless reading can come, so this pass stops at the
     first value that does not open. With no key it reads on past a BLOB, which fails under any
     cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
-    decides it, whichever row comes first. A full verify runs this pass before the store's own
-    open (:func:`_full_open_check`), so the open cannot decide first or change a cell this reads,
-    and again after it, over the migrated copy.
+    decides it, whichever row comes first. When a full verify runs this pass, and why, is
+    :func:`_full_open_check`'s to say.
 
     It also reads the non-blank values with no marker, as ``cipher-audit`` does: one on a surface
     the keyed store has sealed fails, unless ``allow_unmarked_ciphertext`` is set, because the
@@ -4966,6 +5003,17 @@ def _decrypt_check(
                     return "FAIL", reading.failure(source="snapshot"), cells
                 first_blob = first_blob or reading.failure(source="snapshot")
             elif reading.kind == "failed":
+                if reading.error is not None and gave_no_verdict(reading.error):
+                    # The key service failed, not the value: the walk stops here, as
+                    # `cipher-audit` stops on an outage, and the reason says so rather than
+                    # calling the cell undecryptable (BACKLOG #1719 item 12). Still no PASS.
+                    return (
+                        "FAIL",
+                        f"the key service gave no answer while {reading.cell.table}."
+                        f"{reading.cell.column} {reading.where} was read, so the walk stopped "
+                        f"without a verdict on it: {safe_exc(reading.error)}",
+                        cells,
+                    )
                 # Only under a key: a keyless walk never decrypts. FAIL, not KEY_MISMATCH:
                 # CipherError cannot separate a corrupted ciphertext from a key that was never
                 # supplied, so the softer verdict on a bit-flipped PHI cell is the reading that

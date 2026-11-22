@@ -1399,13 +1399,23 @@ def test_the_server_walk_reads_large_rows_in_small_chunks(
     tmp_path: Path, _template: tuple[Path, StoreSettings]
 ) -> None:
     """A server driver fetches a whole chunk at once, so ``attachment_chunk``, one 1 MiB slice a
-    row, is read at most its cap at a time whatever ``chunk_rows`` asks; other cells are not."""
+    row, and each cell that holds a whole body are read at most their cap at a time whatever
+    ``chunk_rows`` asks; a small cell is not (BACKLOG #1719 item 2)."""
     db, settings = _copy(_template, tmp_path)
     _audit_result, source = _server_audit(db, build_store_cipher(settings), chunk_rows=500)
-    cap = next(c.chunk_cap for c in POSTGRES_CIPHER_CELLS if c.table == "attachment_chunk")
-    assert cap is not None and cap < 500
-    assert set(source.limits["attachment_chunk.ciphertext"]) == {cap}
-    assert set(source.limits["messages.raw"]) == {500}
+    caps = {f"{c.table}.{c.column}": c.chunk_cap for c in POSTGRES_CIPHER_CELLS}
+    for name in (
+        "attachment_chunk.ciphertext",
+        "messages.raw",
+        "queue.payload",
+        "shared_body.body",
+        "response.body",
+    ):
+        cap = caps[name]
+        assert cap is not None and cap < 500, name
+        assert set(source.limits[name]) == {cap}, name
+    assert caps["messages.error"] is None
+    assert set(source.limits["messages.error"]) == {500}
 
 
 def test_an_unreachable_key_service_stops_the_server_audit(
@@ -1954,3 +1964,102 @@ def test_a_keyless_open_after_a_failed_walk_is_still_a_key_mismatch(
     assert (status, cells) == ("KEY_MISMATCH", 0), reason
     head, _, tail = reason.partition("; ")
     assert "no key resolved" in head and tail == "synthetic walk line", reason
+
+
+def test_a_key_service_outage_in_the_verify_walk_is_not_called_a_damaged_cell(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A decrypt the key service gave no answer to stops the walk as an outage, as cipher-audit
+    stops, and its FAIL says so rather than that the cell did not decrypt (BACKLOG #1719 item 12).
+    It is still no PASS."""
+    from messagefoundry.store.crypto import CipherUnavailableError
+
+    db, settings = _copy(_template, tmp_path)
+    calls: list[int] = []
+
+    def down(_cipher: Any, _stored: str, _aad: bytes) -> CipherError:
+        calls.append(1)
+        return CipherUnavailableError("synthetic: the key service did not answer")
+
+    monkeypatch.setattr(cipher_cells_module, "decrypt_or_error", down)
+    status, reason, cells = dr_backup._decrypt_check(db, settings)
+    assert (status, cells) == ("FAIL", 0), reason
+    assert "key service gave no answer" in reason and "did not decrypt" not in reason, reason
+    assert len(calls) == 1, "the walk sent a value to the key service after its outage"
+    assert _SYNTH not in reason
+
+
+def test_an_incompatible_snapshot_keeps_the_walks_finding(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The remedy for a snapshot this build cannot open still leads, and the cell walk that ran
+    before the open is reported after it: what it found, or that it passed and whether it held a
+    sealed value to decrypt (BACKLOG #1719 item 3)."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    def incompatible(coro: Any) -> Any:
+        coro.close()
+        raise SchemaMismatchError("synthetic: schema written by another build")
+
+    monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "raw", rowid, "x" + value[1:])
+    status, reason, cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert (status, cells) == ("FAIL", 0), reason
+    remedy, _, walk = reason.partition("Before the open")
+    assert "0.0.1" in remedy and "messages.raw" not in remedy, reason
+    assert "messages.raw" in walk and "reported FAIL" in walk, reason
+    assert _SYNTH not in reason
+
+    (tmp_path / "intact").mkdir()
+    db, settings = _copy(_template, tmp_path / "intact")
+    passed = dr_backup._decrypt_check(db, settings)
+    assert passed[0] == "PASS" and passed[2] > 0, passed
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "passed: every sealed value it read decrypted and authenticated" in reason, reason
+    # Nor does it claim a decrypt that a walk with nothing sealed to read never made.
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: ("PASS", "ok", 0))
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "holding no sealed value to decrypt" in reason and "authenticated" not in reason, reason
+    assert reason.index("The schema step failed") < reason.index("Before the open"), reason
+
+
+def test_the_second_walk_reads_the_cell_the_migration_made_readable(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control for the intact-migration case (BACKLOG #1719 item 20): the walk before the
+    open opens no ``queue.payload`` value on the schema without ``body_ref``, and the walk after it
+    opens at least one."""
+    db, settings = _copy(_template, tmp_path)
+    _drop_queue_body_ref(db)
+    real = read_cipher_cells
+    opened: list[int] = []
+
+    def recorded(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        opened.append(0)
+        for reading in real(*args, **kwargs):
+            cell = (reading.cell.table, reading.cell.column)
+            if reading.kind == "opened" and cell == ("queue", "payload"):
+                opened[-1] += 1
+            yield reading
+
+    monkeypatch.setattr(dr_backup, "read_cipher_cells", recorded)
+    status, reason, _cells = dr_backup._full_open_check(db, settings)
+    assert status == "PASS", reason
+    assert len(opened) == 2 and opened[0] == 0 and opened[1] >= 1, opened
+
+
+def test_the_absence_predicates_the_live_server_tests_use_can_fire() -> None:
+    """Negative control for the live audit tests' ``absent`` check (BACKLOG #1719 item 23): a cell
+    whose table, value column or any paging, locator or AAD column the catalog lacks is absent."""
+    from messagefoundry.store.cipher_cells import server_cell_present
+
+    for cells in (POSTGRES_CIPHER_CELLS, SQLSERVER_CIPHER_CELLS):
+        for spec in cells:
+            needed = {spec.column, *spec.aad_columns, *spec.order, *spec.locator} - {POSITION}
+            assert server_cell_present(spec, {spec.table: frozenset(needed)}), spec
+            assert not server_cell_present(spec, {}), spec
+            for column in needed:
+                partial = {spec.table: frozenset(needed - {column})}
+                assert not server_cell_present(spec, partial), (spec, column)
