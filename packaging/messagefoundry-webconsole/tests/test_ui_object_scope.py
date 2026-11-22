@@ -147,7 +147,8 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(
     # A scoped caller sees only rules on names in inbound_names() (BACKLOG #3378), so a
     # stand-in runner declares both; the route reads only these attributes.
     graph = SimpleNamespace(inbound_names=lambda: frozenset({"IB_MINE", "IB_THEIRS"}))
-    monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(registry=graph))
+    runner = SimpleNamespace(registry=graph, knows_outbound=lambda _name: False)
+    monkeypatch.setattr(engine, "_registry_runner", runner)
     rules = AlertsSettings(
         rules=[AlertRule(connection="IB_MINE"), AlertRule(connection="IB_THEIRS")]
     )

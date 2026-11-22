@@ -203,14 +203,17 @@ def _attach_graph(
     engine: Engine,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     inbounds: tuple[str, ...] = _GRAPH,
+    outbounds: tuple[str, ...] = (),
 ) -> None:
-    """Give ``engine`` a stand-in runner whose graph declares ``inbounds``, since
+    """Give ``engine`` a stand-in runner whose graph declares ``inbounds`` and ``outbounds``, since
     ``GET /alerts/rules`` shows a scoped caller only rules on in-scope names in ``inbound_names()``
-    (BACKLOG #3378). Of the runner, that route reads only ``registry.inbound_names()``.
-    ``monkeypatch`` restores the engine's own (None) runner before the engine fixture stops it, as
-    long as the test names ``engine`` first."""
+    that the runner does not also know as outbounds (BACKLOG #3378). Of the runner, that route
+    reads only ``registry.inbound_names()`` and ``knows_outbound``. ``monkeypatch`` restores the
+    engine's own (None) runner before the engine fixture stops it, as long as the test names
+    ``engine`` first."""
     registry = SimpleNamespace(inbound_names=lambda: frozenset(inbounds))
-    monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(registry=registry))
+    stub = SimpleNamespace(registry=registry, knows_outbound=lambda name: name in outbounds)
+    monkeypatch.setattr(engine, "_registry_runner", stub)
 
 
 async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope(
@@ -321,16 +324,16 @@ async def test_alert_rules_withhold_an_outbound_the_scope_lists(
     assert json.loads(str(rows[0]["detail"])) == {"shown": 1, "withheld": 3}
 
 
-async def test_alert_rules_admit_an_inbound_whatever_its_other_side(
+async def test_alert_rules_withhold_a_name_on_both_sides(
     engine: Engine,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3378 item 4: the route tests only the inbound side, so a name the graph declares as
-    an inbound passes whether or not it is an outbound too, and its rules show to a scope that
-    lists it, whatever the event type (the stand-in declares only the inbound side for that reason).
-    A ``restart_outbound`` rule is still withheld, since its action names the outbound side, a
-    ``"*"`` rule with no target included."""
-    _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"))
+    """BACKLOG #3378 item 4: a name the graph declares as both an inbound and an outbound is
+    withheld from a scope that lists it, as ``connection`` and as ``control_target``, since a rule
+    on it can match the outbound's events. A ``restart_outbound`` rule is withheld too, a ``"*"``
+    rule with no target included. The control: the same names on an inbound-only graph show, and
+    the in-scope inbound's own rule shows on both."""
+    _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"), outbounds=("SHARED",))
     rules = AlertsSettings(
         rules=[
             AlertRule(id="stall", event_type="message_stall", connection="SHARED"),
@@ -350,17 +353,26 @@ async def test_alert_rules_admit_an_inbound_whatever_its_other_side(
                 connection="*",
                 control_action="restart_outbound",
             ),
+            AlertRule(id="mine", connection="IB_A"),
         ]
     )
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A", "SHARED"])
     app = create_app(engine, auth=service, alerts_settings=rules)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.get("/alerts/rules", headers=await _login(c, "scoped"))
-        assert r.status_code == 200, r.text
-        assert [(rule["connection"], rule["control_action"]) for rule in r.json()["rules"]] == [
+        h = await _login(c, "scoped")
+
+        async def shown() -> list[tuple[str, str | None]]:
+            r = await c.get("/alerts/rules", headers=h)
+            assert r.status_code == 200, r.text
+            return [(rule["connection"], rule["control_action"]) for rule in r.json()["rules"]]
+
+        assert await shown() == [("IB_A", None)]
+        _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"))
+        assert await shown() == [
             ("SHARED", None),
             ("IB_A", "restart_inbound"),
+            ("IB_A", None),
         ]
 
 

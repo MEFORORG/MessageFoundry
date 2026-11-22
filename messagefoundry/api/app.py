@@ -10621,15 +10621,19 @@ def create_app(
         rr = engine.registry_runner if engine is not None else None
         scoped = _user.allowed_channels is not None
         # An allowlist (BACKLOG #3378 item 4; the batch Manager's 2026-11-22 reading of the owner's
-        # 2026-11-04 ruling that part 4 "stays strict"): a
-        # scoped caller reaches a name only when it is in its scope AND an inbound of the
-        # deployment, the set the flag route's scope test reads (on an engine shard, every engine
-        # shard's inbounds). So an outbound, a name that exists nowhere, and with no graph loaded every
-        # name, are withheld. Read once per scoped request.
+        # 2026-11-04 ruling that part 4 "stays strict"): a scoped caller reaches a name only when
+        # it is in its scope AND an inbound of the deployment, the set the flag route's scope test
+        # reads (on an engine shard, every engine shard's inbounds), AND not an outbound this
+        # runner knows, a name declared on both sides included, since a rule on it can match the
+        # outbound's events. Read once per scoped request.
         inbounds = rr.registry.inbound_names() if scoped and rr is not None else frozenset[str]()
 
         def reachable(name: str) -> bool:
-            return _user.can_access_channel(name) and (not scoped or name in inbounds)
+            if not _user.can_access_channel(name):
+                return False
+            if not scoped:
+                return True
+            return rr is not None and name in inbounds and not rr.knows_outbound(name)
 
         def visible(rule: AlertRule) -> bool:
             if not (rule.connection == "*" or reachable(rule.connection)):

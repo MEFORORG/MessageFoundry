@@ -2315,10 +2315,13 @@ the same permission set on the same method reds CI until it is listed here.
 > manual", and shows a race as a refused save with the edits kept.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
-> caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
+> caller `GET /channels`, `GET /connections`, `GET /events` and `GET /graph/edges`
 > return only their own inbound connections, and every **shared outbound** is suppressed outright
 > rather than relabelled — its dashboard row, its graph node and its live status all disappear, because
 > an outbound spans channels and its state can reflect another channel's downstream.
+> `GET /alerts/active` is narrowed differently: it filters alert instances by exact scope
+> membership of their `connection`, so a scoped caller sees the instances of every name its scope
+> lists, an outbound's included. An alert on an outbound its scope does not list is not shown.
 > `GET /connections/{name}/events` and `GET /connections/{name}/metadata` answer 403 outside the scope.
 > What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
@@ -2389,7 +2392,8 @@ the same permission set on the same method reds CI until it is listed here.
 > rule; this allowlist is the batch Manager's 2026-11-22 reading of that ruling. So a rule
 > naming an outbound, or a name that
 > exists nowhere, is withheld from a scoped caller, and with no graph loaded every rule that
-> names a connection is. A name that is both an inbound and an outbound passes that test. Every
+> names a connection is. A name the running graph also knows as an outbound, a name declared on
+> both sides included, is withheld too, since a rule on it can match the outbound's events. Every
 > `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
 > its action names the outbound side. Other routes were left as they were, on purpose, at least
 > the alert-instance routes and `GET /connections/{name}/events`. The batch Manager decided this
@@ -2414,7 +2418,7 @@ the same permission set on the same method reds CI until it is listed here.
 > that polled would need the row coalesced. The counts are a disclosure in their own right. A
 > scoped caller that holds `audit:read`, such as an Auditor, reads in `GET /audit` how many rules
 > it was not shown. That count includes at least rules outside its scope, rules withheld by the
-> inbound and `restart_outbound` tests above, and, with no graph loaded, every rule that names a
+> inbound, outbound and `restart_outbound` tests above, and, with no graph loaded, every rule that names a
 > connection, so it is not a count of rules outside the scope alone. A `logs:view` holder reads them in the ERROR line a lost row leaves.
 > Without either, one extra write's latency can show that some rule was withheld. It cannot show
 > which rules or how many. Why it is not
