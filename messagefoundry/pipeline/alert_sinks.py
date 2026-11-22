@@ -41,9 +41,9 @@ from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar, cast
 
 from messagefoundry.config.alert_webhook import (
-    alert_host_allowed,
-    refuse_unbuildable_webhook_url,
+    alert_host_allowed as alert_host_allowed,  # re-exported: __main__ and the tests import it here
 )
+from messagefoundry.config.alert_webhook import refuse_unbuildable_webhook_url
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
@@ -795,8 +795,9 @@ class WebhookTransport:
         revocation_attested_reason: str | None = None,
     ) -> None:
         # The posture-free checks, stated once in config/alert_webhook.py, which settings load
-        # runs too (vault BACKLOG #3533 item 14).
-        refuse_unbuildable_webhook_url(url, allowed_hosts)
+        # runs too (vault BACKLOG #3533 item 14). It returns the value it judged, with the
+        # whitespace it strips gone; the revocation guard, each POST and the dial read that value.
+        url = refuse_unbuildable_webhook_url(url, allowed_hosts)
         # BACKLOG #2484: build the shared opener here, so an OpenSSL that refuses the engine's list
         # refuses the start, as the #5088 allowlist check does, rather than failing every POST.
         _shared_no_redirect_opener()

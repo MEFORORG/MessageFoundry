@@ -202,6 +202,9 @@ _REFUSED_WEBHOOK_URLS = [
     pytest.param(f" http://hooks.example/{_WEBHOOK_TOKEN}\n", (), id="space-http"),
     pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}", ("other.example",), id="off-allowlist"),
     pytest.param(f"https://h.example/{_WEBHOOK_TOKEN}" + "x" * 8192, (), id="over-length"),
+    # No host, with no allowlist: the build's revocation guard refuses these in every posture.
+    pytest.param(f"https:///{_WEBHOOK_TOKEN}", (), id="hostless"),
+    pytest.param(f"https://:443/{_WEBHOOK_TOKEN}", (), id="port-only"),
 ]
 
 
@@ -212,7 +215,7 @@ def test_a_webhook_the_build_refuses_is_refused_at_load_without_echoing_it(
     # Vault BACKLOG #3533 item 14: settings load runs the build's own checks, so check and the
     # serve pre-flight refuse what the build refuses. The path can hold the webhook's token, so
     # no message repeats the token.
-    with pytest.raises(ValueError, match=_SETTING_NAMED + "|outbound URL") as built:
+    with pytest.raises(ValueError, match=_SETTING_NAMED) as built:
         WebhookTransport(url, allowed_hosts=allowed, posture=STAGING_PHI)
     with pytest.raises(ValidationError) as info:
         AlertsSettings(webhook_url=url, webhook_allowed_hosts=list(allowed))
@@ -248,6 +251,16 @@ def test_a_listed_webhook_host_loads() -> None:
         webhook_url="https://hooks.example/x", webhook_allowed_hosts=["HOOKS.example"]
     )
     assert alerts.webhook_allowed_hosts == ["HOOKS.example"]
+
+
+def test_the_build_dials_the_value_it_judged() -> None:
+    # The screen strips surrounding ASCII whitespace; the revocation guard and the dial read the
+    # stripped value too, so a loopback host behind a trailing space is still loopback, which an
+    # enforcing posture lets cross without an attestation.
+    transport = WebhookTransport(
+        " https://localhost/x \n", allowed_hosts=("localhost",), posture=PROD_PHI
+    )
+    assert transport.url == "https://localhost/x"
 
 
 def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:

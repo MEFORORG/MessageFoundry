@@ -4,8 +4,8 @@
 
 :func:`refuse_unbuildable_webhook_url` is called by at least the ``AlertsSettings`` load check,
 ``notifier_from_settings`` before it reads the SMTP password, ``WebhookTransport``'s build and its
-every POST, so settings load and the build refuse the same URLs. The revocation guard, which reads
-the posture, stays in ``pipeline/alert_sinks.py``.
+every POST, so settings load and the build refuse the same URLs on these checks. The revocation
+guard, which reads the posture, stays in ``pipeline/alert_sinks.py``.
 
 Imports no ``transports`` module: that package's ``__init__`` registers every connector, and
 settings load would pay for it.
@@ -24,7 +24,6 @@ from messagefoundry.urlscreen import (
 
 __all__ = [
     "alert_host_allowed",
-    "refuse_off_allowlist_webhook",
     "refuse_unbuildable_webhook_url",
 ]
 
@@ -55,21 +54,25 @@ def alert_host_allowed(host: str, allowed_hosts: Sequence[str]) -> bool:
     return bool(candidate) and candidate in (h.lower() for h in allowed_hosts)
 
 
-def refuse_off_allowlist_webhook(url: str, allowed_hosts: Sequence[str]) -> None:
-    """Refuse a webhook URL whose host ``[alerts].webhook_allowed_hosts`` does not admit.
+def _refuse_hostless_or_off_allowlist(url: str, allowed_hosts: Sequence[str]) -> None:
+    """Refuse a webhook URL that names no host, or whose host ``[alerts].webhook_allowed_hosts``
+    does not admit. Private: ``url`` must already have passed ``refuse_url_credentials``, whose
+    screen keeps urlsplit's own netloc-quoting ``ValueError`` from being raised here.
 
     Names the host, never the URL: the path carries the webhook's token (BACKLOG #1793)."""
     host = UNCACHED_URLSPLIT(url).hostname or ""  # urlsplit lower-cases the host
-    if not host and allowed_hosts:
-        # The remedy is the URL, not the allowlist, so say that. With no allowlist the https
-        # revocation guard's hop_url_host refuses the same URL at the build.
+    if not host:
+        # Whatever the allowlist: the build's revocation guard refuses a hostless URL in every
+        # posture too, so this keeps settings load from passing one the build refuses.
         raise ValueError(f"{_SETTING} names no host")
     if not alert_host_allowed(host, allowed_hosts):
         raise ValueError(f"{_SETTING} host {host!r} is not in [alerts].webhook_allowed_hosts")
 
 
-def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> None:
-    """Refuse a webhook URL on the checks that read no secret, no posture and log nothing.
+def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> str:
+    """Refuse a webhook URL on the checks that read no secret, no posture and log nothing, and
+    return the value it judged: ``url`` with :data:`_STRIPPED_BY_BOTH` stripped from each end. A
+    caller that dials the URL dials that value, so no later reader sees other whitespace.
 
     No refusal here prints the URL (BACKLOG #1793): a Slack or Teams hook carries its secret in the
     PATH, and a userinfo URL carries a password. The userinfo screen runs before any check that
@@ -83,8 +86,8 @@ def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> No
     * any scheme but https. A plaintext http target is refused with no escape, in every posture
       (vault BACKLOG #3533 item 5, ASVS 12.2.1): the URL can carry the hop's credential as a path
       token;
-    * a host off a non-empty ``webhook_allowed_hosts`` (BACKLOG #5088), after the scheme, so an
-      http URL is never sent to fix an entry it cannot use;
+    * a URL that names no host, and a host off a non-empty ``webhook_allowed_hosts`` (BACKLOG
+      #5088), after the scheme, so an http URL is never sent to fix an entry it cannot use;
     * a URL over the outbound length bound (ASVS 4.2.5). Construction-only is enough: the URL is
       operator config and the sole header is a fixed ``Content-Type``.
     """
@@ -105,9 +108,9 @@ def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> No
         # The scheme is not named: in a value with no "//", such as "svc:PW@host/x", it is text
         # the operator may not have meant as one.
         raise ValueError(f"{_SETTING} must be https")
-    refuse_off_allowlist_webhook(candidate, allowed_hosts)
-    if len(url) > MAX_OUTBOUND_URL_LEN:
+    _refuse_hostless_or_off_allowlist(candidate, allowed_hosts)
+    if len(candidate) > MAX_OUTBOUND_URL_LEN:
         raise ValueError(
-            f"outbound URL is {len(url)} chars, over the {MAX_OUTBOUND_URL_LEN}-char limit; "
-            "check the configured 'url' / its env() value"
+            f"{_SETTING} is {len(candidate)} chars, over the {MAX_OUTBOUND_URL_LEN}-char limit"
         )
+    return candidate

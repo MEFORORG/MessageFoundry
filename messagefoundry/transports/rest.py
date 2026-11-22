@@ -115,10 +115,12 @@ from messagefoundry.transports.proxy_address import (
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 from messagefoundry.urlscreen import (  # moved there for config's load check (#3533 item 14)
     _URL_CREDENTIAL_USE,
-    MAX_OUTBOUND_URL_LEN,
     _host_holds_encoded_colon,
     _split_or_refuse,
     refuse_url_credentials,
+)
+from messagefoundry.urlscreen import (
+    MAX_OUTBOUND_URL_LEN as MAX_OUTBOUND_URL_LEN,
 )
 
 __all__ = [
