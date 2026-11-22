@@ -666,10 +666,10 @@ lifetime is Vault's to version. The bound is a no-op there and for the identity 
 > `enforce_transit_bound_attestation`, so "documented" now undersells it. The R3 ruling above
 > judged the precondition before that record existed. ADR 0138's 2026-10-07 amendment says how the
 > attestation is recorded and what the check does under each enforcement level. It also says what
-> the check does not change, and who judges the record against R3. *(Corrected 2026-11-21, vault
-> BACKLOG #1173: this note read "an operator attests to the precondition with `messagefoundry
-> store attest-transit-bound`, and `Engine.start` reads that record" and "whether the record meets
-> R3 is a scorecard call". The 2026-10-07 amendment states both.)*
+> the check does not change. Whether the record meets R3 is, in that amendment's words, "a
+> scorecard call, not this amendment's". *(Corrected 2026-11-21, vault BACKLOG #1173: this note
+> read "an operator attests to the precondition with `messagefoundry store attest-transit-bound`,
+> and `Engine.start` reads that record", which the 2026-10-07 amendment states.)*
 
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.

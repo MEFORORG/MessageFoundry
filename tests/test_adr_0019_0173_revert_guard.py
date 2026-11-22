@@ -77,7 +77,7 @@ def test_each_refused_phrase_matches_the_removed_wording(
         assert phrase in _flat(old), phrase
 
 
-def test_adr_0019_does_not_restate_the_transit_gate() -> None:
+def test_adr_0019_does_not_revert_the_transit_gate_wording() -> None:
     text = _ADR_0019.read_text(encoding="utf-8")
     point_4 = _flat(
         _between(
@@ -104,7 +104,7 @@ def test_adr_0019_does_not_restate_the_transit_gate() -> None:
     assert "enforce_transit_bound_attestation" in note
 
 
-def test_adr_0173_odbc_amendment_does_not_restate_dates_or_versions() -> None:
+def test_adr_0173_odbc_amendment_does_not_revert_its_opening_or_version_limit() -> None:
     text = _ADR_0173.read_text(encoding="utf-8")
     amendment = _between(
         text,
