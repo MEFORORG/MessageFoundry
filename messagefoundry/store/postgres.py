@@ -8977,9 +8977,11 @@ class PostgresStore:
         of :attr:`_CANCEL_CHUNK_ROWS`, each its own transaction with its own audit row carrying that
         chunk's true count, so the rows of one purge sum to the total. If a chunk fails, the chunks
         before it stay cancelled and audited, that chunk rolls back whole, and the error
-        propagates. It covers the rows PENDING when it started; one enqueued later is left alone."""
+        propagates. It stops at the highest PENDING position read when it started, so a row placed
+        after that mark is left alone, and a row below it that commits or turns PENDING later is
+        still taken. Without ``now``, each chunk is stamped with its own time."""
         audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
-        now = time.time() if now is None else now
+        fixed_now = now
         # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
         # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
         # younger rows behind it, so that key would pick a healthy younger row and leave the
@@ -9011,6 +9013,7 @@ class PostgresStore:
             )
         total = 0
         while True:
+            now = time.time() if fixed_now is None else fixed_now
             # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
             async with (
                 AuditedWrite(now) as written,

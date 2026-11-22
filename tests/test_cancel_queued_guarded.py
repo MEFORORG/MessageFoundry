@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -203,6 +204,24 @@ async def test_sqlite_row_claimed_in_a_later_chunk_stays_claimed(
     assert await store.cancel_queued(None, "d", now=50.0, audit=no_purge_audit) == 3
     assert await _status(store, mids[2]) == OutboxStatus.INFLIGHT.value
     assert await _status(store, mids[3]) == OutboxStatus.CANCELLED.value
+
+
+async def test_sqlite_each_chunk_is_stamped_with_its_own_time(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MessageStore, "_CANCEL_CHUNK_ROWS", 2, raising=False)
+    await _seed_lane(store, 4)
+
+    def audit(cancelled: int) -> AuditAppend:
+        time.sleep(0.05)  # so the second chunk starts measurably later than the first
+        return AuditAppend("test.cancel_chunk", actor="test", detail=str(cancelled))
+
+    assert await store.cancel_queued(None, "d", audit=audit) == 4
+    cur = await store._db.execute(
+        "SELECT ts FROM audit_log WHERE action='test.cancel_chunk' ORDER BY seq"
+    )
+    stamps = [r["ts"] for r in await cur.fetchall()]
+    assert len(stamps) == 2 and stamps[1] > stamps[0]
 
 
 async def test_sqlite_row_enqueued_during_a_deep_cancel_is_not_cancelled(
