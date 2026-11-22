@@ -2648,7 +2648,7 @@ def _resolve(expr: ast.expr, state: _ScopeState) -> str | None:
 def _merge(states: list[_ScopeState]) -> _ScopeState:
     """The scope after exactly one of `states`' paths ran. A name keeps every definition any path
     leaves live, or becomes ``None`` if any path leaves it bound to something else; a binding keeps
-    its origin only where every path agrees on it."""
+    its origin only where every path that binds it agrees on it."""
     out = _ScopeState()
     for name in dict.fromkeys(n for s in states for n in s.defs):
         entries = [s.defs[name] for s in states if name in s.defs]
@@ -2661,7 +2661,7 @@ def _merge(states: list[_ScopeState]) -> _ScopeState:
             alts.extend(d for d in entry if not any(d is a for a in alts))
         out.defs[name] = tuple(alts)
     for name in dict.fromkeys(n for s in states for n in s.bindings):
-        origins = {s.lookup(name) for s in states}
+        origins = {s.lookup(name) for s in states if name in s.bindings or name in _SHAPE_BUILTINS}
         out.bindings[name] = origins.pop() if len(origins) == 1 else None
     return out
 
@@ -2745,11 +2745,12 @@ def _is_accessor(node: _FunctionNode, state: _ScopeState, reading: _Reading) -> 
 
 
 def _has_break(body: list[ast.stmt]) -> bool:
-    """Whether `body` holds a ``break`` of its own loop, not one of a nested loop."""
+    """Whether `body` holds a ``break`` or ``continue`` of its own loop, not one of a nested loop:
+    either can end the loop's last pass partway."""
     stack = list(body)
     while stack:
         node = stack.pop()
-        if isinstance(node, ast.Break):
+        if isinstance(node, (ast.Break, ast.Continue)):
             return True
         if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             stack.extend(node.orelse)  # a break in a nested loop's else ends THIS loop
@@ -2784,7 +2785,8 @@ def _run_block(
     (:func:`_is_accessor`). A decorator is resolved at the point its ``def`` runs.
 
     The TARGET is read `generous`ly, since more live alternatives there can only remove refusals:
-    each prefix of a ``with`` body, of a loop body that holds a ``break``, and of a ``try`` body,
+    each prefix of a ``with`` body, of a loop body that holds a ``break`` or ``continue``, and of a
+    ``try`` body,
     at any depth inside it, is a live alternative too. The mutation is read without them: a ``with``
     body is read as running whole, and a handler follows only a prefix of the ``try`` body's own
     statements. `sink`, when given, collects the state before each statement read, at any depth.
@@ -2812,12 +2814,6 @@ def _run_stmt(
     sink: list[_ScopeState] | None = None,
 ) -> _ScopeState:
     """:func:`_run_block` for one statement. May update `state` in place; returns the result."""
-
-    def run(
-        block: list[ast.stmt], start: _ScopeState, into: list[_ScopeState] | None = sink
-    ) -> _ScopeState:
-        return _run_block(block, start, reading, outer, generous=generous, sink=into)
-
     _bind_walrus(node, state)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         reading.decorators[node] = tuple(
@@ -2877,23 +2873,28 @@ def _run_stmt(
                 state.bind(name)
     elif isinstance(node, ast.If):
         if _is_type_checking(node.test):
-            return run(node.orelse, state)
+            return _run_block(node.orelse, state, reading, outer, generous=generous, sink=sink)
         if (
             isinstance(node.test, ast.UnaryOp)
             and isinstance(node.test.op, ast.Not)
             and _is_type_checking(node.test.operand)
         ):
-            return run(node.body, state)
-        return _merge([run(node.body, state), run(node.orelse, state)])
+            return _run_block(node.body, state, reading, outer, generous=generous, sink=sink)
+        return _merge(
+            [
+                _run_block(node.body, state, reading, outer, generous=generous, sink=sink),
+                _run_block(node.orelse, state, reading, outer, generous=generous, sink=sink),
+            ]
+        )
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         for item in node.items:
             if item.optional_vars is not None:
                 for name in _target_names(item.optional_vars):
                     state.bind(name)
         if not generous:
-            return run(node.body, state)
+            return _run_block(node.body, state, reading, outer, generous=generous, sink=sink)
         cut: list[_ScopeState] = []
-        whole = run(node.body, state, cut)
+        whole = _run_block(node.body, state, reading, outer, generous=generous, sink=cut)
         if sink is not None:
             sink.extend(cut)
         return _merge([whole, *cut])  # an __exit__ that suppresses ends the body at any prefix
@@ -2902,16 +2903,26 @@ def _run_stmt(
             for name in _target_names(node.target):
                 state.bind(name)
         cut = []
-        ran = run(node.body, state, cut if generous else sink)
+        ran = _run_block(
+            node.body, state, reading, outer, generous=generous, sink=cut if generous else sink
+        )
         if generous and sink is not None:
             sink.extend(cut)
         broke = cut if generous and _has_break(node.body) else []
         # The else is read ONCE, from the merged entry states, so nested loop-elses cost linearly.
-        return _merge([ran, *broke, run(node.orelse, _merge([ran, state]))])
+        return _merge(
+            [
+                ran,
+                *broke,
+                _run_block(
+                    node.orelse, _merge([ran, state]), reading, outer, generous=generous, sink=sink
+                ),
+            ]
+        )
     elif isinstance(node, (ast.Try, ast.TryStar)):
         if generous:
             cut = []
-            whole = run(node.body, state, cut)
+            whole = _run_block(node.body, state, reading, outer, generous=generous, sink=cut)
             prefixes = [*cut, whole]
             if sink is not None:
                 sink.extend(cut)
@@ -2919,14 +2930,20 @@ def _run_stmt(
             prefixes = [state]
             for stmt in node.body:
                 prefixes.append(_run_stmt(stmt, prefixes[-1].copy(), reading, outer))
-        alternatives = [run(node.orelse, prefixes[-1])]
+        alternatives = [
+            _run_block(node.orelse, prefixes[-1], reading, outer, generous=generous, sink=sink)
+        ]
         partial = _merge(prefixes)
         for handler in node.handlers:
             caught = partial.copy()
             if handler.name:
                 caught.bind(handler.name)
-            alternatives.append(run(handler.body, caught))
-        return run(node.finalbody, _merge(alternatives))
+            alternatives.append(
+                _run_block(handler.body, caught, reading, outer, generous=generous, sink=sink)
+            )
+        return _run_block(
+            node.finalbody, _merge(alternatives), reading, outer, generous=generous, sink=sink
+        )
     elif isinstance(node, ast.Match):
         cases = []
         for case in node.cases:
@@ -2935,7 +2952,9 @@ def _run_stmt(
                 matched.bind(name)
             if case.guard is not None:
                 _bind_walrus_in(case.guard, matched)
-            cases.append(run(case.body, matched))
+            cases.append(
+                _run_block(case.body, matched, reading, outer, generous=generous, sink=sink)
+            )
         return _merge([*cases, state])
     return state
 

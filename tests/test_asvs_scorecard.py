@@ -2893,6 +2893,36 @@ def test_prove_absences_screen_reads_nested_loop_elses_in_linear_time(tmp_path: 
     assert time.monotonic() - started < 5
 
 
+def test_prove_absences_screen_keeps_an_import_bound_inside_a_with_body(tmp_path: Path) -> None:
+    """A prefix of a ``with`` body where a name is not bound yet gives it no origin of its own, so
+    a decorator naming it after the ``with`` still resolves, and an exact copy is accepted."""
+    target = (
+        "import contextlib\nwith contextlib.suppress(ImportError):\n    import functools\n"
+        "@functools.lru_cache\ndef scan(a): ...\n"
+    )
+    copy = "import functools\n@functools.lru_cache\ndef scan(a):\n    return 1\n"
+    assert _screen(copy, target, tmp_path) == []
+    assert _refused("def scan(a):\n    return 1\n", target, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_400_branch_chain_with_both_checks(tmp_path: Path) -> None:
+    """Nesting about 400 deep stays inside the stack, so an exact decorated copy is accepted. Found
+    refused by review once the walk spent an extra frame per level."""
+    chain = "if v == 0:\n    pass\n" + "".join(f"elif v == {i}:\n    pass\n" for i in range(1, 400))
+    target = "import functools\n@functools.lru_cache\ndef scan(a): ...\n" + chain
+    copy = "import functools\n@functools.lru_cache\ndef scan(a):\n    return 1\n"
+    assert _screen(copy, target, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_a_continue_mid_body_as_ending_the_loop(
+    tmp_path: Path,
+) -> None:
+    """A ``continue`` on the last pass ends the loop at its prefix, as a ``break`` does."""
+    target = "for x in r:\n    def f(a): ...\n    if x:\n        continue\n    def f(a, b): ...\n"
+    assert _screen("def f(a): ...\n", target, tmp_path) == []
+    assert _refused("def f(): ...\n", target, tmp_path)
+
+
 def test_signature_fields_name_every_signature_value() -> None:
     """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
     assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))
