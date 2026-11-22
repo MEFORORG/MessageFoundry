@@ -2386,9 +2386,9 @@ the same permission set on the same method reds CI until it is listed here.
 > scope, and `control_target` is unset or in it. A rule that names an outbound is withheld too,
 > even from a scope that lists it, as the flag route refuses an outbound (BACKLOG #3378, owner
 > ruling 2026-11-04). A name counts as an outbound when the running graph knows it as one, a
-> reload-dropped outbound still draining included, and does not also hold it as an inbound; and
-> a `restart_outbound` rule's target counts as one whatever the graph holds. With no graph
-> loaded only that last test applies. The flag route refuses more than this: at least a name in
+> reload-dropped outbound still draining included, and it is not an inbound anywhere in the
+> deployment, the set the flag route reads. A `restart_outbound` rule is withheld whatever the
+> graph holds, since it acts on an outbound. With no graph loaded only that last test applies. The flag route refuses more than this: at least a name in
 > the scope that exists nowhere, which a rule here may still name. Each rule it shows has a null
 > `id` (BACKLOG
 > #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any

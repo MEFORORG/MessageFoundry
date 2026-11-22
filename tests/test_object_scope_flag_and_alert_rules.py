@@ -263,6 +263,14 @@ async def test_alert_rules_withhold_an_outbound_the_scope_lists(
                 control_action="restart_outbound",
                 control_target="OB_TOML",
             ),
+            # Withheld by the graph's sides alone: the action names the inbound side.
+            AlertRule(
+                id="in-inbound-action-targets-out",
+                event_type="connection_stopped",
+                connection="IB_TOML",
+                control_action="restart_inbound",
+                control_target="OB_TOML",
+            ),
         ]
     )
     service = await _service(toml_engine)
@@ -280,31 +288,41 @@ async def test_alert_rules_withhold_an_outbound_the_scope_lists(
             ("IB_TOML", None),
             ("OB_TOML", None),
             ("IB_TOML", "OB_TOML"),
+            ("IB_TOML", "OB_TOML"),
         ]
         assert await shown("scoped") == [("IB_TOML", None)]
-    # The withheld count covers these rules too, so the read that withheld two writes one row.
+    # The withheld count covers these rules too, so the read that withheld three writes one row.
     rows = await toml_engine.store.list_audit(action="alert_rules_withheld")
     assert len(rows) == 1, rows
-    assert json.loads(str(rows[0]["detail"])) == {"shown": 1, "withheld": 2}
+    assert json.loads(str(rows[0]["detail"])) == {"shown": 1, "withheld": 3}
 
 
 async def test_alert_rules_withhold_a_restart_outbound_target_with_no_graph(
     engine: Engine,  # noqa: F811
 ) -> None:
-    """BACKLOG #3378 item 4: a ``restart_outbound`` rule's target is an outbound whatever the graph
-    holds, so it is withheld from a scope that lists it even with no graph loaded. The control: the
-    same rule with ``restart_inbound`` shows, since with no graph nothing else marks the name."""
+    """BACKLOG #3378 item 4: a ``restart_outbound`` rule acts on an outbound whatever the graph
+    holds, so it is withheld from a scoped caller even with no graph loaded, a ``"*"`` rule with no
+    target included. The control: the same rule with ``restart_inbound`` shows, since with no graph
+    nothing else marks the name."""
     assert engine.registry_runner is None
     rules = AlertsSettings(
         rules=[
+            *(
+                AlertRule(
+                    id=f"in-{action}",
+                    event_type="connection_stopped",
+                    connection="IB_A",
+                    control_action=action,
+                    control_target="SHARED",
+                )
+                for action in ("restart_outbound", "restart_inbound")
+            ),
             AlertRule(
-                id=f"in-{action}",
-                event_type="connection_stopped",
-                connection="IB_A",
-                control_action=action,
-                control_target="SHARED",
-            )
-            for action in ("restart_outbound", "restart_inbound")
+                id="any-outbound",
+                event_type="message_stall",
+                connection="*",
+                control_action="restart_outbound",
+            ),
         ]
     )
     service = await _service(engine)

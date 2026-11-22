@@ -10616,17 +10616,15 @@ def create_app(
         engine: Engine | None = getattr(request.app.state, "engine", None)
         rr = engine.registry_runner if engine is not None else None
         scoped = _user.allowed_channels is not None
+        # The deployment's inbounds, read once: on an engine shard this is every shard's.
+        inbounds = rr.registry.inbound_names() if rr is not None else frozenset()
 
         def outbound(name: str) -> bool:
             # An outbound spans channels, so a scope that lists one does not reach it (BACKLOG #3378
             # item 4, owner ruling 2026-11-04). knows_outbound also counts a reload-dropped outbound
             # still draining, as the alert's own control action does. A name that is also an
-            # inbound counts as the inbound here, as in _resolve_connection.
-            return (
-                rr is not None
-                and rr.knows_outbound(name)
-                and name not in rr.registry.inbound_names()
-            )
+            # inbound anywhere in the deployment counts as the inbound, as the flag route reads it.
+            return rr is not None and rr.knows_outbound(name) and name not in inbounds
 
         def visible(rule: AlertRule) -> bool:
             if not (rule.connection == "*" or _user.can_access_channel(rule.connection)):
@@ -10637,21 +10635,17 @@ def create_app(
                 return False
             if not scoped:
                 return True
-            if rule.connection != "*" and outbound(rule.connection):
+            # restart_outbound acts on an outbound whatever the graph holds, a name that is also an
+            # inbound and a "*" rule's firing connection included.
+            if _CONTROL_ACTION_SIDE.get(rule.control_action or "") == "outbound":
                 return False
-            if rule.control_target is not None and outbound(rule.control_target):
-                return False
-            # The action names its target's side, so a restart_outbound target is an outbound
-            # whatever the graph holds, a name that is also an inbound included. With no
-            # control_target the target is the event's own connection.
-            target = rule.control_target or (None if rule.connection == "*" else rule.connection)
             return not (
-                target is not None
-                and _CONTROL_ACTION_SIDE.get(rule.control_action or "") == "outbound"
+                (rule.connection != "*" and outbound(rule.connection))
+                or (rule.control_target is not None and outbound(rule.control_target))
             )
 
         rules = [r for r in alerts.rules if visible(r)]
-        show_ids = _user.allowed_channels is None
+        show_ids = not scoped
 
         config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
