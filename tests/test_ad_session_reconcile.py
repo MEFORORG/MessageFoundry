@@ -7446,17 +7446,17 @@ async def test_a_fault_reading_the_evidence_reports_and_still_writes_the_row(
         await store.close()
 
 
-async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet() -> None:
+@pytest.mark.parametrize("reason", ["directory_undetermined", "directory_object_id_missing"])
+async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet(reason: str) -> None:
     """The 2026-10-17 ruling names disabled and absent only. An undetermined account's revocation
-    that ends no session keeps the 2026-10-16 rule: audited, no notice, no alert."""
+    that ends no session keeps the 2026-10-16 rule: audited, no notice, no alert. So does an
+    unkeyed account's, ``directory_object_id_missing`` (vault BACKLOG #3750 item 19)."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         notifier = _CapturingNotifier()
         service._security_notifier = notifier
         user = await _signed_out(store, "jdoe")
-        revocation = reconcile.SessionRevocation(
-            user.id, user.username, reason="directory_undetermined"
-        )
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
         assert (
             await service._apply_reconcile_revocation(
                 revocation, watermark=await service._audit_watermark(), maps_held=True
@@ -7464,6 +7464,8 @@ async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet() -> Non
             == "quiet"
         )
         assert notifier.sent == []
+        rows = _revoked_rows(await store.list_audit())
+        assert len(rows) == 1 and rows[0].get("sessions") == 0, rows  # audited, with no session
     finally:
         await store.close()
 
@@ -7596,6 +7598,45 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         )
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert len(_revoked_rows(await store.list_audit())) == 2
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "cleared", "returned"),
+    [("quiet", True, False), ("reported", True, True), ("skipped", False, False)],
+)
+async def test_a_quiet_revocation_reaches_the_clears_as_applied_and_pages_nobody(
+    monkeypatch: pytest.MonkeyPatch, outcome: str, cleared: bool, returned: bool
+) -> None:
+    """Vault BACKLOG #3750 item 3. A quiet revocation's account holds no session now, so the pass
+    hands it to ``_mark_reconcile_clears`` with the applied revocations, and leaves it off the
+    plan the caller alerts on. RED when the clears are marked over the reported revocations only:
+    the quiet one then never reaches them. A reported one reaches both; a skipped one neither."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        assert await _signed_in_ad_user(service, store, "jdoe") is not None
+        ldap.present.clear()  # the account is disabled in AD
+        assert (await service.reconcile_directory_sessions()).revocations == ()  # strike 1
+
+        async def applied_as(*_args: Any, **_kwargs: Any) -> str:
+            return outcome
+
+        seen: list[tuple[str, ...]] = []
+        real_mark = service._mark_reconcile_clears
+
+        def mark(plan: reconcile.ReconcilePlan, users: Any) -> reconcile.ReconcilePlan:
+            seen.append(tuple(r.username for r in plan.revocations))
+            return real_mark(plan, users)
+
+        monkeypatch.setattr(service, "_apply_reconcile_revocation", applied_as)
+        monkeypatch.setattr(service, "_mark_reconcile_clears", mark)
+        plan = await service.reconcile_directory_sessions()  # strike 2: jdoe is revoked
+        assert seen == [("jdoe",) if cleared else ()], seen
+        assert [r.username for r in plan.revocations] == (["jdoe"] if returned else [])
     finally:
         await store.close()
 
