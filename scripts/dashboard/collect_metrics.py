@@ -29,8 +29,8 @@ child runs with the full power of the user who runs this script. It can run ``gh
 the user's stored credentials (keyring, ``hosts.yml``), read and write any file that user can, and
 so alter the engine files this process runs after it, such as ``scripts/ci/check_stalled_prs.py``,
 ``scripts/asvs/scorecard.py``, ``render_html.py`` and this script. The scrub is an allowlist: the
-child gets only the variables named in ``_CHILD_ENV_KEEP``, plus ``LC_ALL``, so every other variable,
-any token and ``GIT_*`` variable among them, is withheld. Running this script therefore trusts
+child gets only the variables whose names match ``_CHILD_ENV_KEEP`` case-insensitively, plus
+``LC_ALL``, so every other variable, any token and ``GIT_*`` variable among them, is withheld. Running this script therefore trusts
 vault ``origin/main`` as fully as the engine code itself. Pinning the vault code to a reviewed
 commit would narrow that trust; it is not done here.
 
@@ -447,9 +447,9 @@ _CHILD_ENV_KEEP = (
 
 #: Added for the engine's own scorecard tool only: its git probes find the user's global gitconfig
 #: (safe.directory, core.excludesFile) through these. That covers only a gitconfig under the home
-#: directory: XDG_CONFIG_HOME, GIT_CONFIG_GLOBAL and PROGRAMDATA are still dropped, so a gitconfig
-#: found only through one of them is not read, and the engine= stamp can then differ from a plain
-#: run.
+#: directory. Other variables that locate or carry git config are still dropped, at least
+#: XDG_CONFIG_HOME, PROGRAMDATA and every GIT_CONFIG_* one, so config that comes only through one
+#: of them is not read, and the engine= stamp can then differ from a plain run.
 _HOME_ENV_KEEP = ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
 
 
@@ -460,7 +460,7 @@ def child_env(*, home: bool = False) -> dict[str, str]:
 
 
 def _run_python(
-    argv: Sequence[str], cwd: Path | None, env: dict[str, str], *, strict: bool = False
+    argv: Sequence[str], cwd: Path | None, env: dict[str, str], *, strict: bool = True
 ) -> str:
     # -X utf8, not PYTHONUTF8: -I ignores every PYTHON* variable.
     out = run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=env)
@@ -469,22 +469,21 @@ def _run_python(
     try:
         return out.decode("utf-8")
     except UnicodeDecodeError as exc:
-        # Six words, as in run_bytes, so the message names the script that ran.
-        raise CollectError(f"{' '.join(argv[:6])} wrote non-UTF-8 output: {exc}") from None
+        raise CollectError(f"{argv[0]} wrote non-UTF-8 output: {exc}") from None
 
 
 def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:
     """Run the vault census driver: ``python -I -X utf8`` under :func:`child_env`, from ``cwd``
     (the archive root), so a relative write by the vault code never lands in the caller's work
-    tree. Its output is decoded strictly: bytes that are not UTF-8 fail the census rather than
-    reach it as replacement characters."""
-    return _run_python(argv, cwd, child_env(), strict=True)
+    tree. Its output is decoded strictly: output that is not UTF-8 raises :class:`CollectError`
+    instead of being decoded with replacement characters."""
+    return _run_python(argv, cwd, child_env())
 
 
 def run_tool_child(argv: Sequence[str], cwd: Path | None = None) -> str:
     """Run the engine's scorecard tool: ``python -I -X utf8`` under :func:`child_env` plus the
     home variables its git probes need, from ``cwd`` (the engine tree, which it stamps)."""
-    return _run_python(argv, cwd, child_env(home=True))
+    return _run_python(argv, cwd, child_env(home=True), strict=False)
 
 
 def fetch_url(url: str) -> bytes:
@@ -1428,10 +1427,13 @@ def _created(path: Path) -> float:
 
     Creation time, as build.ps1 and scheduled-refresh.ps1 age theirs: a sweep that removes only
     part of a directory moves its modified time to now, which would hide the leftover from the
-    next run. Linux's ``os.stat`` has no ``st_birthtime``, so there the modified time stands in.
+    next run. Linux's ``os.stat`` has no ``st_birthtime``, so there the modified time stands in
+    and that case is not covered. A creation time of zero or less is a filesystem that keeps none,
+    and reading it would age every directory, a live run's too, so the modified time stands in.
     """
     st = path.stat()
-    return float(getattr(st, "st_birthtime", st.st_mtime))
+    born = float(getattr(st, "st_birthtime", 0.0))
+    return born if born > 0 else st.st_mtime
 
 
 def sweep_stale(base: Path, prefix: str, now: float | None = None) -> bool:

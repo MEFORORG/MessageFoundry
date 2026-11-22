@@ -34,7 +34,7 @@ $first = @($ast.EndBlock.Statements)[0]
 """
 
 
-def _ps_literal(path: Path) -> str:
+def _ps_literal(path: Path | str) -> str:
     return "'" + str(path).replace("'", "''") + "'"
 
 
@@ -138,13 +138,15 @@ $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.Functi
 Invoke-Expression $fn.Extent.Text
 # The sweep ages a directory by creation time, which Python cannot set; backdate the -old ones.
 Get-ChildItem -LiteralPath $base -Directory -Filter '*-old' | ForEach-Object { $_.CreationTimeUtc = [DateTime]::UtcNow.AddYears(-20) }
-$r = @(Remove-StaleTemp $base 'mf-dashboard-build-')
+$r = @(Remove-StaleTemp $base $prefix)
 [pscustomobject]@{ result = $r } | ConvertTo-Json -Compress
 """
 
 
-def _sweep(tmp_path: Path) -> list[object]:
-    # Only the sweep function is evaluated, lifted from build.ps1's AST, against tmp_path.
+def _sweep(
+    tmp_path: Path, script: str = "build.ps1", prefix: str = "mf-dashboard-build-"
+) -> list[object]:
+    # Only the sweep function is evaluated, lifted from the script's AST, against tmp_path.
     pwsh = shutil.which("pwsh")
     if pwsh is None:
         pytest.skip("pwsh is not installed")
@@ -154,7 +156,8 @@ def _sweep(tmp_path: Path) -> list[object]:
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            f"$path = {_ps_literal(_DIR / 'build.ps1')}; $base = {_ps_literal(tmp_path)}" + _SWEEP,
+            f"$path = {_ps_literal(_DIR / script)}; $base = {_ps_literal(tmp_path)}; "
+            f"$prefix = {_ps_literal(prefix)}" + _SWEEP,
         ],
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -249,6 +252,17 @@ def test_refs_are_explicit_and_python_splits_on_commas() -> None:
         assert "\"$_\" -split ','" in (_DIR / name).read_text(encoding="utf-8"), name
     build = (_DIR / "build.ps1").read_text(encoding="utf-8")
     assert "'mf-dashboard-build-'" in build and "'mf-dashboard-'" not in build
+
+
+@_WIN_ONLY
+def test_refresh_sweep_ages_by_creation_time(tmp_path: Path) -> None:
+    old = _stale_dir(tmp_path, "mf-dashboard-src-old")
+    fresh = _stale_dir(tmp_path, "mf-dashboard-src-new")
+    # An old last-write time on a new directory: a last-write sweep would remove it.
+    os.utime(fresh, (1_000_000.0, 1_000_000.0))
+    assert _sweep(tmp_path, "scheduled-refresh.ps1", "mf-dashboard-src-") == []
+    assert not old.exists()
+    assert fresh.exists()
 
 
 def test_both_ps_sweeps_age_by_creation_time() -> None:
