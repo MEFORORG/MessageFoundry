@@ -1144,6 +1144,11 @@ IDE_SITES: dict[str, Site] = {
         " sweepStaleCaseDirs docblocks.",
         "ide/src/collectionCaseFiles.ts::st.uid !== uid",
     ),
+    "ide/src/configEditorModel.ts": Site(
+        4,
+        REVIEWED,
+        "The open document's path and the config-dir setting, resolved only to compare them.",
+    ),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/engineTrustModel.ts": Site(

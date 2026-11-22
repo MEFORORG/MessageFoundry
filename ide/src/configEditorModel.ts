@@ -101,7 +101,13 @@ function configDirSegments(
   const p = platform === "win32" ? path.win32 : path.posix;
   const caseInsensitive = platform === "win32" || platform === "darwin";
   const fold = (s: string): string => (caseInsensitive ? s.toLowerCase() : s);
-  const rel = p.relative(fold(p.resolve(workspaceDir, configDir)), fold(p.resolve(documentFsPath)));
+  const dir =
+    platform === "win32"
+      ? path.win32.resolve(workspaceDir, configDir)
+      : path.posix.resolve(workspaceDir, configDir);
+  const doc =
+    platform === "win32" ? path.win32.resolve(documentFsPath) : path.posix.resolve(documentFsPath);
+  const rel = p.relative(fold(dir), fold(doc));
   // `relative` is "" for the dir itself, absolute across Windows drives, and starts with a `..`
   // SEGMENT when outside -- not merely those characters, so a child dir named "..x" is still inside.
   if (p.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${p.sep}`)) {
