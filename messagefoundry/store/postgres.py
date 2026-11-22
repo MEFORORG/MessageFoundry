@@ -7649,11 +7649,11 @@ class PostgresStore:
         """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
-        all dead-letter together). Returns a :class:`FailOutcome` naming the first member still
-        present, with the shared ``next_attempt_at`` or the count written DEAD.
-        On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
-        own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
-        when every member was skipped."""
+        all dead-letter together). Returns a :class:`FailOutcome` naming the head, the first member
+        still open (the first present if all are resolved), with the shared ``next_attempt_at`` or
+        the count written DEAD. On either branch a resolved member is skipped and keeps its own state
+        (ADR 0157 Amendments A and D); the shared retry time still comes back when every member was
+        skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
@@ -7661,21 +7661,25 @@ class PostgresStore:
                 self._timed_acquire() as conn,
                 conn.transaction(isolation=_FINALIZE_ISOLATION),
             ):
-                # ADR 0157 Amendment D (BACKLOG #5724): lock in sorted id order, one keyed read each,
-                # and keep the caller's order for the head and the writes.
-                handed = tuple(outbox_ids)  # walked twice: the lock order, then the caller's order
-                locked = {
-                    oid: await conn.fetchrow(
+                # ADR 0157 Amendment D (BACKLOG #5724): lock in the caller's order, the order
+                # mark_batch_done locks the same rows in, so the two cannot deadlock.
+                present = []
+                for outbox_id in outbox_ids:
+                    row = await conn.fetchrow(
                         "SELECT message_id, destination_name, attempts, status"
                         " FROM queue WHERE id=$1 FOR UPDATE",
-                        oid,
+                        outbox_id,
                     )
-                    for oid in sorted(set(handed))
-                }
-                present = [(oid, locked[oid]) for oid in handed if locked[oid] is not None]
+                    if row is not None:
+                        present.append((outbox_id, row))
                 if not present:
                     return FailOutcome()
-                head_attempts = present[0][1]["attempts"]
+                # The head is the first member still open: a resolved row has left the batch, so
+                # its attempts decide nothing. With every member resolved, the first present.
+                head_id, head_row = next(
+                    (m for m in present if m[1]["status"] not in _RESOLVED_STATUSES), present[0]
+                )
+                head_attempts = head_row["attempts"]
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
@@ -7704,8 +7708,7 @@ class PostgresStore:
                 finalize: dict[str, None] = {}
                 changed = 0
                 for outbox_id, row in present:
-                    # Amendment D: the DEAD branch declines a resolved member before its UPDATE. A
-                    # resolved head still decided the disposition above.
+                    # Amendment D: the DEAD branch declines a resolved member before its UPDATE.
                     if not retrying and row["status"] in _RESOLVED_STATUSES:
                         continue
                     args = (
@@ -7744,7 +7747,7 @@ class PostgresStore:
                 return FailOutcome(
                     retry_at=next_at if retrying else None,
                     dead=0 if retrying else changed,
-                    head_id=present[0][0],
+                    head_id=head_id,
                     attempts=head_attempts,
                     dead_messages=tuple(finalize),  # filled on the DEAD branch only
                 )
@@ -7756,30 +7759,27 @@ class PostgresStore:
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
     ) -> None:
         """Force N outbound rows terminal (``DEAD``) in one transaction — the batch counterpart of
-        :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N)."""
+        :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N
+        still open; a resolved member keeps its state, ADR 0157 Amendment D)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(
             6
         )  # ADR 0157 C1 — TERMINAL, once for the whole loop
-        all_ids = tuple(outbox_ids)  # walked twice below, and a fence re-pends all N
+        all_ids = tuple(outbox_ids)  # a fence re-pends all N, members not yet walked included
         try:
             async with (
                 self._timed_acquire() as conn,
                 conn.transaction(isolation=_FINALIZE_ISOLATION),
             ):
-                # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed.
-                locked = {
-                    oid: await conn.fetchrow(
-                        "SELECT message_id, destination_name, status"
-                        " FROM queue WHERE id=$1 FOR UPDATE",
-                        oid,
-                    )
-                    for oid in sorted(set(all_ids))
-                }
                 finalize: dict[str, None] = {}
                 for outbox_id in all_ids:
-                    row = locked[outbox_id]
+                    # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed: caller's order.
+                    row = await conn.fetchrow(
+                        "SELECT message_id, destination_name, status"
+                        " FROM queue WHERE id=$1 FOR UPDATE",
+                        outbox_id,
+                    )
                     if row is None or row["status"] in _RESOLVED_STATUSES:
                         continue
                     await self._exec_terminal(

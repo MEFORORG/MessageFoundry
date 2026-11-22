@@ -1082,7 +1082,8 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to every member, so all N re-pend to the same ``next_attempt_at`` (re-claimed
         as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. The
-        head is the first member still present, and the returned :class:`FailOutcome` names it, with
+        head is the first member still open (the first present if all are resolved), and the
+        returned :class:`FailOutcome` names it, with
         the shared ``next_attempt_at`` as ``retry_at`` when rescheduled and the members written DEAD
         as ``dead``. An empty or wholly vanished batch returns an empty outcome, and so does a final
         write the H1 fence rolled back. On the
@@ -1090,8 +1091,7 @@ class QueueStore(StoreLifecycle, Protocol):
         all, as in
         :meth:`mark_failed`, and the shared retry time is returned even when every member was
         skipped. On the DEAD branch a member already ``done``, ``dead`` or ``cancelled`` is skipped
-        the same way and is not counted in ``dead`` (ADR 0157 Amendment D). A resolved head still
-        decides the disposition and is still the one named."""
+        the same way and is not counted in ``dead`` (ADR 0157 Amendment D)."""
         ...
 
     async def dead_letter_batch(

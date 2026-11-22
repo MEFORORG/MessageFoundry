@@ -446,9 +446,9 @@ async def test_postgres_dead_now_reads_under_a_lock_and_declines_a_resolved_row(
     assert _pg_updates(conn) == [] and order == []
 
 
-async def test_postgres_batch_locks_sorted_keeps_the_callers_head_and_declines() -> None:
-    """Locks go in sorted id order whatever the caller passed, the head stays the caller's first
-    member, and the resolved member gets no UPDATE, event or finalize."""
+async def test_postgres_batch_locks_in_the_callers_order_and_declines() -> None:
+    """Locks follow the caller's order, the order mark_batch_done uses, so the two cannot deadlock.
+    The head is the first open member, and the resolved one gets no UPDATE, event or finalize."""
     for write in ("dead_letter_batch", "mark_batch_failed"):
         conn = _PgConn({"c": "inflight", "a": "done", "b": "pending"})
         store, order = _pg_store(conn)
@@ -459,7 +459,7 @@ async def test_postgres_batch_locks_sorted_keeps_the_callers_head_and_declines()
         outcome = await getattr(store, write)(["c", "a", "b"], *args, now=1.0)
 
         reads = [a[0] for s, a in conn.calls if s.startswith("SELECT")]
-        assert reads == ["a", "b", "c"], write
+        assert reads == ["c", "a", "b"], write
         assert all(s.endswith("FOR UPDATE") for s, _a in conn.calls if s.startswith("SELECT"))
         assert [a[4] for _s, a in _pg_updates(conn)] == ["c", "b"], write
         assert order == [

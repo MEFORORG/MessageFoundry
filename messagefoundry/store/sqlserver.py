@@ -10060,8 +10060,8 @@ class SqlServerStore:
     ) -> int:
         """Dead-letter non-terminal routed queue rows whose handler_name is no longer in the registry
         (a removed/renamed handler) — no transform worker would drain them, so they'd strand forever.
-        Call ONCE at startup, AFTER reset_stale_inflight. Per-message finalize applocks are pre-acquired
-        in sorted id order to avoid multi-message deadlock; a killed routed row -> DEAD -> the finalizer
+        Call ONCE at startup, AFTER reset_stale_inflight. Per-message finalize applocks are taken in
+        sorted id order after the row updates (BACKLOG #5729); a killed routed row -> DEAD -> the finalizer
         resolves the message to ERROR."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -10101,7 +10101,7 @@ class SqlServerStore:
         forever. Outbound rows key on destination_name and drain regardless of origin, so they are
         excluded. Call ONCE at startup, AFTER reset_stale_inflight. ``valid_names`` is the WHOLE
         deployment's inbound names, never one engine shard's slice. Per-message finalize applocks are
-        pre-acquired in sorted id order to avoid multi-message deadlock; a killed row -> DEAD -> the
+        taken in sorted id order after the row updates (BACKLOG #5729); a killed row -> DEAD -> the
         finalizer resolves the message to ERROR."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -12405,34 +12405,34 @@ class SqlServerStore:
         """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
-        all dead-letter together). Returns a :class:`FailOutcome` naming the first member still
-        present, with the shared ``next_attempt_at`` or the count written DEAD.
-        On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
-        own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
-        when every member was skipped."""
+        all dead-letter together). Returns a :class:`FailOutcome` naming the head, the first member
+        still open (the first present if all are resolved), with the shared ``next_attempt_at`` or
+        the count written DEAD. On either branch a resolved member is skipped and keeps its own state
+        (ADR 0157 Amendments A and D); the shared retry time still comes back when every member was
+        skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # ADR 0157 Amendment D (BACKLOG #5724): lock in sorted id order, one keyed read each
-                # (a set read's lock order is the plan's), and keep the caller's order for the head
-                # and the writes.
-                handed = tuple(outbox_ids)  # walked twice: the lock order, then the caller's order
-                locked: dict[str, Any] = {}
-                for outbox_id in sorted(set(handed)):
+                # ADR 0157 Amendment D (BACKLOG #5724): lock in the caller's order, the order
+                # mark_batch_done locks the same rows in, so the two cannot deadlock.
+                present: list[tuple[str, Any, Any, Any, Any]] = []
+                for outbox_id in outbox_ids:
                     await cur.execute(
                         "SELECT message_id, destination_name, attempts, status"
                         " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                         (outbox_id,),
                     )
-                    locked[outbox_id] = await cur.fetchone()
-                present: list[tuple[str, Any, Any, Any, Any]] = [
-                    (oid, *locked[oid]) for oid in handed if locked[oid] is not None
-                ]
+                    row = await cur.fetchone()
+                    if row is not None:
+                        present.append((outbox_id, row[0], row[1], row[2], row[3]))
                 if not present:
                     await self._commit(conn)
                     return FailOutcome()
-                head_attempts = present[0][3]
+                # The head is the first member still open: a resolved row has left the batch, so
+                # its attempts decide nothing. With every member resolved, the first present.
+                head = next((m for m in present if m[4] not in _RESOLVED_STATUSES), present[0])
+                head_attempts = head[3]
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
@@ -12465,8 +12465,7 @@ class SqlServerStore:
                 finalize: dict[str, None] = {}
                 changed = 0
                 for outbox_id, message_id, destination_name, attempts, row_status in present:
-                    # Amendment D: the DEAD branch declines a resolved member before its UPDATE. A
-                    # resolved head still decided the disposition above.
+                    # Amendment D: the DEAD branch declines a resolved member before its UPDATE.
                     if not retrying and row_status in _RESOLVED_STATUSES:
                         continue
                     params = (
@@ -12507,7 +12506,7 @@ class SqlServerStore:
                 return FailOutcome(
                     retry_at=next_at if retrying else None,
                     dead=0 if retrying else changed,
-                    head_id=present[0][0],
+                    head_id=head[0],
                     attempts=head_attempts,
                     dead_messages=tuple(finalize),  # filled on the DEAD branch only
                 )
@@ -12521,7 +12520,8 @@ class SqlServerStore:
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
     ) -> None:
         """Force N outbound rows terminal (``DEAD``) in one transaction — the batch counterpart of
-        :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N)."""
+        :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N
+        still open; a resolved member keeps its state, ADR 0157 Amendment D)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         # ADR 0157 C1: TERMINAL, once for the loop.
@@ -12529,18 +12529,15 @@ class SqlServerStore:
         all_ids = tuple(outbox_ids)  # a rejection re-pends ALL N, as in mark_batch_done
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed.
-                locked: dict[str, Any] = {}
-                for outbox_id in sorted(set(all_ids)):
+                finalize: dict[str, None] = {}
+                for outbox_id in all_ids:
+                    # ADR 0157 Amendment D (BACKLOG #5724), as mark_batch_failed: caller's order.
                     await cur.execute(
                         "SELECT message_id, destination_name, status"
                         " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                         (outbox_id,),
                     )
-                    locked[outbox_id] = await cur.fetchone()
-                finalize: dict[str, None] = {}
-                for outbox_id in all_ids:
-                    row = locked[outbox_id]
+                    row = await cur.fetchone()
                     if row is None or row[2] in _RESOLVED_STATUSES:
                         continue
                     message_id, destination_name = row[0], row[1]
@@ -13129,8 +13126,8 @@ class SqlServerStore:
     ) -> int:
         """Dead-letter non-terminal outbound queue rows whose destination_name is no longer in the
         registry (a removed/renamed outbound) — they have no delivery worker and would strand forever
-        (H-5). The per-message finalize applocks are pre-acquired in sorted id order so two concurrent
-        multi-message finalizers can't deadlock."""
+        (H-5). The per-message finalize applocks are taken in sorted id order after the row updates
+        (BACKLOG #5729)."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:

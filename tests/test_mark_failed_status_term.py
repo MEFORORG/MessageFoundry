@@ -406,23 +406,45 @@ async def test_a_dead_sibling_still_lands_on_an_open_row(store: MessageStore, wr
         assert await _message_status(store, mid) == MessageStatus.ERROR.value
 
 
-async def test_a_resolved_head_still_decides_and_only_the_open_member_goes_dead(
+async def test_a_resolved_head_is_not_the_head_and_only_the_open_member_goes_dead(
     store: MessageStore,
 ) -> None:
-    """The choice for a resolved head member. The disposition still comes from the first member
-    present, as it does on the retry branch, and ``head_id`` still names it. Only the write is
-    declined, so the delivered head stays DONE and the open member is what the outcome counts."""
-    mid, (head, other) = await _claimed(store, "OB1", "OB2")
-    await store.mark_done(head, now=101.0)
+    """The first member still open is the head, so the outcome names the row actually written."""
+    mid, (done, open_row) = await _claimed(store, "OB1", "OB2")
+    await store.mark_done(done, now=101.0)
 
-    failed = await store.mark_batch_failed([head, other], "late", _AT_CAP, now=102.0)
+    failed = await store.mark_batch_failed([done, open_row], "late", _AT_CAP, now=102.0)
 
     rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
     assert rows["OB1"]["status"] == OutboxStatus.DONE.value
     assert rows["OB2"]["status"] == OutboxStatus.DEAD.value
-    assert (failed.dead, failed.head_id, failed.dead_messages) == (1, head, (mid,))
+    assert (failed.dead, failed.head_id, failed.dead_messages) == (1, open_row, (mid,))
     assert failed.retry_at is None
     assert await _message_status(store, mid) == MessageStatus.ERROR.value
+
+
+@pytest.mark.parametrize(
+    ("done_attempts", "open_attempts", "dead"), [(5, 1, 0), (1, 5, 1)], ids=["retries", "dies"]
+)
+async def test_a_resolved_heads_attempts_do_not_decide_for_an_open_member(
+    store: MessageStore, done_attempts: int, open_attempts: int, dead: int
+) -> None:
+    """Both directions: a finished row at the cap cannot kill a member with retries left, and one
+    below the cap cannot re-pend a member already at it."""
+    mid, (done, open_row) = await _claimed(store, "OB1", "OB2")
+    await store.mark_done(done, now=101.0)
+    for oid, attempts in ((done, done_attempts), (open_row, open_attempts)):
+        await store._db.execute("UPDATE queue SET attempts=? WHERE id=?", (attempts, oid))
+    await store._db.commit()
+    policy = RetryPolicy(max_attempts=5, backoff_seconds=5, backoff_multiplier=1)
+
+    failed = await store.mark_batch_failed([done, open_row], "late", policy, now=102.0)
+
+    assert (failed.dead, failed.head_id, failed.attempts) == (dead, open_row, open_attempts)
+    rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
+    assert rows["OB1"]["status"] == OutboxStatus.DONE.value
+    expected = OutboxStatus.DEAD.value if dead else OutboxStatus.PENDING.value
+    assert rows["OB2"]["status"] == expected
 
 
 async def test_a_batch_dead_letter_with_every_member_resolved_reports_nothing_dead(

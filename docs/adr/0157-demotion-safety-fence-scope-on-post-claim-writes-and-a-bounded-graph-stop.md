@@ -1478,23 +1478,22 @@ already DONE, DEAD or CANCELLED before its UPDATE. None of those UPDATEs gained 
 on Postgres and SQL Server a miss is still the fence alone (C3), and C2 is not contradicted: an
 INFLIGHT or PENDING row is still written.
 
-**Batch members.** The server backends lock members one keyed read at a time in sorted id order,
-because a set read's lock order on SQL Server is the plan's and not its `ORDER BY`. The writes keep
-the caller's order. **A resolved head still decides the batch's disposition**, from its attempts,
-and `head_id` still names it, as on the retry branch; only its write is declined. So a batch whose
-delivered head is at the cap dead-letters its open members, even a member whose own attempts are
-below the cap, and a resolved head below the cap re-pends a member already at it. This keeps the
-disposition rule as it was and is a known cost. A batch with every member resolved
-writes nothing and reports `dead=0` with no retry time. `dead_letter_now` keeps its `None` return,
-so a caller cannot tell a decline from a landed write, as it already cannot for a vanished or
-fenced row; it re-reads nothing from it.
+**Batch members.** The server backends lock members one keyed read at a time in the caller's
+order, the order `mark_batch_done` locks the same rows in. A sorted order here would invert against
+it and could deadlock a late failure with the delivery it raced. **The head is the first member
+still open**, because a resolved row has left the batch: its attempts decide nothing and `head_id`
+does not name it. With every member resolved the head is the first present, nothing is written, and
+the DEAD branch reports `dead=0` with no retry time. `dead_letter_now` keeps its `None` return, so
+a caller cannot tell a decline from a landed write, as it already cannot for a vanished or fenced
+row.
 
 **What changed for the startup sweeps (#5729).** On Postgres and SQL Server the
 `dead_letter_missing_destinations`, `_handlers` and `_inbounds` sweeps select candidates unlocked,
 then run one UPDATE per row in sorted id order with `status IN (pending, inflight)`, reading the
-match from `RETURNING` or `OUTPUT`. One statement per row rather than one set UPDATE, because each
-row's `last_error` is sealed to its own id. Events, finalize locks and the finalize run after the
-UPDATEs and only for rows actually changed, and the count returned and logged is those rows.
+match from the command tag or `OUTPUT`. One statement per row rather than one set UPDATE, because each
+row's `last_error` is sealed to its own id. Each changed row's event follows its UPDATE. The
+finalize locks and the finalize run after all the UPDATEs, only for rows actually changed, and the
+count returned and logged is those rows.
 
 **Why a status term is right here and wrong above.** C2 and C3 keep a status term off a *fenced*
 write, because its empty result must mean the fence fired. These sweeps carry no epoch fence

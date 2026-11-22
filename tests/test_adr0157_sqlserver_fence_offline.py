@@ -702,7 +702,7 @@ async def test_a_fence_miss_on_an_open_row_still_fires_after_the_lock() -> None:
     assert released == [["a"]] and store.fenced_writes == 1 and conn.commits == 0
 
 
-async def test_a_batch_locks_sorted_keeps_the_callers_head_and_declines() -> None:
+async def test_a_batch_locks_in_the_callers_order_and_declines() -> None:
     for write in ("dead_letter_batch", "mark_batch_failed"):
         cur, conn = _RowCursor({"c": "inflight", "a": "done", "b": "pending"}), _Conn()
         store, released = _store(cur, conn, epoch=None)
@@ -714,7 +714,7 @@ async def test_a_batch_locks_sorted_keeps_the_callers_head_and_declines() -> Non
         outcome = await getattr(store, write)(["c", "a", "b"], *args, now=1.0)
 
         reads = [(s, p) for s, p in cur.calls if s.startswith("SELECT")]
-        assert [p[0] for _s, p in reads] == ["a", "b", "c"], write
+        assert [p[0] for _s, p in reads] == ["c", "a", "b"], write
         assert all("WITH (UPDLOCK, ROWLOCK)" in s for s, _p in reads), write
         assert [p[4] for _s, p in _updates(cur)] == ["c", "b"], write
         assert order == ["event:dead:m-c", "event:dead:m-b", "finalize:m-b", "finalize:m-c"], write

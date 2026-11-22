@@ -16802,9 +16802,9 @@ class MessageStore:
         preserved), or all dead-letter together — never a split batch that fractures the prefix. Returns
         a :class:`FailOutcome`: the shared ``next_attempt_at`` as ``retry_at`` when rescheduled (the
         runner arms the lane retry wake on it), and the members it dead-lettered as ``dead``, decided
-        from the first member still present (``head_id``). A vanished member is skipped, and on the retry
-        branch so is a member that is neither INFLIGHT nor PENDING (ADR 0157 Amendment A, widened
-        2026-09-29), which is a terminal member; it keeps its own state."""
+        from the first member still open, or the first present if all are resolved (``head_id``). A
+        vanished member is skipped, and on either branch so is a resolved member, which keeps its own
+        state (ADR 0157 Amendments A and D)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         outcome = FailOutcome()
@@ -16815,8 +16815,13 @@ class MessageStore:
             present = [(oid, r) for oid, r in rows if r is not None]
             if not present:
                 raise _AbortMember(None)  # every member vanished — nothing to do
-            # ONE disposition for the whole batch, from the HEAD member's (post-claim) attempts.
-            head_attempts = present[0][1]["attempts"]
+            # ONE disposition for the whole batch, from the HEAD member's (post-claim) attempts. The
+            # head is the first member still open: a resolved row has left the batch, so its attempts
+            # decide nothing (ADR 0157 Amendment D). With every member resolved, the first present.
+            head_id, head_row = next(
+                (m for m in present if m[1]["status"] not in _RESOLVED_STATUSES), present[0]
+            )
+            head_attempts = head_row["attempts"]
             if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                 status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
             else:
@@ -16831,7 +16836,7 @@ class MessageStore:
             finalize: dict[str, None] = {}
             for outbox_id, row in present:
                 # ADR 0157 Amendment D (BACKLOG #5724): the DEAD branch declines a resolved member,
-                # read under the writer lock. A resolved head still decides the disposition above.
+                # read under the writer lock.
                 if not retrying and row["status"] in _RESOLVED_STATUSES:
                     continue
                 cur = await self._db.execute(
@@ -16865,7 +16870,7 @@ class MessageStore:
             outcome = FailOutcome(
                 retry_at=next_at if retrying else None,
                 dead=0 if retrying else changed,
-                head_id=present[0][0],
+                head_id=head_id,
                 attempts=head_attempts,
                 dead_messages=tuple(finalize),  # filled on the DEAD branch only, in handed order
             )
@@ -16884,7 +16889,8 @@ class MessageStore:
         :meth:`dead_letter_now` (ADR 0082 ratified decision #1). A **permanent** partner reject (``AR``)
         of the envelope can never succeed as-is, so all N dead-letter together (atomic, no retry
         consumed), preserving the atomic-batch guarantee; the operator replays the dead-lettered batch.
-        The finalizer runs once per distinct ``message_id``; a vanished member is skipped."""
+        The finalizer runs once per distinct ``message_id``; a vanished or resolved member is skipped
+        (ADR 0157 Amendment D)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
 
