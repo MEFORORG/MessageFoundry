@@ -185,9 +185,7 @@ class FinishedAuditLine(str):
 def _is_finished_line(record: logging.LogRecord) -> bool:
     """Whether ``record``'s message is a :class:`FinishedAuditLine` the text passes must skip."""
     return (
-        isinstance(record.msg, FinishedAuditLine)
-        and not record.args
-        and record.name == AUDIT_LOGGER_NAME
+        isinstance(record.msg, FinishedAuditLine) and not record.args and _is_audit_record(record)
     )
 
 

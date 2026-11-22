@@ -40,10 +40,10 @@ import logging
 import re
 from collections import Counter
 from collections.abc import Callable
-from typing import overload
 
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.logging_setup import (
+    _SHIPPED_READING_MAX_PASSES,
     AUDIT_LOGGER_NAME,
     FinishedAuditLine,
     ensure_logger_sink,
@@ -134,9 +134,6 @@ _PLACEHOLDERS = re.compile(r"\[redacted\]|<redacted>")
 _WORD = re.compile(r"[^\W_]+")
 #: Whether this process has logged a field scrub fault; see :func:`_scrub_field`.
 _FIELD_SCRUB_FAULT_LOGGED = False
-#: The most passes :func:`_settled` runs before it gives up on a value that is still changing.
-#: The handler chain is not idempotent, and a later handler used to get those extra passes.
-_SETTLE_PASSES = 12
 #: The record's free-text fields, the ones :func:`_tee_line` may cut to keep the line bounded.
 _TEXT_FIELDS = ("action", "actor", "channel_id", "client", "detail")
 
@@ -233,11 +230,7 @@ def _bounded_detail(kept: str, note: str, old: str) -> str:
     return shipped
 
 
-@overload
-def _scrub_field(value: str, *, detail: bool = False) -> str: ...
-@overload
-def _scrub_field(value: None, *, detail: bool = False) -> None: ...
-def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
+def _scrub_field(value: str, *, detail: bool = False) -> str:
     """One tee field, scrubbed by the handlers' text passes before ``json.dumps`` escapes a C0
     control in it (BACKLOG #3045). A value the scrub finds no C0 control in, within the window
     :func:`_window` names, is returned unchanged.
@@ -259,8 +252,6 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     that spells a C0 control decoded first and encoded again after, and the whole field is then
     the JSON string ``"[redacted]"``, as it is where the result no longer parses. On a fault the
     whole field is returned. :func:`_finished` then scrubs what this returns, control or none."""
-    if value is None:
-        return None
     as_json = False
     try:
         probe, note = _window(value, detail=detail)
@@ -323,8 +314,8 @@ def _log_scrub_fault(exc: Exception) -> None:
 
 def _settled(text: str) -> str | None:
     """``text`` once the handlers' text passes change it no more, or ``None`` if they still do
-    after :data:`_SETTLE_PASSES`. A further pass can redact more than the first."""
-    for _ in range(_SETTLE_PASSES):
+    after the shipped chain's own cap. A further pass can redact more than the first."""
+    for _ in range(_SHIPPED_READING_MAX_PASSES):
         out = scrub_log_text(text)
         if out == text:
             return out
@@ -345,14 +336,16 @@ def _finished(key: str, written: str, scrubbed: str) -> str:
     settled = _settled(scrubbed)
     if settled is None:
         return _FIELD_REDACTED
-    encoded = json.dumps(written, ensure_ascii=False)[1:-1]
-    if settled == written and encoded == written and scrub_control_chars(written) == written:
-        return written
     # Spelled as the line will be, so an escape splits words here as it does in the readings.
     shown = scrub_control_chars(json.dumps(settled, ensure_ascii=False)[1:-1])
+    if settled == written and shown == written:  # escapes only lengthen, so nothing was escaped
+        return written
     member = json.dumps({key: written}, ensure_ascii=False)
-    if not all(_shows_no_more(shown, _line_words(r)) for r in sink_readings(member)):
-        return _FIELD_REDACTED
+    words = _line_words(shown)
+    for reading in dict.fromkeys(sink_readings(member)):
+        bar = _line_words(reading)
+        if not all(seen <= limit for seen, limit in zip(words, bar, strict=True)):
+            return _FIELD_REDACTED
     return settled
 
 
@@ -365,10 +358,9 @@ def _finished_detail(detail: str) -> str:
     kept = _scrub_field(detail, detail=True)
     # Judged before safe_text bounds it: the bound's own "(+N chars)" is not text of the value.
     scrubbed = _finished("detail", head, head if kept is detail else kept)
-    if scrubbed == _FIELD_REDACTED:
-        return _bounded_detail(_FIELD_REDACTED, note, bounded)
-    shipped = bounded if scrubbed == head else _bounded_detail(scrubbed, note, bounded)
-    final = _settled(shipped)
+    final = None
+    if scrubbed != _FIELD_REDACTED:
+        final = _settled(bounded if scrubbed == head else _bounded_detail(scrubbed, note, bounded))
     if final is None:
         return _bounded_detail(_FIELD_REDACTED, note, bounded)
     if _parses(bounded) and not _parses(final):
@@ -383,7 +375,7 @@ def _tee_line(record: dict[str, object]) -> FinishedAuditLine:
     A line over the window has its longest text field cut, with the clamp's note, until it fits.
     Each field stays present, so the line still parses and keeps its anchors."""
     fields = dict(record)
-    for _ in _TEXT_FIELDS:
+    for _ in range(len(_TEXT_FIELDS) + 1):
         line = FinishedAuditLine(json.dumps(fields, ensure_ascii=False))
         excess = len(line) - _REDACT_WINDOW
         if excess <= 0:
@@ -392,9 +384,6 @@ def _tee_line(record: dict[str, object]) -> FinishedAuditLine:
         value = str(fields[key] or "")
         cut = clamp_untrusted(value, window=max(len(value) - excess, 0))
         fields[key] = cut if len(cut) < len(value) else _FIELD_REDACTED
-    line = FinishedAuditLine(json.dumps(fields, ensure_ascii=False))
-    if len(line) <= _REDACT_WINDOW:
-        return line
     hidden = {k: _FIELD_REDACTED for k in _TEXT_FIELDS if record[k] is not None}
     return FinishedAuditLine(json.dumps({**record, **hidden}, ensure_ascii=False))
 
@@ -470,9 +459,9 @@ def emit_audit_tee(
     break chain verification on the first rekey. See BACKLOG #1198. Because of all that, ``detail`` is
     run through
     :func:`~messagefoundry.redaction.safe_text` — which scrubs HL7-shaped spans and bounds length —
-    before it leaves the process. The handler-level ``RedactionFilter`` re-scrubs as a backstop, but
-    redacting here keeps the off-box guarantee independent of handler config and **identical across
-    every backend**.
+    before it leaves the process. No handler filter re-reads this message (BACKLOG #5649), so the
+    scrub here is its only redaction, independent of handler config and **identical across every
+    backend**.
 
     **Each field is scrubbed, then the record is serialized, and no filter rewrites the result
     (BACKLOG #5649).** A failed sign-in sets ``actor`` to the typed name, so a client chooses its
