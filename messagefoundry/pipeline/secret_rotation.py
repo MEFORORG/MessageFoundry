@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MonitoredSecret",
+    "ROTATION_CLOSED_WITHOUT_ROLL_ACTION",
     "ROTATION_RECORD_ID",
     "RefusedSecret",
     "SecretCheck",
@@ -257,6 +258,10 @@ def dek_fingerprint(key_id: str) -> str:
 #: leaves it alone and it reads the same under any key.
 ROTATION_RECORD_ID = "rotate-key:incomplete"
 _ROTATION_RECORD_CLOSED = ""
+
+#: The audit action ``rotate-key --close-without-roll`` writes when it closes the rotation record
+#: over an audit chain no run can roll (BACKLOG #4935).
+ROTATION_CLOSED_WITHOUT_ROLL_ACTION = "store.rotation_closed_without_roll"
 
 
 def _record_open(record: SecretRotationMetaRow | None) -> TypeGuard[SecretRotationMetaRow]:

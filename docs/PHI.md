@@ -812,8 +812,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    2026-11-04): re-run `rotate-key` with the same keys and `--close-without-roll "<reason>"`. A run
    that then re-seals the data with no skip writes a `store.rotation_closed_without_roll` audit row
    carrying the reason, stamps the key's rotation date and closes the record. It rolls nothing, the
-   chain still does not verify, the run still exits 1, and the prior key stays needed to verify the
-   rows it MACed. The refusal also names at least two other ways out:
+   chain still does not verify, and the run still exits 1. Keep the prior key: the rows it MACed do
+   not verify without it, and where the chain's current range is under it, new audit rows are still
+   MACed under it, since no run can roll the chain off it. The refusal also names at least two other ways out:
    `[secret_rotation].store_key_last_rotated`, set to the date of a run that re-sealed the data with
    no skip, and `[secret_rotation].enforce_store_key_expiry = false`, which lifts only the start
    refusal and is a named security loosening.

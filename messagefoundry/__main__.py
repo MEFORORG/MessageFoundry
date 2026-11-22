@@ -12470,11 +12470,9 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
 #: The docs/SECURITY.md section ``rotate-key``'s vault_transit refusal cites, by its bold title.
 _TRANSIT_AUDIT_RETIRE_SECTION = "Retiring an old version of the audit key breaks the chain"
 
-#: The audit action ``rotate-key --close-without-roll`` writes when it closes the rotation record
-#: over an audit chain no run can roll (BACKLOG #4935).
-ROTATION_CLOSED_WITHOUT_ROLL_ACTION = "store.rotation_closed_without_roll"
-#: The longest ``--close-without-roll`` reason, in UTF-16 code units, as the attestation's reason
-#: is bounded, so the audit detail that carries it stays a bounded size.
+#: The longest ``--close-without-roll`` reason, in UTF-16 code units, the number the Transit bound
+#: attestation's reason takes. The roll's refusal recorded beside it is cut to this many
+#: characters too, since its text can quote a stored value (BACKLOG #4935).
 _ROTATION_CLOSE_REASON_MAX = 1000
 
 
@@ -12540,6 +12538,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.pipeline.secret_rotation import ROTATION_CLOSED_WITHOUT_ROLL_ACTION
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.row_seal import ResealOutcome
@@ -12609,8 +12608,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "MEFOR_STORE_TRANSIT_AUDIT_KEY is set to the name of a different Transit key, and set "
             "empty or to the data key's own name it is still the data key. Trimming a version off "
             "either key does the same to what it sealed or MACed, and the engine cannot undo it; "
-            "a restore from a Transit key backup or a Vault snapshot taken before the trim may "
-            "bring the version back. docs/SECURITY.md, under "
+            "a restore of a Vault snapshot taken before the trim may bring the version back. "
+            "docs/SECURITY.md, under "
             f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
             "does to the attestation. Nothing was changed.",
             file=sys.stderr,
@@ -12770,23 +12769,28 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # It is one-way; docs/PHI.md says what that costs. A re-run finds the range already
             # under this key, and the roll is a verified no-op.
             rolled = await store.roll_audit_key_epoch()
-            # BACKLOG #4935, owner ruling 2026-11-04 ("Dedicated exit"): where the record holds
-            # this key, both data passes completed with no skip, and the roll refused in a way no
-            # run clears, the operator may close the record with a reason. The audit row goes
-            # first, so a refused append closes nothing and stamps nothing.
-            closing = (
-                close_reason is not None
-                and record_named
-                and not rolled[0]
-                and audit_roll_refused_for_good(rolled[1])
-                and not uploads.incomplete
-                and isinstance(store, SecretRotationMetaStore)
+            # BACKLOG #4934, #4935: some chains no run can roll, under any key, a new one
+            # included, and the rotation record then holds a changed key's stamp for good. A run
+            # with the key already stamped opens no record, and a refusal a re-run or a restored
+            # key clears has its own remedy in the roll's error.
+            held_for_good = (
+                record_named and not rolled[0] and audit_roll_refused_for_good(rolled[1])
             )
+            # BACKLOG #4935, owner ruling 2026-11-04 ("Dedicated exit"): there, once both data
+            # passes completed with no skip, the operator may close the record with a reason.
+            # The audit row goes first, in its own transaction, so a refused append closes
+            # nothing and stamps nothing; a failure after it leaves the record open for a re-run.
+            closing = close_reason is not None and held_for_good and not uploads.incomplete
             if closing:
                 await store.record_audit(
                     ROTATION_CLOSED_WITHOUT_ROLL_ACTION,
                     actor=close_actor,
-                    detail=json.dumps({"reason": close_reason, "roll_refusal": rolled[1]}),
+                    detail=json.dumps(
+                        {
+                            "reason": close_reason,
+                            "roll_refusal": rolled[1][:_ROTATION_CLOSE_REASON_MAX],
+                        }
+                    ),
                 )
             # ASVS 13.3.4: stamp the DEK rotation so the watcher's clock resets automatically (rotation
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
@@ -12835,16 +12839,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
                             last_rotated=today,
                         )
                 await close_rotation_record(store, today)
-            # BACKLOG #4934, #4935: some chains no run can roll, under any key, a new one
-            # included, and the rotation record then holds a changed key's stamp for good. Name a
-            # way out only then: a run with the key already stamped opens no record, and a
-            # refusal a re-run or a restored key clears has its own remedy in the roll's error.
-            way_out = (
-                not closing
-                and record_named
-                and not rolled[0]
-                and audit_roll_refused_for_good(rolled[1])
-            )
+            # Name a way out only for a record held for good that this run did not close.
+            way_out = held_for_good and not closing
             return count, uploads, rolled, way_out, seals, closing
         finally:
             await store.close()
@@ -13045,7 +13041,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
                 "the reason. The audit chain did not roll and still does not verify; "
                 "`messagefoundry audit-verify` names the break. Keep the prior key in "
                 "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED: the audit rows it MACed do not verify "
-                "without it.",
+                "without it, and where the chain's current range is under it, new audit rows "
+                "are still MACed under it, since no run can roll the chain off it.",
                 file=sys.stderr,
             )
         elif close_reason is not None:
@@ -13061,8 +13058,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # BACKLOG #4935: the chain rolled, so the ordinary close applies and the flag wrote nothing.
         print(
             "note: --close-without-roll was not used: the audit chain step completed, so the "
-            "rotation record closes as it does for any run that completes. No audit row was "
-            "written for it.",
+            "flag does not apply. "
+            + (
+                "This run completed and closed the rotation record. "
+                if complete
+                else "This run did not complete, so the rotation record stays open. "
+            )
+            + "No audit row was written for the flag.",
             file=sys.stderr,
         )
     if uploads.skipped:

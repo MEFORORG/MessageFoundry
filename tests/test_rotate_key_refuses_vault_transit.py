@@ -104,6 +104,9 @@ def test_rotate_key_refuses_vault_transit_mode_before_vault_or_the_store(
     assert "the engine cannot undo it" in captured.err, captured.err
     assert "cannot be undone" not in captured.err, captured.err
     assert "Vault snapshot taken before the trim may" in captured.err, captured.err
+    # A Transit key backup needs an exportable key with plaintext backup allowed, a one-way
+    # loosening, so the refusal does not offer it.
+    assert "Transit key backup" not in captured.err, captured.err
     assert "says which Vault settings retire one" not in captured.err, captured.err
     assert "Nothing was changed." in captured.err, captured.err
     assert "needs an active key" not in captured.err, captured.err
