@@ -2948,6 +2948,79 @@ def test_prove_absences_screen_skips_decorators_after_the_recursion_fallback(
     assert _refused("def scan(): ...\n", target, tmp_path)
 
 
+# --- BACKLOG #5590 follow-up: the PR 3144 review findings on the decorator rule -----------------
+#
+# Each "refuses" test below is red on the screen PR 3144 merged; the "accepts" in the last test is
+# too. Every other assertion is a control that is green on it.
+
+
+def test_prove_absences_screen_compares_shape_decorators_beside_the_same_unnamed_one(
+    tmp_path: Path,
+) -> None:
+    """A decorator the screen cannot name cancels where both sides hold the same one, so dropping
+    ``@cache`` beside it is still a shape change. Where the unnamed decorators differ, none is
+    compared, as before."""
+    target = "from functools import cache\n\ndef deco(f):\n    return f\n\n@deco\n@cache\ndef f(a): ...\n"
+    assert _refused("@deco\ndef f(a):\n    return 1\n", target, tmp_path)
+    assert _screen("@deco\n@cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    # Dropping the unnamed decorator too: the two sides' unnamed decorators differ.
+    assert _screen("@cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    assert _screen("def f(a):\n    return 1\n", target, tmp_path) == []
+
+
+def test_prove_absences_screen_keeps_a_staticmethod_beside_an_unnamed_decorator(
+    tmp_path: Path,
+) -> None:
+    """A ``staticmethod``'s first parameter is passed by its callers, so renaming it breaks a
+    keyword call even when a decorator beside it cannot be named."""
+    target = (
+        "def deco(f):\n    return f\n\nclass C:\n    @staticmethod\n    @deco\n    def m(x): ...\n"
+    )
+    renamed = "class C(C):\n    @staticmethod\n    @deco\n    def m(y): ...\n"
+    assert _refused(renamed, target, tmp_path)
+    same = "class C(C):\n    @staticmethod\n    @deco\n    def m(x):\n        return 1\n"
+    assert _screen(same, target, tmp_path) == []
+    # Control: a method's first parameter is still bound, so its name is not part of the shape.
+    method = "def deco(f):\n    return f\n\nclass C:\n    @deco\n    def m(self, x): ...\n"
+    assert _screen("class C(C):\n    @deco\n    def m(this, x): ...\n", method, tmp_path) == []
+
+
+def test_prove_absences_screen_compares_an_accessor_of_a_plain_method(tmp_path: Path) -> None:
+    """``@A.x.setter`` where this module's class ``A`` binds ``x`` to a plain method builds no
+    property, so the mutation's def is compared too. Where ``A.x`` is a property, or ``A`` is not
+    read, it is still an accessor and is not compared."""
+    target = "class A:\n    def x(self): ...\n\nclass B:\n    def x(self, v): ...\n"
+    assert _refused("class B(B):\n    @A.x.setter\n    def x(self): ...\n", target, tmp_path)
+    assert (
+        _screen("class B(B):\n    @A.x.setter\n    def x(self, v): ...\n", target, tmp_path) == []
+    )
+    prop = "class A:\n    @property\n    def x(self): ...\n\nclass B:\n    def x(self, v): ...\n"
+    assert _screen("class B(B):\n    @A.x.setter\n    def x(self): ...\n", prop, tmp_path) == []
+    imported = "from m import A\n\nclass B:\n    def x(self, v): ...\n"
+    assert _screen("class B(B):\n    @A.x.setter\n    def x(self): ...\n", imported, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_star_args_as_taking_the_bound_value(tmp_path: Path) -> None:
+    """A method ``def m(*args)`` takes the bound value in ``*args``, so every call ``def m(self,
+    *args)`` takes, it takes too. With a named parameter after the bound one, or as a
+    ``staticmethod``, it is still a different shape."""
+    assert (
+        _screen(
+            "class C(C):\n    def m(*args): ...\n",
+            "class C:\n    def m(self, *args): ...\n",
+            tmp_path,
+        )
+        == []
+    )
+    assert _refused(
+        "class C(C):\n    def m(*args): ...\n",
+        "class C:\n    def m(self, x, *args): ...\n",
+        tmp_path,
+    )
+    static = "class C:\n    @staticmethod\n    def m(x, *args): ...\n"
+    assert _refused("class C(C):\n    @staticmethod\n    def m(*args): ...\n", static, tmp_path)
+
+
 def test_signature_fields_name_every_signature_value() -> None:
     """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
     assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))
