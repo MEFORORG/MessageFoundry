@@ -2212,7 +2212,9 @@ async def spend_step_up_action(request: Request, action: str) -> None:
     (owner ruling 2026-10-13, #3241 R1), other than one in ``_EDIT_RESEND_SPENDING_REFUSALS`` in
     ``api/app.py`` (owner ruling 2026-11-07, #3241 added item 1). With no auth service attached it
     does nothing, as the dependency does. Its refusal writes ``auth.gate_refused``
-    (:func:`_record_route_refusal`)."""
+    (:func:`_record_route_refusal`) only where the admitting ``proof_in_route`` gate wrote a grant
+    row, that is where :func:`_audited_permission` names a permission for the request. With no
+    admitting gate it logs a WARNING and writes no row."""
     auth = get_auth(request)
     if auth is None:
         return
@@ -2245,7 +2247,9 @@ async def refuse_unless_step_up_window_live(request: Request) -> None:
     call that branch would take no step-up at all. The 403 carries ``X-Step-Up-Required`` and no
     ``X-Step-Up-Action``, so a client refreshes the window with a plain ``POST /me/reauth``. Does
     nothing with no auth service attached, as the dependency then checks nothing. Its refusal
-    writes ``auth.gate_refused`` (:func:`_record_route_refusal`)."""
+    writes ``auth.gate_refused`` (:func:`_record_route_refusal`) only where the admitting
+    ``proof_in_route`` gate wrote a grant row, that is where :func:`_audited_permission` names a
+    permission for the request. With no admitting gate it logs a WARNING and writes no row."""
     auth = get_auth(request)
     if auth is None or await step_up_window_live(request):
         return
