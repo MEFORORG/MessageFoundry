@@ -215,30 +215,40 @@ def _custody_paths(directory: Path) -> tuple[Path, Path]:
     return directory / HOST_FILE_NAME, directory / HANDOFF_FILE_NAME
 
 
-def _key_file_directories(settings: StoreSettings, environ: Mapping[str, str]) -> list[Path]:
-    """Each directory a host file or handoff for this store may sit in: the ones
+def _key_file_directories(
+    settings: StoreSettings, environ: Mapping[str, str], *, always_beside_store: bool
+) -> list[Path]:
+    """At least these directories a host file or handoff for this store may sit in: the ones
     ``MEFOR_CUSTODY_DIRECTORY`` and ``MEFOR_SECRETS_DIRECTORY`` name, and a SQLite store's data
-    directory, where a mint run with neither variable writes, whether or not a variable is set
-    here. A variable that is not an absolute path names none here; :func:`custody_directory`
-    refuses it."""
+    directory, where a mint run with neither variable writes. The data directory is named only when
+    ``MEFOR_SECRETS_DIRECTORY`` is unset, unless ``always_beside_store``. Not named, at least: a
+    custody directory an earlier setting named. A variable that is not an absolute path names none
+    here; :func:`custody_directory` refuses it."""
     found: list[Path] = []
     for variable in (CUSTODY_DIRECTORY_VARIABLE, SECRETS_DIRECTORY_VARIABLE):
         raw = environ.get(variable, "").strip()
         if raw and Path(raw).is_absolute():
             found.append(Path(raw))
-    beside = custody_directory(settings, environ={})
-    if beside is not None:
-        found.append(beside)
+    if always_beside_store or not environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip():
+        beside = custody_directory(settings, environ={})
+        if beside is not None:
+            found.append(beside)
     return list(dict.fromkeys(found))
 
 
 def _key_files_outside(
-    settings: StoreSettings, directory: Path | None, environ: Mapping[str, str]
+    settings: StoreSettings,
+    directory: Path | None,
+    environ: Mapping[str, str],
+    *,
+    always_beside_store: bool,
 ) -> list[Path]:
     """The host files and handoffs in :func:`_key_file_directories` other than ``directory``."""
     return [
         p
-        for other in _key_file_directories(settings, environ)
+        for other in _key_file_directories(
+            settings, environ, always_beside_store=always_beside_store
+        )
         if other != directory
         for p in _custody_paths(other)
         if os.path.lexists(p)
@@ -286,7 +296,9 @@ def foreign_custody_refusal(
     the blob minted for it. A directory setting that is not an absolute path is passed over here,
     and the directories the other setting names are still looked in."""
     environ = os.environ if environ is None else environ
-    found = _key_files_outside(settings, None, environ)
+    # Beside the store only where the provider would read it now: the remedy, a new directory
+    # named by a variable, must be able to clear the refusal.
+    found = _key_files_outside(settings, None, environ, always_beside_store=False)
     if not found:
         return None
     return (
@@ -659,7 +671,7 @@ def _left_outside_the_custody_directory(
     environ = os.environ if environ is None else environ
     if _directory_variable(environ) != CUSTODY_DIRECTORY_VARIABLE:
         return None  # without it the provider reads where it did before the variable existed
-    found = _key_files_outside(settings, directory, environ)
+    found = _key_files_outside(settings, directory, environ, always_beside_store=True)
     if not found:
         return None
     return (

@@ -1189,6 +1189,9 @@ function Set-CustodyDirAcl {
         $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
         & icacls $Path /remove:d $spelled | Out-Null
     }
+    # /grant:r replaces only an entry with the same inheritance flags, so every allow entry for the
+    # account goes first, and a wider one cannot survive beside the grant.
+    & icacls $Path /remove:g $Account | Out-Null
     # No inheritance flag: the grant is on the directory, and the key files carry their own lists.
     & icacls $Path /grant:r "${Account}:(RX,WD)" | Out-Null
     if ($LASTEXITCODE -ne 0) {
@@ -3575,22 +3578,27 @@ if ($HostCustody) {
     catch {
         throw "$($_.Exception.Message) $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'its first start cannot write its store key file as the custody directory needs')"
     }
+    # A refusal, not a warning: without the variable the service reads the secrets directory, where
+    # it cannot write its key file, and a mint made as SERVICE.md says lands where it does not look.
+    $custodyNamingError = $null
+    $replacedCustodyDir = $null
     try {
         $replacedCustodyDir = Set-ServiceEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_CUSTODY_DIRECTORY" -Value $CustodyDir
-        if ($replacedCustodyDir -and -not $CustodyDirNamed) {
-            Write-Warning ("The service's MEFOR_CUSTODY_DIRECTORY named '$replacedCustodyDir' and now " +
-                "names '$CustodyDir', as -CustodyDir asked. The engine reads no key file from the old " +
-                "directory: if master.key or handoff.key is there, move it into the new one as an " +
-                "administrator, on the same volume so it keeps its own access list. Then remove the " +
-                "service account's grant on the old directory.")
-        }
-        Write-Host "  Custody: '$CustodyDir', named to the service as MEFOR_CUSTODY_DIRECTORY (docs/SERVICE.md)."
-    } catch {
-        Write-Warning ("Could not name the custody directory in the service's environment " +
-            "($($_.Exception.Message)). Add MEFOR_CUSTODY_DIRECTORY=$CustodyDir to its AppEnvironmentExtra " +
-            "by hand, keeping the entries already there; without it the service looks for its key " +
-            "file in the secrets directory, where it cannot write one.")
+    } catch { $custodyNamingError = $_.Exception.Message }
+    if ($null -ne $custodyNamingError) {
+        throw ("Could not name the custody directory in the service's environment " +
+            "($custodyNamingError), and without MEFOR_CUSTODY_DIRECTORY the service looks for its " +
+            "key file in the secrets directory, where it cannot write one. Re-run the installer. " +
+            "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it would not find its custody directory')")
     }
+    if ($replacedCustodyDir -and -not $CustodyDirNamed) {
+        Write-Warning ("The service's MEFOR_CUSTODY_DIRECTORY named '$replacedCustodyDir' and now " +
+            "names '$CustodyDir', as -CustodyDir asked. The engine reads no key file from the old " +
+            "directory: if master.key or handoff.key is there, move it into the new one as an " +
+            "administrator, on the same volume so it keeps its own access list. Then remove the " +
+            "service account's grant on the old directory.")
+    }
+    Write-Host "  Custody: '$CustodyDir', named to the service as MEFOR_CUSTODY_DIRECTORY (docs/SERVICE.md)."
 }
 # The lockdown above removes Users and Authenticated Users, so a named account writes the data
 # directory through its own grant. That grant is read back on the two directories the service must

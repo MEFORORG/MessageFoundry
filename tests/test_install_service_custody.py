@@ -220,7 +220,7 @@ def test_the_custody_grant_rule(tmp_path: Path) -> None:
 @_windows_only
 def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_path: Path) -> None:
     """Set-CustodyDirAcl on a directory that inherits Users read and the account's Modify, and
-    denies the account and Users add-file. The account ends with read and add-file on the directory alone,
+    denies the account and Users add-file, and grants the account Modify itself. The account ends with read and add-file on the directory alone,
     nothing inherited and no deny, and the engine's own check of a custody directory passes it,
     where it refused the directory before. Unelevated, the owner change is refused, and the
     function refuses for that alone."""
@@ -234,6 +234,8 @@ def test_the_custody_directory_lockdown_grants_exactly_read_and_add_file(tmp_pat
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)RX' "${{me}}:(OI)(CI)M" | Out-Null
   & icacls {_psq(str(custody))} /deny "${{me}}:(WD)" '*S-1-5-32-545:(WD)' | Out-Null
+  # An explicit wider grant, with other inheritance flags than the one the lockdown writes.
+  & icacls {_psq(str(custody))} /grant "${{me}}:(OI)(CI)M" | Out-Null
 """
     _ok(_extract(_SCRIPT, [], pre), tmp_path)
     environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody)}
@@ -335,3 +337,27 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
         end = next(i for i in range(head, len(lines)) if lines[i] == "}")
         assert head < at < end, call["text"]
     assert "-CustodyDir is used only under [store].key_provider = 'host'" in text
+    # A custody variable the installer could not write refuses and disables the service, as a
+    # lockdown failure does: without it the service reads the secrets directory for its key file.
+    flat = " ".join(text.split())
+    refusal = flat.index('throw ("Could not name the custody directory')
+    assert "Disable-RefusedService" in flat[refusal : refusal + 600], flat[refusal : refusal + 600]
+    assert 'Write-Warning ("Could not name the custody directory' not in flat
+
+
+def test_the_uninstaller_names_the_custody_directory_and_removes_its_grant(
+    tmp_path: Path,
+) -> None:
+    """CALL-SITE guard: the uninstaller reads MEFOR_CUSTODY_DIRECTORY off the registration,
+    removes the account's entry there under -RemoveAccountAces, and hands both to the notice,
+    whose lines tests/test_service_install_manifest.py checks."""
+    from tests.test_service_install_manifest import _UNINSTALL
+
+    assert _UNINSTALL is not None
+    facts = _preflight_facts(tmp_path, _UNINSTALL)
+    remove = _sole_call_on(facts, "Remove-AccountAce", "-Path $custodyDir")
+    assert "-Principal $acePrincipal" in remove["text"], remove["text"]
+    notice = _sole_call(facts, "Get-UninstallResidueNotice")
+    assert "-CustodyDir $custodyDir" in notice["text"], notice["text"]
+    assert "-CustodyAceRemoved:$custodyAceRemoved" in notice["text"], notice["text"]
+    assert 'StartsWith("MEFOR_CUSTODY_DIRECTORY="' in _UNINSTALL.read_text(encoding="utf-8")

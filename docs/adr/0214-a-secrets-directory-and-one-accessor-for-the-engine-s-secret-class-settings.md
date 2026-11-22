@@ -167,7 +167,8 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   right included. While the variable is set and neither file is in that directory, a host file or
   handoff in this directory or beside a SQLite store refuses a read and a mint, so one made
   without the variable is not taken for no key; and the check that refuses another key provider
-  beside a host file or handoff looks in all three places. `install-service.ps1` makes the directory only when it reads that provider: `-CustodyDir`,
+  beside a host file or handoff looks in that directory and in the one the provider reads without
+  it. `install-service.ps1` makes the directory only when it reads that provider: `-CustodyDir`,
   else the one the service names, else `<DataDir>-custody`, judged by slice C's rules with this
   directory added to the paths it must not be, hold or sit inside, made restricted in one step,
   and restricted to Administrators as owner, SYSTEM and Administrators with full control, and the

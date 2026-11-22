@@ -198,9 +198,13 @@ def test_the_custody_directory_is_the_secrets_directory_or_the_data_directory(
 
 
 def _own_custody_directory(path: Path) -> Path:
-    """A directory no broad group reaches: mode 0700 on POSIX; on Windows pytest's own, which
-    inherits SYSTEM, Administrators and this account from the user's temporary folder."""
-    path.mkdir(mode=0o700)
+    """A directory no broad group reaches: mode 0700 on POSIX. On Windows it is made with no mode,
+    since there Python 3.13 and later turn a mode into explicit SYSTEM, Administrators and OWNER
+    RIGHTS full-control entries; it inherits the list of pytest's temporary folder instead."""
+    if sys.platform == "win32":
+        path.mkdir()
+    else:
+        path.mkdir(mode=0o700)
     return path
 
 
@@ -244,6 +248,13 @@ def _grant(path: Path, *grants: str, reset: bool = False) -> None:
 
     argv = ["icacls", str(path)]
     if reset:
+        # Explicit entries survive /inheritance:r and /grant:r, so SYSTEM, Administrators and
+        # OWNER RIGHTS, the ones a mode would have written, go first.
+        subprocess.run(
+            [*argv, "/remove:g", "*S-1-5-18", "*S-1-5-32-544", "*S-1-3-4"],
+            check=True,
+            capture_output=True,
+        )
         argv += ["/inheritance:r"]
     subprocess.run([*argv, "/grant:r", *grants], check=True, capture_output=True)
 
@@ -354,6 +365,33 @@ def test_a_host_blob_anywhere_the_host_provider_reads_refuses_every_other_key_pr
         assert foreign_custody_refusal(settings, environ=unusable) is not None
 
 
+def test_another_provider_is_not_refused_for_a_file_beside_the_store_it_would_not_read(
+    tmp_path: Path,
+) -> None:
+    """With MEFOR_SECRETS_DIRECTORY set, the host provider would not read beside the store, so a
+    file there does not refuse another provider, as before MEFOR_CUSTODY_DIRECTORY existed. The
+    refusal's own remedy, a new directory named by a variable, can then clear it. The left-behind
+    check, which stops a second key, still looks there."""
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    (tmp_path / "master.key").write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
+    for environ in (
+        {"MEFOR_SECRETS_DIRECTORY": str(secrets)},
+        {"MEFOR_SECRETS_DIRECTORY": str(secrets), "MEFOR_CUSTODY_DIRECTORY": str(secrets)},
+    ):
+        assert foreign_custody_refusal(settings, environ=environ) is None, environ
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    with pytest.raises(HostCustodyRefused, match="move it into"):
+        load_host_custody(
+            _settings(tmp_path),
+            enforcing=True,
+            environ={
+                "MEFOR_CUSTODY_DIRECTORY": str(custody_dir),
+                "MEFOR_SECRETS_DIRECTORY": str(secrets),
+            },
+        )
+
+
 def test_the_way_on_names_the_custody_directory_of_its_own(tmp_path: Path) -> None:
     environ = {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")}
     step = custody_host.keep_the_key_step(_settings(tmp_path), new_store=False, environ=environ)
@@ -386,8 +424,19 @@ async def test_the_first_start_converts_into_a_directory_it_may_only_read_and_ad
     # this token full control, and the case would no longer measure read and add-file alone.
     _grant(custody_dir, "*S-1-5-18:(OI)F", f"{_me()}:(RX,WD)", reset=True)
     try:
-        # The grant took: this account may add a file there.
+        # The grant took: this account may add a file there, and holds nothing more through any
+        # entry: SYSTEM's full control and this account's read and add-file are the whole list.
         assert restricted_file.can_add_a_file(custody_dir) is True
+        import subprocess
+
+        listed = subprocess.run(
+            ["icacls", str(custody_dir)], check=True, capture_output=True, text=True
+        ).stdout
+        entries = [line.strip() for line in listed.splitlines()[:-1] if line.strip()]
+        entries[0] = entries[0].removeprefix(str(custody_dir)).strip()
+        assert len(entries) == 2, listed
+        assert any(e.endswith(":(OI)(F)") and "SYSTEM" in e for e in entries), listed
+        assert any(e.endswith(":(RX,WD)") for e in entries), listed
         env = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
         with pytest.MonkeyPatch.context() as patch:
             for name, value in env.items():

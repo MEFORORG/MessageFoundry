@@ -2752,6 +2752,8 @@ _FULL_FACTS: dict[str, object] = {
     "ServiceAccountSid": "S-1-5-80-4001",
     "ConfigDir": r"D:\mefor\config",
     "SecretsDir": r"C:\ProgramData\MessageFoundry-secrets",
+    # Under the host key provider only (vault BACKLOG #3411).
+    "CustodyDir": r"C:\ProgramData\MessageFoundry-custody",
     "ConfigInheritanceStripped": True,
     "CachedNssm": r"C:\ProgramData\MessageFoundry\bin\nssm.exe",
     "WerImages": ["messagefoundry.exe", "python.exe"],
@@ -2766,6 +2768,8 @@ _NEEDLE = {
     "config_ace": "Config dir entry",
     "secrets_dir": "Secrets dir ",
     "secrets_ace": "Secrets entry",
+    "custody_dir": "Custody dir ",
+    "custody_ace": "Custody entry",
     "logon_right": "Log on as a service",
     "config_inheritance": "/inheritance:e",
     "wer": "Windows Error Reporting",
@@ -2923,10 +2927,11 @@ def test_a_cleared_residue_is_reported_as_cleared_not_as_remaining(tmp_path: Pat
             "DataAceRemoved": True,
             "ConfigAceRemoved": True,
             "SecretsAceRemoved": True,
+            "CustodyAceRemoved": True,
         }
     )
     text = _notice(tmp_path, facts)
-    assert text.count("REMOVED") >= 4, (
+    assert text.count("REMOVED") >= 5, (
         f"the notice must report what this run actually took back:\n{text}"
     )
     assert "/remove:g" not in text, (
@@ -3753,8 +3758,9 @@ def test_both_switches_are_declared_and_wired(tmp_path: Path) -> None:
     assert names.count(_SECEDIT_FN) == 1, (
         f"expected one {_SECEDIT_FN} call, found {names.count(_SECEDIT_FN)}"
     )
-    assert names.count(_ACE_FN) == 3, (
-        "the account's entry is written on the data dir, the config dir and the secrets dir, so "
+    assert names.count(_ACE_FN) == 4, (
+        "the account's entry is written on the data dir, the config dir, the secrets dir and, "
+        "under the host key provider, the custody dir (vault BACKLOG #3411), so "
         f"each must be removable; found {names.count(_ACE_FN)} {_ACE_FN} calls"
     )
     notice = [c for c in cmds if c["name"] == "Get-UninstallResidueNotice"]
