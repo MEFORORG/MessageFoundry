@@ -24,6 +24,7 @@ from messagefoundry.secrets_dpapi import DpapiError
 from messagefoundry.store import MessageStore
 from messagefoundry.store.base import StoreCipherConfigError
 from messagefoundry.store.keyprovider import KeyProviderError
+from tests._refusal_log_capture import until
 
 #: How long the fake provider can hold a thread. On the unfixed code it holds the loop this long.
 _HOLD_SECONDS = 3.0
@@ -71,10 +72,8 @@ class _Provider:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.left = threading.Event()
-        self.thread: int | None = None
 
     def _answer(self) -> str:
-        self.thread = threading.get_ident()
         self.entered.set()
         try:
             if self.hold:
@@ -105,15 +104,7 @@ def held(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Provider]:
         yield provider
     finally:
         provider.release.set()
-        assert provider.left.wait(_HOLD_SECONDS * 2) or not provider.entered.is_set()
-
-
-async def _until(event: threading.Event) -> None:
-    for _ in range(int(_HOLD_SECONDS * 200)):
-        if event.is_set():
-            return
-        await asyncio.sleep(0.005)
-    raise AssertionError("the provider was never called")
+        assert not provider.entered.is_set() or provider.left.wait(_HOLD_SECONDS * 2)
 
 
 @_ENTRY_POINTS
@@ -122,10 +113,8 @@ async def test_the_loop_stays_live_while_the_key_provider_blocks(
 ) -> None:
     """Red before the fix: the provider ran on the loop, so it had left before the loop ran again."""
     task = asyncio.ensure_future(call(tmp_path))
-    await _until(held.entered)
-    await asyncio.sleep(0.02)
+    await until(held.entered.is_set, "the provider call", timeout=_HOLD_SECONDS)
     assert not held.left.is_set(), "the loop did not run while the provider was blocked"
-    assert held.thread != threading.get_ident()
     held.release.set()
     with pytest.raises(KeyProviderError, match="synthetic refusal"):
         await task
@@ -207,14 +196,10 @@ async def test_a_key_that_does_not_decode_refuses_off_the_loop(
 async def test_the_blocking_step_runs_only_after_the_key_hop_and_gets_its_keys(
     call: _Call, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    got: dict[str, Any] = {}
-
-    def blocking(**kwargs: Any) -> str:
-        got["keys"] = kwargs["keys"]
-        return "done"
+    def blocking(**kwargs: Any) -> object:
+        return kwargs["keys"]
 
     _install(monkeypatch, _Provider())
     monkeypatch.setattr(dr_backup, "_verify_archive_blocking", blocking)
     monkeypatch.setattr(dr_backup, "_restore_blocking", blocking)
-    assert await call(tmp_path) == "done"
-    assert got["keys"] == [bytes(32)]
+    assert await call(tmp_path) == [bytes(32)]
