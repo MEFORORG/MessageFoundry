@@ -30,7 +30,7 @@ deterministic, salt-keyed surrogate machinery the tee relay and test harness use
 written** (§9: centralize the rules, don't reimplement beside the framework). Each overlay scrubs
 the fields this corpus needs that are not defaults, and lists every other field the leak-check
 walks as reviewed and kept, so no field it walks is undecided. The leak-check does not walk the
-MSH header, so the MSH fields are neither scrubbed nor listed.
+MSH header, so no MSH field is listed, and only `adt_a03.txt`'s overlay scrubs any.
 [`tests/test_anon_hapi_samples.py`](../../../tests/test_anon_hapi_samples.py) holds each file to its
 overlay. The salt is not recorded: these surrogates are final, not reversible, and the files are
 not intended to be re-derived. Line endings, segment order and every line's field count are
@@ -38,7 +38,8 @@ unchanged.
 
 **What the scrub does not replace.** A run of `DEFAULT_RULES` is not Safe Harbor
 de-identification, and ADR 0030 and [`docs/PHI.md`](../../../docs/PHI.md) §9 say why. In these files,
-at least: `MSH-7` and the other MSH routing fields keep their upstream values, a query time, an
+at least: outside `adt_a03.txt`, `MSH-7` and the other MSH routing fields keep their upstream
+values; a query time, an
 order's requested time in `batch_18_messages.txt` and an order's quantity and timing keep their
 timestamps, an identifier keeps its assigning authority (a hospital or system name), and the coded
 clinical content is kept.
@@ -124,20 +125,26 @@ Upstream this one-message file carries a named hospital and ward, a patient key,
 the shape of an Italian fiscal code, a birth date, a visit number and two clinicians (BACKLOG
 #5825). The patient and clinician names are placeholders, but the hospital, ward and identifiers
 are not plainly so, so it was scrubbed, by `DEFAULT_RULES` plus
-[`tests/fixtures/anon/adt_a03.anon.toml`](../../../tests/fixtures/anon/adt_a03.anon.toml). Every
-field it scrubs is a default, so that overlay only lists the fields it keeps.
+[`tests/fixtures/anon/adt_a03.anon.toml`](../../../tests/fixtures/anon/adt_a03.anon.toml), which
+also scrubs the message time and the sending and receiving facility in the MSH header and says why.
 
 **What was deliberately preserved:** the five segments in order, their field counts, the CRLF line
-endings with no final line ending, the MSH routing fields, the identifiers' assigning authorities
-and type codes, and the coded procedure. The same limits as above apply. In addition, at least:
+endings with no final line ending, the sending and receiving applications, the message type,
+control id and version, the identifiers' assigning authorities and type codes, and the coded
+procedure. The same limits as above apply.
 
-- The hospital and ward in `PV1-3` and `PV1-6` are now `[REDACTED]`.
-- The event, admit and procedure dates keep only their year; the birth date is drawn at random.
+**What the scrub changed beyond identifier values**, at least:
+
+- The facility in `MSH-4` and `MSH-6`, and the hospital and ward in `PV1-3` and `PV1-6`, are now
+  `[REDACTED]`.
+- The message, event, discharge and procedure dates keep only their year; the birth date is drawn
+  at random.
 - The fiscal-code and SSN repetitions of `PID-3` held one upstream value and now hold two
   different surrogates, and the effective and expiration dates of the SSN repetition are blanked.
 - The patient name gained a middle initial, and the clinicians are drawn from the surrogate pool.
-- `MSH-7`, `MSH-10` and the sending and receiving facility in `MSH-4` and `MSH-6` keep their
-  upstream values.
+
+The name, sex, birth date and procedure no longer need agree with one another. Do not use this
+sample to test patient matching, ages, sex or clinician identity.
 
 ## Manifest
 

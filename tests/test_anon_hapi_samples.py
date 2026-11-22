@@ -23,6 +23,7 @@ here is synthetic or upstream public test data (CLAUDE.md section 9).
 from __future__ import annotations
 
 import functools
+import hashlib
 import re
 import tomllib
 from collections.abc import Callable
@@ -58,18 +59,33 @@ _FIXTURES = _REPO / "tests" / "fixtures" / "anon"
 
 class _Corpus(NamedTuple):
     overlay: Path
-    #: The least the corpus must yield, so a read that stopped early fails instead of passing
-    #: empty: the overlay's own scrubbed fields, and the values of a judged kind the surrogate
-    #: check reads.
-    min_overlay_fields: int
+    #: How many fields the overlay itself scrubs, so one added or dropped is noticed.
+    overlay_fields: int
+    #: The least number of values of a judged kind the surrogate check must read, so a walk that
+    #: stopped early fails instead of passing empty. adt_a03 is one frozen message, so its floor
+    #: is its exact count.
     min_checked: int
 
 
 _CORPORA = {
-    "batch_18_messages.txt": _Corpus(_FIXTURES / "batch_18.anon.toml", 7, 100),
+    "batch_18_messages.txt": _Corpus(_FIXTURES / "batch_18.anon.toml", 19, 100),
     "oml_o21.hl7": _Corpus(_FIXTURES / "oml_o21.anon.toml", 7, 100),
-    "adt_a03.txt": _Corpus(_FIXTURES / "adt_a03.anon.toml", 0, 9),
+    "adt_a03.txt": _Corpus(_FIXTURES / "adt_a03.anon.toml", 3, 17),
 }
+#: SHA-256 digests of identifying values upstream adt_a03.txt carried, held as digests so the
+#: values themselves are not in this file: the patient key, the fiscal code, the birth date, the
+#: visit number, the hospital, and the sending facility. The surrogate check cannot see an id or a
+#: birth date put back, since both are fabricated in the shape of the value they replace.
+_ADT_A03_UPSTREAM_DIGESTS = frozenset(
+    {
+        "3c31063b0923ca11d10d15bdddb73c4ef829cd0040632df03a3a42b10fd10dd1",
+        "e68a6c5954f614c27b39ef34431cfc351fc27a8b46246e830bfd9b04215728d8",
+        "d416af96205ae608dc302a2aecdd60216e03fb9b30d560798b67713ca6035035",
+        "76c11cd770cf2925c1f66f1e2fadff9d4033d6912833e24607db0c02265aaf26",
+        "fd3d10d124504d6d08ba270f1d7979686ae53e5c6eed408cb00ea1b9f798991a",
+        "ead80e2d92df57a355f122729044633d4b9f51046947fb84971f074186e0a84e",
+    }
+)
 _SEGMENT = re.compile(r"[A-Z][A-Z0-9]{2}\|")
 # batch_18 keeps one malformed MSH-2 on purpose: three encoding characters, so no parser can read
 # its separators. The README says the scrub repaired it to this and restored it afterward. The
@@ -128,10 +144,9 @@ def _is_filled_date(comps: list[str], rep: str, seps: Seps) -> bool:
 
 def _is_identifier(comps: list[str], rep: str, seps: Seps) -> bool:
     # The surrogate leaves an empty id empty and still writes the kept components, as in adt_a03's
-    # ``^^^^TEAM`` repetition, so an empty id passes only beside a kept component.
-    return (bool(comps[0]) or len(comps) > 1) and _kept_tail(comps, _CX_KEPT_COMPONENTS) == comps[
-        1:
-    ]
+    # ``^^^^TEAM`` repetition, so an empty id passes when every component set beside it is one the
+    # surrogate keeps. An empty repetition is not one the surrogate writes.
+    return bool(rep) and _kept_tail(comps, _CX_KEPT_COMPONENTS) == comps[1:]
 
 
 _IDENTIFIER = (_is_identifier, "components an identifier surrogate blanks are set")
@@ -203,7 +218,7 @@ def test_the_overlay_scrubs_only_fields_no_default_maps(name: str) -> None:
     reason is stale, and this is the prompt to rewrite it."""
     with _CORPORA[name].overlay.open("rb") as handle:
         overlay_fields = set(tomllib.load(handle)["hl7"].get("fields", {}))
-    assert len(overlay_fields) >= _CORPORA[name].min_overlay_fields
+    assert len(overlay_fields) == _CORPORA[name].overlay_fields
     assert overlay_fields.isdisjoint(rule.path for rule in DEFAULT_RULES)
 
 
@@ -259,6 +274,33 @@ def test_the_surrogate_check_passes_what_the_anonymizer_writes() -> None:
     checked, found = _residue(scrubbed, _CONTROL_RULES)
     assert checked == len(_CONTROL_RULES)
     assert found == []
+
+
+@pytest.mark.parametrize(
+    ("rep", "expected"),
+    [
+        ("^^^^TEAM", True),  # what the surrogate writes for an empty id beside a type code
+        ("6075145^^^PK^PK", True),
+        ("^", False),
+        ("^8^M10", False),  # a check digit left beside an empty id
+        ("^^^^TEAM^^20070103", False),  # an effective date left beside an empty id
+    ],
+)
+def test_the_identifier_check_judges_an_empty_id(rep: str, expected: bool) -> None:
+    assert _is_identifier(rep.split("^"), rep, Seps()) is expected
+
+
+def _tokens(text: str) -> set[str]:
+    return set(re.split(r"[|^~&\r\n]", text)) - {""}
+
+
+def test_no_upstream_identifier_is_left_in_adt_a03() -> None:
+    """A put-back id or birth date passes the surrogate check, so the upstream values are pinned
+    absent by digest. A token of the committed file is found, so the tokens were read; on the
+    upstream file this test fails."""
+    digests = {hashlib.sha256(t.encode()).hexdigest() for t in _tokens(_messages("adt_a03.txt")[0])}
+    assert digests.isdisjoint(_ADT_A03_UPSTREAM_DIGESTS)
+    assert hashlib.sha256(b"ADT").hexdigest() in digests
 
 
 _MANIFEST_ROW = re.compile(r"^\| `([^`]+)` \| ([^|]+) \| [^|]+ \| *(\d+) \|", re.M)
