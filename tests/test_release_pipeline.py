@@ -1205,8 +1205,8 @@ def _posix_tool_env() -> dict[str, str]:
 
 
 #: The timeout for a short subprocess here: a bash run of an extracted step, or a one-line probe.
-#: It bounds a hang where nothing else does first. It does not measure speed: nothing in this file
-#: reads a duration.
+#: It does not measure speed: nothing in this file reads a duration. On Windows it does not bound
+#: a grandchild that still holds the pipes.
 #:
 #: WHY IT STAYS AT 60 S (BACKLOG #3633 item 2). That row records one overrun: on engine PR 2327's
 #: run 38674972250, `over-long-body[console]` took 84.5 s in notes.sh on windows-2025, and that

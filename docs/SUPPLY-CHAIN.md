@@ -157,10 +157,9 @@ Facts the labels leave out:
   run, that is the toolkit and the engine only. A separate job publishes it last, so no
   job adds an asset to a published release. The console's release is a draft too, at least until
   its `publish-pypi-webconsole` job has succeeded. The console upload runs under the same two
-  reads of `PUBLISH_WEBCONSOLE`. When it does not run, the console's release is still published
-  once the `pypi` approval is given, as the engine's is without the harness upload. Each draft
-  publisher reads its variable again when it runs, outside the `pypi` environment, and while that
-  read is `true` it refuses to publish the release unless that run's upload step succeeded. On an engine tag the toolkit and engine
+  reads of `PUBLISH_WEBCONSOLE`. Each draft publisher reads its variable again when it runs,
+  outside the `pypi` environment, and while that read is `true` it refuses to publish the
+  release unless that run's upload step succeeded. On an engine tag the toolkit and engine
   are on PyPI by then. The refusal's text names two causes, a remedy with the upload and one
   without, but not which cause fired, and points here for the routes left past GitHub's re-run
   window. At least these two can fire, alone or together:
