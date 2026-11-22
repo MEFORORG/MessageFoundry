@@ -368,8 +368,6 @@ _PLAIN_PATH = re.compile(
     r"(?=[A-Za-z0-9 ._()-]*[A-Za-z0-9])[A-Za-z0-9 ._()-]+(?:[\\/][A-Za-z0-9 ._()\\/-]*)?"
 )
 _EITHER_KEY_RUN = re.compile(r"[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43}")
-#: For the remedy only: a line that starts a ``NAME=`` assignment (:func:`_sets_a_name`).
-_ASSIGNMENT = re.compile(r"\s*[A-Za-z_][A-Za-z0-9_]*\s*=")
 
 #: One 32-byte secret, whole (vault BACKLOG #5394 added items 6 and 12): 43 characters of the
 #: standard base64 alphabet and its one ``=``, as a store key is written, or 43 of the base64url
@@ -1078,22 +1076,21 @@ def read_service_env_posture(
 
 
 def _has_content(variable: _Variable) -> bool:
-    """Whether ``variable``'s value holds content: its own line is not blank, or a later line
-    is not blank and is no ``NAME=`` assignment (:func:`_sets_a_name`), which sets another
-    variable rather than continuing this one (the Lander's eighth round on PR 3142). A blank
-    later line adds nothing. ``#`` is nothing special to NSSM or to the engine, which reads the
-    value as it stands, so a line such as ``#x`` is content. Remedy only."""
+    """Whether ``variable``'s value holds content (the Lander's eighth round on PR 3142): its
+    own line is not blank, or a later line is, before the first later line that starts a
+    variable of its own as the reader reads one (:func:`_line_start`). That line and the lines
+    after it are the other variable's. A blank later line adds nothing; any other, ``==`` among
+    them, is in the value the engine loads. ``#`` is nothing special to NSSM or to the engine,
+    which reads the value as it stands, so a line such as ``#x`` is content. Remedy only."""
     own, *later = _LINE_BREAK.split(variable.value)
-    return bool(own.strip()) or any(line.strip() and not _sets_a_name(line) for line in later)
-
-
-def _sets_a_name(line: str) -> bool:
-    """Whether ``line`` is a ``NAME=`` assignment: a name of letters, digits and underscores,
-    then an equals sign. Key-shaped text (:func:`_is_key_value`, :func:`_holds_key_run`), such
-    as a base64 key and its padding, is content, not a name. Remedy only."""
-    return (
-        _ASSIGNMENT.match(line) is not None and not _is_key_value(line) and not _holds_key_run(line)
-    )
+    if own.strip():
+        return True
+    for line in later:
+        if _line_start(line) is not None:
+            return False
+        if line.strip():
+            return True
+    return False
 
 
 def _every_kept(

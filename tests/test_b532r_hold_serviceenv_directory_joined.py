@@ -64,9 +64,11 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert posture.value_runs_on
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
-    # Nothing here has a value of its own to move, so nothing says to put it in the directory or
-    # how one is created (the fifth hold on PR 3142, H3; the seventh hold).
-    assert CREATE not in refusal and "Put " not in refusal
+    # The reader reads ``mefor_secrets_directory ==`` as no variable of its own (_line_start), so
+    # joined to an empty MEFOR_VALUE_A it is A's content, and A is moved. Otherwise nothing here
+    # has a value to move (the fifth hold on PR 3142, H3; the seventh hold; its eighth round).
+    moved = refused.startswith("MEFOR_VALUE_") and " " in directory
+    assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
         refused.startswith("MEFOR_VALUE_") and " " not in directory
     )
@@ -113,13 +115,23 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
         "MEFOR_VALUE_A=\nOTHER=1",
         "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d",
         "MEFOR_VALUE_A=\n   ",
+        f"MEFOR_VALUE_A=\nOTHER={_KEY_B64}",
+        "MEFOR_VALUE_A=\nProgramFiles(x86)=C:\\x",
+        "MEFOR_VALUE_A=\nOTHER=1\nsynthetic-other-line",
     ],
-    ids=["assignment", "directory-assignment", "blank-line"],
+    ids=[
+        "assignment",
+        "directory-assignment",
+        "blank-line",
+        "assignment-to-a-key",
+        "assignment-with-parentheses",
+        "lines-after-an-assignment",
+    ],
 )
-def test_a_name_empty_on_its_own_line_is_only_deleted(entry: str) -> None:
+def test_a_name_with_no_content_of_its_own_is_only_deleted(entry: str) -> None:
     """The Lander's seventh hold on PR 3142, as corrected in its eighth round: a later line
-    that is a ``NAME=`` assignment sets another variable, and a blank one adds nothing, so the
-    name has no content and the refusal says only to delete it."""
+    the reader reads as a variable of its own takes the lines after it, and a blank one adds
+    nothing, so the name has no content and the refusal says only to delete it."""
     refusal = service_env_refusal(_read([entry]))
     assert refusal is not None
     assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
@@ -134,16 +146,29 @@ def test_a_name_empty_on_its_own_line_is_only_deleted(entry: str) -> None:
         [(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "hunter2")],
         [(_EXTRA, "MEFOR_VALUE_A=\n#x")],
         [(_EXTRA, f"MEFOR_VALUE_A=\n{_KEY_B64}")],
+        [(_EXTRA, "MEFOR_VALUE_A=\nhunter2=")],
+        [(_EXTRA, "MEFOR_VALUE_A=\n==")],
+        [(_EXTRA, "MEFOR_VALUE_A=\nOTHER=")],
     ],
-    ids=["next-line", "pem-from-line-2", "next-item", "comment-only-line", "key-with-padding"],
+    ids=[
+        "next-line",
+        "pem-from-line-2",
+        "next-item",
+        "comment-only-line",
+        "key-with-padding",
+        "text-then-an-equals-sign",
+        "equals-only-line",
+        "name-with-nothing-after-it",
+    ],
 )
 def test_a_value_that_starts_on_a_later_line_is_moved(pairs: list[tuple[str, str]]) -> None:
     """The Lander's eighth round on PR 3142: a later line, or the item joined after an empty
-    value, is the name's content unless it is a ``NAME=`` assignment, so Put prints. ``#`` is
-    nothing special, so ``#x`` is content too."""
+    value, is the name's content unless the reader reads it as a variable of its own, so Put
+    prints. ``#`` is nothing special, so ``#x`` is content too."""
     refusal = service_env_refusal(_read_pairs(pairs))
     assert refusal is not None
     assert "Put each MEFOR_VALUE_* variable in the secrets directory" in refusal
+    assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
     assert "hunter2" not in refusal and "AAAA" not in refusal
 
 
