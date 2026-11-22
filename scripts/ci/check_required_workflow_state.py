@@ -146,7 +146,7 @@ def _workflow_state(entry: object) -> tuple[str, str]:
 
 
 def _direct_workflow_file(path: str) -> str | None:
-    """The filename of a path directly in ``.github/workflows``, ``None`` for a well-formed other.
+    """The filename of an allowlisted direct path, ``None`` for a well-formed other, else raises.
 
     An ALLOWLIST on the raw path, because a list of bad spellings cannot be complete: a backslash, a
     case change, ``%2e``, or a trailing NUL or zero-width space each once passed as an ignorable
