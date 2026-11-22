@@ -3327,7 +3327,9 @@ class MLLPSource(SourceConnector):
                                 writer.write(wire)
                                 if replaced:
                                     # BACKLOG #5799: the log line is once per connection; the
-                                    # event records every reply that was altered.
+                                    # event is sent for each reply whose characters the charset
+                                    # forced a replacement of. A frame byte turned into a space
+                                    # is not one of those, and writes only its warning.
                                     await self._emit_event(
                                         "reply_replaced",
                                         peer_host=peer_host,

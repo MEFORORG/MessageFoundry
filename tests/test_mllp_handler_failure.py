@@ -703,7 +703,11 @@ async def test_a_handler_fault_nak_the_charset_altered_writes_a_reply_replaced_e
     assert cap.kinds()[:3] == ["established", "handler_error", "reply_replaced"], cap.kinds()
 
 
-def test_the_handler_fault_nak_flags_a_replacement_only_when_one_was_made() -> None:
+def test_the_handler_fault_nak_flags_a_replacement_only_when_one_was_made(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The warn-once set is module state, so this test's addition is discarded after it.
+    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
     source = _mllp(encoding="ascii")
     clean = source._handler_failure_nak(b"MSH|^~\\&|S|F|R|F|20260101||ADT^A01|C1|P|2.5\r")
     altered = source._handler_failure_nak(b"MSH|^~\\&|S|F|R|F|20260101||ADT^A01|C\xe91|P|2.5\r")

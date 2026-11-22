@@ -80,8 +80,7 @@ _reply_replacement_logged: set[str] = set()
 #: The ``reason`` of a ``reply_replaced`` connection event. Fixed text: it names neither the charset
 #: setting nor any part of the reply, which echoes the message.
 REPLY_REPLACED_REASON = (
-    "the reply held characters the inbound charset cannot encode; each was replaced before it "
-    "was sent"
+    "the reply held characters the inbound charset cannot encode, and each was replaced"
 )
 
 
@@ -183,8 +182,10 @@ def frame_reply_reporting(
 
 
 def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
-    """Encode a listener's post-commit reply in its declared charset, for :func:`frame_reply` and
-    for the X12 listener, which writes its reply unframed (BACKLOG #5958).
+    """Encode a listener's post-commit reply in its declared charset. The listeners call
+    :func:`encode_reply_reporting`, which does this and also says whether characters were replaced:
+    :func:`frame_reply_reporting` for the MLLP and raw-TCP listeners, and the X12 listener directly,
+    since it writes its reply unframed (BACKLOG #5958).
 
     A reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
     that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``

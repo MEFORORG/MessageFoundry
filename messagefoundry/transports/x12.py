@@ -711,7 +711,7 @@ class X12Source(SourceConnector):
     """Listen for inbound raw-TCP connections, reassemble each ``ISA…IEA`` interchange, and hand its
     **raw bytes** to the pipeline handler. No HL7/X12 ACK: if that *pipeline* handler
     (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply it is written
-    back on the same connection, encoded by :func:`~messagefoundry.transports.framing.encode_reply`
+    back on the same connection, encoded by :func:`~messagefoundry.transports.framing.encode_reply_reporting`
     (BACKLOG #5958); the engine's returns ``None`` for every non-HL7 content type,
     so an X12 intake is fire-and-forget in practice. A config **Handler**'s return never reaches here —
     see this module's docstring."""
