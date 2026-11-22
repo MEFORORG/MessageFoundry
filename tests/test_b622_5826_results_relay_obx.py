@@ -89,6 +89,66 @@ def test_a_fieldless_line_beside_a_dropped_result_fails_closed() -> None:
     assert result.disposition.value == "error"
 
 
+def test_a_cancelled_last_result_keeps_the_next_patients_pid_and_pv1() -> None:
+    # Only the cancelled OBX's own NTE goes; the second patient's PID/PV1 is not its child, so the
+    # second order stays under its own patient.
+    segments = _relay_raw(
+        "MSH|^~\\&|LABCO|LAB|EHR|HOSP|20260613130000||ORU^R01|MSG4|P|2.5.1\r"
+        "PID|1||P1^^^LAB^MR\rPV1|1|O\rOBR|1|ORD1\r"
+        "OBX|1|NM|GLU^Glucose^L||95||||||F\r"
+        "OBX|2|NM|K^Potassium^L||4.1||||||X\rNTE|1||hemolyzed\r"
+        "PID|2||P2^^^LAB^MR\rPV1|1|I\rOBR|2|ORD2\rOBX|1|NM|NA^Sodium^L||140||||||F"
+    )
+    assert segments[1:] == [
+        "PID|1||P1^^^LAB^MR",
+        "PV1|1|O",
+        "OBR|1|ORD1",
+        "OBX|1|NM|GLUC^Glucose^L||95||||||F",
+        "PID|2||P2^^^LAB^MR",
+        "PV1|1|I",
+        "OBR|2|ORD2",
+        "OBX|1|NM|SOD^Sodium^L||140||||||F",
+    ]
+
+
+def test_a_cancelled_last_result_keeps_a_following_dsc() -> None:
+    segments = _relay_raw(
+        _HEAD + "OBX|1|NM|GLU^Glucose^L||95||||||F\r"
+        "OBX|2|NM|K^Potassium^L||4.1||||||X\rNTE|1||hemolyzed\rDSC|cont-1|F"
+    )
+    assert segments[2:] == ["OBX|1|NM|GLUC^Glucose^L||95||||||F", "DSC|cont-1|F"]
+
+
+def _drop_result(msg: Message, i: int) -> None:
+    # The template's own helper, reached through the loaded handler. Ingress refuses a body with a
+    # second MSH, so the following-MSH and batch-trailer cases are driven on the helper directly.
+    drop = load_config(RESULTS_RELAY).handlers["relay_results"].__globals__["_drop_result"]
+    drop(msg, i)
+
+
+@pytest.mark.parametrize(
+    "following",
+    [
+        "MSH|^~\\&|LABCO|LAB|EHR|HOSP|20260613130100||ORU^R01|MSG5|P|2.5.1",
+        "DSC|cont-1|F",
+        "FT1|1|||20260613",
+        "CTI|STUDY1",
+        "BTS|1",
+        "FTS|1",
+    ],
+)
+def test_a_dropped_result_leaves_a_following_non_child_segment(following: str) -> None:
+    # Only NTE, PRT and Z-segments are an OBX's children; any other segment after the cancelled
+    # OBX is kept, and a following MSH no longer makes the delete raise.
+    msg = Message.parse(
+        _HEAD + "OBX|1|NM|GLU^Glucose^L||95||||||F\r"
+        "OBX|2|NM|K^Potassium^L||4.1||||||X\rNTE|1||hemolyzed\rZNT|1|x\r" + following
+    )
+    _drop_result(msg, 2)
+    assert msg.segments() == ["MSH", "OBR", "OBX", following[:3]]
+    assert msg.field("OBX-3.1") == "GLU"
+
+
 def test_an_unmapped_code_is_left_exactly_as_it_arrived() -> None:
     obx = r"OBX|1|ST|ZZ\H\Q&SUB^Other^L||x||||||F"
     assert _relay_raw(_HEAD + obx)[2:] == [obx]

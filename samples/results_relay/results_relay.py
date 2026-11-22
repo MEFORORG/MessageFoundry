@@ -100,8 +100,14 @@ def relay_results(msg):  # type: ignore[no-untyped-def]
     return [Send(OB_EHR, msg), Send(FILE_ARCHIVE, msg)]
 
 
-#: Segments that open the next observation, specimen or order, so they end a dropped OBX's rows.
-_NEXT_GROUP = {"OBX", "OBR", "ORC", "SPM"}
+#: Segments that belong to the OBX they follow; a Z-segment does too (see _is_child).
+_CHILD_SEGMENTS = {"NTE", "PRT"}
+
+
+def _is_child(segment_id: str) -> bool:
+    # An allowlist, not a stop list: any other segment after the OBX (the next patient's PID and
+    # PV1, a DSC, FT1 or CTI, a batch trailer, the next MSH) is not this result's and must survive.
+    return segment_id in _CHILD_SEGMENTS or segment_id.startswith("Z")
 
 
 def _drop_result(msg, i):  # type: ignore[no-untyped-def]
@@ -110,7 +116,7 @@ def _drop_result(msg, i):  # type: ignore[no-untyped-def]
     ids = msg.segments()
     at = [pos for pos, seg in enumerate(ids) if seg == "OBX"][i - 1]
     end = at + 1
-    while end < len(ids) and ids[end] not in _NEXT_GROUP:
+    while end < len(ids) and _is_child(ids[end]):
         end += 1
     children = ids[at + 1 : end]
     # segments() lists a fieldless bare line (e.g. "NTE" alone); occurrences skip it. Where one is
