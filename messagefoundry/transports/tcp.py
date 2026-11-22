@@ -56,11 +56,12 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.framing import (
     FrameCodec,
     FrameError,
+    ReplyReplacements,
     check_frame_bytes,
     codec_for,
     declared_encoding,
     frame_for_delivery,
-    frame_reply,
+    frame_reply_reporting,
 )
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
@@ -538,6 +539,7 @@ class TcpSource(SourceConnector):
         )
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
+        self._reply_replacements = ReplyReplacements()  # BACKLOG #5799
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors MLLPSource.
         sa = s.get("source_ip_allowlist")
@@ -730,14 +732,18 @@ class TcpSource(SourceConnector):
                                     break  # handler_error is recorded; close
                                 failed = False
                             if reply is not None:
-                                writer.write(
-                                    frame_reply(
-                                        self.codec,
-                                        reply,
-                                        self.encoding,
-                                        connection=self._pacing_name,
-                                    )
+                                wire, replaced = frame_reply_reporting(
+                                    self.codec,
+                                    reply,
+                                    self.encoding,
+                                    connection=self._pacing_name,
                                 )
+                                writer.write(wire)
+                                if replaced and (note := self._reply_replacements.note()):
+                                    # BACKLOG #5799, throttled as the MLLP listener throttles it.
+                                    await self._emit_event(
+                                        "reply_replaced", peer_host=peer_host, reason=note
+                                    )
                                 await self._drain_reply(writer)
                         if failed:
                             break
