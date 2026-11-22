@@ -8445,11 +8445,26 @@ def create_app(
             for p in reveal[cls]
             if any(getattr(m, p) for m in shown)
         )
+        audit_detail: dict[str, object] = {"message_id": message_id, "revealed": revealed}
+        # A rewritten marker reads as a key not held and no longer fails this read, so this row is
+        # its per-message record (BACKLOG #5693). Read off the store's rows, not the caller's
+        # permission-gated flag, so the record does not depend on who opened the message. Column
+        # names and counts only: never a value, key id, marker or error text.
+        withheld = {
+            column: count
+            for column, count in (
+                ("outbox.last_error", sum(o["last_error_withheld"] for o in outbox_rows)),
+                ("events.detail", sum(e["detail_withheld"] for e in event_rows)),
+            )
+            if count
+        }
+        if withheld:
+            audit_detail["withheld"] = withheld
         await engine.store.record_audit(
             "message_view",
             actor=identity.username,
             channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id, "revealed": revealed}),
+            detail=json.dumps(audit_detail),
             client=client_ip(request),
         )
         rows = [detail, *outbox, *events]

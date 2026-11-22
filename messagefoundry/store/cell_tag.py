@@ -33,6 +33,11 @@ one; under Vault Transit, only a retired or unknown key VERSION, never a configu
 does not find (:func:`refused_for_key`, which names the marker rewrites it cannot tell from
 those). Every other cipher error fails the read, as it did before #5970.
 
+**A per-message detail read that goes through :func:`open_detail_cell` withholds under the same
+rule** (BACKLOG #5693, owner ruling 2026-11-22), at least a delivery's ``last_error`` and an
+event's ``detail``, and flags the row so a withheld cell does not read as one never written. The
+extension covers those detail cells only: a by-id read of the message row raises every refusal.
+
 **The store id.** No store id is minted yet, so every tag carries
 :data:`~messagefoundry.store.crypto.NO_STORE_ID`, as the queue tag does.
 """

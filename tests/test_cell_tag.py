@@ -1406,6 +1406,83 @@ async def test_the_message_detail_route_and_page_say_a_cell_was_withheld(
     assert "Withheld" not in page(False)  # control
 
 
+async def test_the_message_view_audit_names_each_withheld_detail_column(
+    tmp_path: pathlib.Path,
+) -> None:
+    """BACKLOG #5693: a rewritten marker reads as a key not held and no longer fails the read, so
+    the ``message_view`` row is the per-message record of it. It holds column names and counts,
+    never cell content, and a read that withholds nothing writes the detail it always wrote."""
+    import json
+
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+
+    db = tmp_path / "audit.db"
+    foreign_key = generate_key()
+    foreign = make_cipher(foreign_key, write_v2=True).encrypt("SYNTH-FOREIGN")
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
+    engine = Engine(
+        store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+
+    async def view(client: httpx.AsyncClient, message_id: str) -> str:
+        assert (
+            await client.get(f"/messages/{message_id}", params={"reveal_errors": True})
+        ).status_code == 200
+        rows = await store.list_audit(limit=1, action="message_view")
+        return str(rows[0]["detail"])
+
+    try:
+        mid = await store.enqueue_message(
+            channel_id="ch1",
+            raw=_DETAIL_RAW,
+            deliveries=[("archive", _DETAIL_RAW), ("second", _DETAIL_RAW)],
+        )
+        for destination in ("archive", "second"):
+            item = await store.claim_next_fifo(destination)
+            assert item is not None
+            await store.dead_letter_now(item.id, "synthetic permanent reject")
+
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            # Control: nothing withheld, so the detail is byte-for-byte what it was.
+            plain = await view(client, mid)
+            assert plain == json.dumps(
+                {"message_id": mid, "revealed": ["events.detail", "outbox.last_error"]}
+            )
+
+            with sqlite3.connect(db) as planted:
+                planted.execute(
+                    "UPDATE queue SET last_error=? WHERE message_id=? AND stage='outbound'",
+                    (foreign, mid),
+                )
+                event_id = planted.execute(
+                    "SELECT id FROM message_events WHERE message_id=? AND detail IS NOT NULL"
+                    " AND event<>'viewed' LIMIT 1",
+                    (mid,),
+                ).fetchone()[0]
+                planted.execute(
+                    "UPDATE message_events SET detail=? WHERE id=?", (foreign, event_id)
+                )
+            planted.close()
+
+            audited = await view(client, mid)
+            # The record does not depend on the flag the caller is shown.
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr("messagefoundry.api.app.withheld_flag", lambda *_a, **_k: False)
+                unflagged = await view(client, mid)
+    finally:
+        await engine.stop()
+
+    for detail in (audited, unflagged):
+        assert json.loads(detail)["withheld"] == {"events.detail": 1, "outbox.last_error": 2}
+        for content in ("mfenc", "SYNTH-FOREIGN", foreign_key):  # the marker opens every cell
+            assert content not in detail
+
+
 def _transit_refusing(text: str) -> Any:
     """A Vault Transit cipher whose every ``decrypt`` gets Vault's HTTP 400 with ``text``."""
     from hvac.exceptions import InvalidRequest
