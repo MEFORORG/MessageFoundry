@@ -64,24 +64,23 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert posture.value_runs_on
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
-    # The reader reads ``mefor_secrets_directory ==`` as no variable of its own (_line_start), so
-    # joined to an empty MEFOR_VALUE_A it is A's content, and A is moved. Otherwise nothing here
-    # has a value to move (the fifth hold on PR 3142, H3; the seventh hold; its eighth round).
-    moved = refused.startswith("MEFOR_VALUE_") and " " in directory
+    # A MEFOR_VALUE_* name always gets the one Put sentence and the create step (the Lander's
+    # decision d20261122T181059560-3bac03). A key whose only value is the directory entry has
+    # nothing to move (the fifth hold on PR 3142, H3).
+    moved = refused.startswith("MEFOR_VALUE_")
     assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
-        refused.startswith("MEFOR_VALUE_") and " " not in directory
+        moved and " " not in directory
     )
 
 
-def test_the_bare_prefix_joined_to_the_directory_is_only_deleted() -> None:
-    """The bare prefix names no env() key, so even with nothing but a directory entry joined to it
-    the refusal says only to delete it, never to write an empty override in the value file."""
+def test_the_bare_prefix_joined_to_the_directory_is_deleted() -> None:
+    """The bare prefix names no env() key, so the refusal says to delete that entry, and never
+    to write an empty override in the value file."""
     refusal = service_env_refusal(_read(["MEFOR_VALUE_=", "MEFOR_SECRETS_DIRECTORY=="]))
     assert refusal is not None
     assert "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry" in refusal
     assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
-    assert CREATE not in refusal and "Put " not in refusal
 
 
 @pytest.mark.parametrize(
@@ -99,9 +98,8 @@ def test_the_bare_prefix_joined_to_the_directory_is_only_deleted() -> None:
 def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
     pairs: list[tuple[str, str]],
 ) -> None:
-    """The Lander's sixth hold on PR 3142, H2: Put is decided by name. A name with content in
-    any entry is told to go to the secrets directory, even where another entry sets it empty;
-    the empty entry is still told to go."""
+    """The Lander's sixth hold on PR 3142, H2: the empty entry is told to go, and the name is
+    still told to go to the secrets directory."""
     refusal = service_env_refusal(_read_pairs(pairs))
     assert refusal is not None
     assert "Put each MEFOR_VALUE_* variable in the secrets directory" in refusal
@@ -109,109 +107,86 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
     assert "synthetic-a-value" not in refusal
 
 
-@pytest.mark.parametrize(
-    "entry",
-    [
-        "MEFOR_VALUE_A=\nOTHER=1",
-        "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d",
-        "MEFOR_VALUE_A=\n   ",
-        f"MEFOR_VALUE_A=\nOTHER={_KEY_B64}",
-        "MEFOR_VALUE_A=\nProgramFiles(x86)=C:\\x",
-        "MEFOR_VALUE_A=\nOTHER=1\nsynthetic-other-line",
-        "MEFOR_VALUE_A=\nMEFOR_VALUE_B",
-        "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY==",
-    ],
-    ids=[
-        "assignment",
-        "directory-assignment",
-        "blank-line",
-        "assignment-to-a-key",
-        "assignment-with-parentheses",
-        "lines-after-an-assignment",
-        "name-alone",
-        "blank-directory-line",
-    ],
-)
-def test_a_name_with_no_content_of_its_own_is_only_deleted(entry: str) -> None:
-    """The Lander's seventh hold on PR 3142, as corrected in its eighth round: a later line
-    the reader reads as a variable of its own takes the lines after it, and a blank one adds
-    nothing, nor does a blank directory entry, so the name has no content and the refusal
-    says only to delete it."""
-    refusal = service_env_refusal(_read([entry]))
+#: Text in the shapes below that is a value, or could be: the refusal must echo none of it.
+_VALUE_TEXT = ("hunter2", "AAAA", "Winter", "synthetic-other-line", _KEY_B64[:43])
+
+_SHAPES = [
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1")], id="assignment"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d")], id="dir-line"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\n   ")], id="blank-line"),
+    pytest.param([(_EXTRA, f"MEFOR_VALUE_A=\nOTHER={_KEY_B64}")], id="assignment-to-a-key"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1\nsynthetic-other-line")], id="after-it"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_VALUE_B")], id="name-alone"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY==")], id="blank-dir-line"),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, KEY_CLASS_NAMES[0]), (_EXTRA, "=" + _KEY_B64)],
+        id="key-name-alone",
+    ),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nhunter2")], id="next-line"),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A=\n-----BEGIN X-----\nAAAA\n-----END X-----")],
+        id="pem-from-line-2",
+    ),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "hunter2")], id="next-item"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\n#x")], id="comment-only-line"),
+    pytest.param([(_EXTRA, f"MEFOR_VALUE_A=\n{_KEY_B64}")], id="key-with-padding"),
+    pytest.param(
+        [
+            (_PLAIN, "MEFOR_VALUE_A="),
+            (_EXTRA, "MEFOR_VALUE_A="),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
+        ],
+        id="empty-twice-and-a-directory",
+    ),
+]
+
+
+@pytest.mark.parametrize("pairs", _SHAPES)
+def test_every_value_name_gets_one_generic_put_sentence(pairs: list[tuple[str, str]]) -> None:
+    """The Lander's decision d20261122T181059560-3bac03 on PR 3142: no reading of which line is
+    content gates the steps. Every MEFOR_VALUE_* refusal prints the one Put sentence, naming no
+    variable, with the value-file alternative and the ``provider = "env"`` sentence. An empty
+    entry adds the delete clause, and a name the secrets directory refuses adds the rename."""
+    posture = _read_pairs(pairs)
+    refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
-    assert "Put " not in refusal and CREATE not in refusal and KEEP not in refusal
-    assert _KEY_B64[:43] not in refusal
-
-
-def test_a_refused_name_alone_after_an_empty_value_takes_the_key_after_it() -> None:
-    """A refused name written alone starts a variable of its own, so the key joined after it
-    is that name's, not the empty value's: nothing says to move a MEFOR_VALUE_* variable."""
-    refusal = service_env_refusal(
-        _read_pairs(
-            [(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, KEY_CLASS_NAMES[0]), (_EXTRA, "=" + _KEY_B64)]
-        )
+    assert refusal.count("Put each MEFOR_VALUE_* variable in the secrets directory") == 1
+    assert "environments/<env>.toml" in refusal
+    assert '[secrets].provider = "env"' in refusal and "leaves the secret in the registry key" in (
+        refusal
     )
-    assert refusal is not None
-    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
-    assert "Put each MEFOR_VALUE_* variable" not in refusal
-    assert _KEY_B64[:43] not in refusal
+    empty = bool(posture.empty_value_names) or any(
+        name.startswith("MEFOR_VALUE_") and name != "MEFOR_VALUE_"
+        for name in posture.directory_only_names
+    )
+    assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is empty
+    assert ("rename that env() key" in refusal) is bool(posture.unplain_value_names)
+    assert KEEP not in refusal  # no shape here joins a path into a refused value
+    assert "MEFOR_VALUE_A" not in refusal and "MEFOR_VALUE_B" not in refusal
+    assert not any(text in refusal for text in _VALUE_TEXT)
 
 
 @pytest.mark.parametrize(
     "pairs",
     [
-        [(_EXTRA, "MEFOR_VALUE_A=\nhunter2")],
-        [(_EXTRA, "MEFOR_VALUE_A=\n-----BEGIN X-----\nAAAA\n-----END X-----")],
-        [(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "hunter2")],
-        [(_EXTRA, "MEFOR_VALUE_A=\n#x")],
-        [(_EXTRA, f"MEFOR_VALUE_A=\n{_KEY_B64}")],
-        [(_EXTRA, "MEFOR_VALUE_A=\nhunter2=")],
-        [(_EXTRA, "MEFOR_VALUE_A=\n==")],
-        [(_EXTRA, "MEFOR_VALUE_A=\nOTHER=")],
-        [(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "="), (_EXTRA, "Winter=2026!")],
-        [(_EXTRA, "X=1\nMEFOR_VALUE_A\nWinter=2026!")],
-    ],
-    ids=[
-        "next-line",
-        "pem-from-line-2",
-        "next-item",
-        "comment-only-line",
-        "key-with-padding",
-        "text-then-an-equals-sign",
-        "equals-only-line",
-        "name-with-nothing-after-it",
-        "name-alone-split-value",
-        "name-alone-in-one-string",
+        pytest.param([(_EXTRA, "MEFOR_VALUE_A\n=")], id="O1-separator-line"),
+        pytest.param([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "=")], id="O1-separator-item"),
+        pytest.param([(_EXTRA, "MEFOR_VALUE_A\nX=1")], id="O2-assignment-line"),
+        pytest.param([(_EXTRA, "MEFOR_VALUE_A\nWinter=2026!")], id="O2-split-secret-line"),
+        pytest.param([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "Winter=2026!")], id="O3-split-item"),
     ],
 )
-def test_a_value_that_starts_on_a_later_line_is_moved(pairs: list[tuple[str, str]]) -> None:
-    """The Lander's eighth round on PR 3142: a later line, or the item joined after an empty
-    value, is the name's content unless the reader reads it as a variable of its own, so Put
-    prints. ``#`` is nothing special, so ``#x`` is content too."""
-    refusal = service_env_refusal(_read_pairs(pairs))
+def test_the_round_three_shapes_print_put(pairs: list[tuple[str, str]]) -> None:
+    """Review round 3's O1 to O3 shapes on PR 3142, which a content reading misjudged: each
+    prints the one Put sentence, and the rename where the name is one the directory refuses."""
+    posture = _read_pairs(pairs)
+    refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert "Put each MEFOR_VALUE_* variable in the secrets directory" in refusal
-    assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
-    assert "hunter2" not in refusal and "AAAA" not in refusal and "Winter" not in refusal
-    assert _KEY_B64[:43] not in refusal
-
-
-def test_a_name_empty_in_one_entry_and_joined_to_a_directory_in_another_moves_nothing() -> None:
-    """The control for the test above: neither entry gives the name content of its own, so
-    nothing says to put it in the directory, and the empty entry is told to go."""
-    refusal = service_env_refusal(
-        _read_pairs(
-            [
-                (_PLAIN, "MEFOR_VALUE_A="),
-                (_EXTRA, "MEFOR_VALUE_A="),
-                (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
-            ]
-        )
-    )
-    assert refusal is not None
-    assert "Put " not in refusal and CREATE not in refusal
-    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    assert refusal.count("Put each MEFOR_VALUE_* variable in the secrets directory") == 1
+    assert CREATE in refusal
+    assert ("rename that env() key" in refusal) is bool(posture.unplain_value_names)
+    assert "MEFOR_VALUE_A" not in refusal
+    assert "Winter" not in refusal and "2026!" not in refusal
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:

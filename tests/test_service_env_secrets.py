@@ -895,16 +895,12 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
     )
     assert name not in refusal and name.lower() not in refusal
     assert "'MessageFoundry'" in refusal
-    # Only a value that is not empty goes to the directory, so only its refusal says to put it
-    # there and how one is created (the fourth hold on PR 3142, H3; the fifth hold, H3).
-    moves = bool(entry.split("=", 1)[1].strip())
     assert (
         "Put each MEFOR_VALUE_* variable in the secrets directory MEFOR_SECRETS_DIRECTORY names"
         in refusal
-    ) is moves
-    assert ("environments/<env>.toml" in refusal) is moves
-    assert '"[environments]"' in refusal
-    assert (CREATE in refusal) is moves
+    )
+    assert "environments/<env>.toml" in refusal and '"[environments]"' in refusal
+    assert CREATE in refusal
     assert _ENFORCEMENT_NOTE in refusal
     assert "protect-key" not in refusal
     value = entry.split("=", 1)[1]

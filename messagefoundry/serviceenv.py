@@ -172,10 +172,6 @@ class ServiceEnvPosture:
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
-    #: The ``MEFOR_VALUE_<KEY>`` names no entry sets to content of its own: each variable
-    #: :func:`_names` keeps for one has no content (:func:`_has_content`), or takes only a
-    #: joined directory entry. The remedy alone reads this, never the refusal itself.
-    contentless_value_names: tuple[str, ...] = field(default=(), repr=False)
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -637,9 +633,6 @@ class _Variable:
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
-    #: For the whole-string reading's variable only: the value the line reading gives the
-    #: string's first line, the rest of that line and the lines it takes. Remedy only.
-    line_value: str | None = field(default=None, repr=False)
 
 
 def _read_string(
@@ -735,15 +728,7 @@ def _read_string(
         ]
         counted = not (broken and _names(same_string))
         read.append(
-            _Variable(
-                where,
-                name,
-                whole_value,
-                line=first_line,
-                broken=broken,
-                counted=counted,
-                line_value="\n".join(first_parts),
-            )
+            _Variable(where, name, whole_value, line=first_line, broken=broken, counted=counted)
         )
         # Its value ends with the string, so it is the one the string ends on when no line of
         # the line reading starts a variable, as with ``MEFOR_VALUE_A<LF>=``, or
@@ -1074,29 +1059,10 @@ def read_service_env_posture(
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
         directory_only_names=_every_kept(variables, found, lambda v: v.directory_only),
-        contentless_value_names=_every_kept(
-            variables,
-            [f for f in found if f[0].startswith(_VALUE_PREFIX) and f[0] != _VALUE_PREFIX],
-            lambda v: v.directory_only or not _has_content(v),
-        ),
         # Fail closed: one run-on value that takes anything but a blank or plain-path directory
         # entry may hold key material, so nothing says to keep any entry (sixth hold, H1).
         directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
         and all(v.directory_only for v in variables if v.runs_on and _names([v])),
-    )
-
-
-def _has_content(variable: _Variable) -> bool:
-    """Whether ``variable``'s value holds content as the line reading reads it (the Lander's
-    eighth round on PR 3142): the rest of its own line and the later lines :func:`_read_string`
-    gives it, up to the next line that starts a variable, or, for the whole-string reading's
-    variable, its ``line_value``. A blank line adds nothing, nor does a directory entry
-    :func:`_directory_entry_value` takes, as a joined string of one adds nothing
-    (``directory_only``). Any other line is content, ``==`` among them. ``#`` is nothing special
-    to NSSM or to the engine, so a line such as ``#x`` is content. Remedy only."""
-    value = variable.value if variable.line_value is None else variable.line_value
-    return any(
-        line.strip() and _directory_entry_value(line) is None for line in _LINE_BREAK.split(value)
     )
 
 
@@ -1223,9 +1189,6 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     only = posture.directory_only_names
     moving_keys = [k for k in keys if k not in only]
     moving_others = [o for o in others if o not in only]
-    moving_values = any(
-        v not in posture.contentless_value_names and v != _VALUE_PREFIX for v in values
-    )
     steps: list[str] = []
     if moving_keys:
         steps.append(
@@ -1239,14 +1202,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # The installer refuses an existing directory the service does not name, so this points
         # only at how one is created, only where a non-empty setting goes to one, and before the
         # step that moves it there (the third hold's H2, the fourth hold's H1 and H3).
-        if _DIRECTORY_VARIABLE not in posture.listed and (moving_others or moving_values):
+        if _DIRECTORY_VARIABLE not in posture.listed and (moving_others or values):
             steps.append(
                 'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
                 "says how it is created"
             )
         put = [", ".join(moving_others)] if moving_others else []
-        if moving_values:
+        if values:
             put.append("each MEFOR_VALUE_* variable")
         parts = (
             [
@@ -1257,7 +1220,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             else []
         )
         cite = 'See docs/CONFIGURATION.md, "The secrets directory"'
-        if moving_values:
+        if values:
             parts.append(
                 "A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
                 "of the environment may go in its value file instead, environments/<env>.toml by "
@@ -1270,17 +1233,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry rather than "
                 "move it"
             )
-        # A value whose only later lines or joined strings are blank or a directory entry
-        # (_has_content) is empty in its own entry, so a name Put skips is told what to do.
-        if posture.empty_value_names or any(
-            v in posture.contentless_value_names and v != _VALUE_PREFIX for v in values
-        ):
+        # A value whose only content is a joined directory entry is empty in its own entry.
+        if posture.empty_value_names or any(v in only and v != _VALUE_PREFIX for v in values):
             parts.append(
                 "An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where an "
                 "empty override is really wanted, write it in the value file instead, since the "
                 "secrets directory refuses an empty file"
             )
-        if moving_values:
+        if values:
             if posture.unplain_value_names:
                 parts.append(
                     "At least one of them is spelled with a character other than an ASCII "

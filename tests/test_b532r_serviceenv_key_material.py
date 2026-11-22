@@ -346,22 +346,21 @@ def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() ->
 
 
 @pytest.mark.parametrize(
-    ("entry", "creates"),
+    "entry",
     [
-        pytest.param("MEFOR_VALUE_A=", False, id="empty-value"),
-        pytest.param("MEFOR_VALUE_=synthetic", False, id="bare-prefix"),
-        pytest.param("MEFOR_VALUE_A=1", True, id="value"),
-        pytest.param("MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", True, id="secret"),
+        pytest.param("MEFOR_VALUE_A=", id="empty-value"),
+        pytest.param("MEFOR_VALUE_=synthetic", id="bare-prefix"),
+        pytest.param("MEFOR_VALUE_A=1", id="value"),
+        pytest.param("MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", id="secret"),
     ],
 )
-def test_the_create_guidance_needs_a_non_empty_setting_to_move(entry: str, creates: bool) -> None:
-    """The fourth hold's H3: an empty value and the bare prefix are deleted, not moved, so
-    nothing goes to the directory and the refusal says nothing of creating one, or of putting
-    anything there (the fifth hold, H3)."""
+def test_the_create_guidance_comes_with_the_put_step(entry: str) -> None:
+    """A MEFOR_VALUE_* name, empty or the bare prefix among them, or a directory secret gets
+    the Put step and how a directory is created, whatever its value holds (the Lander's
+    decision d20261122T181059560-3bac03 on PR 3142)."""
     refusal = service_env_refusal(_read([entry]))
     assert refusal is not None
-    assert (CREATE in refusal) is creates
-    assert ("Put " in refusal) is creates
+    assert CREATE in refusal and "Put " in refusal
 
 
 def test_the_removal_step_says_with_its_value_for_a_single_item_key() -> None:
