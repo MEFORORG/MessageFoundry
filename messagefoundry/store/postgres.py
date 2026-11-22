@@ -12458,7 +12458,7 @@ class PostgresStore:
             # re-evaluates after a concurrent re-sync commits and matches nothing.
             try:
                 async with (
-                    self._timed_acquire() as conn,
+                    self._timed_acquire(record=False) as conn,
                     conn.transaction(isolation="read_committed"),
                 ):
                     result = await conn.execute(

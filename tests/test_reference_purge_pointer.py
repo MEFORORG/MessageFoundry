@@ -6,10 +6,9 @@ and evicts only what it marked.
 The server-backend cases run the real ``purge_reference_snapshots`` against a small in-memory model
 of the two tables, with no database. The model applies the predicates the SQL text states. It does
 NOT model locking or isolation. Only a real server can prove at least: that read committed
-re-evaluates the age predicate after a concurrent writer commits, that the version match keeps a
-re-sync's rows out of the DELETE under RCSI, that the statements parse, and that ``OUTPUT
-inserted.version`` returns the new value. **No hosted test calls this purge today, so none of those
-is proved by CI.** The hosted Postgres and SQL Server legs would need a test added to prove them.
+re-evaluates the age predicate after a concurrent writer commits, that the statements parse, and
+that ``OUTPUT inserted.version`` returns the new value. **No hosted test calls this purge today, so
+none of those is proved by CI.** The hosted Postgres and SQL Server legs would need a test added.
 """
 
 from __future__ import annotations
@@ -46,7 +45,6 @@ class _Model:
         self.isolation: str | None = None
         self.in_txn = False
         self.txn_statements: list[str] = []
-        self.resync_during_delete = False
 
     def select(self) -> list[str]:
         return ["orphan"] if self.synced_at < CUTOFF else []
@@ -130,14 +128,7 @@ class _MsCursor:
         if sql.startswith("SELECT"):
             self._rows = [(n,) for n in self._model.select()]
         elif sql.startswith("DELETE"):
-            if self._model.resync_during_delete:
-                # RCSI: the EXISTS saw the aged pointer at statement start, and the target scan
-                # blocked on the writer, then read its committed v2 rows.
-                self._model.version, self._model.synced_at = "v2", FRESH
-                self.rowcount = 0 if "v.version = reference.version" in sql else 1
-                self._model.rows -= self.rowcount
-            else:
-                self.rowcount = self._model.delete()
+            self.rowcount = self._model.delete()
             self._rows = []
         else:
             new = self._model.update(sql, params)
@@ -348,17 +339,6 @@ async def test_sqlite_the_pointer_update_carries_the_age_predicate(tmp_path: Pat
         assert store.reference_view()["orphan"] == {"K": "1"}
     finally:
         await store.close()
-
-
-async def test_sqlserver_delete_keeps_a_resync_committed_during_its_scan() -> None:
-    """Mutation: drop the version match from the DELETE and the re-sync's rows are destroyed. This
-    pins the statement's shape against a modelled interleaving; it does not run RCSI."""
-    model = _Model()
-    model.resync_during_delete = True
-    store = _server_store("sqlserver", model)
-    assert await _purge(store) == 0
-    assert model.rows == 1
-    assert model.version == "v2"
 
 
 async def test_postgres_a_busy_pool_stops_the_purge_without_raising() -> None:

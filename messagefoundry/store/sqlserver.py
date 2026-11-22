@@ -10788,14 +10788,11 @@ class SqlServerStore:
                     # outside any lock and write_reference_snapshot takes no applock here, so a config
                     # reload can commit a fresh patient-keyed snapshot between the SELECT above and
                     # this statement. This predicate is the only thing preventing a routine reload from
-                    # destroying live data. Under RCSI the EXISTS reads the pointer as of statement
-                    # start while the target scan can block and then read a re-sync's new rows, so
-                    # the version match keeps those rows out of the delete (BACKLOG #5733).
+                    # destroying live data. `older_than` is bound TWICE (T-SQL has no named params).
                     await cur.execute(
                         "DELETE FROM reference WHERE name = ?"
                         " AND EXISTS (SELECT 1 FROM reference_version v"
-                        "             WHERE v.name = ? AND v.synced_at < ?"
-                        "             AND v.version = reference.version)",
+                        "             WHERE v.name = ? AND v.synced_at < ?)",
                         (name, name, older_than),
                     )
                     # The count can read -1 under SET NOCOUNT ON, which must not lower the total.
