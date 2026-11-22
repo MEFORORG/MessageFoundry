@@ -9365,11 +9365,23 @@ class PostgresStore:
         )
         # Each body is opened under its row's own tag (BACKLOG #2593), as SQLite does: a purged
         # row ('') reads as an empty body, a live row whose tag fails refuses the read and alerts,
-        # and a dead row whose tag fails is left out, since its claim already reported it.
+        # and a dead row whose tag fails is left out, since its claim already reported it. If its
+        # last_error was withheld, the read fails instead (BACKLOG #5693).
         out: list[dict[str, Any]] = []
         for r in rows:
-            # BACKLOG #5693: last_error alone may be withheld; the body's refusal is unchanged.
-            d = open_detail_cell(self._cipher, dict(r), "queue", "last_error", r["id"])
+            # BACKLOG #5693: last_error alone may be withheld, under open_detail_cell's rule.
+            # The refusal is kept, because a row dropped below cannot carry the withheld flag.
+            d = dict(r)
+            refusal: CipherError | None = None
+            try:
+                d["last_error"] = self._dec(
+                    r["last_error"], aad=cell_aad("queue", "last_error", r["id"])
+                )
+            except CipherError as exc:
+                withhold_refused_cell(self._cipher, "queue", exc, r["last_error"])
+                d["last_error"] = None
+                refusal = exc
+            d["last_error_withheld"] = refusal is not None
             dead = r["status"] == OutboxStatus.DEAD.value
             try:
                 d["payload"] = (
@@ -9380,8 +9392,13 @@ class PostgresStore:
             except QueueTagError:
                 if not dead:
                     raise
+            else:
+                out.append(d)
                 continue
-            out.append(d)
+            # Dropped. With a withheld last_error, fail the read: success would leave no
+            # record of that cell. Raised out here so the body's error is not chained to it.
+            if refusal is not None:
+                raise refusal
         return out
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:

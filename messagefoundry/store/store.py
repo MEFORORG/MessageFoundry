@@ -18297,7 +18297,8 @@ class MessageStore:
         # transparent to this PHI-body read (the #14 parity comparison). A purged row ('') reads as an
         # empty body. A live row whose tag fails refuses the whole read and raises the alert. A dead
         # row whose tag fails is left out: the claim dead-lettered and reported it already, and its
-        # metadata, error included, stays in outbox_for.
+        # metadata, error included, stays in outbox_for. If its last_error was withheld, the read
+        # fails instead (BACKLOG #5693).
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT * FROM queue WHERE message_id=? AND stage=? ORDER BY destination_name",
@@ -18305,8 +18306,19 @@ class MessageStore:
             )
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
-                # BACKLOG #5693: last_error alone may be withheld; the body's refusal is unchanged.
-                d = open_detail_cell(self._cipher, dict(r), "queue", "last_error", r["id"])
+                # BACKLOG #5693: last_error alone may be withheld, under open_detail_cell's rule.
+                # The refusal is kept, because a row dropped below cannot carry the withheld flag.
+                d = dict(r)
+                refusal: CipherError | None = None
+                try:
+                    d["last_error"] = self._dec(
+                        r["last_error"], aad=cell_aad("queue", "last_error", r["id"])
+                    )
+                except CipherError as exc:
+                    withhold_refused_cell(self._cipher, "queue", exc, r["last_error"])
+                    d["last_error"] = None
+                    refusal = exc
+                d["last_error_withheld"] = refusal is not None
                 dead = r["status"] == OutboxStatus.DEAD.value
                 try:
                     d["payload"] = (
@@ -18317,8 +18329,13 @@ class MessageStore:
                 except QueueTagError:
                     if not dead:
                         raise
+                else:
+                    out.append(d)
                     continue
-                out.append(d)
+                # Dropped. With a withheld last_error, fail the read: success would leave no
+                # record of that cell. Raised out here so the body's error is not chained to it.
+                if refusal is not None:
+                    raise refusal
             return out
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:

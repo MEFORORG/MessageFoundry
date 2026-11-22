@@ -1822,7 +1822,10 @@ which the engine records itself for the web console), `summary_access` (patient 
 are a sanitized copy). A refused download is not an access, since it serves nothing, and writes
 `attachment_download_refused` with a `reason` (BACKLOG #2387). A detail read that withholds a cell
 because its marker names a key the store does not hold, which a rewritten marker also reads as,
-still succeeds. Its `message_view` or `outbound.read` row then carries a `withheld` map of column
+still succeeds, with two limits. `GET /messages/{id}` answers 423 when the message row's own cells
+are under that key. On SQLite and Postgres, `GET /messages/{id}/outbound` fails with no
+`outbound.read` row when the withheld `last_error` is on a dead row also left out for a failed body
+tag. Otherwise its `message_view` or `outbound.read` row then carries a `withheld` map of column
 name to count, never a value, key id or marker. The open also sets `outbox[].last_error_withheld`
 and `events[].detail_withheld` for a `messages:view_summary` holder (BACKLOG #5693). These sit
 beside the auth and admin events listed in [SECURITY.md](SECURITY.md). Each row carries actor, action, timestamp, channel, the

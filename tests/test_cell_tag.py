@@ -60,6 +60,7 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
+from messagefoundry.store.queue_tag import QueueTagError
 from messagefoundry.store.store import MessageStatus
 from tests._cell_tag_contract import assert_cell_tag_contract
 
@@ -1233,6 +1234,8 @@ def _detail_store(backend: str, cipher: Any, rows: list[dict[str, Any]]) -> Any:
     async def body(_handle: object, row: Any, *, alert: bool = True) -> str:
         if row["payload"] == "REFUSED":
             raise CipherError("the body refuses")
+        if row["payload"] == "TAG-FAILED":
+            raise QueueTagError("synthetic body tag failure", cause="tag")
         return str(row["payload"])
 
     @asynccontextmanager
@@ -1298,6 +1301,118 @@ async def test_the_detail_reads_withhold_only_a_key_not_held_on_the_server_backe
     for bad in (moved_e, good[:-8], "mfenc:v9:x", "SYNTH-UNMARKED"):
         with pytest.raises(CipherError):
             await _detail_store(backend, cipher, event(bad)).events_for("m")
+
+
+def _spy_refusals(monkeypatch: pytest.MonkeyPatch, cipher: Any, stored: str) -> list[BaseException]:
+    """Every refusal ``cipher`` raises opening ``stored``, so a test can name the original."""
+    real = cipher.decrypt
+    seen: list[BaseException] = []
+
+    def decrypt(value: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return real(value, *args, **kwargs)
+        except CipherError as exc:
+            if value == stored:
+                seen.append(exc)
+            raise
+
+    monkeypatch.setattr(cipher, "decrypt", decrypt)
+    return seen
+
+
+async def test_a_dropped_dead_row_with_a_withheld_error_fails_the_read_on_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5693: a row left out for its body tag cannot carry a withheld flag, so the read
+    raises the cell's own refusal, opened once, rather than answer with no record of the cell.
+    SQL Server opens the body first, so it still leaves this row out, as it did on main."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    foreign = make_cipher(generate_key(), write_v2=True).encrypt("SYNTH-FOREIGN")
+    good = cipher.encrypt("SYNTH", aad=cell_aad("queue", "last_error", "q1"))
+    seen = _spy_refusals(monkeypatch, cipher, foreign)
+
+    def read(status: str, last_error: str | None, payload: str, backend: str = "postgres") -> Any:
+        row = {
+            "id": "q1",
+            "status": status,
+            "last_error": last_error,
+            "payload": payload,
+            "body_ref": None,
+        }
+        return _detail_store(backend, cipher, [row]).outbox_payloads_for("m")
+
+    with pytest.raises(UnauthenticatedCipherError) as refused:
+        await read("dead", foreign, "TAG-FAILED")
+    assert len(seen) == 1 and refused.value is seen[0]
+    assert not isinstance(refused.value.__context__, QueueTagError)  # the body's error not chained
+    assert await read("dead", good, "TAG-FAILED") == []  # dropped, as on main
+    assert await read("dead", None, "TAG-FAILED") == []
+    [kept] = await read("dead", foreign, "BODY")
+    assert kept["last_error"] is None and kept["last_error_withheld"] is True
+    for last_error in (foreign, good, None):
+        with pytest.raises(QueueTagError):  # a live row's body refusal is unchanged
+            await read("pending", last_error, "TAG-FAILED")
+    assert await read("dead", foreign, "TAG-FAILED", "sqlserver") == []
+
+
+async def test_a_dropped_dead_row_with_a_withheld_error_fails_the_read_on_sqlite(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5693, on a real store: only the combination of a withheld ``last_error`` and a
+    dropped row fails the read. Each neighbouring case keeps its own answer."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    foreign = make_cipher(generate_key(), write_v2=True).encrypt("SYNTH-FOREIGN")
+    db = tmp_path / "dropped.db"
+    store = await MessageStore.open(db, cipher=cipher)
+    side = sqlite3.connect(db, timeout=30)
+    try:
+        wrong_body = cipher.encrypt("SYNTH-OTHER-BODY")  # held key, wrong binding
+        mid = await store.enqueue_message(
+            channel_id="ch", raw=_DETAIL_RAW, deliveries=[("OB_A", "BODY-A"), ("OB_B", "BODY-B")]
+        )
+        for name in ("OB_A", "OB_B"):
+            item = await store.claim_next_fifo(name)
+            assert item is not None
+            await store.dead_letter_now(item.id, "synthetic permanent reject")
+        live = await store.enqueue_message(
+            channel_id="ch", raw=_DETAIL_RAW, deliveries=[("OB_L", "BODY-L")]
+        )
+        seen = _spy_refusals(monkeypatch, cipher, foreign)
+
+        def plant(message_id: str, destination: str, **cells: object) -> None:
+            names = ", ".join(f"{column}=?" for column in cells)
+            with side:
+                side.execute(
+                    f"UPDATE queue SET {names} WHERE message_id=? AND stage='outbound' "
+                    "AND destination_name=?",
+                    (*cells.values(), message_id, destination),
+                )
+
+        plant(mid, "OB_B", last_error=foreign)  # the body opens, so the row returns, flagged
+        got = {r["destination_name"]: r for r in await store.outbox_payloads_for(mid)}
+        assert got["OB_B"]["last_error"] is None and got["OB_B"]["last_error_withheld"] is True
+        assert got["OB_B"]["payload"] == "BODY-B" and got["OB_A"]["last_error_withheld"] is False
+        plant(mid, "OB_B", last_error=None)
+
+        plant(mid, "OB_A", payload=wrong_body)  # a failed body tag, readable last_error
+        assert [r["destination_name"] for r in await store.outbox_payloads_for(mid)] == ["OB_B"]
+        plant(mid, "OB_A", last_error=None)
+        assert [r["destination_name"] for r in await store.outbox_payloads_for(mid)] == ["OB_B"]
+
+        plant(mid, "OB_A", last_error=foreign)
+        seen.clear()
+        with pytest.raises(UnauthenticatedCipherError) as refused:
+            await store.outbox_payloads_for(mid)
+        assert len(seen) == 1 and refused.value is seen[0]
+
+        plant(live, "OB_L", payload=wrong_body)
+        for live_error in (None, foreign):
+            plant(live, "OB_L", last_error=live_error)
+            with pytest.raises(QueueTagError):
+                await store.outbox_payloads_for(live)
+    finally:
+        side.close()
+        await store.close()
 
 
 def test_the_withheld_flag_follows_the_cells_own_permission() -> None:
