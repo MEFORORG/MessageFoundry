@@ -4,9 +4,10 @@
 added item 3).
 
 Synthetic values only. On POSIX the open of a socket answers ``ENXIO``, and ``fdopen`` of a
-folder's descriptor ``EISDIR``. ``_refused_read`` answered both ``None``, so the by-id read
-re-raised them and the route answered a server error. The swap is forced by raising the error the
-open gives, since a real swap races the ``lstat``.
+folder's descriptor ``EISDIR``. ``_refused_read`` answers an error whose path a fresh ``lstat``
+shows is not a regular file as damage, and one that names no path by its errno alone, through
+``_NOT_A_FILE``, so the by-id read raises ``UploadDamagedError`` rather than re-raising either. The
+swap is forced by raising the error the open gives, since a real swap races the ``lstat``.
 """
 
 from __future__ import annotations
@@ -42,10 +43,10 @@ def test_a_retryable_error_is_still_re_raised(code: int) -> None:
     assert uploads._refused_read(OSError(code, "synthetic")) is None
 
 
-@pytest.mark.parametrize("code", [errno.ENXIO, errno.EISDIR])
+@pytest.mark.parametrize("swap", ["folder", "socket"])
 @pytest.mark.parametrize("part", ["sidecar", "body"])
 async def test_a_swapped_part_answers_damaged_on_a_by_id_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int, part: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap: str, part: str
 ) -> None:
     store = UploadStore(tmp_path / "uploads", make_cipher(None), max_bytes=4096)
     meta = await store.save(
@@ -56,11 +57,17 @@ async def test_a_swapped_part_answers_damaged_on_a_by_id_read(
 
     def _swapped(path: Path) -> object:
         if path.name.endswith(suffix):
+            if swap == "socket":
+                # A socket's ENXIO that names no path, so no fresh lstat is made and the errno
+                # alone decides (``uploads._NOT_A_FILE``). A real socket's open names the path, and
+                # its re-check would answer damage whatever the errno, so it is simulated here;
+                # this also runs where a socket cannot be made, as on Windows.
+                raise OSError(errno.ENXIO, "synthetic swap")
             # The part really is a folder now, as a fresh lstat reads it (``uploads._recheck``):
             # an error naming a part that is still a regular file is not damage.
             path.unlink()
             path.mkdir()
-            raise OSError(code, "synthetic swap", str(path))
+            raise IsADirectoryError(errno.EISDIR, "synthetic swap", str(path))
         return real(path)
 
     monkeypatch.setattr(uploads, "_open_plain", _swapped)
@@ -74,10 +81,18 @@ async def test_a_swapped_part_answers_damaged_on_a_by_id_read(
 def test_a_failed_folder_check_is_logged_not_swallowed(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def _fails(path: object) -> object:
-        raise ValueError("synthetic")
+    class _OsWithAFailingLstat:
+        """The ``os`` the uploads module reads, with only its ``lstat`` failing, so no other
+        module's ``os.lstat`` is patched."""
 
-    monkeypatch.setattr(os, "lstat", _fails)
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+        @staticmethod
+        def lstat(path: object) -> object:
+            raise ValueError("synthetic")
+
+    monkeypatch.setattr(uploads, "os", _OsWithAFailingLstat())
     with caplog.at_level(logging.DEBUG, logger=uploads.__name__):
         assert uploads._refused_read(PermissionError(13, "denied", "x.meta")) == "denied"
     assert any("synthetic" in r.getMessage() for r in caplog.records), caplog.records
