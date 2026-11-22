@@ -2385,13 +2385,16 @@ the same permission set on the same method reds CI until it is listed here.
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
 > scope, and `control_target` is unset or in it. Each name a rule carries must also be an inbound
 > in `Registry.inbound_names()`, the set the flag route's scope test reads, even when the scope
-> lists it (BACKLOG #3378, owner ruling 2026-11-04). So a rule naming an outbound, or a name that
+> lists it (BACKLOG #3378). The owner ruled on 2026-11-04 that a scoped caller sees no outbound
+> rule; this allowlist is the batch Manager's 2026-11-22 reading of that ruling. So a rule
+> naming an outbound, or a name that
 > exists nowhere, is withheld from a scoped caller, and with no graph loaded every rule that
 > names a connection is. A name that is both an inbound and an outbound passes that test. Every
 > `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
-> its action names the outbound side. This narrowing is this route's alone, on purpose: the
-> alert-instance routes below still let a scope that lists an outbound reach that outbound's
-> alerts, because the ruling covers rules and flagging only. Each rule it shows has a null `id`
+> its action names the outbound side. The routes that read or act on alert instances were left as
+> they were, on purpose: the batch Manager decided on 2026-11-22 to read the owner's ruling as
+> covering rules and flagging, and not instances. What those routes admit is in the ack, resolve,
+> suspend and resume bullet under *Single-route data rules*, below. Each rule it shows has a null `id`
 > (BACKLOG #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
 > connection name in it, and nothing here reliably tells a label that names one from one that
 > does not. An

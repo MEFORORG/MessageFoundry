@@ -7,7 +7,8 @@
   200 against a 409 told it which names exist. It now gives the one
   refusal the per-name routes give (BACKLOG #2551, #2640) to every target outside the caller's scope.
 * ``GET /alerts/rules`` returned every rule's ``connection`` and ``control_target``. It now withholds
-  any rule that names a connection outside the caller's scope.
+  any rule that names a connection outside the caller's scope and, since BACKLOG #3378, any rule
+  naming a name that is not an inbound of the loaded graph, and every ``restart_outbound`` rule.
 
 NOT-DEPLOYED beta: each gap was one a first deployment would have carried, not a live exposure.
 """
@@ -202,18 +203,14 @@ def _attach_graph(
     engine: Engine,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     inbounds: tuple[str, ...] = _GRAPH,
-    outbounds: tuple[str, ...] = (),
 ) -> None:
-    """Give ``engine`` a stand-in runner whose graph declares ``inbounds`` and ``outbounds``, since
+    """Give ``engine`` a stand-in runner whose graph declares ``inbounds``, since
     ``GET /alerts/rules`` shows a scoped caller only rules on an in-scope inbound of a loaded graph
-    (BACKLOG #3378). The route reads only these attributes. ``monkeypatch`` restores the engine's
-    own (None) runner before the engine fixture stops it, as long as the test names ``engine``
-    first."""
-    registry = SimpleNamespace(
-        inbound_names=lambda: frozenset(inbounds), outbound=dict.fromkeys(outbounds)
-    )
-    stub = SimpleNamespace(registry=registry, knows_outbound=lambda name: name in outbounds)
-    monkeypatch.setattr(engine, "_registry_runner", stub)
+    (BACKLOG #3378). Of the runner, that route reads only ``registry.inbound_names()``.
+    ``monkeypatch`` restores the engine's own (None) runner before the engine fixture stops it, as
+    long as the test names ``engine`` first."""
+    registry = SimpleNamespace(inbound_names=lambda: frozenset(inbounds))
+    monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(registry=registry))
 
 
 async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope(
@@ -221,7 +218,9 @@ async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A scoped caller sees a rule only when its ``connection`` is ``*`` or a name in its scope and
-    its ``control_target`` is unset or in its scope. An all-channels caller sees every rule."""
+    its ``control_target`` is unset or in its scope; the graph declares ``IB_B`` too, so its rule
+    is withheld by the scope test, not the inbound one (BACKLOG #3378 adds that test and withholds
+    every ``restart_outbound`` rule). An all-channels caller sees every rule."""
     _attach_graph(engine, monkeypatch)
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
@@ -326,11 +325,12 @@ async def test_alert_rules_a_name_on_both_sides_counts_as_its_inbound(
     engine: Engine,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3378 item 4: a name the graph declares as both an inbound and an outbound passes the
-    inbound test, so its rules show to a scope that lists it, whatever the event type. A
-    ``restart_outbound`` rule is still withheld, since its action names the outbound side, a
+    """BACKLOG #3378 item 4: the route tests only the inbound side, so a name the graph declares as
+    an inbound passes whether or not it is an outbound too, and its rules show to a scope that
+    lists it, whatever the event type (the stand-in declares only the inbound side for that reason).
+    A ``restart_outbound`` rule is still withheld, since its action names the outbound side, a
     ``"*"`` rule with no target included."""
-    _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"), outbounds=("SHARED",))
+    _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"))
     rules = AlertsSettings(
         rules=[
             AlertRule(id="stall", event_type="message_stall", connection="SHARED"),
