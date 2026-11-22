@@ -453,6 +453,27 @@ def test_guard_direct_path_judges_the_form_limit_on_the_reattach_parse(shape: st
     assert admit_resubmitted_body(within, None) == within
 
 
+def test_guard_direct_path_gives_the_listeners_reason_on_a_body_they_parse() -> None:
+    # BACKLOG #5972: a body Peek.parse accepts meets the listeners' check whole and in its order,
+    # so one holding the marker under a colliding header and past the form limit is refused for
+    # the marker, as the listeners and the re-route refuse it, not for its form count.
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT, DOC_REF_MARKER
+    from messagefoundry.pipeline.ingress_guards import COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+
+    headers = "".join(
+        f"BHS|:~{chr(0x4E00 + index)}&|A\r" for index in range(_LATER_HEADER_FORMS_LIMIT + 1)
+    )
+    body = (
+        "MSH|~|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r" + f"NTE|1||{DOC_REF_MARKER}x\r" + headers
+    )
+    with pytest.raises(IngressGuardError) as direct:
+        admit_resubmitted_body(body, None)
+    with pytest.raises(IngressGuardError) as routed:
+        admit_resubmitted_body(body, _ic(ContentType.HL7V2))
+    assert direct.value.phase == routed.value.phase == "ingest"
+    assert direct.value.reason == routed.value.reason == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+
+
 def test_guard_sniffs_the_declared_type() -> None:
     admit_resubmitted_body('{"a": 1}', _ic(ContentType.JSON))
     with pytest.raises(IngressGuardError) as exc:

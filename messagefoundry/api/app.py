@@ -4237,7 +4237,9 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
 #: the same status the upload route gives a non-text file. A body the listener could not have decoded,
 #: an HL7 body ``Peek.parse`` or the document-marker check refuses, or one a ``validation.strict``
-#: inbound's strict hl7apy validation refuses or times out on, is 422.
+#: inbound's strict hl7apy validation refuses or times out on, is 422. On the edit-resend direct
+#: path a body ``Peek.parse`` refuses as not HL7 is admitted, and only a parser fault there is a
+#: ``parse`` refusal.
 _INGRESS_GUARD_STATUS: dict[str, int] = {
     "size": 413,
     "type": 415,
