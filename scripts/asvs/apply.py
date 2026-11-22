@@ -184,8 +184,10 @@ def toml_str(s: object) -> str:
 #: `review_notes`, the free text that moves out of `reviewed_by`, is deliberately NOT ordered. It is
 #: carried like any other key, so a payload that omits it keeps the record's value.
 _ORDERED = ("id", "level", "verdict", "residual", "last_verified", "verified_at", "reviewed_by")
-#: The ordered fields `render` omits when empty. Every other ordered field is always written, which
-#: is why `main` requires them; `reviewed_by` is required too unless the run is an anchor repair.
+#: The ordered fields `render` omits when the PAYLOAD states them empty. Every other ordered field is
+#: always written, which is why `main` requires them; `reviewed_by` is required too unless the run is
+#: an anchor repair. A declared repair that omits one keeps the record's value, uncoerced and even
+#: if empty (`_repair_carry`, BACKLOG #5867).
 _OPTIONAL_ORDERED = ("residual", "reviewed_by")
 
 #: AT LEAST these top-level keys carry free text. **NOT every field that can** -- `posture`,
@@ -542,14 +544,16 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     #
     # A DECLARED REPAIR MAY OMIT THE OPTIONAL PROSE, AND THE RECORD'S VALUE IS THEN KEPT (BACKLOG
     # #5867). `main`'s byte-identity loop already reads an omission as the live value. Only a key the
-    # payload does not hold is carried: an explicit empty is a change, which that loop refuses, and
-    # an ordinary payload still has to state these. Written by `_scalar`, because `toml_str` would
-    # coerce a non-string to its repr under a type guard that exempts ordered fields.
+    # payload does not hold is carried: an explicit empty over a non-empty value is a change, which
+    # that loop refuses, and an ordinary payload still has to state these. Not written by `toml_str`,
+    # which would coerce a non-string to its repr under a type guard that exempts ordered fields.
     kept = _repair_carry(cell, live or {})
     out = ["[[cell]]"]
     for key in _ORDERED:
         if key in kept:
-            out.append(_scalar(key, kept[key]))
+            value = kept[key]
+            is_table = key == "reviewed_by" and isinstance(value, dict)
+            out.append(f"{key} = {_reviewed_by_table(value)}" if is_table else _scalar(key, value))
         elif key == "level":
             out.append(f"level = {int(cell[key])}")
         elif key == "reviewed_by" and isinstance(cell.get(key), dict) and cell[key]:
@@ -1089,11 +1093,19 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"{c.get('id')}: bad verdict {c.get('verdict')!r}")
         # THE STRUCTURED FORM IS CHECKED BY THE LOADER'S OWN RULE (BACKLOG #2168). Written unchecked,
         # a malformed table would land in the record and make the next load of it fail.
-        if isinstance(c.get("reviewed_by"), dict):
+        # A CARRIED value is held to the same rule (BACKLOG #5867): a repair must not stamp new anchors
+        # on a cell the next load refuses. A blank string is left to the guards below.
+        stated_rb = _repair_carry(c, live).get("reviewed_by", c.get("reviewed_by"))
+        if isinstance(stated_rb, dict):
             try:
-                parse_reviewed_by(c["reviewed_by"], c.get("id"))
+                parse_reviewed_by(stated_rb, c.get("id"))
             except ScorecardError as err:
                 problems.append(_printable(str(err)))
+        elif "reviewed_by" not in c and stated_rb is not None and not isinstance(stated_rb, str):
+            problems.append(
+                f"{_printable(str(c.get('id')))}: the record's reviewed_by is a "
+                f"{type(stated_rb).__name__}, not a table, so a repair cannot carry it"
+            )
         if "review_notes" in c and not isinstance(c["review_notes"], str):
             problems.append(
                 f"{c.get('id')}: review_notes must be a string, got "
@@ -1452,7 +1464,10 @@ def main(argv: list[str] | None = None) -> int:
         # `_ORDERED`, and `_toml_value` writes a TOML date as a string, so nothing else would see it.
         changed_carry = [k for k, v in _repair_carry(c, was).items() if not _same(now.get(k), v)]
         if changed_carry:
-            print(f"REFUSING: cell {c['id']} would CHANGE carried field(s) {changed_carry}")
+            print(
+                f"REFUSING: cell {_printable(str(c['id']))} would CHANGE carried field(s) "
+                f"{changed_carry}"
+            )
             return 1
         # A STRUCTURED reviewed_by MUST COME BACK AS THE TABLE THE PAYLOAD STATED (BACKLOG #2168).
         # The type guard below skips `_ORDERED` because `render` coerces those fields to strings, and
@@ -1492,7 +1507,8 @@ def main(argv: list[str] | None = None) -> int:
         #
         # _ORDERED is excluded because render() deliberately COERCES those -- `int(cell['level'])`
         # and the quoted emissions -- so a payload stating another type there is NORMALISED BY
-        # DESIGN, and refusing it would be the false-refusal this scoping exists to prevent.
+        # DESIGN, and refusing it would be the false-refusal this scoping exists to prevent. A value
+        # a repair CARRIED is not coerced, and the `changed_carry` check above is what holds it.
         # _SUBTABLES are excluded because they have their own key AND type comparison below, one
         # level further in, where the entries are matched by identity. That comparison used to be
         # key-only, which is what made this exclusion a hole rather than a delegation (#1242).

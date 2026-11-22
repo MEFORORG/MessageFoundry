@@ -3671,7 +3671,10 @@ def test_an_ordinary_payload_omitting_prose_is_still_refused(
     assert rc == 1
     assert rec.read_bytes() == before
     out = capsys.readouterr().out
-    assert f"missing {field}" in out or f"would LOSE field(s) ['{field}']" in out, out
+    expected = (
+        "missing reviewed_by" if field == "reviewed_by" else "would LOSE field(s) ['residual']"
+    )
+    assert expected in out, out
 
 
 @pytest.mark.parametrize(
@@ -3714,6 +3717,65 @@ def test_an_anchor_repair_omitting_residual_on_a_closed_cell_is_still_refused(
     assert rec.read_bytes() == before
     out = capsys.readouterr().out
     assert "is decision_closed and this edit changes ['residual']" in out, out
+
+
+def test_an_anchor_repair_of_a_closed_cell_may_omit_reviewed_by(tmp_path: Path) -> None:
+    """The success path on the cell where a dropped field costs most."""
+    rec = _record(tmp_path)
+    live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}["5.4.3"]
+    repair = {
+        "id": "5.4.3",
+        "level": 2,
+        "verdict": "na",
+        "residual": live["residual"],
+        "last_verified": "2026-08-02",
+        "verified_at": "5555555555555555555555555555555555555555",
+        "anchor_repair": True,
+        "anchor_repaired_at": _REPAIR_DATE,
+        "evidence": [{"path": "messagefoundry/m.py", "line": 31, "expect": "_no_scan"}],
+    }
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    got = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}["5.4.3"]
+    assert got["reviewed_by"] == live["reviewed_by"]
+    assert got["decision_closed"] is True and got["decision_closed_by"] == "owner"
+    assert got["evidence"][0]["line"] == 31
+
+
+@pytest.mark.parametrize(
+    "live_line",
+    [
+        'reviewed_by = { reviewer = "fixture", ref = "not-a-sha", date = "unrecorded" }',
+        'reviewed_by = ["x"]',
+    ],
+)
+def test_an_anchor_repair_will_not_carry_a_reviewed_by_the_loader_refuses(
+    tmp_path: Path, live_line: str
+) -> None:
+    rec = _record(tmp_path)
+    rec.write_text(FIXTURE.replace(_FIX_LINE, live_line + "\n", 1), encoding="utf-8")
+    before = rec.read_bytes()
+    repair = _repair_omitting("reviewed_by")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+
+
+def test_a_carried_reviewed_by_table_is_written_in_canonical_order(tmp_path: Path) -> None:
+    """Omitting and echoing the table must produce the same bytes."""
+    shuffled = 'reviewed_by = { date = "unrecorded", ref = "unrecorded", reviewer = "fixture" }\n'
+    written = []
+    for name, repair in (
+        ("omit", _repair_omitting("reviewed_by")),
+        ("echo", _cell_with_repair()),
+    ):
+        rec = tmp_path / name / "asvs-scorecard.toml"
+        rec.parent.mkdir()
+        rec.write_text(FIXTURE.replace(_FIX_LINE, shuffled, 1), encoding="utf-8")
+        rc = main([str(_payload(rec.parent, [repair])), "--scorecard", str(rec), "--apply"])
+        assert rc == 0
+        written.append(rec.read_bytes())
+    assert written[0] == written[1]
 
 
 def test_an_anchor_repair_omitting_an_na_rationale_is_still_refused(
