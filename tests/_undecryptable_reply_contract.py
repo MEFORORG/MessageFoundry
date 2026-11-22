@@ -38,6 +38,7 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
+from messagefoundry.store.queue_tag import QueueOpenFault
 from tests._erased_reply_contract import BODY, LOOP, RAW, REPLY, children, status_of
 from tests._queue_tag_contract import RawFetch, RawSql, _handoff
 from tests._store_audit import no_operator_audit
@@ -231,7 +232,9 @@ async def _assert_token_live(store: Any, fetch: RawFetch, mid: str) -> None:
     assert await children(fetch) == []
 
 
-def _open_fault_propagates(which: str, error: type[CipherError]) -> ContractCase:
+def _open_fault_propagates(
+    which: str, error: type[CipherError], raised: type[Exception] | None = None
+) -> ContractCase:
     async def case(store: Any, fetch: RawFetch, raw: RawSql) -> None:
         mid, item = await _claimed_head(store)
         if which == "metadata":  # a captured message carries none, and NULL is never opened
@@ -239,8 +242,10 @@ def _open_fault_propagates(which: str, error: type[CipherError]) -> ContractCase
         target = await _cell(fetch, which, mid)
         with faulting_cipher(store) as fault:
             fault.target, fault.open_error = target, error("synthetic")
-            with pytest.raises(error):
+            with pytest.raises(raised or error) as caught:
                 await _handoff(store, item.id, LOOP)
+            if raised is not None:  # the raw key-service error must not reach the fault log
+                assert caught.value.__cause__ is None and caught.value.__suppress_context__
             await _assert_token_live(store, fetch, mid)
             # CONTROL: the same token hands off once the fault clears, so it was the fault.
             fault.heal()
@@ -258,8 +263,9 @@ async def worker_read_outage_retries(store: Any, fetch: RawFetch, _raw: RawSql) 
     target = await _cell(fetch, "reply", mid)
     with faulting_cipher(store) as fault:
         fault.target, fault.open_error = target, CipherUnavailableError("synthetic")
-        with pytest.raises(CipherUnavailableError):
+        with pytest.raises(QueueOpenFault) as caught:
             await step._process_response_item(LOOP, item)
+        assert caught.value.__cause__ is None and caught.value.__suppress_context__
         await _assert_token_live(store, fetch, mid)
         fault.heal()
         await step._process_response_item(LOOP, item)
@@ -325,7 +331,7 @@ HANDOFF_CASES: list[ContractCase] = [
     tampered_reply_in_the_handoff_dead_letters,
     worker_read_outage_retries,
     seal_failure_stays_a_hard_stop,
-    _open_fault_propagates("ref", CipherUnavailableError),
+    _open_fault_propagates("ref", CipherUnavailableError, QueueOpenFault),
     _open_fault_propagates("reply", CipherUnavailableError),
     _open_fault_propagates("metadata", CipherUnavailableError),
     _open_fault_propagates("reply", AADComponentError),

@@ -279,6 +279,7 @@ from messagefoundry.store.queue_tag import (
     PROGRAMMING_ERRORS,
     QueueTagError,
     is_transient_open_failure,
+    queue_open_fault,
 )
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import (
@@ -12976,9 +12977,14 @@ class RegistryRunner:
         except CipherError as exc:
             # BACKLOG #5727: a key service that gave no verdict says nothing about this reply, and
             # a fault in the engine's own code is not the cell's either. Both take the fault arm,
-            # which re-pends the token with a backoff, so an outage holds the lane and loses nothing.
-            if isinstance(exc, PROGRAMMING_ERRORS) or is_transient_open_failure(exc):
+            # which re-pends the token with a backoff and dead-letters nothing. A per-lane worker
+            # retries until the service answers; a pooled lane under infra_fault_policy "stop"
+            # goes STOPPED after infra_fault_stop_after such faults, its token left pending.
+            if isinstance(exc, PROGRAMMING_ERRORS):
                 raise
+            if is_transient_open_failure(exc):
+                # Without the raw key-service error, which can echo a URL or body (BACKLOG #2318).
+                raise queue_open_fault(exc) from None
             # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
             # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
             # does an unopenable payload; the token keeps its reference for a replay. The handoff

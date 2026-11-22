@@ -6468,7 +6468,7 @@ class PostgresStore:
                         )
                     except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
                         if is_transient_open_failure(exc):  # BACKLOG #5727: no verdict on the cell
-                            raise
+                            raise queue_open_fault(exc) from None  # never the raw key-service error
                         # A corrupt/undecryptable work-row reference can never be re-ingressed.
                         # Mirrors the SQLite branch and the depth-cap branch.
                         return await _consume_dead(

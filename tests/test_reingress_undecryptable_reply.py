@@ -82,14 +82,16 @@ async def test_an_outage_re_pends_the_token_and_the_lane_resumes_in_order(
             async with asyncio.timeout(5.0):
                 while True:
                     [row] = await fetch(
-                        "SELECT status, attempts, next_attempt_at FROM queue"
+                        "SELECT status, attempts, next_attempt_at, updated_at FROM queue"
                         " WHERE message_id=? AND stage='response'",
                         (head,),
                     )
-                    if row["status"] == OutboxStatus.PENDING.value and row["next_attempt_at"] > 2:
+                    # Past the capture's own due time (2.0 at most): the fault arm has re-pended it.
+                    if row["status"] == OutboxStatus.PENDING.value and row["updated_at"] > 2:
                         break
                     await asyncio.sleep(0.005)
             assert row["attempts"] == 0
+            assert row["next_attempt_at"] > row["updated_at"]  # a backoff, not a hot re-claim
             assert (await contract.token_of(fetch, behind))["status"] == OutboxStatus.PENDING.value
             assert await children(fetch) == []
             assert not [e for e in await store.events_for(head) if e["event"] == "dead"]

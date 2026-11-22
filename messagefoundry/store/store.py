@@ -16353,7 +16353,7 @@ class MessageStore:
                 )
             except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
                 if is_transient_open_failure(exc):  # BACKLOG #5727: no verdict on the cell
-                    raise
+                    raise queue_open_fault(exc) from None  # never the raw key-service error
                 # A corrupt/undecryptable work-row reference (DB corruption, a key the store lacks)
                 # can NEVER be re-ingressed. Mirrors the depth-cap branch (a different
                 # unrecoverable-token case).

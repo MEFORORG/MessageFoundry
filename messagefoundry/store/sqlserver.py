@@ -9464,7 +9464,7 @@ class SqlServerStore:
                     )
                 except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
                     if is_transient_open_failure(exc):  # BACKLOG #5727: no verdict on the cell
-                        raise
+                        raise queue_open_fault(exc) from None  # never the raw key-service error
                     return await _consume_dead(
                         "ingress_handoff(corrupt-ref)",
                         "re-ingress work-row reference is corrupt/unparseable",
