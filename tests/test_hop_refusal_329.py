@@ -41,7 +41,7 @@ from messagefoundry.config.settings import (
     load_settings,
 )
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline import Engine, alert_sinks
 from messagefoundry.pipeline.alert_sinks import (
     NotifierAlertSink,
     WebhookTransport,
@@ -298,6 +298,24 @@ async def test_a_failed_send_logs_the_exception_class_only(
     assert record.exc_info is None and record.exc_text is None
     assert record.getMessage().endswith(": InvalidURL")
     assert _WEBHOOK_TOKEN not in caplog.text
+
+
+def test_post_re_raises_invalid_url_with_fixed_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Defence in depth (#3533 item 14): an InvalidURL the screen did not foresee is re-raised with
+    # text that holds nothing of the URL, and with no chain link holding the original.
+    transport = WebhookTransport(f"https://hooks.example/{_WEBHOOK_TOKEN}", posture=STAGING_PHI)
+
+    class _Opener:
+        def open(self, req: object, timeout: float) -> object:
+            raise http.client.InvalidURL(
+                f"URL can't contain control characters. '/{_WEBHOOK_TOKEN}'"
+            )
+
+    monkeypatch.setattr(alert_sinks, "_shared_no_redirect_opener", lambda: _Opener())
+    with pytest.raises(http.client.InvalidURL) as info:
+        transport._post({"type": "synthetic"})
+    assert _WEBHOOK_TOKEN not in str(info.value)
+    assert info.value.__context__ is None and info.value.__cause__ is None
 
 
 def test_the_build_dials_the_value_it_judged() -> None:

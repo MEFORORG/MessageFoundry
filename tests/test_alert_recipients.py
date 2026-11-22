@@ -281,7 +281,7 @@ def test_a_permanent_refusal_of_every_recipient_fails_the_alert_send_content_fre
 ) -> None:
     # Every recipient refused (vault BACKLOG #2884, #2924 step 5). RED on main: smtplib's own
     # SMTPRecipientsRefused, whose args hold each address and the relay's reply, reached the
-    # notifier, which then logged a failed send with exc_info.
+    # notifier, which logs a failed send with exc_info.
     refuse_every_recipient(wire, quit_ok=quit_ok)
     with pytest.raises(NegativeAckError) as caught:
         _send_to(wire.port, "engine@hospital.example", _PARTIAL_RECIPIENTS)
@@ -289,20 +289,19 @@ def test_a_permanent_refusal_of_every_recipient_fails_the_alert_send_content_fre
 
 
 @pytest.mark.parametrize(
-    "refused",
+    ("refused", "expected"),
     [
-        [_PARTIAL_REFUSED],
+        ([_PARTIAL_REFUSED], "1 of 2 recipients refused"),
         # vault BACKLOG #2884: RED on main, the log held SMTPRecipientsRefused and both addresses.
-        _PARTIAL_RECIPIENTS,
+        (_PARTIAL_RECIPIENTS, "all 2 recipients refused (550)"),
     ],
     ids=["partial", "total"],
 )
 async def test_the_notifier_logs_a_refusal_without_an_address(
-    wire: _WireCapture, caplog: pytest.LogCaptureFixture, refused: list[str]
+    wire: _WireCapture, caplog: pytest.LogCaptureFixture, refused: list[str], expected: str
 ) -> None:
-    # The notifier logs a failed transport by its exception class alone, with no message and no
-    # exc_info (vault BACKLOG #3533 item 14), so neither the refusal's text nor its traceback reach
-    # the log. Neither may name a recipient.
+    # The notifier logs a failed transport with exc_info, so the refusal's text and traceback are
+    # what reach the log. Neither may name a recipient.
     wire.refuse_rcpt = frozenset(a.encode() for a in refused)
     email = EmailTransport(
         host="127.0.0.1",
@@ -317,15 +316,15 @@ async def test_the_notifier_logs_a_refusal_without_an_address(
         sink.connection_stopped("OB_X", detail="boom")
         sink.start()
         for _ in range(500):
-            if any("alert transport email failed" in r.getMessage() for r in caplog.records):
+            if any(r.exc_info for r in caplog.records):
                 break
             await asyncio.sleep(0.01)
         await sink.aclose()
-    [record] = [r for r in caplog.records if "alert transport email failed" in r.getMessage()]
-    assert record.exc_info is None
-    assert record.getMessage().endswith(": NegativeAckError")
+    [record] = [r for r in caplog.records if r.exc_info]
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], NegativeAckError)
     logged = caplog.text.lower()
-    assert "recipients refused" not in logged
+    assert expected in logged
     for address in _PARTIAL_RECIPIENTS:
         assert address not in logged
 

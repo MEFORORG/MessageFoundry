@@ -26,6 +26,7 @@ import asyncio
 import datetime
 import fnmatch
 import html
+import http.client
 import json
 import logging
 import smtplib
@@ -846,19 +847,33 @@ class WebhookTransport:
         # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily.
         from messagefoundry.transports.bounded_read import drain_2xx_reply
 
-        # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
-        with _shared_no_redirect_opener().open(req, timeout=self.timeout) as resp:
-            # Drain (bounded) so the connection can be reused/closed cleanly. The body is discarded,
-            # so completeness is not checked: the POST has already been accepted by this point, and
-            # failing the drain on a short reply would report an alert as undelivered when the host
-            # took it. The byte bound still applies -- an unbounded drain is a memory exhaustion
-            # whether or not anyone reads the bytes.
-            #
-            # An over-cap body after a 2xx counts as delivered, with a WARNING: owner ruling
-            # 2026-10-12 (#3040 item 1), which extends the owner ruling of 2026-10-05, "decide by
-            # who reads the body", to this sink. Nothing reads this body. The label is fixed, so
-            # the WARNING does not carry the configured host.
-            drain_2xx_reply(resp, connector="alert webhook")
+        # Defence in depth (vault BACKLOG #3533 item 14): http.client's InvalidURL quotes the
+        # request target, whose path can carry the webhook's token. The screen above refuses the
+        # shapes known to raise it, and any other is re-raised with fixed text, outside the
+        # handler, so no chain link holds the original either.
+        unsendable = False
+        try:
+            # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST
+            # (15.3.2).
+            with _shared_no_redirect_opener().open(req, timeout=self.timeout) as resp:
+                # Drain (bounded) so the connection can be reused/closed cleanly. The body is
+                # discarded, so completeness is not checked: the POST has already been accepted by
+                # this point, and failing the drain on a short reply would report an alert as
+                # undelivered when the host took it. The byte bound still applies -- an unbounded
+                # drain is a memory exhaustion whether or not anyone reads the bytes.
+                #
+                # An over-cap body after a 2xx counts as delivered, with a WARNING: owner ruling
+                # 2026-10-12 (#3040 item 1), which extends the owner ruling of 2026-10-05, "decide
+                # by who reads the body", to this sink. Nothing reads this body. The label is
+                # fixed, so the WARNING does not carry the configured host.
+                drain_2xx_reply(resp, connector="alert webhook")
+        except http.client.InvalidURL:
+            unsendable = True
+        if unsendable:
+            raise http.client.InvalidURL(
+                "[alerts].webhook_url could not be sent by http.client; the URL is not repeated "
+                "here, since its path can carry the webhook's token"
+            )
 
 
 #: The name the alerts SMTP hop logs under. The security notifier registers its verification-off
@@ -962,9 +977,8 @@ def send_plain_email(
     msg = EmailMessage()
     # The Subject header refuses some lone surrogates as it is set, and set_content() and
     # add_alternative() encode with a bare str.encode(). Each raises a UnicodeEncodeError whose text
-    # names the character and whose `.object` is the whole value. The notifier logs a failed send
-    # by class only now, but send_plain_email has other callers, the security notifier among them.
-    # Keep only the type name, and raise outside the handler so neither chain
+    # names the character and whose `.object` is the whole value, and the notifier logs a failed
+    # send with exc_info. Keep only the type name, and raise outside the handler so neither chain
     # link holds that error (vault BACKLOG #3011). The subject and the body get separate arms, as
     # the Email destination's headers and body do, so the refusal names the right one.
     failure = ""
@@ -2687,17 +2701,28 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             except Exception as exc:
                 # Best-effort: a failing transport must not drop the event for the others, nor
                 # ever propagate into the engine. The line names the event's type and connection,
-                # never its free text, which can echo a partner's reply (docs/PHI.md row 10). It
-                # names the exception's class only, with no message and no exc_info: a send's
-                # exception text can quote the webhook URL, whose path can carry its token (an
-                # http.client InvalidURL does), or a relay's reply (vault BACKLOG #3533 item 14).
-                log.warning(
-                    "alert transport %s failed for %s/%r: %s",
-                    transport.name,
-                    event.get("type"),
-                    event.get("connection"),
-                    type(exc).__name__,
-                )
+                # never its free text, which can echo a partner's reply (docs/PHI.md row 10).
+                if transport.name == "webhook":
+                    # The webhook's URL is its credential, and a send's exception text can quote
+                    # it (an http.client InvalidURL does), so this line names the class only,
+                    # with no message and no exc_info (vault BACKLOG #3533 item 14).
+                    log.warning(
+                        "alert transport %s failed for %s/%r: %s",
+                        transport.name,
+                        event.get("type"),
+                        event.get("connection"),
+                        type(exc).__name__,
+                    )
+                else:
+                    # The other transports' exceptions were made safe to log with their text
+                    # and traceback (vault BACKLOG #2884, #3011), which name what went wrong.
+                    log.warning(
+                        "alert transport %s failed for %s/%r",
+                        transport.name,
+                        event.get("type"),
+                        event.get("connection"),
+                        exc_info=True,
+                    )
                 return
             observer = self._delivery_observer
             if observer is not None:

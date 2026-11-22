@@ -8,7 +8,8 @@
   `provision-admin`, now stops on such a URL; before, `provision-admin` dropped an http webhook
   with a WARNING and ran. These refusals do not repeat the URL, whose path can carry the webhook's
   token; the allowlist refusal names the host as urlsplit reads it, lower-cased. The WARNING the
-  alert notifier logs for a failed transport now names the exception's class only, with no message
-  and no traceback, since a send's exception text can quote the webhook URL. The static-credential
+  alert notifier logs for a failed webhook send now names the exception's class only, with no
+  message and no traceback, since a send's exception text can quote the webhook URL; the other
+  transports still log their exception and traceback. The static-credential
   report now lists `settings:alerts.webhook` as a static credential rather than as none (vault
   BACKLOG #3533 items 14 and 24).
