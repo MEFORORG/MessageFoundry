@@ -387,10 +387,8 @@ export async function withStepUpAuth<T>(
       // The re-proof ended the token withAuthAdopting handed in, so it is told which one this call
       // now holds: a 401 on it is then not mistaken for a sign-in elsewhere merely because the
       // cache holds the rotated token (BACKLOG #5960).
-      // reauth above already stored it, inside the tracked span.
-      storeToken: async (rotated) => {
-        adopt(rotated);
-      },
+      // Adopt only: reauth above already stored it in the cache, inside the tracked span.
+      storeToken: async (rotated) => adopt(rotated),
     }),
   );
 }

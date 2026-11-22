@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -171,46 +172,44 @@ def test_a_client_timeout_up_to_the_floor_gets_the_floor_on_the_queued_reads(own
     assert seen["/auth/me"] == _every_phase(own)
 
 
-def _client_methods() -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
-    """The ``EngineClient`` methods, ``async def`` ones included, read from its source."""
+def _methods_with_a_call(matches: Callable[[ast.Call], bool]) -> set[str]:
+    """The ``EngineClient`` methods, ``async def`` ones included, whose body holds a call that
+    ``matches``, read from its source."""
     tree = ast.parse(Path(inspect.getfile(EngineClient)).read_text(encoding="utf-8"))
     cls = next(
         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == EngineClient.__name__
     )
-    return [fn for fn in cls.body if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    return {
+        fn.name
+        for fn in cls.body
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(isinstance(node, ast.Call) and matches(node) for node in ast.walk(fn))
+    }
 
 
 def _methods_calling(name: str) -> set[str]:
-    """The ``EngineClient`` methods whose body calls ``self.<name>()``, read from its source."""
-    found: set[str] = set()
-    for fn in _client_methods():
-        for node in ast.walk(fn):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == name
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "self"
-            ):
-                found.add(fn.name)
-    return found
+    """The ``EngineClient`` methods whose body calls ``self.<name>()``."""
+    return _methods_with_a_call(
+        lambda call: (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == name
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+        )
+    )
 
 
 def _methods_setting_a_read_timeout() -> set[str]:
     """The ``EngineClient`` methods that build an ``httpx.Timeout`` with its own ``read=``."""
-    found: set[str] = set()
-    for fn in _client_methods():
-        for node in ast.walk(fn):
-            if (
-                isinstance(node, ast.Call)
-                and (
-                    (isinstance(node.func, ast.Attribute) and node.func.attr == "Timeout")
-                    or (isinstance(node.func, ast.Name) and node.func.id == "Timeout")
-                )
-                and any(kw.arg == "read" for kw in node.keywords)
-            ):
-                found.add(fn.name)
-    return found
+    return _methods_with_a_call(
+        lambda call: (
+            (
+                (isinstance(call.func, ast.Attribute) and call.func.attr == "Timeout")
+                or (isinstance(call.func, ast.Name) and call.func.id == "Timeout")
+            )
+            and any(kw.arg == "read" for kw in call.keywords)
+        )
+    )
 
 
 def test_the_census_of_queued_calls_matches_the_client() -> None:

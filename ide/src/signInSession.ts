@@ -123,7 +123,7 @@ export function reproveTracked(
 ): Promise<string | undefined> {
   return tracked(key, waitMs, async () => {
     const rotated = await post();
-    if (rotated !== undefined && rotated !== "") {
+    if (rotated) {
       await cache.store(key, rotated);
     }
     return rotated;
