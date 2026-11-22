@@ -4512,7 +4512,9 @@ def _decode_store_key(key_b64: str) -> bytes:
 def _resolve_decrypt_keyring(store_settings: object, posture: HopPosture | None) -> list[bytes]:
     """The decrypt-capable keyring, decoded. Blocking: the provider can dial a Vault, so the callers
     run this in its own thread hop, ahead of the verify or restore hop (BACKLOG #5888). A caller's
-    timeout cannot stop the thread; one left behind finishes resolving and its value is dropped."""
+    timeout cannot stop the thread. One left behind runs until the provider returns, which nothing
+    here bounds, and whatever the provider does in that time still happens; only its value is
+    dropped."""
     return [
         _decode_store_key(k)
         for k in resolve_decrypt_keys(

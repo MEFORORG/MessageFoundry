@@ -26,8 +26,9 @@ from messagefoundry.store.base import StoreCipherConfigError
 from messagefoundry.store.keyprovider import KeyProviderError
 from tests._refusal_log_capture import until
 
-#: How long the fake provider can hold a thread. On the unfixed code it holds the loop this long.
-_HOLD_SECONDS = 3.0
+#: A safety bound on the fake provider's hold, well past any scheduling delay on a loaded runner, so
+#: it cannot expire on correct code. Each test releases it. On the unfixed code it holds the loop.
+_HOLD_SECONDS = 30.0
 _GOOD_KEY = "A" * 43 + "="
 
 
@@ -142,7 +143,8 @@ async def test_the_takeover_timeout_fires_on_a_blocked_key_provider(
             await coord._verify_seed(str(tmp_path / "seed.mfbak"), "synthetic-actor", 1.0)
         assert raised.value.kind == "key"
         assert "KeyProvider unreachable" in str(raised.value)
-        assert held.entered.is_set() and not held.left.is_set()
+        # Not `entered`: on a loaded runner the timeout can fire before the worker thread starts.
+        assert not held.left.is_set()
     finally:
         held.release.set()
         await store.close()
