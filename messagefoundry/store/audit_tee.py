@@ -100,8 +100,51 @@ audit_logger.setLevel(logging.INFO)
 _TEE_FAILURE_LOGGED = False
 
 
+#: The keys of a JSON ``detail`` whose values the tee withholds, at any depth. ``recovery_wrap`` is
+#: the store master key wrapped under the recovery key, which a host-provider store's genesis row
+#: keeps (``store.store.audit_genesis_detail``). The row keeps it, behind the audit read gates; the
+#: log does not. ``tests/test_audit_tee_recovery_wrap.py`` holds this name to the writer's.
+_WITHHELD_DETAIL_FIELDS = frozenset({"recovery_wrap"})
+#: What a withheld value ships as, so a reader sees the field exists.
+_DETAIL_WITHHELD = "<withheld>"
+#: What a ``detail`` that names a withheld field but cannot be read as JSON ships as, whole.
+_DETAIL_WITHHELD_WHOLE = json.dumps({"withheld": _DETAIL_WITHHELD})
 #: What a field scrubbed whole is shipped as: the redactor's own placeholder.
 _FIELD_REDACTED = _REDACTED
+
+
+def _withhold(value: object) -> object:
+    """``value`` with every withheld key's value replaced, in every object it nests."""
+    if isinstance(value, dict):
+        return {
+            k: _DETAIL_WITHHELD if k in _WITHHELD_DETAIL_FIELDS else _withhold(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_withhold(v) for v in value]
+    return value
+
+
+def _withhold_detail(detail: str | None) -> str | None:
+    """``detail`` as the tee may copy it. Unchanged unless its text holds a withheld field's name;
+    then parsed as JSON, each withheld key's value replaced by :data:`_DETAIL_WITHHELD`, and
+    re-encoded in its key order. It ships whole as :data:`_DETAIL_WITHHELD_WHOLE` where it does not
+    parse, nests too deep to walk, or still holds the name anywhere but as a withheld key, as in a
+    string value that quotes it."""
+    if not detail or not any(name in detail for name in _WITHHELD_DETAIL_FIELDS):
+        return detail
+    try:
+        # Not ensure_ascii, for the reason "The record survives the scrub" gives.
+        kept = json.dumps(_withhold(json.loads(detail)), ensure_ascii=False)
+    except (ValueError, RecursionError):  # a deep nest raises the second
+        return _DETAIL_WITHHELD_WHOLE
+    placeholder = json.dumps(_DETAIL_WITHHELD)
+    for name in _WITHHELD_DETAIL_FIELDS:
+        if kept.count(name) != kept.count(f"{json.dumps(name)}: {placeholder}"):
+            return _DETAIL_WITHHELD_WHOLE
+    return kept
+
+
 #: A raw C0 control, U+0000 to U+001F, which ``json.dumps`` escapes.
 _RAW_C0 = re.compile(r"[\x00-\x1f]")
 #: One JSON string escape, matched from the left, so the second half of an escaped backslash is
@@ -462,6 +505,12 @@ def emit_audit_tee(
     redacting here keeps the off-box guarantee independent of handler config and **identical across
     every backend**.
 
+    **A withheld field ships as a placeholder (owner ruling 2026-11-22).** Where ``detail`` is a
+    JSON object naming a key in :data:`_WITHHELD_DETAIL_FIELDS`, at any depth, that key's value
+    ships as ``<withheld>``, before the passes below read it; :func:`_withhold_detail` says how. At
+    least the genesis row of a store minted under ``[store].key_provider = "host"`` names one,
+    ``recovery_wrap``. The row in ``audit_log`` keeps the value, and the observers are passed it.
+
     **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
     ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``
     runs last on every configured handler, and since vault BACKLOG #3012 every escape it writes is
@@ -523,6 +572,10 @@ def emit_audit_tee(
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
+    # The observers below get the row's own detail; the line gets it with any withheld field's
+    # value replaced, before any other pass reads it.
+    row_detail = detail
+    detail = _withhold_detail(detail)
     # safe_text(head) + note is safe_text(detail); the note is kept for a scrubbed detail.
     head, note = safe_text_bound(detail) if detail else ("", "")
     old_detail = safe_text(head) + note
@@ -586,7 +639,7 @@ def emit_audit_tee(
     # After the tee, so an observer fault cannot cost the off-box copy. Each is guarded on its own.
     for observer in _OBSERVERS:
         try:
-            observer(action, actor, channel_id, client, detail)
+            observer(action, actor, channel_id, client, row_detail)
         except Exception as exc:  # noqa: BLE001 - the row is durable; an observer is best-effort
             # Once per process and never the action, for the reason the tee's handler above gives:
             # a line per row would count the hidden lock rows for `logs:view` (#1131).

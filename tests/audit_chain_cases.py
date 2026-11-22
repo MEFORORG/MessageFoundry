@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
@@ -47,7 +48,9 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
+    OPEN_STORE_PIN,
     AuditGenesisStoreId,
+    StorePin,
     audit_genesis_detail,
     audit_handover_tag,
     audit_range_closing,
@@ -862,6 +865,54 @@ async def a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused(
             await keyless.close()
 
 
+#: The bytes of a version 1 recovery wrap, which ``audit_genesis_detail`` holds a wrap to.
+_RECOVERY_WRAP_BYTES: Final = 65
+
+
+class _EveryRecord(logging.Handler):
+    """Each record that reaches the root logger, as a formatter renders it, traceback included."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(self.format(record))
+
+
+async def a_minted_genesis_rows_recovery_wrap_stays_out_of_the_log(b: ChainBackend) -> None:
+    """A store minted under the ``host`` key provider keeps the recovery wrap in its genesis row,
+    and the off-box tee's copy of that row ships it as ``<withheld>`` (owner ruling 2026-11-22).
+    The positive controls: the row read back holds the wrap, and the tee did copy the row."""
+    await b.reset()
+    store_id = bytes(range(STORE_ID_BYTES))
+    wrap = bytes(range(0x80, 0x80 + _RECOVERY_WRAP_BYTES))
+    capture = _EveryRecord()
+    root = logging.getLogger()
+    root.addHandler(capture)
+    pinned = OPEN_STORE_PIN.set(StorePin(store_id, frozenset({store_id}), wrap))
+    try:
+        store = await b.open_keyed(generate_key(), ())
+        await store.close()
+    finally:
+        OPEN_STORE_PIN.reset(pinned)
+        root.removeHandler(capture)
+    genesis = (await _chain(b))[0]
+    label = parse_audit_genesis_store_id(genesis["detail"])
+    assert label == AuditGenesisStoreId(store_id, refused=False, recovery_wrap=wrap), b.name
+    teed = [
+        json.loads(line[line.index("{") :])
+        for line in capture.lines
+        if '"event": "audit"' in line and AUDIT_KEY_EPOCH_ACTION in line
+    ]
+    assert len(teed) == 1, f"{b.name}: {capture.lines}"
+    shipped = json.loads(teed[0]["detail"])
+    assert shipped["recovery_wrap"] == "<withheld>", b.name
+    assert shipped["store_id"] == store_id.hex(), b.name
+    leaked = [line for line in capture.lines if wrap.hex() in line]
+    assert not leaked, f"{b.name}: {leaked}"
+
+
 #: Every case, for a backend's test module to parametrise over.
 CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     an_untouched_keyed_chain_verifies,
@@ -880,4 +931,5 @@ CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     a_record_naming_a_scheme_this_release_does_not_hold_is_refused,
     a_chain_renamed_keyless_and_recomputed_does_not_pass_as_keyless,
     a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused,
+    a_minted_genesis_rows_recovery_wrap_stays_out_of_the_log,
 )
