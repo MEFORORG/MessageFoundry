@@ -435,7 +435,7 @@ _UNRELATED_CONFLICT = [
 def test_a_conflict_on_an_unrelated_workflow_keeps_the_real_finding(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A file no required context resolves to must not abort the sweep and discard a finding."""
+    """A conflicting repeat on a file no required context resolves to keeps the real finding."""
     entries = _active_entries()
     name = Path(str(entries[0]["path"])).name
     entries[0] = {**entries[0], "state": "disabled_manually"}

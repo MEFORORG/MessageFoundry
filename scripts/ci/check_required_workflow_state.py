@@ -180,11 +180,7 @@ def _workflow_states(
         # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
         route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
         payload = gh_api(["--paginate", "--slurp", route])
-    # Only a file directly in .github/workflows can own a required context. A nested or `dynamic/`
-    # path the allowlist accepts is left out, so a basename match cannot let it stand in for a real
-    # file. A repeat that disagrees on a required file is refused, because last-wins could overwrite
-    # a disabled state. On any other file nothing reads the state, so a conflict there is not
-    # refused.
+    # A repeat that disagrees on a required file is refused; for any other file, setdefault keeps the first state listed.
     states: dict[str, str] = {}
     for path, state in map(_workflow_state, _workflow_entries(payload)):
         name = _direct_workflow_file(path)
