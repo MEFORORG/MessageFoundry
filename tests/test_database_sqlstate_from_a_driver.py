@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import sys
 from typing import Any
 
 import pytest
@@ -274,3 +275,87 @@ def test_a_member_whose_chain_leads_back_to_its_group_does_not_loop() -> None:
     (copied,) = copy.exceptions
     assert copied.__context__ is not None
     assert copied.__context__.args == (copy.message,)
+
+
+# --- Review round-999fe74847 repairs: regressions of this branch's earlier heads ---------------
+
+
+async def test_a_withheld_send_error_still_discards_a_lost_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Red on the previous head: the withheld error carries no chain, so the release's lost-link
+    read saw no class-08 link under a driver tuple re-raised as a builtin, and the dead handle went
+    back to its pool. The verdict is taken from the original now, as main took it."""
+    try:
+        try:
+            raise DriverError("08S01", "link lost")
+        except DriverError as link:
+            raise RuntimeError("HY000", "wrapped") from link
+    except RuntimeError as caught:
+        failure = caught
+    released: list[bool] = []
+    real_release = database._close_and_release
+
+    async def recording(pool: Any, conn: Any, cur: Any, *, discard: bool = False) -> None:
+        # The release's own lost-link read, as it decides with the exception in flight.
+        released.append(discard or database._connection_lost(sys.exc_info()[1]))
+        await real_release(pool, conn, cur, discard=discard)
+
+    monkeypatch.setattr(database, "_close_and_release", recording)
+    conn = _FakeConn(_FakeCursor(failure))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(database.WithheldSendError):
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert released == [True]
+
+
+@pytest.mark.parametrize("step", ["fetch", "nextset"])
+async def test_a_capture_error_shaped_like_a_drivers_rolls_the_write_back(step: str) -> None:
+    """Red on the previous head: a non-driver error shaped like a SQLSTATE during the capture read
+    as a client problem, and the write committed. It propagates now, as main did, and the send
+    rolls back."""
+    from tests.test_database_out_params_capture import _FaultCursor, _send_dest
+
+    def error() -> Exception:
+        return RuntimeError("40001", f"deadlock victim ({_VALUE})")
+
+    sets: list[Any] = [([(1,)], [("id",)]), ([(0,)], [("status",)])]
+    if step == "fetch":
+        cur = _FaultCursor(sets, fetch_raises_on=0, fetch_error=error)
+    else:
+        cur = _FaultCursor(sets, nextset_raises_on=0, nextset_error=error)
+    d, conn = _send_dest(cur)
+    with pytest.raises(database.WithheldSendError):
+        await d.send('{"mrn": "42"}')
+    assert conn.rolledback and not conn.committed
+
+
+class _AsyncpgMessage(Exception):
+    """asyncpg's shape: the message in ``args[0]``, and a ``sqlstate`` that is set but unusable."""
+
+    __module__ = "asyncpg.exceptions._base"
+    sqlstate = ""
+
+
+def test_the_traceback_line_never_reads_a_message_as_a_sqlstate() -> None:
+    """Red on the previous head: past an unusable ``sqlstate`` the traceback line read ``args[0]``,
+    asyncpg's message, and printed ``[MRN42]``. The connector's log reading still falls back, as
+    main's did."""
+    exc = _AsyncpgMessage(_VALUE)
+    assert _VALUE not in safe_traceback((type(exc), exc, None))
+    assert database._log_sqlstate(exc) == _VALUE  # main's log reading, for a driver's own error
+
+
+class _NoArgs(DriverError):
+    """A driver error whose ``args`` is missing when read."""
+
+    @property
+    def args(self) -> Any:  # type: ignore[override]
+        raise AttributeError("args")
+
+
+def test_a_missing_args_reads_as_no_sqlstate() -> None:
+    """Red on the previous head: ``exc.args`` was read with no default, so an error arm raised
+    before its rollback. Read with ``getattr`` and a default, as main read it."""
+    assert database._sqlstate(_NoArgs()) is None

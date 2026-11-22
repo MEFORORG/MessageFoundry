@@ -2794,8 +2794,8 @@ def _sqlstate(exc: BaseException) -> str | None:
     letting a genuine bug propagate as an internal error rather than being misread as a transport
     failure. A non-driver error whose ``args[0]`` reads like a SQLSTATE, such as ``KeyError('MRN42')``,
     is not read as one (vault BACKLOG #1661; engine PR 3150, finding 1). Never for a
-    ``UnicodeError``, whose first argument is the codec name. It reads no attribute, so an error
-    arm can call it before its cleanup."""
+    ``UnicodeError``, whose first argument is the codec name. It reads no attribute but ``args``,
+    with ``getattr`` and a default as main did, so an error arm can call it before its cleanup."""
     if isinstance(exc, UnicodeError):
         return None
     return driver_sqlstate_of(exc, attribute=False)
@@ -2807,7 +2807,7 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     or an exception that holds one, whose text a codec name can make read like a SQLSTATE."""
     if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
         return None
-    return driver_sqlstate_of(exc)
+    return driver_sqlstate_of(exc, past_attribute=True)
 
 
 def _sqlstate_shaped(exc: BaseException) -> bool:
@@ -2815,8 +2815,13 @@ def _sqlstate_shaped(exc: BaseException) -> bool:
     none from it, as pyodbc's error is shaped: ``KeyError('MRN42')``, or a driver's tuple re-raised
     as a builtin type. Its arguments may carry a value, so its text is withheld (engine PR 3150,
     finding 1). Never for a ``UnicodeError``, whose first argument is the codec name."""
-    args = exc.args
-    return not isinstance(exc, UnicodeError) and bool(args) and reads_as_a_sqlstate(args[0])
+    args = getattr(exc, "args", ())
+    return (
+        not isinstance(exc, UnicodeError)
+        and isinstance(args, tuple)
+        and bool(args)
+        and reads_as_a_sqlstate(args[0])
+    )
 
 
 def _connection_lost(exc: BaseException | None) -> bool:
@@ -4440,6 +4445,8 @@ async def _fetch_result_set(cur: Any) -> list[Any] | None:
         rows: list[Any] = await cur.fetchall()
     except Exception as exc:
         state = _log_sqlstate(exc)
+        if state is None and _sqlstate_shaped(exc):
+            raise  # shaped like a driver's error, as main read it: the send rolls back
         if state is None:
             raise _ResultUnreadable(type(exc).__name__) from exc
         if state in _CLIENT_FETCH_STATES:
@@ -4462,6 +4469,8 @@ async def _next_result_set(advance: Callable[[], Awaitable[Any]]) -> bool:
         return bool(await advance())
     except Exception as exc:
         state = _log_sqlstate(exc)
+        if state is None and _sqlstate_shaped(exc):
+            raise  # shaped like a driver's error, as main read it: the send rolls back
         if state in _NO_NEXTSET_STATES:
             logger.debug("DATABASE: nextset() ended the capture walk with [%s]", state)
             return False
@@ -4636,6 +4645,9 @@ class DatabaseDestination(DestinationConnector):
                     raise _send_refusal(state, exc) from exc
                 if not _sqlstate_shaped(exc):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
+                # The release reads the chain for a lost link (_connection_lost); the withheld error
+                # carries none, so that verdict is taken here, from the original.
+                discard = discard or _connection_lost(exc)
                 withheld = type(exc).__name__
             if withheld is not None:
                 # Raised outside the handler, so the withheld error is on no chain (BACKLOG #1796).

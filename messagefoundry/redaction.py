@@ -3119,16 +3119,22 @@ def reads_as_a_sqlstate(value: object) -> TypeIs[str]:
     return isinstance(value, str) and _DRIVER_SQLSTATE.fullmatch(value) is not None
 
 
-def driver_sqlstate_of(exc: BaseException, *, attribute: bool = True) -> str | None:
+def driver_sqlstate_of(
+    exc: BaseException, *, attribute: bool = True, past_attribute: bool = False
+) -> str | None:
     """The SQLSTATE a database driver's own error names: asyncpg's ``sqlstate`` attribute when it
     :func:`reads_as_a_sqlstate` and ``attribute`` says to read it, else ``args[0]`` when that does.
-    None for any other exception, so a ``KeyError('MRN42')`` is never read as one, and None for a
-    SQLite error, whose ``args[0]`` is its message (vault BACKLOG #1661). The one reading that the
-    DATABASE connector and :func:`safe_traceback` share.
+    ``args[0]`` is read past an attribute that is set but is no SQLSTATE only when
+    ``past_attribute`` says so: asyncpg's ``args[0]`` is its message, so the traceback line never
+    does (engine PR 3150, round-999fe74847 finding 3). None for any other exception, so a
+    ``KeyError('MRN42')`` is never read as one, and None for a SQLite error, whose ``args[0]`` is
+    its message (vault BACKLOG #1661). The one reading that the DATABASE connector and
+    :func:`safe_traceback` share.
 
     A class whose driver test raises counts as no driver's here, where :func:`raised_by_a_driver`
     answers ``True`` to withhold its text: here ``True`` would read its argument as a SQLSTATE. A
-    ``sqlstate`` attribute that raises when read propagates; ``attribute=False`` never reads it."""
+    ``sqlstate`` attribute that raises when read propagates; ``attribute=False`` never reads it.
+    ``args`` is read with ``getattr`` and a default, so a missing one reads as empty."""
     try:
         driver = any(_a_driver_class(kind) for kind in type(exc).__mro__)
     except Exception:  # noqa: BLE001 - no SQLSTATE is read from an error that cannot be classed
@@ -3139,7 +3145,10 @@ def driver_sqlstate_of(exc: BaseException, *, attribute: bool = True) -> str | N
         state = getattr(exc, "sqlstate", None)
         if reads_as_a_sqlstate(state):
             return state
-    first = exc.args[0] if exc.args else None
+        if state is not None and not past_attribute:
+            return None
+    args = getattr(exc, "args", ())
+    first = args[0] if isinstance(args, tuple) and args else None
     return first if reads_as_a_sqlstate(first) else None
 
 
