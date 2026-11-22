@@ -7806,8 +7806,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
     if outcome == "read-refused":
         return _emit_error(
-            f"the store refused to read the account {wanted!r} ({type(extra).__name__}); "
-            "nothing was written. Check the store key and the database, then re-run",
+            f"the store refused to read the account {wanted!r} ({type(extra).__name__}). "
+            # After a full open, which may have written (BACKLOG #5067).
+            f"{_opened_left_behind(extra, settings.store, keyed=_store_key_configured(settings))}. "
+            "Check the store key and the database, then re-run",
             as_json=args.json,
         )
     # A Transit row seal is not a busy store, so neither gets the busy store's remedy (BACKLOG
@@ -9963,7 +9965,9 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     (``KeylessAuditChainRefused``), raised itself or as such a cause, can come after the open has
     run its own writing steps, or from a read after a full open. For those it says the change this
     command makes did not land and names, at least, what the open may already have changed
-    (:func:`_open_steps_left_behind`), or ``None`` where it names nothing.
+    (:func:`_open_steps_left_behind`). So does a refused write of this command's own audit row
+    (``_UnauditableWrite``) or a keyless open the settings refuse (``_KeylessProvisionRefused``),
+    each raised after a full open.
 
     Not every refusal it returns ``None`` for comes before the database is touched: at least a
     store pin refusal under the host key provider can come after the schema step, and this does
@@ -9975,10 +9979,14 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     raised = (exc, exc.__cause__)
     if not any(isinstance(e, ServerSchemaMismatchError) for e in raised):
         if any(isinstance(e, CipherError) for e in raised):
-            return _open_steps_left_behind(store, salt=True)
-        if any(isinstance(e, (StoreKeylessError, KeylessAuditChainRefused)) for e in raised):
-            # Keyless: the open binds no salt under the identity cipher.
-            return _open_steps_left_behind(store, salt=False)
+            return _open_steps_left_behind(store, keyed=True)
+        keyless = (StoreKeylessError, KeylessAuditChainRefused, _KeylessProvisionRefused)
+        if any(isinstance(e, keyless) for e in raised):
+            # Keyless: the open binds no salt and writes no genesis record.
+            return _open_steps_left_behind(store, keyed=False)
+        if any(isinstance(e, _UnauditableWrite) for e in raised):
+            # Keyed or not, which this does not know, so it names only what either may do.
+            return _open_steps_left_behind(store, keyed=False)
         return None
     left = (
         "The open rolled its schema batch back and wrote no schema marker, and this command wrote "
@@ -10010,12 +10018,13 @@ def _open_runs_schema_ddl(store: StoreSettings) -> bool:
     return store.resolved_schema_management() is SchemaManagement.AUTO
 
 
-def _open_changes(store: StoreSettings, *, salt: bool) -> str:
+def _open_changes(store: StoreSettings, *, salt: bool, genesis: bool = False) -> str:
     """What a writable open of ``store`` may change before a late refusal, as one phrase, or
     ``""`` when it names nothing: the schema where the open runs DDL
     (:func:`_open_runs_schema_ddl`), the store's salt record where ``salt`` says the cipher binds
-    one, and on SQL Server the snapshot options (:func:`_open_switches_snapshot_options`). A
-    caller says "at least" before it: a step this omits may also write."""
+    one, on SQL Server the snapshot options (:func:`_open_switches_snapshot_options`), and the
+    audit chain's genesis record where ``genesis`` says a keyed open may write one. A caller says
+    "at least" before it: a step this omits may also write."""
     changed = ["the store's salt record"] if salt else []
     if _open_runs_schema_ddl(store):
         changed.insert(0, "the schema, which the open creates or migrates")
@@ -10023,6 +10032,10 @@ def _open_changes(store: StoreSettings, *, salt: bool) -> str:
         changed.append(
             "the database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options, which "
             "under [store].schema_management = auto the open switches on and does not switch back"
+        )
+    if genesis:
+        changed.append(
+            "the audit chain's genesis record, which a keyed open writes to an empty chain"
         )
     if len(changed) < 2:
         return "".join(changed)
@@ -10036,19 +10049,30 @@ def _binds_salt(store: StoreSettings) -> bool:
     return store.cipher_provider == "aesgcm" and store.aad_bind
 
 
-def _open_steps_left_behind(store: StoreSettings, *, salt: bool) -> str | None:
-    """What a key, cipher or keyless-chain refusal left behind when it can follow the open's own
-    writing steps (BACKLOG #5067): sentences, the last with no full stop, as
-    :func:`_open_refusal_left_behind` returns them, or ``None`` when :func:`_open_changes` names
-    nothing. ``salt`` is whether the cipher binds a salt; the caller says, since a keyless open
-    binds none, and the salt bind skips the ``vault_transit`` cipher and the v1 writer too."""
-    listed = _open_changes(store, salt=salt and _binds_salt(store))
+def _open_steps_left_behind(store: StoreSettings, *, keyed: bool) -> str:
+    """What a refusal left behind when it can follow the open's own writing steps (BACKLOG
+    #5067): sentences, the last with no full stop, as :func:`_open_refusal_left_behind` returns
+    them. Never "nothing was written", since an open ran. ``keyed`` is whether the open was
+    keyed, as far as the caller knows: a keyed open may bind a salt (:func:`_binds_salt`) and
+    write an empty chain's genesis record, and a keyless one does neither. Where
+    :func:`_open_changes` names nothing, it says the open may have written all the same."""
+    listed = _open_changes(store, salt=keyed and _binds_salt(store), genesis=keyed)
     if not listed:
-        return None
+        return (
+            "The change this command makes did not land, but the open's own steps may already "
+            "have written to the database before this refusal"
+        )
     return (
         "The change this command makes did not land, but the open may already have changed the "
         f"database before this refusal: at least {listed}"
     )
+
+
+def _opened_left_behind(exc: BaseException, store: StoreSettings, *, keyed: bool) -> str:
+    """What a refusal raised after an open returned left behind (BACKLOG #5067): what
+    :func:`_open_refusal_left_behind` says for ``exc``, else :func:`_open_steps_left_behind`, so
+    it never says nothing was written. ``keyed`` is whether a store key is configured."""
+    return _open_refusal_left_behind(exc, store) or _open_steps_left_behind(store, keyed=keyed)
 
 
 def _kept_key_sentence(kept: Path) -> str:
@@ -10174,7 +10198,7 @@ def _provision_open_refusal(
 
     left = _open_refusal_left_behind(exc, store)
     if left is None and opened:
-        left = _open_steps_left_behind(store, salt=keyed)
+        left = _open_steps_left_behind(store, keyed=keyed)
     if kept is not None:
         held = _kept_key_sentence(kept)
         tail = (
@@ -10440,6 +10464,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # catch it to find a store error the invocation bound's pass re-raised (BACKLOG #5608).
     bound_open_errors = _invocation_bound_open_errors()
 
+    # Set once the pre-check's open has returned, so a refusal from the reads after it says what
+    # that open may have changed (BACKLOG #5067).
+    precheck_opened = False
+
     async def administrator_exists() -> tuple[bool, str | None]:
         """``(absent, refusal)``: whether no store exists yet, and what the service refuses."""
         # Opened WITHOUT create, so asking cannot make a SQLite store: an absent one holds no
@@ -10463,6 +10491,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # not start, as at the write's open below. Any other error propagates as before.
             _raise_if_bound_refused(exc, bound_open_errors)
             raise
+        nonlocal precheck_opened
+        precheck_opened = True
         store_slot.current = store
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
@@ -10720,7 +10750,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # and wrote no marker, and the text lists the differences and the remedy, then says what
         # the open may have changed before it (#5067). Exit 2: could not start, never the
         # dispatch floor's 1, this command's refusal.
-        _emit_error(_provision_open_refusal(exc, settings.store), as_json=args.json)
+        _emit_error(
+            _provision_open_refusal(
+                exc,
+                settings.store,
+                opened=precheck_opened,
+                keyed=_store_key_configured(settings),
+            ),
+            as_json=args.json,
+        )
         return 2
     except TrustAnchorError as exc:
         return _emit_trust_anchor_refusal(exc, as_json=args.json)
@@ -10961,14 +10999,26 @@ def _provision_admin(args: argparse.Namespace) -> int:
         Names the exception CLASS only, never its text. The driver's message carries the constraint,
         the table and the duplicate key value, and ``safe_exc`` keeps all three: it redacts PHI
         shapes, not schema names or a username. This arm sits ahead of the CLI floor, which never
-        formats the exception, so it must not print what that floor would not."""
+        formats the exception, so it must not print what that floor would not.
+
+        Under a shown key it names the entry: keep it once the write has started, or, where the
+        refusal came before any account write (a refused first INSERT), delete it, since no seed
+        was stored (BACKLOG #5067)."""
+        entry = ""
+        if totp_secret is not None:
+            entry = (
+                f".{keep_the_entry()}"
+                if write_started
+                else ". If you added the entry this run showed to the authenticator app, delete "
+                "it: its seed was never stored"
+            )
         return _emit_error(
             f"the store refused one of this command's writes ({type(exc).__name__}), so the "
             "Administrator may be "
             "missing or incomplete. Once no other provision-admin run is in progress, run the "
             "command again: it completes a partly written account, or says why it cannot. If it "
             "is refused the same way again, the store has a fault this command cannot repair"
-            + (f".{keep_the_entry()}" if write_started and totp_secret is not None else ""),
+            + entry,
             as_json=args.json,
         )
 
@@ -11061,15 +11111,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
         # Each is raised before the write, so the shown key's entry has no seed (#5067). Each
         # follows a full open, which may have changed the database, so the text says so (#5067).
-        keyless_left = _open_refusal_left_behind(exc, settings.store) or _open_steps_left_behind(
-            settings.store, salt=False
-        )
-        _emit_error(
-            after_the_key(
-                str(exc), str(exc) if keyless_left is None else f"{_sentence(exc)} {keyless_left}"
-            ),
-            as_json=args.json,
-        )
+        keyless_left = _opened_left_behind(exc, settings.store, keyed=False)
+        _emit_error(after_the_key(str(exc), f"{_sentence(exc)} {keyless_left}"), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # Refused before the prompt already; one that changed since is refused the same way. A
@@ -11361,11 +11404,13 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         except (StoreKeylessError, CipherError) as exc:
             # A keyed store with encrypted rows, opened from a shell without its key, refuses at
             # open. So does a keyed open that meets a row it cannot read or that is not JSON once
-            # decrypted (BACKLOG #2308). Nothing has been read or written. Through
+            # decrypted (BACKLOG #2308). The command has read and written nothing, but the open's
+            # own steps may have, so the text names them (BACKLOG #5067). Through
             # `codec_safe_str`, as the sibling commands print it (BACKLOG #2532).
             from messagefoundry.redaction import codec_safe_str
 
-            return ("open-refused", wanted, codec_safe_str(exc))
+            left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+            return ("open-refused", wanted, f"{_sentence(codec_safe_str(exc))} {left}")
         except bound_open_errors as exc:
             # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
             # arrived as the `CipherError` above: could not start, reported below. Any other
@@ -11435,7 +11480,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         _StoreOpenRefused,
         _UnauditableWrite,
     ) as exc:
-        _emit_error(str(exc), as_json=args.json)
+        # A keyless-chain or audit refusal follows a full open, which may have written (#5067).
+        left = _open_refusal_left_behind(exc, settings.store)
+        _emit_error(str(exc) if left is None else f"{_sentence(exc)} {left}", as_json=args.json)
         return 2
     except _InvocationBoundOpenRefused as bound:
         # Could not start, exit 2, under the store's name, as a SQLite error from this open was
@@ -11451,7 +11498,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         # delegation 2026-10-08, not an owner ruling). A `CipherError` here is raised by the open,
         # before the command reads an account, so it is the same "could not start" as a
         # `StoreKeylessError`. Exit 1 stays a refusal about the account.
-        _emit_error(f"{_sentence(extra)} Nothing was written", as_json=args.json)
+        _emit_error(extra, as_json=args.json)
         return 2
     if outcome == "seal-refused":  # BACKLOG #3510; its own branch, since the text logs a warning
         refused = _seal_refusal(username, "address write")

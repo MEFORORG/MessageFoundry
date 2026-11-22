@@ -588,7 +588,8 @@ def test_a_keyed_store_with_encrypted_rows_is_refused_at_open(
     # not an owner ruling). It exited 1 before.
     assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
     error = _error(capsys)
-    assert "Nothing was written" in error
+    # The open may have written before it, so not "nothing was written" (BACKLOG #5067).
+    assert "did not land, but the open may" in error
     # The OPEN refused, not the later audit append: the store's own text names the key variable,
     # and the append branch's wording is absent.
     assert "MEFOR_STORE_ENCRYPTION_KEY" in error
@@ -626,8 +627,10 @@ def test_a_row_the_open_cannot_decrypt_is_could_not_start(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())  # not the sealing key
     assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
     error = _error(capsys)
-    # The CipherError arm's text, not another could-not-start refusal that also exits 2.
-    assert "no configured key decrypts" in error and error.endswith("Nothing was written")
+    # The CipherError arm's text, not another could-not-start refusal that also exits 2. The open
+    # may have written before it, so not "nothing was written" (BACKLOG #5067).
+    assert "no configured key decrypts" in error and "did not land, but the open may" in error
+    assert "nothing was written" not in error.lower(), error
 
 
 @pytest.mark.parametrize("busy_error", ["acquire-timeout", "database-locked"])

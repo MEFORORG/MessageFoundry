@@ -637,8 +637,9 @@ def test_a_refusal_once_the_write_started_names_no_entry_under_no_totp(
 async def test_the_service_calls_on_first_write_after_its_reads_and_before_its_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``on_first_write`` fires once, after the pre-write reads and before the first write, so a
-    read's refusal is reported as raised before any write (finding 1).
+    """``on_first_write`` fires once, after the pre-write reads and once the fresh row's INSERT
+    has returned, so a read's or a refused INSERT's refusal is reported as raised before any
+    account write (finding 1).
 
     Mutation: call ``on_first_write`` at the top of the method; the refused read then fires it."""
     from messagefoundry.auth.service import AuthService
@@ -683,19 +684,21 @@ async def test_the_service_calls_on_first_write_after_its_reads_and_before_its_w
             on_first_write=lambda: fired.append("first write"),
             **provision_totp(),
         )
-        assert fired == ["first write", "create_user"], fired
+        assert fired == ["create_user", "first write"], fired
     finally:
         await store.close()
 
 
 #: ``(backend, schema_management, refusal kind)`` -> what the text names: the schema step, the
-#: snapshot options, the salt record; ``None`` where it names nothing and says nothing was written.
-_STEPS: dict[tuple[str, str, str], tuple[bool, bool, bool] | None] = {
-    ("sqlserver", "auto", "cipher"): (True, True, True),
-    ("postgres", "auto", "keyless"): (True, False, False),
-    ("postgres", "external", "cipher"): (False, False, True),
+#: snapshot options, the salt record, the genesis record; ``None`` where it names none of them and
+#: says only that the open's own steps may have written, never that nothing was written.
+_STEPS: dict[tuple[str, str, str], tuple[bool, bool, bool, bool] | None] = {
+    ("sqlserver", "auto", "cipher"): (True, True, True, True),
+    ("postgres", "auto", "keyless"): (True, False, False, False),
+    ("postgres", "external", "cipher"): (False, False, True, True),
     ("postgres", "external", "keyless"): None,
 }
+_MAY_HAVE_WRITTEN = "the open's own steps may already have written to the database"
 
 
 def _steps_refusal(kind: str) -> Exception:
@@ -706,14 +709,15 @@ def _steps_refusal(kind: str) -> Exception:
     return StoreKeylessError("table synthetic_table holds an encrypted value")
 
 
-def _assert_steps(out: str, expected: tuple[bool, bool, bool] | None) -> None:
+def _assert_steps(out: str, expected: tuple[bool, bool, bool, bool] | None) -> None:
     assert "synthetic_table" in out, out
-    if expected is None:
-        assert "nothing was written" in out.lower() and _OWN_WRITES not in out, out
-        return
-    schema, options, salt = expected
-    assert _OWN_WRITES in out, out
     assert "nothing was written" not in out.lower(), out
+    if expected is None:
+        assert _MAY_HAVE_WRITTEN in out and _OWN_WRITES not in out, out
+        return
+    schema, options, salt, genesis = expected
+    assert _OWN_WRITES in out, out
+    assert ("the audit chain's genesis record" in out) is genesis, out
     assert ("the schema, which the open creates or migrates" in out) is schema, out
     assert (_RCSI in out) is options, out
     assert ("the store's salt record" in out) is salt, out
@@ -892,3 +896,106 @@ def test_a_keyless_store_open_names_no_salt_record() -> None:
     assert "the store's salt record" in keyed, keyed
     v1 = StoreSettings(path="synthetic.db", aad_bind=False)
     assert "salt record" not in _invocation_bound_left_behind(v1)
+
+
+# Manager follow-up on w7-cli open findings 1 to 3 (BACKLOG #5067).
+
+
+def test_a_refused_first_insert_says_the_shown_entry_has_no_seed(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A fresh run whose first INSERT the store refuses, with no row holding the name, wrote no
+    account and no seed, so the integrity arm says to delete the shown entry, not to keep it.
+
+    Mutation: call ``on_first_write`` before ``create_user`` again; the run then says to keep
+    it."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.store import MessageStore
+
+    async def refused_insert(*_a: object, **_k: object) -> object:
+        raise sqlite3.IntegrityError("synthetic constraint")
+
+    monkeypatch.setattr(MessageStore, "create_user", refused_insert)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    monkeypatch.setattr(
+        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+    )
+    monkeypatch.setattr("messagefoundry.auth.totp.verify_totp_step", lambda *_a, **_k: 1)
+    code = main(_provision_sqlite(shell))
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code == 1, out
+    assert "the store refused one of this command's writes (IntegrityError)" in out, out
+    assert "delete it: its seed was never stored" in out and _KEEP_ENTRY not in out, out
+
+
+def test_a_refusal_after_the_pre_check_open_says_what_the_open_may_have_changed(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key-resolution refusal from the pre-check's reads comes after its open returned, which
+    may have migrated the store, so it does not say nothing was written.
+
+    Mutation: pass ``opened=False`` from the pre-check's key-resolution arm."""
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store import base
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    class _Opened:
+        async def close(self) -> None:
+            return None
+
+    async def opening(*_a: object, **_k: object) -> object:
+        return _Opened()
+
+    async def refusing(*_a: object, **_k: object) -> object:
+        raise KeyProviderError("synthetic key service refusal in a read")
+
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(AuthService, "provision_refusal", refusing)
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert "synthetic key service refusal in a read" in out, out
+    assert _OWN_WRITES in out and _RCSI in out, out
+    assert "nothing was written" not in out.lower(), out
+
+
+def test_an_open_that_names_no_step_still_never_says_nothing_was_written() -> None:
+    """Where the list names nothing, the text says the open's own steps may have written; a keyed
+    open names the genesis record it may write to an empty chain.
+
+    Mutation: return ``None`` from ``_open_steps_left_behind`` for an empty list again."""
+    from messagefoundry.__main__ import (
+        _open_refusal_left_behind,
+        _open_steps_left_behind,
+        _UnauditableWrite,
+    )
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
+
+    store = StoreSettings(
+        backend=StoreBackend.POSTGRES,
+        server="127.0.0.1",
+        database="mefor",
+        username="mefor",
+        schema_management=SchemaManagement.EXTERNAL,
+        cipher_provider="vault_transit",
+    )
+    assert _MAY_HAVE_WRITTEN in _open_steps_left_behind(store, keyed=False)
+    keyed = _open_steps_left_behind(store, keyed=True)
+    assert "the audit chain's genesis record" in keyed and "salt record" not in keyed, keyed
+    # A refused audit row of the command's own follows a full open too.
+    assert _open_refusal_left_behind(_UnauditableWrite("synthetic"), store) is not None
+
+
+def test_admin_reset_totp_unauditable_write_says_what_the_open_may_have_changed(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``_UnauditableWrite`` follows a full open in admin-reset-totp too.
+
+    Mutation: return ``None`` from ``_open_refusal_left_behind`` for ``_UnauditableWrite``."""
+    from messagefoundry.__main__ import _UnauditableWrite
+
+    _open_refuses_with(monkeypatch, _UnauditableWrite("synthetic unauditable write"))
+    settings = _settings(shell, "sqlserver", "auto")
+    out = _run(["admin-reset-totp", "--username", "ops", "--service-config", str(settings)], capsys)
+    assert "synthetic unauditable write" in out, out
+    assert _OWN_WRITES in out and "nothing was written" not in out.lower(), out
