@@ -84,16 +84,72 @@ function Format-Age {
     return "$([math]::Round($Span.TotalDays, 1)) days old"
 }
 
+function ConvertTo-OneLine {
+    # Record text goes into model context, so a line break inside a field could forge a SEAT or GOAL
+    # line of its own. alloc.ps1 folds titles for the same reason (BACKLOG #1040).
+    param([string]$Text)
+    return $Text -replace '[\p{Cc}\p{Zl}\p{Zp}]+', ' '
+}
+
 function Get-RecordText {
-    # One field of a parsed record as text, '' when the record has no such field or is not an object.
-    # A plain `$record.field` THROWS under strict mode on a missing field or a null record, and the
-    # throw lands in the outer catch, which exits 0 with no output: one empty file among the seats or
-    # allocations would cost this session its whole restore (BACKLOG #5865).
+    # One field of a parsed record as one line of text, '' when the record has no such field or is
+    # not an object. A plain `$record.field` THROWS under strict mode on a missing field or a null
+    # record, and one empty file among the seats or allocations would then cost this session its
+    # whole restore (BACKLOG #5865).
     param($Record, [string]$Name)
     if ($null -eq $Record) { return '' }
     $property = $Record.PSObject.Properties[$Name]
     if (-not $property) { return '' }
-    return [string]$property.Value
+    return ConvertTo-OneLine ([string]$property.Value)
+}
+
+function Test-AllocTombstone {
+    # EXACTLY the ownerless record the retired allocator left (BACKLOG #1829), the same test
+    # remove.ps1's Read-RecordFile applies. Any near miss stays a record nobody can attribute.
+    param($Record)
+    if ($Record -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    $t = $Record.PSObject.Properties['tombstone']
+    $w = $Record.PSObject.Properties['worktree']
+    $b = $Record.PSObject.Properties['branch']
+    if (-not ($t -and $w -and $b)) { return $false }
+    return ($t.Value -is [bool]) -and $t.Value -and
+        ($w.Value -is [string]) -and ($w.Value -eq '') -and
+        ($b.Value -is [string]) -and ($b.Value -eq '')
+}
+
+function Get-LedgerLines {
+    # The held-number block, built in one place so the normal path and the catch print the same text.
+    param([string[]]$Held, [string[]]$Unreadable, [int]$Unattributed, [string]$AllocDir)
+    if ($Held.Count -gt 0) {
+        ''
+        'LEDGER NUMBERS THIS WORKTREE HOLDS -- these burn permanently if the tree is removed'
+        'with raw git rather than scripts/worktree/remove.ps1:'
+        foreach ($h in $Held) { "    $h" }
+    }
+    if ($Unreadable.Count -gt 0) {
+        ''
+        'UNREADABLE LEDGER RECORD -- names this worktree but its filename is no number, so it may'
+        'be a held allocation. Read it before removing this tree:'
+        foreach ($u in $Unreadable) { "    $(ConvertTo-OneLine $u)" }
+    }
+    if ($Unattributed -gt 0) {
+        ''
+        "LEDGER RECORDS NOT ATTRIBUTED: $Unattributed under $(ConvertTo-OneLine $AllocDir) cannot be read"
+        'or name no worktree, so any of them could be this tree''s. Check before removing it.'
+    }
+}
+
+function Get-WorkLines {
+    # Whether the work is safe. Its own function so a throw earlier in the restore still reports it.
+    param([string]$Branch)
+    if (-not $Branch) { $Branch = (& git rev-parse --abbrev-ref HEAD 2>$null) }
+    $dirty = @(& git status --porcelain 2>$null | Where-Object { $_ }).Count
+    $unpushed = (& git rev-list --count HEAD --not --remotes --tags 2>$null)
+    ''
+    "BRANCH: $Branch -- $dirty uncommitted file(s), $unpushed commit(s) on no remote or tag."
+    if ([int]($unpushed | ForEach-Object { $_ }) -gt 0 -or $dirty -gt 0) {
+        'Commit and push before the context gets any tighter. An unpushed branch is lost work.'
+    }
 }
 
 # ---- scope: a compaction restart, and nothing else --------------------------------------------
@@ -159,6 +215,11 @@ if (-not (Get-Command Read-CoordText -ErrorAction SilentlyContinue)) {
 
 # Outside the try, so the catch below can still print what was gathered before a throw.
 $lines = @()
+$held = @()
+$unreadable = @()
+$unattributed = 0
+$allocDir = ''
+$branchNow = ''
 $banner = "[precompact] Restoring what this compaction is about to drop.`n"
 try {
     $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
@@ -222,13 +283,14 @@ try {
                 if (-not $j.PSObject.Properties['sessionId'] -or
                     $j.sessionId -ne "codex-$env:KORUS_SESSION_ID") { continue }
             }
+            # seat.ps1 always writes the `seat` key, so a record without it is damaged and must not
+            # displace a good declaration. A PRESENT null is real: `-Declare -Goal` with no -Seat.
+            if (-not $j.PSObject.Properties['seat']) { continue }
             if ($j.PSObject.Properties['goal'] -and $j.goal) { $declared = $j; break }
         }
     }
 
     if ($declared) {
-        # A goal with no seat is a real record: `seat.ps1 -Declare -Goal` without -Seat writes one. It
-        # is still the newest stated intent, so it is restored with the seat marked as missing.
         $declSeat = Get-RecordText $declared 'seat'
         if (-not $declSeat) { $declSeat = '(none recorded)' }
         # A worktree OUTLIVES the session that declared in it -- directories here get re-used, and a
@@ -267,13 +329,13 @@ try {
             $lines += "Worktrees get re-used, so treat the following as a previous occupant's intent"
             $lines += "and re-declare rather than adopting it:"
             $lines += "    seat: $declSeat"
-            $lines += "    goal: $($declared.goal)"
+            $lines += "    goal: $(Get-RecordText $declared 'goal')"
             $lines += '    pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"'
         } else {
             $lines += "SEAT: $declSeat"
-            $lines += "GOAL: $($declared.goal)"
-            if ($declared.PSObject.Properties['done'] -and $declared.done) { $lines += "DONE WHEN: $($declared.done)" }
-            if ($declared.PSObject.Properties['outOfScope'] -and $declared.outOfScope) { $lines += "OUT OF SCOPE: $($declared.outOfScope)" }
+            $lines += "GOAL: $(Get-RecordText $declared 'goal')"
+            if ($declared.PSObject.Properties['done'] -and $declared.done) { $lines += "DONE WHEN: $(Get-RecordText $declared 'done')" }
+            if ($declared.PSObject.Properties['outOfScope'] -and $declared.outOfScope) { $lines += "OUT OF SCOPE: $(Get-RecordText $declared 'outOfScope')" }
             if ($declaredDisplay) { $lines += "declared at $declaredDisplay$age" }
         }
     } elseif ($sharedError -and -not $seatsDir) {
@@ -287,15 +349,18 @@ try {
     # ---- ledger numbers this worktree holds ------------------------------------------------
     # This is the fact with a permanent cost attached. An allocated-but-unfiled number burns if the
     # worktree is removed, and after a compaction nobody in the session remembers holding one.
-    $allocDir = if ($sharedRoot) { Join-Path $sharedRoot 'alloc' } else { $null }
-    $held = @()
-    $unreadable = @()
+    $allocDir = if ($sharedRoot) { Join-Path $sharedRoot 'alloc' } else { '' }
     if ($sharedError) { $lines += ''; $lines += "LEDGER NUMBERS: not checked, the shared root did not answer." }
     if ($allocDir -and (Test-Path -LiteralPath $allocDir)) {
         foreach ($f in (Get-ChildItem -LiteralPath $allocDir -Recurse -Filter '*.json' -File -EA SilentlyContinue)) {
-            try { $a = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
+            # A record that does not parse or names no worktree could be this tree's. They are counted
+            # rather than listed, because the registry is shared and this text costs context.
+            try { $a = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { $unattributed++; continue }
             $aw = Get-RecordText $a 'worktree'
-            if (-not $aw) { continue }
+            if ([string]::IsNullOrWhiteSpace($aw)) {
+                if (-not (Test-AllocTombstone $a)) { $unattributed++ }
+                continue
+            }
             # Another machine's allocation names a path on that machine's disk, so the same path here
             # is a different tree and the number is not this one's to lose. No `host` is this machine.
             if (-not (Test-CoordRecordIsHere $a)) { continue }
@@ -306,31 +371,19 @@ try {
             # THE FILENAME IS THE NUMBER, as alloc.ps1 records, and the body's `number` field is not, so
             # a body that lost the field still names its number. A file naming this tree with no
             # number in its name may still be a held allocation, so it is reported, never skipped.
-            if ($f.BaseName -notmatch '^\d+$') { $unreadable += $f.FullName; continue }
-            $held += "#$($f.BaseName) ($($f.Directory.Name)) $(Get-RecordText $a 'title')"
+            # ASCII digits only: `\d` also matches other scripts' digits, as alloc.ps1 warns.
+            if ($f.BaseName -notmatch '\A[0-9]+\z') { $unreadable += $f.FullName; continue }
+            $held += "#$($f.BaseName) ($(ConvertTo-OneLine $f.Directory.Name)) $(Get-RecordText $a 'title')"
         }
     }
-    if ($held.Count -gt 0) {
-        $lines += ''
-        $lines += "LEDGER NUMBERS THIS WORKTREE HOLDS -- these burn permanently if the tree is removed"
-        $lines += "with raw git rather than scripts/worktree/remove.ps1:"
-        foreach ($h in $held) { $lines += "    $h" }
-    }
-    if ($unreadable.Count -gt 0) {
-        $lines += ''
-        $lines += "UNREADABLE LEDGER RECORD -- names this worktree but its filename is no number, so it may"
-        $lines += "be a held allocation. Read it before removing this tree:"
-        foreach ($u in $unreadable) { $lines += "    $u" }
-    }
+    $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir)
+    # Emptied once printed, so the catch below cannot print them a second time.
+    $held = @()
+    $unreadable = @()
+    $unattributed = 0
 
     # ---- is the work safe ------------------------------------------------------------------
-    $dirty = @(& git status --porcelain 2>$null | Where-Object { $_ }).Count
-    $unpushed = (& git rev-list --count HEAD --not --remotes --tags 2>$null)
-    $lines += ''
-    $lines += "BRANCH: $($branchNow) -- $dirty uncommitted file(s), $unpushed commit(s) on no remote or tag."
-    if ([int]($unpushed | ForEach-Object { $_ }) -gt 0 -or $dirty -gt 0) {
-        $lines += "Commit and push before the context gets any tighter. An unpushed branch is lost work."
-    }
+    $lines += @(Get-WorkLines $branchNow)
 
     # PLAIN TEXT ON STDOUT, which is what SessionStart adds to context. See the header for the
     # envelope that used to be here and why the harness threw all of it away. [Console]::Out.Write
@@ -341,11 +394,12 @@ try {
     # This hook never fails a turn, but a throw must not discard what was already gathered: that
     # total loss is BACKLOG #5865. The inner try keeps a failed write from failing the turn.
     try {
-        if ($lines.Count -gt 0) {
-            $lines += ''
-            $lines += "RESTORE INCOMPLETE: this hook stopped early ($($_.Exception.Message))."
-            [Console]::Out.Write($banner + ($lines -join "`n"))
-        }
+        $why = ConvertTo-OneLine $_.Exception.Message
+        $lines += @(Get-LedgerLines $held $unreadable $unattributed $allocDir)
+        try { $lines += @(Get-WorkLines $branchNow) } catch { }
+        $lines += ''
+        $lines += "RESTORE INCOMPLETE: this hook stopped early ($why)."
+        [Console]::Out.Write($banner + ($lines -join "`n"))
     } catch { }
     exit 0
 }
