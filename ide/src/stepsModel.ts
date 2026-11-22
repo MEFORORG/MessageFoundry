@@ -495,6 +495,15 @@ function rowParams(row: LensRow): ParamField[] {
     }
     return [{ name: "handlers", value: names.length > 0 ? names.join(", ") : "(dynamic selection)" }];
   }
+  if (row.kind === "note") {
+    // BACKLOG #5841. A one-line Comment shows and edits its text in a field. A pragma (read-only) and a
+    // multi-line run get none: one text box cannot hold a newline, and the engine refuses a text whose
+    // line count changed. Those show their raw lines in the row body instead (renderRowHtml).
+    const text = row.text;
+    return text !== undefined && row.pragma !== true && !text.includes("\n")
+      ? [{ name: "text", value: text }]
+      : [];
+  }
   return paramsToFields(row.params);
 }
 
@@ -3688,8 +3697,10 @@ export function renderRowHtml(
     : "";
   // A field is editable only when the handler name is known (the write path); read-only callers pass "".
   const editable = new Set(handlerName ? (row.editableParams ?? []) : []);
+  // A note with no text field (a pragma, or a multi-line run) shows its verbatim lines read-only, as a
+  // code row does, rather than a blank body (BACKLOG #5841).
   const body =
-    row.kind === "code"
+    row.kind === "code" || (row.kind === "note" && row.params.length === 0)
       ? `<pre class="code">${escapeHtml(row.code ?? "")}</pre>`
       : renderParamsHtml(row.params, editable, handlerName, row, schema);
   const lineLabel =
