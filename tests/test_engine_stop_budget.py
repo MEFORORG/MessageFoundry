@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,9 +45,9 @@ class _CrlRecorder:
 
 class _WatchRecorder:
     def __init__(self) -> None:
-        self.deadlines: list[float | None] = []
+        self.deadlines: list[remote_debug_watch.StopDeadline | None] = []
 
-    async def stop(self, *, deadline: float | None = None) -> None:
+    async def stop(self, *, deadline: remote_debug_watch.StopDeadline | None = None) -> None:
         self.deadlines.append(deadline)
 
 
@@ -85,19 +86,26 @@ def _attach(eng: Engine) -> tuple[_DrainRecorder, _CrlRecorder, _WatchRecorder]:
     return drain, crl, watch
 
 
-async def test_a_hung_graph_supervisor_is_cut_inside_the_stop_budget(tmp_path: Path) -> None:
-    """Before BACKLOG #3191 the supervisor got a fixed 10 s whatever the stop had left, so a hung
-    reconcile alone took the stop past NSSM's window. The gate is closed and idle, as the managed
-    lifespan leaves it, so the supervisor gets a share of the budget, not the floor."""
+async def test_a_hung_graph_supervisor_keeps_its_fixed_wait_under_a_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop budget does not shorten the supervisor's wait: a hung reconcile gets its fixed
+    bound, as on main, however little budget the stop is handed. The bound is lowered here only to
+    keep the test short."""
+    monkeypatch.setattr(engine_module, "_GRAPH_SUPERVISOR_STOP_SECONDS", 1.0)
     eng = await _engine(tmp_path)
     await eng.drain_config_writes(0.0)
     supervisor = asyncio.ensure_future(_hangs())
     eng._graph_supervisor = supervisor
     began = time.monotonic()
-    await _stop(eng, budget_seconds=2.5)
+    await _stop(eng, budget_seconds=0.1)
     took = time.monotonic() - began
     assert supervisor.cancelled()
-    assert 0.5 < took < 4.0, took
+    assert took >= 0.95, took
+
+
+def test_the_supervisor_wait_is_mains_fixed_ten_seconds() -> None:
+    assert engine_module._GRAPH_SUPERVISOR_STOP_SECONDS == 10.0
 
 
 async def test_under_a_budget_the_budgeted_waits_are_shortened_to_fit(tmp_path: Path) -> None:
@@ -117,7 +125,7 @@ async def test_under_a_budget_the_budgeted_waits_are_shortened_to_fit(tmp_path: 
     watch_kept = close + share + engine_module._CONFIG_WRITE_DRAIN_SECONDS
     # Past what is kept, the CRL wait is at its floor: the budget is all spoken for.
     assert crl_wait == pytest.approx(floor)
-    assert watch_deadline == pytest.approx(began + 2.0 - watch_kept, abs=0.05)
+    assert watch_deadline.loop_time == pytest.approx(began + 2.0 - watch_kept, abs=0.05)
     # The stand-ins return at once, so the drain sees nearly the whole budget left.
     assert 2.0 - close - 0.5 <= drain_wait <= 2.0 - close
 
@@ -167,14 +175,14 @@ def test_the_budget_never_lengthens_a_wait_past_its_fixed_bound() -> None:
     asyncio.run(_check())
 
 
-def test_the_time_kept_after_the_supervisor_fits_the_engine_reserve() -> None:
-    """The supervisor's wait is the first budgeted one, so what it keeps back is the most any wait
+def test_the_time_kept_after_the_crl_wait_fits_the_engine_reserve() -> None:
+    """The CRL runner's wait is the first budgeted one, so what it keeps back is the most any wait
     keeps. With the managed lifespan's closed gate and a write still running, the late drain's
-    fixed bound is kept; the supervisor must still get more than its floor inside the reserve."""
+    fixed bound is kept; the CRL wait must still get more than its floor inside the reserve."""
     kept = (
         engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
         + engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
-        + 3 * engine_module._STOP_WAIT_SHARE_SECONDS
+        + 2 * engine_module._STOP_WAIT_SHARE_SECONDS
         + remote_debug_watch.STOP_FLOOR_SECONDS
     )
     assert kept + engine_module._STOP_WAIT_FLOOR_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS
@@ -224,7 +232,7 @@ async def test_the_remote_debug_watch_ends_both_waits_by_its_deadline(
     loop = asyncio.get_running_loop()
     began = loop.time()
     try:
-        await watch.stop(deadline=began + 0.4)
+        await watch.stop(deadline=remote_debug_watch.StopDeadline(began + 0.4))
         assert loop.time() - began < 2.0
     finally:
         task.cancel()
@@ -237,3 +245,108 @@ async def test_the_crl_runner_abandons_a_hung_pass_at_the_timeout_it_is_handed()
     began = time.monotonic()
     await runner.stop(timeout=0.2)
     assert time.monotonic() - began < 2.0
+
+
+async def _unwinds_slowly(release: asyncio.Event) -> None:
+    """A pass whose cancel lands only once ``release`` is set."""
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await release.wait()
+        raise
+
+
+async def _until_cancel_requested(task: asyncio.Task[None]) -> None:
+    loop = asyncio.get_running_loop()
+    give_up = loop.time() + 5.0
+    while not task.cancelling():
+        assert loop.time() < give_up, "the stop never cancelled the pass"
+        await asyncio.sleep(0.01)
+
+
+async def test_a_cancel_of_the_crl_runner_stop_caller_propagates() -> None:
+    """A cancel of the caller while the stop waits for the pass's cancel to land is the caller's,
+    so it is raised. Before, ``suppress(CancelledError)`` around ``await task`` swallowed it."""
+    release = asyncio.Event()
+    runner = CrlReloadRunner(stop_timeout_seconds=30.0)
+    pass_task = asyncio.ensure_future(_unwinds_slowly(release))
+    runner._task = pass_task
+    stopping = asyncio.ensure_future(runner.stop(timeout=0.05))
+    try:
+        await _until_cancel_requested(pass_task)
+        await asyncio.sleep(0.05)
+        assert not stopping.done()
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        assert stopping.cancelled()
+    finally:
+        release.set()
+        await asyncio.gather(pass_task, return_exceptions=True)
+
+
+async def test_the_crl_runner_stop_does_not_raise_its_own_cancel_of_the_pass() -> None:
+    """The control: the stop's own cancel of a pass that outran the timeout is not raised, however
+    long the cancel takes to land."""
+    release = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.2, release.set)
+    runner = CrlReloadRunner(stop_timeout_seconds=30.0)
+    pass_task = asyncio.ensure_future(_unwinds_slowly(release))
+    runner._task = pass_task
+    await asyncio.wait_for(runner.stop(timeout=0.05), 5.0)
+    assert pass_task.cancelled()
+
+
+async def test_the_watch_warning_says_a_pass_that_outlived_its_cancel_may_still_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pass still running after the cancel's wait can outlive the store's close, so the
+    WARNING must not say it was cancelled."""
+    store: Any = object()
+    watch = remote_debug_watch.RemoteDebugRefusalWatch(store, read=lambda: 0)
+    task = asyncio.ensure_future(_ignores_one_cancel())
+    watch._task = task
+    deadline = remote_debug_watch.StopDeadline(asyncio.get_running_loop().time() + 0.3)
+    try:
+        with caplog.at_level(logging.WARNING, logger=remote_debug_watch.__name__):
+            await watch.stop(deadline=deadline)
+        assert not task.done()
+        [record] = [r for r in caplog.records if "remote-debug refusal watch" in r.getMessage()]
+        message = record.getMessage()
+        assert "may still be running when the store closes" in message
+        assert "was cancelled" not in message
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_the_watch_warning_says_a_pass_whose_cancel_landed_was_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store: Any = object()
+    watch = remote_debug_watch.RemoteDebugRefusalWatch(store, read=lambda: 0)
+    task = asyncio.ensure_future(_hangs())
+    watch._task = task
+    deadline = remote_debug_watch.StopDeadline(asyncio.get_running_loop().time() + 0.3)
+    with caplog.at_level(logging.WARNING, logger=remote_debug_watch.__name__):
+        await watch.stop(deadline=deadline)
+    assert task.cancelled()
+    [record] = [r for r in caplog.records if "remote-debug refusal watch" in r.getMessage()]
+    assert "was cancelled" in record.getMessage()
+    assert "may still be running" not in record.getMessage()
+
+
+def test_the_watch_deadline_and_the_crl_timeout_are_typed_apart() -> None:
+    """The watch takes an event-loop time and the CRL runner a relative timeout. A relative timeout
+    passed as the deadline would silently give each wait the floor, so the deadline is its own
+    type. The tests' mypy leg runs with warn_unused_ignores, so each ignore below fails that leg if
+    the swapped call it sits on ever type-checks."""
+
+    async def _swapped(
+        watch: remote_debug_watch.RemoteDebugRefusalWatch, runner: CrlReloadRunner
+    ) -> None:
+        await watch.stop(deadline=1.5)  # type: ignore[arg-type]
+        await runner.stop(timeout=remote_debug_watch.StopDeadline(1.5))  # type: ignore[arg-type]
+
+    assert not isinstance(remote_debug_watch.StopDeadline(1.5), float)
+    assert callable(_swapped)

@@ -1336,8 +1336,17 @@ class CrlReloadRunner:
                     wait,
                 )
                 task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            # ``wait``, not ``await task``: awaiting the task would raise a cancel of this caller
+            # as the task's own CancelledError, and suppressing that swallowed the caller's cancel.
+            # So a cancel raised here is always the caller's, and it propagates; the task's own
+            # cancel, this stop's above or one from elsewhere, is not raised (BACKLOG #3191).
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            if not task.cancelled():
+                task.result()
         # Also with no task: a clear the sink refused at an earlier stop is retried by this one.
         self._resolve(list(self._alerted), "the reload has stopped")
         if self._alerted:
