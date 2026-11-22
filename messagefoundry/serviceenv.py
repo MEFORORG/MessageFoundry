@@ -333,13 +333,13 @@ _LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 #: A later line that sets an ordinary variable: a name Windows allows in an environment block,
 #: which is any non-blank text without an equals sign (``ProgramFiles(x86)`` among them), then an
 #: equals sign, then a value holding something other than equals signs and blanks. Such a line
-#: ends the variable above it, except where :func:`_is_ordinary_line` reads it into that value,
-#: and below an empty secret-class value, where :func:`_ends_blank_class` decides instead. A line
-#: of base64 does not match, since its only equals signs are the padding at its end, and neither
-#: does a line of PEM armour, which holds no equals sign. So ``OTHER=`` with an empty value does
-#: not match either, nor does one whose value is only equals signs and blanks in any order, and
-#: each is read as part of the value above it: a store key left empty above it then reads as set,
-#: an error toward refusing.
+#: ends the variable above it, except below an empty secret-class value, where
+#: :func:`_ends_blank_class` decides instead. A line of base64 does
+#: not match, since its only equals signs are the padding at its end, and neither does a line of
+#: PEM armour, which holds no equals sign. So ``OTHER=`` with an empty value does not match
+#: either, nor does one whose value is only equals signs and blanks in any order, and each is
+#: read as part of the value above it: a store key left empty above it then reads as set, an
+#: error toward refusing.
 _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 
 #: A run of 43 standard base64 characters: a store key, 32 bytes, less its one padding character.
@@ -423,7 +423,12 @@ def _ends_blank_class(line: str) -> bool:
       Windows spells it (:data:`_WINDOWS_NAMES`), such as ``Path=C:\\x``;
     * an ordinary line under ``MEFOR_SECRETS_DIRECTORY`` in upper case, so an item that sets the
       directory is still read as setting it (a later line of one string never is, under the
-      line rule :func:`_variables` states).
+      line rule :func:`_variables` states);
+
+    and its value is not one secret or a list of them (:func:`_is_key_value`). So ``Path=<key>``
+    or ``MEFOR_SECRETS_DIRECTORY=<key>`` there is read as the secret's value (vault BACKLOG #5394
+    added items 6 and 12), an error toward refusing: such a variable whose whole value has a
+    secret's shape makes an empty secret above it read as set.
 
     No other name ends the value, however conventional: ``HTTP_PROXY=x``, ``TZ=UTC``,
     ``MEFOR_AI_ENVIRONMENT=prod``, ``Public=Summer!``, ``PATH=,C:\\x`` and ``=orphan`` all refuse,
@@ -434,8 +439,12 @@ def _ends_blank_class(line: str) -> bool:
     (``tests/test_b532w3_serviceenv_split_shapes.py`` pins it). What
     this misses, at least: a secret whose own text is exactly such a line, such as
     ``OS=Summer!``."""
-    name = line.partition("=")[0]
-    return (name in _WINDOWS_NAMES or name == _DIRECTORY_VARIABLE) and _is_ordinary_line(line)
+    name, _equals, value = line.partition("=")
+    return (
+        (name in _WINDOWS_NAMES or name == _DIRECTORY_VARIABLE)
+        and _is_ordinary_line(line)
+        and not _is_key_value(value)
+    )
 
 
 def _mixed_case(text: str) -> bool:
@@ -471,29 +480,10 @@ def _is_key_value(text: str) -> bool:
     return all(_is_one_key_text(part.strip()) for part in value.split(","))
 
 
-def _sets_ordinary_name(line: str) -> bool:
-    """Whether ``line`` has an ordinary variable's shape (:data:`_ORDINARY_LINE`) and its name
-    holds no key material (:func:`_holds_key_run`), whether or not its value is one secret. A
-    value that is empty, or only equals signs and blanks, is not of that shape.
-    :func:`_is_ordinary_line` says how such a line is read."""
-    return bool(_ORDINARY_LINE.match(line)) and not _holds_key_run(line.partition("=")[0])
-
-
 def _is_ordinary_line(line: str) -> bool:
-    """Whether ``line`` sets an ordinary variable (:func:`_sets_ordinary_name`) and its value is
-    not one secret (:func:`_is_key_value`). A line such as ``x=<key>`` below an empty secret is so
-    read as that secret's value, not as a variable that ends it (vault BACKLOG #5394 added item
-    6), an error toward refusing: an ordinary variable whose whole value has a secret's shape
-    makes an empty secret above it read as set.
-
-    This decides whether such a line joins the value above it: as a later line, and, through
-    :func:`_ends_blank_class`, as a line or item below an empty secret-class value or a refused
-    name written alone. A line of an ordinary variable's shape whose value is one secret still
-    marks a variable start, so a refused name alone below it starts a variable of its own
-    (:func:`_read_string`). As an item below an empty ``MEFOR_VALUE_*`` item written with its
-    equals sign it is a variable of its own, whether or not its value is one secret
-    (:func:`_continues_string`)."""
-    return _sets_ordinary_name(line) and not _is_key_value(line.partition("=")[2])
+    """Whether ``line`` sets an ordinary variable (:data:`_ORDINARY_LINE`) and its name holds no
+    key material (:func:`_holds_key_run`)."""
+    return bool(_ORDINARY_LINE.match(line)) and not _holds_key_run(line.partition("=")[0])
 
 
 #: The secret-class names, the two lists above together, both taken from ``engine_secrets``.
@@ -530,9 +520,8 @@ def _line_start(line: str, *, below_empty_class: bool = False) -> Literal["kept"
     """How a line below a registry string's first is read: ``"kept"`` when it sets a name the
     refusal is about, so it is a variable of its own; ``"ends"`` when it sets an ordinary
     variable (:func:`_is_ordinary_line`), which ends the value above and is not kept; ``None``
-    when it belongs to the value above: it starts no variable, or :func:`_is_ordinary_line`
-    reads it into that value. :func:`_continues_string` applies it to a string's first line,
-    narrowed as it says.
+    when it starts no variable and so belongs to the value above. :func:`_continues_string`
+    applies it to a string's first line, narrowed as it says.
 
     ``below_empty_class`` is for a line whose value above is a secret-class name set so far to
     nothing but blanks (:func:`_blank_class`), or a refused name written alone
@@ -686,8 +675,6 @@ def _read_string(
         if start is None:
             parts.append(line)
             empty_class = empty_class and _still_blank(line)
-            # A line of an ordinary variable's shape still starts a variable (_is_ordinary_line).
-            starts_seen = starts_seen or _sets_ordinary_name(line)
             continue
         written, _equals, rest = line.partition("=")
         parts = [rest]
@@ -755,14 +742,13 @@ def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
     under, so the two readings of one shape agree on whether the secret-class value refuses.
 
     Below any other value, NSSM reading each item as its own variable, a first line with an
-    equals sign continues the value only in the cases below, and never when it has an ordinary
-    variable's shape (:func:`_sets_ordinary_name`), whatever its value (:func:`_is_ordinary_line`).
-    Its name is the text before its first equals sign, stripped, and its value the text after
-    it:
+    equals sign continues the value only in the cases below. Its name is the text before its
+    first equals sign, stripped, and its value the text after it:
 
     * the name holds key material (:func:`_holds_key_run`), whatever the value, or the value is
       one secret (:func:`_is_key_value`), so a base64url secret with one ``=`` and ``=<key>``
-      continue it (vault BACKLOG #5394 added items 6 and 12);
+      continue it (vault BACKLOG #5394 added items 6 and 12), but ``x=<key>``, an ordinary line
+      (:func:`_is_ordinary_line`), ends it, so the empty ``MEFOR_VALUE_*`` item is named;
     * the name is standard base64 text, and the value holds only whitespace and equals signs;
     * the name is not blank, and the value holds an equals sign and nothing but equals signs
       and whitespace.
@@ -784,10 +770,6 @@ def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
     written, equals, rest = first.partition("=")
     if not equals:
         return True
-    if _sets_ordinary_name(first):
-        # An item of an ordinary variable's shape, such as ``x=<key>``: the empty entry above is
-        # then named as empty, and the remedy does not remove this item with it.
-        return False
     name = written.strip()
     could_be_key = (
         _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name) or _is_key_value(rest)
@@ -801,10 +783,15 @@ def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
 
 def _sets_directory_first(entry: str) -> bool:
     """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
-    regard to case, as Windows compares names."""
-    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
-    written, equals, _rest = first.partition("=")
-    return bool(equals) and written.strip().upper() == _DIRECTORY_VARIABLE
+    regard to case, as Windows compares names, and the string holds no secret: neither that
+    line's value nor a later line, with any equals signs that lead it taken off, is one secret or
+    a list of them (:func:`_is_key_value`). A string holding one is key material read into the
+    value above it, so the remedy never says to keep it as the directory's entry."""
+    lines = [line for line in _LINE_BREAK.split(entry) if line.strip()]
+    written, equals, rest = (lines[0] if lines else "").partition("=")
+    if not equals or written.strip().upper() != _DIRECTORY_VARIABLE:
+        return False
+    return not any(_is_key_value(text.lstrip("=")) for text in (rest, *lines[1:]))
 
 
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
@@ -820,10 +807,9 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`)
     ends the value above it under the line reading, and is not kept: under the whole-string
     reading it sets nothing, so the secrets directory's name is never taken as set by a later
-    line. :func:`_is_ordinary_line` says how a line of that shape whose value is one secret is
-    read instead. Below an empty secret-class value :func:`_ends_blank_class` decides instead
-    whether a later line ends it. Any other line, such as one of key material, belongs to the
-    value above it, so a key whose value starts on the next line is not empty.
+    line. Below an empty secret-class value :func:`_ends_blank_class` decides instead whether a
+    later line ends it. Any other line, such as one of key material, belongs to the value above it,
+    so a key whose value starts on the next line is not empty.
 
     Each string is also read whole: the name before its first equals sign, stripped, and
     everything after it as the value. That variable is kept when its name is one the refusal is

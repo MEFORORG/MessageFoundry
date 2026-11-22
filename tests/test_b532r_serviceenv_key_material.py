@@ -125,17 +125,59 @@ def test_a_secret_alone_below_an_ordinary_name_set_to_a_key_is_named(name: str, 
         assert "DPAPI-protected key file" in refusal
 
 
-def test_an_ordinary_name_set_to_a_key_does_not_join_an_empty_value_item() -> None:
-    """An item of an ordinary variable's shape whose value is a key is a variable of its own, so
-    below an empty ``MEFOR_VALUE_*`` item the empty entry is named, and the remedy does not say to
-    remove the item below it (Lander hold on PR 3142, finding 3)."""
-    posture = _read(["MEFOR_VALUE_A=", f"x={_KEY_B64}"])
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param(["MEFOR_VALUE_A=", f"x={_KEY_B64}"], id="item"),
+        pytest.param([f"MEFOR_VALUE_A=\nx={_KEY_B64}"], id="line"),
+        pytest.param([f"MEFOR_VALUE_A=\nPath={_KEY_B64}"], id="line-windows-name"),
+    ],
+)
+def test_an_ordinary_name_set_to_a_key_does_not_join_an_empty_value(entries: list[str]) -> None:
+    """An ordinary variable whose value is a key, as the next item or on the next line, is a
+    variable of its own, so below an empty ``MEFOR_VALUE_*`` value the empty entry is named, and
+    the remedy does not say to remove the item below it (Lander holds on PR 3142: the first's
+    finding 3, the item form, and the second's H1, the line form)."""
+    posture = _read(entries)
     assert posture.empty_value_names == ("MEFOR_VALUE_A",)
     assert not posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
     assert "remove those strings with it" not in refusal
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param([f"{_KEY}=", f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"], id="item"),
+        pytest.param(
+            [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=", f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"],
+            id="item-below-a-later-line",
+        ),
+        pytest.param([_KEY, f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"], id="item-below-the-name"),
+        pytest.param([f"{_KEY}=\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}"], id="line"),
+        pytest.param(
+            [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}"],
+            id="later-line",
+        ),
+    ],
+)
+def test_a_directory_entry_holding_a_key_is_never_kept(entries: list[str]) -> None:
+    """``MEFOR_SECRETS_DIRECTORY=<key>`` below an empty store key holds that key, so the remedy
+    never tells the operator to keep it as the directory's entry, and where the key runs on into
+    it, says to remove it with the key (Lander's second hold on PR 3142, H3)."""
+    posture = _read(entries)
+    assert posture.listed_keys == (_KEY,), posture.listed
+    assert not posture.directory_joined
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "Keep one MEFOR_SECRETS_DIRECTORY entry" not in refusal
+    assert "but for any that sets MEFOR_SECRETS_DIRECTORY" not in refusal
+    # Only the item forms run on; a single string is removed as one refused variable.
+    assert posture.value_runs_on == (len(entries) == 2), posture.value_runs_on
+    if posture.value_runs_on:
+        assert "so remove those strings with it, or the value stays in the registry key" in refusal
 
 
 def test_a_nameless_key_item_joins_an_empty_value_item() -> None:
