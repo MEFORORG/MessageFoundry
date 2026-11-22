@@ -105,7 +105,9 @@ counting process over the rung's full event streams. No pairing, no ``claimed_at
 It assumes one outbound row per ``transformed``, which the stores do not guarantee: they write one
 per handler handoff. So it is ``None`` when any message received before the window's end has a
 different count of the two or a repeated destination (``concurrency.n_outbound_parity``), and that
-check is necessary rather than sufficient (``_outbound_parity``). Two things it is NOT:
+check is necessary rather than sufficient (``_outbound_parity``). A void figure makes an otherwise
+passing armed gate NO VERDICT (``census.ok`` null), which ``--strict`` does not pass. Two things it is
+NOT:
 
 * it is NOT capped at 8. It counts QUEUED **plus** IN-SERVICE outbound rows; only rows in service are
   bounded by the 8 destination lanes. "N is about 8, therefore the lanes are saturated" is a category error.
@@ -390,7 +392,12 @@ def _decompose(aggs: list[_Agg]) -> list[dict[str, Any]]:
     ]
 
 
-def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dict[str, Any]:
+def _census(
+    aggs: list[_Agg],
+    expect_t: int | None,
+    expect_d: int | None,
+    unmeasured: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """The population census + fan-out gate. LOUD by construction, and TRI-STATE.
 
     Four independent failure modes, reported separately because they mean different things:
@@ -407,6 +414,9 @@ def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dic
 
     ``ok`` is ``None`` when the gate is UNARMED (no topology passed). "No verdict" must be
     distinguishable from "verdict: failed" — a bare ``False`` would read as a refutation never made.
+    It is also ``None`` on an ARMED gate whose own checks passed while a figure named in ``unmeasured``
+    was refused: that rung was not shown good, and ``True`` would print OK beside the refusal. A check
+    that failed stays ``False`` either way. ``expected`` tells the two ``None`` states apart.
     """
     total = len(aggs)
     complete = [m for m in aggs if m.complete]
@@ -424,6 +434,8 @@ def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dic
     ok: bool | None = None
     if expected is not None:
         ok = bool(modal_ok) and full == len(complete) and censored == 0 and retried == 0
+        if ok and unmeasured:
+            ok = None
 
     return {
         "messages_in_cohort": total,
@@ -447,6 +459,7 @@ def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dic
             {"n_transformed": key[0], "n_delivered": key[1], "messages": v}
             for key, v in hist.most_common(12)
         ],
+        "unmeasured": list(unmeasured),
         "ok": ok,
     }
 
@@ -685,7 +698,17 @@ async def _window_report(
     in_win = (
         [m for m in aggs if m.received is not None and lo <= m.received < hi] if window_s else []
     )
-    census = _census(in_win, expect_t, expect_d)
+    delivered_ts = [float(ts) for _, ts in lane_rows]
+    parity = _outbound_parity(aggs, hi)
+    n_out = (
+        None if parity["mismatched_messages"] else _counting_n(transformed_ts, delivered_ts, lo, hi)
+    )
+    census = _census(
+        in_win,
+        expect_t,
+        expect_d,
+        unmeasured=("n_outbound_rows",) if n_out is None else (),
+    )
 
     pop = [m for m in in_win if m.complete]
     population = "complete-path"
@@ -696,11 +719,6 @@ async def _window_report(
     if limit is not None:
         pop = pop[:limit]
 
-    delivered_ts = [float(ts) for _, ts in lane_rows]
-    parity = _outbound_parity(aggs, hi)
-    n_out = (
-        None if parity["mismatched_messages"] else _counting_n(transformed_ts, delivered_ts, lo, hi)
-    )
     # Messages in flight: born at `received`, dead at the LAST delivery. Same caveat — its time-average is
     # lambda x W by construction, so it corroborates the arithmetic; it cannot validate it.
     n_e2e = _counting_n(
@@ -906,7 +924,7 @@ def _render_census(c: dict[str, Any], population: str) -> list[str]:
             f"({h['n_transformed']},{h['n_delivered']})={h['messages']}" for h in c["histogram"]
         )
     )
-    if c["expected"] is not None and not c["ok"]:
+    if c["expected"] is not None and c["ok"] is False:
         out += [
             "",
             "  ##############################################################################",
@@ -949,6 +967,11 @@ def _render_census(c: dict[str, Any], population: str) -> list[str]:
             ]
         out.append(
             "  ##############################################################################"
+        )
+    elif c["expected"] is not None and c["ok"] is None:
+        out.append(
+            f"  gate: NO VERDICT — {', '.join(c['unmeasured'])} is void, so this rung is not "
+            "shown good. --strict does not pass it."
         )
     elif c["expected"] is not None:
         out.append("  gate: OK — no censoring, no partials, no retries, modal == topology.")
@@ -1091,10 +1114,19 @@ def _finite(v: float | None, flag: str) -> float | None:
     return v
 
 
+def _failure_label(r: dict[str, Any]) -> str:
+    """A report's name, marking an armed no-verdict so it cannot read as a refutation."""
+    label = str(r.get("label", "window"))
+    census = r.get("census", {})
+    if "error" not in r and census.get("expected") is not None and census.get("ok") is None:
+        label += f" (NO VERDICT: {', '.join(census['unmeasured'])} unmeasured)"
+    return label
+
+
 def _gate_failures(d: dict[str, Any]) -> list[str]:
     reports = d["rungs"] if d["mode"] == "per-rung" else [d]
     return [
-        str(r.get("label", "window"))
+        _failure_label(r)
         for r in reports
         if "error" in r or r.get("census", {}).get("ok") is not True
     ]
@@ -1183,7 +1215,10 @@ def main() -> int:
     ap.add_argument(
         "--strict",
         action="store_true",
-        help="exit 2 if ANY reported cohort fails the gate (censoring / partial / retry / modal)",
+        help=(
+            "exit 2 if ANY reported cohort does not pass the gate (censoring / partial / retry / "
+            "modal), or has no verdict because n_outbound_rows is void"
+        ),
     )
     args = ap.parse_args()
 
@@ -1241,7 +1276,7 @@ def main() -> int:
     if args.strict:
         bad = _gate_failures(d)
         if bad:
-            print(f"  GATE FAILED (--strict) for: {', '.join(bad)}", file=sys.stderr)
+            print(f"  GATE NOT PASSED (--strict) for: {', '.join(bad)}", file=sys.stderr)
             return 2
     return 0
 

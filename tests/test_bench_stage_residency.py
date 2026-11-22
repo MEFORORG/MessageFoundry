@@ -49,7 +49,13 @@ def _message(mid: str, at: float, *, births: int, deaths: int, step: float = 0.0
     return events
 
 
-def _report(events: list[Event], *, trim_tail_s: float = 0.0) -> dict[str, Any]:
+def _report(
+    events: list[Event],
+    *,
+    trim_head_s: float = 0.0,
+    trim_tail_s: float = 0.0,
+    expect: tuple[int, int] | None = None,
+) -> dict[str, Any]:
     async def run() -> dict[str, Any]:
         async with aiosqlite.connect(":memory:") as db:
             await db.execute(
@@ -60,10 +66,10 @@ def _report(events: list[Event], *, trim_tail_s: float = 0.0) -> dict[str, Any]:
                 SimpleNamespace(_db=db),
                 since=None,
                 until=None,
-                trim_head_s=0.0,
+                trim_head_s=trim_head_s,
                 trim_tail_s=trim_tail_s,
-                expect_t=None,
-                expect_d=None,
+                expect_t=expect[0] if expect else None,
+                expect_d=expect[1] if expect else None,
                 full_only=False,
                 limit=None,
                 service_ms=24.42,
@@ -182,3 +188,95 @@ def test_the_report_renders_when_the_figure_is_none() -> None:
 
     assert "N_outbound_rows   UNAVAILABLE" in text
     assert "1 of 21" in text
+
+
+def _census_text(report: dict[str, Any]) -> str:
+    return "\n".join(sr._render_census(report["census"], report["population"]))
+
+
+def _one_handoff_three_destinations() -> list[Event]:
+    """Every message matches an armed (1, 3) topology, and every one breaks the birth premise."""
+    events: list[Event] = []
+    for i in range(20):
+        events += _message(f"m{i}", 100.0 + i, births=1, deaths=3)
+    return events
+
+
+def _clean_window_with_a_mismatch_in_the_head_trim() -> list[Event]:
+    """The census reads only the trimmed window. Parity also reads the head, so only it sees this."""
+    return _ladder() + _message("early", 100.5, births=1, deaths=3)
+
+
+@pytest.mark.parametrize(
+    ("events", "expect", "trim_head_s"),
+    [
+        pytest.param(_one_handoff_three_destinations(), (1, 3), 0.0, id="armed-fan-out-topology"),
+        pytest.param(
+            _clean_window_with_a_mismatch_in_the_head_trim(), (8, 8), 2.0, id="mismatch-in-head"
+        ),
+    ],
+)
+def test_a_void_figure_is_no_verdict_rather_than_a_passed_gate(
+    events: list[Event], expect: tuple[int, int], trim_head_s: float
+) -> None:
+    """RED when: a rung prints gate OK and passes --strict with its figure refused."""
+    report = _report(events, expect=expect, trim_head_s=trim_head_s)
+    census = report["census"]
+
+    assert report["concurrency"]["n_outbound_rows"] is None
+    # The census's own four checks passed, so this is the void figure's doing and nothing else's.
+    assert census["modal_ok"] is True
+    assert census["censored"] == 0
+    assert census["ok"] is None
+    assert census["unmeasured"] == ["n_outbound_rows"]
+
+    text = _census_text(report)
+    assert "gate: OK" not in text
+    assert "GATE FAILED" not in text
+    assert "gate: NO VERDICT" in text
+
+    assert sr._gate_failures({"mode": "window", **report}) == [
+        "window (NO VERDICT: n_outbound_rows unmeasured)"
+    ]
+    assert sr._gate_failures({"mode": "per-rung", "rungs": [report]}) != []
+
+
+def test_a_good_figure_still_passes_the_gate_and_keeps_its_values() -> None:
+    """THE CONTROL: the no-verdict arm must be able to answer OK, on the pre-fix ladder figures."""
+    report = _report(_ladder(), expect=(8, 8))
+    census = report["census"]
+
+    assert report["concurrency"]["n_outbound_rows"] == {
+        "time_avg": 2.4,
+        "peak": 8.0,
+        "at_lo": 0.0,
+        "at_hi": 0.0,
+    }
+    assert census["ok"] is True
+    assert census["unmeasured"] == []
+    assert "gate: OK" in _census_text(report)
+    assert sr._gate_failures({"mode": "window", **report}) == []
+
+
+def test_a_failed_census_stays_failed_when_the_figure_is_also_void() -> None:
+    """RED when: the void figure softens a real refutation into a no-verdict."""
+    events = _ladder() + _message("odd", 110.5, births=1, deaths=3)
+
+    report = _report(events, expect=(8, 8))
+
+    assert report["concurrency"]["n_outbound_rows"] is None
+    assert report["census"]["ok"] is False
+    assert "GATE FAILED" in _census_text(report)
+    assert sr._gate_failures({"mode": "window", **report}) == ["window"]
+
+
+def test_an_unarmed_gate_is_not_reported_as_an_unmeasured_figure() -> None:
+    """RED when: an UNGATED report with a void figure claims a verdict state it never reached."""
+    report = _report(_one_handoff_three_destinations())
+
+    assert report["census"]["ok"] is None
+    assert report["census"]["expected"] is None
+    text = _census_text(report)
+    assert "NO VERDICT" not in text
+    assert "UNGATED" in text
+    assert "NO VERDICT" not in sr._failure_label(report)
