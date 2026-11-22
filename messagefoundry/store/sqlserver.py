@@ -14715,7 +14715,10 @@ class SqlServerStore:
         :func:`hmac.compare_digest` over :func:`~messagefoundry.store.store.audit_mac_bytes`."""
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
-        return verify_audit_rows(
+        # Off the loop because a row MAC can be a blocking Transit round trip (BACKLOG #5741). The
+        # arguments are still evaluated on the loop, and every row is held in memory for the walk.
+        return await asyncio.to_thread(
+            verify_audit_rows,
             await self._audit_rows(),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
