@@ -3,9 +3,10 @@
 """A Transit ``plaintext`` that is not base64 once the six ASCII whitespace characters are removed
 is refused as that value's own error (BACKLOG #5964). Non-strict decoding drops every character
 outside the alphabet, so ``!!!!`` would have opened as an empty cell and a stray character as a
-value Transit never returned. A reply with ASCII whitespace added around or inside its base64
-still opens as it did. These tests pin the plain :class:`CipherError` a refused reply has today;
-they do not decide whether it should instead read as an outage. Synthetic data only."""
+value Transit never returned. A reply with ASCII whitespace added around or inside non-empty
+base64 still opens as it did; a reply of whitespace alone is refused even if the sealed value was
+empty, which differs from main. These tests pin the plain :class:`CipherError` a refused reply has
+today; they do not decide whether it should instead read as an outage. Synthetic data only."""
 
 from __future__ import annotations
 
