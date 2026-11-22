@@ -234,8 +234,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
     So the change audit in the store is only as good as the hop it is meant to catch. **The
     in-process compare** (vault BACKLOG #3714 step 9) does not read the store: each settings
-    preflight of the pin compares the file with the first pin bytes this engine process checked,
-    at its store open or else at its first preflight (:data:`_STORE_PIN_FIRST_CHECKED`), and logs
+    preflight of the pin compares the file with the first pin bytes this engine process checked
+    and passed, at a store open or else at a preflight (:data:`_STORE_PIN_FIRST_CHECKED`), and logs
     a WARNING when they differ, at each check until a restart. It writes no row and refuses
     nothing. A restart starts a new baseline, so it does not see a swap made before the process
     first checked the pin, and each engine process holds its own. The file
@@ -1706,9 +1706,9 @@ def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
 _WARNED_AT_OPEN: dict[tuple[str, str], tuple[object, ...]] = {}
 
 #: The SQL Server store pin's in-process baseline (vault BACKLOG #3714 step 9), keyed by label and
-#: path: the fingerprint of the first pin bytes this process checked, at a store open
-#: (:func:`note_store_pin_checked`) or, failing that, at its first settings preflight. Only the
-#: first is kept, so a later open or preflight of a swapped file cannot move it. The settings
+#: path: the fingerprint of the first pin bytes this process checked and passed, at a store open
+#: or, failing that, at a settings preflight (:func:`note_store_pin_checked`). Only the first is
+#: kept, so a later open or preflight of a swapped file cannot move it. The settings
 #: preflight compares the file with it (:func:`_warn_off_hop_pin_change`) without reading the
 #: store, so the compare does not ride the hop the pin secures (module item 11).
 _STORE_PIN_FIRST_CHECKED: dict[tuple[str, str], str] = {}
@@ -1716,17 +1716,18 @@ _STORE_PIN_FIRST_CHECKED: dict[tuple[str, str], str] = {}
 
 def note_store_pin_checked(spec: AnchorSpec, fingerprint: str) -> None:
     """Record ``fingerprint`` as the SQL Server pin's in-process baseline unless one is already
-    held (:data:`_STORE_PIN_FIRST_CHECKED`). The store open calls it once its pin checks pass."""
+    held (:data:`_STORE_PIN_FIRST_CHECKED`). The store open and the settings preflight call it once
+    their checks of the pin pass, so a refused file never becomes the baseline."""
     _STORE_PIN_FIRST_CHECKED.setdefault((spec.label, spec.path), fingerprint)
 
 
 def _warn_off_hop_pin_change(spec: AnchorSpec, fingerprint: str) -> None:
     """Log a WARNING when the SQL Server pin's bytes differ from its in-process baseline
-    (:data:`_STORE_PIN_FIRST_CHECKED`), and set the baseline when none is held. It reads no store
-    row, so a server the swapped pin admits cannot answer it. It warns at each check until a
-    restart, since the baseline does not move. It writes no row and refuses nothing."""
-    first = _STORE_PIN_FIRST_CHECKED.setdefault((spec.label, spec.path), fingerprint)
-    if first == fingerprint:
+    (:data:`_STORE_PIN_FIRST_CHECKED`); with no baseline held, do nothing. It reads no store row,
+    so a server the swapped pin admits cannot answer it. It warns at each check until a restart,
+    since the baseline does not move. It writes no row and refuses nothing."""
+    first = _STORE_PIN_FIRST_CHECKED.get((spec.label, spec.path))
+    if first is None or first == fingerprint:
         return
     log.warning(
         "%s: the SQL Server pin %r on disk (%s %s) differs from the pin this engine process first "
@@ -2888,6 +2889,8 @@ async def _preflight_checks(
     except TrustAnchorError as refusal:
         refusal.unaudited = store_fault is not None
         raise
+    if spec.server_pin:
+        note_store_pin_checked(spec, verdict.fingerprint)  # the file passed (step 9)
     if store_fault is not None:
         raise store_fault
     return verdict.fingerprint

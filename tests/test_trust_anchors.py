@@ -3749,6 +3749,32 @@ async def test_a_store_pin_swap_warns_off_hop_when_the_store_answers_with_the_ne
     assert swapped in warned[0] and "[store].ssl_root_cert" in warned[0]
 
 
+async def test_a_refused_store_pin_never_becomes_the_in_process_baseline(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Review round-5c1e8a07b2 finding 3: a first preflight that refuses the pin, here for a
+    private key in it, sets no baseline, so the corrected file that passes next is the baseline and
+    logs no off-hop warning. Red when the baseline is set before the refusal."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    caplog.set_level("WARNING", logger=ta.__name__)
+    pin = _sqlserver_pin(tmp_path)
+    good = pin.read_bytes()
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))  # settings check the file
+    pin.write_bytes(good + _marked_key_block("PRIVATE" + " KEY"))
+    with pytest.raises(TrustAnchorError):
+        await run_anchor_preflight(specs, store, enforcing=True)
+    assert not ta._STORE_PIN_FIRST_CHECKED
+    pin.write_bytes(good)
+    await run_anchor_preflight(specs, store, enforcing=True)
+    assert _off_hop_warnings(caplog) == []
+    baseline = ta._STORE_PIN_FIRST_CHECKED
+    assert baseline == {("store_sqlserver_pin", str(pin)): ta.anchor_fingerprint(pin)}
+
+
 async def test_the_store_open_sets_the_in_process_baseline(
     store: MessageStore,
     tmp_path: Path,
