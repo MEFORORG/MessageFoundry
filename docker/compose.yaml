@@ -378,9 +378,11 @@ services:
   # standby is promoted within ≈ one heartbeat and binds the listeners — genuine failover, because they
   # share a store and a lease (the default `engine` service shares NEITHER, so it is not in this picture).
   #
-  # NOTE on ports: a single host cannot publish 2575 twice, so only `engine-ha` publishes the MLLP port.
-  # When `engine-ha` is the leader, MLLP works through the published port; when it is the standby its
-  # listener is closed (connection refused on 2575) and the leader is `engine-standby`, reachable on the
+  # NOTE on ports: a single host cannot publish one port twice, and the default `engine` has no profile,
+  # so it runs beside this pair under --profile ha and already owns host 8443 and 2575. So only
+  # `engine-ha` publishes the MLLP port, on host port 2576 (the container still listens on 2575).
+  # When `engine-ha` is the leader, MLLP works through host port 2576; when it is the standby its
+  # listener is closed (connection refused on 2576) and the leader is `engine-standby`, reachable on the
   # container network but not via the host-published port. That host-port asymmetry is a single-host
   # docker limitation only — in k8s the L4 LB's primary-only health check moves the VIP to whichever pod is
   # the leader (docs/CLOUD-DEPLOYMENT.md §3). For a clean local failover demo, hit `engine-ha` first, then
@@ -401,10 +403,10 @@ services:
       - mefor-spool-ha:/var/lib/mefor
     ports:
       - "8444:8443"     # API on a distinct host port (the default `engine` already owns 8443)
-      - "2575:2575"     # MLLP — published only here; works while this node is the leader
+      - "2576:2575"     # MLLP on a distinct host port (the default `engine` already owns 2575); leader only
 
   # Clustered engine #2 — same image + config + cluster; the warm standby (or leader after a failover).
-  # Publishes only its API on a distinct host port; it does NOT publish 2575 (one host can't bind it twice).
+  # Publishes only its API on a distinct host port; it publishes no MLLP port (engine-ha owns host 2576).
   engine-standby:
     <<: *ha-engine
     environment:
