@@ -6,9 +6,7 @@ Step 9: the in-process pin baseline's WARNING tells the operator how to accept a
 made, a restart, since the baseline moves only then.
 
 Step 11, re-scoped: after a settings check at ``enforce`` refuses the SQL Server store pin, the
-store refuses new connects, its pool's (through the pool executor) and its claim holders' and
-sync handoff pools', until a check passes the pin again, unchanged from the process's
-baseline. A check at ``warn`` does not.
+store refuses new connects. Item 11 of the trust anchors module docstring states the hold.
 
 ``aioodbc`` and ``pyodbc`` are the optional ``sqlserver`` extra, so recording modules stand in for
 them through ``sys.modules``, as ``tests/test_sqlserver_login_timeout.py`` does. The one test that
@@ -202,6 +200,52 @@ async def test_a_swapped_pin_does_not_lift_its_own_refusal(
     refused = [r for r in caplog.records if "connections stay refused" in r.getMessage()]
     assert len(refused) == 1, refused
     assert "The pin changed" in refused[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        FileNotFoundError(2, "No such file or directory"),  # mid-renewal, between unlink and write
+        PermissionError(13, "The process cannot access the file"),  # a scanner's lock
+    ],
+    ids=["renewal-by-rename", "scanner-lock"],
+)
+async def test_a_pin_that_cannot_be_read_sets_no_hold(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: OSError
+) -> None:
+    """A read fault at ``enforce`` still refuses the reload, but it is no verdict on the file,
+    so it sets no hold and new store connects go on. Red under: the hold set for every refusal
+    (head c985a608fee)."""
+    settings = _settings(_pin(tmp_path))
+
+    def unreadable(_spec: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(ta, "evaluate_anchor", unreadable)
+    with pytest.raises(TrustAnchorError, match="could not read the trust anchor"):
+        await run_anchor_preflight(_specs(settings), store, enforcing=True)
+    refuse_connect_after_pin_refusal(settings)
+
+
+async def test_the_store_open_database_options_connects_are_refused_under_a_hold(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The open's database-options connect dials outside the pool, so it takes the gate itself,
+    and the refusal reaches the caller as itself, not as a failed options read. Red under: no
+    gate in ``_ensure_database_options``, where it dials."""
+    dialled: list[dict[str, Any]] = []
+
+    async def connect(**kwargs: Any) -> object:
+        dialled.append(kwargs)
+        raise AssertionError("dialled")
+
+    module = types.ModuleType("aioodbc")
+    module.connect = connect  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aioodbc", module)
+    settings = await _refuse_at(store, _pin(tmp_path), enforcing=True)
+    with pytest.raises(StorePinConnectRefused):
+        await SqlServerStore._ensure_database_options(settings)
+    assert dialled == []
 
 
 def test_a_store_with_no_pin_gets_a_plain_pool_executor() -> None:

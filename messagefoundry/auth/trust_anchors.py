@@ -246,17 +246,25 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     next paragraph says which a reload runs); only their rows travel the hop. A file that cannot
     be read refuses before this anchor writes any row. **A refusal at a reload refuses the
     reload, and at ``enforce`` it also stops new store connects** in the engine process that ran
-    the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). Its SQL Server store
-    refuses at least the new connects its pool makes and those of its claim holders and sync
-    handoff pools (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`).
-    It lifts when a later settings check passes the pin with no content warning, or a store open
-    in that process passes it at ``enforce``, in each case only where the pin is unchanged from
-    this process's in-process baseline (:func:`release_store_pin_refusal`). A store call
-    that needs one of those connects fails until then. A reload may not reach the pin's check: at
-    least an earlier anchor's refusal ends the preflight first, and a reload route that makes a
-    store call before the check fails there whenever that call needs a new connection, such as
-    when no pooled connection is free and the pool is below its size. A restart once
-    the file is corrected lifts it too, since the refusal is held in memory. The store is not
+    the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). **This paragraph is
+    where the hold is stated; the code and messages that act on it point here.** What sets it: a
+    refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path. A file
+    that cannot be read sets nothing, since the next check may read it, such as after a renewal
+    by rename or while a scanner holds the file. What it refuses: at least the new connects the
+    SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
+    store open's own database-options connects
+    (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
+    needs one of those connects fails while the hold stands. What lifts it: a later settings check
+    at ``enforce`` that passes the pin with no content warning, or a store open in that process
+    whose checks pass the pin at ``enforce``, in each case only where the pin is unchanged from
+    this process's in-process baseline (:func:`release_store_pin_refusal`). A changed pin keeps the
+    hold, with one ERROR, so a swapped pin cannot lift it by passing after an ACL fix; a renewal
+    then takes a restart. Where no baseline was held before such a check, the pin it passes
+    becomes the baseline first, and so lifts the hold. A restart once the file is corrected lifts
+    it too, since the hold is held in memory. A reload may not reach the pin's check: at least an
+    earlier anchor's refusal ends the preflight first, and a reload route that makes a store call
+    before the check fails there whenever that call needs a new connection, such as when no
+    pooled connection is free and the pool is below its size. The store is not
     closed: the connections already in its pool can stay open, whichever server they reach, and
     the store goes on using them. At ``warn`` a new connect reads the file on disk then, as
     above. So where the refusal follows a swap, correcting the file does not by itself end the
@@ -1764,9 +1772,8 @@ def _warn_off_hop_pin_change(spec: AnchorSpec, fingerprint: str) -> None:
 
 #: SQL Server store pins an ``enforce`` settings preflight refused (vault BACKLOG #3714 step 11, as
 #: re-scoped by decision d20261122T111258871-87279a), keyed by label and path, each holding the
-#: refusal's text. While a pin is held here the store refuses new connects
-#: (:func:`store_pin_connect_refusal`); connections already open stay open (module item 11).
-#: :func:`release_store_pin_refusal` says what releases it. Holding and releasing each log once.
+#: refusal's text (:func:`store_pin_connect_refusal`). Module item 11 states what sets, refuses
+#: and lifts the hold. Holding and lifting each log once.
 _STORE_PIN_REFUSED: dict[tuple[str, str], str] = {}
 
 #: The held pins whose release was refused because their bytes differ from the baseline
@@ -1781,18 +1788,17 @@ def store_pin_connect_refusal(spec: AnchorSpec) -> str | None:
 
 
 def hold_store_pin_refused(spec: AnchorSpec, refusal: str) -> None:
-    """Refuse ``spec``'s new store connects (:data:`_STORE_PIN_REFUSED`), logging an ERROR when
-    that starts, since the reload's own refusal does not say that connects stopped."""
+    """Hold ``spec``'s new store connects refused (:data:`_STORE_PIN_REFUSED`, module item 11),
+    logging an ERROR when that starts, since the reload's own refusal does not say that connects
+    stopped."""
     key = (spec.label, spec.path)
     if key not in _STORE_PIN_REFUSED:
         _STORE_PIN_RELEASE_REFUSED.discard(key)
         log.error(
             "%s: a settings check at enforce refused the SQL Server pin %r, so this engine "
-            "process's store now refuses new connections; the ones already open stay open. A "
-            "later settings check at enforce that passes the pin with no content warning, and "
-            "finds it unchanged from the pin this process first checked, lets it connect again, "
-            "but a reload may not reach that check: its route can need a new store connection "
-            "first. A restart once the file is corrected lifts it",
+            "process's store now refuses new connections; the ones already open stay open. "
+            "Fix what the refusal names; item 11 of the messagefoundry.auth.trust_anchors module docstring "
+            "says which checks then let it connect again, and a restart does",
             spec.setting,
             spec.path,
         )
@@ -1800,17 +1806,9 @@ def hold_store_pin_refused(spec: AnchorSpec, refusal: str) -> None:
 
 
 def release_store_pin_refusal(spec: AnchorSpec, fingerprint: str) -> None:
-    """Let ``spec``'s store connect again (:data:`_STORE_PIN_REFUSED`), logging when a refusal
-    is lifted. Called by a settings preflight at ``enforce`` that passes the pin with no content
-    warning, and by a store open whose checks of the pin pass at ``enforce``. Each runs the
-    checks a refusal at ``enforce`` names, and the store open's refuse what the preflight only
-    warns of.
-
-    ``fingerprint`` is the pin those checks passed. Unless it equals this process's baseline
-    (:data:`_STORE_PIN_FIRST_CHECKED`), the hold stays and an ERROR is logged once per hold: a
-    swapped pin must not lift the hold its own refusal set by passing after, say, an ACL fix.
-    A renewal then takes a restart, as the off-hop warning says. Where no baseline was held
-    before the check, the pin it passes becomes the baseline first, so it lifts the hold."""
+    """Lift ``spec``'s hold (:data:`_STORE_PIN_REFUSED`) where ``fingerprint``, the pin the
+    caller's checks passed, equals the baseline (:data:`_STORE_PIN_FIRST_CHECKED`); otherwise
+    keep it and log an ERROR once per hold. Module item 11 states which checks call it."""
     key = (spec.label, spec.path)
     if key not in _STORE_PIN_REFUSED:
         return
@@ -2900,8 +2898,9 @@ async def _preflight_one(
     except TrustAnchorError as refusal:
         if refusal.setting is None:
             refusal.setting = spec.setting
-        if spec.server_pin and enforcing:
-            # Step 11: the store refuses new connects until a check passes the pin.
+        # Step 11 (module item 11): a file that could not be read is no verdict on it, as for
+        # a MemoryError, so it sets no hold. _unreadable_anchor raises from the OSError.
+        if spec.server_pin and enforcing and not isinstance(refusal.__cause__, OSError):
             hold_store_pin_refused(spec, str(refusal))
         raise
 

@@ -1547,12 +1547,12 @@ class SyncHandoffUnavailable(RuntimeError):
 
 class StorePinConnectRefused(RuntimeError):
     """A new store connection refused before it dialled, because a settings check at ``enforce``
-    refused the SQL Server ``[store].ssl_root_cert`` pin and no check has passed it since (vault
-    BACKLOG #3714 step 11, :func:`refuse_connect_after_pin_refusal`). It is not a
+    refused the SQL Server ``[store].ssl_root_cert`` pin, while that hold stands (vault BACKLOG
+    #3714 step 11, :func:`refuse_connect_after_pin_refusal`; trust anchors module item 11). It is
+    not a
     :class:`~messagefoundry.config.tls_policy.StoreTlsRefused`, so a handler of that refusal does
     not read it as a start gate refusing. It is raised mostly while the store runs, but a store
-    open whose own pin check did not lift the refusal, such as one at a posture that does not
-    enforce, can raise it too, from its pool's first connect."""
+    open whose own pin check did not lift the hold can raise it too."""
 
 
 class _SyncHandoffPool:
@@ -3272,8 +3272,8 @@ def check_pinned_certificate(
     The file is read once, and the certificate checks read the bytes the anchor checks read
     (BACKLOG #3714). It writes no audit row. A pin that passes becomes the process's in-process
     baseline, unless an earlier one is held (:func:`~messagefoundry.auth.trust_anchors.note_store_pin_checked`).
-    One that passes at ``enforce`` also lets the store connect again after a refusal
-    (:func:`~messagefoundry.auth.trust_anchors.release_store_pin_refusal`). The audited check is the settings preflight
+    It may also lift a held refusal of new connects
+    (:func:`~messagefoundry.auth.trust_anchors.release_store_pin_refusal`, module item 11). The audited check is the settings preflight
     (:mod:`messagefoundry.auth.trust_anchors`, module item 11, which says what a reload skips).
 
     Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
@@ -3346,12 +3346,10 @@ def check_pinned_certificate(
 
 def refuse_connect_after_pin_refusal(settings: StoreSettings) -> None:
     """Raise :class:`StorePinConnectRefused` when a settings check at ``enforce`` refused this
-    store's SQL Server pin and no check has passed it since (vault BACKLOG #3714 step 11,
-    :func:`~messagefoundry.auth.trust_anchors.store_pin_connect_refusal`).
-
-    Called before at least these new connects: the pool's, through :class:`_PinGatedExecutor`,
-    a claim holder's and a sync handoff connection's. A connection already open is not closed.
-    A store with no pin, or one whose pin no ``enforce`` check refused, connects as before."""
+    store's SQL Server pin, while that hold stands (vault BACKLOG #3714 step 11,
+    :func:`~messagefoundry.auth.trust_anchors.store_pin_connect_refusal`). The trust anchors
+    module's item 11 states the hold and the connects it covers. Through
+    :class:`_PinGatedExecutor` the pool's connects take the same check."""
     from messagefoundry.auth.trust_anchors import store_pin_anchor_spec
 
     spec = store_pin_anchor_spec(settings)
@@ -3367,7 +3365,8 @@ def _refuse_connect(spec: AnchorSpec) -> None:
     if refusal is not None:
         raise StorePinConnectRefused(
             f"[store].ssl_root_cert {spec.path!r}: a new store connection was refused, because a "
-            f"settings check at enforce refused the pin and none has passed it since: {refusal}"
+            f"settings check at enforce refused the pin and the hold stands (item 11 of the "
+            f"messagefoundry.auth.trust_anchors module docstring): {refusal}"
         )
 
 
@@ -4996,6 +4995,8 @@ class SqlServerStore:
             for attempt in range(_RCSI_REREADS):
                 if attempt:
                     await asyncio.sleep(_RCSI_REREAD_DELAY_S)
+                # Outside the try, whose `except Exception` reads any failure as OFF.
+                refuse_connect_after_pin_refusal(settings)  # vault BACKLOG #3714 step 11
                 try:
                     probe = await aioodbc.connect(
                         dsn=dsn, autocommit=True, timeout=settings.connect_timeout
@@ -5029,6 +5030,7 @@ class SqlServerStore:
                     return True
             return False
 
+        refuse_connect_after_pin_refusal(settings)  # step 11, outside the RuntimeError wrap
         try:
             conn = await aioodbc.connect(
                 dsn=dsn,
