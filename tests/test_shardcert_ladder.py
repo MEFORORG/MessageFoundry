@@ -11,6 +11,7 @@ stop-at-ceiling (the throughput-SUSTAIN signal — non-drain/loss or an intake s
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,12 +19,20 @@ import pytest
 from harness.load import shardcert
 from harness.load.shardcert import (
     RungFidelity,
+    ShardCertLadderReport,
     ShardCertReport,
     ShardCertStepRecord,
     parse_rate_ladder,
     run_shardcert_ladder,
 )
-from harness.load.shardcert_ladder import ClaimTiming, aggregate_claim_timing
+from harness.load.shardcert_ladder import (
+    ClaimTiming,
+    LadderRung,
+    RungOutcome,
+    aggregate_claim_timing,
+    build_rung_outcome,
+)
+from tests.test_shardcert_failclosed_verdicts import _clean_gate, _consolidated, _drive, _sustained
 
 
 def _step(
@@ -1160,6 +1169,130 @@ def test_fidelity_note_names_every_measured_void_verdict(fidelity: RungFidelity)
     # recorded inputs "were not recorded". This fails for such a verdict.
     note = shardcert.fidelity_note(fidelity, sent=90, acked=90, offered=100)
     assert note is not None and not note.startswith("FIDELITY UNKNOWN")
+
+
+@pytest.mark.parametrize("fidelity", list(RungFidelity))
+def test_fidelity_note_never_divides_by_a_zero_offered(fidelity: RungFidelity) -> None:
+    # BACKLOG #5861: the guard is on the input, so no verdict can reach a division at offered 0. The
+    # counts WERE recorded there, so the note must not say they were not.
+    note = shardcert.fidelity_note(fidelity, sent=0, acked=0, offered=0)
+    assert note is not None and "offered no messages" in note
+    assert "not recorded" not in note
+
+
+def test_fidelity_note_still_says_unrecorded_for_a_sentinel_offered() -> None:
+    note = shardcert.fidelity_note(RungFidelity.UNKNOWN, sent=-1, acked=-1, offered=-1)
+    assert note is not None and "not recorded" in note
+
+
+_ZERO_RATE = 0.005  # at a 60 s hold this plans 0.3 messages, which rounds to none
+
+
+def _two_box_zero(*, is_soak: bool = False, lane_inversions: int = 0) -> RungOutcome:
+    drive = replace(_drive(_ZERO_RATE), lanes_observed=0, lane_inversions=lane_inversions)
+    assert drive.offered == 0
+    rung = LadderRung(
+        index=1,
+        ingress_rate=_ZERO_RATE,
+        hold_seconds=60.0,
+        drain_timeout=150.0,
+        is_soak=is_soak,
+    )
+    return build_rung_outcome(rung, drive, _clean_gate(), None)
+
+
+def _colocated_zero(**over: object) -> ShardCertStepRecord:
+    report = _report(
+        **{
+            "offered": 0,
+            "sent": 0,
+            "acked": 0,
+            "achieved_intake": 0,
+            "delivered_distinct": 0,
+            "sink_received": 0,
+            "engine_done": 0,
+            "lanes_observed": 0,
+            **over,
+        }
+    )
+    return ShardCertStepRecord.from_report(_ZERO_RATE, report, hold_seconds=60.0)
+
+
+def _colocated_run(
+    monkeypatch: pytest.MonkeyPatch, plan: dict[float, ShardCertStepRecord]
+) -> ShardCertLadderReport:
+    async def fake_step(*, rate: float, **_kw: object) -> ShardCertStepRecord:
+        return plan[rate]
+
+    monkeypatch.setattr(shardcert, "_run_ladder_step", fake_step)
+    return asyncio.run(shardcert.run_shardcert_ladder(rates=list(plan)))
+
+
+def test_two_box_control_rung_still_passes() -> None:
+    control = _sustained(0, 16.0)
+    assert control.fidelity_admissible
+    lad = _consolidated([control])
+    assert (lad.exit_code, lad.result_label) == (0, "PASS")
+
+
+@pytest.mark.parametrize("with_control", [False, True])
+def test_two_box_zero_offered_climb_rung_is_setup_degraded(with_control: bool) -> None:
+    # BACKLOG #5861: this rung reads FROZEN_TAIL with UNKNOWN fidelity, and no setup term saw it: exit 0.
+    climb = [*([_sustained(0, 16.0)] if with_control else []), _two_box_zero()]
+    lad = _consolidated(climb)
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+    assert "offered no messages" in lad.render()
+
+
+def test_two_box_zero_offered_soak_is_setup_degraded() -> None:
+    lad = _consolidated([_sustained(0, 16.0)], soak=_two_box_zero(is_soak=True))
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+
+
+def test_two_box_zero_offered_rung_does_not_hide_a_real_break() -> None:
+    lad = _consolidated([_sustained(0, 16.0), _two_box_zero(lane_inversions=1)])
+    assert (lad.exit_code, lad.result_label) == (1, "FAIL")
+
+
+def test_colocated_control_rung_still_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    control = ShardCertStepRecord.from_report(10.0, _report(), hold_seconds=60.0)
+    lad = _colocated_run(monkeypatch, {10.0: control})
+    assert (lad.exit_code, lad.result_label) == (0, "PASS")
+
+
+@pytest.mark.parametrize("lossless", [True, False])
+def test_colocated_zero_offered_rung_is_setup_degraded(
+    monkeypatch: pytest.MonkeyPatch, lossless: bool
+) -> None:
+    # BACKLOG #5861: this rung read as an engine correctness FAIL (exit 1). `lossless=False` drives the
+    # ceiling branch and `True` the non-ceiling one, so both routes through the climb are covered.
+    control = ShardCertStepRecord.from_report(10.0, _report(), hold_seconds=60.0)
+    zero = _colocated_zero(drained=lossless)
+    assert zero.no_loss is lossless
+    lad = _colocated_run(monkeypatch, {10.0: control, 20.0: zero, 30.0: control})
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+    assert len(lad.records) == 2  # the climb stops at the rung that offered nothing
+    rendered = lad.render()
+    assert "offered no messages" in rendered
+    assert "broke correctness" not in rendered and "not recorded" not in rendered
+
+
+def test_colocated_zero_offered_record_is_degraded_without_the_climb() -> None:
+    # The verdict itself fails closed, so a report assembled by any other route cannot read PASS.
+    lad = ShardCertLadderReport(records=[_colocated_zero()])
+    assert (lad.exit_code, lad.result_label) == (2, "SETUP_DEGRADED")
+
+
+@pytest.mark.parametrize(
+    "fault", [{"lane_inversions": 1}, {"dead_total": 2}, {"stranded_nonterminal": 1}]
+)
+def test_colocated_zero_offered_rung_does_not_hide_a_real_break(
+    monkeypatch: pytest.MonkeyPatch, fault: dict[str, int]
+) -> None:
+    lad = _colocated_run(monkeypatch, {20.0: _colocated_zero(**fault)})
+    assert (lad.exit_code, lad.result_label) == (1, "FAIL")
+    assert "measured nothing about the engine. Raise" not in lad.render().split("note:")[0]
+    assert "broke correctness" in lad.render()
 
 
 def test_step_record_carries_sent_across_from_the_report() -> None:

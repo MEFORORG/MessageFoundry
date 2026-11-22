@@ -2500,6 +2500,13 @@ class ConsolidatedLadderReport:
         return any(r.verdict is RungVerdict.INCONCLUSIVE for r in self.climb)
 
     @property
+    def zero_offered_rates(self) -> list[float]:
+        """The rates of the climb or soak rungs that offered no messages (BACKLOG #5861). Only these, and
+        not every UNKNOWN rung: an unrecorded ``sent`` on a rung that did offer load keeps its existing
+        reading, because the verdict's other authorities still measured that rung."""
+        return [r.ingress_rate for r in self.all_records if r.offered <= 0]
+
+    @property
     def setup_degraded(self) -> bool:
         """The run hit a RIG/infra degradation (a climb OR soak rendezvous abort, an unconfirmed store-truth,
         or — ARTIFACT 4 — a SOAK the LOAD GENERATOR could not drive), NOT a clean measurement. Surfaced as
@@ -2513,13 +2520,17 @@ class ConsolidatedLadderReport:
         tripwire is a RESOURCE bind, not an engine ceiling. It is a real number, so it is not voided — but it
         must not exit 0 as a clean PASS either, or the tripwire is decorative. :attr:`result_label` names it
         POOL_BOUND rather than folding it into the generic SETUP_DEGRADED token, because "the pool was the
-        wall" is a specific and actionable finding (raise ``--store-pool-size`` and re-run)."""
+        wall" is a specific and actionable finding (raise ``--store-pool-size`` and re-run).
+
+        A rung that offered no messages (:attr:`zero_offered_rates`) belongs here too: its verdict is
+        scale-free and can read as a benign FROZEN_TAIL, so without this term the run exits 0."""
         return (
             self.climb_aborted
             or self.soak_aborted
             or self.store_truth_unconfirmed
             or self.soak_drive_shortfall
             or self.ceiling_pool_bound
+            or bool(self.zero_offered_rates)
         )
 
     @property
@@ -2675,6 +2686,7 @@ class ConsolidatedLadderReport:
                 or self.soak_aborted
                 or self.store_truth_unconfirmed
                 or self.soak_drive_shortfall
+                or bool(self.zero_offered_rates)
             )
             return "SETUP_DEGRADED" if nothing_measured else "POOL_BOUND"
         if not self.ok:
@@ -2894,6 +2906,12 @@ class ConsolidatedLadderReport:
                     f"{self.soak.offered} offered at {self.soak.ingress_rate:g}/s. 'The operating point "
                     "held' would be a readback of the plan, and 'it collapsed' would be a fabrication — "
                     "so this run certifies NOTHING. Add sender workers / drive boxes and re-run"
+                )
+            elif self.zero_offered_rates:
+                rates = ", ".join(f"{rate:g}" for rate in self.zero_offered_rates)
+                reason = (
+                    f"the rung(s) at {rates} ingress/s offered no messages, so they measured nothing "
+                    "about the engine. Raise the rate or the hold and re-run"
                 )
             else:
                 reason = (
