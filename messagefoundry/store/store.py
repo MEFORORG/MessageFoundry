@@ -17952,25 +17952,19 @@ class MessageStore:
             cur = await self._db.execute(query, tuple(params))
             rows = list(await cur.fetchall())
             if not rows:
-                # BEGIN IMMEDIATE left a transaction open, so a purge with no audit row must close
-                # it without a commit, which would count a transaction that wrote nothing.
-                noop_audits = operator_audits(audit, 0)
-                if noop_audits:
-                    written.add(noop_audits, await self._append_audits(noop_audits, now=now))
-                    await self._commit()
-                else:
-                    await self._db.rollback()
+                # Only read so far: close BEGIN IMMEDIATE, so a purge with no audit row commits
+                # nothing, which would otherwise count a transaction that wrote nothing.
+                await self._db.rollback()
+                await self._commit_operator_noop(written, audit, 0)
                 return 0
+            if top_only:
+                where.append("id=?")
+                params.append(rows[0]["id"])
             # The lane predicate rather than an id list, so a deep queue cannot exceed SQLite's
-            # bound-variable limit; every form keeps the PENDING term.
-            target, target_params = (
-                ("id=? AND status=?", (rows[0]["id"], OutboxStatus.PENDING.value))
-                if top_only
-                else (" AND ".join(where), tuple(params))
-            )
+            # bound-variable limit; it carries the PENDING term in both forms.
             upd = await self._db.execute(
-                f"UPDATE queue SET status=?, updated_at=? WHERE {target}",
-                (OutboxStatus.CANCELLED.value, now, *target_params),
+                f"UPDATE queue SET status=?, updated_at=? WHERE {' AND '.join(where)}",
+                (OutboxStatus.CANCELLED.value, now, *params),
             )
             cancelled = upd.rowcount
             for r in rows:

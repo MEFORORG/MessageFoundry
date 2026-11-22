@@ -13812,28 +13812,27 @@ class SqlServerStore:
                         (*params, OutboxStatus.CANCELLED.value, now),
                     )
                     # OUTPUT promises no order; the events keep the queue's.
-                    rows = [(r[0], r[1]) for r in sorted(await cur.fetchall(), key=lambda r: r[2])]
-                    if not rows:
+                    message_ids = [r[1] for r in sorted(await cur.fetchall(), key=lambda r: r[2])]
+                    if not message_ids:
                         await self._append_operator_audit(cur, written, audit, 0)
                         await self._commit(conn)
                         return 0
-                    ids = [r[0] for r in rows]
-                    for _id, message_id in rows:
+                    for message_id in message_ids:
                         await self._event(
                             cur, message_id, "cancelled", destination_name, "manual purge", now
                         )
-                    mids = {r[1] for r in rows}
+                    mids = set(message_ids)
                     await self._lock_finalize_batch(cur, mids)
                     for message_id in sorted(mids):
                         await self._maybe_finalize(cur, message_id, now)
-                    await self._append_operator_audit(cur, written, audit, len(ids))
+                    await self._append_operator_audit(cur, written, audit, len(message_ids))
                     await self._commit(conn)
             except Exception:
                 # BACKLOG #2624: the transaction may hold the audit applock and an
                 # audit row. After the cursor closes, so a detached close cannot race it.
                 await self._rollback_or_discard(conn)
                 raise
-        return len(ids)
+        return len(message_ids)
 
     # --- read helpers --------------------------------------------------------
 

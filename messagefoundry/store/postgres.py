@@ -8986,22 +8986,23 @@ class PostgresStore:
             self._timed_acquire() as conn,
             conn.transaction(isolation=_FINALIZE_ISOLATION),
         ):
-            returned = await conn.fetch(
-                f"UPDATE queue SET status=$5, updated_at=$6 WHERE {target if top_only else lane}"
-                " RETURNING id, message_id, seq",
-                destination_name,
-                OutboxStatus.PENDING.value,
-                channel_id,
-                Stage.OUTBOUND.value,
-                OutboxStatus.CANCELLED.value,
-                now,
+            # RETURNING promises no order; the events keep the queue's.
+            rows = sorted(
+                await conn.fetch(
+                    f"UPDATE queue SET status=$5, updated_at=$6 WHERE {target if top_only else lane}"
+                    " RETURNING id, message_id, seq",
+                    destination_name,
+                    OutboxStatus.PENDING.value,
+                    channel_id,
+                    Stage.OUTBOUND.value,
+                    OutboxStatus.CANCELLED.value,
+                    now,
+                ),
+                key=lambda r: r["seq"],
             )
-            if not returned:
+            if not rows:
                 await self._append_operator_audit(conn, written, audit, 0)
                 return 0
-            # RETURNING promises no order; the events keep the queue's.
-            rows = sorted(returned, key=lambda r: r["seq"])
-            ids = [r["id"] for r in rows]
             for r in rows:
                 await self._event(
                     conn,
@@ -9016,8 +9017,8 @@ class PostgresStore:
             await self._lock_finalize_batch(conn, (r["message_id"] for r in rows))
             for message_id in {r["message_id"] for r in rows}:
                 await self._maybe_finalize_message(conn, message_id, now)
-            await self._append_operator_audit(conn, written, audit, len(ids))
-        return len(ids)
+            await self._append_operator_audit(conn, written, audit, len(rows))
+        return len(rows)
 
     # --- read helpers (API / console) ----------------------------------------
 
