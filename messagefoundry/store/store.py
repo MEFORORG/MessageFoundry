@@ -7784,6 +7784,11 @@ class AuditVerdict(tuple[bool, str | None]):
         )
 
 
+class _AuditWalkStopped(Exception):
+    """A :func:`verify_audit_rows` walk ended by its ``should_stop``. An exception, so a walk that
+    did not finish can never come back as a verdict (BACKLOG #5741)."""
+
+
 def verify_audit_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -7793,6 +7798,7 @@ def verify_audit_rows(
     expected_anchor: tuple[int, str] | None = None,
     expected_prefix: tuple[int, str] | None = None,
     expected_rows: Sequence[tuple[int, str]] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> AuditVerdict:
     """Recompute the audit chain over ``rows`` (all of ``audit_log``, in ``seq`` order) -- the ONE
     walk all three backends' ``verify_audit_chain`` run, so the rule cannot drift between them.
@@ -7892,6 +7898,8 @@ def verify_audit_rows(
     #: (position, row id, outgoing key, the range row's record, what the walk saw)
     closings: list[tuple[int, Any, str | None, AuditEpoch, dict[str, Any]]] = []
     for pos, r in enumerate(rows, start=1):
+        if should_stop is not None and should_stop():
+            raise _AuditWalkStopped
         rid = r["id"]
         seq_ok = _strict_int(r["seq"]) == pos
         if not seq_ok:
@@ -7998,6 +8006,9 @@ def verify_audit_rows(
             )
         )
     for pos, rid, outgoing, epoch, actual in closings:
+        # Each closing can cost a handover-tag MAC, so the row loop's check is not enough.
+        if should_stop is not None and should_stop():
+            raise _AuditWalkStopped
         claimed = epoch.closes
         fields_ok = all(
             claimed.get(f) == actual[f] for f in ("key_id", "from_seq", "to_seq", "rows")
