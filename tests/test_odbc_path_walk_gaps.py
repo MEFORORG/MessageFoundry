@@ -1533,3 +1533,102 @@ async def test_hold_f2_a_replaced_connector_whose_close_raises_leaves_the_reload
         await runner.stop()
         if stale is not None:
             await real_close(stale)
+
+
+# --- wave 5: the pre-existing not-found item, and PR 2738 finding 3 ------------------------------
+
+
+def _not_found(winerror: int | None) -> FileNotFoundError:
+    """A ``FileNotFoundError`` as CPython raises it for ``winerror``, or with none (off Windows)."""
+    exc = FileNotFoundError(2, "synthetic not found")
+    exc.winerror = winerror  # type: ignore[attr-defined]
+    return exc
+
+
+@pytest.mark.parametrize("winerror", [15, 18, 161, 206])
+def test_another_not_found_code_on_the_path_is_not_cleared(winerror: int) -> None:
+    """Vault BACKLOG #5197, *Pre-existing* item 1. CPython raises these Win32 codes as not found,
+    where a name may be there, so the walk stops on them with a cause rather than ending as at a
+    missing name. Red on main: each read as the path ending, so the path was cleared."""
+    failing: dict[str, OSError] = {r"C:\phi-name": _not_found(winerror)}
+    assert _walk(r"C:\phi-name\ca.pem", failing=failing) is None
+
+
+@pytest.mark.parametrize("winerror", [2, 3, None])
+def test_a_missing_name_code_on_the_path_still_ends_the_walk(winerror: int | None) -> None:
+    """Control: 2 and 3, the only codes measured on Windows 11 for a missing name, and ENOENT off
+    Windows, still end the walk as local text. Green before and after."""
+    failing: dict[str, OSError] = {r"C:\phi-name": _not_found(winerror)}
+    assert _walk(r"C:\phi-name\ca.pem", failing=failing) is False
+
+
+def test_a_path_through_a_file_still_ends_the_walk() -> None:
+    """Control: ``NotADirectoryError`` still ends the walk, whatever its code."""
+    failing: dict[str, OSError] = {r"C:\phi-name": NotADirectoryError(20, "synthetic")}
+    assert _walk(r"C:\phi-name\ca.pem", failing=failing) is False
+
+
+@pytest.mark.parametrize(
+    ("winerror", "no_file"),
+    [(2, True), (3, True), (None, True), (53, False), (161, False), (206, False)],
+)
+def test_a_driver_file_read_reads_only_a_missing_name_as_no_file(
+    winerror: int | None, no_file: bool
+) -> None:
+    """Vault BACKLOG #5197, *Pre-existing* item 1, at the read (``_names_no_file``). Red on main:
+    161 and 206 read as no file, so a file there was left to the driver unchecked."""
+    assert database._names_no_file(_not_found(winerror)) is no_file
+
+
+def _walk_not_cleared(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every walk logs one synthetic not-cleared cause and answers ``None``, as on Windows."""
+
+    def verdict(path: str, **_inputs: object) -> bool | None:
+        database._not_cleared("synthetic cause", path)
+        return None
+
+    monkeypatch.setattr(database, "_WALKS_BEYOND_SPELLING", True)
+    monkeypatch.setattr(database, "_windows_path_verdict", verdict)
+
+
+def test_finding_3_the_not_cleared_warning_names_the_connection_and_keyword(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Engine PR 2738 finding 3: the WARNING named neither, so an operator with several connections
+    could not tell which setting it was about. Red on main: no connection name in the line."""
+    _walk_not_cleared(monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(ValueError, match="'sslca'"):
+        database._build_odbc_dsn(_generic(SSLCA=r"C:\phi-name\ca.pem"), connection=_OUT)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(_OUT in m and "odbc_params sslca" in m and "synthetic cause" in m for m in warned)
+    assert all("phi-name" not in m for m in warned)  # the path stays at DEBUG
+
+
+def test_finding_3_the_lane_check_warning_names_the_connection_and_keyword(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same at the lane check, in its refusal's own words."""
+    _walk_not_cleared(monkeypatch)
+    caplog.set_level(logging.WARNING, logger=database.logger.name)
+    with pytest.raises(ValueError, match="sslkey"):
+        ta.lane_anchor_spec("outbound", _OUT, _generic(SSLKEY=r"C:\phi-name\client.key"))
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(f"'{_OUT}' odbc_params sslkey" in m for m in warned)
+
+
+def test_finding_3_a_walk_outside_a_judgement_names_no_setting(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Control: outside a judgement the line is as before, and a judgement's name does not leak
+    into a later walk."""
+    _walk_not_cleared(monkeypatch)
+    caplog.set_level(logging.WARNING, logger=database.logger.name)
+    with database.judging_file_keyword("connection 'X'; odbc_params sslca"):
+        pass
+    assert database.names_another_host(r"C:\phi-name\ca.pem")
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warned == [
+        "DATABASE file keyword path not cleared: synthetic cause (the path, if any, is logged at "
+        "DEBUG)"
+    ]

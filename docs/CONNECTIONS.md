@@ -2262,7 +2262,8 @@ name, counts only when every folder before it exists; a path that ends at a miss
 is left to the driver, as a missing file is. A `subst` drive onto a share counts as leading to
 another host.
 When the check cannot finish, or finds that the path leads to another host, a WARNING names the
-kind of cause, never the path; the path is logged at DEBUG only. The value is judged as the text
+kind of cause, never the path; the path is logged at DEBUG only. At least where the build or the
+lane check judges the value, the WARNING also names the connection and the keyword. The value is judged as the text
 the build sends, so `0` is checked as the path `0`. On Windows each entry of an `SSLCAPATH` folder
 takes the same check, since the driver opens a `<hash>.0` entry there by name: an entry that leads
 to another host, or one the check cannot finish, refuses the value, and so does a folder the engine
@@ -2401,8 +2402,10 @@ Two limits follow from this:
   file and a share Windows could not reach, saying the file must be a plain local path, not a
   share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
   file's own name can pass the walk, since Windows answers it from the folder's listing; the
-  read then refuses it as a file that could not be read. A missing name, other than such a share,
-  ends the walk and is left to libpq.
+  read then refuses it as a file that could not be read. A missing name, which Windows reports as
+  code 2 or 3, ends the walk and is left to libpq. Another code Windows raises as not found is not
+  read as a missing name: a share it could not reach is refused as above, and at least codes 161
+  and 206 stop the walk, and the build is refused.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder, which the engine asks the shell for as libpq does, through the ANSI
