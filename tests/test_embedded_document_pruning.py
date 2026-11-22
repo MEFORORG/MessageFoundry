@@ -68,9 +68,23 @@ _DB_NAME = "embedded_doc_pruning.db"
 # --- backend fixtures (SQLite always; PG/SQLServer skipif-gated) ---------------
 #
 # The server cases run on the shared live databases of at least the postgres-store,
-# postgres-store-windows and sqlserver-store CI legs (BACKLOG #5651). As in the sibling store suites, a setup failure closes the pool (BACKLOG
-# #1629), and the audit chain is read again from the emptied log, because a keyed chain an earlier
-# file left would make this keyless handle refuse every append.
+# postgres-store-windows and sqlserver-store CI legs (BACKLOG #5651). As in the sibling store
+# suites, a setup failure closes the pool (BACKLOG #1629), and a close that fails too is logged
+# rather than raised, so the setup error is the one reported. The audit chain is read again from
+# the emptied log, because a keyed chain an earlier file left would make this keyless handle
+# refuse every append.
+
+
+async def _close_after_failed_setup(s: Any) -> None:
+    """Close a server store whose fixture setup failed. A close error is logged, not raised: it
+    would replace the setup error the run reports (BACKLOG #5651)."""
+    try:
+        await s.close()
+    except Exception as close_exc:
+        logging.getLogger(__name__).warning(
+            "closing the store after its setup failed failed too: %r", close_exc
+        )
+
 
 _PG = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_POSTGRES"),
@@ -86,7 +100,7 @@ async def _open_sqlite(tmp_path) -> MessageStore:
     return await MessageStore.open(tmp_path / _DB_NAME)
 
 
-async def _open_postgres(_tmp_path):  # pragma: no cover - only runs when gated on
+async def _open_postgres(_tmp_path):
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
 
@@ -100,12 +114,12 @@ async def _open_postgres(_tmp_path):  # pragma: no cover - only runs when gated 
             )
         await load_audit_chain(s, read_only=False)
     except BaseException:
-        await s.close()
+        await _close_after_failed_setup(s)
         raise
     return s
 
 
-async def _open_sqlserver(_tmp_path):  # pragma: no cover - only runs when gated on
+async def _open_sqlserver(_tmp_path):
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.sqlserver import SqlServerStore
 
@@ -130,7 +144,7 @@ async def _open_sqlserver(_tmp_path):  # pragma: no cover - only runs when gated
                 await cur.close()
         await load_audit_chain(s, read_only=False)
     except BaseException:
-        await s.close()
+        await _close_after_failed_setup(s)
         raise
     return s
 
@@ -1331,3 +1345,286 @@ async def test_runner_enabled_for_document_pruning_only(store: MessageStore) -> 
     empty.add_inbound(build_inbound_connection("IB", MLLP(port=2702), router="r"))
     off = RetentionRunner(store, no_floor, clock=lambda: 5 * DAY, registry_source=lambda: empty)
     assert off.enabled is False
+
+
+# --- BACKLOG #5651, PR 2922's closing steps 1 (the breaker), 10, 17 and 21 --------------------
+
+
+async def test_batch_writes_failing_in_a_row_end_the_call(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED when: a write fault that hits every batch (a full disk, a read-only store) has no
+    breaker, so the call re-seals every candidate in the store for nothing and logs one ERROR per
+    batch (closing step 1). It ends after ``WRITE_FAULT_MAX_BATCHES`` failed writes in a row."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    writes: list[str] = []
+
+    async def read_only(updates: Any) -> list[Any]:
+        writes.append(updates[0].message_id)
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"):
+        result = await _run_pass(_keyset_fetch(_plain_rows(8)), read_only, _no_report)
+
+    assert len(writes) == document_strip.WRITE_FAULT_MAX_BATCHES
+    assert result == StripResult(ended_early=True, write_failed=True)
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == document_strip.WRITE_FAULT_MAX_BATCHES
+    [early] = [r.getMessage() for r in caplog.records if "ended early" in r.getMessage()]
+    assert "batch writes in a row failed" in early and "OperationalError" in early
+
+
+async def test_a_write_that_lands_resets_the_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control for the breaker: failures on particular rows, broken up by writes that land,
+    never add up to it, so the scan reaches the end of the keyset."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    below = document_strip.WRITE_FAULT_MAX_BATCHES - 1
+    failing = {f"M-{i}" for i in range(8) if i % (below + 1) != below}
+    writes: list[str] = []
+
+    async def some_rows_locked(updates: Any) -> list[Any]:
+        writes.append(updates[0].message_id)
+        if updates[0].message_id in failing:
+            raise sqlite3.OperationalError("lock timeout on this row")
+        return list(updates)
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(8)), some_rows_locked, _no_report)
+
+    assert len(writes) == 8
+    assert (result.ended_early, result.write_failed) == (False, True)
+    assert result.messages_stripped == 8 - len(failing)
+
+
+class _Row(dict[str, Any]):
+    """A candidate row a weak reference can watch."""
+
+
+async def test_a_call_holds_one_batch_of_bodies_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED when: the previous batch's rows and write-backs are still referenced while the next
+    batch is read, so a call holds two batches of bodies at once (closing step 10)."""
+    import gc
+    import weakref
+
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 2)
+    watched: list[weakref.ref[Any]] = []
+    alive_at_each_read: list[int] = []
+
+    async def fetch(_cutoff: float, after: Any, limit: int) -> list[_Row]:
+        # A real backend's read gives the loop turns, which drop asyncio's own hold on the last
+        # worker thread's result; only the strip's own references are left to measure.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        gc.collect()
+        alive_at_each_read.append(sum(ref() is not None for ref in watched))
+        start = 0 if after is None else int(after[1].removeprefix("M-")) + 1
+        rows = [
+            _Row(id=f"M-{i}", channel_id="IB", raw=MFB64_BODY, received_at=float(i))
+            for i in range(start, min(start + limit, 6))
+        ]
+        watched.extend(weakref.ref(row) for row in rows)
+        return rows
+
+    async def write(updates: Any) -> list[Any]:
+        watched.extend(weakref.ref(u) for u in updates)
+        return list(updates)
+
+    result = await _run_pass(fetch, write, _no_report)
+
+    assert result.messages_stripped == 6
+    # Rows and write-backs were watched from the first batch on; none outlived its batch.
+    assert len(alive_at_each_read) == 4 and len(watched) == 12
+    assert alive_at_each_read == [0, 0, 0, 0]
+
+
+async def test_the_guard_compares_sealed_cells_on_a_keyed_store(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the compare-and-swap is only ever run keyless, comparing plaintext (closing step
+    17). On a keyed store every cell is sealed under its row's AAD with a fresh nonce, so a key
+    rotation that re-seals the same body leaves a different cell. The guard must refuse the
+    strip's write-back over it, and with no concurrent writer it must still strip."""
+    from messagefoundry.store.cell_tag import message_cell_aad
+    from messagefoundry.store.crypto import generate_key, make_cipher
+
+    store = await MessageStore.open(tmp_path / _DB_NAME, cipher=make_cipher(generate_key()))
+    try:
+        raced = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-K1")
+        alone = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=1.0, control="C-K2")
+        with contextlib.closing(sqlite3.connect(tmp_path / _DB_NAME)) as db:
+            [sealed_before] = db.execute("SELECT raw FROM messages WHERE id=?", (raced,)).fetchone()
+        assert sealed_before != MFB64_BODY  # sealed, so the guard compares ciphertext
+        aad = message_cell_aad("raw", message_id=raced, channel_id="IB")
+        resealed = store.cipher().encrypt(MFB64_BODY, aad=aad)  # same body, fresh nonce
+        assert resealed != sealed_before
+        resealed_once = _concurrent_writer(
+            store,
+            tmp_path,
+            "UPDATE messages SET raw=? WHERE id=?",
+            (resealed, raced),
+            asyncio.get_running_loop(),
+        )
+        _spy_strip(monkeypatch, resealed_once)
+
+        result = await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
+
+        assert result.messages_stripped == 1  # the row nobody else touched
+        with contextlib.closing(sqlite3.connect(tmp_path / _DB_NAME)) as db:
+            [raw_after] = db.execute("SELECT raw FROM messages WHERE id=?", (raced,)).fetchone()
+        assert raw_after == resealed  # the rotation's cell stands
+        rec = await _get(store, raced)
+        assert rec["raw"] == MFB64_BODY and rec["documents_pruned"] is None
+        stripped = await _get(store, alone)
+        assert stripped["documents_pruned"] == PRUNED_AT and stripped["raw"] != MFB64_BODY
+    finally:
+        await store.close()
+
+
+class _FailingSetupStore:
+    """A server store whose setup fails, and whose close then fails too."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self._pool = self
+
+    @contextlib.asynccontextmanager
+    async def acquire(self) -> AsyncIterator[Any]:
+        raise RuntimeError("SETUP-FAILED")
+        yield  # pragma: no cover - makes this an async generator
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        raise RuntimeError("CLOSE-FAILED")
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_a_failed_server_fixture_setup_closes_and_raises_the_setup_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, backend: str
+) -> None:
+    """RED when: a server fixture's setup fails and its close then fails too, and the close error
+    replaces the setup error the run reports (closing step 21). Runs with no server: the store's
+    ``open`` is replaced, so only the fixture's own failure branch is exercised."""
+    from messagefoundry.store import postgres, sqlserver
+
+    fake = _FailingSetupStore()
+
+    async def fake_open(_settings: Any) -> _FailingSetupStore:
+        return fake
+
+    if backend == "postgres":
+        monkeypatch.setattr(postgres.PostgresStore, "open", fake_open)
+        opener = _open_postgres
+    else:
+        monkeypatch.setattr(sqlserver.SqlServerStore, "open", fake_open)
+        opener = _open_sqlserver
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="SETUP-FAILED"):
+        await opener(None)
+    assert fake.close_calls == 1
+    assert any("CLOSE-FAILED" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_breaker_does_not_trip_on_the_last_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A third failed write on a short, last batch: the scan did reach its end, so the call does
+    not report an early end, and a retention pass goes on to its other thresholds."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 2)
+    writes: list[int] = []
+
+    async def read_only(updates: Any) -> list[Any]:
+        writes.append(len(updates))
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(5)), read_only, _no_report)
+
+    assert writes == [2, 2, 1]
+    assert result == StripResult(write_failed=True)
+
+
+async def test_the_breaker_does_not_trip_on_a_full_last_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a third failed write on a FULL last batch, at a candidate count that is an exact
+    multiple of the batch size, reports an early end the scan did not have (BACKLOG #5651)."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 2)
+    writes: list[int] = []
+
+    async def read_only(updates: Any) -> list[Any]:
+        writes.append(len(updates))
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(6)), read_only, _no_report)
+
+    assert writes == [2, 2, 2]
+    assert result == StripResult(write_failed=True)
+
+
+async def test_a_committed_write_with_a_malformed_return_resets_the_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a write that returned, so committed, but returned something malformed leaves the
+    failure count standing, so fail, fail, malformed, fail ends the call though a write landed in
+    between (BACKLOG #5651)."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    outcomes = ["fail", "fail", "malformed", "fail", "ok", "ok"]
+    writes: list[str] = []
+
+    async def mixed(updates: Any) -> Any:
+        outcome = outcomes[len(writes)]
+        writes.append(outcome)
+        if outcome == "fail":
+            raise sqlite3.OperationalError("lock timeout on this row")
+        return None if outcome == "malformed" else list(updates)
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(6)), mixed, _no_report)
+
+    assert writes == outcomes
+    assert (result.ended_early, result.write_failed, result.messages_stripped) == (False, True, 2)
+
+
+async def test_a_batch_with_nothing_to_write_breaks_a_run_of_failed_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: write failures far apart across the keyset, with batches between them that had
+    nothing to write, add up to the breaker and end the call (BACKLOG #5651). Only consecutive
+    batches that write count."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    has_document = [True, True, False, True, False, True, True]
+    rows = [
+        {
+            "id": f"M-{i}",
+            "channel_id": "IB",
+            "raw": MFB64_BODY if doc else _BASE_HL7 + "\r",
+            "received_at": float(i),
+        }
+        for i, doc in enumerate(has_document)
+    ]
+    writes: list[str] = []
+
+    async def locked_rows(updates: Any) -> list[Any]:
+        writes.append(updates[0].message_id)
+        if updates[0].message_id != "M-6":
+            raise sqlite3.OperationalError("lock timeout on this row")
+        return list(updates)
+
+    result = await _run_pass(_keyset_fetch(rows), locked_rows, _no_report)
+
+    assert writes == ["M-0", "M-1", "M-3", "M-5", "M-6"]
+    assert (result.ended_early, result.write_failed, result.messages_stripped) == (False, True, 1)
+
+
+async def test_consecutive_writing_batches_that_fail_still_trip_the_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control: three writing batches in a row that fail, with a later batch to read, end the
+    # call, and the rows after them are not written.
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    writes: list[str] = []
+
+    async def read_only(updates: Any) -> list[Any]:
+        writes.append(updates[0].message_id)
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(5)), read_only, _no_report)
+
+    assert writes == ["M-0", "M-1", "M-2"]
+    assert result == StripResult(ended_early=True, write_failed=True)

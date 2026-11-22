@@ -26,7 +26,9 @@ EVERY commit, paging on ``hasNextPage``:
   1. A commit whose AUTHOR is linked to no GitHub account is refused, whatever its committer or
      git name. The CLA binds the author, and an unlinked author can never be shown to have signed
      (owner ruling 2026-11-13). Measured before the ruling: every commit on merged PRs 2909 and
-     2432 has a linked author, so the rule refuses nothing in current flows.
+     2432 has a linked author, so the rule refuses nothing in current flows. A null author, and an
+     author whose ``user`` is null or absent, are refused; an absent ``author`` key, or a value of
+     either that is neither null nor an object, is a reply in the wrong shape and a fault.
   2. A linked author first seen past the action's one page is refused only when absent from the
      signature file the action keeps (below). The action's list is built as the action builds it,
      from the FIRST PAGE only, first commit seen under each key.
@@ -84,6 +86,7 @@ from __future__ import annotations
 
 import http.client
 import io
+import itertools
 import json
 import os
 import re
@@ -98,6 +101,9 @@ from typing import Any
 EXIT_PASS = 0
 EXIT_REFUSED = 1
 EXIT_FAULT = 3  # never 2: the interpreter exits 2 when it cannot open the script
+
+# Refusals printed as annotations before the rest go to the log; one more annotation counts them.
+_ANNOTATED_REFUSALS = 9
 
 # `github-actions[bot]`, the one id the action drops from its committer list.
 ACTIONS_BOT_ID = 41898282
@@ -155,7 +161,6 @@ class Attribution:
     name: str
     database_id: int | None
     author_linked: bool
-    committer_linked: bool
 
 
 @dataclass(frozen=True)
@@ -174,14 +179,22 @@ class Verdict:
     fault: str | None = None
 
 
-def _person(commit: Mapping[str, Any], role: str) -> Mapping[str, Any]:
-    person = commit.get(role)
+def _person(commit: Mapping[str, Any], role: str) -> Mapping[str, Any] | None:
+    """The commit's ``author`` or ``committer``: None for a null one, which the schema allows. An
+    absent key, or any value that is not an object, is a reply in the wrong shape: a fault."""
+    if role not in commit:
+        raise PrecheckFault(f"a commit has no {role} key")
+    person = commit[role]
+    if person is None:
+        return None
     if not isinstance(person, Mapping):
         raise PrecheckFault(f"a commit's {role} is not an object")
     return person
 
 
 def _user(person: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """A person's linked account, or None when none is linked (a null or absent ``user``). Any
+    other value that is not an object is a fault."""
     user = person.get("user")
     if user is None:
         return None
@@ -191,22 +204,27 @@ def _user(person: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 
 def attribute(commit: Mapping[str, Any]) -> Attribution:
-    """Mirror ``extractUserFromCommit``: author.user, then committer.user, then the raw author.
+    """Mirror ``extractUserFromCommit``: ``author.user || committer.user || author || committer``.
 
-    JavaScript's ``||`` passes over null only, never an empty object, so this tests ``is None``
-    rather than Python truthiness.
+    A null is passed over, as ``||`` passes it; an empty ``{}`` user is still chosen, as ``||``
+    chooses it. The bundle reads ``author.user``, and ``committer.user`` when that is null, so a
+    null person there would throw in the action: that is a fault here, and the commit keys nothing
+    in the action's view.
     """
     author = _person(commit, "author")
+    if author is None:
+        raise PrecheckFault("a commit's author is null, so the action has no key for it")
     author_user = _user(author)
+    committer: Mapping[str, Any] | None = None
     # The action never reads the committer when the author is linked, so neither does this: a
     # malformed committer there must not fault that commit.
-    committer_user = _user(_person(commit, "committer")) if author_user is None else None
-    if author_user is not None:
-        chosen = author_user
-    elif committer_user is not None:
-        chosen = committer_user
-    else:
-        chosen = author
+    if author_user is None:
+        committer = _person(commit, "committer")
+        if committer is None:
+            raise PrecheckFault("a commit's committer is null, so the action has no key for it")
+    committer_user = None if committer is None else _user(committer)
+    # Each is None or an object, and `is not None` rather than Python truthiness keeps an empty {}.
+    chosen = next(c for c in (author_user, committer_user, author) if c is not None)
     login = chosen.get("login")
     raw_id = chosen.get("databaseId")
     return Attribution(
@@ -214,24 +232,30 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
         name=str(login) if login else str(chosen.get("name") or ""),
         database_id=raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None,
         author_linked=author_user is not None,
-        committer_linked=committer_user is not None,
     )
 
 
-def unlinked_author(commit: Mapping[str, Any]) -> str | None:
-    """Rule 1's input, read from the author alone: the git author name when no account is linked
-    to the author, ``""`` for a null author, or None when one is linked or the author is malformed.
-    An absent ``author`` key is a reply in the wrong shape, so it is malformed, not unlinked.
+def _rule_one(commit: Mapping[str, Any]) -> str | None:
+    """Rule 1's refusal for one commit, judged from its author alone, or None when it owes none.
 
-    Kept apart from :func:`attribute`, so a fault while working out the action's key for a commit
-    can never drop the refusal rule 1 already owes it.
+    Uses the same ``_person``/``_user`` reading as :func:`attribute`, so the two cannot disagree on
+    whether an author is linked. A malformed author raises; the caller records the fault.
     """
-    if "author" in commit and commit["author"] is None:
-        return ""
-    author = commit.get("author")
-    if isinstance(author, Mapping) and author.get("user") is None:
-        return str(author.get("name") or "")
-    return None
+    oid = commit.get("oid", "")
+    author = _person(commit, "author")
+    if author is None:
+        return (
+            f"commit {oid} has no git author GitHub reports, so no author can be shown to have "
+            "signed the CLA; re-author the commit"
+        )
+    if _user(author) is not None:
+        return None
+    # The CLA binds the AUTHOR, and an unlinked author cannot have signed.
+    return (
+        f"commit {oid} has a git author, {str(author.get('name') or '')!r}, linked to no GitHub "
+        "account, so that author cannot be shown to have signed the CLA; link the author's email "
+        "to an account, or re-author the commit"
+    )
 
 
 def matches_allowlist(name: str, patterns: Iterable[str]) -> bool:
@@ -368,7 +392,8 @@ def evaluate(
         ids = signed_cache["ids"]
         return None if ids is None else who.database_id in ids
 
-    refusals: list[str] = []
+    rule_one: list[str] = []
+    rule_two: list[str] = []
     distinct = len({str(commit.get("oid", "")) for commit in read.commits})
     # A FAULT, not a refusal, until GitHub's commit cap is measured (owner ruling 2026-11-13): if
     # GitHub stops the connection short of totalCount, refusing would fail every large PR closed.
@@ -380,28 +405,29 @@ def evaluate(
     # One slot per commit, None for a malformed one, so the first-page slice below never shifts a
     # second-page commit into the action's view.
     slots: list[Attribution | None] = []
-    for commit in read.commits:
-        unlinked = unlinked_author(commit)
+    for index, commit in enumerate(read.commits):
         oid = commit.get("oid", "")
-        if unlinked is not None and commit.get("author") is None:
-            # Rule 1, a commit GitHub reports no author for: nobody can be shown to have signed.
-            refusals.append(
-                f"commit {oid} has no git author GitHub reports, so no author can be shown to have "
-                "signed the CLA; re-author the commit"
-            )
-        elif unlinked is not None:
-            # Rule 1: the CLA binds the AUTHOR, and an unlinked author cannot have signed. Judged
-            # before the key below, so a commit whose committer cannot be read is still refused.
-            refusals.append(
-                f"commit {oid} has a git author, {unlinked!r}, linked to no GitHub account, so "
-                "that author cannot be shown to have signed the CLA; link the author's email to "
-                "an account, or re-author the commit"
-            )
+        try:
+            refusal = _rule_one(commit)
+        except PrecheckFault as exc:
+            faults.append(f"commit {oid}: {exc}")
+            slots.append(None)
+            continue
+        if refusal is not None:
+            # Judged before the key below, so a commit whose committer cannot be read is refused.
+            rule_one.append(refusal)
+            # Past the action's view, rule 2 judges linked authors only, so no rule reads this
+            # commit's key, and an unreadable committer here is not a fault. A null author, which
+            # the schema allows, has no key anywhere: the action would throw on it.
+            if index >= read.first_page or commit["author"] is None:
+                slots.append(None)
+                continue
         try:
             slots.append(attribute(commit))
         except PrecheckFault as exc:
-            # Recorded even for a refused commit: its key is then missing from the action's view.
-            faults.append(f"commit {oid}: {exc}")
+            # Only an unlinked author on the action's page gets here, so its key, the committer's
+            # account the action would file it under, is then missing from the action's view.
+            faults.append(f"commit {oid}: {exc}; its key is missing from the action's view")
             slots.append(None)
     # The action's committer list: the FIRST page only, one key per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
@@ -410,17 +436,26 @@ def evaluate(
     for who in (slot for slot in slots if slot is not None):
         if not who.author_linked:
             continue  # rule 1 judged it above
-        if who.name in seen_by_action or who.database_id is None or who.database_id in checked:
+        if who.name in seen_by_action or who.database_id in checked:
+            continue
+        if who.database_id is None:
+            # Linked, but with no integer id: the signature file cannot be checked for it, so
+            # rule 2 cannot be judged, and skipping it in silence would read as a pass.
+            faults.append(f"commit {who.oid}: its linked author has no integer databaseId")
             continue
         # Rule 2: a linked author the action never reads, unless it would skip them anyway.
         checked.add(who.database_id)
         skipped = who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
         if not skipped and has_signed(who) is False:
-            refusals.append(
+            rule_two.append(
                 f"commit {who.oid} is past the {read.first_page} commits the action reads, its "
                 f"author {who.name!r} appears in none of them, and the CLA signature file holds "
                 "no signature for that account"
             )
+    # Interleaved, so the first annotations GitHub shows carry both rules' reasons, not one rule's.
+    refusals = [
+        r for pair in itertools.zip_longest(rule_one, rule_two) for r in pair if r is not None
+    ]
     return Verdict(tuple(refusals), "; ".join(faults) or None)
 
 
@@ -600,8 +635,20 @@ def run(
     fault = "; ".join(f for f in (read_fault, verdict.fault) if f)
     if fault:
         print(f"::warning title=CLA pre-check fault::{_escape_command(fault)}")
-    for refusal in verdict.refusals:
+    # GitHub keeps at most 10 error annotations per step. Up to 10 refusals are all annotated; past
+    # that, 9 are, one annotation counts the rest, and they go to the log as plain lines.
+    limit = len(verdict.refusals) if len(verdict.refusals) <= 10 else _ANNOTATED_REFUSALS
+    shown = verdict.refusals[:limit]
+    for refusal in shown:
         print(f"::error title=CLA pre-check refused::{_escape_command(refusal)}")
+    rest = verdict.refusals[len(shown) :]
+    if rest:
+        print(
+            f"::error title=CLA pre-check refused::{len(rest)} more refusal(s), printed below as "
+            "plain log lines"
+        )
+        for refusal in rest:
+            print(f"CLA pre-check refused: {_escape_command(refusal)}")
     if verdict.refusals:
         return EXIT_REFUSED  # a refusal the read proved stands, whatever else faulted
     if fault:

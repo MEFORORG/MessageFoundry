@@ -44,6 +44,7 @@ from harness.config.shardcert._shape import (
     BROADCAST,
     PARTITIONED_FANOUT,
     destinations_for_seq,
+    fanout_refusal,
     fifo_lane_destination,
     load_routing,
     reported_shape,
@@ -75,7 +76,12 @@ from harness.load.failover_track import FailoverTracker
 from harness.load.ids import SHARDCERT_IDS
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix, load_profile_text
-from harness.load.rigadmin import REMOTE_RIG_SESSION, RIG_SESSION
+from harness.load.rigadmin import (
+    REMOTE_RIG_SESSION,
+    RIG_SESSION,
+    RigSignInRateLimited,
+    RigSignInRefused,
+)
 from harness.load.sender import PersistentConnection
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context
@@ -925,7 +931,10 @@ def _copies_missing(tracker: FailoverTracker, *, routing: str, dests: int, deliv
     """Copies of ACKed messages that never arrived, against exactly the destinations the served router
     picks for each seq (:func:`destinations_for_seq`), read from each copy's lane label. O(A x D) under
     broadcast and O(A x dests) under the partitioned modes, so an async caller runs it off the loop."""
-    fanout = max(delivering, 0)
+    fanout = delivering
+    # Unmeasured, never a guess: the walk would raise on a routing or fan-out the router never serves.
+    if fanout < 1 or fanout_refusal(routing, dests=dests, fanout=fanout) is not None:
+        return -1
     if routing == BROADCAST:
         every = frozenset(destinations_for_seq(0, routing=BROADCAST, dests=dests, fanout=fanout))
         return tracker.acked_copies_missing(lambda _seq: every, fifo_lane_destination)
@@ -3787,7 +3796,14 @@ def _remote_engine_poller(
     half's only when both shells export the same pair.
 
     ``allow_insecure`` keeps the old posture for an engine box that serves plain http: http, and
-    no credential, since the client refuses to put one on a cleartext hop to another box."""
+    no credential, since the client refuses to put one on a cleartext hop to another box.
+
+    An empty ``cacert`` is refused: the poller would read it as unset and verify against the default
+    trust instead."""
+    if cacert is not None and not cacert.strip():
+        raise ValueError(
+            "cacert names no certificate: an empty value would fall back to the default trust"
+        )
     if allow_insecure:
         if cacert is not None:
             raise ValueError(
@@ -3904,6 +3920,14 @@ async def run_shardcert_driver(
         notes.append(
             "SHARDS_READY carried no `dests` for a partitioned run: the per-message copy check cannot "
             "know each message's destinations, so it FAILS"
+        )
+    # A fan-out or routing the served router never runs would divide by zero or guess in the copy walk.
+    refusal = fanout_refusal(routing, dests=dests, fanout=delivering) if delivering >= 1 else None
+    if refusal is not None:
+        delivering = 0
+        notes.append(
+            f"SHARDS_READY carried {refusal}: the per-message copy check cannot know each message's "
+            "destinations, so it FAILS"
         )
 
     ids = SHARDCERT_IDS
@@ -4551,6 +4575,11 @@ class ShardCertDriveReport:
     #: #5577). Only then is ``sink_received`` a post-drain count; a gate that lands on disk after the wait
     #: timed out does not make an early tally late. False = no barrier (default OFF, or timed out).
     tallied_behind_gate: bool = False
+    #: Whether the engine box refused this drive's sign-in (:class:`RigSignInRefused`, a 429's
+    #: :class:`RigSignInRateLimited` excepted), or an earlier
+    #: refusal kept it from trying (``sign_in=False``). The ladder reads it to stop retrying a refused
+    #: sign-in on every rung.
+    sign_in_refused: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -4885,6 +4914,7 @@ async def run_shardcert_drive(
     cacert: str | None = None,
     await_engine_drained: bool = False,
     engine_drained_timeout: float | None = None,
+    sign_in: bool = True,
 ) -> ShardCertDriveReport:
     """The multi-process SIZING drive COORDINATOR (load-gen box). Learns the topology from
     :data:`SHARDS_READY` (the engine half posts it), spawns ``sink_count`` :func:`run_shardcert_sink` +
@@ -4909,7 +4939,14 @@ async def run_shardcert_drive(
     alone risks reading a teardown-frozen in-flight tail as loss; awaiting the engine's DIRECT store read
     closes that window. The advisory poll runs beside the gate: once the gate lands it gets
     :data:`_ADVISORY_DRAIN_GRACE` more, then is asked to stop. Bounded + best-effort — a missing signal degrades to
-    the advisory-drain fallback (the poll then runs in full) with a note, never a hang."""
+    the advisory-drain fallback (the poll then runs in full) with a note, never a hang.
+
+    ``sign_in=False`` skips the sign-in, with a note, for a caller that already saw this engine box
+    refuse it; it needs ``await_engine_drained``, the only path on which the poll is advisory."""
+    if not sign_in and not await_engine_drained:
+        raise ValueError(
+            "sign_in=False needs await_engine_drained: without the gate the poll is the barrier"
+        )
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
@@ -4969,6 +5006,7 @@ async def run_shardcert_drive(
     run_id = coord.run_id
     procs: list[tuple[str, Any]] = []
     notes: list[str] = []
+    sign_in_refused = not sign_in
     poller: EnginePoller | None = None
     advisory_drain: asyncio.Task[float | None] | None = None
     advisory_stop = asyncio.Event()
@@ -4997,17 +5035,29 @@ async def run_shardcert_drive(
         #     error, raised before any child exists: tallying with no barrier would read the in-flight
         #     tail as loss. With the gate armed, the poller's terms are advisory only, so a refusal is
         #     a note and the run goes on.
-        try:
-            poller = await _open_remote_poller(
-                engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
-            )
-        except RemoteEngineSignInError as exc:
-            if not await_engine_drained:
-                raise
+        if not sign_in:
             notes.append(
                 "advisory /stats poller not opened, so drained/engine_done/engine_dead are unread: "
-                + escape_for_terminal(str(exc), single_line=True)
+                "the engine box refused an earlier sign-in, and a retry could lock the account out"
             )
+        else:
+            try:
+                poller = await _open_remote_poller(
+                    engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
+                )
+            except RemoteEngineSignInError as exc:
+                if not await_engine_drained:
+                    raise
+                # Only a refusal, never an engine that did not answer: a retry of a refused
+                # credential is what counts toward a lockout.
+                # A 429 (RigSignInRateLimited) is transient, so it does not stop a later rung's try.
+                sign_in_refused = isinstance(exc.__cause__, RigSignInRefused) and not isinstance(
+                    exc.__cause__, RigSignInRateLimited
+                )
+                notes.append(
+                    "advisory /stats poller not opened, so drained/engine_done/engine_dead are unread: "
+                    + escape_for_terminal(str(exc), single_line=True)
+                )
 
         # (1) Spawn the M sink children over CONTIGUOUS chunks of the [sink_base, sink_base+sink_ports)
         #     (== dests) band; await each SINK_BOUND.<m>.
@@ -5250,5 +5300,6 @@ async def run_shardcert_drive(
         drained=drain_s is not None,
         drain_seconds=drain_s,
         tallied_behind_gate=tallied_behind_gate,
+        sign_in_refused=sign_in_refused,
         notes=notes,
     )

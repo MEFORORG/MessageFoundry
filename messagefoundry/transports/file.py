@@ -1004,6 +1004,13 @@ class FileSource(SourceConnector):
         self._stuck_full_logged = False
         # Set by _candidates when this scan's listing failed, so the scan prunes no memory on it.
         self._listing_failed = False
+        # The lstat the listing took of each remembered stuck reject this scan, so the fresh pass
+        # skips an unchanged one without a stat hop of its own (BACKLOG #5717). A fresh dict per
+        # scan, bound on the loop once the listing returns, so a listing thread a stop left behind
+        # writes only into its own scan's dict. It holds no more than the stuck memory does.
+        self._listed_marks: dict[str, _FileMark] = {}
+        # The dict the next listing fills; _scan_once binds a fresh one before each listing.
+        self._marks_for_listing: dict[str, _FileMark] = {}
         # The cause of the last listing failure, or None when the last listing worked, so a WARNING
         # is written once per outage and again when its cause changes (_candidates).
         self._listing_down: tuple[object, ...] | None = None
@@ -1311,7 +1318,10 @@ class FileSource(SourceConnector):
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
         self._listing_failed = False
+        marks: dict[str, _FileMark] = {}
+        self._marks_for_listing = marks
         candidates = await self._run_fs(self._candidates)
+        self._listed_marks = marks
         if (self._settle_seen or self._refused or self._stuck) and not self._listing_failed:
             # A listing that failed lists nothing, which is no evidence a file has gone (#5717).
             listed = {str(p) for p in candidates}
@@ -1378,13 +1388,21 @@ class FileSource(SourceConnector):
         # One stat serves the leave-mode key, the settle gate and the before-read side of the #116
         # partial-write check, so the key recorded below describes the bytes actually read. The size
         # cap is NOT charged here: it is charged on the handle the read opens (BACKLOG #2507).
+        key = str(path)
+        listed = None if retry else self._listed_marks.get(key)
+        if listed is not None and key in self._stuck and self._stuck[key][0].mark == listed:
+            # Unchanged since it was remembered, by the listing's own lstat: skipped or deferred
+            # without a stat hop of its own, which under a share credential is a logon (#5717).
+            # The step is what the stat below would have led to, so nothing else changes.
+            step = self._stuck_step(key, listed, retry=False)
+            if step is not None:
+                return step
         try:
             mark = await self._run_fs(_file_mark, path)
         except OSError as exc:
             self._log_unreadable(path, exc)
             return _Step.FREE
         before: _FileSig = mark[:2]
-        key = str(path)
         if key in self._stuck:
             step = self._stuck_step(key, mark, retry=retry)
             if step is not None:
@@ -2008,6 +2026,7 @@ class FileSource(SourceConnector):
         count the ceiling's log line carries. Not folded in here: it changes what the screens mean
         for the ceiling's budget, and this method's contract is worth keeping simple."""
         globber = self.directory.rglob if self.recursive else self.directory.glob
+        marks = self._marks_for_listing  # read once: this listing's own dict (BACKLOG #5717)
         try:
             matched = list(globber(self.pattern))
             if not matched and (self.recursive or glob.has_magic(self.pattern)):
@@ -2051,7 +2070,7 @@ class FileSource(SourceConnector):
             for p in matched
             if self.processed_dir not in p.parents
             and self.error_dir not in p.parents
-            and self._listable(p)
+            and self._listable(p, marks)
         ]
         # Decorate-sort-undecorate under `sort="mtime"`: the min-age filter and the sort key are the
         # SAME stat, and reading it twice per candidate doubled the syscalls on the one path that
@@ -2072,7 +2091,7 @@ class FileSource(SourceConnector):
         files.sort(key=lambda p: p.name)
         return files
 
-    def _listable(self, path: Path) -> bool:
+    def _listable(self, path: Path, marks: dict[str, _FileMark] | None = None) -> bool:
         """Whether a listed name is a candidate, judged without following a link at that name
         (BACKLOG #2535).
 
@@ -2090,7 +2109,11 @@ class FileSource(SourceConnector):
             return False
         if stat.S_ISLNK(st.st_mode) or _names_another_path(st):
             return not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_DIRECTORY
-        return stat.S_ISREG(st.st_mode)
+        regular = stat.S_ISREG(st.st_mode)
+        if regular and marks is not None and str(path) in self._stuck:
+            # The mark of a remembered reject, for the fresh pass (BACKLOG #5717).
+            marks[str(path)] = _mark_of(st)
+        return regular
 
     def _read_settled(self, path: Path) -> tuple[bytes, _FileSig, _FileId]:
         """Read ``path``, then stat it, in one hop off the event loop (BACKLOG #116).
@@ -3842,7 +3865,11 @@ def _prune_unlisted[V](memory: dict[str, tuple[V, int]], listed: set[str]) -> No
 def _file_mark(path: Path) -> _FileMark:
     """:func:`_file_sig` and :func:`_file_id` from the same ``lstat`` (BACKLOG #5717). May raise
     ``OSError`` if the file is gone."""
-    st = path.lstat()
+    return _mark_of(path.lstat())
+
+
+def _mark_of(st: os.stat_result) -> _FileMark:
+    """The :data:`_FileMark` of a stat already taken (BACKLOG #5717)."""
     return st.st_size, st.st_mtime_ns, *_file_id(st)
 
 

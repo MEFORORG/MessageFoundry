@@ -16,6 +16,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -98,6 +99,35 @@ def test_a_file_that_grows_while_read_is_refused_not_truncated(
     monkeypatch.setattr(Path, "stat", lambda self, **kw: small_stat)
     monkeypatch.setattr(os, "fstat", lambda fd: small_stat)
     assert read_capped(grown, cap) == (b"", f"grew past the {cap}-byte cap while read; not kept")
+
+
+@pytest.mark.parametrize("reported", [0, 1, 63, 64])
+def test_a_file_that_grows_while_read_is_read_at_most_one_byte_past_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reported: int
+) -> None:
+    """The handle's offset after the read is the bytes taken from the file: never more than one
+    past the cap, however far the file has grown past what its ``fstat`` reported (PR 3076's known
+    defect 4: a buffered read could take up to its buffer's worth more)."""
+    cap = 64
+    grown = tmp_path / "grown.hl7"
+    grown.write_bytes(b"x" * (1 << 20))
+    real_fstat = os.fstat
+
+    def fstat(fd: int) -> os.stat_result:
+        st = list(real_fstat(fd))
+        st[6] = reported  # st_size
+        return os.stat_result(st)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    fd = os.open(grown, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        assert read_fd_capped(fd, cap) == (
+            b"",
+            f"grew past the {cap}-byte cap while read; not kept",
+        )
+        assert os.lseek(fd, 0, os.SEEK_CUR) <= cap + 1
+    finally:
+        os.close(fd)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privilege on Windows")
@@ -259,9 +289,9 @@ def test_the_file_sink_records_a_file_removed_right_after_its_read(
         target.write_bytes(_BODY)
         real = FileSink._inside
 
-        def remove_after_read(self: FileSink, path: Path, link: bool, root: Path) -> bool:
+        def remove_after_read(self: FileSink, path: Path, link: bool, *rest: Any) -> bool:
             path.unlink()  # the handle is closed by now, as it is when the engine moves a file on
-            return real(self, path, link, root)
+            return real(self, path, link, *rest)
 
         monkeypatch.setattr(FileSink, "_inside", remove_after_read)
         records = sink.records()

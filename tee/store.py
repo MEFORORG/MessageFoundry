@@ -9,8 +9,9 @@ is an **audit/log**, not a durable retry queue — the relay is fail-closed, not
 PHI posture: the log stores message **identifiers** (MSH-10 control id, MSH-9 type) and **metadata**
 (size, outcome, ACK code) — never message bodies. Its ``detail`` column, though, can carry at least
 the partner's MSA-3 ACK text or a transport error string, and either can name a patient, so **every**
-tee DB holds PHI at rest, capture on or off, and must live on a protected volume (the file is
-``chmod 0600`` best-effort on open). The optional body capture (``--capture-bodies``) adds raw HL7
+tee DB holds PHI at rest, capture on or off, and must live on a protected volume (on open the file
+and its -wal and -shm are restricted to their owner, best-effort and logged when it fails: chmod
+0600 on POSIX, an owner-only DACL on Windows; ``_secure_file`` says what that leaves). The optional body capture (``--capture-bodies``) adds raw HL7
 in a separate table and is **off by default**.
 """
 
@@ -21,6 +22,7 @@ import contextlib
 import logging
 import os
 import sqlite3
+import sys
 import time
 from collections import Counter
 from collections.abc import AsyncIterator
@@ -256,29 +258,175 @@ def _precreate_secure(path: str) -> None:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
     except OSError:
-        # Race / permission / Windows quirks are non-fatal; _secure_file still chmods after open.
+        # Race / permission / Windows quirks are non-fatal; _secure_file still restricts the file
+        # after open (chmod on POSIX, a DACL on Windows) and logs when it cannot.
         pass
+
+
+def _owner_only_dacl(paths: list[str]) -> dict[str, str]:
+    """Each of ``paths`` that could not be given an owner-only DACL, with the reason; empty when
+    every one was. See ``_apply_owner_only_dacl``. An unexpected ctypes error is a failure too."""
+    import ctypes
+
+    try:
+        result = _apply_owner_only_dacl(paths)
+    except (OSError, ValueError, TypeError, ctypes.ArgumentError) as exc:
+        result = f"the native call failed ({type(exc).__name__})"
+    return dict.fromkeys(paths, result) if isinstance(result, str) else result
+
+
+def _apply_owner_only_dacl(paths: list[str]) -> str | dict[str, str]:
+    """Give each of ``paths`` a protected DACL holding one entry, full control for this process's
+    own user.
+
+    Windows only. Returns why no file could be restricted, as a string, or else each path that
+    could not be, with the reason; an empty dict means every one was. The user is the SID in
+    this process's own token, never a name or an environment variable, which another party could
+    have set. Protected means no entry is inherited from the folder. Native calls rather than
+    ``icacls``: the tee imports nothing from ``messagefoundry``, whose ``_secure_file`` pins that
+    tool's path, and an API call has no program to plant.
+    """
+    if sys.platform != "win32":
+        return "an owner-only DACL is a Windows control"
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    token_query, token_user, sddl_revision_1, se_file_object = 0x0008, 1, 1, 1
+    dacl_information, protected_dacl_information = 0x00000004, 0x80000000
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
+    ):
+        return f"this process's token could not be opened (error {ctypes.get_last_error()})"
+    try:
+        size = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, token_user, None, 0, ctypes.byref(size))
+        buffer = ctypes.create_string_buffer(size.value)
+        if not size.value or not advapi32.GetTokenInformation(
+            token, token_user, buffer, size, ctypes.byref(size)
+        ):
+            return f"this process's user could not be read (error {ctypes.get_last_error()})"
+    finally:
+        kernel32.CloseHandle(token)
+    # TOKEN_USER starts with SID_AND_ATTRIBUTES, whose first member is the user's PSID.
+    sid_pointer = ctypes.cast(buffer, ctypes.POINTER(wintypes.LPVOID)).contents
+    sid_text = wintypes.LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(sid_pointer, ctypes.byref(sid_text)):
+        return f"this process's SID could not be read (error {ctypes.get_last_error()})"
+    try:
+        sid = str(sid_text.value)
+    finally:
+        kernel32.LocalFree(ctypes.cast(sid_text, wintypes.HLOCAL))
+    descriptor = wintypes.LPVOID()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        f"D:P(A;;FA;;;{sid})", sddl_revision_1, ctypes.byref(descriptor), None
+    ):
+        return f"the owner-only DACL could not be built (error {ctypes.get_last_error()})"
+    try:
+        present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), wintypes.LPVOID()
+        if not advapi32.GetSecurityDescriptorDacl(
+            descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
+        ):
+            return f"the owner-only DACL could not be read back (error {ctypes.get_last_error()})"
+        # A NULL DACL set on a file grants everyone full control, so never pass one on.
+        if not present.value or not dacl.value:
+            return "the owner-only DACL came back empty"
+        failures: dict[str, str] = {}
+        for path in paths:
+            error = advapi32.SetNamedSecurityInfoW(
+                path,
+                se_file_object,
+                dacl_information | protected_dacl_information,
+                None,
+                None,
+                dacl,
+                None,
+            )
+            if error != 0:
+                failures[path] = f"SetNamedSecurityInfoW failed (error {error})"
+    finally:
+        kernel32.LocalFree(ctypes.cast(descriptor, wintypes.HLOCAL))
+    return failures
 
 
 def _secure_file(path: str) -> None:
     """Best-effort owner-only permissions on the DB file **and its WAL/SHM siblings**, which WAL mode
     creates. The -wal can hold any recent page, so relay_log detail always and message bodies when
-    body capture is on.
+    body capture is on. Runs after ``open`` has created the siblings and before it returns, so
+    before the store writes a row. A file it cannot restrict is logged as a warning, and the open
+    goes on: the protected-volume advice in the module docstring is the backstop.
 
-    On POSIX a sibling SQLite re-creates later, after this one-time chmod, takes the main file's
-    mode whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is,
-    which holds only when _precreate_secure's 0600 create or this best-effort chmod succeeds;
-    neither reports a failure. test_wal_siblings_recreated_after_open_inherit_owner_only_mode
-    pins the inheritance. On Windows chmod sets only
-    the read-only bit, so none of the three files is restricted to the owner here; that half is
-    open (BACKLOG #5637) and the protected-volume advice below is the only control there today."""
-    for sibling in (path, path + "-wal", path + "-shm"):
-        try:  # noqa: SIM105 - suppress() would drop the rationale recorded in the handler below
+    On Windows each file gets a protected DACL granting full control to this process's own user and
+    nobody else (``_owner_only_dacl``); chmod there sets only the read-only bit. A sibling that
+    SQLite deletes and later re-creates, on the last connection's close or a journal-mode switch,
+    takes its folder's access list again until a later open restricts it. Each open restricts the
+    files to the account opening them, so a DB is usable only by the account that opened it last:
+    run the relay and the tee commands that read its DB under one account.
+
+    On POSIX each file is chmod 0600. A sibling SQLite re-creates later takes the main file's mode
+    whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is.
+    test_wal_siblings_recreated_after_open_inherit_owner_only_mode pins the inheritance."""
+    present = [s for s in (path, path + "-wal", path + "-shm") if os.path.exists(s)]
+    if os.name == "nt":
+        for sibling, reason in _owner_only_dacl(present).items():
+            _log.warning(
+                "could not restrict %s to its owner (%s); it keeps its folder's access list, "
+                "so keep the tee DB on a protected volume",
+                sibling,
+                reason,
+            )
+        return
+    for sibling in present:
+        try:
             os.chmod(sibling, 0o600)
-        except OSError:
-            # Non-fatal: on some filesystems / Windows ACLs chmod is a partial no-op. Every tee DB,
-            # capture on or off, should be on a protected volume regardless (module docstring).
-            pass
+        except OSError as exc:
+            _log.warning(
+                "could not chmod %s to 0600 (%s); keep the tee DB on a protected volume",
+                sibling,
+                exc,
+            )
 
 
 class RelayStore:
@@ -310,7 +458,13 @@ class RelayStore:
         await db.executescript(_SCHEMA)
         await db.commit()
         if path != ":memory:":
-            _secure_file(path)
+            # Off the loop: native ACL calls can block on a network volume. A cancellation there
+            # must not leave the connection's worker thread running.
+            try:
+                await asyncio.to_thread(_secure_file, path)
+            except BaseException:
+                await db.close()
+                raise
         return cls(db, path)
 
     async def record_leg(

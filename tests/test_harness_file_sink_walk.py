@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from typing import Any
 
 import pytest
 
+import harness.bounded_file as bounded_file
 import harness.sinks.file as file_sink
 from harness.bounded_file import NOT_REGULAR
 from harness.scenarios import SCENARIOS
@@ -24,7 +26,7 @@ from harness.scenarios._core import Scenario, _verify_sink, sink_faults
 from harness.scenarios.internal import TimerScenario
 from harness.scenarios.remotefile import RemoteFileScenario, verify_written
 from harness.sinks import Record, Sink
-from harness.sinks.file import ROOT_CHANGED, WALK_BOUND, FileSink
+from harness.sinks.file import ROOT_CHANGED, UNSAFE_NAME, WALK_BOUND, FileSink
 
 _BODY = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|X1|P|2.5.1\r"
 _SECRET = b"MSH|^~\\&|S|S|S|S|20260101||ADT^A01|SECRET|P|2.5.1\r"
@@ -302,10 +304,10 @@ def test_a_file_replaced_right_after_its_read_is_recorded_and_so_is_its_replacem
     replacement = tmp_path.parent / f"{tmp_path.name}-next.hl7"
     real = FileSink._inside
 
-    def replace_after_read(self: FileSink, path: Path, link: bool, root: Path) -> bool:
+    def replace_after_read(self: FileSink, path: Path, link: bool, *rest: Any) -> bool:
         if replacement.exists():
             os.replace(replacement, target)
-        return real(self, path, link, root)
+        return real(self, path, link, *rest)
 
     with FileSink(tmp_path) as sink:
         target.write_bytes(_BODY)
@@ -336,7 +338,11 @@ def test_verify_written_fails_on_an_over_cap_record() -> None:
     over = Record(b"", {"relpath": "big.hl7", "inside": "true", "refused": "9 bytes, over the cap"})
     assert verify_written(scenario, [good], {"X1": _BODY}, "p").ok
     result = verify_written(scenario, [good, over], {"X1": _BODY}, "p")
-    assert not result.ok and "was not read (big.hl7)" in result.detail
+    assert not result.ok and "was not read ('big.hl7': 9 bytes, over the cap)" in result.detail
+    # A refused record with no ``inside`` is not one sink_faults reads; it still fails here.
+    bare = Record(b"", {"relpath": "big.hl7", "refused": "9 bytes, over the cap"})
+    result = verify_written(scenario, [good, bare], {"X1": _BODY}, "p")
+    assert not result.ok and "an entry in the outbox was not read ('big.hl7')" in result.detail
 
 
 class _Fake(Sink):
@@ -355,7 +361,7 @@ def test_verify_sink_fails_on_a_link_in_the_sink() -> None:
     assert _verify_sink(scenario, fake, ["X1"], 0.2, "p").ok
     fake._add(_link_record())
     result = _verify_sink(scenario, fake, ["X1"], 0.2, "p")
-    assert not result.ok and "a link appeared in the sink (L.hl7)" in result.detail
+    assert not result.ok and "a link appeared in the sink ('L.hl7')" in result.detail
 
 
 def test_the_timer_scenario_fails_on_a_link_in_the_sink(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -374,7 +380,7 @@ def test_the_timer_scenario_fails_on_a_link_in_the_sink(monkeypatch: pytest.Monk
     assert scenario.run(ctx).ok
     fake._add(_link_record())
     result = scenario.run(ctx)
-    assert not result.ok and "a link appeared in the sink (L.hl7)" in result.detail
+    assert not result.ok and "a link appeared in the sink ('L.hl7')" in result.detail
 
 
 # --- step 6: the errors it logs ----------------------------------------------------------------
@@ -544,3 +550,217 @@ def test_a_volume_with_no_file_id_gives_no_identity() -> None:
     zero = os.stat_result((0o040755, 0, 7, 1, 0, 0, 0, 0, 0, 0))
     assert file_sink._identity(zero) is None
     assert file_sink._identity(os.stat_result((0o040755, 5, 7, 1, 0, 0, 0, 0, 0, 0))) == (7, 5)
+
+
+# --- the checks that read its records (PR 3076's known defects 2 and 7) -------------------------
+
+
+def _escaped_record() -> Record:
+    """A regular file the sink read whose path resolves outside the directory: no link and no
+    refusal, only ``inside`` false."""
+    return Record(_SECRET, {"relpath": "sub/x.hl7", "inside": "false"})
+
+
+def test_verify_sink_fails_on_a_file_read_from_outside_the_directory() -> None:
+    scenario = Scenario("s", "", "ADT", "A01", 1, sink="file", sink_endpoint="file_out")
+    fake = _Fake()
+    fake._add(Record(_BODY))
+    assert _verify_sink(scenario, fake, ["X1"], 0.2, "p").ok
+    fake._add(_escaped_record())
+    result = _verify_sink(scenario, fake, ["X1"], 0.2, "p")
+    assert not result.ok and "inside the sink directory ('sub/x.hl7')" in result.detail
+
+
+def test_the_timer_scenario_fails_on_a_file_read_from_outside_the_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from harness import sinks
+
+    scenario = TimerScenario("t", "")
+    timer = _BODY.replace(b"|X1|", f"|{scenario.control_id}|".encode())
+    fake = _Fake()
+    for _ in range(scenario.arrivals):
+        fake._add(Record(timer))
+    monkeypatch.setattr(sinks, "build", lambda *args: fake)
+    monkeypatch.setattr(
+        TimerScenario, "_statuses_since", lambda *args: ["processed"] * scenario.arrivals
+    )
+    ctx: Any = SimpleNamespace(endpoints=None, client=None, timeout=0.5)
+    assert scenario.run(ctx).ok
+    fake._add(_escaped_record())
+    result = scenario.run(ctx)
+    assert not result.ok and "shown to be inside the sink directory" in result.detail
+
+
+def test_sink_faults_flags_an_over_cap_file_the_sink_left_unread() -> None:
+    over = {"relpath": "big.hl7", "inside": "true", "refused": "9 bytes, over the 8-byte cap"}
+    assert "was not read ('big.hl7': 9 bytes, over the 8-byte cap)" in sink_faults(
+        [Record(_BODY), Record(b"", over)]
+    )
+    # A record that carries no ``inside`` is not a file sink's: its own refusal is that sink's
+    # business, and an unread delivery carries no control id either way.
+    assert sink_faults([Record(b"", {"refused": "over the cap"})]) == ""
+
+
+def test_sink_faults_quotes_a_link_name() -> None:
+    meta = {"relpath": "a\nb.hl7", "inside": "false", "symlink": "true", "refused": NOT_REGULAR}
+    note = sink_faults([Record(b"", meta)])
+    assert "\n" not in note and "'a\\nb.hl7'" in note
+
+
+def test_sink_faults_names_a_refused_name_with_its_folder() -> None:
+    def refused(folder: str) -> Record:
+        meta = {"name": "nul", "folder": folder, "inside": "false", "refused": UNSAFE_NAME}
+        return Record(b"", meta)
+
+    note = sink_faults([refused("."), refused("sub/deeper")])
+    assert "('nul', 'sub/deeper/nul')" in note
+
+
+def test_verify_sink_stops_waiting_on_a_sink_fault() -> None:
+    """A link in the sink fails the check whatever else arrives, so the wait ends there rather than
+    running out the timeout."""
+    scenario = Scenario("s", "", "ADT", "A01", 1, sink="file", sink_endpoint="file_out")
+    fake = _Fake()
+    fake._add(_link_record())
+    started = time.monotonic()
+    result = _verify_sink(scenario, fake, ["X1"], 30.0, "p")
+    assert not result.ok and time.monotonic() - started < 5.0
+
+
+# --- the walk's own faults (PR 3076's known defects 5, 6, 8 and 9) ------------------------------
+
+
+def test_a_directory_gone_before_its_first_listing_fails_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The by-path walk took the directory itself vanishing before its listing for an empty
+    folder, so start() took an empty first scan for a whole one."""
+    monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    out = tmp_path / "out"
+    real_scandir = os.scandir
+
+    def scandir(target: Any = ".") -> Any:
+        if _named(target, "out"):
+            raise FileNotFoundError(2, "gone")
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with pytest.raises(NotADirectoryError):
+        FileSink(out).start()
+
+
+def test_a_root_read_fault_at_start_is_raised_with_its_error_not_logged_as_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def scandir(target: Any = ".") -> Any:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with (
+        caplog.at_level(logging.WARNING, logger="harness.sinks.file"),
+        pytest.raises(NotADirectoryError) as raised,
+    ):
+        FileSink(tmp_path).start()
+    assert "retried next scan" not in caplog.text
+    assert "errno 13" in str(raised.value)
+    assert isinstance(raised.value.__cause__, PermissionError)
+
+
+def test_a_root_with_a_file_id_where_start_found_none_is_reported_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Started on a volume that reported no file id, a later scan that reads one is not of the
+    directory start() found: it is not adopted as that directory."""
+    real_identity = file_sink._identity
+    no_ids = [True]
+
+    def identity(st: os.stat_result) -> tuple[int, int] | None:
+        return None if no_ids[0] else real_identity(st)
+
+    monkeypatch.setattr(file_sink, "_identity", identity)
+    with FileSink(tmp_path) as sink:
+        no_ids[0] = False
+        (tmp_path / "a.hl7").write_bytes(_BODY)
+        records = sink.records()
+    assert [(r.payload, r.meta["refused"]) for r in records] == [(b"", ROOT_CHANGED)]
+
+
+def test_the_handle_check_refuses_a_followed_link_on_every_os(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``O_NOFOLLOW`` off the file open, as on Windows, a file swapped for a link at its open
+    is followed, so only the handle check stands between the walk and the file outside. Where the
+    OS has ``O_NOFOLLOW`` the swap tests above are refused at the open before that check runs."""
+    monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    monkeypatch.setattr(file_sink, "_FILE_FLAGS", file_sink._FILE_FLAGS & ~file_sink._NOFOLLOW)
+    test_a_file_swapped_for_a_link_between_lstat_and_open_is_not_read(tmp_path, monkeypatch, False)
+
+
+@pytest.mark.skipif(not file_sink._DIR_FD, reason="no dir_fd here (Windows): the walk is by path")
+def test_a_swap_is_read_again_through_the_held_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``a.hl7`` is replaced by another file between its ``lstat`` and its open. The entry is
+    ``lstat``-ed again relative to the held folder, never by its full path."""
+    target, other = tmp_path / "a.hl7", tmp_path / "b.tmp"
+    real_open, real_stat, real_lstat = os.open, os.stat, os.lstat
+    fired: list[bool] = []
+    again: list[bool] = []
+
+    def open_(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if _named(path, "a.hl7") and not fired:
+            fired.append(True)
+            other.write_bytes(_LATER)
+            other.replace(target)
+        return real_open(path, flags, *args, **kwargs)
+
+    def stat_(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if _named(path, "a.hl7"):
+            assert kwargs.get("dir_fd") is not None, "the entry was stat-ed by its full path"
+            if fired:
+                again.append(True)
+        return real_stat(path, *args, **kwargs)
+
+    def lstat_(path: Any, *args: Any, **kwargs: Any) -> Any:
+        assert not _named(path, "a.hl7"), "the entry was lstat-ed again by its full path"
+        return real_lstat(path, *args, **kwargs)
+
+    with FileSink(tmp_path) as sink:
+        target.write_bytes(_BODY)
+        monkeypatch.setattr(os, "open", open_)
+        monkeypatch.setattr(os, "stat", stat_)
+        monkeypatch.setattr(os, "lstat", lstat_)
+        assert sink.records() == []  # not the file its lstat saw: retried
+        monkeypatch.undo()
+        records = sink.records()
+    assert fired, "the hook never fired: the swap was not staged"
+    assert again, "the entry was never stat-ed again after the swap: the test proves nothing"
+    assert [r.payload for r in records] == [_LATER]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows refuses to rename a folder holding an open file"
+)
+@pytest.mark.parametrize("by_path", [False, True], ids=["native-walk", "by-path-walk"])
+def test_a_file_whose_folder_moves_out_after_its_read_is_not_taken_as_inside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, by_path: bool
+) -> None:
+    """Its folder moved out of the sink directory right after the read: the file is judged by its
+    folder's resolved path, so it is not recorded as inside, on either walk."""
+    if by_path:
+        monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    (tmp_path / "sub").mkdir()
+    real_read = bounded_file.read_fd_capped
+
+    def read_then_move(fd: int, cap: int) -> tuple[bytes, str]:
+        got = real_read(fd, cap)
+        (tmp_path / "sub").rename(tmp_path.parent / f"{tmp_path.name}-moved")
+        return got
+
+    with FileSink(tmp_path) as sink:
+        (tmp_path / "sub" / "a.hl7").write_bytes(_BODY)
+        monkeypatch.setattr(file_sink, "read_fd_capped", read_then_move)
+        records = sink.records()
+    assert not (tmp_path / "sub").exists(), "the folder never moved: the test proves nothing"
+    assert [(r.payload, r.meta["inside"]) for r in records] == [(_BODY, "false")]
