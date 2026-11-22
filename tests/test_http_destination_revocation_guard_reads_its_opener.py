@@ -274,15 +274,22 @@ def test_the_expiry_relaxed_refusal_with_no_crl_names_the_same_remedy(cell: str)
     assert EXPIRY_RELAXED_WAYS_ACROSS not in default
 
 
-def test_rest_with_an_ech_sidecar_and_expiry_relaxed_keeps_the_ech_remedy(
-    pki: dict[str, str],
-) -> None:
-    """On an ECH hop the sidecar dials the partner, so the engine's relaxed opener is never used and
-    the ECH remedy stands rather than the expiry-relaxed one."""
-    text = _refused("REST", crl=pki["crl"], extra={**_ECH, **_EXPIRED})
-    assert ECH_HOP_WAYS_ACROSS in text
-    assert EXPIRY_RELAXED_WAYS_ACROSS not in text
-    assert "[tls].crl_file" not in text
+@pytest.mark.parametrize("sidecar", [SIDECAR, f"https://{LOOPBACK}:8123"])
+def test_rest_with_an_ech_sidecar_refuses_expiry_relaxed(sidecar: str, pki: dict[str, str]) -> None:
+    """On an ECH hop the sidecar verifies the partner, so no hop of the connection applies
+    ``tls_allow_expired``. It is refused at build, as ``verify_tls=false`` is (vault BACKLOG #2977),
+    and the refusal is a configuration error, not the revocation refusal."""
+    ech = {**_ECH, "ech_sidecar": sidecar}
+    err = _config_error(
+        "REST", r"ech_egress excludes tls_allow_expired", crl=pki["crl"], extra={**ech, **_EXPIRED}
+    )
+    assert "no hop of this connection applies it" in str(err)
+    # An attestation does not cross it either.
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="tls_allow_expired"):
+        _build("REST", revocation_attested=True, extra={**ech, **_EXPIRED})
+    # CONTROL: the same attested ECH build without the relaxation builds.
+    with active_hop_posture(PROD_PHI):
+        _build("REST", crl=pki["crl"], revocation_attested=True, extra=ech)
 
 
 def test_a_lapsed_crl_passes_a_context_that_skips_validity_checks(tmp_path: Path) -> None:
@@ -357,9 +364,9 @@ def test_an_unstamped_build_is_unchanged(cell: str) -> None:
 def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]) -> None:
     """With ECH the engine dials the loopback sidecar, and the sidecar verifies the destination.
 
-    No context the engine holds checks that peer, so the guard is handed no opener on this arm. The
-    opener built before the sidecar swap DOES carry the CRL, which is what a guard placed above the
-    swap would have read."""
+    No context the engine holds checks that peer, so the guard is handed no opener on this arm. Before
+    vault BACKLOG #2977 item 7 the opener built before the sidecar swap carried the CRL, which is what
+    a guard placed above the swap would have read; it now loads no CRL."""
     assert _LABEL["REST"] in _refused("REST", crl=pki["crl"], extra=_ECH)
     # CONTROL 1: the same CRL relaxes the same destination without the sidecar, so the refusal above
     # is the ECH arm and not a CRL that failed to load.
@@ -369,6 +376,49 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
     with active_hop_posture(PROD_PHI):
         dest = _build("REST", crl=pki["crl"], revocation_attested=True, extra=_ECH)
     assert _checks_a_crl(dest) is False  # the sidecar hop's opener carries no CRL
+
+
+def test_a_bad_crl_file_is_not_reported_on_a_rest_ech_hop(pki: dict[str, str]) -> None:
+    """Vault BACKLOG #2977 item 7. With an ECH sidecar the opener built for the direct destination
+    hop is discarded, and the sidecar makes the partner TLS, so it loads no ``[tls].crl_file``. It
+    used to load the CRL, so a CRL the hop can never consult failed the connection."""
+    with active_hop_posture(PROD_PHI):
+        dest = _build("REST", crl=pki["ca_and_crl"], revocation_attested=True, extra=_ECH)
+    assert _checks_a_crl(dest) is False
+    # CONTROL: the same CRL fails the same destination without the sidecar, so the build above
+    # passes because the CRL was not loaded, not because it loads.
+    _config_error("REST", r"crl_file", crl=pki["ca_and_crl"])
+
+
+@pytest.mark.parametrize("sidecar", [SIDECAR, f"https://{LOOPBACK}:8123"])
+@pytest.mark.parametrize("shape", ["missing", "readable", "pin"])
+def test_a_rest_ech_hop_refuses_a_ca_it_cannot_apply(
+    shape: str, sidecar: str, pki: dict[str, str], tmp_path: Path
+) -> None:
+    """No hop of an ECH connection reads ``tls_ca_file``: the sidecar verifies the partner and the
+    engine verifies an https sidecar against the system trust store. A CA file, readable or not, and
+    a pin beside it are refused at build, and the refusal names the settings but not the path
+    (vault BACKLOG #2977)."""
+    ca = str(tmp_path / "missing-ca.pem") if shape == "missing" else pki["ca"]
+    ech = {**_ECH, "ech_sidecar": sidecar}
+    extra: dict[str, object] = {**ech, "tls_ca_file": ca}
+    if shape == "pin":
+        extra["tls_ca_pin"] = "ab" * 32
+    with (
+        active_hop_posture(PROD_PHI),
+        pytest.raises(ValueError, match="ech_egress excludes tls_ca_file") as exc,
+    ):
+        _build("REST", revocation_attested=True, extra=extra)
+    assert not isinstance(exc.value, (InsecureHopRefused, CaFileUnreadable))
+    assert ca not in str(exc.value)
+    assert ("tls_ca_file and tls_ca_pin" in str(exc.value)) is (shape == "pin")
+    assert "ab" * 32 not in str(exc.value)
+    # CONTROL: the same attested ECH build with no CA builds, and the same readable CA without the
+    # sidecar builds, so the refusal is the pairing.
+    with active_hop_posture(PROD_PHI):
+        _build("REST", revocation_attested=True, extra=ech)
+        if shape == "readable":
+            _build("REST", revocation_attested=True, extra={"tls_ca_file": ca})
 
 
 def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[str, str]) -> None:

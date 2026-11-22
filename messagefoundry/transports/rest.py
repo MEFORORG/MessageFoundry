@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Literal
 
 from messagefoundry.config.models import (
@@ -3164,6 +3164,25 @@ class RestDestination(DestinationConnector):
                 "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
                 "engine, makes this connection's TLS connection to the destination (ADR 0139)"
             )
+        # Vault BACKLOG #2977 item 7, by the reasoning item 8 gives for verify_tls=false above: the
+        # sidecar verifies the destination's certificate, the engine verifies an https sidecar
+        # against the system trust store, and the token hop posts through an opener built the same
+        # way (smart.py).
+        # So no hop of this connection applies a tls_allow_expired relaxation, a tls_ca_file or a
+        # tls_ca_pin. Accepted, each would read as in force while nothing applies it. The message
+        # names the settings only, never their values.
+        if self._ech_sidecar is not None:
+            unapplied = [
+                key for key in ("tls_allow_expired", "tls_ca_file", "tls_ca_pin") if s.get(key)
+            ]
+            if unapplied:
+                raise ValueError(
+                    f"ech_egress excludes {' and '.join(unapplied)} — no hop of this connection "
+                    "applies "
+                    + ("it" if len(unapplied) == 1 else "them")
+                    + ": the ECH sidecar verifies the destination's certificate, and the engine "
+                    "verifies an https sidecar against the system trust store (ADR 0139)"
+                )
         # BACKLOG #5529 limb 3 (#2707 closing step 1): the ECH branch below replaces the opener the
         # Digest handler is folded into, so the connection used to build and deliver with no Digest
         # auth. Keeping the handler on the ECH opener would not work: its password manager is keyed
@@ -3291,6 +3310,13 @@ class RestDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
             )
+            if self._ech_sidecar is not None:
+                # The opener built here is replaced by the sidecar opener below, and the sidecar
+                # makes the TLS connection to the partner, so no CRL loaded here is ever consulted.
+                # Loading it anyway reported a CRL fault on a hop that cannot use the CRL (vault
+                # BACKLOG #2977 item 7). A tls_ca_file is refused above on this connection, so the
+                # CA half here can come only from the [tls] policy, and it still loads.
+                anchor = replace(anchor, crl_file=None)
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
@@ -3372,9 +3398,8 @@ class RestDestination(DestinationConnector):
                 revocation_attested_reason=config.tls_revocation_attested_reason,
                 opener=None if no_crl_evidence else self._opener,
                 ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
-                # The sidecar, not the engine, dials the partner on an ECH hop, so the relaxation
-                # never reaches it there and the ECH remedy above stands.
-                expiry_relaxed=self._ech_sidecar is None and allow_expired,
+                # tls_allow_expired beside an ECH sidecar is refused near the top of __init__.
+                expiry_relaxed=allow_expired,
                 connection=config.name,
             )
         if self._ech_sidecar is not None and ech_sidecar_is_cleartext(self._ech_sidecar):
