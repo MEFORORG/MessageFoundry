@@ -268,6 +268,79 @@ async def test_delete_user_cascades_roles_and_sessions() -> None:
         await store.close()
 
 
+async def test_delete_user_removes_only_that_users_upload_reservations() -> None:
+    """BACKLOG #5671: nothing else reclaims a deleted uploader's rows, because the stale sweep runs
+    only on that uploader's next reserve. A release or a touch that arrives after the delete, from
+    an upload still in flight, finds no row and is a no-op."""
+    store = await _store()
+    try:
+        for user_id, name in (("u1", "alice"), ("u2", "bob")):
+            await store.create_user(
+                user_id=user_id,
+                username=name,
+                auth_provider="local",
+                now=1.0,
+                password_generated=False,
+                audits=(),
+            )
+            assert await store.reserve_upload_quota(
+                user_id, f"r-{user_id}", size_bytes=10, max_files=5, max_total_bytes=100
+            )
+        await store.delete_user("u1")
+        assert await store.upload_quota_in_flight("u1") == (0, 0)
+        assert await store.upload_quota_in_flight("u2") == (1, 10)
+        await store.touch_upload_quota("r-u1")
+        await store.release_upload_quota(uploader_id="u1", reservation_id="r-u1")
+        assert await store.upload_quota_in_flight("u1") == (0, 0)
+        assert await store.upload_quota_in_flight("u2") == (1, 10)
+    finally:
+        await store.close()
+
+
+class _RecordingHandle:
+    """A cursor or connection that records each statement, for the two server backends' deletes."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    async def execute(self, sql: str, *_args: Any, **_kwargs: Any) -> None:
+        self._events.append(sql)
+
+    async def fetchall(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_server_delete_user_takes_the_upload_lock_before_the_reservations(
+    backend: str,
+) -> None:
+    """BACKLOG #5671: the account row first, then the reserve's per-uploader lock, then the rows."""
+    from messagefoundry.store.postgres import _LOCK_CLASS_UPLOAD_QUOTA, PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore, _upload_quota_lock
+
+    store: Any
+    if backend == "sqlserver":
+        store, lock_attr, mark = SqlServerStore.__new__(SqlServerStore), "_applock", "?"
+        lock = f"lock {_upload_quota_lock('u1')}"
+    else:
+        store, lock_attr, mark = PostgresStore.__new__(PostgresStore), "_advisory_lock", "$1"
+        lock = f"lock {_LOCK_CLASS_UPLOAD_QUOTA} upload_quota:u1"
+    events: list[str] = []
+
+    async def _lock(_handle: Any, *key: object, **_kwargs: Any) -> None:
+        events.append(" ".join(("lock", *map(str, key))))
+
+    setattr(store, lock_attr, _lock)
+    await store._delete_user_rows(_RecordingHandle(events), "u1")
+
+    delete = f"DELETE FROM upload_reservation WHERE uploader_id={mark}"
+    assert "users" in events[0]
+    if backend == "postgres":
+        assert events[0] == "SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE"
+    assert events.index(lock) == events.index(delete) - 1
+    assert events.index(delete) < events.index(f"DELETE FROM users WHERE id={mark}")
+
+
 # ---------------------------------------------------------------------------------------------
 # BACKLOG #1139 (ASVS 6.3.7): ``users.email`` is the PROFILE MIRROR, ``users.notify_email`` is the
 # ENGINE-OWNED NOTIFICATION ADDRESS, and the two are separate columns so a directory repoint cannot

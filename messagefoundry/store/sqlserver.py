@@ -16348,8 +16348,7 @@ class SqlServerStore:
                 raise
         return AdminGrant.GRANTED
 
-    @staticmethod
-    async def _delete_user_rows(cur: Any, user_id: str) -> None:
+    async def _delete_user_rows(self, cur: Any, user_id: str) -> None:
         """Delete the account and every row keyed to it, inside the caller's transaction."""
         # BACKLOG #2733: hold the account row first, before any row keyed to it, so no write can
         # add a child row between the deletes below and the users delete, whose key checks would
@@ -16375,6 +16374,12 @@ class SqlServerStore:
         # reach or purge. This leg is CI-only, so an asymmetry between the three backends
         # surfaces first in CI rather than here.
         await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
+        # BACKLOG #5671: only this uploader's next reserve sweeps its stale rows, and a deleted
+        # account makes none. This delete reaches a row through the uploader index and a release
+        # through the clustered key, the opposite order, so it takes the applock they both take
+        # (vault BACKLOG #3180). Neither waits on the account row while holding that applock.
+        await self._applock(cur, _upload_quota_lock(user_id))
+        await cur.execute("DELETE FROM upload_reservation WHERE uploader_id=?", (user_id,))
         await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
 
     async def record_login_success(

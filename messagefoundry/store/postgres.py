@@ -11274,8 +11274,7 @@ class PostgresStore:
             return AdminGrant.ACCOUNT_CHANGED
         return AdminGrant.GRANTED
 
-    @staticmethod
-    async def _delete_user_rows(conn: Any, user_id: str) -> None:
+    async def _delete_user_rows(self, conn: Any, user_id: str) -> None:
         """Delete the account and every row keyed to it, inside the caller's transaction."""
         # BACKLOG #2738: hold the account row first, as SQL Server's twin does (#2733). A bind, an
         # unbind and revoke_user_sessions lock this row FOR UPDATE and then the account's sessions,
@@ -11294,6 +11293,12 @@ class PostgresStore:
         # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
         # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
         await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
+        # BACKLOG #5671: only this uploader's next reserve sweeps its stale rows, and a deleted
+        # account makes none. The reserve's sweep also deletes several of these rows, so take its
+        # per-uploader lock: two multi-row deletes must not cross. A reserve holds that lock and
+        # never waits on the account row, so holding the account row here cannot close a cycle.
+        await self._advisory_lock(conn, _LOCK_CLASS_UPLOAD_QUOTA, f"upload_quota:{user_id}")
+        await conn.execute("DELETE FROM upload_reservation WHERE uploader_id=$1", user_id)
         await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
     async def record_login_success(
