@@ -5,8 +5,8 @@ connector and the log chain share (engine PR 3150 open findings 1, 5 and 6); an 
 one is still classified by it. Also two log-path changes in the same module (vault BACKLOG #1661,
 added items 5 and 6).
 
-Each test was red on the code before its fix, except where its docstring calls it a control. All
-values are synthetic.
+Each test was red on the code before its fix, except at least those whose docstring calls it a
+control or a regression check that is not red on main. All values are synthetic.
 """
 
 from __future__ import annotations
@@ -157,11 +157,32 @@ class _Unclassable(Exception, metaclass=_UnclassableMeta):
     pass
 
 
-def test_an_error_whose_driver_test_raises_names_no_sqlstate() -> None:
-    """``raised_by_a_driver`` answers True for such a class, to withhold its text; the SQLSTATE
-    reading answers None, so its argument is never named as one."""
-    assert database._sqlstate(_Unclassable(_VALUE)) is None
-    assert database._log_sqlstate(_Unclassable(_VALUE)) is None
+def test_an_error_whose_driver_test_raises_is_classified_by_shape() -> None:
+    """Red on the previous head, which read no state from such a class: it is classified by the
+    shape of ``args[0]``, as on main, so a class-08 link is seen as lost; the state is never named."""
+    exc = _Unclassable("08S01", f"link lost ({_VALUE})")
+    assert database._sqlstate(exc) == "08S01"
+    assert database._log_sqlstate(exc) == "08S01"
+    assert database._connection_lost(exc)
+    assert database._shown_state("08S01", exc) is None
+
+
+async def test_an_unclassable_send_error_is_retried_and_its_text_withheld(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Red on the previous head, where the send raised it as an internal error: an ``('08S01',
+    ...)`` error from a class whose driver test raises is retried, as on main, and neither the
+    error the runner stores nor the log carries its text or state."""
+    conn = _FakeConn(_FakeCursor(_Unclassable("08S01", f"link lost ({_VALUE})")))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert not isinstance(raised.value, NegativeAckError)
+    assert str(raised.value) == "database transient error [SQLSTATE withheld]"
+    assert _VALUE not in safe_exc(raised.value)
+    assert _VALUE not in caplog.text
 
 
 async def test_a_driver_error_in_a_send_is_still_rejected_by_its_sqlstate() -> None:

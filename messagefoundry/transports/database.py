@@ -122,7 +122,8 @@ from messagefoundry.odbc_call_gate import (
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import (
-    driver_sqlstate_of,
+    is_a_sqlite_error,
+    known_driver_error,
     prints_a_codec_error,
     raised_by_a_driver,
     reads_as_a_sqlstate,
@@ -2807,10 +2808,8 @@ def _sqlstate(exc: BaseException) -> str | None:
     ``UnicodeError``, whose first argument is the codec name, nor for a SQLite error, whose
     ``args[0]`` is its message. It reads no attribute but ``args``, with ``getattr`` and a default,
     so an error arm can call it before its cleanup."""
-    if isinstance(exc, UnicodeError):
+    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc):
         return None
-    if raised_by_a_driver(exc):
-        return driver_sqlstate_of(exc, attribute=False)
     return _shaped_state(getattr(exc, "args", ()))
 
 
@@ -2819,10 +2818,8 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     for the arms that classify an error a PostgreSQL store's driver may raise. Never for a
     ``UnicodeError`` or an exception that holds one, whose text a codec name can make read like a
     SQLSTATE. Like :func:`_sqlstate`, it classifies; :func:`_shown_state` says what text names."""
-    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
+    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
-    if raised_by_a_driver(exc):
-        return driver_sqlstate_of(exc, past_attribute=True)
     state = getattr(exc, "sqlstate", None)
     return state if reads_as_a_sqlstate(state) else _shaped_state(getattr(exc, "args", ()))
 
@@ -2836,8 +2833,9 @@ def _shaped_state(args: object) -> str | None:
 def _shown_state(state: str | None, exc: BaseException) -> str | None:
     """``state`` as text may name it: a driver's own error's SQLSTATE, and ``None`` for any other
     error's, whose first argument may be a value such as ``KeyError('MRN42')``'s (engine PR 3150,
-    finding 1). The failure is still classified by ``state``; only its text is withheld."""
-    return state if state is not None and raised_by_a_driver(exc) else None
+    finding 1). The failure is still classified by ``state``; only its text is withheld. A class
+    whose driver test raises names nothing (:func:`~messagefoundry.redaction.known_driver_error`)."""
+    return state if state is not None and known_driver_error(exc) else None
 
 
 def _connection_lost(exc: BaseException | None) -> bool:

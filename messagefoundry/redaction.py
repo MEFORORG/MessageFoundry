@@ -102,6 +102,8 @@ __all__ = [
     "codec_safe_line",
     "codec_safe_str",
     "driver_sqlstate_of",
+    "is_a_sqlite_error",
+    "known_driver_error",
     "json_loads_or_refusal",
     "log_timestamp",
     "prepare_log_record",
@@ -3106,7 +3108,17 @@ _DRIVER_SQLSTATE = re.compile(r"[0-9A-Z]{5}")
 _SQLITE_ERRORNAME = re.compile(r"SQLITE_[A-Z_]{1,40}")
 
 
-def _a_sqlite_error(exc: BaseException) -> bool:
+def known_driver_error(exc: BaseException) -> bool:
+    """:func:`raised_by_a_driver`, except that a class whose driver test raises answers ``False``.
+    For a caller that would NAME something a driver's error carries, where the safe answer for a
+    class that cannot be classed is no (engine PR 3150, finding 1)."""
+    try:
+        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+    except Exception:  # noqa: BLE001 - fail closed for naming: an unclassable error names nothing
+        return False
+
+
+def is_a_sqlite_error(exc: BaseException) -> bool:
     """Whether ``exc`` is one of ``sqlite3``'s own errors or warnings."""
     # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
     # and the CLI defers loading it (tests/test_startup_import_budget.py).
@@ -3130,18 +3142,15 @@ def driver_sqlstate_of(
     either way, so such a message of five SQLSTATE characters still reads as one, on the
     traceback line too. None for any other exception, so a
     ``KeyError('MRN42')`` is never read as one, and None for a SQLite error, whose ``args[0]`` is
-    its message (vault BACKLOG #1661). The one reading that the DATABASE connector and
-    :func:`safe_traceback` share.
+    its message (vault BACKLOG #1661). :func:`safe_traceback` names a driver error's SQLSTATE by
+    it; the DATABASE connector classifies any error by its shape and names a state only for a
+    driver's own error.
 
     A class whose driver test raises counts as no driver's here, where :func:`raised_by_a_driver`
     answers ``True`` to withhold its text: here ``True`` would read its argument as a SQLSTATE. A
     ``sqlstate`` attribute that raises when read propagates; ``attribute=False`` never reads it.
     ``args`` is read with ``getattr`` and a default, so a missing one reads as empty."""
-    try:
-        driver = any(_a_driver_class(kind) for kind in type(exc).__mro__)
-    except Exception:  # noqa: BLE001 - no SQLSTATE is read from an error that cannot be classed
-        return None
-    if not driver or _a_sqlite_error(exc):
+    if not known_driver_error(exc) or is_a_sqlite_error(exc):
         return None
     if attribute:
         state = getattr(exc, "sqlstate", None)
@@ -3158,7 +3167,7 @@ def sqlite_errorname_of(exc: BaseException) -> str | None:
     """SQLite's result-code name for one of ``sqlite3``'s errors, such as
     ``SQLITE_CONSTRAINT_UNIQUE``, or None. SQLite has no SQLSTATE, so this fixed word is its only
     diagnostic free of the statement's values."""
-    if not _a_sqlite_error(exc):
+    if not is_a_sqlite_error(exc):
         return None
     name = getattr(exc, "sqlite_errorname", None)
     return name if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name) else None
