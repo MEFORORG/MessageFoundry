@@ -2551,7 +2551,8 @@ def _is_generator(fn: _FunctionNode) -> bool:
 #: to: a property for a method, a context manager for a value, a wrapper that hashes its arguments,
 #: a stub that is never the live binding. A decorator that resolves to anything else, or to nothing
 #: this screen can name, may come or go freely, because dropping one can BE the reintroduction (a
-#: permission check written as a decorator). The class decorators here (a generated constructor)
+#: permission check written as a decorator), and a decorator the reading cannot name turns off the
+#: decorator comparison for that def (:meth:`_Reading.pair`). The class decorators here (a generated constructor)
 #: are resolved too, but no check compares a class's decorators (:func:`_scope_mismatch`).
 _SHAPE_DECORATORS: Final = frozenset(
     {
@@ -2626,7 +2627,8 @@ class _ScopeState:
 @dataclass
 class _Reading:
     """What :func:`_run_block` records about each ``def`` and ``class`` it reaches: the shape
-    decorators it resolved for it at the point it ran, and each class body's final scope."""
+    decorators it resolved for it at the point it ran, the defs in ``unresolved`` with a decorator
+    it could not name, and each class body's final scope."""
 
     decorators: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
     #: The defs with at least one decorator that resolved to nothing this screen can name.
@@ -2635,9 +2637,8 @@ class _Reading:
     def pair(self, m: _DefNode, s: _DefNode) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """The decorators to compare for `m` against `s`: both resolved, or neither compared.
 
-        Where either side holds a decorator that did not resolve, or was never read, the two records
-        would differ for want of a reading rather than a swap, so neither is compared, as before
-        decorators were compared at all."""
+        Where either side holds a decorator that did not resolve, or was never read, neither is
+        compared, as before decorators were compared at all."""
         if (
             m in self.unresolved
             or s in self.unresolved
