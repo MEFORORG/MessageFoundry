@@ -147,37 +147,68 @@ def test_an_ordinary_name_set_to_a_key_does_not_join_an_empty_value(entries: lis
     assert "remove those strings with it" not in refusal
 
 
+_DIRECTORY_KEY = f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"
+
+
 @pytest.mark.parametrize(
-    "entries",
+    ("entries", "runs_on"),
     [
-        pytest.param([f"{_KEY}=", f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"], id="item"),
+        pytest.param([f"{_KEY}=", _DIRECTORY_KEY], True, id="item"),
         pytest.param(
-            [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=", f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"],
+            [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=", _DIRECTORY_KEY],
+            True,
             id="item-below-a-later-line",
         ),
-        pytest.param([_KEY, f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"], id="item-below-the-name"),
-        pytest.param([f"{_KEY}=\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}"], id="line"),
+        pytest.param([_KEY, _DIRECTORY_KEY], True, id="item-below-the-name"),
         pytest.param(
-            [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}"],
-            id="later-line",
+            [f"{_KEY}=", f"mefor_secrets_directory= ={_KEY_B64}"], True, id="item-blank-led"
+        ),
+        # A single string is removed as one refused variable; nothing runs on.
+        pytest.param([f"{_KEY}=\n{_DIRECTORY_KEY}"], False, id="line"),
+        pytest.param(
+            [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=\n{_DIRECTORY_KEY}"], False, id="later-line"
         ),
     ],
 )
-def test_a_directory_entry_holding_a_key_is_never_kept(entries: list[str]) -> None:
-    """``MEFOR_SECRETS_DIRECTORY=<key>`` below an empty store key holds that key, so the remedy
-    never tells the operator to keep it as the directory's entry, and where the key runs on into
+def test_a_directory_entry_set_to_a_key_is_not_kept(entries: list[str], runs_on: bool) -> None:
+    """``MEFOR_SECRETS_DIRECTORY=<key>`` below an empty store key is that key, so the remedy
+    does not tell the operator to keep it as the directory's entry, and where the key runs on into
     it, says to remove it with the key (Lander's second hold on PR 3142, H3)."""
     posture = _read(entries)
     assert posture.listed_keys == (_KEY,), posture.listed
     assert not posture.directory_joined
+    assert posture.value_runs_on is runs_on
+    assert posture.directory_key_joined is runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert "Keep one MEFOR_SECRETS_DIRECTORY entry" not in refusal
     assert "but for any that sets MEFOR_SECRETS_DIRECTORY" not in refusal
-    # Only the item forms run on; a single string is removed as one refused variable.
-    assert posture.value_runs_on == (len(entries) == 2), posture.value_runs_on
-    if posture.value_runs_on:
+    if runs_on:
         assert "so remove those strings with it, or the value stays in the registry key" in refusal
+
+
+def test_a_directory_entry_set_to_a_key_is_not_said_to_be_absent() -> None:
+    """Beside a secret the directory takes, the refusal does not say the lists set no secrets
+    directory while the key-bearing entry is still in them."""
+    posture = _read([f"{_KEY}=", _DIRECTORY_KEY, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and posture.directory_key_joined
+    assert "The service's lists set no MEFOR_SECRETS_DIRECTORY" not in refusal
+    assert (
+        "Each MEFOR_SECRETS_DIRECTORY entry this reading finds sets it to key material" in refusal
+    )
+    assert "Keep one MEFOR_SECRETS_DIRECTORY entry" not in refusal
+
+
+def test_a_directory_entry_naming_a_path_is_still_kept() -> None:
+    """Control: a joined directory string naming a path on its first line is the directory's
+    entry, whatever its later lines hold, so the remedy still says to keep it."""
+    posture = _read([f"{_KEY}=", f"mefor_secrets_directory=C:\\d\nFOO\n{_KEY_B64}"])
+    assert posture.directory_joined and not posture.directory_key_joined
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "Keep one MEFOR_SECRETS_DIRECTORY entry" in refusal
+    assert "but for any that sets MEFOR_SECRETS_DIRECTORY" in refusal
 
 
 def test_a_nameless_key_item_joins_an_empty_value_item() -> None:

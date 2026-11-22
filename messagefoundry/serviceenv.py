@@ -168,8 +168,13 @@ class ServiceEnvPosture:
     #: its first line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether
     #: or not :func:`_names` keeps the variable it was joined to.
     #: NSSM may read that string as its own variable, so the refusal must not say to remove every
-    #: such string, nor that the lists set no secrets directory.
+    #: such string, nor that the lists set no secrets directory. A string that sets it to a key
+    #: (:func:`_directory_value_is_key`) is not counted here but in ``directory_key_joined``.
     directory_joined: bool = False
+    #: Whether such a string sets ``MEFOR_SECRETS_DIRECTORY`` to a key, as
+    #: ``MEFOR_SECRETS_DIRECTORY=<key>`` below an empty store key does. It is removed with the
+    #: value it runs on into, so the refusal never says to keep it as the directory's entry.
+    directory_key_joined: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -612,8 +617,12 @@ class _Variable:
     #: :func:`_variables` joins to that string.
     runs_on: bool = False
     #: Whether it runs on, and the string its value takes first sets ``MEFOR_SECRETS_DIRECTORY``
-    #: on its first line (:func:`_sets_directory_first`).
+    #: on its first line (:func:`_sets_directory_first`) to a value that is not a key
+    #: (:func:`_directory_value_is_key`).
     holds_directory: bool = False
+    #: Whether it runs on, and that string sets ``MEFOR_SECRETS_DIRECTORY`` to a key instead
+    #: (:func:`_directory_value_is_key`).
+    holds_directory_key: bool = False
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
@@ -783,15 +792,23 @@ def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
 
 def _sets_directory_first(entry: str) -> bool:
     """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
-    regard to case, as Windows compares names, and the string holds no secret: neither that
-    line's value nor a later line, with any equals signs that lead it taken off, is one secret or
-    a list of them (:func:`_is_key_value`). A string holding one is key material read into the
-    value above it, so the remedy never says to keep it as the directory's entry."""
-    lines = [line for line in _LINE_BREAK.split(entry) if line.strip()]
-    written, equals, rest = (lines[0] if lines else "").partition("=")
-    if not equals or written.strip().upper() != _DIRECTORY_VARIABLE:
+    regard to case, as Windows compares names."""
+    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
+    written, equals, _rest = first.partition("=")
+    return bool(equals) and written.strip().upper() == _DIRECTORY_VARIABLE
+
+
+def _directory_value_is_key(entry: str) -> bool:
+    """Whether ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` on its first non-blank line
+    (:func:`_sets_directory_first`) to one secret or a list of them (:func:`_is_key_value`), with
+    any equals signs and blanks that lead the value taken off, as ``MEFOR_SECRETS_DIRECTORY=<key>``
+    below an empty store key does. Such a string is that key, read into the value above it, so
+    the refusal does not take it as the directory's entry to keep. Only that line's value is
+    judged, so a string naming a path there is still the directory's entry."""
+    if not _sets_directory_first(entry):
         return False
-    return not any(_is_key_value(text.lstrip("=")) for text in (rest, *lines[1:]))
+    first = next(line for line in _LINE_BREAK.split(entry) if line.strip())
+    return _is_key_value(first.partition("=")[2].lstrip("= \t"))
 
 
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
@@ -885,7 +902,7 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             ran_on = (key in ran or joined_break) and bool(variable.value.strip())
             # Its value takes the next string's first line, which may set the directory, past any
             # string of equals signs alone, which keeps the value running on (_still_blank).
-            holds = False
+            holds = holds_key = False
             if ran_on:
                 taken = next(
                     (
@@ -895,7 +912,8 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     ),
                     "",
                 )
-                holds = _sets_directory_first(taken)
+                holds_key = _directory_value_is_key(taken)
+                holds = _sets_directory_first(taken) and not holds_key
             read.append(
                 replace(
                     variable,
@@ -903,6 +921,7 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     broken=variable.broken and not joined_break,
                     runs_on=ran_on,
                     holds_directory=holds,
+                    holds_directory_key=holds_key,
                 )
             )
     return read
@@ -1030,6 +1049,7 @@ def read_service_env_posture(
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
+        directory_key_joined=any(variable.holds_directory_key for variable in variables),
     )
 
 
@@ -1235,8 +1255,17 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             # Two routes, because install-service.ps1 refuses an existing directory the service
             # does not name: an operator whose later `nssm set` dropped the variable must not be
             # sent to the installer, which would say to remove the directory holding the files.
+            # A string setting the directory to a key is removed with the empty value that runs on
+            # into it, so once it is gone the lists set none; saying they set none now is false.
+            none_set = (
+                f"Each {_DIRECTORY_VARIABLE} entry this reading finds sets it to key material, "
+                "and is removed with the empty value that runs on into it, so none is left naming "
+                "the secrets directory"
+                if posture.directory_key_joined
+                else f"The service's lists set no {_DIRECTORY_VARIABLE}"
+            )
             steps.append(
-                f"The service's lists set no {_DIRECTORY_VARIABLE}. Where install-service.ps1 "
+                f"{none_set}. Where install-service.ps1 "
                 f"already made the secrets directory, add {_DIRECTORY_VARIABLE} naming that "
                 "existing path back to the service's AppEnvironmentExtra, beside its other "
                 "entries, before any re-run of the installer, which refuses an existing directory "
