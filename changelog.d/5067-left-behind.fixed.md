@@ -4,7 +4,7 @@
   reads exited 1 and never said to delete the authenticator entry it showed; it now exits 2 and
   says to delete it. A refused first INSERT of a new account also says to delete it, since no
   seed was stored. Once the write has started, the refusals that report it in words, at least a
-  key-resolution, hop, schema, keyless or integrity refusal, now say to keep that entry until a
+  key-resolution, hop or integrity refusal, now say to keep that entry until a
   later run of the command completes. A `StoreKeylessError` or `CipherError` raised once the
   write has started still reaches the command's last-resort exit 1, which names no entry.
 - **A refusal that follows a store open no longer says "nothing was written" where the open may

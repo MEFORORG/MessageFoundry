@@ -9950,8 +9950,10 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     """What a refused store open left behind, when that is more than "nothing was written"
     (BACKLOG #5067), or ``None`` when nothing was.
 
-    ``None`` for at least a key-resolution or hop refusal; the callers then say "nothing was
-    written", meaning no row. A server store whose live schema falls short of this build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself or as the cause
+    ``None`` for at least a key-resolution or hop refusal, and the caller decides: at least
+    ``provision-admin``'s arms and ``admin-unlock``'s account read, raised after their open
+    returned, then name what it may have changed (:func:`_opened_left_behind`), and other callers
+    say "nothing was written", meaning no row. A server store whose live schema falls short of this build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself or as the cause
     of a :class:`_StoreOpenRefused`, is refused after the open has touched the database. The open
     rolls its batch back and writes no schema marker. But on SQL Server under
     ``[store].schema_management = auto`` a writable open first switches the database's
