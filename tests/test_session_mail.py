@@ -2474,6 +2474,15 @@ def _offset_stamp(hours: int) -> str:
     return (datetime.now(UTC) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
+def _require_a_zone_away_from_utc() -> None:
+    """Skip, visibly, where a one-hour stamp cannot tell a local reading from a UTC one."""
+    offset = _effective_utc_offset_hours(_PINNED_ZONE)
+    if abs(offset) < 2:
+        pytest.skip(
+            f"host reads as UTC{offset:+g} and ignores TZ, so this cannot detect a local-time misread"
+        )
+
+
 @functools.cache
 def _effective_utc_offset_hours(tz: str) -> float:
     """The offset pwsh itself sees with TZ set, which is the only reading that settles the pin."""
@@ -2570,11 +2579,7 @@ def test_an_offset_stamp_is_read_as_the_instant_it_names(
     host east of it. Within two hours of UTC neither can tell the old reader from this one, so the
     zone is pinned where the platform honours TZ, and the test SKIPS where it still lands there.
     """
-    offset = _effective_utc_offset_hours(_PINNED_ZONE)
-    if abs(offset) < 2:
-        pytest.skip(
-            f"host reads as UTC{offset:+g} and ignores TZ, so this cannot detect the wall-clock misread"
-        )
+    _require_a_zone_away_from_utc()
     specs = [
         _raw_message(_EXPIRY_STEM, "live for an hour", _offset_stamp(1)),
         _raw_message("20260101T000000002-aaaaaa", "dead for an hour", _offset_stamp(-1)),
@@ -2603,12 +2608,20 @@ def test_the_floor_still_covers_a_missing_or_unreadable_stamp(
 
 
 def test_the_moved_box_count_reads_expiry_the_same_way(repo: Path, tmp_path: Path) -> None:
+    _require_a_zone_away_from_utc()
     specs = [
         _raw_message(_EXPIRY_STEM, "live", _offset_stamp(1)),
         _raw_message("20260101T000000002-aaaaaa", "dead", "2020-01-13T00:00:00.000Z"),
         _raw_message("20260101T000000003-aaaaaa", "just dead", _offset_stamp(-1)),
     ]
-    text = _moved_box_notice(repo, tmp_path, specs, culture="en-GB")
+    text = _moved_box_notice(repo, tmp_path, specs, culture="en-GB", tz=_PINNED_ZONE)
+    assert "1 message(s) wait in the box of" in text, text
+
+
+def test_the_moved_box_count_counts_a_duplicated_stem_once(repo: Path, tmp_path: Path) -> None:
+    """The delivery loop shows one of two files sharing a stem, so the notice must count one."""
+    specs = [_raw_message(_EXPIRY_STEM, "twice on disk", _offset_stamp(1))]
+    text = _moved_box_notice(repo, tmp_path, specs, duplicate=True)
     assert "1 message(s) wait in the box of" in text, text
 
 
@@ -2618,6 +2631,8 @@ def _moved_box_notice(
     specs: list[dict[str, Any]],
     age: int = 0,
     culture: str | None = None,
+    tz: str | None = None,
+    duplicate: bool = False,
 ) -> str:
     """What a session pinned to ``repo`` is told about a box it moved into, seeded with ``specs``."""
     wt = Path(os.path.realpath(tmp_path)) / "moved-wt"
@@ -2627,11 +2642,16 @@ def _moved_box_notice(
         capture_output=True,
     )
     seed(repo, tmp_path, specs, box_cwd=wt)
+    if duplicate:
+        # The same stem under a second valid token: only the token's last hex digit differs.
+        for p in list((mail_root(repo) / "box").glob("*/inbox/*.json")):
+            last = "1" if p.stem[-1] == "0" else "0"
+            shutil.copy(p, p.with_name(f"{p.stem[:-1]}{last}.json"))
     if age:
         _age_inbox(repo, age)
     sid = str(uuid.uuid4())
     seed_pin(repo, repo, sid)
-    return injection(run_drain(repo, cwd=wt, run_from=repo, session_id=sid, culture=culture))
+    return injection(run_drain(repo, cwd=wt, run_from=repo, session_id=sid, culture=culture, tz=tz))
 
 
 def test_the_moved_box_count_applies_the_receivers_floor(repo: Path, tmp_path: Path) -> None:
@@ -2677,6 +2697,10 @@ def test_the_moved_box_count_skips_a_payload_that_is_not_an_object(
         "Mon, 13 Jan 2020 10:00:00 GMT",
         "01/13/2020 10:00:00 PM",
         "01/13/2020 10:00:00 +05:00",
+        "2020-01-13 10:00:00 UTC",
+        "01/13/2020 10:00 PM Z",
+        "13 Jan 2020 10:00 PM UTC",
+        "Sept 13 2020",
     ],
 )
 def test_an_unambiguous_past_stamp_expires_a_fresh_message(
@@ -2690,7 +2714,18 @@ def test_an_unambiguous_past_stamp_expires_a_fresh_message(
 
 
 @pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
-@pytest.mark.parametrize("stamp", ["01/13/2099", "13/01/2099", "Jan 13 2099", "13 January 2099"])
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "01/13/2099",
+        "13/01/2099",
+        "Jan 13 2099",
+        "13 January 2099",
+        "Sept 13 2099",
+        "2099-01-13 10:00:00 UTC",
+        "01/13/2099 10:00:00 PM UTC",
+    ],
+)
 def test_an_unambiguous_future_stamp_outlives_the_floor(
     repo: Path, tmp_path: Path, culture: str, stamp: str
 ) -> None:
@@ -2701,7 +2736,17 @@ def test_an_unambiguous_future_stamp_outlives_the_floor(
 
 @pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
 @pytest.mark.parametrize(
-    "stamp", ["03/04/2020", "03-04-2020", "03.04.2020", "02/30/2020", "01/13/20", "Jan 2020"]
+    "stamp",
+    [
+        "03/04/2020",
+        "03-04-2020",
+        "03.04.2020",
+        "02/30/2020",
+        "01/13/20",
+        "Jan 2020",
+        "2020-01-13 PM",
+        "Tue, 13 Jan 2020 10:00:00 GMT",
+    ],
 )
 def test_an_ambiguous_or_impossible_stamp_takes_the_floor(
     repo: Path, tmp_path: Path, culture: str, stamp: str
@@ -2720,8 +2765,9 @@ def test_an_ambiguous_or_impossible_stamp_takes_the_floor(
 def test_a_zoneless_iso_stamp_near_now_is_read_as_utc(
     repo: Path, tmp_path: Path, culture: str
 ) -> None:
-    """ConvertFrom-Json gives these Kind Unspecified. Two hours either side of now, so a reader that
+    """ConvertFrom-Json gives these Kind Unspecified. One hour either side of now, so a reader that
     took them as local time would flip one of them on any host at least two hours from UTC."""
+    _require_a_zone_away_from_utc()
     now = datetime.now(UTC)
     specs = [
         _raw_message(

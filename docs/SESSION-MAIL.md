@@ -177,7 +177,7 @@ reached or a receipt that aged out. Read a receipt inside the window or not at a
 
 **The OFF switch.** Creating the file `mefor-coord/mail/OFF` suppresses delivery repo-wide. Mail keeps
 being queued; it is not shown or consumed. A message whose expiry passes meanwhile moves to `expired/`
-at the first drain after the switch is removed. Its receipt then reads `expired-unshown` with an empty
+at the first drain of its box after the switch is removed. Its receipt then reads `expired-unshown` with an empty
 `observedUtc`, **even if a session was shown that message before OFF went up**, so that receipt does
 not prove the message was never seen. The drain says OFF is up as context at
 SessionStart. At Stop it says so on stderr, because output there would re-wake the session, and the

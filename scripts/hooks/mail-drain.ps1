@@ -708,18 +708,19 @@ function ConvertTo-MailIsoStamp {
     # '03/04/2026' is refused because it names two dates, and a two-digit year because it names many.
     # CultureInvariant matters: under tr-TR, IgnoreCase would not match an I against an i.
     param([string]$Text)
-    if ($Text -cmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ]|\z)') { return $Text }
     $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
     $clock = '(?:[T\s]\s*(?<clock>[0-9]{1,2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:\s*[ap]m)?' +
         '(?:\s*(?:z|utc|gmt|[+-][0-9]{2}(?::?[0-9]{2})?))?))?\z'
-    $weekday = '(?:(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri|sat(?:ur)?|sun)(?:day)?,?\s+)?'
+    # The weekday is kept for the parser, which refuses one that contradicts the date.
+    $weekday = '(?:(?<wd>mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?),?\s+)?'
     $mon = '(?<mon>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|' +
-        'sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
-    # The invariant parser takes Z and GMT but not UTC, so all three leave here as Z.
+        'sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+    # The invariant parser takes Z and GMT but not UTC, so all three leave here as Z. The space stays,
+    # because it refuses 'PMZ'.
     $join = {
         param([string]$Date, $Hit)
         if (-not $Hit.Groups['clock'].Success) { return $Date }
-        "$Date $([regex]::Replace($Hit.Groups['clock'].Value, '\s*(?:utc|gmt|z)\z', 'Z', $options))"
+        "$Date $([regex]::Replace($Hit.Groups['clock'].Value, '\s*(?:utc|gmt|z)\z', ' Z', $options))"
     }
 
     $hit = [regex]::Match($Text, "\A(?<date>[0-9]{4}(?<s>[/.-])[0-9]{1,2}\k<s>[0-9]{1,2})$clock", $options)
@@ -736,7 +737,10 @@ function ConvertTo-MailIsoStamp {
 
     $hit = [regex]::Match($Text, "\A$weekday(?:$mon\s+(?<d>[0-9]{1,2}),?|(?<d>[0-9]{1,2})\s+$mon,?)\s+(?<y>[0-9]{4})$clock", $options)
     if (-not $hit.Success) { return $null }
-    return & $join "$($hit.Groups['d'].Value) $($hit.Groups['mon'].Value) $($hit.Groups['y'].Value)" $hit
+    # Three letters, because the parser does not know 'Sept'.
+    $named = "$($hit.Groups['d'].Value) $($hit.Groups['mon'].Value.Substring(0, 3)) $($hit.Groups['y'].Value)"
+    if ($hit.Groups['wd'].Success) { $named = "$($hit.Groups['wd'].Value), $named" }
+    return & $join $named $hit
 }
 
 function Test-MailExpired {
@@ -1050,7 +1054,9 @@ try {
                             $parts = Split-MailFileName -Name $f.Name
                             if (-not $parts) { continue }
                             $m = $null
-                            try { $m = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
+                            # Get-Content fails at once on a locked file. This is an advisory scan of a
+                            # box this drain does not read, so it must not spend Read-CoordText's retries.
+                            try { $m = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
                             # The delivery loop's two tests, so what is counted is what it would show.
                             if ($m -isnot [System.Management.Automation.PSCustomObject]) { continue }
                             if (Test-MailExpired -Message $m -LastWriteUtc $f.LastWriteTimeUtc -NowUtc $nowUtc) { continue }
@@ -1058,6 +1064,8 @@ try {
                             if ($to -and $to -ne $sessionId) { continue }
                             $parts.Stem
                         })
+                    # One message per stem, as the delivery loop counts them.
+                    $waiting = @($waiting | Sort-Object -Unique)
                     if ($waiting.Count -gt 0) {
                         $newest = ($waiting | Sort-Object -Descending | Select-Object -First 1)
                         $stampDir = Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-mail-moved'
