@@ -356,8 +356,9 @@ def test_the_split_literal_claim_site_is_still_split() -> None:
 
 
 # --- BACKLOG #5724 and #5729 on Postgres, against a fake connection (ADR 0157 Amendment D) ------
-# The fake proves the statement order and the branch taken. That a real FOR UPDATE and a real
-# status term hold under concurrency is for the hosted Postgres leg.
+# The fake proves the statement order and the branch taken, and nothing about real locks. The
+# hosted legs run the decline sequentially (test_dead_letter_targets.py). No test here or there
+# races two connections, so that the lock serializes a late dead-letter is read, not measured.
 
 
 class _PgConn:

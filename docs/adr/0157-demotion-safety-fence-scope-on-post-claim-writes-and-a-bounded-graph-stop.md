@@ -201,7 +201,9 @@ firing, and firing is worse.
 > carry no status conjunct. `mark_failed`'s retry branch, which C1 leaves unfenced, now carries one.
 > The amendment says why the argument above does not reach it. *Amendment C (2026-11-11)* makes
 > `mark_failed`'s DEAD branch and `record_worker_death`'s dead-letter decline an already-resolved row,
-> never an INFLIGHT or PENDING one, so neither is this conjunct; it says why.
+> never an INFLIGHT or PENDING one, so neither is this conjunct; it says why. *Amendment D
+> (2026-11-22)* does the same for `dead_letter_now`, `dead_letter_batch` and `mark_batch_failed`'s
+> DEAD branch.
 
 **C3 — A fenced write is all-or-nothing, and it RE-PENDS the row. It must not leave it INFLIGHT.**
 Zero rows affected ⇒ roll back the enclosing transaction (discarding the `delivered_keys` row, the
@@ -1461,7 +1463,8 @@ reason for one. `mark_failed` now takes its first read under a row lock (`FOR UP
 and its DEAD branch returns the empty outcome before its UPDATE for a resolved row. The increment
 in `record_worker_death` matches only an INFLIGHT or PENDING row and holds its lock until the
 commit, so its dead-letter cannot find the row resolved. SQLite does both under its single writer.
-`mark_batch_failed`'s DEAD branch is unchanged.
+`mark_batch_failed`'s DEAD branch is unchanged. (Amendment D later changed it, and
+`dead_letter_now` and `dead_letter_batch`, to decline a resolved row the same way.)
 
 **The increment is not fenced.** It neither resolves the row nor returns it to PENDING. A fenced
 dead-letter rolls it back with the rest of the transaction and re-pends a row still in flight
