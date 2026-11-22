@@ -320,7 +320,14 @@ async def test_rotating_the_transit_key_keeps_the_attestation(
     db = tmp_path / "rotating.db"
     store = await _transit_store(db)
     await _attest(store)
-    await store.close()
+    try:
+        # The chain as written, before the key moves (BACKLOG #2720 closing step 4's before half).
+        before_ok, before_msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert before_ok, before_msg
+    assert transit.verified and set(transit.verified) == {1}, transit.verified
+    transit.verified.clear()  # so the checks below count only the walk after the move
     transit.latest = 2  # Transit rotated the key; new MACs are vault:v2:
     again = await _transit_store(db)
     try:
