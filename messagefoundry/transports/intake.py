@@ -12,7 +12,7 @@ message's metadata in the ingress transaction.
 :func:`deliver` keeps the plain one-argument handler working: it passes the context only to an
 :class:`IntakeHandler`, which it recognises by class.
 
-Everything here is socket or path metadata, never a byte of the body. A certificate subject can name
+Everything here is connection or path metadata, never a byte of the body. A certificate subject can name
 a person; the runner writes the context into the message's metadata cell, which the store encrypts
 at rest when it has a key, as it does ``connection_event.reason``.
 """
@@ -56,11 +56,11 @@ class IntakeContext:
     It holds no socket address, neither the peer's nor the engine's own, by the owner's ruling of
     2026-11-22 ("No IP in metadata"). A value it records verbatim can still contain an IP, and
     nothing filters one out: at least a certificate subject such as ``CN=10.20.30.40``, and a
-    File path under a UNC directory spelled by IP. The connection-event log,
-    where capture is on, is where a peer address is kept, under
-    ``[retention].connection_event_retention_hours``, and the message row's ``channel_id`` names
-    the inbound connection that took it. A listen source fills how it admitted the peer; a poll
-    source has no peer and fills :attr:`source` with where it read the body. A
+    File path under a UNC directory spelled by IP. A peer address is recorded elsewhere, at least
+    in the connection-event log where capture is on and in some service-log lines; the message
+    row's ``channel_id`` names the inbound connection that took it. The MLLP and raw-TCP listeners
+    fill how they admitted the peer; the File source has no peer and fills :attr:`source` with
+    where it read the body. A
     ``None`` field is left out of the stored record; what ``None`` means is on each field."""
 
     #: The source's transport, lower case, such as ``"mllp"``, ``"tcp"`` or ``"file"``.
