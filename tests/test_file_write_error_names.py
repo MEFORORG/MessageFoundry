@@ -169,7 +169,11 @@ async def test_the_runner_stores_and_alerts_no_rendered_name(
     assert detail
     for text in (row["last_error"], event.reason, detail):
         assert MRN not in text
-    assert_capture_sees_tree(caplog, "messagefoundry")
+    # The packages the delivery path logs through, each with every child created so far, rather
+    # than the root alone, which a blind child would pass (vault BACKLOG #3766 item 29). Not the
+    # whole tree: a logger another test left blind elsewhere would fail this for no cause here.
+    for root in ("messagefoundry.pipeline", "messagefoundry.transports", "messagefoundry.store"):
+        assert_capture_sees_tree(caplog, root)
     assert not [r for r in caplog.records if any(MRN in t for t in record_texts(r))]
 
 

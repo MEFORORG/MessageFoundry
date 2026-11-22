@@ -51,12 +51,16 @@ def assert_no_records(
     #3766 item 36)."""
     log = logger if isinstance(logger, logging.Logger) else logging.getLogger(logger)
     assert_capture_sees_tree(caplog, log.name, level)
-    hits = [
-        r.getMessage()
-        for r in caplog.records
-        if (r.name == log.name or r.name.startswith(f"{log.name}.")) and pred(r)
-    ]
-    assert hits == [], f"{len(hits)} record(s) from {log.name!r} matched: " + "; ".join(hits)
+    # Logger names only, never a message: a check that a value never reaches a log must not print
+    # that value into the failure text.
+    hits = sorted(
+        {
+            r.name
+            for r in caplog.records
+            if (r.name == log.name or r.name.startswith(f"{log.name}.")) and pred(r)
+        }
+    )
+    assert hits == [], f"a record from {hits} matched under {log.name!r}"
 
 
 def assert_capture_sees_tree(

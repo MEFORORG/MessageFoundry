@@ -650,7 +650,13 @@ def _write(tmp_path: Path, module: str) -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "feed.py").write_text(module, encoding="utf-8")
-    (tmp_path / "messagefoundry.toml").write_text(_TOML, encoding="utf-8")
+    # The value file is this test's own, empty, so the url line never reads the working
+    # directory's environments/dev.toml.
+    (tmp_path / "messagefoundry.toml").write_text(
+        _TOML + f'\n[environments]\nbase_dir = "{tmp_path.as_posix()}"\n', encoding="utf-8"
+    )
+    (tmp_path / "environments").mkdir()
+    (tmp_path / "environments" / "dev.toml").write_text("", encoding="utf-8")
     return cfg
 
 
@@ -705,13 +711,10 @@ def _env_url_config(tmp_path: Path, *, value: str | None) -> Path:
     )
     config = config.replace("from messagefoundry import ", "from messagefoundry import env, ")
     cfg = _write(tmp_path, config)
-    toml = tmp_path / "messagefoundry.toml"
-    toml.write_text(
-        _TOML + f'\n[environments]\nbase_dir = "{tmp_path.as_posix()}"\n', encoding="utf-8"
-    )
-    (tmp_path / "environments").mkdir()
-    body = "" if value is None else f'plain_url = "{value}"\n'
-    (tmp_path / "environments" / "dev.toml").write_text(body, encoding="utf-8")
+    if value is not None:
+        (tmp_path / "environments" / "dev.toml").write_text(
+            f'plain_url = "{value}"\n', encoding="utf-8"
+        )
     return cfg
 
 
@@ -763,14 +766,7 @@ def test_a_hit_from_a_default_says_the_url_was_read_by_its_default(tmp_path: Pat
         'Rest(url=env("keyed_url", default="https://p.example.invalid/x?sig=SYNTHETIC-4"))',
     ).replace("from messagefoundry import ", "from messagefoundry import env, ")
     cfg = _write(tmp_path, config)
-    # The values come from this test's own empty value file, not from the working directory's.
-    toml = tmp_path / "messagefoundry.toml"
-    toml.write_text(
-        _TOML + f'\n[environments]\nbase_dir = "{tmp_path.as_posix()}"\n', encoding="utf-8"
-    )
-    (tmp_path / "environments").mkdir()
-    (tmp_path / "environments" / "dev.toml").write_text("", encoding="utf-8")
-    report = run_checks(cfg, run_lint=False, service_config=toml)
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
     detail = next(x for x in report.results if x.name == "url-query-credential").detail
     assert "OB_KEYED (sig)" in detail
     assert "else its default=" in detail

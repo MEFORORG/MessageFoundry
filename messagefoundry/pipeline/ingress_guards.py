@@ -642,8 +642,8 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
 
     :func:`decode_body` then :func:`check_decoded`, the same two calls the live listener makes, so the
     dry-run and the engine share the sequence rather than a copy of it. A ``str`` ``raw`` skips the
-    charset guard and still gets the NUL, frame-byte and size guards: the dry-run entry points accept text, and the
-    transport-fed listener never does.
+    charset guard and still gets the surrogate refusal and the NUL, frame-byte and size guards: the
+    dry-run entry points accept text, and the transport-fed listener never does.
 
     The codec name is resolved the listener's way too, inside :func:`decode_body`, so an absent or
     ``None`` declaration decodes as ``utf-8`` on both and, for a ``bytes`` body, a name naming no

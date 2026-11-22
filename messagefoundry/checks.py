@@ -3022,7 +3022,7 @@ def _check_url_query_credentials(
             name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
         )
     defaults_only = "an env() url is read by its default= only, so one with no default is not read"
-    reading = f"{defaults_only}: no settings file or environment declaration resolved"
+    reading = f"{defaults_only}: no settings were read"
     values: dict[str, Any] | None = None
     toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_search, env=env
