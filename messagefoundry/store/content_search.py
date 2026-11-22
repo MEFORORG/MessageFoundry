@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from messagefoundry.parsing._builtin_hl7 import field_values
 from messagefoundry.parsing.peek import HL7PeekError, Peek, parse_path
 
 # Hard caps (ADR 0046 D1 §3 — the non-negotiable cost ceiling). ``DEFAULT_SCAN_LIMIT`` bounds how many
@@ -47,9 +48,11 @@ class SearchSpec:
     Exactly one of ``substring`` / ``field_path`` is set (validated in ``__post_init__``):
 
     * ``substring`` — a literal case-insensitive substring tested against the decrypted target column(s).
-    * ``field_path`` + ``field_value`` — an HL7 field path (``PID-3``) resolved via ``Peek.field`` against
-      the decrypted ``raw``; matches when the field's value contains ``field_value`` (case-insensitive),
-      or — when ``field_value`` is ``None`` — when the field is merely **present/non-empty**.
+    * ``field_path`` + ``field_value`` — an HL7 field path (``PID-3``) resolved against the decrypted
+      ``raw`` across **every occurrence of the segment and every repetition of the field** (BACKLOG
+      #5883); matches when any value contains ``field_value`` (case-insensitive), or — when
+      ``field_value`` is ``None`` — when any value is **present/non-empty**. A whole-field path reads
+      each occurrence's structural text, repetition delimiters included.
     """
 
     substring: str | None
@@ -210,7 +213,8 @@ def row_matches(spec: SearchSpec, *, raw: str | None, summary: str | None) -> bo
 
     Pure (no I/O, no cipher). Parsing a non-HL7 / unparseable ``raw`` for a field-path query is treated
     as **no match** (tolerant — a malformed body simply doesn't satisfy ``PID-3``), never an error that
-    aborts the scan."""
+    aborts the scan. A field-path query tests every segment occurrence and field repetition. It sees
+    only the row it is handed, so it widens nothing past the caller's own scope."""
     if spec.substring is not None:
         needle = spec.substring.casefold()
         if spec.target in (SearchTarget.RAW, SearchTarget.BOTH) and raw is not None:  # noqa: SIM102
@@ -224,11 +228,13 @@ def row_matches(spec: SearchSpec, *, raw: str | None, summary: str | None) -> bo
     if raw is None:
         return False
     try:
-        value = Peek.parse(raw).field(spec.field_path)  # type: ignore[arg-type]
+        message = Peek.parse(raw).message
+        seg, fld, comp, sub = parse_path(spec.field_path)  # type: ignore[arg-type]
     except HL7PeekError:
         return False  # unparseable body can't satisfy a field-path predicate
-    if value is None:
-        return False
-    if spec.field_value is None:
-        return True  # presence test — the field exists and is non-empty
-    return spec.field_value.casefold() in value.casefold()
+    wanted = None if spec.field_value is None else spec.field_value.casefold()
+    for value in field_values(message, seg, fld, comp, sub):
+        # No wanted value is a presence test: any non-empty value satisfies it.
+        if wanted is None or wanted in value.casefold():
+            return True
+    return False

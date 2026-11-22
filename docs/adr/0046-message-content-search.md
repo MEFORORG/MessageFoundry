@@ -84,6 +84,9 @@ decrypt**, over a **bounded** candidate set:
    `summary`) via the store cipher (`_dec`) and test the operator's needle against the plaintext —
    either a raw substring/`re` match or, for a field-path query, the `Peek.field("PID-3")` resolver
    from [`parsing/peek.py`](../../messagefoundry/parsing/peek.py) (already the tolerant routing peek).
+   *Amended (BACKLOG #5883):* `Peek.parse` still gates the body, but the field-path match now reads
+   `_builtin_hl7.field_values`, which applies `Peek.field`'s semantics to **every occurrence of the
+   segment and every repetition of the field**, so a value past the first is not under-reported.
    Because decrypt is CPU work (AES-GCM) and `Peek` parses HL7, the scan runs **off the asyncio event
    loop** via `asyncio.to_thread` (the `db_lookup` / `WebhookTransport` off-loop pattern), so a long
    search never stalls the listener/router/transform tasks ([CLAUDE.md](../../CLAUDE.md) §6).
@@ -164,8 +167,10 @@ D2's *keyed-token* form is the route — fast **and** inside the cipher — not 
   decrypts and report the result as truncated rather than scanning the whole store.
   → `tests/test_message_search.py::test_scan_cap_truncates`
 - **AC-4** — WHERE a field-path needle (`PID-3`) is given, THE SYSTEM SHALL resolve it via the HL7
-  `Peek.field` path resolver against each decrypted candidate, returning only rows whose field matches.
-  → `tests/test_message_search.py::test_field_path_match`
+  `Peek.field` path semantics against every segment occurrence and field repetition of each decrypted
+  candidate (BACKLOG #5883), returning only rows where any such value matches.
+  → `tests/test_message_search.py::test_field_path_match`,
+  `tests/test_content_search_repetitions.py`
 - **AC-5** — THE SYSTEM SHALL gate the route on `require_phi_read(MESSAGES_READ)` + step-up, redact
   `summary`/`error` for a caller lacking `messages:view_summary`, and gate any returned raw excerpt on
   `messages:view_raw` (identical per-property posture to `/messages`).

@@ -48,7 +48,7 @@ from __future__ import annotations
 import copy
 import operator
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import lru_cache
 from typing import TypedDict
 
@@ -63,6 +63,7 @@ __all__ = [
     "parse",
     "clone",
     "extract_field",
+    "field_values",
     "extract_part",
     "raw_field",
     "set_field",
@@ -579,6 +580,49 @@ def extract_field(
     if sub_num <= len(comp_subs):
         return unescape(comp_subs[sub_num - 1], seps) or None
     return None  # "" -> None (valid over-index)
+
+
+def field_values(
+    msg: ParsedMessage, seg_id: str, fld: int, comp: int | None, sub: int | None
+) -> Iterator[str]:
+    """Every non-empty value of a field path, across all segment occurrences and field repetitions,
+    in message order (BACKLOG #5883). The first value is what a ``Peek.field`` read returns, if that
+    read returns one.
+
+    Each value comes from :func:`extract_field`, so its numbering, descent and unescaping apply. A
+    whole-field read (``comp is None``) and a header's delimiter field yield once per occurrence: the
+    first is already the structural text of every repetition, and the second is never split. A
+    repetition the path runs past, or whose escape cannot be read, yields nothing, as ``Peek.field``
+    reads such a value as absent, and the walk goes on.
+
+    ``extract_field`` finds an occurrence by scanning from the top, so calling it with each
+    ``occurrence`` would be quadratic in segments. It is called here on a one-segment view of each
+    occurrence instead, and the walk is linear in the message. A blank line is not an occurrence and
+    raises nothing here; a ``Peek``-parsed message holds none.
+    """
+    rep_sep = msg["seps"][2]
+    for index, seg in enumerate(msg["segments"]):
+        if seg["id"] != seg_id or _is_fieldless(msg, index):
+            continue
+        _ensure_split(msg, index)
+        fields = seg["fields"]
+        if fld >= len(fields):
+            continue
+        whole = comp is None or is_delimiter_field(seg_id, fld)
+        count = 1 if whole else _field_text(fields[fld]).count(rep_sep) + 1
+        view: ParsedMessage = {
+            "_lazy": {},
+            "segments": [seg],
+            "raw": None,
+            "seps": msg["seps"],
+        }
+        for repetition in range(1, count + 1):
+            try:
+                value = extract_field(view, seg_id, fld, comp, sub, repetition=repetition)
+            except (IndexError, ValueError):
+                continue
+            if value is not None:
+                yield value
 
 
 def extract_part(
