@@ -3548,11 +3548,11 @@ def _serve(args: argparse.Namespace) -> int:
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
-    # _allowlist_for (transports/egress.py). ([egress].allowed_proxy is another allowed_* key, and
-    # it is deliberately NOT one of them: it gates a transport INTERMEDIARY rather than a
-    # destination, is not in _allowlist_for, and is deny-by-default on its own terms — BACKLOG
-    # #1659 — so listing a proxy says nothing about where PHI may be sent and must not satisfy this
-    # gate.)
+    # _allowlist_for (transports/egress.py). ([egress].allowed_proxy and allowed_ech_sidecar are
+    # other allowed_* keys, and they are deliberately NOT among them: each gates a transport
+    # INTERMEDIARY rather than a destination, is not in _allowlist_for, and is deny-by-default on
+    # its own terms — BACKLOG #1659, #5528 — so listing one says nothing about where PHI may be
+    # sent and must not satisfy this gate. A test in tests/test_security_config.py pins both.)
     #
     # Counting only six here meant a mail-only or Direct-only instance could enumerate every
     # destination it actually uses and still be refused, with nothing in the refusal naming the two

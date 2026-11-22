@@ -2873,7 +2873,8 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     :data:`_ECH_SIDECAR_CREDENTIAL_USE` (BACKLOG #5528): urllib would dial ``user:pw@host`` as the
     host. It is refused here, not only at the egress gate, so a directly built connector refuses it.
     So, in fixed words that quote no part of the value, are at least a space or control character,
-    a ``?`` or ``#``, a non-ASCII character and a ``%`` in the host; the comments below say why each.
+    a ``?`` or ``#``, a non-ASCII character, a ``%`` in the host, a port that cannot be read and
+    port 0; the comments below say why each.
 
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
@@ -2922,6 +2923,23 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
         raise ValueError(
             "ech_sidecar must be a loopback address (the ECH sidecar runs beside the engine; a remote "
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
+        )
+    # BACKLOG #5528: refused here, not only at the egress gate, so a directly built connector and
+    # every other reader of this resolver refuse them too. A port of more than 4300 digits, leading
+    # zeros and all, passes the credential screen's port check and breaks int(); urlsplit's own
+    # text is not let out, and the raise comes after the handler ends.
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    if port == -1:
+        raise ValueError("ech_sidecar names a port that cannot be read as a number")
+    if port == 0:
+        # Not "not in the allowlist" at the gate: no entry can list port 0, so that would send the
+        # operator looking for an entry to add.
+        raise ValueError(
+            "ech_sidecar names port 0, which is not a port a sidecar can listen on and no "
+            "[egress].allowed_ech_sidecar entry can list; name the sidecar's own port"
         )
     return sidecar.rstrip("/")
 

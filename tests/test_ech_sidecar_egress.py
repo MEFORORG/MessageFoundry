@@ -300,6 +300,29 @@ def test_a_sidecar_at_port_0_is_refused_in_its_own_words() -> None:
         assert "is empty" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    ("port", "match"),
+    [("0", "names port 0"), ("0" * 5000 + "8123", "cannot be read as a number")],
+    ids=["zero", "too-long"],
+)
+def test_a_direct_build_refuses_a_port_the_gate_refuses(port: str, match: str) -> None:
+    """Row #5528 items 1, 11 and 20: port 0 and a port too long to read were refused only at the
+    gate, so a directly built connector, which skips the gate, accepted them."""
+    with pytest.raises(ValueError, match=match) as caught:
+        RestDestination(_ech(f"http://127.0.0.1:{port}"))
+    if match != "names port 0":
+        assert port not in str(caught.value)
+
+
+def test_an_ipv4_mapped_sidecar_matches_its_ipv4_entry() -> None:
+    """Row #5528 items 5 and 12: both spellings are loopback, and the mapped one can reach no
+    listener but its IPv4 address, so an entry for that address lists it."""
+    check_egress_allowed(_ech("http://[::ffff:127.0.0.1]:8123"), _egress("127.0.0.1:8123"))
+    check_egress_allowed(_ech("http://127.0.0.1:8123"), _egress("[::ffff:127.0.0.1]:8123"))
+    with pytest.raises(WiringError, match=r"allowed_ech_sidecar"):
+        check_egress_allowed(_ech("http://[::ffff:127.0.0.1]:8124"), _egress("127.0.0.1:8123"))
+
+
 def test_http_dial_port_refuses_a_scheme_it_has_no_default_for() -> None:
     assert http_dial_port("HTTP", None) == 80
     assert http_dial_port("https", 8443) == 8443
