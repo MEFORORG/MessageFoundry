@@ -13,6 +13,7 @@ positive controls. It is a text check: it does not run the store.
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import pytest
@@ -31,13 +32,25 @@ def _bullet(text: str) -> str:
     return " ".join(line.strip() for line in lines[start:end])
 
 
+@functools.cache
+def _doc() -> str:
+    return _DOC.read_text(encoding="utf-8")
+
+
 def _inventory_rows(text: str) -> list[list[str]]:
+    """The rows of section 2's at-rest inventory table, whose header opens with the four columns
+    read here, and no other table's. A moved header stops the test rather than passing it."""
     lines = text.splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith(_INVENTORY))
-    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("## "))
+    head = next(
+        i
+        for i in range(start + 1, len(lines))
+        if lines[i].startswith("| Location | Backends | Holds PHI? | Encrypted at rest?")
+    )
+    end = next(i for i in range(head, len(lines)) if not lines[i].startswith("|"))
     return [
         [cell.strip() for cell in line.strip().strip("|").split("|")]
-        for line in lines[start:end]
+        for line in lines[head + 2 : end]
         if line.startswith("| `")
     ]
 
@@ -62,19 +75,19 @@ def _problems(text: str) -> list[str]:
 
 
 def test_the_bullet_matches_the_inventory() -> None:
-    assert _problems(_DOC.read_text(encoding="utf-8")) == []
+    assert _problems(_doc()) == []
 
 
 @pytest.mark.parametrize("phrase", _CLOSED)
 def test_guard_detects_a_closed_claim(phrase: str) -> None:
-    text = _DOC.read_text(encoding="utf-8")
+    text = _doc()
     planted = text.replace("re-encrypts each column it", f"{phrase} column it", 1)
     assert planted != text, "the bullet's wording moved; update the plant"
     assert f"closed claim: {phrase!r}" in _problems(planted)
 
 
 def test_guard_detects_a_dropped_pointer() -> None:
-    text = _DOC.read_text(encoding="utf-8")
+    text = _doc()
     bullet_start = text.index(_LEAD)
     link_at = text.index(_LINK, bullet_start)
     planted = text[:link_at] + "(#nowhere)" + text[link_at + len(_LINK) :]
@@ -82,14 +95,14 @@ def test_guard_detects_a_dropped_pointer() -> None:
 
 
 def test_guard_detects_a_dropped_uncovered_sentence() -> None:
-    text = _DOC.read_text(encoding="utf-8")
-    planted = text.replace("Not\n  every column that can hold PHI is covered", "All covered", 1)
+    text = _doc()
+    planted = text.replace("Not every column that can hold PHI is covered", "All covered", 1)
     assert planted != text, "the bullet's wording moved; update the plant"
     assert "the bullet does not say some PHI columns are uncovered" in _problems(planted)
 
 
 def test_guard_detects_an_inventory_with_no_plaintext_phi_column() -> None:
-    text = _DOC.read_text(encoding="utf-8")
+    text = _doc()
     planted = "\n".join(
         line.replace("| **No**", "| **Yes**") if line.startswith("| `") else line
         for line in text.splitlines()

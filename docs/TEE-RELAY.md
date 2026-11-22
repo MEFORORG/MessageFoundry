@@ -188,10 +188,11 @@ consequences follow from it:
   that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead
   of replacing it; the open can be refused, for example for a named pipe, and that is an error and
   exit 1. It writes the platform's line endings.
-* **A failed write can leave a hidden temp file beside the target.** Where the writer does not
-  write in place, it writes the whole output to a `.<name>.*.tmp` file in the target's folder
-  first, and tries to remove that file when the write raises. At least a failed removal, a killed process
-  or a crash leaves it there. After a failed `--out`, look for one and delete it.
+* **A failed write can leave a temp file beside the target.** Where the writer does not write in
+  place, it first writes the whole output to a `.<name>.*.tmp` file in the target's folder, and it
+  tries to remove that file when the write raises. At least a failed removal, a killed process or a
+  crash leaves it there. The leading dot hides it on POSIX only. After a failed `--out`, look for
+  one and delete it.
 
 ### Purge
 

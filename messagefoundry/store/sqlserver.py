@@ -17326,10 +17326,10 @@ class SqlServerStore:
         its account locks that row, and the sweep reads the new key, or waits until the sweep
         commits and then finds the session ended. The session's account is read unlocked first:
         ``user_id`` never changes, and a session already gone locks nothing. Each path in this file
-        read for this change that locks both rows takes the account row first, so the re-key
-        closes no cycle with any of them. Read from the code; the race is replayed on the SQL
-        Server leg by ``tests/_federated_unbind_store_contract.py``, against store calls only, and
-        not against the TOTP re-enrolment's."""
+        that was read when this order was set (BACKLOG #4974) and that locks both rows takes the
+        account row first, so the re-key closes no cycle with any of them. Read from the code; the
+        race is replayed on the SQL Server leg by ``tests/_federated_unbind_store_contract.py``,
+        against store calls only, and not against a TOTP re-enrolment."""
 
         async def _link(cur: Any) -> None:
             retired_at = time.time() if now is None else now
