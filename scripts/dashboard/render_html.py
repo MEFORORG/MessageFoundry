@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import html
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -179,7 +180,7 @@ def line_chart(
         body.append(f'<line class="ref" x1="{PAD_L}" x2="{W - PAD_R}" y1="{y:.1f}" y2="{y:.1f}"/>')
         body.append(
             f'<text class="axis" x="{W - PAD_R}" y="{y - 4:.1f}" text-anchor="end">'
-            f"{esc(f'{reference:g}')}{esc(unit)} target</text>"
+            f"{esc(f'{reference:g}')}{esc(unit)} good bar</text>"
         )
     for name, css, pts in lines:
         run: list[str] = []
@@ -429,6 +430,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="print the directory the page would be written to, and write nothing",
     )
     args = ap.parse_args(argv)
+    # UTF-8 out, whatever the console: the caller reads the printed path back, and -I ignores
+    # PYTHONIOENCODING.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8", errors="strict")
     out = resolve_out_dir(args.out_dir, os.environ, _home(os.environ)).resolve()
     if args.print_out_dir:
         print(out)

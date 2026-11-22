@@ -951,3 +951,13 @@ def test_asvs_from_an_archive_names_the_archived_commit(tmp_path: Path) -> None:
     assert m.detail["engine_ref"] == "1a0c10fd3485+archive"
     assert "partial_error" not in m.detail
     assert "git archive of engine commit 1a0c10fd3485" in m.detail["tool"]
+
+
+def test_asvs_ignores_an_archive_ref_that_is_no_sha(tmp_path: Path) -> None:
+    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 1: 1 pass\n"
+    ctx = _asvs_ctx(tmp_path, printed)
+    ctx.archive_ref = "origin/main"
+    m = cm.Metric("asvs", "", "", "", "")
+    cm.c_asvs(ctx, m)
+    assert m.detail["engine_ref"] == "NO-GIT"
+    assert "no attributable ref" in m.detail["partial_error"]

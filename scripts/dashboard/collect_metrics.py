@@ -24,7 +24,7 @@ WHAT IT WRITES outside ``--out``, at least: two ``git fetch --no-tags origin mai
 vault and one in the engine checkout. Each moves ``refs/remotes/origin/main`` and also writes
 ``FETCH_HEAD`` and fetched objects, and may start git's own auto-maintenance. No local tag or branch
 is created; the release tag is resolved with ``git ls-remote``. Importing the stalled-PR checker can
-write ``__pycache__`` in the engine checkout. Vault files and downloads go to a temporary directory
+write ``__pycache__`` in the tree this script sits in. Vault files and downloads go to a temporary directory
 removed at exit.
 
 WINDOWED AND CURRENT METRICS. ``--weeks``/``--through`` bound the weekly series. The state metrics
@@ -854,7 +854,12 @@ def c_asvs(ctx: Context, m: Metric) -> None:
     tool = (
         "scripts/asvs/scorecard.py from the tree this collector runs from, whose ref engine= names"
     )
-    if engine_ref is not None and "NO-GIT" in engine_ref and ctx.archive_ref:
+    if (
+        engine_ref is not None
+        and "NO-GIT" in engine_ref
+        and ctx.archive_ref
+        and re.fullmatch(r"[0-9a-f]{7,40}", ctx.archive_ref)
+    ):
         # The tool ran from a git archive, so it could not stamp its own tree; the caller archived
         # that tree from this commit, and says so.
         engine_ref = f"{ctx.archive_ref}+archive"

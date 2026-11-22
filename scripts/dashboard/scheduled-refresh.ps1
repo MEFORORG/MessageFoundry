@@ -34,6 +34,11 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Unattended: a credential prompt would wait, hidden, until the task's time limit killed it.
+$env:GIT_TERMINAL_PROMPT = '0'
+$env:GCM_INTERACTIVE = 'never'
+# render_html.py prints its output path in UTF-8; read it back the same way.
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { [Console]::Error.WriteLine("WARNING: console encoding unchanged: $($_.Exception.Message)") }
 
 #: The engine paths the build reads from the archived copy: the whole of scripts/, so the list
 #: never lags what collect_metrics.py runs and imports.
@@ -65,8 +70,9 @@ function Get-FallbackOutDir {
 }
 
 function Write-BuildLog([string]$Dir, [string]$Line) {
-    # Only beside a page a render already published there: that render passed the work-tree
-    # refusal, and a directory that was refused, or never made, gets nothing written into it.
+    # Only beside a page a render published there, which needed the work-tree refusal to pass
+    # at that time. This run's own refusal is not asked again: a directory that became part of a
+    # work tree after a page was published there still gets this line.
     if (-not $Dir -or -not (Test-Path -LiteralPath (Join-Path $Dir 'index.html') -PathType Leaf)) {
         [Console]::Error.WriteLine("build.log not written (no published page in '$Dir'): $Line")
         return
