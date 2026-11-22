@@ -169,15 +169,18 @@ export function dropRows(f: Fixture): RowDropContext[] {
 function pageShell(bodyHtml: string): string {
   const options = [`<option value="">[select item]</option>`]
     .concat(
-      addMenuGroups().map(({ items }) =>
-        items
-          .map(
-            (item) =>
-              `<option value="${item.id}"` +
-              (item.anchorConstraint ? ` data-anchor="${item.anchorConstraint}"` : "") +
-              `>${item.label}</option>`,
-          )
-          .join(""),
+      addMenuGroups().map(
+        ({ group, items }) =>
+          `<optgroup label="${group}">` +
+          items
+            .map(
+              (item) =>
+                `<option value="${item.id}"` +
+                (item.anchorConstraint ? ` data-anchor="${item.anchorConstraint}"` : "") +
+                `>${item.label}</option>`,
+            )
+            .join("") +
+          `</optgroup>`,
       ),
     )
     .join("");
@@ -249,7 +252,23 @@ export function loadPage(f: Fixture): Page {
   };
 }
 
-/** Rebuild a jsdom-realm value with this realm's prototypes, so deepStrictEqual compares values only. */
+/** Rebuild a jsdom-realm value with this realm's prototypes, so deepStrictEqual compares values only.
+ * Keeps `undefined`-valued keys, as steps-mirror.test.ts's `plain` does and for the same reason. */
 export function plain<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value ?? null)) as T;
+  if (Array.isArray(value)) {
+    // Not `.map()`: it would build the result through the jsdom array's own constructor.
+    const out: unknown[] = [];
+    for (const item of value as unknown[]) {
+      out.push(plain(item));
+    }
+    return out as unknown as T;
+  }
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      out[key] = plain((value as Record<string, unknown>)[key]);
+    }
+    return out as unknown as T;
+  }
+  return value;
 }
