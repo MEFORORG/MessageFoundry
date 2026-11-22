@@ -5157,8 +5157,13 @@ class AuthService:
         totp_secret: str | None = None,
         totp_code: str | None = None,
         totp_code_read_at: float | None = None,
+        on_first_write: Callable[[], None] | None = None,
     ) -> ProvisionedAdministrator:
         """Create the first administrator from an operator-supplied name and credential (#1136).
+
+        ``on_first_write`` is called once, right before this method's first store write, after
+        every read and check that comes before the writes (BACKLOG #5067). A caller uses it to
+        tell a refusal raised before any write from one that may follow a written row.
 
         **IT ENROLS TOTP FROM BIRTH (ADR 0197 Amendment A, N-A, AC-A5).** ``totp_secret`` is the
         secret the command generated and showed at the terminal, and ``totp_code`` the code the
@@ -5310,6 +5315,8 @@ class AuthService:
             # or a session of theirs, onto the new Administrator. Cleared BEFORE anything is
             # written for the new holder, and before the role that would make a kept session an
             # Administrator session.
+            if on_first_write is not None:
+                on_first_write()
             await self._store.disable_totp(user_id)
             await self._store.delete_all_webauthn_credentials(user_id)
             # The command's longer budget here too (vault BACKLOG #3023 residual (4)): no request
@@ -5326,6 +5333,8 @@ class AuthService:
                 ) from missed
         else:
             user_id = uuid4().hex
+            if on_first_write is not None:
+                on_first_write()
             try:
                 await self._store.create_user(
                     user_id=user_id,

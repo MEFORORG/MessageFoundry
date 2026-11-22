@@ -3907,7 +3907,8 @@ def test_admin_unlock_exits_2_when_the_open_refuses_for_a_missing_key(
     monkeypatch.setattr(store_base, "open_store", keyless)
     assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 2
     error = json.loads(capsys.readouterr().out)["error"]
-    assert "holds no key" in error and "Nothing was written" in error
+    # What the open may have changed before it (BACKLOG #5067).
+    assert "holds no key" in error and "own writes did not run" in error
 
 
 def test_admin_unlock_reports_a_defect_rather_than_a_refusal(

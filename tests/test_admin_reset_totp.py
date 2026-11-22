@@ -1055,7 +1055,8 @@ def test_a_seed_that_does_not_open_at_the_write_is_a_refusal_not_a_race(
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
-    assert "Nothing was written" in error and "delete it" in error
+    # What the open may have changed before it (BACKLOG #5067), and no replacement.
+    assert "own writes did not run" in error and "delete it" in error
     assert "enrolled again" not in error
     monkeypatch.setattr(MessageStore, "open_totp_secret", real_open)
     assert _state(db) == before

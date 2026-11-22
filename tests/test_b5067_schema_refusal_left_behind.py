@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import sys
 import types
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -35,6 +37,8 @@ _ROLLED_BACK = "rolled its schema batch back and wrote no schema marker"
 _BOUND_NO_ROW = "No account or audit row was written"
 _BOUND_MAY_HAVE = "may already have changed the database"
 _UNUSED_ENTRY = "If you added the entry this run showed to the authenticator app, delete it"
+_OWN_WRITES = "own writes did not run, but the open may already have changed the database"
+_KEEP_ENTRY = "keep it for now: its seed may be stored"
 
 #: ``(backend, schema_management)`` -> whether the refusal names the database setting.
 _STORES = {
@@ -214,7 +218,10 @@ def test_provision_admin_key_refusal_at_the_write_open_names_the_entry(
     _refused_at_the_write(monkeypatch, "sqlserver", refusal)
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert "synthetic_table" in out, out
-    assert "nothing was written" in out, out
+    # The create open may have run its writing steps first, so not "nothing was written" (#5067
+    # PR 2755 open finding 2).
+    assert _OWN_WRITES in out and _RCSI in out, out
+    assert "nothing was written" not in out.lower(), out
     assert _UNUSED_ENTRY in out, out
     assert "Traceback" not in out, out
 
@@ -361,7 +368,8 @@ def test_provision_admin_names_no_entry_once_the_write_has_started(
     from messagefoundry.auth.service import AuthService
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
-    async def refusing(*_args: object, **_kwargs: object) -> object:
+    async def refusing(*_args: object, on_first_write: Callable[[], None], **_k: object) -> object:
+        on_first_write()
         raise InsecureHopRefused("synthetic hop refusal inside the write")
 
     monkeypatch.setattr(AuthService, "provision_first_administrator", refusing)
@@ -402,7 +410,7 @@ def test_provision_admin_pre_check_cipher_refusal_quotes_no_key_byte(
     monkeypatch.setattr(base, "open_store", refusing)
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert "xe9" not in out.lower(), out
-    assert "Nothing was written" in out, out
+    assert _OWN_WRITES in out, out
 
 
 def test_provision_admin_names_the_os_user_before_the_key_is_shown(
@@ -511,7 +519,8 @@ def test_a_cipher_refusal_once_the_write_has_started_reaches_the_floor(
     from messagefoundry.auth.service import AuthService
     from messagefoundry.store.crypto import CipherError
 
-    async def refusing(*_args: object, **_kwargs: object) -> object:
+    async def refusing(*_args: object, on_first_write: Callable[[], None], **_k: object) -> object:
+        on_first_write()
         raise CipherError("synthetic cipher refusal inside the write")
 
     monkeypatch.setattr(AuthService, "provision_first_administrator", refusing)
@@ -531,4 +540,243 @@ def test_a_cipher_refusal_once_the_write_has_started_reaches_the_floor(
     out = captured.out + captured.err
     assert code == 1, out
     assert _UNUSED_ENTRY not in out, out
+    assert "nothing was written" not in out.lower(), out
+
+
+# Engine PR 2755 open findings 1 and 2, and closing step 2 (BACKLOG #5067).
+
+
+def _provision_sqlite(shell: Path, *extra: str) -> list[str]:
+    """``provision-admin`` against a real SQLite store, so the open succeeds and the write is
+    reached."""
+    return [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        *extra,
+        "--db",
+        str(shell / "provision.db"),
+    ]
+
+
+def _service_raises(monkeypatch: pytest.MonkeyPatch, refusal: Exception, *, wrote: bool) -> None:
+    """The service's provision raises ``refusal``, after its first write when ``wrote``, or from a
+    read before any write. A console types the password and proves the enrolment."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.auth.service import AuthService
+
+    async def refusing(*_args: object, on_first_write: Callable[[], None], **_k: object) -> object:
+        if wrote:
+            on_first_write()
+        raise refusal
+
+    monkeypatch.setattr(AuthService, "provision_first_administrator", refusing)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    monkeypatch.setattr(
+        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+    )
+
+
+def test_a_cipher_refusal_from_a_read_before_the_write_is_could_not_start(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cipher refusal from the service's reads before its first write (finding 1) is could not
+    start, exit 2, with the advice to delete the shown entry, as at the open. The CLI marked the
+    write started before those reads, so it reached the dispatch floor's exit 1.
+
+    Mutation: set ``write_started`` before the service call again; the exit is then 1."""
+    from messagefoundry.store.crypto import CipherError
+
+    _service_raises(monkeypatch, CipherError("table synthetic_table holds a value"), wrote=False)
+    out = _run(_provision_sqlite(shell), capsys)
+    assert "synthetic_table" in out, out
+    assert _UNUSED_ENTRY in out, out
+    assert "The write had started" not in out, out
+
+
+def test_a_refusal_once_the_write_started_says_to_keep_the_shown_entry(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Closing step 2: once the write has started, the refusal names the shown entry, and says
+    to keep it until a later run completes, never to delete it now.
+
+    Mutation: drop the shown-key sentence from ``after_the_key``'s write-started branch."""
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    _service_raises(monkeypatch, InsecureHopRefused("synthetic hop refusal"), wrote=True)
+    out = _run(_provision_sqlite(shell), capsys)
+    assert "The write had started" in out, out
+    assert _KEEP_ENTRY in out and "Once a later run of this command completes" in out, out
+    assert _UNUSED_ENTRY not in out, out
+
+
+def test_a_refusal_once_the_write_started_names_no_entry_under_no_totp(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: with ``--no-totp`` no key was shown, so no entry is named."""
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    _service_raises(monkeypatch, InsecureHopRefused("synthetic hop refusal"), wrote=True)
+    settings = shell / "service.toml"
+    settings.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    out = _run(_provision_sqlite(shell, "--no-totp", "--service-config", str(settings)), capsys)
+    assert "The write had started" in out, out
+    assert _KEEP_ENTRY not in out and _UNUSED_ENTRY not in out, out
+
+
+async def test_the_service_calls_on_first_write_after_its_reads_and_before_its_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``on_first_write`` fires once, after the pre-write reads and before the first write, so a
+    read's refusal is reported as raised before any write (finding 1).
+
+    Mutation: call ``on_first_write`` at the top of the method; the refused read then fires it."""
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.store import MessageStore
+    from tests._admin_account import PROVISION_EMAIL, provision_totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        fired: list[str] = []
+        create_user = store.create_user
+
+        async def recording_create(*args: Any, **kwargs: Any) -> Any:
+            fired.append("create_user")
+            return await create_user(*args, **kwargs)
+
+        monkeypatch.setattr(store, "create_user", recording_create)
+
+        async def refused_read(*_a: object, **_k: object) -> object:
+            raise CipherError("synthetic read refusal")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(service, "_lookup_by_username", refused_read)
+            with pytest.raises(CipherError):
+                await service.provision_first_administrator(
+                    username="site-admin",
+                    password=_PASSWORD,
+                    notify_email=PROVISION_EMAIL,
+                    actor="test",
+                    on_first_write=lambda: fired.append("first write"),
+                    **provision_totp(),
+                )
+        assert fired == [], fired
+
+        await service.provision_first_administrator(
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            on_first_write=lambda: fired.append("first write"),
+            **provision_totp(),
+        )
+        assert fired == ["first write", "create_user"], fired
+    finally:
+        await store.close()
+
+
+#: ``(backend, schema_management, refusal kind)`` -> what the text names: the schema step, the
+#: snapshot options, the salt record; ``None`` where it names nothing and says nothing was written.
+_STEPS: dict[tuple[str, str, str], tuple[bool, bool, bool] | None] = {
+    ("sqlserver", "auto", "cipher"): (True, True, True),
+    ("postgres", "auto", "keyless"): (True, False, False),
+    ("postgres", "external", "cipher"): (False, False, True),
+    ("postgres", "external", "keyless"): None,
+}
+
+
+def _steps_refusal(kind: str) -> Exception:
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
+
+    if kind == "cipher":
+        return CipherError("table synthetic_table holds a value no key opens")
+    return StoreKeylessError("table synthetic_table holds an encrypted value")
+
+
+def _assert_steps(out: str, expected: tuple[bool, bool, bool] | None) -> None:
+    assert "synthetic_table" in out, out
+    if expected is None:
+        assert "nothing was written" in out.lower() and _OWN_WRITES not in out, out
+        return
+    schema, options, salt = expected
+    assert _OWN_WRITES in out, out
+    assert "nothing was written" not in out.lower(), out
+    assert ("the schema, which the open creates or migrates" in out) is schema, out
+    assert (_RCSI in out) is options, out
+    assert ("the store's salt record" in out) is salt, out
+
+
+@pytest.mark.parametrize(("backend", "management", "kind"), _STEPS)
+def test_provision_admin_write_open_key_refusal_says_what_the_open_may_have_changed(
+    backend: str,
+    management: str,
+    kind: str,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Finding 2: a key or cipher refusal at the write's ``create=True`` open can follow the
+    open's own writing steps, so the text names them rather than say nothing was written. A
+    keyless open binds no salt, and under ``external`` the open runs no DDL.
+
+    Mutation: return ``None`` from ``_open_refusal_left_behind`` for these classes again."""
+    _refused_at_the_write(monkeypatch, backend, _steps_refusal(kind))
+    out = _run(_provision(_settings(shell, backend, management)), capsys)
+    _assert_steps(out, _STEPS[backend, management, kind])
+    assert _UNUSED_ENTRY in out, out
+
+
+@pytest.mark.parametrize(("backend", "management", "kind"), _STEPS)
+def test_provision_admin_pre_check_key_refusal_says_what_the_open_may_have_changed(
+    backend: str,
+    management: str,
+    kind: str,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Finding 2 at the pre-check: an existing store's open, migrations included, comes first.
+
+    Mutation: print "Nothing was written" again in the pre-check's key or cipher arm."""
+    _open_refuses_with(monkeypatch, _steps_refusal(kind))
+    out = _run(_provision(_settings(shell, backend, management)), capsys)
+    _assert_steps(out, _STEPS[backend, management, kind])
+
+
+def test_provision_admin_pre_check_key_probe_of_an_absent_store_wrote_nothing(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: with no SQLite store yet, the pre-check only resolves the key and opens
+    nothing, so its refusal still says nothing was written."""
+    from messagefoundry.store import base
+
+    def refusing(*_a: object, **_k: object) -> object:
+        raise _steps_refusal("cipher")
+
+    monkeypatch.setattr(base, "build_store_cipher", refusing)
+    out = _run(_provision_sqlite(shell), capsys)
+    assert "synthetic_table" in out and "Nothing was written" in out, out
+    assert _OWN_WRITES not in out, out
+
+
+def test_admin_reset_totp_keyless_chain_refusal_says_what_the_open_may_have_changed(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 2 at ``admin-reset-totp``: a keyless-chain refusal comes after a full open, which
+    under ``auto`` may have migrated the schema and switched the snapshot options on.
+
+    Mutation: return ``None`` from ``_open_refusal_left_behind`` for this class again."""
+    from messagefoundry.store import base
+
+    _open_refuses_with(monkeypatch, base.KeylessAuditChainRefused("mefor", "[store].synthetic"))
+    settings = _settings(shell, "sqlserver", "auto")
+    out = _run(["admin-reset-totp", "--username", "ops", "--service-config", str(settings)], capsys)
+    assert "[store].synthetic" in out, out
+    assert _OWN_WRITES in out and _RCSI in out, out
     assert "nothing was written" not in out.lower(), out
