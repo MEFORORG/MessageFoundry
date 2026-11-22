@@ -679,9 +679,11 @@ async def test_a_name_that_is_a_prefix_of_another_is_told_apart(
     # would tell the operator to drop "vv after" when "vv" stopped the change. Each cause is
     # SQLite's own text, and views[0] is the broken view. A view already broken fails SQLite's
     # first check, with no suffix; a view the change breaks fails its re-check after the change,
-    # with the "after drop column" suffix. Where both names rank first the text cannot settle the
-    # pair, so both views are named: "vv after after drop column" fits both, and in the two
-    # broken-vv pairs the healthy view's own name holds the suffix or the message. SQLite writes
+    # with the "after drop column" suffix. Where both names rank first the code does not pick
+    # between them, so both views are named. In the two broken-vv pairs the text itself cannot
+    # settle the pair, since the healthy view's own name holds the suffix or the message; "vv after
+    # after drop column" is one a list of SQLite's suffixes could settle, and the code keeps none
+    # (see _foreign_objects). SQLite writes
     # ": " after a name, so "a" is no candidate for "a:b". A view under a name this build creates
     # among the candidates gives the plain remedy, so nothing is returned.
     from messagefoundry.store.schema_verify import _foreign_objects
@@ -724,11 +726,48 @@ async def test_names_the_text_cannot_tell_apart_are_all_named_in_the_remedy(
     assert info.value.cause == cause
     assert isinstance(info.value.__cause__, sqlite3.OperationalError)
     assert str(info.value) == (
-        f"store {path}: drop whichever of these stops its upgrade, then restart: the view 'vv' and"
-        " the view 'vv after drop column'. The error's text could name each of them, and this build"
-        " created none of them. Save each one's CREATE statement from sqlite_master before you"
-        f" drop it, so a healthy one can be restored. The schema step failed: {cause}."
+        f"store {path}: save each one's CREATE statement, then drop whichever stops its upgrade,"
+        " and restart: the view 'vv' and the view 'vv after drop column'. Each CREATE statement is"
+        " the sql column of its sqlite_master row, and saving it lets a healthy one be restored."
+        " The error's text could name each of them, and this build created none of them. The"
+        f" schema step failed: {cause}."
     )
+
+
+@pytest.mark.parametrize(
+    "service_path",
+    [
+        r"C:\ProgramData\MessageFoundry\data\messagefoundry.db",
+        r"C:\ProgramData\MessageFoundry\data\stores\production\instance-a\messagefoundry.db",
+    ],
+)
+async def test_the_multi_name_instruction_survives_the_cut(
+    tmp_path: Path, service_path: str
+) -> None:
+    # safe_exc cuts a rendered error at 200 characters. With long names on a service path, the whole
+    # instruction, the save step included, must still reach the operator; the names may not.
+    from messagefoundry.redaction import safe_exc
+
+    long = "daily_census_by_unit_and_attending_for_the_weekly_report"
+    path = tmp_path / "cut.db"
+    _sql(
+        path,
+        "CREATE TABLE t (a, c)",
+        "CREATE TABLE u (c)",
+        f'CREATE VIEW "{long}" AS SELECT c FROM t',
+        f'CREATE VIEW "{long} after drop column" AS SELECT c FROM u',
+    )
+    async with _connected(path) as db:
+        with pytest.raises(SchemaMismatchError) as info:
+            await run_schema_step(
+                db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
+            )
+    text = str(info.value)
+    assert long in text, text
+    rendered = safe_exc(SchemaMismatchError(text.replace(str(path), service_path)))
+    assert f"store {service_path}: " in rendered, rendered
+    for step in ("save each one's CREATE statement", "drop whichever", "restart"):
+        assert step in rendered, (step, rendered)
 
 
 async def test_three_names_the_text_cannot_tell_apart_are_listed_in_the_remedy(
@@ -749,8 +788,9 @@ async def test_three_names_the_text_cannot_tell_apart_are_listed_in_the_remedy(
                 db, db.execute("ALTER TABLE t DROP COLUMN c"), path=path, counts_under_dek=False
             )
     assert str(info.value).startswith(
-        f"store {path}: drop whichever of these stops its upgrade, then restart: the view 'vv',"
-        " the view 'vv after drop column' and the view 'vv after drop column: no such column'."
+        f"store {path}: save each one's CREATE statement, then drop whichever stops its upgrade,"
+        " and restart: the view 'vv', the view 'vv after drop column' and the view 'vv after drop"
+        " column: no such column'."
     ), str(info.value)
 
 

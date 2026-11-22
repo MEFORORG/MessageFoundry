@@ -454,16 +454,19 @@ async def run_schema_step[T](
                 cause=cause,
             ) from exc
         if foreign:
-            # The text cannot tell these apart, so the remedy names them all rather than tell the
-            # operator to drop one that may be healthy. The instruction leads and the names follow
-            # it, so the 200-character cut keeps the instruction however long the names are.
+            # _foreign_objects does not pick among these, so the remedy names them all rather than
+            # tell the operator to drop one that may be healthy. The instruction, its save step
+            # included, leads and is short: safe_exc's 200-character cut keeps all of it on a store
+            # path of up to 107 characters (measured). The names follow it, so a long path or a
+            # long list loses names, and whatever follows them, to the cut.
             listed = [f"the {kind} {name!r}" for kind, name in foreign]
             names = f"{', '.join(listed[:-1])} and {listed[-1]}"
             raise SchemaMismatchError(
-                f"store {path}: drop whichever of these stops its upgrade, then restart: {names}."
-                f" The error's text could name each of them, and this build created none of them."
-                f" Save each one's CREATE statement from sqlite_master before you drop it, so a"
-                f" healthy one can be restored. The schema step failed: {cause}.",
+                f"store {path}: save each one's CREATE statement, then drop whichever stops its"
+                f" upgrade, and restart: {names}. Each CREATE statement is the sql column of its"
+                f" sqlite_master row, and saving it lets a healthy one be restored. The error's text"
+                f" could name each of them, and this build created none of them. The schema step"
+                f" failed: {cause}.",
                 cause=cause,
             ) from exc
         if counts_under_dek is None:
@@ -490,10 +493,15 @@ async def _foreign_objects(db: aiosqlite.Connection, cause: str) -> tuple[tuple[
     change, and the same text when a view named ``vv after drop column`` was broken already. With
     ``vv`` and ``vv: no such column``, ``vv``'s own "error in view vv: no such column: c" fits both
     too. Other pairs a list of SQLite's suffixes could settle, as ``vv`` against ``vv after`` for
-    "error in view vv after after drop column: ...". The code keeps no such list: only some
-    suffixes are measured, and a suffix missing from the list would name a healthy object alone. So
-    where names collide the ambiguity remains, and the remedy names each candidate, which may
-    include a healthy one. With no first-rank name, the longest last-rank name is the one returned.
+    "error in view vv after after drop column: ...". The code keeps no such list, because only some
+    suffixes are measured and a list that missed one would name a healthy object alone. The " after "
+    rank is itself a one-entry suffix assumption, with the same residual: a suffix SQLite writes
+    that does not start " after " would rank the culprit last and a healthy first-rank name would be
+    named alone. Under a suffix " during x", for one, which no test here has measured, a healthy
+    ``vv during x`` beside a broken ``vv`` would be named for "error in view vv during x: ...". At
+    least " after rename" and " after drop column" start " after " (SQLite 3.50.4). So where names
+    collide the ambiguity remains, and the remedy names each candidate, which may include a healthy
+    one. With no first-rank name, the longest last-rank name is the one returned.
 
     The colon and " after " share a rank because a quoted name may hold either: with ``vv`` and
     ``vv: x``, "error in view vv: x after rename: ..." must not name ``vv`` alone. Where any name
