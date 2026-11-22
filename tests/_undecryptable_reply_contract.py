@@ -39,7 +39,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from tests._erased_reply_contract import BODY, LOOP, RAW, REPLY, children, status_of
-from tests._queue_tag_contract import RawFetch, RawSql
+from tests._queue_tag_contract import RawFetch, RawSql, _handoff
 from tests._store_audit import no_operator_audit
 
 #: Rewrites the bad origin's ``response.body`` cell so it no longer opens. Takes ``(fetch, raw,
@@ -192,17 +192,13 @@ def faulting_cipher(store: Any) -> Iterator[FaultingCipher]:
         store._cipher = real
 
 
-async def handoff(store: Any, token_id: str) -> bool:
-    produced: bool = await store.ingress_handoff(
-        response_row_id=token_id,
-        loopback_channel_id=LOOP,
-        correlation_depth_cap=8,
-        control_id=None,
-        message_type=None,
-        summary=None,
-        now=4.0,
+async def _plant_metadata(cipher: Any, raw: RawSql, mid: str) -> None:
+    """Seal a valid origin metadata cell for ``mid`` under ``cipher``."""
+    sealed = cipher.encrypt(
+        '{"correlation_depth": 0}',
+        aad=message_cell_aad("metadata", message_id=mid, channel_id="IB_REAL"),
     )
-    return produced
+    await raw("UPDATE messages SET metadata=? WHERE id=?", (sealed, mid))
 
 
 async def _claimed_head(store: Any) -> tuple[str, Any]:
@@ -213,14 +209,17 @@ async def _claimed_head(store: Any) -> tuple[str, Any]:
 
 
 async def _cell(fetch: RawFetch, which: str, mid: str) -> str:
-    sql = {
-        "ref": "SELECT payload AS v FROM queue WHERE message_id=? AND stage='response'",
-        "reply": "SELECT body AS v FROM response WHERE message_id=?",
-        "metadata": "SELECT metadata AS v FROM messages WHERE id=?",
-    }[which]
-    [row] = await fetch(sql, (mid,))
-    assert row["v"], which  # a blank cell is never opened, so the fault would not fire
-    return str(row["v"])
+    if which == "ref":
+        value = (await token_of(fetch, mid))["payload"]
+    else:
+        sql = {
+            "reply": "SELECT body AS v FROM response WHERE message_id=?",
+            "metadata": "SELECT metadata AS v FROM messages WHERE id=?",
+        }[which]
+        [row] = await fetch(sql, (mid,))
+        value = row["v"]
+    assert value, which  # a blank cell is never opened, so the fault would not fire
+    return str(value)
 
 
 async def _assert_token_live(store: Any, fetch: RawFetch, mid: str) -> None:
@@ -236,20 +235,16 @@ def _open_fault_propagates(which: str, error: type[CipherError]) -> ContractCase
     async def case(store: Any, fetch: RawFetch, raw: RawSql) -> None:
         mid, item = await _claimed_head(store)
         if which == "metadata":  # a captured message carries none, and NULL is never opened
-            sealed = store._cipher.encrypt(
-                '{"correlation_depth": 0}',
-                aad=message_cell_aad("metadata", message_id=mid, channel_id="IB_REAL"),
-            )
-            await raw("UPDATE messages SET metadata=? WHERE id=?", (sealed, mid))
+            await _plant_metadata(store._cipher, raw, mid)
         target = await _cell(fetch, which, mid)
         with faulting_cipher(store) as fault:
             fault.target, fault.open_error = target, error("synthetic")
             with pytest.raises(error):
-                await handoff(store, item.id)
+                await _handoff(store, item.id, LOOP)
             await _assert_token_live(store, fetch, mid)
             # CONTROL: the same token hands off once the fault clears, so it was the fault.
             fault.heal()
-            assert await handoff(store, item.id) is True
+            assert await _handoff(store, item.id, LOOP) is True
         assert len(await children(fetch)) == 1
 
     case.__name__ = f"handoff_{which}_{error.__name__}_propagates"
@@ -277,7 +272,7 @@ async def seal_failure_stays_a_hard_stop(store: Any, fetch: RawFetch, _raw: RawS
     with faulting_cipher(store) as fault:
         fault.seal_error = CipherError("synthetic invocation ceiling")
         with pytest.raises(CipherError, match="invocation ceiling"):
-            await handoff(store, item.id)
+            await _handoff(store, item.id, LOOP)
         fault.heal()
     await _assert_token_live(store, fetch, mid)
 
@@ -287,11 +282,7 @@ async def origin_under_an_unheld_key_dead_letters(store: Any, fetch: RawFetch, r
     the good token behind it re-ingresses, so the handoff did not dead-letter everything."""
     bad = await captured(store, control="HO-BAD", now=1.0)
     good = await captured(store, control="HO-GOOD", now=2.0)
-    sealed = make_cipher(generate_key(), write_v2=True).encrypt(
-        '{"correlation_depth": 0}',
-        aad=message_cell_aad("metadata", message_id=bad, channel_id="IB_REAL"),
-    )
-    await raw("UPDATE messages SET metadata=? WHERE id=?", (sealed, bad))
+    await _plant_metadata(make_cipher(generate_key(), write_v2=True), raw, bad)
     before = await token_of(fetch, bad)
     step = runner(store)
     for _ in range(2):
@@ -322,7 +313,7 @@ async def tampered_reply_in_the_handoff_dead_letters(
     await spoil_with_a_wrong_cell(fetch, raw, bad, good)
     item = await store.claim_next_fifo(LOOP, now=3.0, stage=Stage.RESPONSE.value)
     assert item is not None and item.message_id == bad
-    assert await handoff(store, item.id) is True
+    assert await _handoff(store, item.id, LOOP) is True
     assert (await token_of(fetch, bad))["status"] == OutboxStatus.DEAD.value
     events = await store.events_for(bad)
     assert [e for e in events if e["event"] == "dead" and "reply undecryptable" in str(e["detail"])]

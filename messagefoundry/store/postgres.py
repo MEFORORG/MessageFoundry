@@ -6466,7 +6466,7 @@ class PostgresStore:
                             REINGRESS_TOKEN_TAG_FAILED,
                             "re-ingress work-row failed its integrity check",
                         )
-                    except Exception as exc:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                    except Exception as exc:  # noqa: BLE001 - a decrypt/parse verdict = an unrecoverable ref
                         if is_transient_open_failure(exc):  # BACKLOG #5727: no verdict on the cell
                             raise
                         # A corrupt/undecryptable work-row reference can never be re-ingressed.
