@@ -87,6 +87,7 @@ def acquire(
     barrier: Path | None = None,
     witness: Path | None = None,
     prove_owned: bool = False,
+    attempted: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Take the lock, optionally hold it, release. Prints ACQUIRED on success.
 
@@ -108,6 +109,13 @@ def acquire(
             f"while (-not (Test-Path (Join-Path '{barrier}' 'go'))) {{ "
             f"if ((Get-Date) -gt $bd) {{ throw 'barrier timeout' }}; "
             f"Start-Sleep -Milliseconds 10 }}; "
+        )
+    if attempted is not None:
+        # Marks the first real create attempt, which the barrier alone cannot place.
+        gate += (
+            "$realOpen = ${function:Open-CoordLockFile}; "
+            "function Open-CoordLockFile([string]$Path) { "
+            f"[IO.File]::WriteAllText('{attempted}', ''); & $realOpen $Path }}; "
         )
     enter = leave = ""
     if witness is not None:
@@ -330,26 +338,37 @@ def _delete_pending(lock: Path, release: Path) -> Iterator[None]:
         yield
     finally:
         release.write_text("", encoding="utf-8")
-        holder.wait(timeout=60)
+        try:
+            holder.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait(timeout=10)
+        if holder.stdout is not None:
+            holder.stdout.close()
 
 
 def test_a_delete_pending_lock_is_waited_out(repo: Path, tmp_path: Path) -> None:
     """The name clears when the last handle closes, so this is a wait and not a failure.
 
-    The barrier puts the claimant's first attempt inside the pending window whatever pwsh's cold
-    start costs; without it a slow start arrives after the name cleared and passes on unfixed code.
+    The name is released only after the claimant has really attempted the create, so the attempt
+    is inside the pending window however long its start-up took.
     """
     barrier = tmp_path / "barrier"
     barrier.mkdir()
     release = tmp_path / "release"
+    attempted = tmp_path / "attempted"
     with _delete_pending(_lock_file(repo), release), ThreadPoolExecutor(max_workers=1) as pool:
-        claim = pool.submit(acquire, repo, timeout=30, barrier=barrier, prove_owned=True)
+        claim = pool.submit(
+            acquire, repo, timeout=30, barrier=barrier, prove_owned=True, attempted=attempted
+        )
         deadline = time.monotonic() + 90
         while not list(barrier.glob("ready-*")):
             assert time.monotonic() < deadline, "the claimant never reached the barrier"
             time.sleep(0.02)
         (barrier / "go").write_text("", encoding="utf-8")
-        time.sleep(3.0)  # inside lock.ps1's 5 s delete-pending wait
+        while not attempted.exists():
+            assert time.monotonic() < deadline, "the claimant never attempted the create"
+            time.sleep(0.02)
         release.write_text("", encoding="utf-8")
         proc = claim.result()
     assert "OWNED" in proc.stdout, f"returned without holding the lock: {proc.stdout}{proc.stderr}"

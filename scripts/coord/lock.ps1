@@ -53,6 +53,9 @@ function Enter-CoordLock {
         # every worktree AND the primary checkout resolve to the same lock.
         [string]$Repo
     )
+    # A caller's SilentlyContinue would otherwise suppress the throws below and run on into the block
+    # that owns and deletes the lock file.
+    $ErrorActionPreference = 'Stop'
     $gitArgs = @()
     if ($Repo) { $gitArgs = @("-C", $Repo) }
     $common = (& git @gitArgs rev-parse --path-format=absolute --git-common-dir 2>$null)
@@ -64,9 +67,9 @@ function Enter-CoordLock {
     if (-not $safe) { throw "Enter-CoordLock: name '$Name' reduces to nothing usable." }
     $lock = Join-Path $dir "$safe.lock"
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $deniedSince = $null
-    $retriedAbsent = $false
+    # Monotonic, so a clock or daylight-saving step cannot stretch or collapse either bound.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $deniedAt = $null
     while ($true) {
         try {
             $fs = Open-CoordLockFile $lock
@@ -74,29 +77,28 @@ function Enter-CoordLock {
             # NTFS raises this, not IOException, for a name in delete-pending (measured on Windows
             # 10.0.26300, NTFS, with the legacy disposition; a plain File.Delete there frees the name at
             # once). A real denial raises it too. Pending shows as a file that is still there, and it
-            # clears when the last handle closes, so only that shape earns a short wait. Anything else
-            # gets one retry, for a pending delete that finished between the two reads. Either way
-            # this reports the denial: the text in a file being deleted names no holder.
-            $now = Get-Date
-            if (-not $deniedSince) { $deniedSince = $now }
-            if (Test-Path -LiteralPath $lock -PathType Leaf) {
-                $wait = ($now -le $deadline) -and ($now -lt $deniedSince.AddSeconds(5))
-            } else {
-                $wait = -not $retriedAbsent
-                $retriedAbsent = $true
-            }
-            if ($wait) {
+            # clears when the last handle closes, so it earns a short bounded wait. A directory at the
+            # path can never clear and fails at once. Either way this reports the denial: the text in
+            # a file being deleted names no holder.
+            $now = $clock.Elapsed.TotalSeconds
+            if ($null -eq $deniedAt) { $deniedAt = $now }
+            $canClear = -not (Test-Path -LiteralPath $lock -PathType Container)
+            if ($canClear -and $now -le $TimeoutSeconds -and ($now - $deniedAt) -lt 5) {
                 Start-Sleep -Milliseconds 50
                 continue
             }
             throw (
                 "Enter-CoordLock: access denied creating the '$safe' lock at '$lock'.`n" +
-                "  This is a path or permission fault, not a wait on another session. Check that path.`n" +
+                "  The file may still be pending deletion, so retry; if this repeats, check that path`n" +
+                "  and its permissions.`n" +
                 "  $($_.Exception.Message)")
         } catch [System.IO.IOException] {
-            $deniedSince = $null
-            $retriedAbsent = $false
-            if ((Get-Date) -gt $deadline) {
+            # Only a name that is taken is contention. Disk full, a missing directory or an over-long
+            # path would otherwise spin to the timeout and be reported as a wedged holder.
+            $io = if ($_.Exception.InnerException) { $_.Exception.InnerException } else { $_.Exception }
+            if (($io.HResult -band 0xFFFF) -notin 0x50, 0x20) { throw }  # FILE_EXISTS, SHARING_VIOLATION
+            $deniedAt = $null
+            if ($clock.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
                 $held = "(unreadable)"
                 try { $held = (Get-Content -LiteralPath $lock -Raw -EA Stop).Trim() } catch { }
                 throw (

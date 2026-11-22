@@ -406,7 +406,10 @@ function Get-OccupancyForHolder([string]$HeldPath) {
         $heldNorm = ConvertTo-Norm $HeldPath
         if ($script:OccupancyByWorktree.ContainsKey($heldNorm)) { return $script:OccupancyByWorktree[$heldNorm] }
         $key = Get-RepoCommonDir $HeldPath
-        if (-not $key -or $script:OccupancyProbedRepos.ContainsKey($key)) { return $false }
+        if (-not $key -or $script:OccupancyProbedRepos.ContainsKey($key)) {
+            $script:OccupancyByWorktree[$heldNorm] = $false
+            return $false
+        }
         # Recorded first, so a probe that throws is not re-run for every holder in this repository.
         $script:OccupancyProbedRepos[$key] = $true
         $occ = Get-WorktreeOccupancy -Repo $HeldPath
@@ -416,10 +419,13 @@ function Get-OccupancyForHolder([string]$HeldPath) {
         foreach ($w in @($occ.Worktrees)) {
             if ($w) { $script:OccupancyByWorktree[(ConvertTo-Norm $w.Path)] = $answer }
         }
-        if ($script:OccupancyByWorktree.ContainsKey($heldNorm)) { return $script:OccupancyByWorktree[$heldNorm] }
+        if (-not $script:OccupancyByWorktree.ContainsKey($heldNorm)) { $script:OccupancyByWorktree[$heldNorm] = $false }
+        return $script:OccupancyByWorktree[$heldNorm]
+    }
+    catch {
+        if ($heldNorm) { $script:OccupancyByWorktree[$heldNorm] = $false }
         return $false
     }
-    catch { return $false }
 }
 
 function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
@@ -832,7 +838,7 @@ function Show-List {
                 # The probe could not run -- no Claude config root, or it failed. Says what it knows
                 # and no more: the path is there. It must NOT claim a session it never looked for.
                 'present' {
-                    $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe could not run]"
+                    $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe gave no answer for this path]"
                 }
                 # THE THIRD STATE, and the listing is the surface that matters (BACKLOG #1348).
                 # -List is what a dispatching seat reads to decide where to spend attention, so a
@@ -916,7 +922,7 @@ if ($Release) {
             }
             'present' {
                 Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
-                Write-Host "  OCCUPANCY UNKNOWN: the session probe could not run, so this does NOT say whether"
+                Write-Host "  OCCUPANCY UNKNOWN: the session probe gave no answer for this path, so this does NOT say whether"
                 Write-Host "  anyone is in it. Treat that as MORE reason to coordinate, not less."
                 Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
                 Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
@@ -1183,7 +1189,7 @@ try {
         }
         'present' {
             Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
-            Write-Host "  OCCUPANCY UNKNOWN: the session probe could not run, so this does NOT say whether"
+            Write-Host "  OCCUPANCY UNKNOWN: the session probe gave no answer for this path, so this does NOT say whether"
             Write-Host "  anyone is in it. Treat that as MORE reason to coordinate, not less."
             Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
             Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"
