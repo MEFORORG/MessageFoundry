@@ -1204,6 +1204,22 @@ def _posix_tool_env() -> dict[str, str]:
     return env
 
 
+#: The timeout for a short subprocess here: a bash run of an extracted step, or a one-line probe.
+#: It catches a hang. It does not measure speed: nothing in this file reads a duration.
+#:
+#: WHY IT STAYS AT 60 S (BACKLOG #3633 item 2). That row records one overrun: on engine PR 2327's
+#: run 38674972250, `over-long-body[console]` took 84.5 s in notes.sh on windows-2025, and that
+#: PR's CI triage comment reports the same tree passing on windows-2022 in the same run. On a
+#: Windows 11 dev box the test took about 1.6 s (measured 2026-11-21). Nothing here was measured on
+#: a windows-2025 runner. Raising this alone would not help. The CI test legs run pytest with a
+#: per-test `--timeout`, its matrix `pytest_timeout` in ci.yml: 60 s on ubuntu, 120 s on Windows.
+#: With `--timeout-method=thread`, pytest-timeout ends the whole worker process when that fires,
+#: rather than failing the one test with this call's output. So on ubuntu a value above 60 s is
+#: never reached, and on Windows one above 120 s trades a named failure for a dead worker. Allowing
+#: a longer stall needs the per-test cap raised too, for these tests or for the leg.
+_HANG_TIMEOUT_S = 60
+
+
 def _run_leak_gate(bash: str, workdir: Path, script: Path, env: dict[str, str]) -> tuple[int, str]:
     """Run the extracted step from ``workdir`` the way the runner would; return (rc, combined output).
 
@@ -1221,7 +1237,7 @@ def _run_leak_gate(bash: str, workdir: Path, script: Path, env: dict[str, str]) 
         cwd=str(workdir),
         env=env,
         capture_output=True,
-        timeout=60,
+        timeout=_HANG_TIMEOUT_S,
     )
     return proc.returncode, (proc.stdout + proc.stderr).decode("utf-8", "replace")
 
@@ -3227,7 +3243,7 @@ def _run_probe(
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=_HANG_TIMEOUT_S,
         check=False,
     )
 
@@ -3857,7 +3873,11 @@ def _run_notes_prefix(tmp_path: Path, case: str, changelog: str, *, bounded: boo
     env["GITHUB_REPOSITORY"] = "MEFORORG/MessageFoundry"
     bash = require_bash(tmp_path, env)
     proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
-        [bash, "-e", str(script)], cwd=str(work), env=env, capture_output=True, timeout=60
+        [bash, "-e", str(script)],
+        cwd=str(work),
+        env=env,
+        capture_output=True,
+        timeout=_HANG_TIMEOUT_S,
     )
     out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
     assert proc.returncode == 0, (
