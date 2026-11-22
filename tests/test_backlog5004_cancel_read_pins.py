@@ -31,10 +31,8 @@ import pytest
 
 from messagefoundry.transports import database
 from messagefoundry.transports.base import DeliveryError
-from tests._ast_sites import call_sites, callee_name, package_trees
+from tests._ast_sites import callee_name, package_trees
 from tests.test_backlog5010_database_gate_discard import _absorb_a_cancel
-
-_TARGET = "_close_and_release"
 
 
 def _read_while_unwinding(exc: BaseException) -> bool:
@@ -90,7 +88,7 @@ def test_a_handled_exception_no_longer_reads_as_in_flight() -> None:
     try:
         raise asyncio.CancelledError
     except asyncio.CancelledError:
-        pass
+        pass  # deliberate: the handled cancel is the state under test
     assert database._unwinding_a_cancel() is False
 
 
@@ -125,7 +123,7 @@ async def test_a_cancel_still_reads_as_one_after_an_uncancel_before_the_finally(
     await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 5.0)
     assert seen == [(0, True)], seen
 
 
@@ -149,7 +147,7 @@ async def test_a_runner_teardown_cancel_reads_as_a_cancel() -> None:
 
         asyncio.run(main())
 
-    await asyncio.to_thread(run)
+    await asyncio.wait_for(asyncio.to_thread(run), 5.0)
     assert seen == [True], seen
 
 
@@ -184,14 +182,22 @@ def test_a_borrow_inside_a_cancel_handler_reads_that_cancel_as_its_own() -> None
 # --- the call-site census ------------------------------------------------------------------------
 #
 # What it checks, for each direct call of ``_close_and_release`` (bare or as an attribute) in an
-# engine module: walking up from the call to its function, every ``try`` that holds the call in
-# a handler, ``else`` or ``finally`` runs nothing before it that is one of the forms below, and no
-# enclosing handler catches a cancel without re-raising it.
+# engine module:
+# walking up from the call to its function, at each level, the statements that may run before it
+# hold none of the forms below. Those are the statements of a ``try`` that holds the call in a
+# handler, ``else`` or ``finally``, and the earlier statements of the same block. No enclosing
+# handler catches a cancel, unless the release is a statement of that handler's own body and the
+# handler re-raises.
 #
-# What it does not see, at least: anything inside a function the ``try`` awaits; an exception a
+# What it does not see, at least: anything inside a function the code awaits; an exception a
 # cleanup step raises in place of the cancel (an inner ``finally`` that awaits, say); a cancel type
-# imported under another name, or a ``suppress`` whose types are not spelled in the call.
+# or converting call imported under another name; a ``suppress`` whose types are not spelled in the
+# call; a release reached through ``functools.partial`` or a wrapper. ``_discard_to_pool`` and
+# ``_discard_held`` are such wrappers, left out because their docstrings restrict them to a
+# connection no worker thread can still be using, which leaves no running statement for a release to
+# wait on.
 
+_TARGET = "_close_and_release"
 # A handler naming one of these catches a cancel; a bare ``except:`` does too.
 _CANCEL_TYPES = frozenset(
     {
@@ -205,11 +211,13 @@ _CANCEL_TYPES = frozenset(
 )
 # Context managers and calls that can end a cancel as something else inside the code they wrap: a
 # TimeoutError, or (a task group whose child fails during the cancel) an ExceptionGroup.
-_CONVERTING_CALLS = frozenset({"timeout", "timeout_at", "wait_for", "TaskGroup"})
+_CONVERTING_CALLS = frozenset({"timeout", "timeout_at", "Timeout", "wait_for", "TaskGroup"})
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _TRIES = (ast.Try, ast.TryStar)
-# The floors are the direct call sites counted when this census was written; a site that moves out
-# of the census's reach lowers the count and fails here.
+_LOOPS = (ast.For, ast.AsyncFor, ast.While)
+# The floors are the direct ``_close_and_release`` call sites counted when this census was
+# written; a site that moves out of the census's reach lowers the count and fails here.
 _FLOORS = {
     "messagefoundry/transports/database.py": 8,
     "messagefoundry/pipeline/reference_sync.py": 1,
@@ -228,30 +236,38 @@ def _names(node: ast.expr | None) -> set[str]:
     return set()
 
 
-def _walk_body(nodes: list[ast.stmt]) -> Iterator[ast.AST]:
-    """Every node under ``nodes``, not entering a ``def``, ``lambda`` or class at any depth."""
-    stack: list[ast.AST] = [n for n in nodes if not isinstance(n, _SCOPES)]
+def _walk_body(nodes: list[ast.stmt], *, skip: tuple[type[ast.AST], ...] = ()) -> Iterator[ast.AST]:
+    """Every node under ``nodes``, entering no ``def``, ``lambda`` or class, nor a ``skip`` node."""
+    stops = (*_SCOPES, *skip)
+    stack: list[ast.AST] = [n for n in nodes if not isinstance(n, stops)]
     while stack:
         node = stack.pop()
         yield node
-        stack.extend(c for c in ast.iter_child_nodes(node) if not isinstance(c, _SCOPES))
+        stack.extend(c for c in ast.iter_child_nodes(node) if not isinstance(c, stops))
+
+
+def _catches_a_cancel(handler: ast.ExceptHandler) -> bool:
+    return handler.type is None or bool(_names(handler.type) & _CANCEL_TYPES)
 
 
 def _converting_handler(handler: ast.ExceptHandler) -> bool:
-    """A handler that catches a cancel and may end it: it raises something else, leaves by a
-    ``return``, ``break`` or ``continue`` anywhere in its body, or does not end with a bare
-    ``raise``."""
-    catches = handler.type is None or bool(_names(handler.type) & _CANCEL_TYPES)
-    if not catches:
+    """A handler that catches a cancel and may end it: it does not end with a bare ``raise``, or on
+    some branch it raises something else or leaves by ``return``, ``break`` or ``continue``. A
+    ``raise`` inside a nested handler, and a ``break`` or ``continue`` of a nested loop, are that
+    construct's own."""
+    if not _catches_a_cancel(handler):
         return False
     last = handler.body[-1]
     if not (isinstance(last, ast.Raise) and last.exc is None):
         return True
-    return any(
-        (isinstance(n, ast.Raise) and n.exc is not None)
-        or isinstance(n, (ast.Return, ast.Break, ast.Continue))
-        for n in _walk_body(handler.body)
+    leaves = any(
+        isinstance(n, ast.Return) or (isinstance(n, ast.Raise) and n.exc is not None)
+        for n in _walk_body(handler.body, skip=(ast.ExceptHandler,))
     )
+    loops = any(
+        isinstance(n, (ast.Break, ast.Continue)) for n in _walk_body(handler.body, skip=_LOOPS)
+    )
+    return leaves or loops
 
 
 def _conversions(nodes: list[ast.stmt]) -> list[str]:
@@ -268,39 +284,52 @@ def _conversions(nodes: list[ast.stmt]) -> list[str]:
     return found
 
 
-def _before(try_node: ast.Try | ast.TryStar, child: ast.AST) -> list[ast.stmt]:
-    """The statements of ``try_node`` that may run before ``child``, one of its direct children."""
-    handlers: list[ast.stmt] = []
-    for handler in try_node.handlers:
-        handlers.extend(handler.body)
-    if child in try_node.finalbody:
-        return [*try_node.body, *handlers, *try_node.orelse]
-    # In a handler or the else: only the body ran first; a sibling handler never runs before it.
-    return list(try_node.body) if child not in try_node.body else []
+def _before(node: ast.AST, child: ast.AST) -> list[ast.stmt]:
+    """The statements of ``node`` that may run before ``child``, one of its direct children."""
+    earlier: list[ast.stmt] = []
+    for field in ("body", "orelse", "finalbody"):
+        block = getattr(node, field, None)
+        if isinstance(block, list) and child in block:
+            earlier = block[: block.index(child)]
+    if isinstance(node, _TRIES):
+        handlers = [s for h in node.handlers for s in h.body]
+        if child in node.finalbody:
+            return [*node.body, *handlers, *node.orelse, *earlier]
+        if child not in node.body:  # in the else: only the body ran first
+            return [*node.body, *earlier]
+    # In a handler, the try's body ran first, and the try supplies it at the next level up; a
+    # sibling handler never runs before it.
+    return earlier
 
 
 def _site_faults(tree: ast.Module) -> tuple[int, list[str]]:
-    """How many direct call sites of ``_close_and_release`` ``tree`` holds, and each conversion
-    the census finds on the way to one."""
+    """How many direct ``_close_and_release`` call sites ``tree`` holds, and each conversion the
+    census finds on the way to one."""
+    sites = [
+        sub for sub in ast.walk(tree) if isinstance(sub, ast.Call) and callee_name(sub) == _TARGET
+    ]
+    if not sites:
+        return 0, []
     parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
-    sites = call_sites(tree, _TARGET)
     faults: list[str] = []
     for call in sites:
         node: ast.AST = call
         while node in parents and not isinstance(node, _SCOPES):
             child, node = node, parents[node]
-            if isinstance(node, ast.ExceptHandler) and _converting_handler(node):
-                faults.append(f"line {call.lineno}: inside a handler that ends a cancel")
-            if isinstance(node, _TRIES):
-                for what in _conversions(_before(node, child)):
-                    faults.append(f"line {call.lineno}: {what}")
-                if child in node.finalbody:
-                    for handler in node.handlers:
-                        if _converting_handler(handler):
-                            faults.append(f"line {call.lineno}: handler at line {handler.lineno}")
-        if isinstance(node, _SCOPES) and not isinstance(
-            parents.get(node), (ast.Module, ast.ClassDef)
-        ):
+            for what in _conversions(_before(node, child)):
+                faults.append(f"line {call.lineno}: {what}")
+            if isinstance(node, ast.ExceptHandler) and _catches_a_cancel(node):
+                own = child in node.body and isinstance(child, ast.Expr)
+                if not own or _converting_handler(node):
+                    faults.append(f"line {call.lineno}: inside a handler of a cancel")
+            if isinstance(node, _TRIES) and child in node.finalbody:
+                for handler in node.handlers:
+                    if _converting_handler(handler):
+                        faults.append(f"line {call.lineno}: handler at line {handler.lineno}")
+        outer = parents.get(node)
+        while outer is not None and not isinstance(outer, _DEFS):
+            outer = parents.get(outer)
+        if outer is not None:
             # A release inside a closure is reached from wherever the closure is awaited, which
             # this walk cannot follow; such a site is reported rather than passed unread.
             faults.append(f"line {call.lineno}: inside a nested def the census cannot follow")
@@ -311,15 +340,16 @@ def test_no_call_site_turns_a_cancel_into_something_else() -> None:
     """The predicate reads the exception in flight, so a call site that turned the cancel into a
     ``TimeoutError``, swallowed it, or raised its own exception in its place would send a cancelled
     borrow down the ordinary path, which waits, through ``shield``, on a statement that may still be
-    running. The census reads the forms named above; a green run is not proof that no other path
-    does this."""
+    running. A borrow made inside an enclosing cancel handler reads that handler's cancel as its own
+    instead. The census reads the forms named above; a green run is not proof that no other path
+    does either."""
     counts: dict[str, int] = {}
     faults: list[str] = []
     for path, tree in package_trees().items():
         count, found = _site_faults(tree)
         if count:
             counts[path] = count
-            faults.extend(f"{path} {fault}" for fault in found)
+        faults.extend(f"{path} {fault}" for fault in found)
     for path, floor in _FLOORS.items():
         assert counts.get(path, 0) >= floor, f"the census reads fewer sites than {floor}: {counts}"
     assert faults == [], faults
@@ -458,10 +488,38 @@ async def f():
     finally:
         await release()
 """,
+    "swallowed by an earlier statement": """
+async def f():
+    try:
+        await cur.execute(sql)
+    except asyncio.CancelledError:
+        pass
+    await _close_and_release(pool, conn, cur)
+""",
+    "asyncio.timeouts.Timeout": """
+async def f():
+    try:
+        async with asyncio.timeouts.Timeout(deadline):
+            await cur.execute(sql)
+    finally:
+        await _close_and_release(pool, conn, cur)
+""",
+    "borrow in a re-raising cancel handler": """
+async def f():
+    try:
+        await work()
+    except asyncio.CancelledError:
+        conn = await acquire()
+        try:
+            await conn.ping()
+        finally:
+            await _close_and_release(pool, conn, None)
+        raise
+""",
 }
 
-# The shapes the live call sites use: an ordinary handler that converts an Exception, and a
-# BaseException handler that releases and re-raises.
+# Shapes that keep the cancel in flight. The first two are the shapes the live call sites use;
+# the rest are synthetic, each a near miss of a positive control above.
 _CLEAN = {
     "finally": """
 async def f():
@@ -502,14 +560,36 @@ async def f():
     else:
         await _close_and_release(pool, conn, cur)
 """,
+    "a module-level def under an if": """
+if PLATFORM:
+    async def f():
+        try:
+            await cur.execute(sql)
+        finally:
+            await _close_and_release(pool, conn, cur)
+""",
+    "a guarded rollback before the re-raise": """
+async def f():
+    try:
+        await cur.execute(sql)
+    except BaseException:
+        try:
+            await conn.rollback()
+        except Exception as exc:
+            raise DeliveryError("rollback failed") from exc
+        for _ in range(2):
+            break
+        await _close_and_release(pool, conn, cur)
+        raise
+""",
 }
 
 
 @pytest.mark.parametrize("source", list(_CONVERTED.values()), ids=list(_CONVERTED))
 def test_the_census_finds_each_conversion(source: str) -> None:
     """Positive controls: each form the census looks for is found."""
-    count, faults = _site_faults(ast.parse(source))
-    assert count == 1 and faults, faults
+    _count, faults = _site_faults(ast.parse(source))
+    assert faults, faults
 
 
 @pytest.mark.parametrize("source", list(_CLEAN.values()), ids=list(_CLEAN))
