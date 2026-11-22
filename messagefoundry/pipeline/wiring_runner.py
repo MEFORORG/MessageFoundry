@@ -6573,7 +6573,7 @@ class RegistryRunner:
         (:meth:`StageDispatcher.stopped_holding_rows`) is not re-armed here, because a re-arm would
         claim past them; the WARNING says the pooled lane is kept STOPPED. Any later
         ``notify_work`` broadcast (:meth:`_broadcast_to`), at least a reload, replay, resend or
-        inject, re-arms it, since the mark is lifted, and it claims past them. Under per_lane the waiting workers are woken here, and the start that
+        inject, re-arms it, since the mark is lifted, and it can claim past them. Under per_lane the waiting workers are woken here, and the start that
         called this respawns any that a STOP ended (:meth:`_ensure_inbound_workers`)."""
         self._log_halted.discard(name)
         if self._claim_mode != "pooled":
@@ -6590,7 +6590,7 @@ class RegistryRunner:
             log.warning(
                 "%s pooled lane %r kept STOPPED: it holds claimed rows whose return to the queue "
                 "never landed; any later notify_work broadcast (at least a reload, replay, resend "
-                "or inject) re-arms it and claims past them",
+                "or inject) re-arms it, and it can claim past them",
                 stage.value,
                 name,
             )
@@ -12906,7 +12906,8 @@ class RegistryRunner:
             # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
             # does an unopenable payload; the token keeps its reference for a replay. The handoff
             # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
-            # any CipherError the handoff raises still takes the fault arm.
+            # any CipherError the handoff raises still takes the fault arm. The Postgres handoff
+            # contains its own decrypt failures that are verdicts on a cell (BACKLOG #5689).
             log.warning(
                 "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
                 name,
