@@ -247,8 +247,8 @@ messagefoundry provision-admin --username <name> --email <address> --db C:\Progr
 
 Under `[store].key_provider = 'host'` (vault BACKLOG #3411) the service cannot run as SYSTEM,
 LOCAL SERVICE or NETWORK SERVICE: that provider refuses them as the engine account. When the
-install script reads that setting, from the settings file in the forms its
-`Get-SettingsKeyProvider` lists or from `MEFOR_STORE_KEY_PROVIDER` in the service's own
+install script reads that setting, from the settings file as its `Get-SettingsKeyProvider`
+describes, or from `MEFOR_STORE_KEY_PROVIDER` in the service's own
 environment, it refuses such an account before it changes anything: `-AllowLocalSystem` with no
 `-ServiceAccount`, and at least the usual spellings of those accounts as `-ServiceAccount`. Under
 `[security].enforcement = 'enforce'` the provider also refuses an account that is not local to

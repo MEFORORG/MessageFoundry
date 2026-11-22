@@ -1145,7 +1145,9 @@ function Get-SettingsKeyProvider {
       which the interpreter check below declines to do. So this reads at least a key_provider line in
       a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table
       with no table nested before the key, each holding a one-line string with no escape. Names
-      compare case-sensitively, as TOML's do. Any other form reads as $null. What the installer does
+      compare case-sensitively, as TOML's do. Any other form reads as $null. A triple quote in a
+      comment or a one-line string, or a multi-line string holding the other delimiter, can make
+      it misread every line after it, either way. What the installer does
       with the answer is an early refusal: the engine applies its own key custody refusals at start
       whatever this returns.
     #>
@@ -2860,7 +2862,7 @@ if ($HostCustody) {
                   else { "Leave out -AllowLocalSystem" }
         throw ("$custodyAccountProblem, and $namedBy, a key provider whose custody refuses that " +
             "account, so the service would not start. $remedy to run as the virtual account " +
-            "'NT SERVICE\$ServiceName' (docs/SERVICE.md 'Least-privilege service account').")
+            "'NT SERVICE\$ServiceName' (docs/SERVICE.md 'Run as a least-privilege account').")
     }
 }
 
