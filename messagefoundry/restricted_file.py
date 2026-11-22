@@ -666,8 +666,8 @@ def _windows_link_problem(
     read_security: Callable[[str, str], WinSecurity],
     trust: WinTrust,
 ) -> str | None:
-    """Why a junction or link in a walked ``chain`` lets another account move the key file, or
-    ``None`` (vault BACKLOG #5657). A link is judged by who can change it: its own owner and access
+    """Why a junction or link in a walked ``chain`` lets an account this check does not trust move
+    the key file, or ``None`` (vault BACKLOG #5657). A link is judged by who can change it: its own owner and access
     list, and every folder above it up to the volume root, any of which could delete, rename or
     re-point what lies below, each by the trust-anchor rule
     (:func:`~messagefoundry.auth.anchor_path.evaluate_windows_object`, whose ``WinTrust`` trusts at
@@ -793,10 +793,11 @@ def _route_source(addr: Any) -> Any:
 
 
 def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
-    """Why the folders on ``path`` let another account move or replace it, or ``None``: at least a
-    walk that did not finish (:func:`_windows_cause_problem`), a share that may be this host itself
-    (:func:`_loopback_share_problem`), a junction or link above it that another account can change
-    (:func:`_windows_link_problem`), then the directory that holds it
+    """Why the folders on ``path`` let an account this check does not trust move or replace it, or
+    ``None``: at least a walk that did not finish (:func:`_windows_cause_problem`), a share that
+    may be this host itself (:func:`_loopback_share_problem`), a junction or link above it that an
+    account this check does not trust can change (:func:`_windows_link_problem`), then the
+    directory that holds it
     (:func:`_windows_holder_problem`). Windows only.
 
     The folder holding ``path`` is walked, or ``path`` itself when it is a drive root, so a
