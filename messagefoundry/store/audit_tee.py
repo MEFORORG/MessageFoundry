@@ -142,8 +142,8 @@ def _withhold_detail(detail: str | None) -> str | None:
     parse keeps its sorted key order; another writer's separators or number forms can change. An
     object's string value that is itself such a JSON text, and a detail that is a JSON string
     holding one, is withheld the same way. What is not matched includes at least a key spelled
-    with a JSON escape, a JSON text held in a string inside a list, and text that strict JSON
-    parsing refuses, such as one with a raw control character, a byte order mark or trailing text;
+    with a JSON escape, unless the name also appears unescaped elsewhere in the text, a JSON text
+    held in a string inside a list or in an object key, and text that strict JSON parsing refuses, such as one with a raw control character, a byte order mark or trailing text;
     no engine writer writes the wrap in any of those. Any other fault, such as a nest too deep to
     read or an integer too long to parse, ships the text being read as
     :data:`_DETAIL_WITHHELD_WHOLE`, since the value may still be in it: the whole detail, or, for
@@ -618,9 +618,9 @@ def emit_audit_tee(
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
     # On the engine's key epoch rows only, the line copies the row's detail with any withheld
-    # field's value replaced, before any other pass reads it. Every other row's detail is not
-    # parsed here, so text a client writes cannot change its copy. The observers below are passed
-    # the row's own.
+    # field's value replaced, before any other pass reads it. Every other row's detail is not read
+    # for withholding, so text a client writes cannot use this pass to change its copy; the C0
+    # field scrub below still can. The observers below are passed the row's own.
     tee_detail = detail
     if action == _KEY_EPOCH_ACTION:
         try:
