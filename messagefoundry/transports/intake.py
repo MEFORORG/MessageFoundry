@@ -15,7 +15,7 @@ time.
 
 Everything here is socket or path metadata, never a byte of the body. A certificate subject can name
 a person; the runner writes the context into the message's metadata cell, which the store encrypts
-at rest as it does ``connection_event.reason``.
+at rest when it has a key, as it does ``connection_event.reason``.
 """
 
 from __future__ import annotations
@@ -57,8 +57,8 @@ class IntakeContext:
     """Who handed the engine one body, as the source saw it.
 
     A listen source fills the peer fields from the accepted socket; a poll source has no peer and
-    fills :attr:`source` with the path or server it read. ``None`` means the source could not say,
-    never a default."""
+    fills :attr:`source` with the path or server it read. A ``None`` field is left out of the stored
+    record; what ``None`` means is on each field."""
 
     #: The source's transport, lower case, such as ``"mllp"``, ``"tcp"`` or ``"file"``.
     transport: str
@@ -72,7 +72,8 @@ class IntakeContext:
     cert_subject: str | None = None
     #: How the peer was admitted; ``None`` for a poll source, which admits no peer.
     auth_mode: IntakeAuth | None = None
-    #: ``True`` when the inbound has a ``source_ip_allowlist`` and the peer was on it.
+    #: ``True`` when the inbound has a ``source_ip_allowlist`` and the peer was on it; ``None`` when
+    #: the inbound has none, so the address was not screened.
     address_listed: bool | None = None
     #: A poll source's origin: the file path, or the remote server and path, it read the body from.
     source: str | None = None

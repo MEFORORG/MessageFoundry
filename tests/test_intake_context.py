@@ -250,6 +250,46 @@ async def test_a_file_source_records_the_path_it_read(tmp_path: Path, store: Mes
     assert await _intakes(store) == [{"transport": "file", "source": str(dropped)}]
 
 
+def test_a_san_only_leaf_records_no_subject_rather_than_an_empty_one() -> None:
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from messagefoundry.pki import peer_subject
+
+    def leaf_der(subject: x509.Name) -> bytes:
+        key = ec.generate_private_key(ec.SECP256R1())
+        now = datetime.datetime.now(datetime.UTC)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(x509.Name([x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "CA")]))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(
+                x509.SubjectAlternativeName([x509.DNSName("partner.example")]), critical=True
+            )
+            .sign(key, hashes.SHA256())
+        )
+        return cert.public_bytes(serialization.Encoding.DER)
+
+    class _Ssl:
+        def __init__(self, der: bytes) -> None:
+            self._der = der
+
+        def getpeercert(self, binary_form: bool = False) -> bytes:
+            return self._der
+
+    assert peer_subject(_Ssl(leaf_der(x509.Name([])))) is None
+    # Control: a leaf with a subject is named.
+    named = x509.Name([x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, _PERSON)])
+    assert peer_subject(_Ssl(leaf_der(named))) == f"CN={_PERSON}"
+
+
 async def test_a_message_the_engine_makes_from_another_carries_no_intake_key(
     store: MessageStore,
 ) -> None:

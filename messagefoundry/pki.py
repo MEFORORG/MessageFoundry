@@ -734,7 +734,10 @@ def peer_subject(ssl_object: Any) -> str | None:
     name a person."""
     try:
         der = ssl_object.getpeercert(binary_form=True) if ssl_object is not None else None
-        return x509.load_der_x509_certificate(der).subject.rfc4514_string() if der else None
+        if not der:
+            return None
+        # A SAN-only leaf has an empty subject, which names nobody, so it reads as none.
+        return x509.load_der_x509_certificate(der).subject.rfc4514_string() or None
     except Exception as exc:
         _log.warning(
             "could not read a peer certificate's subject; the message is stored without it: %s",

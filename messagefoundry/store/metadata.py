@@ -8,8 +8,8 @@ key: engine-internal keys (ADR 0013 correlation lineage — ``correlation_id`` /
 reserved :data:`INTAKE_KEY` (vault BACKLOG #2607), and, under a reserved ``"user"`` sub-key, the
 operator/handler-attached bag written by :class:`~messagefoundry.config.wiring.SetMeta`.
 
-These two functions are the ONLY places that shape that split, shared by every store backend (so the
-merge can never drift across SQLite / Postgres / SQL Server) and by the API (so the internal keys never
+:func:`merge_user_metadata` and :func:`user_metadata` shape the split between the ``"user"`` bag and
+the engine-internal keys, shared by every store backend (so the merge can never drift across SQLite / Postgres / SQL Server) and by the API (so the internal keys never
 leak). They are pure: no I/O beyond a content-free WARNING for an unreadable cell, no crypto — the
 caller decrypts before and encrypts after.
 """
