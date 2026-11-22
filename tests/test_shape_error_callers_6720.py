@@ -1,36 +1,44 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #6720: two callers of ``base.is_store_shape_error`` that the widened
+"""BACKLOG #6720: callers of ``base.is_store_shape_error`` that the widened
 ``schema_verify._SHAPE_MESSAGES`` reaches.
 
 An expected name held by an object of another kind (a view, an index, a table) now reads as a store
-shape error. At least three callers outside the schema step act on that; this file pins these two
-(the ``verify-audit-chain`` walk in ``__main__`` is the third, and is not covered here):
+shape error. At least these callers outside the schema step act on that, and this file pins them:
 
 * ``auth.service._is_revoke_defect``: the post-commit session revoke raises such an error at once,
   unretried, and records no ``auth.sessions_revoke_failed`` row, as it does for any other defect.
 * ``store.note_audit_chain_read``: the open no longer tags such an error as row evidence about the
   audit chain, so it is reported as a store this build cannot read.
+* ``audit-verify``'s walk in ``__main__``: such an error raised by ``verify_audit_chain`` is
+  "could not start", exit 2, rather than the stopped-walk FAIL line and exit 1.
 
 Each case is a real SQLite error from every collision ``test_schema_verify_6719_6720`` measures, so
 the code and the text are SQLite's own and a collision added there is pinned here too. The control
-is a
-syntax error: the same ``SQLITE_ERROR`` code, but not a shape message, which keeps the old handling.
+is a syntax error: the same ``SQLITE_ERROR`` code, but not a shape message, which keeps the old
+handling.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry.__main__ import main
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import SESSIONS_REVOKE_FAILED_ACTION, AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import is_store_shape_error
+from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE, MessageStore, note_audit_chain_read
+from tests.test_audit_keyless_chain_flagged import _AT_REST_ENV
+from tests.test_keyless_chain_every_command import _keyed_chain
 from tests.test_schema_verify_6719_6720 import _COLLISIONS
 
 _PASSWORD = "Str0ng-Synthetic-Pass!!"
@@ -142,3 +150,48 @@ def test_a_sqlite_error_that_is_not_a_shape_is_still_tagged() -> None:
     exc = _not_shape()
     note_audit_chain_read(exc)
     assert AUDIT_CHAIN_READ_NOTE in getattr(exc, "__notes__", ())
+
+
+# --- audit-verify's walk ---------------------------------------------------------------------------
+
+
+def _audit_verify_with_a_walk_raising(
+    exc: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[int, str, str]:
+    """``audit-verify`` against a real keyed chain whose walk raises ``exc``. Returns the exit code,
+    stdout and stderr."""
+    monkeypatch.chdir(tmp_path)
+    for name in _AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+    key = generate_key()
+    db = tmp_path / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+
+    async def raising(self: MessageStore, **kwargs: object) -> object:
+        raise exc
+
+    monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = main(["audit-verify", "--db", str(db)])
+    return rc, out.getvalue(), err.getvalue()
+
+
+@pytest.mark.parametrize(("existing", "step"), _COLLISIONS)
+def test_a_name_held_by_another_kind_of_object_stops_audit_verify_as_could_not_start(
+    existing: str, step: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exc = _sqlite_error("CREATE TABLE other (a TEXT)", existing, step)
+    rc, out, err = _audit_verify_with_a_walk_raising(exc, tmp_path, monkeypatch)
+    assert rc == 2, (out, err)
+    assert "cannot open the store" in err, err
+    assert not out.startswith("FAIL: "), out
+
+
+def test_a_sqlite_error_that_is_not_a_shape_still_stops_audit_verify_with_a_fail_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, out, err = _audit_verify_with_a_walk_raising(_not_shape(), tmp_path, monkeypatch)
+    assert rc == 1, (out, err)
+    assert out.startswith("FAIL: the audit chain check stopped part way"), out
