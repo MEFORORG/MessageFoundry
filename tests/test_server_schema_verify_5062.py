@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5062: DDL forms the server-DB live schema check misread without raising.
 
-Each test here failed before its fix: the reader either built a wrong expected shape or let a form
-it cannot place through. A form the reader cannot place now raises ``ValueError``, which the unit
+Each test of a fix failed before it: the reader either built a wrong expected shape or let a form it
+cannot place through. The rest are controls that pin what the fixes must not change. A form the reader cannot place now raises ``ValueError``, which the unit
 test that reads each shipped batch would surface before an open does. The shipped batches' own
 expected shapes are pinned by ``tests/test_sqlserver_postgres_schema_verify_1720.py``.
 """
@@ -253,3 +253,105 @@ def test_the_postgres_expected_shape_holds_no_table_the_migration_drops() -> Non
         "messagefoundry.store.postgres", reason="requires the postgres extra (asyncpg)"
     )
     assert "lane_leases" not in postgres._declared_schema().columns
+
+
+# --- review round 1 ------------------------------------------------------------------------------
+
+
+def test_a_drop_column_after_a_rename_still_sees_the_opaque_index() -> None:
+    with pytest.raises(ValueError, match="drop column"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT, b INT)",
+                "CREATE INDEX ix ON t (lower(b))",
+                "ALTER TABLE t RENAME COLUMN b TO c",
+                "ALTER TABLE t DROP COLUMN c",
+            )
+        )
+
+
+def test_a_drop_column_reads_the_predicate_to_its_statement_end_only() -> None:
+    with pytest.raises(ValueError, match="drop column"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT, b TEXT, c INT)",
+                "CREATE INDEX ix ON t (a) WHERE b <> ';' AND c IS NULL",
+                "ALTER TABLE t DROP COLUMN c",
+            )
+        )
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT NULL, b INT NULL, c INT NULL)"
+            " CREATE INDEX ix ON t (a) WHERE b > 0 ALTER TABLE t DROP COLUMN c",
+        ),
+        "sqlserver",
+    )
+    assert "ix" in shape.named_indexes
+
+
+def test_a_drop_of_an_include_index_key_column_drops_the_index() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT, b INT)",
+            "CREATE INDEX ix ON t (a) INCLUDE (b)",
+            "ALTER TABLE t DROP COLUMN a",
+        )
+    )
+    assert "ix" not in shape.named_indexes
+
+
+@pytest.mark.parametrize("item", ['CONSTRAINT "nn a" NOT NULL a', "CONSTRAINT [nn a] NOT NULL a"])
+def test_a_not_null_constraint_with_a_quoted_name_raises(item: str) -> None:
+    with pytest.raises(ValueError, match="not-null constraint"):
+        declared_schema((f"CREATE TABLE t (a INT, {item})",), "postgres")
+
+
+@pytest.mark.parametrize(
+    "key", ["((a)::text)", "(a::pg_catalog.text)", '(a::"text")', "(CAST(a AS pg_catalog.text))"]
+)
+def test_a_key_that_opens_with_a_cast_raises(key: str) -> None:
+    with pytest.raises(ValueError, match="cast"):
+        declared_schema((f"CREATE INDEX ix ON t ({key})",))
+
+
+def test_a_bracketed_filegroup_does_not_hide_the_next_statement() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE a (x INT NOT NULL)",
+            "CREATE TABLE b (y INT NULL, z INT NULL)",
+            "IF 1 = 1 ALTER TABLE a ADD CONSTRAINT pk_a PRIMARY KEY (x) ON [PRIMARY]\n"
+            "UPDATE b SET z = 1, y = 2",
+        ),
+        "sqlserver",
+    )
+    assert shape.column_shapes["a"]["x"].nullable is False
+
+
+@pytest.mark.parametrize("name", ["delete", "update", "insert", "merge", "truncate", "select"])
+def test_add_column_takes_a_data_statement_word_as_the_name(name: str) -> None:
+    shape = declared_schema(
+        ("CREATE TABLE t (a INT)", f"ALTER TABLE t ADD COLUMN {name} TEXT"), "postgres"
+    )
+    assert name in shape.columns["t"]
+
+
+def test_a_postgres_column_named_index_is_a_column() -> None:
+    shape = declared_schema(("CREATE TABLE t (index TEXT, a INT)",), "postgres")
+    assert shape.columns["t"] == frozenset({"index", "a"})
+
+
+def test_using_index_inside_a_check_literal_is_text() -> None:
+    shape = declared_schema(("CREATE TABLE t (a TEXT, CHECK (a <> 'USING INDEX x'))",), "postgres")
+    assert shape.columns["t"] == frozenset({"a"})
+
+
+def test_an_unterminated_add_ends_at_an_alter_database() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE a (x INT NULL)",
+            "IF 1 = 1 ALTER TABLE a ADD c INT NULL\n"
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+        ),
+        "sqlserver",
+    )
+    assert shape.column_shapes["a"]["c"].nullable is True

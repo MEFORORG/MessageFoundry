@@ -42,9 +42,9 @@ DDL the reader cannot place raises ``ValueError`` rather than being skipped or m
 not match, an ``ALTER TABLE`` with more than one clause or an action it does not know, a table rename,
 an ``ALTER INDEX``, a second ``CREATE TABLE`` of a table no ``DROP`` removed, a ``USING`` access
 method, a key column or expression carrying a collation, an operator class or a ``NULLS`` order, a key
-that only casts a column, a key built ``USING INDEX``, a SQL Server inline ``INDEX``, a ``NOT NULL``
-table constraint, a ``DROP COLUMN`` of a column an expression, ``INCLUDE`` or predicate of an
-index on its table may name, a column type or clause it does not know, a SQL Server column that
+that opens with a cast of a column, a key built ``USING INDEX``, a SQL Server inline ``INDEX``, a
+``NOT NULL`` table constraint, a ``DROP COLUMN`` of a column an expression, ``INCLUDE`` or predicate
+of an index on its table may name, other than one of its key columns, a column type or clause it does not know, a SQL Server column that
 leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--`` or ``/*`` inside a
 quoted string, which may be dynamic SQL's comment or a literal's text. A unit test reads each shipped
 batch, so a new form fails there before it reaches an open. Not every misread raises: at least DDL
@@ -181,12 +181,11 @@ _TABLE_PRIMARY_KEY = re.compile(r"\bPRIMARY\s+KEY\s*(?:(?:NON)?CLUSTERED\s*)?\("
 #: PostgreSQL's ``PRIMARY KEY`` or ``UNIQUE`` ``USING INDEX <name>``, which turns an existing index
 #: into the constraint. ``USING INDEX TABLESPACE`` is only a storage option.
 _USING_INDEX = re.compile(r"\bUSING\s+INDEX\s+(?!TABLESPACE\b)", re.I)
-#: A key that is only a cast of a column, ``a::text`` or ``CAST(a AS text)``. PostgreSQL stores a
-#: cast to the column's own type as the column, and any other as an expression, and the reader does
-#: not know which.
-_CAST_TYPE = r"\w[\w ]*?(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?(?:\s*\[\])?"
+#: A key that opens with a cast of a column, ``a::text`` or ``CAST(a AS text)``. PostgreSQL stores
+#: a cast to the column's own type as the column, and any other as an expression, and the reader
+#: does not know which.
 _CAST_KEY = re.compile(
-    rf'^(?:"[^"]+"|\w+)\s*::\s*{_CAST_TYPE}$|^CAST\s*\(\s*(?:"[^"]+"|\w+)\s+AS\s+{_CAST_TYPE}\s*\)$',
+    r'^(?:\(\s*)*(?:"[^"]+"|\w+)(?:\s*\))*\s*::|^CAST\s*\(\s*\(*\s*(?:"[^"]+"|\w+)\s*\)*\s+AS\b',
     re.I,
 )
 _PLAIN_KEY = re.compile(r'^(\[?[A-Za-z_][\w$]*\]?|"[^"]+")(?:\s+(ASC|DESC))?$', re.I)
@@ -205,7 +204,9 @@ _STATEMENT_START = frozenset({"if", "begin", "end", "exec", "execute", "else", "
 #: as its own).
 _DATA_STATEMENT = frozenset({"insert", "update", "delete", "merge", "select", "truncate"})
 #: What an ``ALTER`` or ``DROP`` that starts the next statement names, after the word itself.
-_DDL_OBJECT = re.compile(r"\s+(?:TABLE|INDEX|VIEW|PROC|PROCEDURE|TRIGGER|FUNCTION)\b", re.I)
+_DDL_OBJECT = re.compile(
+    r"\s+(?:TABLE|INDEX|VIEW|PROC|PROCEDURE|TRIGGER|FUNCTION|SEQUENCE|SCHEMA|TYPE|DATABASE)\b", re.I
+)
 _TOKEN = re.compile(r"""N?'(?:[^']|'')*'|"[^"]*"|\[[^\]]*\]|\w+|\S""")
 
 
@@ -338,7 +339,8 @@ def _string_spans(text: str) -> list[tuple[int, int]]:
 def _quoted_end(text: str, i: int) -> int | None:
     """The index after the quoted run that opens at ``text[i]``: a ``'`` string, a ``"`` name or a
     SQL Server ``[...]`` name, in which a doubled close continues the run. ``None`` when ``text[i]``
-    opens none. The scanners below share it, so a ``[a,b]`` or ``[end]`` reads as one name in each."""
+    opens none. :func:`_balanced`, :func:`_top_level_items` and :func:`_clause` share it, so a
+    ``[a,b]`` or ``[end]`` reads as one name in each."""
     ch = text[i]
     if ch not in "'\"[":
         return None
@@ -408,7 +410,7 @@ def _clause(segment: str) -> str:
     depth, i, n, prev = 0, 0, len(segment), ""
     while i < n:
         if (end := _quoted_end(segment, i)) is not None:
-            i = end
+            i, prev = end, ""
             continue
         ch = segment[i]
         if ch == "(":
@@ -433,10 +435,11 @@ def _clause(segment: str) -> str:
             ):
                 break
             # A data or DDL statement starts here too. ON DELETE and ON UPDATE are a foreign
-            # key's actions; ALTER COLUMN and DROP COLUMN are the clause's own verbs.
+            # key's actions, and the word after ADD [COLUMN] [IF NOT EXISTS] is a column's
+            # name; ALTER COLUMN and DROP COLUMN are the clause's own verbs.
             if (
                 lower == "create"
-                or (lower in _DATA_STATEMENT and prev != "on")
+                or (lower in _DATA_STATEMENT and prev not in ("on", "add", "column", "exists"))
                 or (lower in ("alter", "drop") and _DDL_OBJECT.match(after))
             ):
                 break
@@ -824,30 +827,34 @@ class _Built:
 
 def _pk_columns(text: str) -> set[str]:
     """The columns of a ``PRIMARY KEY (...)`` in ``text``, a table item or an ``ADD CONSTRAINT``."""
-    if _USING_INDEX.search(text):
-        raise ValueError(f"a key built from an existing index is not compared: {text[:120]!r}")
-    # A string literal's text, as in a CHECK, is blanked first, so a PRIMARY KEY inside one is not
-    # taken for the item's own.
-    blanked = text
+    # A string literal's text, as in a CHECK, is blanked first, so a PRIMARY KEY or USING INDEX
+    # inside one is not taken for the item's own.
+    parts: list[str] = []
+    last = 0
     for start, end in _string_spans(text):
-        blanked = blanked[:start] + "'" + " " * (end - start - 2) + "'" + blanked[end:]
+        parts += [text[last : start + 1], " " * (end - start - 2)]
+        last = end - 1
+    blanked = "".join([*parts, text[last:]])
+    if _USING_INDEX.search(blanked):
+        raise ValueError(f"a key built from an existing index is not compared: {text[:120]!r}")
     if (pk := _TABLE_PRIMARY_KEY.search(blanked)) is None:
         return set()
     inner, _ = _balanced(text, pk.end())
     return {_bare(_TOKEN.findall(k)[0]) for k in _top_level_items(inner)}
 
 
-def _is_constraint(item: str) -> bool:
+def _is_constraint(item: str, dialect: Dialect | None) -> bool:
     """Whether a table item, or what follows an ``ADD`` without ``COLUMN``, is a constraint rather
     than a column. A SQL Server inline ``INDEX`` raises, because it builds a named index the reader
-    does not model, and so do ``PERIOD`` and ``EXCLUDE`` when what follows is not their constraint's
+    does not model, except on PostgreSQL, where ``index`` is a column's name, and so do
+    ``PERIOD`` and ``EXCLUDE`` when what follows is not their constraint's
     own shape, because each may also be a column's name. A ``NOT NULL`` table constraint raises:
     the reader does not apply it."""
-    if re.match(r"(?:CONSTRAINT\s+\S+\s+)?NOT\s+NULL\b", item, re.I):
+    if re.match(r'(?:CONSTRAINT\s+(?:"[^"]*"|\[[^\]]*\]|\w+)\s+)?NOT\s+NULL\b', item, re.I):
         # PostgreSQL 18's NOT NULL table constraint, perhaps NOT VALID.
         raise ValueError(f"a not-null constraint is not compared: {item[:120]!r}")
     words = [w.lower() for w in _TOKEN.findall(item)[:2]] + [""]
-    if words[0] not in _NOT_A_COLUMN:
+    if words[0] not in _NOT_A_COLUMN or (words[0] == "index" and dialect == "postgres"):
         return False
     if words[0] == "index":
         raise ValueError(f"an inline index the live-schema check does not compare: {item[:120]!r}")
@@ -879,14 +886,17 @@ class _Reader:
         table = _bare(m["name"])
         if table in self.created:
             # A guarded second CREATE TABLE never runs: the first one built the table.
-            raise ValueError(f"a second create table of {table}, which its guard skips")
+            raise ValueError(
+                f"a second create table of {table}: its guard skips it, or it names a table of"
+                " another schema, which the reader does not tell apart"
+            )
         self.created.add(table)
         cols = self.columns.setdefault(table, {})
         keys: set[str] = set()
         pending: list[tuple[str, _Column, str]] = []
         for item in _top_level_items(body):
             first = _TOKEN.findall(item)[0]
-            if _is_constraint(item):
+            if _is_constraint(item, self.dialect):
                 keys |= _pk_columns(item)
             elif self.dialect is None:
                 cols.setdefault(_bare(first), _Built())
@@ -923,9 +933,13 @@ class _Reader:
         self.indexes[name] = shape
         self.opaque.pop(name, None)
         if include or shape.partial or any(k.startswith("<expr>") for k in shape.columns):
-            # To the statement's end: a predicate has no closing mark of its own.
-            stop = text.find(";", end)
-            definition = text[m.end() : len(text) if stop < 0 else stop]
+            # To the statement's end, found as an ALTER clause's is: a predicate has no
+            # closing mark of its own.
+            try:
+                tail = _clause(text[end:])
+            except ValueError:  # a top-level comma: read on to the end, which only raises more
+                tail = text[end:]
+            definition = text[m.end() : end] + " " + tail
             self.opaque[name] = frozenset(_ident(w) for w in _TOKEN.findall(definition))
 
     def _built(self, table: str, name: str, action: str) -> _Built:
@@ -952,7 +966,7 @@ class _Reader:
             if not rest:
                 raise ValueError(f"an add with nothing to add: {clause!r}")
             # After ADD COLUMN what follows is a column, whatever its name (BACKLOG #5062).
-            if not head.group(1) and _is_constraint(rest):
+            if not head.group(1) and _is_constraint(rest, self.dialect):
                 for key in _pk_columns(rest):
                     self._not_null(table, key)
                 return
@@ -968,7 +982,11 @@ class _Reader:
             name = re.sub(r"^DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?", "", clause, flags=re.I)
             column = _bare(_TOKEN.findall(name)[0])
             for index, used in self.opaque.items():
-                if index in self.indexes and self.indexes[index].table == table and column in used:
+                shape = self.indexes.get(index)
+                if shape is None or shape.table != table or column not in used:
+                    continue
+                if column not in (k.split(" ", 1)[0] for k in shape.columns):
+                    # A key column takes the index with it, as _rewrite_keys below does.
                     raise ValueError(
                         f"a drop column of {table}.{column}, which index {index}'s expression,"
                         " INCLUDE or predicate may use, so the reader cannot tell whether it goes"
@@ -1055,6 +1073,9 @@ class _Reader:
         if moved is not None:
             built.later |= moved.ways()
         self._rewrite_keys(table, old, new)
+        for index, used in list(self.opaque.items()):
+            if old in used and index in self.indexes and self.indexes[index].table == table:
+                self.opaque[index] = (used - {old}) | {new}
 
     def rename(self, m: re.Match[str]) -> None:
         if m["old"].count(".") != 1:
