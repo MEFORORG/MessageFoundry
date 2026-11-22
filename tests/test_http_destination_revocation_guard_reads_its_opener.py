@@ -358,8 +358,8 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
     """With ECH the engine dials the loopback sidecar, and the sidecar verifies the destination.
 
     No context the engine holds checks that peer, so the guard is handed no opener on this arm. Before
-    vault BACKLOG #2977 item 7 an opener for the direct hop was built first and carried the CRL, which
-    is what a guard placed above the sidecar swap would have read; none is built now."""
+    vault BACKLOG #2977 item 7 the opener built before the sidecar swap carried the CRL, which is what
+    a guard placed above the swap would have read; it now loads no CRL."""
     assert _LABEL["REST"] in _refused("REST", crl=pki["crl"], extra=_ECH)
     # CONTROL 1: the same CRL relaxes the same destination without the sidecar, so the refusal above
     # is the ECH arm and not a CRL that failed to load.
@@ -372,15 +372,26 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
 
 
 def test_a_bad_crl_file_is_not_reported_on_a_rest_ech_hop(pki: dict[str, str]) -> None:
-    """Vault BACKLOG #2977 item 7. With an ECH sidecar the engine builds no opener for the direct
-    destination hop, so it loads no ``[tls].crl_file`` for it. It used to build that opener, load the
-    CRL and discard it, so a CRL the hop can never consult failed the connection."""
+    """Vault BACKLOG #2977 item 7. With an ECH sidecar the opener built for the direct destination
+    hop is discarded, and the sidecar makes the partner TLS, so it loads no ``[tls].crl_file``. It
+    used to load the CRL, so a CRL the hop can never consult failed the connection."""
     with active_hop_posture(PROD_PHI):
         dest = _build("REST", crl=pki["ca_and_crl"], revocation_attested=True, extra=_ECH)
     assert _checks_a_crl(dest) is False
     # CONTROL: the same CRL fails the same destination without the sidecar, so the build above
     # passes because the CRL was not loaded, not because it loads.
     _config_error("REST", r"crl_file", crl=pki["ca_and_crl"])
+
+
+def test_a_rest_ech_hop_still_loads_its_ca_file(tmp_path: Path) -> None:
+    """Only the CRL is dropped on the ECH hop (vault BACKLOG #2977 item 7). A ``tls_ca_file`` that
+    cannot be read still fails the connection, as it did before."""
+    with active_hop_posture(PROD_PHI), pytest.raises(CaFileUnreadable):
+        _build(
+            "REST",
+            revocation_attested=True,
+            extra={**_ECH, "tls_ca_file": str(tmp_path / "missing-ca.pem")},
+        )
 
 
 def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[str, str]) -> None:

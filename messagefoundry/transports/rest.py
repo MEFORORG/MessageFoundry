@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Literal
 
 from messagefoundry.config.models import (
@@ -3282,19 +3282,7 @@ class RestDestination(DestinationConnector):
                 credentials=(),
                 connection=config.name,
             )
-        if self._ech_sidecar is not None:
-            # ECH mode (ADR 0139): the engine->sidecar hop is loopback, cleartext on an http sidecar (the
-            # sidecar owns destination TLS + ECH + cert verification), so a plain no-redirect opener
-            # carries it. No opener for the direct destination hop is built here: none would be used,
-            # and building one resolved this hop's trust anchor and loaded its [tls].crl_file, so a
-            # CRL fault was reported on a hop that never consults it (vault BACKLOG #2977 item 7).
-            # verify_tls=false and Digest were refused above, so neither branch below is skipped
-            # for a connection that builds.
-            # The empty proxy map keeps any proxy handler off this opener (vault BACKLOG #2579). The
-            # loopback rule alone already dials every accepted sidecar direct, so this adds no
-            # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
-            self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
-        elif verify:
+        if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
             # but tolerate an expired server cert, and at least the other chain certificates' and a CRL's
             # validity windows (opt-in; default off = the shared verifying opener, byte-identical). It
@@ -3303,6 +3291,13 @@ class RestDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
             )
+            if self._ech_sidecar is not None:
+                # The opener built here is replaced by the sidecar opener below, and the sidecar
+                # makes the TLS connection to the partner, so no CRL loaded here is ever consulted.
+                # Loading it anyway reported a CRL fault on a hop that cannot use the CRL (vault
+                # BACKLOG #2977 item 7). The CA half is still loaded, so a CA file that cannot be
+                # read fails this connection as it did before.
+                anchor = replace(anchor, crl_file=None)
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
@@ -3356,6 +3351,15 @@ class RestDestination(DestinationConnector):
         # static headers meet, at send.
         self._connection_name = config.name
         self._header_rule = dynamic_header_rule(scheme, self.url, verify_tls=verify)
+        if self._ech_sidecar is not None:
+            # ECH mode (ADR 0139): the engine->sidecar hop is loopback, cleartext on an http sidecar (the
+            # sidecar owns destination TLS + ECH + cert verification), so a plain no-redirect opener
+            # carries it —
+            # never the verify/proxy/insecure opener built above for a direct destination hop.
+            # The empty proxy map keeps any proxy handler off this opener (vault BACKLOG #2579). The
+            # loopback rule alone already dials every accepted sidecar direct, so this adds no
+            # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
+            self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
         if verify:
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
             # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
