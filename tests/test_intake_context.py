@@ -248,3 +248,25 @@ async def test_a_file_source_records_the_path_it_read(tmp_path: Path, store: Mes
     rows = await store.list_messages(allowed_channels=None)
     assert [r["status"] for r in rows] == [MessageStatus.RECEIVED.value]
     assert await _intakes(store) == [{"transport": "file", "source": str(dropped)}]
+
+
+async def test_a_message_the_engine_makes_from_another_carries_no_intake_key(
+    store: MessageStore,
+) -> None:
+    """INTAKE_KEY's statement, for edit-and-resubmit: the child keeps lineage only, and its
+    ``correlation_root_id`` leads back to the message that names the peer."""
+    from tests._store_audit import no_operator_audit
+
+    ctx = IntakeContext(transport="mllp", peer_host="192.0.2.7", peer_port=40001)
+    origin = await store.enqueue_ingress(
+        channel_id=_INBOUND, raw=_ADT, metadata=intake_metadata_json(ctx.fields())
+    )
+    out = await store.reingress(
+        origin_message_id=origin, raw=_ADT, idempotency_key="k2607", audit=no_operator_audit
+    )
+    assert out.new_message_id and out.new_message_id != origin
+    child = json.loads(await store.message_metadata_json(out.new_message_id) or "{}")
+    assert INTAKE_KEY not in child
+    assert child["correlation_root_id"] == origin
+    # Control: the origin still names its peer.
+    assert intake_of(await store.message_metadata_json(origin)) == ctx.fields()
