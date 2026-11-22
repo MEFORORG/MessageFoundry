@@ -23,6 +23,7 @@ constraint the tool was built under gets an arm here that goes RED if the constr
 
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 import sys
@@ -497,14 +498,7 @@ def test_a_cited_file_that_cannot_be_examined_is_not_reported_missing(
 ) -> None:
     """RED when: a stat failure reads as "file missing", because ``is_file`` answers False on it."""
     root, record = tree
-    real_stat = Path.stat
-
-    def _deny(self: Path, *args: Any, **kwargs: Any) -> Any:
-        if self.name == "engine_module.py":
-            raise PermissionError(SENTINEL_ID)
-        return real_stat(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "stat", _deny)
+    _stat_raises(monkeypatch, PermissionError(SENTINEL_ID))
 
     code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
 
@@ -538,23 +532,112 @@ def test_a_refusal_with_no_usable_stderr_still_exits_2(
 def test_a_closed_stdout_pipe_exits_2_not_120(tree: tuple[Path, Path], tmp_path: Path) -> None:
     """RED when: the failed flush fails again at interpreter exit, which CPython reports as 120."""
     root, record = tree
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(ROOT / "scripts" / "asvs" / "anchor_report.py"),
-            "--scorecard",
-            str(record),
-            "--root",
-            str(root),
-        ],
-        cwd=tmp_path,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    assert proc.stdout is not None
-    proc.stdout.close()
+    # The read end closes BEFORE the child starts, so its first write cannot win a race against it.
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "asvs" / "anchor_report.py"),
+                "--scorecard",
+                str(record),
+                "--root",
+                str(root),
+            ],
+            cwd=tmp_path,
+            stdout=write_end,
+            stderr=subprocess.DEVNULL,
+        )
+    finally:
+        os.close(write_end)
 
     assert proc.wait(timeout=120) == EXIT_INSTRUMENT
+
+
+def _stat_raises(monkeypatch: pytest.MonkeyPatch, exc: OSError) -> None:
+    """Make the cited file's stat fail with ``exc``, leaving every other path alone."""
+    real_stat = Path.stat
+
+    def _fail(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == "engine_module.py":
+            raise exc
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _fail)
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="winerror is Windows-only")
+
+
+def _winerror(code: int) -> Any:
+    return pytest.param(
+        OSError(None, SENTINEL_ID, None, code), id=f"winerror-{code}", marks=_WINDOWS_ONLY
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(OSError(errno.EINVAL, SENTINEL_ID), id="bare-einval"),
+        *(_winerror(code) for code in (64, 1117, 1920, 362)),
+    ],
+)
+def test_an_einval_that_says_nothing_about_the_name_is_refused(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    exc: OSError,
+) -> None:
+    """RED when: EINVAL, which CPython gives every unmapped winerror, reads as "file missing"."""
+    root, record = tree
+    assert exc.errno == errno.EINVAL, "the premise: this error carries EINVAL"
+    _stat_raises(monkeypatch, exc)
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    _assert_instrument_refusal(code, out, "OSError")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(OSError(errno.ELOOP, SENTINEL_ID), id="eloop"),
+        *(_winerror(code) for code in (123, 1921)),
+    ],
+)
+def test_a_bad_name_or_link_loop_is_one_missing_file(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    exc: OSError,
+) -> None:
+    """RED when: one such cited path aborts the report for every anchor."""
+    root, record = tree
+    _stat_raises(monkeypatch, exc)
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    assert code == EXIT_FINDINGS, out
+    assert "file missing     : 1" in out, out
+
+
+def test_a_real_symlink_loop_is_one_missing_file(
+    tree: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same answer from the real filesystem, on whichever platform runs this."""
+    root, record = tree
+    cited = root / "engine_module.py"
+    cited.unlink()
+    try:
+        cited.symlink_to(cited)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"this account cannot create a symlink: {type(exc).__name__}")
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root), "--strict"], capsys)
+
+    assert code == EXIT_FINDINGS, out
+    assert "file missing     : 1" in out, out
 
 
 def test_a_name_the_filesystem_cannot_hold_is_a_missing_file(

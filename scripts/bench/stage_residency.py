@@ -104,8 +104,9 @@ re-arm compressing a swept-discovered backlog.
 counting process over the rung's full event streams. No pairing, no ``claimed_at``, no Little's law.
 It assumes one outbound row per ``transformed``, which the stores do not guarantee: they write one
 per handler handoff. So it is ``None`` when any message received before the window's end has a
-different count of the two or a repeated destination (``concurrency.n_outbound_parity``), and that
-check is necessary rather than sufficient (``_outbound_parity``). A void figure makes an otherwise
+different count of the two, a repeated destination, or more deliveries than transforms at any
+point in its own stamps (``concurrency.n_outbound_parity``). That check is necessary rather than
+sufficient (``_outbound_parity``). A void figure makes an otherwise
 passing armed gate NO VERDICT (``census.ok`` null), which ``--strict`` does not pass. Two things it is
 NOT:
 
@@ -140,6 +141,7 @@ import statistics
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
@@ -230,6 +232,14 @@ def _transformed_sql(since: float | None, until: float | None) -> str:
     )
 
 
+def _marks_sql(since: float | None, until: float | None) -> str:
+    """Every birth and death of the cohort, by message, for ``_mark_overdelivered``."""
+    return (
+        "SELECT message_id, event, ts FROM message_events "
+        f"WHERE event IN ('transformed', 'delivered'){_cohort_pred(since, until)}"
+    )
+
+
 def _extent_sql() -> str:
     return "SELECT COUNT(*), MIN(ts), MAX(ts) FROM message_events"
 
@@ -289,6 +299,8 @@ class _Agg:
     d_max: float | None = None
     n_delivered: int = 0
     n_dest: int = 0
+    #: At some stamp this message had more deliveries than transforms. See ``_mark_overdelivered``.
+    overdelivered: bool = False
 
     @property
     def complete(self) -> bool:
@@ -637,12 +649,37 @@ def _outbound_parity(aggs: list[_Agg], hi: float) -> dict[str, int]:
     Only messages received before ``hi`` count. A later one has no mark inside the window, so the
     stop edge a tail trim exists to exclude cannot erase the rung's figure.
 
-    NECESSARY, NOT SUFFICIENT. Handlers delivering 2 and 0 have two births and two deaths, so they
-    pass here while the second birth is stamped at the wrong handoff.
+    A message that is ever ``overdelivered`` voids it too, which covers a last delivery stamped
+    before the last ``transformed``.
+
+    NECESSARY, NOT SUFFICIENT. Handlers delivering 2 and 0 still pass here when a delivery lands
+    after the second handler's stamp, because every prefix of the message's stamps then fits.
     """
     relevant = [m for m in aggs if m.received is None or m.received < hi]
-    mismatched = sum(1 for m in relevant if m.n_transformed != m.n_delivered or m.retried)
+    mismatched = sum(
+        1 for m in relevant if m.n_transformed != m.n_delivered or m.retried or m.overdelivered
+    )
     return {"mismatched_messages": mismatched, "messages": len(relevant)}
+
+
+def _mark_overdelivered(by_msg: dict[str, _Agg], rows: list[tuple[Any, ...]]) -> None:
+    """Flag each message whose own count of births minus deaths ever drops below zero.
+
+    PER MESSAGE, because in the pooled count another message's live rows hide the dip, and a loaded
+    rung is what this tool measures. A transform sorts first on a tie: one clock reading is not an
+    ordering. There is NO skew tolerance. A row's delivery is stamped after the commit of the handoff
+    that made it, so on one clock this cannot fire on a valid run (measured on a real SQLite store:
+    150 messages of 8 handlers, twice, none, smallest last-transform-to-last-delivery gap 2.1 ms). Skew
+    between boxes could fire it, and the cost is then a no-verdict rather than a false figure.
+    """
+    marks: dict[str, list[tuple[float, bool]]] = {}
+    for mid, event, ts in rows:
+        marks.setdefault(str(mid), []).append((float(ts), event == "delivered"))
+    for mid, stamps in marks.items():
+        if mid in by_msg:
+            by_msg[mid].overdelivered = any(
+                n < 0 for n in accumulate(-1 if died else 1 for _, died in sorted(stamps))
+            )
 
 
 async def _window_report(
@@ -673,6 +710,7 @@ async def _window_report(
     behaviour) truncates the slowest messages' deliveries and drives the fitted latency slope to zero.
     """
     aggs_map = _build_aggs(await _query(store, _agg_sql(since, until)))
+    _mark_overdelivered(aggs_map, await _query(store, _marks_sql(since, until)))
     lane_rows = await _query(store, _lane_sql(since, until))
     transformed_ts = [float(r[0]) for r in await _query(store, _transformed_sql(since, until))]
 
@@ -1031,8 +1069,8 @@ def _render_concurrency(c: dict[str, Any]) -> list[str]:
     if o is None:
         outbound = (
             f"  N_outbound_rows   UNAVAILABLE: {parity['mismatched_messages']} of "
-            f"{parity['messages']} messages have transformed != delivered rows or a destination "
-            "delivered more than once"
+            f"{parity['messages']} messages have transformed != delivered rows, a destination "
+            "delivered more than once, or more deliveries than transforms at some point"
         )
     else:
         outbound = (

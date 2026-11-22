@@ -102,6 +102,10 @@ PATH_MISSING = "path_missing"
 #: certifies nothing, which is the reason ``check_anchors`` treats it as fatal rather than as drift.
 UNRESOLVED = (PATH_MISSING, ANCHOR_GONE, ANCHOR_AMBIGUOUS)
 
+#: Windows' invalid-name error, and its symlink-loop error.
+_ERROR_INVALID_NAME = 123
+_ERROR_CANT_RESOLVE_FILENAME = 1921
+
 
 @dataclass(frozen=True)
 class AnchorOutcome:
@@ -130,22 +134,32 @@ def _read_cited(target: Path) -> str | None:
     """The cited file's text, or None when it is not there.
 
     ``stat`` rather than ``Path.is_file``, which answers False on ANY stat failure and so would
-    report a file this run could not examine as a file that is missing. Only the two errors that
-    mean "not there" are None; any other reaches the guard in :func:`main`.
+    report a file this run could not examine as a file that is missing. Only the errors that mean
+    "not there" are None; any other reaches the guard in :func:`main`.
     """
     try:
         mode = target.stat().st_mode
     except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError as exc:
-        # A name this filesystem cannot hold cannot exist here. Windows maps its invalid-name
-        # error to EINVAL.
-        if exc.errno in (errno.ENAMETOOLONG, errno.EINVAL):
+        if _names_no_file(exc):
             return None
         raise
     if not stat.S_ISREG(mode):
         return None
     return target.read_text(encoding="utf-8", errors="replace")
+
+
+def _names_no_file(exc: OSError) -> bool:
+    """A name this filesystem cannot hold, or a symlink loop, which reaches no file on any platform.
+
+    A Windows error is judged by its ``winerror`` alone. CPython gives EINVAL to every Windows error
+    it has no mapping for, at least 64, 1117, 1920 and 362, so EINVAL says nothing about the name.
+    """
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in (_ERROR_INVALID_NAME, _ERROR_CANT_RESOLVE_FILENAME)
+    return exc.errno in (errno.ENAMETOOLONG, errno.ELOOP)
 
 
 def audit(cells: list[Cell], root: Path) -> list[AnchorOutcome]:
