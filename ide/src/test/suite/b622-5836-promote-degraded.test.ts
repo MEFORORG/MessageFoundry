@@ -33,25 +33,32 @@ suite("b622 #5836 promote reports a degraded reload", () => {
     assert.strictEqual(msg.level, "warning");
     assert.strictEqual(
       msg.text,
-      "MessageFoundry: finish by hand the follow-on steps that failed after the swap: " +
+      "MessageFoundry: check the engine's log: these follow-on steps failed after the swap: " +
         `reference_sync, audit. The new graph is live. Promoted ${graph}`,
     );
   });
 
-  test("a degraded reload that also needs a restart reports both, degraded first", () => {
+  // Only the lead survives a collapsed notification, so the stale-CA restart leads.
+  test("a degraded reload that also needs a restart reports both, restart first", () => {
     const msg = message({
       degraded: true,
       failures: ["cluster_propagate"],
       restart_required: ["[auth].ad_tls_ca_cert_file"],
     });
     assert.strictEqual(msg.level, "warning");
-    assert.ok(msg.text.startsWith("MessageFoundry: finish by hand the follow-on steps"), msg.text);
-    assert.ok(msg.text.includes(`Promoted ${graph} Restart the engine for [auth].ad_tls_ca_cert_file: `), msg.text);
+    assert.ok(msg.text.startsWith("MessageFoundry: restart the engine for [auth].ad_tls_ca_cert_file: "), msg.text);
+    assert.ok(
+      msg.text.endsWith("Check the engine's log: these follow-on steps failed after the swap: " +
+        "cluster_propagate. The new graph is live."),
+      msg.text,
+    );
   });
 
   for (const [name, body] of [
     ["no degraded field", { degraded: undefined }],
     ["a degraded that is a string", { degraded: "true" }],
+    ["a clean reply that names a failed step", { degraded: false, failures: ["reference_sync"] }],
+    ["a clean reply with failures missing", { failures: undefined }],
     ["degraded with no failures", { degraded: true, failures: [] }],
     ["degraded with failures missing", { degraded: true, failures: undefined }],
     ["degraded with a link in failures", { degraded: true, failures: ["[x](command:y)"] }],
@@ -62,7 +69,7 @@ suite("b622 #5836 promote reports a degraded reload", () => {
       assert.strictEqual(msg.level, "warning");
       assert.strictEqual(
         msg.text,
-        "MessageFoundry: check the engine's log for a follow-on step that failed after the swap: " +
+        "MessageFoundry: check the engine's log for whether a follow-on step failed after the swap: " +
           `the engine's report of them could not be read. Promoted ${graph}`,
       );
     });

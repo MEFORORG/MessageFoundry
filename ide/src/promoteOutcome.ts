@@ -114,20 +114,24 @@ function printableList(value: unknown, re: RegExp): string[] | undefined {
 }
 
 /** The degraded sentence, or none for a reload whose follow-on steps all completed. The engine
- *  sends `degraded` on every reply, so a missing or non-boolean value is unreadable, not clean. */
+ *  sends `degraded` and `failures` on every reply, and the two agree, so any other pairing (a
+ *  missing or non-boolean `degraded`, a clean reply naming a step, a degraded one naming none) is
+ *  unreadable, not clean. */
 function degradedShortfall(r: ReloadResult): string[] {
-  if (r.degraded === false) {
+  const steps = printableList(r.failures, STEP_LABEL_RE);
+  if (r.degraded === false && steps?.length === 0) {
     return [];
   }
-  const steps = printableList(r.failures, STEP_LABEL_RE);
   if (r.degraded !== true || steps === undefined || steps.length === 0) {
     return [
-      "Check the engine's log for a follow-on step that failed after the swap: the engine's " +
+      "Check the engine's log for whether a follow-on step failed after the swap: the engine's " +
         "report of them could not be read.",
     ];
   }
+  // `audit` is among the labels, and nobody can redo that one by hand, so the sentence names the
+  // steps and the log rather than promising a step to finish.
   return [
-    `Finish by hand the follow-on steps that failed after the swap: ${steps.join(", ")}. ` +
+    `Check the engine's log: these follow-on steps failed after the swap: ${steps.join(", ")}. ` +
       "The new graph is live.",
   ];
 }
@@ -135,12 +139,14 @@ function degradedShortfall(r: ReloadResult): string[] {
 /**
  * The sentences for what a live swap left to do, as far as this reply says. A list, as in the web
  * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, #5836) sits beside the restart
- * sentence, ahead of it as there. This reads applied replies only, so null or no value is
- * unreadable, as any other shape is. An unreadable list keeps the counts and says so: the swap did
- * happen, and it must not read as a clean promote.
+ * sentence. The restart goes first, unlike the web console, which shows each sentence as its own
+ * banner: here only the lead survives a collapsed notification, and a stale CA is the one left
+ * trusted. This reads applied replies only, so null or no value is unreadable, as any other shape
+ * is. An unreadable list keeps the counts and says so: the swap did happen, and it must not read as
+ * a clean promote.
  */
 function reloadShortfall(r: ReloadResult): string[] {
-  return [...degradedShortfall(r), ...restartShortfall(r)];
+  return [...restartShortfall(r), ...degradedShortfall(r)];
 }
 
 function restartShortfall(r: ReloadResult): string[] {

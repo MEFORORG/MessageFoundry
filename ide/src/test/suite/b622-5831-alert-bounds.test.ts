@@ -53,7 +53,10 @@ function load(): AlertPage {
   const el = window.document.createElement("script");
   el.textContent = alertEditorScript(TOKEN, ["any", "queue_buildup"], ["info", "warning", "critical"]);
   window.document.body.appendChild(el);
-  assert.deepStrictEqual(errors.map(String), [], "the panel script threw while loading");
+  if (errors.length > 0) {
+    window.close(); // the caller never gets a handle to close
+    assert.fail(`the panel script threw while loading: ${errors.map(String).join("; ")}`);
+  }
   // A list first, so the page is in its ordinary state and Add is on.
   window.dispatchEvent(
     new window.MessageEvent("message", {
@@ -79,6 +82,7 @@ suite("b622 #5831 Alert Rules numeric bounds", () => {
     ["a negative min_depth", { min_depth: "-5" }, "Min depth"],
     ["a zero min_depth", { min_depth: "0" }, "Min depth"],
     ["a fractional min_depth", { min_depth: "2.5" }, "Min depth"],
+    ["a min_depth past the safe-integer range", { min_depth: String(2 ** 53) }, "Min depth"],
     ["a negative min_oldest_seconds", { min_oldest_seconds: "-1" }, "Min oldest"],
     ["a negative cooldown_seconds", { cooldown_seconds: "-30" }, "Cooldown"],
     ["a zero cooldown_seconds", { cooldown_seconds: "0" }, "Cooldown"],
@@ -96,6 +100,22 @@ suite("b622 #5831 Alert Rules numeric bounds", () => {
       }
     });
   }
+
+  // A number input reads '' for text it cannot parse. jsdom never sets badInput, so it is set here
+  // as a browser would for "5-".
+  test("Add refuses unparseable text in a number box rather than dropping the field", () => {
+    const p = load();
+    try {
+      Object.defineProperty(p.window.document.getElementById("min_depth"), "validity", {
+        value: { badInput: true },
+      });
+      const shown = add(p, { min_depth: "" });
+      assert.deepStrictEqual(p.posted, [], `Add posted ${JSON.stringify(p.posted)}`);
+      assert.ok(shown.startsWith("Min depth must be a number."), shown);
+    } finally {
+      p.close();
+    }
+  });
 
   // The control: values at the engine's bounds still post, so the refusals above are not a page
   // that refuses everything.
@@ -123,7 +143,10 @@ suite("b622 #5831 Alert Rules numeric bounds", () => {
   // The page mirrors these by hand, so a change to any of them on the engine fails here first.
   test("AlertRule still declares the lower bounds the page mirrors", () => {
     const source = fs.readFileSync(path.resolve(__dirname, "../../../../messagefoundry/config/settings.py"), "utf8");
-    const rule = source.slice(source.indexOf("class AlertRule(BaseModel):"));
+    const start = source.indexOf("\nclass AlertRule(BaseModel):");
+    assert.ok(start >= 0, "class AlertRule not found in settings.py");
+    const end = source.indexOf("\nclass ", start + 1);
+    const rule = source.slice(start, end < 0 ? undefined : end);
     assert.match(rule, /min_depth: int \| None = Field\(default=None, ge=1\)/);
     assert.match(rule, /min_oldest_seconds: float \| None = Field\(\s*default=None, ge=0, allow_inf_nan=False\s*\)/);
     assert.match(

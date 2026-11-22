@@ -21,7 +21,6 @@ export function alertEditorScript(
     const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}${SHAPE_HELPERS}
     const EVENT_TYPES = ${embedJson(eventTypes)};
     const SEVERITIES = ${embedJson(severities)};
-    const COOLDOWN_MAX = ${ALERT_COOLDOWN_MAX_SECONDS};
     const $ = (id) => document.getElementById(id);
     const errorEl = $('error');
     // True while a discarded list is the last word on the rules. See refuse().
@@ -54,7 +53,14 @@ export function alertEditorScript(
       if (t.length === 0) return 'suppress';
       return t.join(', ');
     }
-    const num = (id) => { const v = $(id).value.trim(); return v === '' ? undefined : Number(v); };
+    // A number input reads '' for text it cannot parse, as for an empty box; badInput tells them
+    // apart, so "5-" is refused rather than dropped from the rule (BACKLOG #5831).
+    const num = (id) => {
+      const el = $(id);
+      if (el.validity && el.validity.badInput) { return NaN; }
+      const v = el.value.trim();
+      return v === '' ? undefined : Number(v);
+    };
 
     function build() {
       const rule = {
@@ -78,9 +84,10 @@ export function alertEditorScript(
       // Each in-range test is the engine's own bound on AlertRule (messagefoundry/config/settings.py,
       // BACKLOG #5831), so a value the engine would refuse is refused here, before Add.
       for (const [k, label, inRange, bound] of [
-        ['min_depth', 'Min depth', (v) => Number.isInteger(v) && v >= 1, 'a whole number of 1 or more'],
+        ['min_depth', 'Min depth', (v) => mfInt(v) && v >= 1, 'a whole number of 1 or more'],
         ['min_oldest_seconds', 'Min oldest', (v) => v >= 0, '0 or more seconds'],
-        ['cooldown_seconds', 'Cooldown', (v) => v > 0 && v <= COOLDOWN_MAX, 'more than 0 and at most ' + COOLDOWN_MAX + ' seconds'],
+        ['cooldown_seconds', 'Cooldown', (v) => v > 0 && v <= ${ALERT_COOLDOWN_MAX_SECONDS},
+          'more than 0 and at most ${ALERT_COOLDOWN_MAX_SECONDS} seconds (7 days)'],
       ]) {
         if (rule[k] === undefined) { continue; }
         if (!Number.isFinite(rule[k])) { return invalid(label + ' must be a number.'); }
