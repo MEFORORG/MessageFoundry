@@ -14718,34 +14718,23 @@ class SqlServerStore:
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         # Off the loop because a row MAC can be a blocking Transit round trip (BACKLOG #5741). The
         # arguments are still evaluated on the loop, and every row is held in memory for the walk.
-        rows = await self._audit_rows()
-        capable = self._audit_keyed_capable()
         stop = threading.Event()
-
-        def walk() -> AuditVerdict:
-            try:
-                return verify_audit_rows(
-                    rows,
-                    mac_keys=self._audit_mac_keys,
-                    mac_fn=self._audit_mac_fn,
-                    capable=capable,
-                    expected_anchor=expected_anchor,
-                    expected_prefix=expected_prefix,
-                    expected_rows=expected_rows,
-                    should_stop=stop.is_set,
-                )
-            finally:
-                # This worker's Transit client must not outlive the walk. The call also marks other
-                # threads' clients stale, so each rebuilds on its next Transit request.
-                release = getattr(getattr(self, "_cipher", None), "close_connections", None)
-                if callable(release):
-                    release()
-
         try:
-            return await asyncio.to_thread(walk)
-        except asyncio.CancelledError:
-            stop.set()  # the abandoned thread ends before its next row's MAC
-            raise
+            return await asyncio.to_thread(
+                verify_audit_rows,
+                await self._audit_rows(),
+                mac_keys=self._audit_mac_keys,
+                mac_fn=self._audit_mac_fn,
+                capable=self._audit_keyed_capable(),
+                expected_anchor=expected_anchor,
+                expected_prefix=expected_prefix,
+                expected_rows=expected_rows,
+                should_stop=stop.is_set,
+            )
+        finally:
+            # On any exit from the await. An abandoned thread finishes the row it is on, whose MAC
+            # can take several Transit requests, and starts no other.
+            stop.set()
 
     # --- auth: users / roles / sessions --------------------------------------
 

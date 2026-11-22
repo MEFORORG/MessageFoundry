@@ -14,18 +14,17 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 
+from messagefoundry.store import sqlserver
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     AUDIT_TRANSIT_KEY_ID,
     AuditVerdict,
-    _AuditWalkStopped,
+    _AuditWalkCancelled,
     audit_epoch_detail,
     audit_genesis_detail,
     verify_audit_rows,
@@ -77,7 +76,7 @@ async def test_a_slow_mac_does_not_block_the_event_loop() -> None:
     def gated_mac(data: bytes, /) -> str:
         nonlocal calls
         assert threading.get_ident() != loop_thread, "the walk ran on the event loop"
-        asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result()
+        asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(_HANG_GUARD_SECONDS)
         calls += 1
         return stub_transit_mac(data)
 
@@ -128,55 +127,48 @@ def _transit_setup(
     return store, built, gate, rows
 
 
-@contextmanager
-def _one_worker(loop: asyncio.AbstractEventLoop) -> Iterator[None]:
-    """A one-thread default executor, so a later submit runs only after the walk has finished. The
-    loop is shared between tests, so it gets a fresh default executor afterwards."""
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            loop.set_default_executor(executor)
-            yield
-    finally:
-        loop.set_default_executor(ThreadPoolExecutor())
+def _watch_walk_end(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """An event set when the worker's walk has ended, however it ended."""
+    ended = threading.Event()
+
+    def watched(*args: Any, **kwargs: Any) -> AuditVerdict:
+        try:
+            return verify_audit_rows(*args, **kwargs)
+        finally:
+            ended.set()
+
+    monkeypatch.setattr(sqlserver, "verify_audit_rows", watched)
+    return ended
 
 
-async def _worker_done(loop: asyncio.AbstractEventLoop) -> None:
-    """Returns once the one-worker executor has finished the walk, without reading a clock."""
-    await loop.run_in_executor(None, lambda: None)
-
-
-async def test_the_shipped_verifier_runs_off_the_loop_and_its_client_closes_after_the_walk() -> (
-    None
-):
+async def test_the_shipped_verifier_runs_off_the_loop() -> None:
     loop = asyncio.get_running_loop()
-    store, built, gate, rows = _transit_setup(loop, length=4)
+    store, _built, gate, rows = _transit_setup(loop, length=4)
     gate.proceed.set()
-    with _one_worker(loop):
-        verdict = await store.verify_audit_chain()
-        await _worker_done(loop)
-        # Read while the worker thread is alive, so its exit cannot be what closed the client.
-        assert [client.adapter.closed for client in built] == [0, 1]
+
+    verdict = await store.verify_audit_chain()
 
     assert verdict[0] is True
     assert gate.calls == len(rows)
     assert threading.get_ident() not in gate.threads
 
 
-async def test_cancel_and_close_stop_transit_calls_and_close_the_workers_client() -> None:
+async def test_cancel_and_close_stop_transit_calls_after_the_one_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ended = _watch_walk_end(monkeypatch)
     loop = asyncio.get_running_loop()
-    store, built, gate, rows = _transit_setup(loop)
-    with _one_worker(loop):
-        task = asyncio.create_task(store.verify_audit_chain())
-        await gate.entered.wait()
+    store, _built, gate, rows = _transit_setup(loop)
+    task = asyncio.create_task(store.verify_audit_chain())
+    try:
+        await asyncio.wait_for(gate.entered.wait(), _HANG_GUARD_SECONDS)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         store._cipher.close_connections()  # what store.close() does next
+    finally:
         gate.proceed.set()
-        await _worker_done(loop)
-        # Every client the worker used, the one rebuilt for the in-flight call included.
-        assert all(client.adapter.closed == 1 for client in built[1:])
-        assert len(built) >= 2
+    assert await asyncio.to_thread(ended.wait, _HANG_GUARD_SECONDS)
 
     assert gate.calls == 1, f"{gate.calls} of {len(rows)} rows were verified after the cancel"
 
@@ -189,7 +181,7 @@ def test_a_stopped_walk_raises_and_makes_no_mac_call() -> None:
         calls += 1
         return stub_transit_mac(data)
 
-    with pytest.raises(_AuditWalkStopped):
+    with pytest.raises(_AuditWalkCancelled):
         verify_audit_rows(
             _chain(), mac_keys={}, mac_fn=counting_mac, capable=True, should_stop=lambda: True
         )
@@ -213,7 +205,6 @@ def test_a_stop_at_a_key_range_row_comes_before_its_handover_mac() -> None:
     )
     calls = 0
     checks = 0
-    calls_at_stop = -1
 
     def counting_mac(data: bytes, /) -> str:
         nonlocal calls
@@ -221,18 +212,15 @@ def test_a_stop_at_a_key_range_row_comes_before_its_handover_mac() -> None:
         return stub_transit_mac(data)
 
     def stop_after_the_rows() -> bool:
-        nonlocal checks, calls_at_stop
+        nonlocal checks
         checks += 1
-        if checks > len(rows):
-            calls_at_stop = calls
-            return True
-        return False
+        return checks > len(rows)
 
-    with pytest.raises(_AuditWalkStopped):
+    with pytest.raises(_AuditWalkCancelled):
         verify_audit_rows(
             rows, mac_keys={}, mac_fn=counting_mac, capable=True, should_stop=stop_after_the_rows
         )
-    assert calls == calls_at_stop
+    assert calls == 2, "the handover tag's MAC ran before the stop"  # genesis and row two
 
 
 @pytest.mark.parametrize("tamper", [False, True], ids=["good-chain", "tampered-chain"])

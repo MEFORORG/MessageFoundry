@@ -7784,7 +7784,7 @@ class AuditVerdict(tuple[bool, str | None]):
         )
 
 
-class _AuditWalkStopped(Exception):
+class _AuditWalkCancelled(Exception):
     """A :func:`verify_audit_rows` walk ended by its ``should_stop``. An exception, so a walk that
     did not finish can never come back as a verdict (BACKLOG #5741)."""
 
@@ -7852,7 +7852,11 @@ def verify_audit_rows(
     with that error, so the walk could not run, except that a range row's handover-tag MAC
     raising :class:`~messagefoundry.store.crypto.AuditMacMalformedError` is a logged break at that
     row (BACKLOG #8222). A structural break is
-    reported at its own position, with the reason."""
+    reported at its own position, with the reason.
+
+    ``should_stop``, when given, is asked before each row and each key-range closing. When it answers
+    true the walk raises :class:`_AuditWalkCancelled` and returns no verdict. It is not asked within
+    one row's MAC, which can take several Transit requests."""
     # The row AT seq 1, not the row that sorts first, which is the rule the open applies too
     # (``load_audit_chain``). A row added below the genesis row must not change what the chain is:
     # with a key in hand it would leave every row's MAC uncompared, and with none it would make a
@@ -7899,7 +7903,7 @@ def verify_audit_rows(
     closings: list[tuple[int, Any, str | None, AuditEpoch, dict[str, Any]]] = []
     for pos, r in enumerate(rows, start=1):
         if should_stop is not None and should_stop():
-            raise _AuditWalkStopped
+            raise _AuditWalkCancelled
         rid = r["id"]
         seq_ok = _strict_int(r["seq"]) == pos
         if not seq_ok:
@@ -8008,7 +8012,7 @@ def verify_audit_rows(
     for pos, rid, outgoing, epoch, actual in closings:
         # Each closing can cost a handover-tag MAC, so the row loop's check is not enough.
         if should_stop is not None and should_stop():
-            raise _AuditWalkStopped
+            raise _AuditWalkCancelled
         claimed = epoch.closes
         fields_ok = all(
             claimed.get(f) == actual[f] for f in ("key_id", "from_seq", "to_seq", "rows")
