@@ -1279,7 +1279,13 @@ def _record_burst(
     add_error: Exception | None = None,
 ) -> None:
     """Record the reservation, the persisted add and each encrypt, in order, into ``events``."""
-    real_add = store.add_cipher_invocations
+    # SQLite charges through the variant that runs under the writer lock it already holds.
+    add_attr = (
+        "_add_cipher_invocations_locked"
+        if isinstance(store, MessageStore)
+        else "add_cipher_invocations"
+    )
+    real_add = getattr(store, add_attr)
     real_encrypt = cipher.encrypt
 
     async def reserve(c: Any, add_fn: Any, count: int) -> None:
@@ -1297,7 +1303,7 @@ def _record_burst(
         return str(real_encrypt(plaintext, aad=aad))
 
     monkeypatch.setattr(f"{type(store).__module__}.reserve_invocations_ahead", reserve)
-    store.add_cipher_invocations = add
+    setattr(store, add_attr, add)
     monkeypatch.setattr(cipher, "encrypt", encrypt)
 
 
@@ -1373,6 +1379,37 @@ async def test_5688_failed_add_on_a_hydrated_cipher_keeps_the_shared_contract(
         _record_burst(store, cipher, events, monkeypatch, add_error=blip)
         await store.write_reference_snapshot(name="codes", version="v2", rows=_BURST_ROWS)
         assert events[:2] == ["reserve:3", "add"] and events.count("encrypt") == 3
+        assert dict(store.reference_view()["codes"]) == _BURST_ROWS
+    finally:
+        await store.close()
+
+
+async def test_5688_sqlite_reservation_does_not_deadlock_a_queued_checkpoint(
+    tmp_path: Path,
+) -> None:
+    # A checkpoint takes the writer lock and then the pass lock, so the reservation must too.
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    store = await MessageStore.open(tmp_path / "order.db", cipher=cipher)
+    try:
+        _empty_reserve(cipher)
+        await store._lock.acquire()  # stands in for a pipeline writer
+        checkpoint = asyncio.create_task(store.checkpoint_cipher_invocations())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        snapshot = asyncio.create_task(
+            store.write_reference_snapshot(name="codes", version="v1", rows=_BURST_ROWS)
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        store._lock.release()
+        _, pending = await asyncio.wait({checkpoint, snapshot}, timeout=5)
+        stuck = bool(pending)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=5)
+        assert not stuck, "the reservation deadlocked against a queued checkpoint"
         assert dict(store.reference_view()["codes"]) == _BURST_ROWS
     finally:
         await store.close()

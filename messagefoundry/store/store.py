@@ -14737,9 +14737,9 @@ class MessageStore:
         commit — a rolled-back write never leaks into :meth:`reference_view`. Replaces the whole set
         (build-new-then-flip), so it is idempotent on a re-run with the same rows."""
         encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
-        # BACKLOG #5688: one encrypt per row, reserved before the first, so the persisted total leads
-        # the burst. Outside the transaction: on SQLite a reservation commits the writer connection.
-        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, len(encoded))
+        # BACKLOG #5688: one encrypt per row, reserved before the first. If the add fails on a
+        # hydrated cipher, the burst runs under the in-process ceiling and the persisted total trails.
+        await self._reserve_reference_burst(len(encoded))
         encrypted = [
             (
                 name,
@@ -14768,6 +14768,28 @@ class MessageStore:
             await self._commit()
         # Commit succeeded → swap the active snapshot in the read cache, sealed (BACKLOG #1174).
         self._reference_cache[name] = sealed_reference_set(name, encoded)
+
+    async def _reserve_reference_burst(self, count: int) -> None:
+        """Reserve ``count`` encrypts, taking the writer lock BEFORE the bound's pass lock.
+
+        The order :meth:`checkpoint_cipher_invocations` requires (BACKLOG #5608): the pass lock first
+        would deadlock against a checkpoint queued on the writer lock. Its own commit means this runs
+        before the snapshot's transaction opens. A keyless store, or a reserve that already covers
+        the burst, takes no lock."""
+        bound = bounded_cipher(self._cipher)
+        if bound is None or count <= 0:
+            return
+        if bound.invocation_bound_hydrated and not bound.invocation_reserve_shortfall(ahead=count):
+            return
+
+        async def add(key_id: str, need: int) -> int:
+            try:
+                return await self._add_cipher_invocations_locked(key_id, need)
+            except BaseException as exc:
+                await _unwind_and_raise(self._db, exc, role="writer")
+
+        async with _writer_guard(self._db, self._lock):
+            await reserve_invocations_ahead(self._cipher, add, count)
 
     async def converge_reference_cache(self) -> list[str]:
         """No-op on SQLite (Track B Step 6). SQLite is single-node: this handle is the SOLE writer of
