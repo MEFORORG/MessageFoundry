@@ -112,47 +112,63 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
 _VALUE_TEXT = ("hunter2", "AAAA", "Winter", "2026!", "synthetic-other-line", _KEY_B64[:43])
 
 
-def _shape(pairs: list[tuple[str, str]], delete: bool, rename: bool, id: str) -> object:
-    return pytest.param(pairs, delete, rename, id=id)
-
-
 #: Each shape, with whether the refusal adds the empty-entry delete clause and the rename.
 _SHAPES = [
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1")], True, False, "assignment"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d")], True, False, "dir-line"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\n   ")], True, False, "blank-line"),
-    _shape([(_EXTRA, f"MEFOR_VALUE_A=\nOTHER={_KEY_B64}")], True, False, "assignment-to-a-key"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1\nsynthetic-other-line")], True, False, "after-it"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_VALUE_B")], True, False, "name-alone"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1")], True, False, id="assignment"),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d")], True, False, id="dir-line"
+    ),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\n   ")], True, False, id="blank-line"),
+    pytest.param(
+        [(_EXTRA, f"MEFOR_VALUE_A=\nOTHER={_KEY_B64}")], True, False, id="assignment-to-a-key"
+    ),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1\nsynthetic-other-line")], True, False, id="after-it"
+    ),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_VALUE_B")], True, False, id="name-alone"),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A=\nProgramFiles(x86)=C:\\x")],
+        True,
+        False,
+        id="assignment-with-parentheses",
+    ),
     # The value holds the directory line, so as on main it is not empty, and no delete prints.
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY==")], False, False, "blank-dir-line"),
-    _shape(
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY==")], False, False, id="blank-dir-line"
+    ),
+    pytest.param(
         [(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, KEY_CLASS_NAMES[0]), (_EXTRA, "=" + _KEY_B64)],
         True,
         False,
-        "key-name-alone",
+        id="key-name-alone",
     ),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\nhunter2")], False, False, "next-line"),
-    _shape(
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nhunter2")], False, False, id="next-line"),
+    pytest.param(
         [(_EXTRA, "MEFOR_VALUE_A=\n-----BEGIN X-----\nAAAA\n-----END X-----")],
         False,
         False,
-        "pem-from-line-2",
+        id="pem-from-line-2",
     ),
-    _shape([(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "hunter2")], False, False, "next-item"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\n#x")], False, False, "comment-only-line"),
-    _shape([(_EXTRA, f"MEFOR_VALUE_A=\n{_KEY_B64}")], False, False, "key-with-padding"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\nhunter2=")], False, False, "text-then-an-equals-sign"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\n==")], False, False, "equals-only-line"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=")], False, False, "name-with-nothing-after-it"),
-    _shape(
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "hunter2")], False, False, id="next-item"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\n#x")], False, False, id="comment-only-line"),
+    pytest.param([(_EXTRA, f"MEFOR_VALUE_A=\n{_KEY_B64}")], False, False, id="key-with-padding"),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A=\nhunter2=")], False, False, id="text-then-an-equals-sign"
+    ),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\n==")], False, False, id="equals-only-line"),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A=\nOTHER=")], False, False, id="name-with-nothing-after-it"
+    ),
+    pytest.param(
         [(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "="), (_EXTRA, "Winter=2026!")],
         False,
         False,
-        "name-alone-split-value",
+        id="name-alone-split-value",
     ),
-    _shape([(_EXTRA, "X=1\nMEFOR_VALUE_A\nWinter=2026!")], False, False, "name-alone-in-a-string"),
-    _shape(
+    pytest.param(
+        [(_EXTRA, "X=1\nMEFOR_VALUE_A\nWinter=2026!")], False, False, id="name-alone-in-a-string"
+    ),
+    pytest.param(
         [
             (_PLAIN, "MEFOR_VALUE_A="),
             (_EXTRA, "MEFOR_VALUE_A="),
@@ -160,14 +176,16 @@ _SHAPES = [
         ],
         True,
         False,
-        "empty-twice-and-a-directory",
+        id="empty-twice-and-a-directory",
     ),
     # Review round 3's O1 to O3 shapes, which a content reading of the value misjudged.
-    _shape([(_EXTRA, "MEFOR_VALUE_A\n=")], True, False, "O1-separator-line"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "=")], True, False, "O1-separator-item"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A\nX=1")], False, True, "O2-assignment-line"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A\nWinter=2026!")], False, True, "O2-split-secret-line"),
-    _shape([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "Winter=2026!")], False, False, "O3-split-item"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A\n=")], True, False, id="O1-separator-line"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "=")], True, False, id="O1-separator-item"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A\nX=1")], False, True, id="O2-assignment-line"),
+    pytest.param([(_EXTRA, "MEFOR_VALUE_A\nWinter=2026!")], False, True, id="O2-split-secret-line"),
+    pytest.param(
+        [(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "Winter=2026!")], False, False, id="O3-split-item"
+    ),
 ]
 
 
@@ -191,6 +209,28 @@ def test_every_value_name_gets_one_generic_put_sentence(
     assert KEEP not in refusal  # no shape here joins a path into a refused value
     assert "MEFOR_VALUE_A" not in refusal and "MEFOR_VALUE_B" not in refusal
     assert not any(text in refusal for text in _VALUE_TEXT)
+
+
+def test_a_value_name_alone_joined_to_a_directory_path_keeps_the_path_entry() -> None:
+    """Where the unconditional MEFOR_VALUE_* steps meet the KEEP path: the create step, Put
+    and the delete clause come before the removal, and the run-on and KEEP sentences after
+    it."""
+    refusal = service_env_refusal(
+        _read_pairs([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "mefor_secrets_directory=C:\\d")])
+    )
+    assert refusal is not None
+    order = [
+        refusal.index(text)
+        for text in (
+            CREATE,
+            "Put each MEFOR_VALUE_* variable in the secrets directory",
+            "An empty or blank MEFOR_VALUE_* entry is refused too: delete it",
+            REMOVE,
+            RUNS_ON,
+            KEEP,
+        )
+    ]
+    assert order == sorted(order)
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:

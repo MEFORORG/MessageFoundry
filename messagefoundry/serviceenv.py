@@ -165,9 +165,8 @@ class ServiceEnvPosture:
     #: its registry value, so the refusal can say to remove those entries too.
     value_runs_on: bool = False
     #: The refused names whose only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that are
-    #: blank or plainly a path (:func:`_directory_entry_value`), so the refusal sends no key
-    #: or directory secret among them to a key file or the secrets directory. The remedy
-    #: alone reads this, never the refusal itself.
+    #: blank or plainly a path (:func:`_directory_entry_value`). The remedy alone reads this,
+    #: never the refusal itself.
     directory_only_names: tuple[str, ...] = field(default=(), repr=False)
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it. The remedy alone reads this, never the refusal itself.

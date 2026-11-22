@@ -346,21 +346,22 @@ def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() ->
 
 
 @pytest.mark.parametrize(
-    "entry",
+    ("entry", "creates"),
     [
-        pytest.param("MEFOR_VALUE_A=", id="empty-value"),
-        pytest.param("MEFOR_VALUE_=synthetic", id="bare-prefix"),
-        pytest.param("MEFOR_VALUE_A=1", id="value"),
-        pytest.param("MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", id="secret"),
+        pytest.param("MEFOR_VALUE_A=", True, id="empty-value"),
+        pytest.param("MEFOR_VALUE_=synthetic", True, id="bare-prefix"),
+        pytest.param("MEFOR_VALUE_A=1", True, id="value"),
+        pytest.param("MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", True, id="secret"),
+        pytest.param(f"{_KEY}={_KEY_B64}", False, id="store-key"),
     ],
 )
-def test_the_create_guidance_comes_with_the_put_step(entry: str) -> None:
-    """A MEFOR_VALUE_* name, empty or the bare prefix among them, or a directory secret gets
-    the Put step and how a directory is created, whatever its value holds (the Lander's
-    decision d20261122T181059560-3bac03 on PR 3142)."""
+def test_the_create_guidance_comes_with_the_put_step(entry: str, creates: bool) -> None:
+    """A MEFOR_VALUE_* name, empty or the bare prefix among them, gets the Put step and how a
+    directory is created (the Lander's decision d20261122T181059560-3bac03 on PR 3142). A
+    store key alone goes to a key file, so it gets neither."""
     refusal = service_env_refusal(_read([entry]))
     assert refusal is not None
-    assert CREATE in refusal and "Put " in refusal
+    assert (CREATE in refusal) is creates and ("Put " in refusal) is creates
 
 
 def test_the_removal_step_says_with_its_value_for_a_single_item_key() -> None:
