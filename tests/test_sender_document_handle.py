@@ -964,9 +964,8 @@ def test_the_retention_strip_leaves_a_body_it_cannot_write(
         report = functools.partial(calls.append, "readable")
         assert strip_documents(body, pruned_at=0.0, on_unwritable=report)[1] == 1
         assert calls == ["^~&", "~"]
-        # Every logger created under the parsing package so far, probed inside the act's capture
-        # at its level (vault BACKLOG #3766 items 27 and 28): the codec module defines none of its
-        # own, so a probe of it alone proved nothing.
+        # The codec defines no logger of its own, so the whole parsing tree is probed, inside the
+        # act's capture and at its level (vault BACKLOG #3766 items 27 and 28).
         assert_no_records(caplog, "messagefoundry.parsing", lambda r: True, logging.DEBUG)
 
 
@@ -1950,14 +1949,22 @@ def test_the_detach_scan_reads_a_body_under_the_delimiters_the_parser_filled() -
     ] == [1]
 
 
-def test_the_retention_strip_strips_a_body_under_the_delimiters_the_parser_filled() -> None:
+def test_the_retention_strip_strips_a_body_under_the_delimiters_the_parser_filled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The retention pass strips the document of a short-MSH-2 body as it strips any other, where
-    it used to skip the row and leave the document past its strip window (BACKLOG #5972)."""
+    it used to skip the row and leave the document past its strip window (BACKLOG #5972). The codec
+    logs nothing on that path, or on a body with no OBX."""
     from messagefoundry.parsing.binary import strip_documents
 
-    body = _SHORT_MSH2_DOCUMENT
-    stripped, documents, _reclaimed = strip_documents(body, pruned_at=0.0)
-    assert documents == 1 and stripped != body
+    with caplog.at_level(logging.DEBUG):
+        body = _SHORT_MSH2_DOCUMENT
+        stripped, documents, _reclaimed = strip_documents(body, pruned_at=0.0)
+        assert documents == 1 and stripped != body
+        assert strip_documents("MSH|^~|A\rPID|1\r", pruned_at=0.0)[1] == 0
+        # The whole parsing tree, inside the capture at its level (vault BACKLOG #3766 items 27
+        # and 28).
+        assert_no_records(caplog, "messagefoundry.parsing", lambda r: True, logging.DEBUG)
 
 
 async def test_a_streaming_short_msh2_body_is_detached_and_acked(store: MessageStore) -> None:
