@@ -28,8 +28,7 @@ KEEP = (
     "entry"
 )
 
-#: Printed when a non-empty setting goes to the secrets directory and no entry is read as naming
-#: it.
+#: Printed when a setting goes to the secrets directory and no entry is read as naming it.
 CREATE = (
     'Where no secrets directory exists yet, the bullet "The other secrets: a secrets directory" '
     'under docs/SERVICE.md, "Protect the store encryption key at rest", says how it is created'

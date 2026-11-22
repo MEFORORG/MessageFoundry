@@ -66,7 +66,7 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
     # A MEFOR_VALUE_* name always gets the one Put sentence and the create step (the Lander's
     # decision d20261122T181059560-3bac03). A key whose only value is the directory entry has
-    # nothing to move (the fifth hold on PR 3142, H3).
+    # nothing to move (the fifth hold on PR 3142, H2).
     moved = refused.startswith("MEFOR_VALUE_")
     assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
@@ -81,6 +81,7 @@ def test_the_bare_prefix_joined_to_the_directory_is_deleted() -> None:
     assert refusal is not None
     assert "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry" in refusal
     assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
+    assert CREATE in refusal and "Put each MEFOR_VALUE_* variable" in refusal
 
 
 @pytest.mark.parametrize(
@@ -108,85 +109,88 @@ def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
 
 
 #: Text in the shapes below that is a value, or could be: the refusal must echo none of it.
-_VALUE_TEXT = ("hunter2", "AAAA", "Winter", "synthetic-other-line", _KEY_B64[:43])
+_VALUE_TEXT = ("hunter2", "AAAA", "Winter", "2026!", "synthetic-other-line", _KEY_B64[:43])
 
+
+def _shape(pairs: list[tuple[str, str]], delete: bool, rename: bool, id: str) -> object:
+    return pytest.param(pairs, delete, rename, id=id)
+
+
+#: Each shape, with whether the refusal adds the empty-entry delete clause and the rename.
 _SHAPES = [
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1")], id="assignment"),
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d")], id="dir-line"),
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\n   ")], id="blank-line"),
-    pytest.param([(_EXTRA, f"MEFOR_VALUE_A=\nOTHER={_KEY_B64}")], id="assignment-to-a-key"),
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1\nsynthetic-other-line")], id="after-it"),
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_VALUE_B")], id="name-alone"),
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY==")], id="blank-dir-line"),
-    pytest.param(
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1")], True, False, "assignment"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d")], True, False, "dir-line"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\n   ")], True, False, "blank-line"),
+    _shape([(_EXTRA, f"MEFOR_VALUE_A=\nOTHER={_KEY_B64}")], True, False, "assignment-to-a-key"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=1\nsynthetic-other-line")], True, False, "after-it"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_VALUE_B")], True, False, "name-alone"),
+    # The value holds the directory line, so as on main it is not empty, and no delete prints.
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY==")], False, False, "blank-dir-line"),
+    _shape(
         [(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, KEY_CLASS_NAMES[0]), (_EXTRA, "=" + _KEY_B64)],
-        id="key-name-alone",
+        True,
+        False,
+        "key-name-alone",
     ),
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\nhunter2")], id="next-line"),
-    pytest.param(
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\nhunter2")], False, False, "next-line"),
+    _shape(
         [(_EXTRA, "MEFOR_VALUE_A=\n-----BEGIN X-----\nAAAA\n-----END X-----")],
-        id="pem-from-line-2",
+        False,
+        False,
+        "pem-from-line-2",
     ),
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "hunter2")], id="next-item"),
-    pytest.param([(_EXTRA, "MEFOR_VALUE_A=\n#x")], id="comment-only-line"),
-    pytest.param([(_EXTRA, f"MEFOR_VALUE_A=\n{_KEY_B64}")], id="key-with-padding"),
-    pytest.param(
+    _shape([(_EXTRA, "MEFOR_VALUE_A="), (_EXTRA, "hunter2")], False, False, "next-item"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\n#x")], False, False, "comment-only-line"),
+    _shape([(_EXTRA, f"MEFOR_VALUE_A=\n{_KEY_B64}")], False, False, "key-with-padding"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\nhunter2=")], False, False, "text-then-an-equals-sign"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\n==")], False, False, "equals-only-line"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A=\nOTHER=")], False, False, "name-with-nothing-after-it"),
+    _shape(
+        [(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "="), (_EXTRA, "Winter=2026!")],
+        False,
+        False,
+        "name-alone-split-value",
+    ),
+    _shape([(_EXTRA, "X=1\nMEFOR_VALUE_A\nWinter=2026!")], False, False, "name-alone-in-a-string"),
+    _shape(
         [
             (_PLAIN, "MEFOR_VALUE_A="),
             (_EXTRA, "MEFOR_VALUE_A="),
             (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
         ],
-        id="empty-twice-and-a-directory",
+        True,
+        False,
+        "empty-twice-and-a-directory",
     ),
+    # Review round 3's O1 to O3 shapes, which a content reading of the value misjudged.
+    _shape([(_EXTRA, "MEFOR_VALUE_A\n=")], True, False, "O1-separator-line"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "=")], True, False, "O1-separator-item"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A\nX=1")], False, True, "O2-assignment-line"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A\nWinter=2026!")], False, True, "O2-split-secret-line"),
+    _shape([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "Winter=2026!")], False, False, "O3-split-item"),
 ]
 
 
-@pytest.mark.parametrize("pairs", _SHAPES)
-def test_every_value_name_gets_one_generic_put_sentence(pairs: list[tuple[str, str]]) -> None:
+@pytest.mark.parametrize(("pairs", "delete", "rename"), _SHAPES)
+def test_every_value_name_gets_one_generic_put_sentence(
+    pairs: list[tuple[str, str]], delete: bool, rename: bool
+) -> None:
     """The Lander's decision d20261122T181059560-3bac03 on PR 3142: no reading of which line is
     content gates the steps. Every MEFOR_VALUE_* refusal prints the one Put sentence, naming no
-    variable, with the value-file alternative and the ``provider = "env"`` sentence. An empty
-    entry adds the delete clause, and a name the secrets directory refuses adds the rename."""
-    posture = _read_pairs(pairs)
-    refusal = service_env_refusal(posture)
+    variable, the create step, the value-file alternative and the ``provider = "env"`` sentence.
+    An empty entry adds the delete clause, and a name the secrets directory refuses adds the
+    rename."""
+    refusal = service_env_refusal(_read_pairs(pairs))
     assert refusal is not None
     assert refusal.count("Put each MEFOR_VALUE_* variable in the secrets directory") == 1
-    assert "environments/<env>.toml" in refusal
-    assert '[secrets].provider = "env"' in refusal and "leaves the secret in the registry key" in (
-        refusal
-    )
-    empty = bool(posture.empty_value_names) or any(
-        name.startswith("MEFOR_VALUE_") and name != "MEFOR_VALUE_"
-        for name in posture.directory_only_names
-    )
-    assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is empty
-    assert ("rename that env() key" in refusal) is bool(posture.unplain_value_names)
+    assert CREATE in refusal and "environments/<env>.toml" in refusal
+    assert '[secrets].provider = "env"' in refusal
+    assert "leaves the secret in the registry key" in refusal
+    assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is delete
+    assert ("rename that env() key" in refusal) is rename
     assert KEEP not in refusal  # no shape here joins a path into a refused value
     assert "MEFOR_VALUE_A" not in refusal and "MEFOR_VALUE_B" not in refusal
     assert not any(text in refusal for text in _VALUE_TEXT)
-
-
-@pytest.mark.parametrize(
-    "pairs",
-    [
-        pytest.param([(_EXTRA, "MEFOR_VALUE_A\n=")], id="O1-separator-line"),
-        pytest.param([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "=")], id="O1-separator-item"),
-        pytest.param([(_EXTRA, "MEFOR_VALUE_A\nX=1")], id="O2-assignment-line"),
-        pytest.param([(_EXTRA, "MEFOR_VALUE_A\nWinter=2026!")], id="O2-split-secret-line"),
-        pytest.param([(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, "Winter=2026!")], id="O3-split-item"),
-    ],
-)
-def test_the_round_three_shapes_print_put(pairs: list[tuple[str, str]]) -> None:
-    """Review round 3's O1 to O3 shapes on PR 3142, which a content reading misjudged: each
-    prints the one Put sentence, and the rename where the name is one the directory refuses."""
-    posture = _read_pairs(pairs)
-    refusal = service_env_refusal(posture)
-    assert refusal is not None
-    assert refusal.count("Put each MEFOR_VALUE_* variable in the secrets directory") == 1
-    assert CREATE in refusal
-    assert ("rename that env() key" in refusal) is bool(posture.unplain_value_names)
-    assert "MEFOR_VALUE_A" not in refusal
-    assert "Winter" not in refusal and "2026!" not in refusal
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:

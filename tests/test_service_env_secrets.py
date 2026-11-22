@@ -905,7 +905,7 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
     assert "protect-key" not in refusal
     value = entry.split("=", 1)[1]
     assert not value.strip() or value not in refusal, "the value must never reach the refusal"
-    # An empty entry is told to go, not to move into the directory, which refuses an empty file.
+    # An empty entry is also told to go, since the secrets directory refuses an empty file.
     told_to_delete = "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
     assert told_to_delete is (not value.strip())
     [(loosening, twin)] = service_env_loosenings(posture)

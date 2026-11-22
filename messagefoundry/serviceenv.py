@@ -165,9 +165,9 @@ class ServiceEnvPosture:
     #: its registry value, so the refusal can say to remove those entries too.
     value_runs_on: bool = False
     #: The refused names whose only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that are
-    #: blank or plainly a path (:func:`_directory_entry_value`), so the refusal sends none of
-    #: them to a key file or the secrets directory. The remedy alone reads this, never the
-    #: refusal itself.
+    #: blank or plainly a path (:func:`_directory_entry_value`), so the refusal sends no key
+    #: or directory secret among them to a key file or the secrets directory. The remedy
+    #: alone reads this, never the refusal itself.
     directory_only_names: tuple[str, ...] = field(default=(), repr=False)
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it. The remedy alone reads this, never the refusal itself.
@@ -1200,8 +1200,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         )
     if others or values:
         # The installer refuses an existing directory the service does not name, so this points
-        # only at how one is created, only where a non-empty setting goes to one, and before the
-        # step that moves it there (the third hold's H2, the fourth hold's H1 and H3).
+        # only at how one is created, and before the step that moves a setting there (the third
+        # hold's H2, the fourth hold's H1).
         if _DIRECTORY_VARIABLE not in posture.listed and (moving_others or values):
             steps.append(
                 'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
@@ -1256,7 +1256,6 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "engine. Renaming the variable outside MEFOR_VALUE_* ends this refusal but leaves "
                 "the secret in the registry key"
             )
-        if values:
             cite += ' and "[environments]"'
         if parts:
             steps.append(". ".join([*parts, cite]))
