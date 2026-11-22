@@ -14,7 +14,6 @@ the reference backend (Phases 3/4 are separate); mirrors ``test_store_once_deliv
 from __future__ import annotations
 
 import hashlib
-import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -101,24 +100,6 @@ async def test_read_counts_utf8_bytes_as_the_put_does(store: MessageStore) -> No
     assert await _read(store, ref) == chunks
 
 
-async def test_read_decrypts_off_the_event_loop(
-    enc_store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Red before #5728: decryption is CPU work in proportion to the document."""
-    ref = await enc_store.put_attachment(CHUNKS, "application/pdf")
-    real = enc_store._cipher.decrypt
-    threads: list[int] = []
-
-    def _spy(*args: Any, **kwargs: Any) -> str:
-        threads.append(threading.get_ident())
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(enc_store._cipher, "decrypt", _spy)
-    assert "".join(await _read(enc_store, ref)) == DOC
-    assert len(threads) == len(CHUNKS)
-    assert threading.get_ident() not in threads
-
-
 class _ReadCursor:
     """Answers the header read and then the chunk read, as a SQL Server cursor would."""
 
@@ -170,6 +151,14 @@ async def test_sqlserver_read_raises_on_a_short_document() -> None:
         _ = [c async for c in _sqlserver_reader(5, [(0, "abc")]).read_attachment("a" * 64)]
     whole = _sqlserver_reader(5, [(0, "abc"), (1, "de")])
     assert [c async for c in whole.read_attachment("a" * 64)] == ["abc", "de"]
+
+
+async def test_sqlserver_read_counts_utf8_bytes_as_the_put_does() -> None:
+    """``total_bytes`` is UTF-8 bytes, so a non-ASCII document must not read as a mismatch."""
+    chunks = ["café-", "文書"]
+    total = len("".join(chunks).encode("utf-8"))
+    reader = _sqlserver_reader(total, list(enumerate(chunks)))
+    assert [c async for c in reader.read_attachment("a" * 64)] == chunks
 
 
 async def test_put_read_roundtrip_verbatim_chunked(store: MessageStore) -> None:

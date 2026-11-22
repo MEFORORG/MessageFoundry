@@ -496,6 +496,18 @@ class _PgReadConn:
         return self._rows
 
 
+def _pg_reader(total: int, rows: list[dict[str, Any]]) -> Any:
+    store: Any = PostgresStore.__new__(PostgresStore)
+    store._cipher = make_cipher(None)
+
+    @asynccontextmanager
+    async def _timed_acquire() -> AsyncIterator[_PgReadConn]:
+        yield _PgReadConn(total, rows)
+
+    store._timed_acquire = _timed_acquire
+    return store
+
+
 @pytest.mark.parametrize(
     "rows",
     [[], [{"seq": 0, "ciphertext": "abc"}]],
@@ -503,16 +515,20 @@ class _PgReadConn:
 )
 async def test_postgres_read_raises_on_a_short_document(rows: list[dict[str, Any]]) -> None:
     """Red before #5728: GC between the two reads returned a short document and no error."""
-    store: Any = PostgresStore.__new__(PostgresStore)
-    store._cipher = make_cipher(None)
-
-    @asynccontextmanager
-    async def _timed_acquire() -> AsyncIterator[_PgReadConn]:
-        yield _PgReadConn(5, rows)
-
-    store._timed_acquire = _timed_acquire
     with pytest.raises(KeyError, match="incomplete"):
-        _ = [c async for c in store.read_attachment("a" * 64)]
+        _ = [c async for c in _pg_reader(5, rows).read_attachment("a" * 64)]
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [["abc", "de"], ["café-", "文書"]],
+    ids=["whole", "non-ascii"],
+)
+async def test_postgres_read_returns_a_whole_document(chunks: list[str]) -> None:
+    """The control: ``total_bytes`` is UTF-8 bytes, so a whole document must not read as short."""
+    rows = [{"seq": seq, "ciphertext": chunk} for seq, chunk in enumerate(chunks)]
+    total = len("".join(chunks).encode("utf-8"))
+    assert [c async for c in _pg_reader(total, rows).read_attachment("a" * 64)] == chunks
 
 
 async def test_a_failed_alter_cursor_open_reaches_the_alters_handler(

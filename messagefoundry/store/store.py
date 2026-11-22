@@ -14054,22 +14054,14 @@ class MessageStore:
         exact VERBATIM slices that were put (Approach B: no decode/encode, so concatenating them
         reconstructs the exact OBX-5.5 value byte-for-byte). Raises :class:`KeyError` if the attachment
         does not exist (corruption, or already GC'd at ``refcount=0``), or, after the last chunk, if
-        the chunks do not add up to the header's ``total_bytes``. The per-chunk AAD binds
+        the chunks' UTF-8 byte count differs from the header's ``total_bytes``. The per-chunk AAD binds
         ``(attachment_id, seq)`` but not the chunk count, so a lost chunk would otherwise read as a
-        shorter document (BACKLOG #5728). A consumer must treat the content as good only once
-        iteration ends. Streams one chunk at a time (the whole document is never held in one
-        buffer); the pooled read runs on one consistent WAL snapshot, so a GC cannot land between
-        its two statements here, unlike on the server backends."""
+        shorter document (BACKLOG #5728). That is a byte-count check only: a clean end of iteration
+        says the count matched, and the check does not detect equal-length damage or reordering.
+        Streams one chunk at a time (the whole document is never held in one buffer); the pooled
+        read runs on one consistent WAL snapshot, so a GC cannot land between its two statements
+        here, unlike on the server backends."""
         self._require_streaming_attachments()
-
-        def _open(ciphertext: str, seq: int) -> tuple[str, int]:
-            # Bound to (attachment_id, seq) — a chunk relocated to another attachment/seq fails closed.
-            plain = self._cipher.decrypt(
-                ciphertext, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq)
-            )
-            # isascii is O(1) and the detach path's base64 is ASCII, so this rarely copies a chunk.
-            return plain, len(plain) if plain.isascii() else len(plain.encode("utf-8"))
-
         async with self._read() as conn:
             cur = await conn.execute("SELECT total_bytes FROM attachment WHERE id=?", (ref,))
             header = await cur.fetchone()
@@ -14082,8 +14074,13 @@ class MessageStore:
             )
             seen = 0
             async for row in cur:
-                plain, size = await asyncio.to_thread(_open, row["ciphertext"], row["seq"])
-                seen += size
+                # Bound to (attachment_id, seq) — a chunk relocated to another attachment/seq fails closed.
+                plain = self._cipher.decrypt(
+                    row["ciphertext"],
+                    aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
+                )
+                # isascii is O(1) and the detach path's base64 is ASCII, so this rarely copies a chunk.
+                seen += len(plain) if plain.isascii() else len(plain.encode("utf-8"))
                 yield plain
         if seen != total:
             raise KeyError(f"attachment {ref!r} incomplete: {seen} of {total} bytes")

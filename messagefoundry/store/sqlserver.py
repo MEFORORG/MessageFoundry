@@ -12700,9 +12700,10 @@ class SqlServerStore:
         """Yield the detached document's chunks back as decrypted plaintext, in ``seq`` order — the exact
         verbatim slices that were put (Approach B: concatenating them reconstructs OBX-5.5 byte-for-byte).
         Raises :class:`KeyError` if the attachment does not exist (corruption or already GC'd), or,
-        after the last chunk, if the chunks do not add up to the header's ``total_bytes``: the two
-        reads are separate statements, so a GC between them must not read as an empty document
-        (BACKLOG #5728). A consumer must treat the content as good only once iteration ends."""
+        after the last chunk, if the chunks' UTF-8 byte count differs from the header's
+        ``total_bytes``: the two reads are separate statements, so a GC between them must not read as
+        an empty document (BACKLOG #5728). That is a byte-count check only: a clean end of iteration
+        says the count matched, and the check does not detect equal-length damage or reordering."""
         total: int | None = None
         rows: list[dict[str, Any]] = []
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -12723,18 +12724,13 @@ class SqlServerStore:
                 raise
         if total is None:
             raise KeyError(f"attachment {ref!r} not found")
-
-        def _open(ciphertext: str, seq: int) -> tuple[str, int]:
-            plain = self._cipher.decrypt(
-                ciphertext, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq)
-            )
-            # isascii is O(1) and the detach path's base64 is ASCII, so this rarely copies a chunk.
-            return plain, len(plain) if plain.isascii() else len(plain.encode("utf-8"))
-
         seen = 0
         for r in rows:
-            plain, size = await asyncio.to_thread(_open, r["ciphertext"], r["seq"])
-            seen += size
+            plain = self._cipher.decrypt(
+                r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
+            )
+            # isascii is O(1) and the detach path's base64 is ASCII, so this rarely copies a chunk.
+            seen += len(plain) if plain.isascii() else len(plain.encode("utf-8"))
             yield plain
         if seen != total:
             raise KeyError(f"attachment {ref!r} incomplete: {seen} of {total} bytes")
