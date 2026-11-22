@@ -110,19 +110,9 @@ function configDirSegments(
   return rel === "" ? [] : rel.split(p.sep);
 }
 
-/** Whether `documentFsPath` lives anywhere under the configured config dir ({@link configDirSegments}
- *  says how the two are resolved and compared). */
-export function isUnderConfigDir(
-  documentFsPath: string,
-  workspaceDir: string,
-  configDir: string,
-  platform: NodeJS.Platform = process.platform,
-): boolean {
-  return configDirSegments(documentFsPath, workspaceDir, configDir, platform) !== undefined;
-}
-
 /**
- * Whether `documentFsPath` IS the config dir's own `connections.toml`. The custom editors read and
+ * Whether `documentFsPath` IS the config dir's own `connections.toml` ({@link configDirSegments} says
+ * how the two paths are resolved and compared). The custom editors read and
  * write via the CLI's `--config <configDir>`, so they faithfully represent only the exact file the CLI
  * edits. The selector globs match by file name across the whole workspace, so a same-named file
  * elsewhere, or nested deeper under the config dir, would otherwise be shown and saved as the config
@@ -147,7 +137,9 @@ export function isConfigDirCodeSetFile(
   platform: NodeJS.Platform = process.platform,
 ): boolean {
   const segs = configDirSegments(documentFsPath, workspaceDir, configDir, platform);
-  return segs?.length === 2 && segs[0] === "codesets" && /\.(csv|toml)$/i.test(segs[1]);
+  // No /i: the segments are already folded where the filesystem folds, and elsewhere the CLI looks up
+  // only the lower-case extensions.
+  return segs?.length === 2 && segs[0] === "codesets" && /\.(csv|toml)$/.test(segs[1]);
 }
 
 /** A connection summary the connections customEditor lists (name/direction/transport) — the fields it

@@ -5,7 +5,8 @@ import * as assert from "assert";
 import {
   codeSetNameFromPath,
   isReadOnlyCodeSet,
-  isUnderConfigDir,
+  isConfigDirCodeSetFile,
+  isConfigDirConnectionsFile,
   pickCurrentConnection,
   shouldPushDocumentChange,
   type ConnectionListItem,
@@ -53,21 +54,21 @@ suite("configEditorModel — webview↔document loop guard", () => {
 suite("configEditorModel — config-dir scope guard (F3)", () => {
   test("the config-dir's own connections.toml is under the (relative) config dir", () => {
     assert.strictEqual(
-      isUnderConfigDir("/ws/samples/config/connections.toml", "/ws", "samples/config"),
+      isConfigDirConnectionsFile("/ws/samples/config/connections.toml", "/ws", "samples/config"),
       true,
     );
   });
 
   test("a codesets/*.csv nested under the config dir is under it", () => {
     assert.strictEqual(
-      isUnderConfigDir("/ws/samples/config/codesets/diets.csv", "/ws", "samples/config"),
+      isConfigDirCodeSetFile("/ws/samples/config/codesets/diets.csv", "/ws", "samples/config"),
       true,
     );
   });
 
   test("a same-named file elsewhere in the workspace is NOT under the config dir", () => {
     assert.strictEqual(
-      isUnderConfigDir("/ws/other/connections.toml", "/ws", "samples/config"),
+      isConfigDirConnectionsFile("/ws/other/connections.toml", "/ws", "samples/config"),
       false,
     );
   });
@@ -75,18 +76,18 @@ suite("configEditorModel — config-dir scope guard (F3)", () => {
   test("a sibling dir that merely shares a name prefix is not a match (boundary check)", () => {
     // "samples/config-backup" must not count as under "samples/config".
     assert.strictEqual(
-      isUnderConfigDir("/ws/samples/config-backup/connections.toml", "/ws", "samples/config"),
+      isConfigDirConnectionsFile("/ws/samples/config-backup/connections.toml", "/ws", "samples/config"),
       false,
     );
   });
 
   test("Windows paths + an absolute config dir, case-insensitively", () => {
     assert.strictEqual(
-      isUnderConfigDir("C:\\WS\\Config\\connections.toml", "C:\\ws", "C:\\ws\\config", "win32"),
+      isConfigDirConnectionsFile("C:\\WS\\Config\\connections.toml", "C:\\ws", "C:\\ws\\config", "win32"),
       true,
     );
     assert.strictEqual(
-      isUnderConfigDir("C:\\ws\\elsewhere\\connections.toml", "C:\\ws", "C:\\ws\\config", "win32"),
+      isConfigDirConnectionsFile("C:\\ws\\elsewhere\\connections.toml", "C:\\ws", "C:\\ws\\config", "win32"),
       false,
     );
   });
