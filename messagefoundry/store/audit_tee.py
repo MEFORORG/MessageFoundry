@@ -100,7 +100,8 @@ audit_logger.setLevel(logging.INFO)
 _TEE_FAILURE_LOGGED = False
 
 
-#: The keys of a JSON ``detail`` whose values the tee withholds, at any depth. ``recovery_wrap`` is
+#: The keys of a JSON ``detail`` whose values the tee withholds, in the objects
+#: :func:`_withhold_detail` reaches; its docstring names at least what it misses. ``recovery_wrap`` is
 #: the store master key wrapped under the recovery key, which a host-provider store's genesis row
 #: keeps (``store.store.audit_genesis_detail``). The row keeps it, behind the audit read gates; the
 #: tee's copy does not. ``tests/test_audit_tee_recovery_wrap.py`` holds this name to the writer's.
@@ -126,14 +127,16 @@ def _withhold_detail(detail: str | None) -> str | None:
     nests, with each such key's value as :data:`_DETAIL_WITHHELD`, and otherwise unchanged.
 
     The text is parsed only where it holds a withheld field's name, and re-encoded only where a
-    value was replaced, by ``json.dumps``'s defaults, as the genesis writer encodes it. An object's
-    string value that is itself such a JSON text, and a detail that is a JSON string holding one,
-    is withheld the same way. What is not matched includes at least a key spelled with a JSON
-    escape, a JSON text held in a string inside a list, and the value in text that is not JSON; no
-    engine writer writes the wrap in any of those. Any other fault, such as a nest too deep to
-    read or an integer too long to parse, ships the whole detail as
-    :data:`_DETAIL_WITHHELD_WHOLE`, since the value may still be in the text, and is logged once
-    per process."""
+    value was replaced, by ``json.dumps``'s defaults. That is the genesis writer's encoder, and the
+    parse keeps its sorted key order; another writer's separators or number forms can change. An
+    object's string value that is itself such a JSON text, and a detail that is a JSON string
+    holding one, is withheld the same way. What is not matched includes at least a key spelled
+    with a JSON escape, a JSON text held in a string inside a list, and text that strict JSON
+    parsing refuses, such as one with a raw control character, a byte order mark or trailing text;
+    no engine writer writes the wrap in any of those. Any other fault, such as a nest too deep to
+    read or an integer too long to parse, ships the text being read as
+    :data:`_DETAIL_WITHHELD_WHOLE`, since the value may still be in it: the whole detail, or, for
+    a fault in a JSON text held in a string value, that value. It is logged once per process."""
     if not detail or not _names_a_withheld_field(detail):
         return detail
     changed = False
@@ -160,8 +163,9 @@ def _withhold_detail(detail: str | None) -> str | None:
         if not _WITHHOLD_FAULT_LOGGED:
             _WITHHOLD_FAULT_LOGGED = True
             log.warning(
-                "the audit tee could not withhold a field in a detail (%s); that detail ships "
-                "whole as withheld, and further such faults in this process are not logged",
+                "the audit tee could not withhold a field in a detail (%s); the text it was "
+                "reading ships whole as withheld, and further such faults in this process are not "
+                "logged",
                 type(exc).__name__,
             )
         return _DETAIL_WITHHELD_WHOLE
@@ -532,8 +536,7 @@ def emit_audit_tee(
     ships as ``<withheld>``, before the passes below read it. At least the genesis row of a store
     minted under ``[store].key_provider = "host"`` holds one, ``recovery_wrap``. The row in
     ``audit_log`` keeps the value, and the observers are passed it. :func:`_withhold_detail` names
-    at least what it does not match, and says that a fault there ships the whole detail as
-    withheld.
+    at least what it does not match, and says what a fault there ships.
 
     **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
     ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``

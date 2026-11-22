@@ -10,8 +10,8 @@ ships it as ``<withheld>``.
 
 Before this, the copy of a genesis row in the in-heap or Transit scheme held no wrap only because
 :func:`~messagefoundry.redaction.safe_text`'s length bound cut its detail before the wrap.
-``test_the_wrap_is_withheld_where_the_length_bound_does_not_cut_it`` shows that bound was all that
-kept it out. The chain case ``a_minted_genesis_rows_recovery_wrap_stays_out_of_the_log`` in
+``test_the_wrap_is_withheld_where_the_length_bound_does_not_cut_it`` widens that bound; it fails
+against the origin/main tee, whose line then holds the wrap (measured 2026-11-22). The chain case ``a_minted_genesis_rows_recovery_wrap_stays_out_of_the_log`` in
 ``tests/audit_chain_cases.py`` runs the end-to-end path on all three backends.
 """
 
@@ -122,7 +122,7 @@ def test_a_detail_that_names_no_withheld_field_is_left_alone() -> None:
     assert audit_tee._withhold_detail(None) is None
 
 
-def test_a_held_key_is_re_encoded_as_the_genesis_writer_encodes_it() -> None:
+def test_a_held_key_is_re_encoded_with_json_dumps_defaults() -> None:
     """``json.dumps``'s defaults, so a line separator stays escaped and NaN stays NaN."""
     text = f"a{chr(0x2028)}b"
     kept = audit_tee._withhold_detail(json.dumps({"recovery_wrap": "x", "s": text, "f": NAN}))
