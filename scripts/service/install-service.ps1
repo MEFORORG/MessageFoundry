@@ -1146,9 +1146,10 @@ function Get-SettingsKeyProvider {
       a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table
       with no table nested before the key, each holding a one-line string with no escape. Lines
       inside a multi-line array or string are skipped. Names compare case-sensitively, as TOML's
-      do. Any other form reads as $null. A triple quote in a
-      comment or a one-line string, or a multi-line string holding the other delimiter, can make
-      it misread every line after it, either way. What the installer does
+      do. Other forms can misread either way: at least a header it does not recognize (a tab, or a
+      quoted key with a space or punctuation) leaves the lines after it credited to the table
+      before it, and a triple quote in a comment or a one-line string, or a multi-line string
+      holding the other delimiter, can make it misread every line after it. What the installer does
       with the answer is an early refusal: the engine applies its own key custody refusals at start
       whatever this returns.
     #>
