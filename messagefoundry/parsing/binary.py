@@ -1327,10 +1327,11 @@ async def reattach_documents_in_hl7(
     for occ, sha256 in handles:
         verbatim = await reader(sha256)
         if not verbatim:
-            # The handle names a document the store no longer has (missing / GC'd), or a header
-            # whose chunks are gone, which a store read returns as "": the detach never stores an
-            # empty value. Fail loud rather than deliver the raw handle text, or an empty OBX-5.5,
-            # into the partner's message (silent corruption).
+            # The reader gave back None or "" for this handle, and the detach never stores an empty
+            # value, so neither is the document. A store read does not return "" for a header whose
+            # chunks are gone: it raises KeyError after the last chunk, unless that header's
+            # total_bytes is 0. Fail loud rather than deliver the raw handle text, or an empty
+            # OBX-5.5, into the partner's message (silent corruption).
             raise DocRefError(
                 f"attachment {sha256!r} not found for re-attach (missing / GC'd); refusing to "
                 "deliver an un-hydrated document handle"

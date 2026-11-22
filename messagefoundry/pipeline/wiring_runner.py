@@ -11471,12 +11471,16 @@ class RegistryRunner:
         try:
             return await reattach_documents_in_hl7(payload, _reader, bound=bound)
         except (DocRefError, KeyError, StreamingAttachmentsUnsupported) as exc:
-            # A held attachment whose read fails (KeyError, a race with the links read), or an
-            # unsupported backend at read time — surface as a retryable DeliveryError (the message
-            # reached NEITHER wire nor peer). An attachment GC'd with its header is not held, so it
-            # is the permanent refusal below.
-            # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
-            # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
+            # A held attachment whose read fails with KeyError, or an unsupported backend at read
+            # time — surface as a retryable DeliveryError (the message reached NEITHER wire nor
+            # peer), exactly like the encoding-override / raw-separators pre-send failures. An
+            # attachment GC'd with its header is not held, so it is the permanent refusal below.
+            # The KeyError can be a race with the links read, which a retry may clear. It can also
+            # be a permanently lost chunk (read_attachment's byte total does not match the header),
+            # which no retry clears but which takes this same retryable path: the row re-pends with
+            # backoff until the retry policy dead-letters it, and on a FIFO lane it holds the lane
+            # for that whole retry budget (with max_attempts=None, until an operator purges it).
+            # The buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
             # Only failures the MESSAGE causes, at least: the payload does not parse as HL7 (vault

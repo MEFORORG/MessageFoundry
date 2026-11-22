@@ -1224,7 +1224,9 @@ class QueueStore(StoreLifecycle, Protocol):
     def read_attachment(self, ref: str) -> AsyncIterator[str]:
         """Yield the detached document's chunks back as decrypted plaintext in ``seq`` order — the exact
         verbatim slices that were put (Approach B: concatenating them reconstructs the OBX-5.5 value
-        byte-for-byte). Raises :class:`KeyError` if the attachment does not exist."""
+        byte-for-byte). Raises :class:`KeyError` if the attachment does not exist, or, after the last
+        chunk has been yielded, if the chunks do not add up to the header's ``total_bytes``. A consumer
+        must treat the content as good only once iteration ends."""
         ...
 
     async def attachments_for(
