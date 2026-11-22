@@ -118,8 +118,7 @@ as the accepted draft wrote them except where a point below says otherwise.
    anywhere but the whitespace at either end. The refusal is in `check_decoded` in
    `messagefoundry/pipeline/ingress_guards.py`, the guard at least both live listeners, the dry-run
    and the operator resend share. A resend with no inbound to guard for
-   (`admit_resubmitted_body(raw, None)`) applies only the engine-wide rules, as it did before, and
-   so skips this one. It is `IngressFrameByteRejected`, a sibling
+   (`admit_resubmitted_body(raw, None)`) skips this one. It is `IngressFrameByteRejected`, a sibling
    of the NUL refusal under a new base, `IngressBodyRejected`. A listener with an ACK channel answers
    `AR` with the fixed MSA-3 text `MLLP frame byte in body` and records `ERROR`; a source with no ACK
    channel records `ERROR` alone. With rule 1, this is what closes route 3: a rule about a second

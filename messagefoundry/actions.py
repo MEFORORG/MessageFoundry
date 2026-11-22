@@ -618,9 +618,8 @@ _Unit = tuple[str, str, Literal["lit", "esc", "open"]]
 def _seps(msg: Message) -> _Seps:
     """The separators a :meth:`Message.field` read decodes a value with: the first header line's,
     which are a ``BHS`` or ``FHS`` header's in a batch, so an edit decodes a value as a read of it
-    does (BACKLOG #5928). :meth:`Message.set` and the repetition split of a read still use
-    ``MSH-2``'s, so a batch whose header's encoding characters differ from ``MSH-2``'s is still read
-    and written with two sets."""
+    does (BACKLOG #5928). :meth:`Message.set` and the repetition split of a read use the same set
+    (BACKLOG #5972); this keeps the parser's tuple order."""
     return _builtin_hl7.separators(msg._m)
 
 

@@ -14,9 +14,10 @@ import tracemalloc
 
 import pytest
 
-from messagefoundry.parsing import encode_batch, split_batch
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing import HL7PeekError, encode_batch, split_batch
+from messagefoundry.parsing.message import COLLIDING_DELIMITERS_WRITE, Message
 from messagefoundry.parsing.peek import normalize
+from messagefoundry.parsing.split import batch_member_collides
 
 M1 = "MSH|^~\\&|A|B|C|D|20260101010101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JOHN\r"
 M2 = "MSH|^~\\&|A|B|C|D|20260101010102||ADT^A02|MSG2|P|2.5.1\rPID|1||200||ROE^JANE\r"
@@ -136,8 +137,10 @@ _Reading = tuple[str, ...]
 
 
 def _parser_reading(head: str) -> _Reading:
+    # The write read: the BHS is a write of the head's delimiters, so a head whose short MSH-2
+    # fills a default it already uses is refused as any write to it is (BACKLOG #5972).
     try:
-        return Message.parse(head)._encoding_chars()
+        return Message.parse(head)._write_encoding_chars()
     except ValueError as exc:  # HL7PeekError is one
         return type(exc).__name__, str(exc)
 
@@ -150,33 +153,80 @@ def _batch_reading(head: str) -> _Reading:
     return bhs[3], bhs[4], bhs[5], bhs[6], bhs[7]
 
 
-@pytest.mark.parametrize(
-    "head",
-    [
-        "  \r\n" + M1,  # leading whitespace, as the parser strips it
-        M1.replace("\r", "\n"),  # LF line endings
-        "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
-        "MSH#@~\\&#A#B\r",  # custom delimiters
-        "MSH|^~\\&|A\rOBX|1|TX|||\\.in5\\\r",  # a counted escape under the budget still frames
-        "MSH#@~$&#A\rOBX#1#TX###$.in5$" + "\\.in9999999\\" * 20 + "\r",  # not its escape char
-        "MSH|^~\\&",  # MSH-2 and nothing more
-        "MSH|^~\\ \r",  # a trailing space the parser's strip removes, leaving MSH-2 short
-        "MSH|^~\\\t",
-        "MSH|^~\\ \rPID|1\r",  # the same space kept, as more follows it
-        "MSH\r",
-        "MSH|^~\r",
-        "MSH|^~|A|B\r",
-        "MSH|",
-        "not an HL7 message",
-        "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, which the parser refuses
-        "BHS|^~\\&\rMSH#@~\\&#A#B\r",  # an envelope-led head, parsed as before
-        "BHS|^~\\&\rPID|1\r",
-    ],
-)
+#: Heads a header-only read must judge as a parse does.
+_HEADS = [
+    "  \r\n" + M1,  # leading whitespace, as the parser strips it
+    M1.replace("\r", "\n"),  # LF line endings
+    "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
+    "MSH#@~\\&#A#B\r",  # custom delimiters
+    "MSH|^~\\&|A\rOBX|1|TX|||\\.in5\\\r",  # a counted escape under the budget still frames
+    "MSH#@~$&#A\rOBX#1#TX###$.in5$" + "\\.in9999999\\" * 20 + "\r",  # not its escape char
+    "MSH|^~\\&",  # MSH-2 and nothing more
+    "MSH|^~\\ \r",  # a trailing space the parser's strip removes, leaving MSH-2 short
+    "MSH|^~\\\t",
+    "MSH|^~\\ \rPID|1\r",  # the same space kept, as more follows it
+    "MSH\r",
+    "MSH|^~\r",
+    "MSH|^~|A|B\r",
+    "MSH|~|A|B\r",  # a filled default the head already uses, refused as a write
+    "MSH^^A^B\r",
+    "MSH|",
+    "not an HL7 message",
+    "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, which the parser refuses
+    "BHS|^~\\&\rMSH#@~\\&#A#B\r",  # an envelope-led head, parsed as before
+    "BHS|^~\\&\rPID|1\r",
+    "MSH|~\nPID|1\n",  # a colliding head with LF line endings
+    "  \nMSH|^~&|A\r",  # a colliding head after whitespace
+    "BHS|~|A\rMSH|^~\\&|A\r",  # a colliding envelope-led head
+    "MSH|~ \n",  # a trailing space the parser's strip removes, after an LF
+    "MSH|~ \nPID|1\n",  # the same space kept, as more follows it
+    "MSH|^~\\ \t \n\n",  # whitespace past the eight characters the read takes
+]
+
+
+@pytest.mark.parametrize("head", _HEADS)
 def test_the_head_separators_match_the_parser(head: str) -> None:
     # The contract Message._encoding_chars kept: the separators it reads, or a refusal rather than
     # a guess.
     assert _batch_reading(head) == _parser_reading(head)
+
+
+@pytest.mark.parametrize("head", _HEADS)
+def test_batch_member_collides_is_the_parse_verdict(head: str) -> None:
+    # The delivery stage refuses a member alone on this verdict (BACKLOG #5972), so on every head
+    # the parse accepts it must match what the parse and the write read decide, without parsing.
+    try:
+        expected = Message.parse(head)._delimiters_collide()
+    except ValueError:  # HL7PeekError is one: encode_batch still refuses it as a parse does
+        expected = False
+    assert batch_member_collides(head) is expected
+    if expected:
+        assert _batch_reading(head)[1] == COLLIDING_DELIMITERS_WRITE
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "MSH|~|A\rOBX|1|TX|||" + "\\.in9999999\\" * 20 + "\r",  # over the escape budget
+        "BHS|~|A\rMSH",  # a later header line too short to read
+    ],
+)
+def test_a_colliding_first_line_is_judged_alone_whatever_a_parse_refuses_later(head: str) -> None:
+    # The verdict reads the first line only, as documented, so a parse refusal later in the text
+    # does not change it; encode_batch still raises the parse's own refusal for such a head, the
+    # budget checked before the collision, as a parse checks it before it reads anything.
+    with pytest.raises(HL7PeekError):
+        Message.parse(head)
+    assert batch_member_collides(head) is True
+    assert _batch_reading(head)[0] == "HL7PeekError"
+
+
+def test_a_message_head_whose_filled_default_collides_is_refused() -> None:
+    # The BHS writes the head's delimiters, so a parsed head is refused as a str head is.
+    head = Message.parse("MSH|~|A|B\rPID|1\r")
+    with pytest.raises(ValueError, match="a default filled in for one"):
+        encode_batch([head], control_id="1", timestamp=_TS)
+    assert encode_batch([Message.parse(M1)], control_id="1", timestamp=_TS).startswith("BHS|")
 
 
 #: A head whose escapes could expand past the parser's budget (ASVS 1.3.3).

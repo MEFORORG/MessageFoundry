@@ -31,7 +31,7 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
-from messagefoundry.transports.mllp import MLLPDestination
+from messagefoundry.transports.mllp import MLLPDestination, parse_encoding_characters
 from tests._claim_lock_helpers import claim_past_empty_yield
 from tests._mllp_recorder import MllpRecorder, run_one_batch
 
@@ -452,7 +452,7 @@ async def test_pooled_claim_projects_created_at(store: Any) -> None:
 async def test_unparseable_head_dead_letters_not_strands(store: Any) -> None:
     # An MLLP outbound is payload-agnostic (ADR 0004): a non-HL7 body can reach the batch framer. It must
     # dead-letter (framing inside the try) — NOT leave every claimed row INFLIGHT forever.
-    bad = "MSH|^~|X\r"  # MSH-2 has < 4 encoding chars → _encoding_chars raises at frame time
+    bad = "NOT-HL7|X\r"  # no MSH/BHS/FHS header, so the head parse raises at frame time
     mids = [
         await store.enqueue_message(channel_id="c1", raw=bad, deliveries=[(DEST, bad)], now=now)
         for now in (101.0, 102.0)
@@ -635,6 +635,90 @@ async def test_a_member_holding_two_messages_is_dead_lettered_alone(
     (row,) = await store.outbox_for(mids[at])
     error = str(row["last_error"])
     assert "more than one MSH segment" in error and "DOE" not in error and "MSG" not in error
+
+
+#: A member whose short MSH-2, ``~``, leaves the parser's default repetition separator the same
+#: character as its declared component one, so its header cannot be written (BACKLOG #5972).
+_COLLIDING = "MSH|~|A|B|C|D|20260101000009||ADT~A01|MSGX|P|2.5.1\rPID|1||900\r"
+
+
+@pytest.mark.parametrize("simulate", [False, True], ids=["live", "shadow"])
+async def test_a_colliding_head_is_dead_lettered_alone_and_the_rest_batch(
+    store: Any, simulate: bool
+) -> None:
+    # The envelope's BHS is written in its head's delimiters, which a colliding head cannot give.
+    # encode_batch refused the whole batch for it, so every member went to the internal-error
+    # arm (BACKLOG #5972, review finding 2). Only the head is refused now; the next member heads.
+    mids = await _enqueue_bodies(store, [_COLLIDING, _msg(2), _msg(3)])
+    rec = await _run_one_batch(store, simulate=simulate)
+    if simulate:
+        assert rec.sent == []
+    else:
+        (envelope,) = rec.sent
+        assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG2", "MSG3"]
+        assert envelope.startswith("BHS|^~\\&|") and envelope.endswith("BTS|2\r")
+    assert await _states(store, mids) == [DEAD_LETTERED, DELIVERED, DELIVERED]
+    (row,) = await store.outbox_for(mids[0])
+    error = str(row["last_error"])
+    assert "cannot be batched" in error and "MSGX" not in error and "ADT" not in error
+
+
+@pytest.mark.parametrize("raw_separators", [False, True], ids=["plain", "raw-separators"])
+async def test_a_verbatim_outbound_carries_a_colliding_member_that_does_not_head(
+    store: Any, raw_separators: bool
+) -> None:
+    # The plain outbound sends each member's own bytes, so a colliding member behind the head is
+    # delivered with no write in its own delimiters; only the would-be heads are refused (BACKLOG
+    # #5972). hl7_raw_separators is not byte-for-byte: it re-joins the envelope on the delimiters
+    # it split it on and emits structural escapes as raw delimiters, so it keeps the bytes of a
+    # member that holds no structural escape, as this colliding one holds none, and delivers a
+    # colliding member behind the head too (PR 3135 finding f394ede3-2).
+    mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
+    dest = MllpRecorder(DEST, hl7_raw_separators=True) if raw_separators else None
+    rec = await _run_one_batch(store, simulate=False, dest=dest)
+    (envelope,) = rec.sent
+    if dest is not None:
+        # The send's own rewrite keeps the colliding member's bytes on the wire.
+        assert _COLLIDING in dest._rewrite_for_wire(envelope)
+    assert envelope.split("\r")[0].split("|")[10] == "MSG3"  # BHS-11, the first kept member
+    assert _COLLIDING in envelope and envelope.endswith("BTS|3\r")
+    assert await _states(store, mids) == [
+        DEAD_LETTERED,
+        DEAD_LETTERED,
+        DELIVERED,
+        DELIVERED,
+        DELIVERED,
+    ]
+
+
+async def test_a_rewriting_outbound_refuses_a_colliding_member_wherever_it_sits(
+    store: Any,
+) -> None:
+    # A send that rewrites the envelope's delimiters would rewrite a later colliding member under
+    # the BHS's, so MSH-9 "ADT~A01" would read as two repetitions on the wire. There every
+    # colliding member is refused alone, wherever it sits (BACKLOG #5972).
+    mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
+    dest = MllpRecorder(DEST)
+    dest.encoding_characters = parse_encoding_characters("|^~\\&")
+    rec = await _run_one_batch(store, simulate=False, dest=dest)
+    (envelope,) = rec.sent
+    assert envelope.split("\r")[0].split("|")[10] == "MSG3"  # BHS-11, the first kept member
+    assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG3", "MSG5"]
+    assert "MSGX" not in envelope and envelope.endswith("BTS|2\r")
+    assert await _states(store, mids) == [
+        DEAD_LETTERED,
+        DEAD_LETTERED,
+        DELIVERED,
+        DEAD_LETTERED,
+        DELIVERED,
+    ]
+
+
+async def test_a_batch_of_colliding_members_only_sends_nothing(store: Any) -> None:
+    mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING])
+    rec = await _run_one_batch(store, simulate=False)
+    assert rec.sent == []
+    assert await _states(store, mids) == [DEAD_LETTERED, DEAD_LETTERED]
 
 
 async def test_the_batch_envelope_still_goes_out_through_the_real_send(

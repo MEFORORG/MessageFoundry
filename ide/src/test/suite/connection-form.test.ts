@@ -455,6 +455,14 @@ suite("connectionForm — an untouched form writes nothing", () => {
     assert.strictEqual(coerce(flag, true), true, "a real change still writes");
   });
 
+  test("a checkbox with no schema default, left unticked, is omitted (BACKLOG #5976)", () => {
+    const flag = { ...field(buildForm(schemaFixture(), "demo", "inbound", {}), "tls")!, defaultValue: null };
+    assert.strictEqual(coerce(flag, false), undefined, "an unticked defaultless checkbox writes nothing");
+    assert.strictEqual(coerce(flag, true), true, "ticking it still writes");
+    assert.strictEqual(coerce({ ...flag, value: false }, false), false, "a recorded false stays explicit");
+    assert.strictEqual(coerce({ ...flag, required: true }, false), false, "a required one always writes");
+  });
+
   test("a value the record already carried stays explicit even when it equals the default", () => {
     const groups = buildForm(schemaFixture(), "demo", "inbound", { tls: false });
     const flag = field(groups, "tls");

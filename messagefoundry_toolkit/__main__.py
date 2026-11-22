@@ -769,7 +769,9 @@ def _impact(args: argparse.Namespace) -> int:
         if args.apply:
             try:
                 applied = apply_rename(plan)
-            except OSError as exc:
+            except WiringError as exc:
+                # A file changed after the plan, or could not be read or written; apply_rename left
+                # every file as it was, or names the ones it could not restore (BACKLOG #5980).
                 return _emit_error(str(exc), as_json=args.json)
             result["applied"] = len(applied)
             result["dry_run"] = False
@@ -803,13 +805,15 @@ def _impact(args: argparse.Namespace) -> int:
     return 0
 
 
-def _reference_dict(ref: Any) -> dict[str, str]:
-    """JSON view of a :class:`~messagefoundry.config.reachability.Reference` (referrer -> target edge)."""
+def _reference_dict(ref: Any) -> dict[str, str | None]:
+    """JSON view of a :class:`~messagefoundry.config.reachability.Reference` (referrer -> target
+    edge), with its relation, so an ``Http`` inbound's ``reply_from`` reads as one (BACKLOG #5966)."""
     return {
         "referrer_kind": ref.referrer_kind,
         "referrer": ref.referrer,
         "target_kind": ref.target_kind,
         "target": ref.target,
+        "relation": ref.relation,
     }
 
 
