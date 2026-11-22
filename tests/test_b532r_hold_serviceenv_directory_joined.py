@@ -24,7 +24,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import NO_DIRECTORY, REMOVE, RUNS_ON
+from tests._serviceenv_remedy import CREATE, REMOVE, RUNS_ON
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
 _PLAIN = "Parameters\\AppEnvironment"
@@ -62,7 +62,7 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
     # Only a value goes to the directory, so only a value's refusal says how one is created.
-    assert (NO_DIRECTORY in refusal) is refused.startswith("MEFOR_VALUE_")
+    assert (CREATE in refusal) is refused.startswith("MEFOR_VALUE_")
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
@@ -76,7 +76,7 @@ def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE in refusal and RUNS_ON in refusal and NO_DIRECTORY not in refusal
+    assert REMOVE in refusal and RUNS_ON in refusal and CREATE not in refusal
 
 
 def test_a_directory_joined_to_an_empty_pem_key_is_removed_with_it() -> None:
@@ -93,20 +93,20 @@ def test_a_directory_joined_to_an_empty_pem_key_is_removed_with_it() -> None:
     assert posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE in refusal and RUNS_ON in refusal and NO_DIRECTORY in refusal
+    assert REMOVE in refusal and RUNS_ON in refusal and CREATE in refusal
 
 
 def test_with_nothing_joined_the_run_on_sentence_follows_the_run_on() -> None:
-    """Control: a value name alone gets the removal and the create guidance and no run-on
+    """Control: a value alone gets the removal and the create guidance and no run-on
     sentence, and a run-on into key material gets the run-on sentence."""
-    value_only = service_env_refusal(_read(["MEFOR_VALUE_A="]))
+    value_only = service_env_refusal(_read(["MEFOR_VALUE_A=1"]))
     assert value_only is not None
-    assert REMOVE in value_only and NO_DIRECTORY in value_only and RUNS_ON not in value_only
+    assert REMOVE in value_only and CREATE in value_only and RUNS_ON not in value_only
     run_on = _read([f"{KEY_CLASS_NAMES[0]}=", "abc=="])
     assert run_on.value_runs_on
     refusal = service_env_refusal(run_on)
     assert refusal is not None
-    assert RUNS_ON in refusal and NO_DIRECTORY not in refusal
+    assert RUNS_ON in refusal and CREATE not in refusal
 
 
 def test_two_joined_groups_in_one_registry_value_both_refuse_and_run_on() -> None:

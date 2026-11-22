@@ -51,7 +51,7 @@ from messagefoundry.serviceenv import (
     service_env_loosenings,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import NO_DIRECTORY, REMOVE
+from tests._serviceenv_remedy import CREATE, REMOVE
 
 #: Synthetic stand-ins. Never a real key: the tests check that no value is kept, by searching for
 #: these strings in what the reading returns.
@@ -427,7 +427,7 @@ def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
     )
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert NO_DIRECTORY in refusal
+    assert CREATE in refusal
 
 
 def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
@@ -438,7 +438,7 @@ def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert NO_DIRECTORY not in refusal
+    assert CREATE not in refusal
 
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
@@ -598,7 +598,7 @@ def test_every_other_secret_class_name_in_the_nssm_list_refuses(name: str) -> No
     assert 'enforcement = "warn" does not change this refusal' in refusal
     # The store key's remedy is not offered for a secret that is not the store key.
     assert "protect-key" not in refusal
-    assert NO_DIRECTORY in refusal
+    assert CREATE in refusal
     # `serve` refuses before it reads the loosenings; an engine it did not start names it there.
     [(entry, twin)] = service_env_loosenings(posture)
     assert entry == "secret_in_service_environment"
@@ -611,7 +611,7 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
     assert serviceenv._DIRECTORY_VARIABLE == SECRETS_DIRECTORY_VARIABLE
     posture = _service(["MEFOR_STORE_PASSWORD=x", "MEFOR_SECRETS_DIRECTORY=C:/s"])
     refusal = service_env_refusal(posture)
-    assert refusal is not None and NO_DIRECTORY not in refusal
+    assert refusal is not None and CREATE not in refusal
 
 
 @pytest.mark.parametrize(
@@ -633,7 +633,7 @@ def test_the_remedy_names_no_list_string_or_command(entries: list[str]) -> None:
     # The control: the finding before the remedy names the lists, so the probe can fire.
     assert "appenvironment" in refusal.lower()
     remedy = refusal.split("each value refused here. ", 1)[1]
-    assert remedy.startswith(REMOVE)
+    assert REMOVE in remedy
     for named in ("appenvironment", "nssm", "string", "install-service.ps1"):
         assert named not in remedy.lower(), named
 
@@ -897,7 +897,8 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
         "Put each MEFOR_VALUE_* variable in the secrets directory MEFOR_SECRETS_DIRECTORY names"
     ) in refusal
     assert "environments/<env>.toml" in refusal and '"[environments]"' in refusal
-    assert NO_DIRECTORY in refusal
+    # Only a value that is not empty goes to the directory (the fourth hold on PR 3142, H3).
+    assert (CREATE in refusal) is bool(entry.split("=", 1)[1].strip())
     assert _ENFORCEMENT_NOTE in refusal
     assert "protect-key" not in refusal
     value = entry.split("=", 1)[1]
@@ -1008,7 +1009,7 @@ def test_a_directory_secret_and_an_env_value_share_one_remedy_sentence() -> None
         "MEFOR_SECRETS_DIRECTORY names"
     ) in refusal
     assert refusal.count('"The secrets directory"') == 1
-    assert NO_DIRECTORY not in refusal
+    assert CREATE not in refusal
 
 
 def test_the_smoke_legs_nssm_list_is_one_serve_does_not_refuse() -> None:

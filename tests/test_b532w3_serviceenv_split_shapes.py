@@ -27,7 +27,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import NO_DIRECTORY
+from tests._serviceenv_remedy import CREATE
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
 
@@ -329,7 +329,7 @@ def test_an_ordinary_comma_led_value_on_a_later_line_is_still_its_own_variable()
     posture = _read(["MEFOR_SECRETS_DIRECTORY=\nNO_PROXY=,localhost", "MEFOR_VALUE_A=1"])
     assert posture.listed == ("MEFOR_VALUE_A",)
     refusal = service_env_refusal(posture)
-    assert refusal is not None and NO_DIRECTORY in refusal
+    assert refusal is not None and CREATE in refusal
 
 
 @pytest.mark.parametrize("line", ['"x"=y', "PATH=,C:\\x", "Http_Proxy=,x", "\u201cx\u201d=y"])
@@ -340,7 +340,7 @@ def test_an_empty_directory_above_an_ordinary_line_still_reads_as_unset(line: st
     posture = _read([f"MEFOR_SECRETS_DIRECTORY=\n{line}", "MEFOR_VALUE_A=1"])
     assert posture.listed == ("MEFOR_VALUE_A",), line
     refusal = service_env_refusal(posture)
-    assert refusal is not None and NO_DIRECTORY in refusal, line
+    assert refusal is not None and CREATE in refusal, line
 
 
 @pytest.mark.parametrize("item", ["Http_Proxy=", "=ExitCode=0", "=abc123", "ab-c_dE="])

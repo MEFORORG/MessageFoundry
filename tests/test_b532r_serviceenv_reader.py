@@ -25,7 +25,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import NO_DIRECTORY, REMOVE, RUNS_ON
+from tests._serviceenv_remedy import CREATE, REMOVE, RUNS_ON
 
 #: A store-key-shaped stand-in: 32 bytes of ASCII, so 44 base64 characters ending in one ``=``.
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
@@ -416,9 +416,9 @@ def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_abo
     secret = "MEFOR_AUTH_OIDC_CLIENT_SECRET=synthetic"
     refusal = service_env_refusal(_read([*posture_items, secret]))
     assert refusal is not None
-    assert NO_DIRECTORY not in refusal
+    assert CREATE not in refusal
     control = service_env_refusal(_read(["MEFOR_STORE_PASSWORD=", secret]))
-    assert control is not None and NO_DIRECTORY in control
+    assert control is not None and CREATE in control
 
 
 @pytest.mark.parametrize(
@@ -442,7 +442,7 @@ def test_a_directory_item_set_to_nothing_on_its_first_line_is_taken_into_an_empt
     assert posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE in refusal and RUNS_ON in refusal and NO_DIRECTORY in refusal
+    assert REMOVE in refusal and RUNS_ON in refusal and CREATE in refusal
 
 
 #: A base64url secret with two ``=`` of padding and both ``-`` and ``_`` in it.

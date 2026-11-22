@@ -1097,18 +1097,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         )
     else:
         return None
-    # Only what is true whatever the lists hold: the variables, that they go, and a doc to see,
-    # naming no list, string or command (the Lander's third hold on PR 3142, H1).
-    steps = [
-        "Remove each refused variable, with its value, from the service's environment. See "
-        'docs/SERVICE.md, "Start / stop / status"'
-    ]
-    if posture.value_runs_on:
-        # Removing the name alone would leave the value, which then refuses nothing.
-        steps.append(
-            "At least one refused variable's value runs on past its own entry, so remove the "
-            "entries it runs on into with it, or the value stays in the registry key"
-        )
+    steps: list[str] = []
     if keys:
         steps.append(
             "Keep the store key in a DPAPI-protected key file instead: `messagefoundry protect-key "
@@ -1162,15 +1151,30 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             )
             cite += ' and "[environments]"'
         steps.append(f"{step}. {cite}")
-        if _DIRECTORY_VARIABLE not in posture.listed:
+        moved = [v for v in values if v not in posture.empty_value_names and v != _VALUE_PREFIX]
+        if _DIRECTORY_VARIABLE not in posture.listed and (others or moved):
             # The installer refuses an existing directory the service does not name, so this
-            # points only at how one is created, and only where a setting goes to one (H2).
+            # points only at how one is created, and only where a non-empty setting goes to one
+            # (the third hold's H2, the fourth hold's H3).
             steps.append(
-                f"No {_DIRECTORY_VARIABLE} entry is read here as naming the secrets directory. "
                 'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
                 "says how it is created"
             )
+    # Last, so protect-key and the secrets directory take each value before its entry goes. It
+    # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).
+    steps.append(
+        "Remove each refused variable from the service's environment. See docs/SERVICE.md, "
+        '"Start / stop / status"'
+    )
+    if posture.value_runs_on:
+        # Removing the name alone would leave the value, which then refuses nothing. A path
+        # alone holds no secret, and the service may read it as its directory (fourth hold, H2).
+        steps.append(
+            "At least one refused variable's value runs on past its own entry, so remove the "
+            "entries it runs on into with it, or the value stays in the registry key. Keep any "
+            f"of them that sets {_DIRECTORY_VARIABLE} to a path and nothing else, as its own entry"
+        )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value refused "
         f"here. {'. '.join(steps)}"

@@ -20,7 +20,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import NO_DIRECTORY, REMOVE, RUNS_ON
+from tests._serviceenv_remedy import CREATE, KEEP, REMOVE, RUNS_ON
 
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
 #: A base64url stand-in of a 32-byte secret's length, with one ``=``, a "-" and a "_" in it, and
@@ -149,6 +149,8 @@ def test_an_ordinary_name_set_to_a_key_does_not_join_an_empty_value(entries: lis
 
 
 _DIRECTORY_KEY = f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"
+#: How every refusal ends, after its remedy.
+_END = '. [security].enforcement = "warn" does not change this refusal'
 
 
 @pytest.mark.parametrize(
@@ -198,13 +200,79 @@ def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directo
     key_alone = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
     assert key_alone is not None
     remedy = key_alone.split("each value refused here. ", 1)[1]
-    # Nothing says to keep the joined string, or names the directory at all (second hold, H3).
-    assert remedy.startswith(f"{REMOVE}. {RUNS_ON}. Keep the store key in a DPAPI-protected")
-    assert "MEFOR_SECRETS_DIRECTORY" not in remedy
+    # The key file comes first and the removal last (fourth hold, H1). Only the keep sentence
+    # names the directory, and it spares a path alone, not this key (second hold, H3).
+    assert remedy.startswith("Keep the store key in a DPAPI-protected key file instead")
+    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    assert "MEFOR_SECRETS_DIRECTORY" not in remedy.replace(KEEP, "")
     beside = service_env_refusal(
         _read([f"{_KEY}=", _DIRECTORY_KEY, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
     )
-    assert beside is not None and NO_DIRECTORY in beside
+    assert beside is not None and CREATE in beside
+
+
+def test_a_path_alone_joined_into_an_empty_key_is_kept() -> None:
+    """The fourth hold's H2. A path-only directory entry joined into the empty key is the
+    service's directory entry, so the remedy says to keep it, and nothing after says otherwise.
+    """
+    posture = _read([f"{_KEY}=", "mefor_secrets_directory=C:\\d"])
+    assert posture.listed_keys == (_KEY,) and posture.value_runs_on
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    assert CREATE not in refusal
+
+
+def test_a_path_alone_joined_into_an_empty_key_beside_a_secret_is_kept() -> None:
+    """The same shape beside a secret the directory takes: the secret goes to the directory and
+    the path entry stays, so the keep sentence ends the remedy and contradicts nothing before."""
+    posture = _read(
+        [f"{_KEY}=", "mefor_secrets_directory=C:\\d", "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"]
+    )
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert refusal.endswith(f"{CREATE}. {REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    assert refusal.index("Put MEFOR_AUTH_AD_BIND_PASSWORD in the secrets directory") < (
+        refusal.index(REMOVE)
+    )
+
+
+def test_a_key_bearing_directory_entry_still_gets_the_remove_guidance() -> None:
+    """The control for the two above: a directory entry holding the key is not a path alone,
+    so the run-on sentence says to remove it with the key."""
+    refusal = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
+    assert refusal is not None
+    assert f"{REMOVE}. {RUNS_ON}" in refusal
+
+
+def test_protect_key_and_the_secrets_directory_come_before_any_removal() -> None:
+    """The fourth hold's H1: protect-key reads the key from the shell, and a secret is copied
+    to its file, before any step says to remove a variable."""
+    refusal = service_env_refusal(
+        _read([f"{_KEY}=", _KEY_B64, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", "MEFOR_VALUE_A=1"])
+    )
+    assert refusal is not None
+    first_removal = refusal.index(REMOVE)
+    assert refusal.index("protect-key") < first_removal
+    assert refusal.index("Put MEFOR_AUTH_AD_BIND_PASSWORD") < first_removal
+    assert "with its value" not in refusal
+
+
+@pytest.mark.parametrize(
+    ("entry", "creates"),
+    [
+        pytest.param("MEFOR_VALUE_A=", False, id="empty-value"),
+        pytest.param("MEFOR_VALUE_=synthetic", False, id="bare-prefix"),
+        pytest.param("MEFOR_VALUE_A=1", True, id="value"),
+        pytest.param("MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", True, id="secret"),
+    ],
+)
+def test_the_create_guidance_needs_a_non_empty_setting_to_move(entry: str, creates: bool) -> None:
+    """The fourth hold's H3: an empty value and the bare prefix are deleted, not moved, so
+    nothing goes to the directory and the refusal says nothing of creating one."""
+    refusal = service_env_refusal(_read([entry]))
+    assert refusal is not None
+    assert (CREATE in refusal) is creates
 
 
 def test_a_directory_named_on_its_own_gets_no_create_guidance() -> None:
@@ -213,7 +281,7 @@ def test_a_directory_named_on_its_own_gets_no_create_guidance() -> None:
         _read(["MEFOR_SECRETS_DIRECTORY=C:\\d", "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
     )
     assert refusal is not None
-    assert REMOVE in refusal and NO_DIRECTORY not in refusal
+    assert REMOVE in refusal and CREATE not in refusal
 
 
 def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -> None:
@@ -224,7 +292,7 @@ def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE in refusal and RUNS_ON in refusal and NO_DIRECTORY not in refusal
+    assert REMOVE in refusal and RUNS_ON in refusal and CREATE not in refusal
     assert "string" not in refusal.split("each value refused here. ", 1)[1]
 
 
@@ -239,7 +307,7 @@ def test_a_directory_line_in_the_key_string_refuses_as_the_key_alone(prefix: str
     assert not posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE in refusal and RUNS_ON not in refusal and NO_DIRECTORY not in refusal
+    assert REMOVE in refusal and RUNS_ON not in refusal and CREATE not in refusal
 
 
 def test_a_nameless_key_item_joins_an_empty_value_item() -> None:
