@@ -12,7 +12,7 @@
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir, writerPathSetting } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
-import { alertEditorScript } from "./alertEditorWebview";
+import { ALERT_COOLDOWN_MAX_DAYS, ALERT_COOLDOWN_MAX_SECONDS, alertEditorScript } from "./alertEditorWebview";
 
 const EVENT_TYPES = [
   "any",
@@ -217,8 +217,8 @@ function formHtml(webview: vscode.Webview): string {
   </div>
   <div class="row">
     <div><label for="severity">Severity</label><select id="severity"></select></div>
-    <div><label for="cooldown_seconds">Cooldown (s)</label><input id="cooldown_seconds" type="number" min="0.001" placeholder="(global re-alert)" />
-      <div class="hint">Re-alert interval for matching events; blank = global default.</div></div>
+    <div><label for="cooldown_seconds">Cooldown (s)</label><input id="cooldown_seconds" type="number" min="0.001" max="${ALERT_COOLDOWN_MAX_SECONDS}" placeholder="(global re-alert)" />
+      <div class="hint">Re-alert interval for matching events, more than 0 and at most ${ALERT_COOLDOWN_MAX_DAYS} days; blank = global default.</div></div>
   </div>
   <label for="transports">Transports</label>
   <select id="transports">
