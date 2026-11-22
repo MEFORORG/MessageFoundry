@@ -786,9 +786,10 @@ class SoapDestination(DestinationConnector):
         if digest_selected and digest_password_unmatched(url):
             # Every send would otherwise end in a 401 the Digest handler cannot answer.
             raise ValueError(
-                "SOAP destination 'url' must not end in whitespace with HTTP Digest (the Digest "
-                "password is stored under the url as written, and the request goes to the url "
-                "without it, so no challenge would find the password)"
+                "SOAP destination 'url' must not end in whitespace the Digest password lookup "
+                "keeps, such as a space, with HTTP Digest (the password is stored under the url "
+                "as written, and the request goes to the url without it, so no challenge would "
+                "find the password)"
             )
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).

@@ -1876,10 +1876,8 @@ def request_target_as_sent(url: str) -> str:
 
 
 def digest_password_unmatched(url: str) -> bool:
-    """Whether a Digest password stored under ``url`` as written would be found for the url
-    urllib requests (BACKLOG #5911). Asked of ``urllib.request.HTTPPasswordMgr.reduce_uri``, the
-    key the lookup itself compares, so a ``#`` and leading whitespace, which its split drops on
-    both sides, are not a mismatch; trailing whitespace it keeps is."""
+    """True when a Digest password stored under ``url`` as written would not be found for the
+    url urllib requests (BACKLOG #5911). Asked of ``urllib.request.HTTPPasswordMgr.reduce_uri``."""
     reduce = urllib.request.HTTPPasswordMgr().reduce_uri
     return reduce(url) != reduce(request_target_as_sent(url))
 
@@ -3191,9 +3189,10 @@ class RestDestination(DestinationConnector):
         if digest_selected and digest_password_unmatched(url):
             # Every send would otherwise end in a 401 the Digest handler cannot answer.
             raise ValueError(
-                "REST destination 'url' must not end in whitespace with HTTP Digest (the Digest "
-                "password is stored under the url as written, and the request goes to the url "
-                "without it, so no challenge would find the password)"
+                "REST destination 'url' must not end in whitespace the Digest password lookup "
+                "keeps, such as a space, with HTTP Digest (the password is stored under the url "
+                "as written, and the request goes to the url without it, so no challenge would "
+                "find the password)"
             )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.

@@ -238,7 +238,9 @@ def test_a_soap_url_with_surrounding_controls_is_refused_with_ws_addressing() ->
 def test_a_url_with_trailing_whitespace_is_refused_with_digest(kind: ConnectorType) -> None:
     """The Digest password is stored under the url as written, and the lookup keeps a trailing
     space the request drops (round-4104477e09 finding 5)."""
-    with pytest.raises(ValueError, match="must not end in whitespace with HTTP Digest"):
+    with pytest.raises(
+        ValueError, match="must not end in whitespace the Digest password lookup keeps"
+    ):
         _build(
             kind,
             url=_URLS[kind] + " ",
