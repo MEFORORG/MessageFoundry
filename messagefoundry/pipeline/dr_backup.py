@@ -4845,16 +4845,27 @@ def _full_open_check(
         ok, msg = run_guarded(_open())
     except SchemaMismatchError as exc:
         # The walk's finding rides along, so it is not lost behind the remedy (BACKLOG #1719 item
-        # 3). A walk that raised, whether in its cipher build, its connect or partway through,
-        # returned no finding of its own, so it says nothing here.
+        # 3). `_walk` turns an exception that escapes `_decrypt_check` (its cipher build, its
+        # connect, or a RuntimeError, ValueError or OSError partway) into a FAIL of its own, which
+        # says nothing here. A sqlite3.Error or CipherWalkInterrupted partway is
+        # `_decrypt_check`'s own FAIL, and does ride along.
         walk = None
         if walked_cells:
             # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
             if walked[0] != "PASS":
+                # A key mismatch or a key-service outage is not this build reading the cells, so
+                # it is not offered that reading; a FAIL that read them, a SQLite fault included,
+                # may be.
+                why = (
+                    " (the remedy leads because this build can misread another version's cells)"
+                    if walked[0] == "FAIL" and not walked[1].startswith(_OUTAGE_LEAD)
+                    else ""
+                )
+                # Redacted by `_incompatible_snapshot`, which does not cut it to safe_text's
+                # default, so its tail survives in this reason.
                 walk = (
                     f"Before the open, the walk of the cells this build knows reported {walked[0]}"
-                    " (the remedy leads because this build can misread another version's cells): "
-                    f"{safe_text(walked[1])}"
+                    f"{why}: {walked[1]}"
                 )
             elif walked[2]:
                 walk = (
@@ -4891,6 +4902,20 @@ def _full_open_check(
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
 _INCOMPATIBLE_REASON_LIMIT = 600
 
+#: The most characters of the walk's sentence the incompatible-snapshot refusal quotes. Its parts
+#: are bounded where they are made, so this only keeps a defect from making it unbounded.
+_WALK_REASON_LIMIT = 2000
+
+#: How :func:`_decrypt_check` opens the reason for a decrypt the key service gave no verdict on.
+_OUTAGE_LEAD = "the key service did not return a usable answer"
+
+
+def _error_classes(error: BaseException) -> str:
+    """The error's class, and its cause's when it has one, as a PHI-free label."""
+    cause = error.__cause__
+    named = type(error).__name__
+    return named if cause is None else f"{named} from {type(cause).__name__}"
+
 
 def _incompatible_snapshot(
     exc: SchemaMismatchError, engine_version: str, *, walk: str | None = None
@@ -4912,14 +4937,15 @@ def _incompatible_snapshot(
         tail = f"The schema step failed: {exc.cause or ''}."
     # Redacted and bounded like every other arm's reason (safe_exc there): the tail is driver text
     # and a difference list with no length of its own. The remedy leads, so a cut loses only detail.
-    after = f" {walk}" if walk else ""
-    return safe_text(
+    head = safe_text(
         "the archive's store is from an incompatible version, so this build cannot open it: restore"
         f" it with {wrote}. The archive opened and passed its integrity and row-count checks."
-        f" {tail}{after}",
-        # The walk's sentence is bounded where it is made, and adds its own length to the cut.
-        limit=_INCOMPATIBLE_REASON_LIMIT + len(after),
+        f" {tail}",
+        limit=_INCOMPATIBLE_REASON_LIMIT,
     )
+    # Redacted here, and appended after the head's cut, so a long differences list cannot cut it
+    # away.
+    return f"{head} {safe_text(walk, limit=_WALK_REASON_LIMIT)}" if walk else head
 
 
 def _sqlite_error_reason(exc: sqlite3.Error) -> str:
@@ -5009,9 +5035,9 @@ def _decrypt_check(
                     # calling the cell undecryptable (BACKLOG #1719 item 12). Still no PASS.
                     return (
                         "FAIL",
-                        f"the key service gave no answer while {reading.cell.table}."
-                        f"{reading.cell.column} {reading.where} was read, so the walk stopped "
-                        f"without a verdict on it: {safe_exc(reading.error)}",
+                        f"{_OUTAGE_LEAD} ({_error_classes(reading.error)}) while "
+                        f"{reading.cell.table}.{reading.cell.column} {reading.where} was read, so "
+                        f"the walk stopped without a verdict on it: {safe_exc(reading.error)}",
                         cells,
                     )
                 # Only under a key: a keyless walk never decrypts. FAIL, not KEY_MISMATCH:
