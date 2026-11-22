@@ -62,11 +62,24 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
     # Nothing here has a value of its own to move, so nothing says to put it in the directory or
-    # how one is created. An empty value is still told to go (the fifth hold on PR 3142, H3).
+    # how one is created. An empty value is still told to go (the fifth hold on PR 3142, H3). A
+    # name written with a blank before its equals sign is not read as the directory's, so a value
+    # joined to it still has that text to move.
+    moves = refused.startswith("MEFOR_VALUE_") and " " in directory
+    assert (CREATE in refusal) is moves and ("Put " in refusal) is moves
+    assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
+        refused.startswith("MEFOR_VALUE_") and not moves
+    )
+
+
+def test_the_bare_prefix_joined_to_the_directory_is_only_deleted() -> None:
+    """The bare prefix names no env() key, so even with nothing but a directory entry joined to it
+    the refusal says only to delete it, never to write an empty override in the value file."""
+    refusal = service_env_refusal(_read(["MEFOR_VALUE_=", "MEFOR_SECRETS_DIRECTORY=="]))
+    assert refusal is not None
+    assert "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry" in refusal
+    assert "An empty or blank MEFOR_VALUE_* entry" not in refusal
     assert CREATE not in refusal and "Put " not in refusal
-    assert (
-        "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
-    ) is refused.startswith("MEFOR_VALUE_")
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:

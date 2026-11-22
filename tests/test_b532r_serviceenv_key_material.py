@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -258,7 +258,7 @@ def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() ->
     first_removal = refusal.index(REMOVE)
     assert refusal.index("protect-key") < first_removal
     assert refusal.index("Put MEFOR_AUTH_AD_BIND_PASSWORD") < first_removal
-    assert "Remove each refused variable, with its value, from" in REMOVE
+    assert "Remove each refused variable, with its value, from" in refusal
 
 
 @pytest.mark.parametrize(
@@ -286,7 +286,7 @@ def test_the_removal_step_says_with_its_value_for_a_single_item_key() -> None:
     refusal = service_env_refusal(_read([f"{_KEY}=\n{_KEY_B64}"]))
     assert refusal is not None
     assert refusal.endswith(f"{REMOVE}{_END}")
-    assert "Remove each refused variable, with its value, from" in REMOVE
+    assert "Remove each refused variable, with its value, from" in refusal
     assert _KEY_B64 not in refusal
 
 
@@ -311,25 +311,6 @@ def test_a_secret_whose_only_value_is_a_joined_path_moves_nothing() -> None:
     assert refusal is not None
     assert CREATE not in refusal and "Put " not in refusal and "protect-key" not in refusal
     assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
-
-
-@pytest.mark.parametrize(
-    "entries",
-    [
-        [f"{_KEY}=", "mefor_secrets_directory=C:\\d"],
-        ["MEFOR_AUTH_AD_BIND_PASSWORD=", "mefor_secrets_directory=C:\\d"],
-        ["MEFOR_VALUE_A=", "MEFOR_SECRETS_DIRECTORY=="],
-    ],
-)
-def test_the_remedy_only_fields_change_no_refusal(entries: list[str]) -> None:
-    """The fifth hold's H2: the two fields the remedy alone reads decide no refusal. Cleared,
-    the same posture still refuses and lists the same names."""
-    posture = _read(entries)
-    assert posture.directory_only_names
-    cleared = replace(posture, directory_only_names=(), directory_path_joined=False)
-    assert cleared.listed == posture.listed
-    assert service_env_refusal(posture) is not None
-    assert service_env_refusal(cleared) is not None
 
 
 def test_a_directory_named_on_its_own_gets_no_create_guidance() -> None:

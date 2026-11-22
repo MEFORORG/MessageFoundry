@@ -866,6 +866,24 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         # ``\r\n`` between strings: a string ending in a lone ``\r`` then still ends a line of
         # its own, so each line keeps the number ``starts`` gives it.
         joined, _ends = _read_string(where, "\r\n".join(strings), own_lines=starts[1] - 1)
+        # For the remedy only, from the last string back: whether the non-blank strings from
+        # each index on are all directory entries holding no key, whether there is one, and
+        # whether one sets the directory to a path. Nothing here feeds ``_names``, so it changes
+        # no refusal (the Lander's fifth hold on PR 3142, H2).
+        only_after = [True] * (len(strings) + 1)
+        any_after = [False] * (len(strings) + 1)
+        path_after = [False] * (len(strings) + 1)
+        for i in range(len(strings) - 1, -1, -1):
+            only_after[i], any_after[i], path_after[i] = (
+                only_after[i + 1],
+                any_after[i + 1],
+                path_after[i + 1],
+            )
+            if not _still_blank(strings[i]):
+                path = _directory_entry_value(strings[i])
+                only_after[i] = only_after[i] and path is not None
+                any_after[i] = True
+                path_after[i] = path_after[i] or (path is not None and not _still_blank(path))
         for variable in joined:
             index = bisect.bisect_right(starts, variable.line or 1) - 1
             local = (variable.line or 1) - starts[index] + 1
@@ -873,32 +891,28 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             key = (index, variable.written, line_on_string, variable.broken)
             joined_break = key in joined_breaks
             ran_on = (key in ran or joined_break) and bool(variable.value.strip())
-            # For the remedy only: what the strings this value takes hold. Nothing here feeds
-            # ``_names``, so it changes no refusal (the Lander's fifth hold on PR 3142, H2).
-            taken = [_directory_entry_value(s) for s in strings[index + 1 :] if not _still_blank(s)]
             read.append(
                 replace(
                     variable,
                     line=line_on_string,
                     broken=variable.broken and not joined_break,
                     runs_on=ran_on,
-                    directory_only=ran_on and bool(taken) and None not in taken,
-                    keeps_directory=ran_on
-                    and any(v is not None and not _still_blank(v) for v in taken),
+                    directory_only=ran_on and any_after[index + 1] and only_after[index + 1],
+                    keeps_directory=ran_on and path_after[index + 1],
                 )
             )
     return read
 
 
 def _directory_entry_value(entry: str) -> str | None:
-    """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it holds nothing but that one
-    line and the value is no key (:func:`_is_key_value`, :func:`_holds_key_run`); else None.
-    The remedy alone reads it, to tell a joined directory path from key material."""
-    lines = [line for line in _LINE_BREAK.split(entry) if line.strip()]
-    if len(lines) != 1:
+    """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with no
+    blank around the name, and the value is no key (:func:`_is_key_value`,
+    :func:`_holds_key_run`); else None. The remedy alone reads it, to tell a joined directory
+    path from key material."""
+    if _LINE_BREAK.search(entry):
         return None
-    written, equals, value = lines[0].partition("=")
-    if not equals or written.strip().upper() != _DIRECTORY_VARIABLE:
+    written, equals, value = entry.partition("=")
+    if not equals or written.upper() != _DIRECTORY_VARIABLE:
         return None
     return None if _is_key_value(value) or _holds_key_run(value) else value
 
@@ -1196,7 +1210,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "move it"
             )
         # A value whose only content is a joined directory entry is empty in its own entry.
-        if posture.empty_value_names or any(v in only for v in values):
+        if posture.empty_value_names or any(v in only and v != _VALUE_PREFIX for v in values):
             parts.append(
                 "An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where an "
                 "empty override is really wanted, write it in the value file instead, since the "
