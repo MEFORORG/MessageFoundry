@@ -5,9 +5,9 @@
 
 The join stays: the string still continues the empty value, and every input that refused before
 still refuses. Since the Lander's third hold on PR 3142 the remedy names no list, registry string
-or command: it says to remove each refused variable with its value, leaving one directory entry
-written on its own, says to remove what a value runs on into, and points at docs/SERVICE.md for
-how. An OIDC key empty on its own line runs on and refuses (round-2 finding 1).
+or command: it says to remove each refused variable with its value and what a value runs on
+into, and points at docs/SERVICE.md. An OIDC key empty on its own line runs on and refuses
+(round-2 finding 1).
 Synthetic values only.
 """
 
@@ -107,3 +107,20 @@ def test_with_nothing_joined_the_run_on_sentence_follows_the_run_on() -> None:
     refusal = service_env_refusal(run_on)
     assert refusal is not None
     assert RUNS_ON in refusal and NO_DIRECTORY not in refusal
+
+
+def test_two_joined_groups_in_one_registry_value_both_refuse_and_run_on() -> None:
+    """A store key running on into key material, then an OIDC key running on into a directory
+    string: both keys are listed and the value runs on. This pins the reader, not the remedy."""
+    posture = _read(
+        [
+            f"{KEY_CLASS_NAMES[0]}=",
+            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGk=",
+            "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=",
+            "MEFOR_SECRETS_DIRECTORY==",
+        ]
+    )
+    assert posture.listed == (KEY_CLASS_NAMES[0], "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY")
+    assert posture.value_runs_on
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and RUNS_ON in refusal

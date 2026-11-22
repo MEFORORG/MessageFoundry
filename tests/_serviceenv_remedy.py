@@ -3,7 +3,8 @@
 """The service-environment refusal's remedy wording, pinned once for every test that reads it.
 
 Each constant is the exact text ``messagefoundry/serviceenv.py`` prints, so a test that looks for
-it fails when that text changes (the Lander's third hold on PR 3142, H3)."""
+one fails when its own text changes (the Lander's third hold on PR 3142, H3). Text added beside
+it is caught only where a test pins the remedy's start."""
 
 from __future__ import annotations
 

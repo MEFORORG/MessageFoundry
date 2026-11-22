@@ -630,6 +630,8 @@ def test_the_remedy_names_no_list_string_or_command(entries: list[str]) -> None:
     (the Lander's third hold on PR 3142, H1)."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
+    # The control: the finding before the remedy names the lists, so the probe can fire.
+    assert "appenvironment" in refusal.lower()
     remedy = refusal.split("each value refused here. ", 1)[1]
     assert remedy.startswith(REMOVE)
     for named in ("appenvironment", "nssm", "string", "install-service.ps1"):

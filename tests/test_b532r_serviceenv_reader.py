@@ -435,8 +435,8 @@ def test_a_directory_item_set_to_nothing_on_its_first_line_is_taken_into_an_empt
     """With its path on a later line, the directory item's first line sets it to nothing, which
     is not positively a variable of its own, so the empty password above takes it and refuses
     (vault BACKLOG #5394), past any item of equals signs alone between them. The remedy says to
-    remove what the value runs on into and to leave one directory entry written on its own, and,
-    since no entry is read as naming the directory, how one is created where none exists."""
+    remove what the value runs on into and, since no entry is read as naming the directory, how
+    one is created where none exists."""
     posture = _read([*items, "MEFOR_VALUE_A=1"])
     assert "MEFOR_STORE_PASSWORD" in posture.listed
     assert posture.value_runs_on
