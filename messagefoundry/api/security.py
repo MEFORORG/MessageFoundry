@@ -1482,10 +1482,8 @@ async def _recorded_decision(
     A refusal row is written exactly where the grant row would have been, so a gate writes at most
     one decision row per request, and a gate that wrote no grant row writes no refusal row either.
     That keeps the per-request volume where the shipped trail already put it while the audit chain
-    has no drain (BACKLOG #1421). The step-up refusals of :func:`spend_step_up_action` and
-    :func:`refuse_unless_step_up_window_live`, made in a route body after a ``proof_in_route`` gate
-    admitted the request, add a second row through :func:`_record_route_refusal`; other refusals a
-    route body makes, at least the reveal and pacing ones, write none. The reason comes from the
+    has no drain (BACKLOG #1421). For a refusal a route body makes after its gate admitted the
+    request, see :func:`_record_route_refusal`. The reason comes from the
     :class:`_GateRefusal` the check raised. Any other exception leaves the block with no decision
     row from it, which is right for the :func:`_mfa_refusal` 403: it wrote its own
     ``auth.mfa_denied`` row where it was raised. A failed refusal-row write raises in place of the
@@ -1533,11 +1531,13 @@ _ADMITTED_DECISION_ATTR = "mefor_admitted_decision"
 async def _record_route_refusal(request: Request, refusal: _GateRefusal) -> None:
     """Record a step-up refusal a route body makes after its ``proof_in_route`` gate admitted it.
 
-    BACKLOG #1197 (ASVS 16.3.2). The gate has already written its grant row, so without this the
-    refusal of :func:`spend_step_up_action` or :func:`refuse_unless_step_up_window_live` left no
-    row. The row names the permission the gate's grant row named, through the same writer as the
-    gate's own refusals. A route that reaches here without such a gate writes no row, and says so
-    in the log; the caller raises the refusal either way."""
+    BACKLOG #1197 (ASVS 16.3.2), for the refusals of :func:`spend_step_up_action` and
+    :func:`refuse_unless_step_up_window_live`. This is where the rule for their row is stated. It
+    writes ``auth.gate_refused``, through the writer the gate's own refusals use, only where the
+    admitting ``proof_in_route`` gate left its decision on ``request.state`` and
+    :func:`_audited_permission` names a permission for the request, which is where that gate wrote
+    its grant row. Where the gate wrote no grant row it writes none and logs nothing. With no
+    admitting gate it logs a WARNING and writes none. The caller raises the refusal either way."""
     admitted = getattr(request.state, _ADMITTED_DECISION_ATTR, None)
     if not isinstance(admitted, _AdmittedDecision):
         log.warning(
@@ -2211,10 +2211,7 @@ async def spend_step_up_action(request: Request, action: str) -> None:
     ``AuthService.refund_action_step_up``, as edit-resend does for a refusal before its store write
     (owner ruling 2026-10-13, #3241 R1), other than one in ``_EDIT_RESEND_SPENDING_REFUSALS`` in
     ``api/app.py`` (owner ruling 2026-11-07, #3241 added item 1). With no auth service attached it
-    does nothing, as the dependency does. Its refusal writes ``auth.gate_refused``
-    (:func:`_record_route_refusal`) only where the admitting ``proof_in_route`` gate wrote a grant
-    row, that is where :func:`_audited_permission` names a permission for the request. With no
-    admitting gate it logs a WARNING and writes no row."""
+    does nothing, as the dependency does. :func:`_record_route_refusal` records its refusal."""
     auth = get_auth(request)
     if auth is None:
         return
@@ -2246,10 +2243,8 @@ async def refuse_unless_step_up_window_live(request: Request) -> None:
     Moving a route to ``proof_in_route=True`` drops its dependency's window check, so without this
     call that branch would take no step-up at all. The 403 carries ``X-Step-Up-Required`` and no
     ``X-Step-Up-Action``, so a client refreshes the window with a plain ``POST /me/reauth``. Does
-    nothing with no auth service attached, as the dependency then checks nothing. Its refusal
-    writes ``auth.gate_refused`` (:func:`_record_route_refusal`) only where the admitting
-    ``proof_in_route`` gate wrote a grant row, that is where :func:`_audited_permission` names a
-    permission for the request. With no admitting gate it logs a WARNING and writes no row."""
+    nothing with no auth service attached, as the dependency then checks nothing.
+    :func:`_record_route_refusal` records its refusal."""
     auth = get_auth(request)
     if auth is None or await step_up_window_live(request):
         return
