@@ -82,6 +82,48 @@ def test_the_bare_prefix_joined_to_the_directory_is_only_deleted() -> None:
     assert CREATE not in refusal and "Put " not in refusal
 
 
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        pytest.param(
+            [(_PLAIN, "MEFOR_VALUE_A="), (_EXTRA, "MEFOR_VALUE_A=synthetic-a-value")],
+            id="two-values",
+        ),
+        pytest.param(
+            [(_EXTRA, "MEFOR_VALUE_A=\nmefor_value_a=synthetic-a-value")], id="one-string"
+        ),
+    ],
+)
+def test_a_name_set_empty_in_one_entry_and_with_content_in_another_is_moved(
+    pairs: list[tuple[str, str]],
+) -> None:
+    """The Lander's sixth hold on PR 3142, H2: Put is decided by name. A name with content in
+    any entry is told to go to the secrets directory, even where another entry sets it empty;
+    the empty entry is still told to go."""
+    refusal = service_env_refusal(_read_pairs(pairs))
+    assert refusal is not None
+    assert "Put each MEFOR_VALUE_* variable in the secrets directory" in refusal
+    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    assert "synthetic-a-value" not in refusal
+
+
+def test_a_name_empty_in_one_entry_and_joined_to_a_directory_in_another_moves_nothing() -> None:
+    """The control for the test above: neither entry gives the name content of its own, so
+    nothing says to put it in the directory, and the empty entry is told to go."""
+    refusal = service_env_refusal(
+        _read_pairs(
+            [
+                (_PLAIN, "MEFOR_VALUE_A="),
+                (_EXTRA, "MEFOR_VALUE_A="),
+                (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
+            ]
+        )
+    )
+    assert refusal is not None
+    assert "Put " not in refusal and CREATE not in refusal
+    assert "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+
+
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
     posture = _read_pairs(
         [

@@ -237,6 +237,41 @@ def test_only_an_entry_the_engine_reads_as_the_directory_is_kept(entry: str) -> 
     assert ("protect-key" in refusal) is not kept
 
 
+@pytest.mark.parametrize(
+    ("value", "kept"),
+    [
+        pytest.param(f"C:\\d;{_URL_ONE_PAD}", False, id="base64url-key"),
+        pytest.param(f"C:\\d;{_KEY_B64}", False, id="standard-key"),
+        pytest.param(
+            "D:/MessageFoundrySecrets/ProductionEngineSecretsDirectory", False, id="slash-path-run"
+        ),
+        pytest.param("Summer!2026", False, id="not-a-path"),
+        pytest.param("C:\\d", True, id="plain-path"),
+    ],
+)
+def test_only_a_plain_absolute_path_is_kept(value: str, kept: bool) -> None:
+    """The Lander's sixth hold on PR 3142, H1: the keep sentence fails closed. Only a value that
+    is plainly an absolute path, with no key run in either base64 alphabet, is kept. Anything
+    else is read as key material: the key is protected and nothing says to keep the entry. A
+    forward-slash path with a long run of letters is refused the keep sentence too."""
+    refusal = service_env_refusal(_read([f"{_KEY}=", f"mefor_secrets_directory={value}"]))
+    assert refusal is not None
+    assert (KEEP in refusal) is kept
+    assert ("protect-key" in refusal) is not kept
+    assert REMOVE in refusal and RUNS_ON in refusal
+
+
+def test_a_secret_joined_to_a_directory_value_that_is_no_path_is_moved() -> None:
+    """The same rule beside a password: a value that is no plain path may be the password, so it
+    is sent to the secrets directory, and nothing says to keep it."""
+    refusal = service_env_refusal(
+        _read(["MEFOR_AUTH_AD_BIND_PASSWORD=", "mefor_secrets_directory=Summer!2026"])
+    )
+    assert refusal is not None
+    assert "Put MEFOR_AUTH_AD_BIND_PASSWORD in the secrets directory" in refusal
+    assert KEEP not in refusal
+
+
 def test_a_path_alone_joined_into_an_empty_key_beside_a_secret_is_kept() -> None:
     """The same shape beside a secret the directory takes: the secret goes to the directory and
     the path entry stays, so the keep sentence ends the remedy and contradicts nothing before."""

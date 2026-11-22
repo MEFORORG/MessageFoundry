@@ -61,7 +61,7 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -171,6 +171,11 @@ class ServiceEnvPosture:
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
+    #: The ``MEFOR_VALUE_<KEY>`` names no entry sets to content of its own: each variable
+    #: :func:`_names` keeps for one is empty or blank, or takes only a joined directory entry.
+    #: A name with content in any entry is not here, so its Put step prints (the Lander's sixth
+    #: hold on PR 3142, H2). The remedy alone reads this, never the refusal itself.
+    contentless_value_names: tuple[str, ...] = field(default=(), repr=False)
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -351,6 +356,13 @@ _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 #: 43 such characters in a row, such as a hex digest, is read as key material too, an error toward
 #: refusing.
 _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
+
+#: For the remedy only (the Lander's sixth hold on PR 3142, H1): an absolute path's start, a
+#: drive letter, a UNC share or a POSIX root, and a key run in either base64 alphabet. A joined
+#: directory value is kept only when it starts so and holds no such run; anything else may be
+#: key material, so the remedy treats it as one.
+_ABSOLUTE_PATH = re.compile(r"[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/]|/")
+_EITHER_KEY_RUN = re.compile(r"[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43}")
 
 #: One 32-byte secret, whole (vault BACKLOG #5394 added items 6 and 12): 43 characters of the
 #: standard base64 alphabet and its one ``=``, as a store key is written, or 43 of the base64url
@@ -906,17 +918,28 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
 
 def _directory_entry_value(entry: str) -> str | None:
     """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with
-    only blanks or line breaks after it and no blank around the name, and the value is no key
-    (:func:`_is_key_value`, :func:`_holds_key_run`); else None. The engine strips the value it
-    reads, so what trails it does not matter. The remedy alone reads it, to tell a joined
-    directory path from key material."""
+    only blanks or line breaks after it and no blank around the name, and the value is blank or
+    plainly a path: an absolute path (:data:`_ABSOLUTE_PATH`) with no key in it
+    (:func:`_is_key_value`, :func:`_holds_key_run`, :data:`_EITHER_KEY_RUN`); else None, as for
+    key material. The engine strips the value it reads, so what trails it does not matter. The
+    remedy alone reads it, to tell a joined directory path from key material."""
     line = entry.rstrip()
     if _LINE_BREAK.search(line):
         return None
     written, equals, value = line.partition("=")
     if not equals or written.upper() != _DIRECTORY_VARIABLE:
         return None
-    return None if _is_key_value(value) or _holds_key_run(value) else value
+    if _still_blank(value):
+        return value  # nothing in it, so no key and no path to keep
+    path = value.strip()
+    if (
+        not _ABSOLUTE_PATH.match(path)
+        or _EITHER_KEY_RUN.search(path)
+        or _is_key_value(value)
+        or _holds_key_run(value)
+    ):
+        return None
+    return value
 
 
 def _kept_empty(variable: _Variable) -> bool:
@@ -1038,20 +1061,27 @@ def read_service_env_posture(
         empty_value_names=empty,
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
-        directory_only_names=_directory_only_names(variables, found),
+        directory_only_names=_every_kept(variables, found, lambda v: v.directory_only),
+        contentless_value_names=_every_kept(
+            variables,
+            [f for f in found if f[0].startswith(_VALUE_PREFIX) and f[0] != _VALUE_PREFIX],
+            lambda v: v.directory_only or not v.value or v.value.isspace(),
+        ),
         directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables),
     )
 
 
-def _directory_only_names(
-    variables: Sequence[_Variable], found: Sequence[tuple[str, str, int | None]]
+def _every_kept(
+    variables: Sequence[_Variable],
+    found: Sequence[tuple[str, str, int | None]],
+    test: Callable[[_Variable], bool],
 ) -> tuple[str, ...]:
-    """The names in ``found`` each of whose variables :func:`_names` keeps takes only
-    directory entries holding no key (:attr:`_Variable.directory_only`). Remedy only."""
+    """The names in ``found`` each of whose variables :func:`_names` keeps passes ``test``.
+    Remedy only."""
     only: list[str] = []
     for name, _where, _line in found:
         kept = [v for v in variables if v.written.upper() == name and _names([v])]
-        if kept and all(v.directory_only for v in kept):
+        if kept and all(test(v) for v in kept):
             only.append(name)
     return tuple(only)
 
@@ -1165,7 +1195,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     moving_keys = [k for k in keys if k not in only]
     moving_others = [o for o in others if o not in only]
     moving_values = any(
-        v not in posture.empty_value_names and v != _VALUE_PREFIX and v not in only for v in values
+        v not in posture.contentless_value_names and v != _VALUE_PREFIX and v not in only
+        for v in values
     )
     steps: list[str] = []
     if moving_keys:
