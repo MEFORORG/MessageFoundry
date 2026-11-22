@@ -40,7 +40,6 @@ _BARE_LOCK_ALLOWED: dict[str, tuple[int, str]] = {
         1,
         "the :memory: read fallback; yields the writer connection to reads, which never auto-begin",
     ),
-    "MessageStore.list_fifo_lanes": (1, "lane discovery: SELECTs only, no commit needed"),
 }
 
 #: The context managers that make a lock block safe. A block under either is not a bare lock.

@@ -139,6 +139,7 @@ from messagefoundry.store.cell_tag import (
     withhold_message_cells,
     withhold_refused_cell,
 )
+from messagefoundry.store.close_steps import CloseSteps
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -3013,6 +3014,15 @@ class PostgresStore:
                 release()
 
     async def _close_handles(self) -> None:
+        # BACKLOG #5668: a cancellation during the settlement must not skip the pool's close.
+        steps = CloseSteps()
+        try:
+            await steps.run(self._settle_at_close(), "the AES-GCM settlement")
+            await steps.run(self._pool.close(), "the connection pool")
+        finally:
+            steps.reraise()
+
+    async def _settle_at_close(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -3028,7 +3038,6 @@ class PostgresStore:
                 "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
             )
             log.debug("the settle's failure at close", exc_info=exc)
-        await self._pool.close()
 
     async def warm_pool(self) -> None:
         # Pre-open pooled connections so a connection burst (the post-promotion delivery workers, or a

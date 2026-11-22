@@ -128,6 +128,7 @@ from messagefoundry.store.cell_tag import (
     withhold_message_cells,
     withhold_refused_cell,
 )
+from messagefoundry.store.close_steps import CloseSteps
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -6000,6 +6001,37 @@ class SqlServerStore:
                 release()
 
     async def _close_handles(self) -> None:
+        # BACKLOG #5668: neither a cancellation nor a failing step may skip a later step.
+        steps = CloseSteps()
+        try:
+            await steps.run(self._settle_at_close(), "the AES-GCM settlement")
+            try:
+                # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when
+                # none were opened, so it never affects the async path). ADR 0071 B5.
+                self.close_sync_handoff_pool()
+            finally:
+                try:
+                    # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op
+                    # when the prepared path never opened one).
+                    await steps.run(self._close_claim_holders(), "the claim holders")
+                finally:
+                    # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point.
+                    # wait_closed() cannot complete while the pool is wedged -- which is precisely
+                    # the state these threads are stuck in -- so releasing them only on the success
+                    # path would leak the whole pool's worth of threads in the one case that
+                    # matters. shutdown(wait=False) does not join: a wedged ODBC call is not
+                    # interruptible, and the process is going away regardless.
+                    try:
+                        self._pool.close()
+                        await steps.run(self._pool.wait_closed(), "the connection pool")
+                    finally:
+                        if self._pool_executor is not None:
+                            self._pool_executor.shutdown(wait=False)
+                            self._pool_executor = None
+        finally:
+            steps.reraise()
+
+    async def _settle_at_close(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -6015,24 +6047,6 @@ class SqlServerStore:
                 "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
             )
             log.debug("the settle's failure at close", exc_info=exc)
-        # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
-        # opened, so it never affects the async path). ADR 0071 B5.
-        self.close_sync_handoff_pool()
-        # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op when the
-        # prepared path never opened one).
-        await self._close_claim_holders()
-        # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point. wait_closed() cannot
-        # complete while the pool is wedged -- which is precisely the state these threads are stuck in --
-        # so releasing them only on the success path would leak the whole pool's worth of threads in the
-        # one case that matters. shutdown(wait=False) does not join: a wedged ODBC call is not
-        # interruptible, and the process is going away regardless.
-        try:
-            self._pool.close()
-            await self._pool.wait_closed()
-        finally:
-            if self._pool_executor is not None:
-                self._pool_executor.shutdown(wait=False)
-                self._pool_executor = None
 
     # --- ADR 0071 B5: synchronous fused-handoff connection source ------------
     def open_sync_handoff_pool(self, stage: str, size: int) -> _SyncHandoffPool:

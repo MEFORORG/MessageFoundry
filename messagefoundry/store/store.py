@@ -124,6 +124,7 @@ from messagefoundry.store.cell_tag import (
     withhold_message_cells,
     withhold_refused_cell,
 )
+from messagefoundry.store.close_steps import CloseSteps
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import (
     AUDIT_KEYLESS_MAC,
@@ -13769,6 +13770,28 @@ class MessageStore:
                 release()
 
     async def _close_handles(self) -> None:
+        # BACKLOG #5668: a cancellation landing on one step must not skip the rest, or the workers
+        # of the connections after it stay alive and interpreter exit hangs on them. CloseSteps
+        # holds it until every step has run.
+        steps = CloseSteps()
+        try:
+            await steps.run(self._settle_at_close(), "the AES-GCM settlement")
+            # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members
+            # and resolves their futures before the write connection is closed — otherwise an
+            # in-flight handoff would hang forever on a future no committer will ever complete.
+            if self._group_commit is not None:
+                await steps.run(self._close_group_commit(), "the group committer")
+            # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
+            # state), then the writer. Best-effort: one failing close must not strand the rest.
+            for conn in self._read_conns:
+                await steps.run(self._close_read_connection(conn), "a read-pool connection")
+            self._read_conns = []
+            self._read_pool = None
+            await steps.run(self._close_writer(), "the writer connection")
+        finally:
+            steps.reraise()
+
+    async def _settle_at_close(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -13779,29 +13802,31 @@ class MessageStore:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
             _log_close_failure("could not settle the AES-GCM invocation bound at close", exc)
-        # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
-        # resolves their futures before the write connection is closed — otherwise an in-flight handoff
-        # would hang forever on a future no committer will ever complete.
-        if self._group_commit is not None:
-            try:
-                await self._group_commit.aclose()
-            except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
-                _log_close_failure("error closing group-commit committer", exc)
-        # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
-        # state), then the writer. Best-effort: one failing close must not strand the rest.
-        for conn in self._read_conns:
-            try:
-                await conn.close()
-                await _await_connection_worker_exit(conn)
-            except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
-                _log_close_failure("error closing read-pool connection", exc)
-        self._read_conns = []
-        self._read_pool = None
-        await self._db.close()
-        # Each close above returns before the worker thread it stops has actually gone, and those
-        # threads are non-daemon, so a `close`d store could still hold threads interpreter exit has
-        # to join. Wait them out so "the store is closed" means every thread it owned is gone.
-        await _await_connection_worker_exit(self._db)
+
+    async def _close_group_commit(self) -> None:
+        assert self._group_commit is not None
+        try:
+            await self._group_commit.aclose()
+        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+            _log_close_failure("error closing group-commit committer", exc)
+
+    @staticmethod
+    async def _close_read_connection(conn: aiosqlite.Connection) -> None:
+        try:
+            await conn.close()
+        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+            _log_close_failure("error closing read-pool connection", exc)
+        finally:
+            await _await_connection_worker_exit(conn)
+
+    async def _close_writer(self) -> None:
+        # Each close returns before the worker thread it stops has actually gone, and those threads
+        # are non-daemon, so a `close`d store could still hold threads interpreter exit has to join.
+        # Wait them out so "the store is closed" means every thread it owned is gone.
+        try:
+            await self._db.close()
+        finally:
+            await _await_connection_worker_exit(self._db)
 
     # --- write path ----------------------------------------------------------
 
@@ -15581,8 +15606,9 @@ class MessageStore:
         """Read-only lane discovery (ADR 0066 §3.6; see the base protocol for the full contract):
         every lane with >=1 PENDING row at ``stage``, paired with its HEAD row's (rowid-min pending
         row's) ``next_attempt_at`` — head-of-line-aware by construction. ``DISTINCT`` + per-lane head
-        sub-select under the write lock (the universe is registry-bounded); no writes, no commit
-        needed (mirrors the single claim's read-only early return)."""
+        sub-select in ONE statement on a pooled reader (BACKLOG #5673), so a sweep neither holds the
+        write lock nor pays one round trip per lane; no writes, no commit needed. A NULL lane still
+        takes a ``limit`` slot and is then dropped, as the per-lane lookup it replaces dropped it."""
         lane_col = (
             "channel_id"
             if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
@@ -15593,24 +15619,17 @@ class MessageStore:
         if after is not None:
             where += f" AND {lane_col} > ?"  # resume-after-lane cursor (ascending lane order)
             params.append(after)
-        out: list[tuple[str, float]] = []
-        async with self._lock:
-            cur = await self._db.execute(
-                f"SELECT DISTINCT {lane_col} AS lane FROM queue WHERE {where}"
-                " ORDER BY lane LIMIT ?",
-                (*params, limit),
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT d.lane AS lane, (SELECT h.next_attempt_at FROM queue h"
+                f" WHERE h.stage=? AND h.{lane_col}=d.lane AND h.status=?"
+                " ORDER BY h.rowid LIMIT 1) AS head_at"
+                f" FROM (SELECT DISTINCT {lane_col} AS lane FROM queue WHERE {where}"
+                " ORDER BY lane LIMIT ?) d WHERE d.lane IS NOT NULL ORDER BY d.lane",
+                (stage, OutboxStatus.PENDING.value, *params, limit),
             )
-            lane_rows = await cur.fetchall()
-            for lr in lane_rows:
-                cur = await self._db.execute(
-                    f"SELECT next_attempt_at FROM queue WHERE stage=? AND {lane_col}=? AND status=?"
-                    " ORDER BY rowid LIMIT 1",
-                    (stage, lr["lane"], OutboxStatus.PENDING.value),
-                )
-                head = await cur.fetchone()
-                if head is not None:
-                    out.append((lr["lane"], head["next_attempt_at"]))
-        return out
+            rows = await cur.fetchall()
+        return [(r["lane"], r["head_at"]) for r in rows]
 
     async def release_claimed(self, ids: Sequence[str], now: float | None = None) -> None:
         """Return never-dispatched INFLIGHT rows to ``pending``, undoing exactly the claim's
