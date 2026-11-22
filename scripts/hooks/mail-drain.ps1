@@ -683,20 +683,69 @@ function ConvertTo-MailExpiryUtc {
     # month-first with the Kind and the offset gone, so re-parsing it misread day-first cultures and
     # treated a Local wall clock as UTC (BACKLOG #5864).
     #
-    # A string that reaches here is one the JSON reader did not recognise. Only an ISO date is read
-    # from it, because '03/04/2026' has no reading that does not depend on a convention. Anything
-    # else is unreadable, and the caller applies the receiver's floor. A stamp with no zone is UTC,
-    # which is what the field's name says.
+    # A string that reaches here is one the JSON reader did not recognise. ConvertTo-MailIsoStamp
+    # admits only the forms with one possible reading, so the current culture never decides a date.
+    # Anything else is unreadable, and Test-MailExpired applies the receiver's floor. A stamp with no
+    # zone is UTC, which is what the field's name says.
     param($Value)
     if ($Value -is [DateTime]) {
         if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc) }
         return $Value.ToUniversalTime()
     }
-    if ($Value -isnot [string] -or $Value -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ]|\z)') { return $null }
+    if ($Value -isnot [string]) { return $null }
+    $iso = ConvertTo-MailIsoStamp $Value.Trim()
+    if (-not $iso) { return $null }
     $parsed = [DateTimeOffset]::MinValue
-    if ([DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture,
+    if ([DateTimeOffset]::TryParse($iso, [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $parsed.UtcDateTime }
     return $null
+}
+
+function ConvertTo-MailIsoStamp {
+    # An expiry string rewritten year-first, or $null where it has no single reading. Admitted: ISO,
+    # year-first, a numeric date whose day and month cannot be swapped (one part above 12, or both
+    # equal), and an English month name, each with a four-digit year and an optional clock.
+    # '03/04/2026' is refused because it names two dates, and a two-digit year because it names many.
+    # CultureInvariant matters: under tr-TR, IgnoreCase would not match an I against an i.
+    param([string]$Text)
+    if ($Text -cmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ]|\z)') { return $Text }
+    $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
+    $clock = '(?:[T\s]\s*(?<clock>[0-9]{1,2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:\s*[ap]m)?' +
+        '(?:\s*(?:z|utc|gmt|[+-][0-9]{2}(?::?[0-9]{2})?))?))?\z'
+    $weekday = '(?:(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri|sat(?:ur)?|sun)(?:day)?,?\s+)?'
+    $mon = '(?<mon>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|' +
+        'sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+    # The invariant parser takes Z and GMT but not UTC, so all three leave here as Z.
+    $join = {
+        param([string]$Date, $Hit)
+        if (-not $Hit.Groups['clock'].Success) { return $Date }
+        "$Date $([regex]::Replace($Hit.Groups['clock'].Value, '\s*(?:utc|gmt|z)\z', 'Z', $options))"
+    }
+
+    $hit = [regex]::Match($Text, "\A(?<date>[0-9]{4}(?<s>[/.-])[0-9]{1,2}\k<s>[0-9]{1,2})$clock", $options)
+    if ($hit.Success) { return & $join ($hit.Groups['date'].Value -replace '[/.]', '-') $hit }
+
+    $hit = [regex]::Match($Text, "\A(?<a>[0-9]{1,2})(?<s>[/.-])(?<b>[0-9]{1,2})\k<s>(?<y>[0-9]{4})$clock", $options)
+    if ($hit.Success) {
+        $a = [int]$hit.Groups['a'].Value
+        $b = [int]$hit.Groups['b'].Value
+        if ($a -le 12 -and $b -le 12 -and $a -ne $b) { return $null }
+        $month, $day = if ($a -gt 12) { $b, $a } else { $a, $b }
+        return & $join "$($hit.Groups['y'].Value)-$month-$day" $hit
+    }
+
+    $hit = [regex]::Match($Text, "\A$weekday(?:$mon\s+(?<d>[0-9]{1,2}),?|(?<d>[0-9]{1,2})\s+$mon,?)\s+(?<y>[0-9]{4})$clock", $options)
+    if (-not $hit.Success) { return $null }
+    return & $join "$($hit.Groups['d'].Value) $($hit.Groups['mon'].Value) $($hit.Groups['y'].Value)" $hit
+}
+
+function Test-MailExpired {
+    # THE ONE EXPIRY DECISION, so the moved-box count cannot disagree with the delivery loop. A stated
+    # expiry wins in either direction; only a missing or unreadable one falls to the receiver's floor.
+    param($Message, [DateTime]$LastWriteUtc, [DateTime]$NowUtc)
+    $exp = ConvertTo-MailExpiryUtc $Message.expiresUtc
+    if ($null -ne $exp) { return $exp -lt $NowUtc }
+    return $LastWriteUtc -lt $NowUtc.AddDays(-$RETAIN_DAYS)
 }
 
 function Get-LiveMessageStems {
@@ -1001,9 +1050,10 @@ try {
                             $parts = Split-MailFileName -Name $f.Name
                             if (-not $parts) { continue }
                             $m = $null
-                            try { $m = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
-                            $exp = ConvertTo-MailExpiryUtc $m.expiresUtc
-                            if ($null -ne $exp -and $exp -lt $nowUtc) { continue }
+                            try { $m = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
+                            # The delivery loop's two tests, so what is counted is what it would show.
+                            if ($m -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                            if (Test-MailExpired -Message $m -LastWriteUtc $f.LastWriteTimeUtc -NowUtc $nowUtc) { continue }
                             $to = if ($m.to -and $m.to.sessionId) { [string]$m.to.sessionId } else { '' }
                             if ($to -and $to -ne $sessionId) { continue }
                             $parts.Stem
@@ -1474,15 +1524,7 @@ try {
         # THE FLOOR APPLIES ONLY WHERE THE FIELD IS MISSING OR UNREADABLE. Applying it to a message that
         # states a longer TTL would silently overrule an explicit instruction from the sender, which is
         # a different and worse failure than the one being closed.
-        $expiredNow = $false
-        $exp = ConvertTo-MailExpiryUtc $m.expiresUtc
-        if ($null -ne $exp) {
-            $expiredNow = $exp -lt [DateTime]::UtcNow
-        }
-        else {
-            $expiredNow = $f.LastWriteTimeUtc -lt $cutoff
-        }
-        if ($expiredNow) {
+        if (Test-MailExpired -Message $m -LastWriteUtc $f.LastWriteTimeUtc -NowUtc ([DateTime]::UtcNow)) {
             # Two drains can be inside this box at once -- two sessions sharing a worktree, or one
             # session's Stop overlapping another's SessionStart -- and a shared destination is the
             # arm that was measured to return success for every racer. A lost sweep must NOT

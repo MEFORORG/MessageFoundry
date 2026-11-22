@@ -35,6 +35,7 @@ fixed and cannot be quietly closed.
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import hashlib
 import json
 import os
@@ -263,6 +264,7 @@ def run_drain(
     run_from: Path | None = None,
     expect_stderr: str | None = None,
     culture: str | None = None,
+    tz: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the hook exactly as Claude Code does.
 
@@ -271,6 +273,8 @@ def run_drain(
 
     ``culture`` runs the hook under that CurrentCulture, through a wrapper, because a process's
     culture comes from the machine and a test cannot otherwise choose it.
+
+    ``tz`` sets the TZ variable, which moves the hook's local zone only where .NET honours it.
 
     The payload MUST carry ``cwd``: mail-drain.ps1:272 falls back to ``(Get-Location).Path``, so a
     payload without it would point the drain at the LIVE checkout's mail root, which is both a false
@@ -295,6 +299,8 @@ def run_drain(
         assert anchor_repo is None, "the culture wrapper does not forward -AnchorRepo"
         argv += ["-Command", _CULTURE_WRAPPER]
         env = {**os.environ, "MAIL_TEST_DRAIN": str(DRAIN), "MAIL_TEST_CULTURE": culture}
+    if tz is not None:
+        env = {**(env if env is not None else os.environ), "TZ": tz}
     # run_from exists because the PAYLOAD cwd and the PROCESS cwd are separable in production and
     # must be separable here: a payload can name a directory that no longer exists, which Windows
     # refuses as a process working directory. Defaulting it to the payload keeps every other test
@@ -2460,8 +2466,33 @@ _EXPIRY_CULTURES = ["en-GB", "en-US"]
 _EXPIRY_STEM = "20260101T000000001-aaaaaa"
 
 
+# .NET honours TZ on Linux and macOS and ignores it on Windows.
+_PINNED_ZONE = "Asia/Tokyo"
+
+
 def _offset_stamp(hours: int) -> str:
     return (datetime.now(UTC) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+@functools.cache
+def _effective_utc_offset_hours(tz: str) -> float:
+    """The offset pwsh itself sees with TZ set, which is the only reading that settles the pin."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[TimeZoneInfo]::Local.GetUtcOffset([DateTime]::UtcNow).TotalHours.ToString("
+            "[Globalization.CultureInfo]::InvariantCulture)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+        env={**os.environ, "TZ": tz},
+    )
+    return float(proc.stdout.strip())
 
 
 def test_the_culture_wrapper_carries_the_exit_code(tmp_path: Path) -> None:
@@ -2536,14 +2567,20 @@ def test_an_offset_stamp_is_read_as_the_instant_it_names(
     """Coerced to a Local DateTime, and read as a wall clock it would be off by the host's offset.
 
     The two stamps cover both directions: the live one catches a host west of UTC, the dead one a
-    host east of it. A host ON UTC cannot tell the old reader from this one.
+    host east of it. Within two hours of UTC neither can tell the old reader from this one, so the
+    zone is pinned where the platform honours TZ, and the test SKIPS where it still lands there.
     """
+    offset = _effective_utc_offset_hours(_PINNED_ZONE)
+    if abs(offset) < 2:
+        pytest.skip(
+            f"host reads as UTC{offset:+g} and ignores TZ, so this cannot detect the wall-clock misread"
+        )
     specs = [
         _raw_message(_EXPIRY_STEM, "live for an hour", _offset_stamp(1)),
         _raw_message("20260101T000000002-aaaaaa", "dead for an hour", _offset_stamp(-1)),
     ]
     info = seed(repo, tmp_path, specs)
-    text = injection(run_drain(repo, culture=culture))
+    text = injection(run_drain(repo, culture=culture, tz=_PINNED_ZONE))
     assert "live for an hour" in text, text
     assert "dead for an hour" not in text, text
     assert len(box_files(repo, str(info["key"]), "expired")) == 1
@@ -2566,22 +2603,141 @@ def test_the_floor_still_covers_a_missing_or_unreadable_stamp(
 
 
 def test_the_moved_box_count_reads_expiry_the_same_way(repo: Path, tmp_path: Path) -> None:
+    specs = [
+        _raw_message(_EXPIRY_STEM, "live", _offset_stamp(1)),
+        _raw_message("20260101T000000002-aaaaaa", "dead", "2020-01-13T00:00:00.000Z"),
+        _raw_message("20260101T000000003-aaaaaa", "just dead", _offset_stamp(-1)),
+    ]
+    text = _moved_box_notice(repo, tmp_path, specs, culture="en-GB")
+    assert "1 message(s) wait in the box of" in text, text
+
+
+def _moved_box_notice(
+    repo: Path,
+    tmp_path: Path,
+    specs: list[dict[str, Any]],
+    age: int = 0,
+    culture: str | None = None,
+) -> str:
+    """What a session pinned to ``repo`` is told about a box it moved into, seeded with ``specs``."""
     wt = Path(os.path.realpath(tmp_path)) / "moved-wt"
     subprocess.run(
         ["git", "-C", str(repo), "worktree", "add", "-q", "-b", wt.name, str(wt)],
         check=True,
         capture_output=True,
     )
-    specs = [
-        _raw_message(_EXPIRY_STEM, "live", _offset_stamp(1)),
-        _raw_message("20260101T000000002-aaaaaa", "dead", "2020-01-13T00:00:00.000Z"),
-        _raw_message("20260101T000000003-aaaaaa", "just dead", _offset_stamp(-1)),
-    ]
     seed(repo, tmp_path, specs, box_cwd=wt)
+    if age:
+        _age_inbox(repo, age)
     sid = str(uuid.uuid4())
     seed_pin(repo, repo, sid)
-    text = injection(run_drain(repo, cwd=wt, run_from=repo, session_id=sid, culture="en-GB"))
+    return injection(run_drain(repo, cwd=wt, run_from=repo, session_id=sid, culture=culture))
+
+
+def test_the_moved_box_count_applies_the_receivers_floor(repo: Path, tmp_path: Path) -> None:
+    """Past the floor, the box's own drain expires these, so the notice must not call them waiting.
+
+    The dated message is the control: a stated future expiry outranks the floor in both readers.
+    """
+    specs = [
+        _raw_message(_EXPIRY_STEM, "no stamp", None),
+        _raw_message("20260101T000000002-aaaaaa", "ambiguous stamp", "03/04/2026"),
+        _raw_message("20260101T000000003-aaaaaa", "dated far ahead", "2099-01-13T00:00:00Z"),
+    ]
+    text = _moved_box_notice(repo, tmp_path, specs, age=8)
     assert "1 message(s) wait in the box of" in text, text
+
+
+def test_the_moved_box_count_skips_a_payload_that_is_not_an_object(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The delivery loop calls these unreadable, so they are not waiting mail. One real message
+    beside them is the control that the notice still fires."""
+    payloads = ["[1,2,3]", '"just a string"', "7", "true"]
+    specs: list[dict[str, Any]] = [
+        {"stem": f"20260101T00000000{i}-aaaaaa", "raw": raw} for i, raw in enumerate(payloads, 1)
+    ]
+    specs.append(_raw_message("20260101T000000005-aaaaaa", "a real one", _offset_stamp(1)))
+    text = _moved_box_notice(repo, tmp_path, specs)
+    assert "1 message(s) wait in the box of" in text, text
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "01/13/2020",
+        "13/01/2020",
+        "13.01.2020",
+        "03/03/2020",
+        "2020/01/13",
+        "Jan 13 2020",
+        "January 13, 2020",
+        "13 Jan 2020",
+        "Mon, 13 Jan 2020 10:00:00 GMT",
+        "01/13/2020 10:00:00 PM",
+        "01/13/2020 10:00:00 +05:00",
+    ],
+)
+def test_an_unambiguous_past_stamp_expires_a_fresh_message(
+    repo: Path, tmp_path: Path, culture: str, stamp: str
+) -> None:
+    """Fresh, so the floor cannot be what expires it: only reading the stamp can."""
+    info = seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "stale body", stamp)])
+    text = injection(run_drain(repo, culture=culture))
+    assert "stale body" not in text, text
+    assert len(box_files(repo, str(info["key"]), "expired")) == 1
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+@pytest.mark.parametrize("stamp", ["01/13/2099", "13/01/2099", "Jan 13 2099", "13 January 2099"])
+def test_an_unambiguous_future_stamp_outlives_the_floor(
+    repo: Path, tmp_path: Path, culture: str, stamp: str
+) -> None:
+    seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "still live", stamp)])
+    _age_inbox(repo, 8)
+    assert "still live" in injection(run_drain(repo, culture=culture))
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+@pytest.mark.parametrize(
+    "stamp", ["03/04/2020", "03-04-2020", "03.04.2020", "02/30/2020", "01/13/20", "Jan 2020"]
+)
+def test_an_ambiguous_or_impossible_stamp_takes_the_floor(
+    repo: Path, tmp_path: Path, culture: str, stamp: str
+) -> None:
+    """Read as a date, each of these past stamps would expire a fresh message at once."""
+    info = seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "floor decides", stamp)])
+    key = str(info["key"])
+    assert "floor decides" in injection(run_drain(repo, event="SessionStart", culture=culture))
+    assert box_files(repo, key, "expired") == []
+    _age_inbox(repo, 8)
+    run_drain(repo, session_id=f"{uuid.uuid4()}", culture=culture)
+    assert len(box_files(repo, key, "expired")) == 1
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+def test_a_zoneless_iso_stamp_near_now_is_read_as_utc(
+    repo: Path, tmp_path: Path, culture: str
+) -> None:
+    """ConvertFrom-Json gives these Kind Unspecified. Two hours either side of now, so a reader that
+    took them as local time would flip one of them on any host at least two hours from UTC."""
+    now = datetime.now(UTC)
+    specs = [
+        _raw_message(
+            _EXPIRY_STEM, "zoneless live", (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        ),
+        _raw_message(
+            "20260101T000000002-aaaaaa",
+            "zoneless dead",
+            (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+        ),
+    ]
+    info = seed(repo, tmp_path, specs)
+    text = injection(run_drain(repo, culture=culture, tz=_PINNED_ZONE))
+    assert "zoneless live" in text, text
+    assert "zoneless dead" not in text, text
+    assert len(box_files(repo, str(info["key"]), "expired")) == 1
 
 
 def _hand_drain(wt: Path, sid: str) -> str:
