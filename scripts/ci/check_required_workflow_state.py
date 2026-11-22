@@ -165,7 +165,8 @@ def _workflow_states(
 ) -> dict[str, str]:
     """``{filename: state}`` of the direct workflow files.
 
-    Raises ``RuntimeError`` at least on a path that ``_direct_workflow_file`` refuses.
+    Raises ``RuntimeError`` at least on a path that ``_direct_workflow_file`` refuses, even one
+    directly in ``.github/workflows``.
 
     Keyed on the FILENAME rather than the display name: the display name is what ``workflow_run``
     matches on, but a required context resolves to a FILE, and two workflows may legitimately share a
