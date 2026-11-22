@@ -2498,20 +2498,17 @@ def _landing_swallows(source: str) -> bool:
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+_DefNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
 
 
-def _toplevel(source: str) -> tuple[dict[str, _FunctionNode], set[str]] | None:
-    """Top-level function signatures by name, plus every top-level name bound. ``None`` if `source`
-    does not parse.
+def _toplevel(tree: ast.Module) -> tuple[dict[str, _FunctionNode], set[str]]:
+    """Top-level function signatures by name, plus every top-level name bound.
 
     TOP LEVEL ONLY, and that is the point rather than a simplification: the mutation is APPENDED to
-    the module, so it can only shadow a module-level binding. A method inside a class body is not
-    reachable by this mechanism and must not be compared against.
+    the module, so it can only shadow a module-level binding. This is the first of the two checks
+    :func:`_screen_mutation` runs; the second, :func:`_run_block`, reads definitions under compound
+    statements and inside a redefined class, and can only add refusals to this one.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return None
     sigs: dict[str, _FunctionNode] = {}
     bound: set[str] = set()
     for node in tree.body:
@@ -2527,8 +2524,480 @@ def _toplevel(source: str) -> tuple[dict[str, _FunctionNode], set[str]] | None:
     return sigs, bound
 
 
-def _signature(fn: _FunctionNode) -> tuple[object, ...]:
-    """The call-compatible shape of a signature: what a CALL SITE can observe.
+def _is_generator(fn: _FunctionNode) -> bool:
+    """Whether `fn`'s OWN body yields. A nested function, lambda or class body is its own scope, so
+    a ``yield`` there does not make `fn` a generator; their defaults, decorators and bases run in
+    `fn`'s scope, so a ``yield`` in one of those does.
+    """
+    stack: list[ast.AST] = list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            stack.extend(node.args.defaults)
+            stack.extend(d for d in node.args.kw_defaults if d is not None)
+            if not isinstance(node, ast.Lambda):
+                stack.extend(node.decorator_list)
+            continue
+        if isinstance(node, ast.ClassDef):
+            stack.extend([*node.decorator_list, *node.bases, *node.keywords])
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
+#: Decorators that change what a call site gets back, by the origin a decorator expression resolves
+#: to: a property for a method, a context manager for a value, a wrapper that hashes its arguments,
+#: a stub that is never the live binding. A decorator that resolves to anything else, or to nothing
+#: this screen can name, may come or go freely, because dropping one can BE the reintroduction (a
+#: permission check written as a decorator), and a decorator the reading cannot name turns off the
+#: decorator comparison for that def (:meth:`_Reading.pair`). The class decorators here (a generated constructor)
+#: are resolved too, but no check compares a class's decorators (:func:`_scope_mismatch`).
+_SHAPE_DECORATORS: Final = frozenset(
+    {
+        "builtins.property",
+        "builtins.staticmethod",
+        "builtins.classmethod",
+        "functools.cache",
+        "functools.lru_cache",
+        "functools.cached_property",
+        "functools.singledispatch",
+        "functools.singledispatchmethod",
+        "contextlib.contextmanager",
+        "contextlib.asynccontextmanager",
+        "dataclasses.dataclass",
+        "typing.overload",
+        "typing_extensions.overload",
+        "attr.s",
+        "attr.attrs",
+        "attr.define",
+        "attr.frozen",
+        "attr.mutable",
+        "attrs.define",
+        "attrs.frozen",
+        "attrs.mutable",
+        "pytest.fixture",
+    }
+)
+#: Shape decorators that give a call site the same thing: ``cache`` is ``lru_cache(maxsize=None)``,
+#: and ``typing_extensions`` re-exports ``typing``'s ``overload``.
+_SAME_SHAPE: Final = {
+    "functools.cache": "functools.lru_cache",
+    "typing_extensions.overload": "typing.overload",
+}
+#: The builtins a bare name resolves to while nothing in its scope has rebound it.
+_SHAPE_BUILTINS: Final = frozenset({"property", "staticmethod", "classmethod"})
+#: The property accessor decorators, ``@x.setter`` and its siblings.
+_ACCESSORS: Final = frozenset({"setter", "getter", "deleter"})
+#: The prefix of a binding's origin that names a MODULE rather than an object in one.
+_MODULE: Final = "module:"
+
+
+@dataclass
+class _ScopeState:
+    """One scope at one point of a straight-line reading of its statements.
+
+    ``defs`` maps a name to the ``def`` and ``class`` statements that may still be what it is bound
+    to, or to ``None`` when some live binding of it is not one (an import or an assignment), which
+    leaves nothing to compare it against. ``bindings`` maps a name to the origin a decorator naming
+    it resolves to (``"functools.cache"``, ``"module:functools"``), or to ``None`` for anything else.
+    A ``from m import *`` is read as rebinding every name already bound, and not the builtins.
+    """
+
+    defs: dict[str, tuple[_DefNode, ...] | None] = field(default_factory=dict)
+    bindings: dict[str, str | None] = field(default_factory=dict)
+
+    def copy(self) -> _ScopeState:
+        return _ScopeState(dict(self.defs), dict(self.bindings))
+
+    def lookup(self, name: str) -> str | None:
+        if name in self.bindings:
+            return self.bindings[name]
+        if name in _SHAPE_BUILTINS:
+            return f"builtins.{name}"
+        return None
+
+    def bind(self, name: str, origin: str | None = None) -> None:
+        """`name` rebound to something other than a ``def`` or ``class``."""
+        self.bindings[name] = origin
+        self.defs[name] = None
+
+
+@dataclass
+class _Reading:
+    """What :func:`_run_block` records about each ``def`` and ``class`` it reaches: the shape
+    decorators it resolved for it at the point it ran, the defs in ``unresolved`` with a decorator
+    it could not name, and each class body's final scope."""
+
+    decorators: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
+    #: The defs with at least one decorator that resolved to nothing this screen can name.
+    unresolved: set[_DefNode] = field(default_factory=set)
+
+    def pair(self, m: _DefNode, s: _DefNode) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The decorators to compare for `m` against `s`: both resolved, or neither compared.
+
+        Where either side holds a decorator that did not resolve, or was never read, neither is
+        compared, as before decorators were compared at all."""
+        if (
+            m in self.unresolved
+            or s in self.unresolved
+            or m not in self.decorators
+            or s not in self.decorators
+        ):
+            return (), ()
+        return self.decorators[m], self.decorators[s]
+
+    classes: dict[ast.ClassDef, _ScopeState] = field(default_factory=dict)
+
+
+def _resolve(expr: ast.expr, state: _ScopeState) -> str | None:
+    """The origin `expr` names in `state`, ignoring a call's arguments; ``None`` if unknown."""
+    if isinstance(expr, ast.Call):
+        return _resolve(expr.func, state)
+    if isinstance(expr, ast.Name):
+        return state.lookup(expr.id)
+    if isinstance(expr, ast.Attribute):
+        base = _resolve(expr.value, state)
+        if base is not None and base.startswith(_MODULE):
+            return f"{base.removeprefix(_MODULE)}.{expr.attr}"
+    return None
+
+
+def _merge(states: list[_ScopeState]) -> _ScopeState:
+    """The scope after exactly one of `states`' paths ran. A name keeps every definition any path
+    leaves live, or becomes ``None`` if any path leaves it bound to something else; a binding keeps
+    its origin only where every path that binds it agrees on it."""
+    out = _ScopeState()
+    for name in dict.fromkeys(n for s in states for n in s.defs):
+        entries = [s.defs[name] for s in states if name in s.defs]
+        if any(e is None for e in entries):
+            out.defs[name] = None
+            continue
+        alts: list[_DefNode] = []
+        for entry in entries:
+            assert entry is not None
+            alts.extend(d for d in entry if not any(d is a for a in alts))
+        out.defs[name] = tuple(alts)
+    for name in dict.fromkeys(n for s in states for n in s.bindings):
+        origins = {s.lookup(name) for s in states if name in s.bindings or name in _SHAPE_BUILTINS}
+        out.bindings[name] = origins.pop() if len(origins) == 1 else None
+    return out
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+    """``TYPE_CHECKING`` or ``typing.TYPE_CHECKING``, false at runtime."""
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _target_names(target: ast.AST) -> list[str]:
+    """The names an assignment, loop, ``with`` or ``match`` target binds."""
+    out: list[str] = []
+    for node in ast.walk(target):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            out.append(node.id)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            out.append(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            out.append(node.rest)
+    return out
+
+
+_WALRUS_SKIP: Final = frozenset({"body", "orelse", "finalbody", "handlers", "cases"})
+
+
+def _bind_walrus(node: ast.stmt, state: _ScopeState) -> None:
+    """A ``:=`` in `node`'s own expressions binds in this scope; its nested blocks run later, and
+    a lambda body is a scope of its own, though its defaults are evaluated here."""
+    for name, value in ast.iter_fields(node):
+        if name not in _WALRUS_SKIP:
+            for item in value if isinstance(value, list) else [value]:
+                if isinstance(item, ast.AST):
+                    _bind_walrus_in(item, state)
+
+
+def _bind_walrus_in(expr: ast.AST, state: _ScopeState) -> None:
+    """:func:`_bind_walrus` for one expression."""
+    stack: list[ast.AST] = [expr]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, ast.NamedExpr):
+            state.bind(item.target.id)
+        if isinstance(item, ast.Lambda):
+            stack.extend(item.args.defaults)
+            stack.extend(d for d in item.args.kw_defaults if d is not None)
+            continue
+        stack.extend(ast.iter_child_nodes(item))
+
+
+def _is_accessor(node: _FunctionNode, state: _ScopeState, reading: _Reading) -> bool:
+    """A ``@x.setter``, ``@x.getter`` or ``@x.deleter`` def named ``x`` while every live ``x`` in
+    this scope is a def decorated as a builtin property: it adds an accessor to that property, so
+    it does not replace the property's shape. So is one whose decorator reaches ``x`` through
+    another name (``@Base.x.setter``), the shape of an override of one accessor of an inherited
+    property; it binds a property built on that one, and is not compared."""
+    if any(
+        isinstance(d, ast.Attribute)
+        and d.attr in _ACCESSORS
+        and isinstance(d.value, ast.Attribute)
+        and d.value.attr == node.name
+        for d in node.decorator_list
+    ):
+        return True
+    entry = state.defs.get(node.name)
+    if not entry:
+        return False
+    if not any(
+        isinstance(d, ast.Attribute)
+        and d.attr in _ACCESSORS
+        and isinstance(d.value, ast.Name)
+        and d.value.id == node.name
+        for d in node.decorator_list
+    ):
+        return False
+    return all(
+        not isinstance(e, ast.ClassDef) and "builtins.property" in reading.decorators.get(e, ())
+        for e in entry
+    )
+
+
+def _has_break(body: list[ast.stmt]) -> bool:
+    """Whether `body` holds a ``break`` or ``continue`` of its own loop, not one of a nested loop:
+    either can end the loop's last pass partway."""
+    stack = list(body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Break, ast.Continue)):
+            return True
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            stack.extend(node.orelse)  # a break in a nested loop's else ends THIS loop
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for name in ("body", "orelse", "finalbody"):
+            stack.extend(getattr(node, name, ()))
+        stack.extend(s for h in getattr(node, "handlers", ()) for s in h.body)
+        stack.extend(s for c in getattr(node, "cases", ()) for s in c.body)
+    return False
+
+
+def _run_block(
+    body: list[ast.stmt],
+    state: _ScopeState,
+    reading: _Reading,
+    outer: _ScopeState | None = None,
+    *,
+    generous: bool = False,
+    sink: list[_ScopeState] | None = None,
+) -> _ScopeState:
+    """`state` after `body` runs, one statement at a time, as the second check of
+    :func:`_screen_mutation` reads it.
+
+    In sequence a later ``def`` or ``class`` replaces an earlier one. Each alternative of a compound
+    statement leaves its own definitions possible: both arms of an ``if``; a ``try``'s body with its
+    ``else``, and each handler after a prefix of the body, then its ``finally``; a loop that breaks
+    after its body, or runs or skips its body and then runs its ``else``; each ``match`` case, or
+    none. An ``if TYPE_CHECKING:`` body is read as never running, so only its ``else`` counts, and
+    the reverse for ``if not TYPE_CHECKING:``. A property accessor def does not replace the property
+    (:func:`_is_accessor`). A decorator is resolved at the point its ``def`` runs.
+
+    The TARGET is read `generous`ly: each prefix of a ``with`` body, of a loop body that holds a ``break`` or ``continue``, and of a
+    ``try`` body,
+    at any depth inside it, is a live alternative too. The mutation is read without them: a ``with``
+    body is read as running whole, and a handler follows only a prefix of the ``try`` body's own
+    statements.
+
+    A class body is read when its ``class`` statement runs, in a scope of its own that starts from
+    the enclosing module scope's bindings (`outer`, or `state` at module level). A function body is
+    never entered: it binds nothing in this scope until it is called, except a name it declares
+    ``global``, which is read as rebound to an unknown value from the point the function is defined.
+    """
+    state = state.copy()
+    for node in body:
+        if sink is not None:
+            sink.append(state.copy())
+        state = _run_stmt(node, state, reading, outer, generous=generous, sink=sink)
+    return state
+
+
+def _run_stmt(
+    node: ast.stmt,
+    state: _ScopeState,
+    reading: _Reading,
+    outer: _ScopeState | None,
+    *,
+    generous: bool = False,
+    sink: list[_ScopeState] | None = None,
+) -> _ScopeState:
+    """:func:`_run_block` for one statement. May update `state` in place; returns the result."""
+    _bind_walrus(node, state)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        origins = [_resolve(d, state) for d in node.decorator_list]
+        if None in origins:
+            reading.unresolved.add(node)
+        reading.decorators[node] = tuple(
+            _SAME_SHAPE.get(origin, origin) for origin in origins if origin in _SHAPE_DECORATORS
+        )
+        if outer is None:  # a `global` anywhere inside binds a MODULE name, never a class member
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Global):
+                    for name in sub.names:
+                        state.bind(name)
+        if isinstance(node, ast.ClassDef):
+            module = outer if outer is not None else state
+            fresh = _ScopeState(bindings=dict(module.bindings))
+            reading.classes[node] = _run_block(node.body, fresh, reading, module, generous=generous)
+        elif _is_accessor(node, state, reading):
+            return state
+        state.defs[node.name] = (node,)
+        state.bindings[node.name] = None
+    elif isinstance(node, ast.Import):
+        for alias in node.names:
+            if alias.asname:
+                state.bind(alias.asname, _MODULE + alias.name)
+            else:
+                head = alias.name.split(".")[0]
+                state.bind(head, _MODULE + head)
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            if alias.name == "*":
+                for name in list(state.bindings):
+                    state.bind(name)
+                for name in list(state.defs):
+                    state.defs[name] = None
+                continue
+            origin = f"{node.module}.{alias.name}" if not node.level and node.module else None
+            state.bind(alias.asname or alias.name, origin)
+    elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        if isinstance(node, ast.AnnAssign) and value is None:
+            return state  # an annotation alone binds nothing
+        origin = (
+            _resolve(value, state)
+            if isinstance(node, ast.Assign) and isinstance(value, (ast.Name, ast.Attribute))
+            else None
+        )
+        for target in targets:
+            for name in _target_names(target):
+                state.bind(name, origin if isinstance(target, ast.Name) else None)
+    elif isinstance(node, ast.TypeAlias):
+        for name in _target_names(node.name):
+            state.bind(name)
+    elif isinstance(node, ast.Delete):
+        for target in node.targets:
+            for name in _target_names(target):
+                state.bind(name)
+    elif isinstance(node, ast.If):
+        if _is_type_checking(node.test):
+            return _run_block(node.orelse, state, reading, outer, generous=generous, sink=sink)
+        if (
+            isinstance(node.test, ast.UnaryOp)
+            and isinstance(node.test.op, ast.Not)
+            and _is_type_checking(node.test.operand)
+        ):
+            return _run_block(node.body, state, reading, outer, generous=generous, sink=sink)
+        return _merge(
+            [
+                _run_block(node.body, state, reading, outer, generous=generous, sink=sink),
+                _run_block(node.orelse, state, reading, outer, generous=generous, sink=sink),
+            ]
+        )
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                for name in _target_names(item.optional_vars):
+                    state.bind(name)
+        if not generous:
+            return _run_block(node.body, state, reading, outer, generous=generous, sink=sink)
+        cut: list[_ScopeState] = []
+        whole = _run_block(node.body, state, reading, outer, generous=generous, sink=cut)
+        if sink is not None:
+            sink.extend(cut)
+        return _merge([whole, *cut])  # an __exit__ that suppresses ends the body at any prefix
+    elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+        if not isinstance(node, ast.While):
+            for name in _target_names(node.target):
+                state.bind(name)
+        cut = []
+        ran = _run_block(
+            node.body, state, reading, outer, generous=generous, sink=cut if generous else sink
+        )
+        if generous and sink is not None:
+            sink.extend(cut)
+        broke = cut if generous and _has_break(node.body) else []
+        # The else is read ONCE, from the merged entry states, so nested loop-elses cost linearly.
+        return _merge(
+            [
+                ran,
+                *broke,
+                _run_block(
+                    node.orelse, _merge([ran, state]), reading, outer, generous=generous, sink=sink
+                ),
+            ]
+        )
+    elif isinstance(node, (ast.Try, ast.TryStar)):
+        if generous:
+            cut = []
+            whole = _run_block(node.body, state, reading, outer, generous=generous, sink=cut)
+            prefixes = [*cut, whole]
+            if sink is not None:
+                sink.extend(cut)
+        else:
+            prefixes = [state]
+            for stmt in node.body:
+                prefixes.append(_run_stmt(stmt, prefixes[-1].copy(), reading, outer))
+        alternatives = [
+            _run_block(node.orelse, prefixes[-1], reading, outer, generous=generous, sink=sink)
+        ]
+        partial = _merge(prefixes)
+        for handler in node.handlers:
+            caught = partial.copy()
+            if handler.name:
+                caught.bind(handler.name)
+            alternatives.append(
+                _run_block(handler.body, caught, reading, outer, generous=generous, sink=sink)
+            )
+        return _run_block(
+            node.finalbody, _merge(alternatives), reading, outer, generous=generous, sink=sink
+        )
+    elif isinstance(node, ast.Match):
+        cases = []
+        for case in node.cases:
+            matched = state.copy()
+            for name in _target_names(case.pattern):
+                matched.bind(name)
+            if case.guard is not None:
+                _bind_walrus_in(case.guard, matched)
+            cases.append(
+                _run_block(case.body, matched, reading, outer, generous=generous, sink=sink)
+            )
+        return _merge([*cases, state])
+    return state
+
+
+#: The name of each field :func:`_signature` returns, in its order, for the refusal message.
+_SIGNATURE_FIELDS: Final = (
+    "async",
+    "generator",
+    "decorators",
+    "positional-only",
+    "positional",
+    "keyword-only",
+    "*args",
+    "**kwargs",
+    "positional defaults",
+    "keyword-only defaults",
+)
+
+
+def _signature(
+    fn: _FunctionNode, decorators: tuple[str, ...] = (), *, method: bool = False
+) -> tuple[object, ...]:
+    """The call-compatible shape of a signature: what a CALL SITE can observe, one value per
+    :data:`_SIGNATURE_FIELDS` entry.
 
     Parameter NAMES are included, not just counts -- a rename breaks every keyword call, which is the
     same wrecking-ball failure as a wrong count and is invisible to an arity-only comparison. Default
@@ -2540,13 +3009,27 @@ def _signature(fn: _FunctionNode) -> tuple[object, ...]:
 
     ``async`` is part of the shape too: a plain caller of an ``async def`` gets a coroutine it never
     runs, and an awaiting caller of a ``def`` gets a non-awaitable, so a swap breaks every call site
-    with every parameter intact (BACKLOG #5590).
+    with every parameter intact (BACKLOG #5590). Being a GENERATOR is part of it for the same
+    reason: a caller of a function that now yields gets a generator object in place of its value.
+    So are `decorators`, the shape decorators :func:`_run_block` resolved for `fn`
+    (:data:`_SHAPE_DECORATORS`), which change what the name is bound to.
+
+    For a ``method`` other than a ``staticmethod``, the first parameter is bound, never passed by a
+    caller, so neither its name nor whether it is positional-only is part of the shape (``self``,
+    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``.
     """
     args = fn.args
+    posonly = [p.arg for p in args.posonlyargs]
+    positional = [p.arg for p in args.args]
+    if method and "builtins.staticmethod" not in decorators and (posonly or positional):
+        (posonly if posonly else positional).pop(0)
+        posonly.insert(0, "<bound>")
     return (
         isinstance(fn, ast.AsyncFunctionDef),
-        tuple(p.arg for p in args.posonlyargs),
-        tuple(p.arg for p in args.args),
+        _is_generator(fn),
+        decorators,
+        tuple(posonly),
+        tuple(positional),
         tuple(p.arg for p in args.kwonlyargs),
         args.vararg.arg if args.vararg else None,
         args.kwarg.arg if args.kwarg else None,
@@ -2555,12 +3038,88 @@ def _signature(fn: _FunctionNode) -> tuple[object, ...]:
     )
 
 
+def _signature_clause(
+    qual: str, path: str, mine: tuple[object, ...], live: tuple[object, ...]
+) -> str:
+    return (
+        f"redefines {qual}() with a different signature than {path} declares "
+        f"(({', '.join(_SIGNATURE_FIELDS)}) = {mine} vs {live})"
+    )
+
+
+def _node_mismatch(
+    m: _DefNode, s: _DefNode, qual: str, path: str, reading: _Reading, *, method: bool
+) -> str | None:
+    """Why definition `m` cannot stand in for live definition `s`, or ``None`` if it can."""
+    if isinstance(m, ast.ClassDef) != isinstance(s, ast.ClassDef):
+        return (
+            f"redefines {qual} as a class where {path} defines a function"
+            if isinstance(m, ast.ClassDef)
+            else f"redefines {qual}() as a function where {path} defines a class"
+        )
+    if isinstance(m, ast.ClassDef) and isinstance(s, ast.ClassDef):
+        return _scope_mismatch(
+            reading.classes[m].defs, reading.classes[s].defs, f"{qual}.", path, reading, method=True
+        )
+    assert not isinstance(m, ast.ClassDef) and not isinstance(s, ast.ClassDef)
+    mdecs, sdecs = reading.pair(m, s)
+    mine = _signature(m, mdecs, method=method)
+    live = _signature(s, sdecs, method=method)
+    return None if mine == live else _signature_clause(qual, path, mine, live)
+
+
+def _scope_mismatch(
+    mut: dict[str, tuple[_DefNode, ...] | None],
+    src: dict[str, tuple[_DefNode, ...] | None],
+    prefix: str,
+    path: str,
+    reading: _Reading,
+    *,
+    method: bool,
+) -> str | None:
+    """The first of the mutation's definitions in `mut` that matches none of the live definitions
+    `src` holds for its name, as a clause for the refusal; ``None`` if there is none.
+
+    Only definitions `src` does not already hold are the mutation's. A name is skipped where `src`
+    does not bind it, or where some live binding of it on either side is not a ``def`` or ``class``
+    (an import, an assignment, ``C = deco(C)``, ``scan = lambda: 1``), so neither check compares a
+    name the mutation rebinds that way. A class redefined over a class is
+    compared member by member, its methods with :func:`_signature`'s ``method``.
+
+    NOT COMPARED, at least: the members, annotated fields (a dataclass's constructor arguments),
+    bases and class decorators a redefined class leaves out or changes, though a whole replacement
+    that drops one breaks its callers.
+    """
+    for name, mentry in mut.items():
+        sentry = src.get(name)
+        if not mentry or not sentry:
+            continue
+        for m in mentry:
+            if any(m is s for s in sentry):
+                continue
+            problems = [
+                _node_mismatch(m, s, f"{prefix}{name}", path, reading, method=method)
+                for s in sentry
+            ]
+            if all(problems):
+                return problems[-1]
+    return None
+
+
 def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings) -> bool:
     """Refuse a mutation that would redden the observable for a reason other than the change it
     claims. ``False`` means refused, and a PROVE-ERROR has been recorded.
 
     Runs on the live-proof AND the static-screen path: a mutation whose signature does not match the
     symbol it shadows is a defective claim whether or not anyone executes it.
+
+    TWO CHECKS, and the second only adds refusals. The first compares each module-level function the
+    mutation defines with the target's last module-level function of that name (:func:`_toplevel`).
+    The second reads both in order (:func:`_run_block`), the mutation continuing from where the
+    target ends, since it is appended: it refuses a mutation definition, at module level or inside a
+    redefined class, that matches none of the target's definitions still possibly live for its name.
+    It compares nothing for a name the target may leave bound to something other than a ``def`` or
+    ``class``, such as an import under ``try:`` with a fallback ``def`` (:func:`_scope_mismatch`).
 
     A REFUSAL IS PROBLEM-ONLY: it appends a PROVE-ERROR and increments NO counter, which is why the
     accounting identity on :class:`Findings` still closes. That was a choice between three options and
@@ -2573,38 +3132,59 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
     """
     if target.suffix != ".py":
         return True  # nothing to parse; the append is opaque text by design
-    mutation = _toplevel(a.mutation)
-    if mutation is None:
+    try:
+        mutation = ast.parse(a.mutation)
+    except SyntaxError:
         findings.problems.append(
             f"{cell_id}: absence claim PROVE-ERROR — the mutation is not valid Python, so applying it "
             f"breaks import of {a.mutation_path} rather than reintroducing anything. An observable "
             "that imports inside a test body reddens at exit 1 and would be counted as a proof"
         )
         return False
-    source = _toplevel(target.read_text(encoding="utf-8", errors="replace"))
-    if source is None:
+    try:
+        source = ast.parse(target.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
         # The TARGET does not parse. Not this claim's defect, and not something to refuse it over --
         # leave it to execution, where the baseline will already be red and fail closed.
         return True
-    mut_sigs, _ = mutation
-    src_sigs, _ = source
+    reading = _Reading()
+    walked: tuple[_ScopeState, _ScopeState] | None
+    try:
+        live = _run_block(source.body, _ScopeState(), reading, generous=True)
+        walked = live, _run_block(mutation.body, live, reading)
+    except RecursionError:
+        # Nesting deeper than the interpreter's stack (a long ``elif`` chain). The second check only
+        # adds refusals, so it is skipped, and the first compares no decorators, since the walk
+        # stopped before reading them all.
+        walked = None
+        reading = _Reading()
+    mut_sigs, _ = _toplevel(mutation)
+    src_sigs, _ = _toplevel(source)
+    mismatch: str | None = None
     for name, margs in mut_sigs.items():
         real = src_sigs.get(name)
         if real is None:
             continue  # shadows no module-level function of that name; nothing to compare
-        if _signature(margs) != _signature(real):
-            findings.problems.append(
-                f"{cell_id}: absence claim PROVE-ERROR — the mutation redefines {name}() with a "
-                f"different signature than {a.mutation_path} declares "
-                f"((async, positional-only, positional, keyword-only, *args, **kwargs, positional "
-                f"defaults, keyword-only defaults) = {_signature(margs)} vs {_signature(real)}). "
-                "Applied, that breaks every call site -- a TypeError, or a coroutine where a value "
-                "was expected -- so the observable would go red for the call shape and not for the "
-                "reintroduction — a wrecking ball wearing the shape of a surgical proof. Copy the "
-                "live signature; the mutation lives in a different repository from the symbol it "
-                "shadows, so nothing else keeps the two in step"
-            )
-            return False
+        mdecs, sdecs = reading.pair(margs, real)
+        mine = _signature(margs, mdecs)
+        theirs = _signature(real, sdecs)
+        if mine != theirs:
+            mismatch = _signature_clause(name, a.mutation_path, mine, theirs)
+            break
+    if mismatch is None and walked is not None:
+        mismatch = _scope_mismatch(
+            walked[1].defs, walked[0].defs, "", a.mutation_path, reading, method=False
+        )
+    if mismatch is not None:
+        findings.problems.append(
+            f"{cell_id}: absence claim PROVE-ERROR — the mutation {mismatch}. "
+            "Applied, that breaks every call site -- a TypeError, or a coroutine, generator or "
+            "other object where a value was expected -- so the observable would go red for the "
+            "call shape and not for the reintroduction — a wrecking ball wearing the shape of a "
+            "surgical proof. Copy the live signature; the mutation lives in a different repository "
+            "from the symbol it shadows, so nothing else keeps the two in step"
+        )
+        return False
     return True
 
 
