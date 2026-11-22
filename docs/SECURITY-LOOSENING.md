@@ -2370,7 +2370,7 @@ count is above `0` (vault BACKLOG #2613).
     not finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING
     that a row may be missing. Under `serve`, the shutdown's stop budget can cut each of those
     two waits to about 0.1 seconds (BACKLOG #3191), so on a tight stop the read at stop may get
-    almost no time at all. [SERVICE.md](SERVICE.md#start--stop--status) says when. A row cut off this way has no ERROR line. The engine then goes on
+    almost no time at all. [SERVICE.md](SERVICE.md#start--stop--status) says when, and which other stop waits the budget covers; the graph supervisor's wait is not one. A row cut off this way has no ERROR line. The engine then goes on
     stopping, even if a read is still running. A read in progress that is cancelled this way
     keeps the read at stop from running at all. Refusals that no read had reached then get
     neither a row nor an alert. Their WARNING lines may remain, within the limits the **No file
