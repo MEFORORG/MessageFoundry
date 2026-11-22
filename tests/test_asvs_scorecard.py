@@ -2923,6 +2923,31 @@ def test_prove_absences_screen_reads_a_continue_mid_body_as_ending_the_loop(
     assert _refused("def f(): ...\n", target, tmp_path)
 
 
+def test_prove_absences_screen_skips_decorators_one_side_cannot_resolve(tmp_path: Path) -> None:
+    """The appended mutation's decorator resolves against the target's final state. Where that
+    state no longer names the decorator's module, the two records would differ for want of a
+    reading, so an exact copy is accepted, as before decorators were compared."""
+    head = "import functools\n@functools.lru_cache\ndef f(a): ...\n"
+    copy = "@functools.lru_cache\ndef f(a):\n    return 1\n"
+    for tail in (
+        "try:\n    from x import *\nexcept ImportError:\n    pass\n",
+        "if DEBUG:\n    functools = None\n",
+        "def g():\n    global functools\n",
+    ):
+        assert _screen(copy, head + tail, tmp_path) == [], tail
+
+
+def test_prove_absences_screen_skips_decorators_after_the_recursion_fallback(
+    tmp_path: Path,
+) -> None:
+    """After a walk too deep for the stack, the decorators were not all read, so none is compared."""
+    chain = "if v == 0:\n    pass\n" + "".join(f"elif v == {i}:\n    pass\n" for i in range(1, 700))
+    target = "import functools\n@functools.lru_cache\ndef scan(a): ...\n" + chain
+    copy = "import functools\n@functools.lru_cache\ndef scan(a):\n    return 1\n"
+    assert _screen(copy, target, tmp_path) == []
+    assert _refused("def scan(): ...\n", target, tmp_path)
+
+
 def test_signature_fields_name_every_signature_value() -> None:
     """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
     assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))

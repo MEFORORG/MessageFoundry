@@ -2629,6 +2629,24 @@ class _Reading:
     decorators it resolved for it at the point it ran, and each class body's final scope."""
 
     decorators: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
+    #: The defs with at least one decorator that resolved to nothing this screen can name.
+    unresolved: set[_DefNode] = field(default_factory=set)
+
+    def pair(self, m: _DefNode, s: _DefNode) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The decorators to compare for `m` against `s`: both resolved, or neither compared.
+
+        Where either side holds a decorator that did not resolve, or was never read, the two records
+        would differ for want of a reading rather than a swap, so neither is compared, as before
+        decorators were compared at all."""
+        if (
+            m in self.unresolved
+            or s in self.unresolved
+            or m not in self.decorators
+            or s not in self.decorators
+        ):
+            return (), ()
+        return self.decorators[m], self.decorators[s]
+
     classes: dict[ast.ClassDef, _ScopeState] = field(default_factory=dict)
 
 
@@ -2815,10 +2833,11 @@ def _run_stmt(
     """:func:`_run_block` for one statement. May update `state` in place; returns the result."""
     _bind_walrus(node, state)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        origins = [_resolve(d, state) for d in node.decorator_list]
+        if None in origins:
+            reading.unresolved.add(node)
         reading.decorators[node] = tuple(
-            _SAME_SHAPE.get(origin, origin)
-            for d in node.decorator_list
-            if (origin := _resolve(d, state)) in _SHAPE_DECORATORS
+            _SAME_SHAPE.get(origin, origin) for origin in origins if origin in _SHAPE_DECORATORS
         )
         if outer is None:  # a `global` anywhere inside binds a MODULE name, never a class member
             for sub in ast.walk(node):
@@ -3042,8 +3061,9 @@ def _node_mismatch(
             reading.classes[m].defs, reading.classes[s].defs, f"{qual}.", path, reading, method=True
         )
     assert not isinstance(m, ast.ClassDef) and not isinstance(s, ast.ClassDef)
-    mine = _signature(m, reading.decorators.get(m, ()), method=method)
-    live = _signature(s, reading.decorators.get(s, ()), method=method)
+    mdecs, sdecs = reading.pair(m, s)
+    mine = _signature(m, mdecs, method=method)
+    live = _signature(s, sdecs, method=method)
     return None if mine == live else _signature_clause(qual, path, mine, live)
 
 
@@ -3133,8 +3153,10 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         walked = live, _run_block(mutation.body, live, reading)
     except RecursionError:
         # Nesting deeper than the interpreter's stack (a long ``elif`` chain). The second check only
-        # adds refusals, so skipping it leaves the first, which reads the decorators it reached.
+        # adds refusals, so it is skipped, and the first compares no decorators, since the walk
+        # stopped before reading them all.
         walked = None
+        reading = _Reading()
     mut_sigs, _ = _toplevel(mutation)
     src_sigs, _ = _toplevel(source)
     mismatch: str | None = None
@@ -3142,8 +3164,9 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         real = src_sigs.get(name)
         if real is None:
             continue  # shadows no module-level function of that name; nothing to compare
-        mine = _signature(margs, reading.decorators.get(margs, ()))
-        theirs = _signature(real, reading.decorators.get(real, ()))
+        mdecs, sdecs = reading.pair(margs, real)
+        mine = _signature(margs, mdecs)
+        theirs = _signature(real, sdecs)
         if mine != theirs:
             mismatch = _signature_clause(name, a.mutation_path, mine, theirs)
             break
