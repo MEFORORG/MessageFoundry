@@ -190,9 +190,10 @@ function Get-RecordStartedUtc($Record) {
 # Every registry record, with the root it came from attached.
 #
 # -IncludeUnreadable also returns a row for every file that could NOT be parsed (Record = $null,
-# Unreadable = $true; Directory = $true when the row is a directory named *.json). A caller about to destroy something needs those: a record that is half-written
-# -- i.e. a session that launched a moment ago -- fails to parse, and DROPPING it silently turns an
-# occupied worktree from SKIP into PRUNE while the receipt reports one fewer record than existed.
+# Unreadable = $true; Directory = $true when the row is a directory named *.json). A caller about to
+# destroy something needs those: a record that is half-written -- i.e. a session that launched a
+# moment ago -- fails to parse, and DROPPING it silently turns an occupied worktree from SKIP into
+# PRUNE while the receipt reports one fewer record than existed.
 # It is off by default so the read-only roster callers keep the shape they already handle.
 function Get-SessionRecords {
     [CmdletBinding()]
