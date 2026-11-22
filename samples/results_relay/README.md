@@ -19,7 +19,7 @@ names/endpoints (via `env()`), the real code sets, and the real transform.
 | Reference data | `code_set("test_codes")` maps the local lab code → the EHR's code (`codesets/test_codes.csv`) |
 | Per-environment endpoints | `env("ehr_host")`, `env("ehr_port")`, `env("archive_dir")` with local defaults |
 | **Repeating fields** | `repetitions("PID-3")` + `field(..., repetition=k)` to find the MR identifier; whole-field write to collapse the list |
-| **Repeating segments** | `count_segments("OBX")` + `field(..., occurrence=i)` to read each OBX, walked back to front; `delete_segments("OBX", occurrence=i)` drops a cancelled one and `set("OBX-3.1", ..., occurrence=i)` remaps a code in place, so every other field, component, escape and the OBX-to-OBR grouping survive; `groups("OBR")` renumbers OBX-1 within each order |
+| **Repeating segments** | `count_segments("OBX")` + `field(..., occurrence=i)` to read each OBX, walked back to front; `delete_segments("OBX", occurrence=i)` drops a cancelled one and `set("OBX-3.1", ..., occurrence=i)` remaps a code in place, so every other field, component, escape and the OBX-to-OBR grouping survive; `groups("OBR")` renumbers OBX-1 within each order, and a flat `set("OBX-1", ..., occurrence=n)` renumbers the results before the first OBR, which no group holds |
 | Fan-out | handler returns a list of `Send`s (EHR + file archive) |
 | Separators | never needed: every edit goes through the parsed model, so no delimiter is hardcoded or joined by hand |
 

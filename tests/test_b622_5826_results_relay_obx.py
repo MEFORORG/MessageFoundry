@@ -226,13 +226,34 @@ def test_an_obx_before_the_first_obr_is_renumbered_too() -> None:
     ]
 
 
+def test_a_message_with_no_obr_is_renumbered_too() -> None:
+    segments = _relay_raw(
+        "MSH|^~\\&|LABCO|LAB|EHR|HOSP|20260613130000||ORU^R01|MSG7|P|2.5.1\r"
+        "OBX|4|NM|GLU^Glucose^L||95||||||F\r"
+        "OBX|5|NM|K^Potassium^L||4.1||||||X\r"
+        "OBX|9|NM|NA^Sodium^L||140||||||F"
+    )
+    assert segments[1:] == [
+        "OBX|1|NM|GLUC^Glucose^L||95||||||F",
+        "OBX|2|NM|SOD^Sodium^L||140||||||F",
+    ]
+
+
+def test_a_blank_test_code_stays_blank_without_a_blank_mapping() -> None:
+    # The control for the next test: the sample code set has no blank row, so nothing is written.
+    obx = "OBX|1|ST|^Note^L||x||||||F"
+    assert _relay_raw(_HEAD + obx)[2:] == [obx]
+
+
 def test_a_blank_test_code_takes_the_code_sets_blank_mapping(tmp_path: Path) -> None:
     # origin/main looked a blank OBX-3.1 up as "" (field or ""), so a code set row with a blank
     # local code remapped it. The component write keeps OBX-3.2 onward as they arrived.
     config = tmp_path / "results_relay"
     shutil.copytree(RESULTS_RELAY, config)
     codes = config / "codesets" / "test_codes.csv"
-    codes.write_text(codes.read_text(encoding="utf-8") + ",UNSPEC\n", encoding="utf-8")
+    codes.write_text(
+        codes.read_text(encoding="utf-8").rstrip("\r\n") + "\n,UNSPEC\n", encoding="utf-8"
+    )
     raw = _HEAD + r"OBX|1|ST|^Note\T\Text^L||x||||||F" + "\rOBX|2|ST|||y||||||F"
     payload = dry_run(load_config(config), raw).deliveries[0].payload
     assert isinstance(payload, str)

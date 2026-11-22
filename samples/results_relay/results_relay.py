@@ -15,8 +15,9 @@ after:
   - collapsing PID-3's identifier repetition list to the single **MR** identifier the EHR wants,
   - dropping **cancelled** results (OBX-11 = ``X``), and
   - remapping each local test code (OBX-3.1) to the EHR's code via a code set,
-  - renumbering OBX-1 within each order — the *repeating-segment edit* that the mutable-``Message``
-    API makes first-class (``count_segments`` / ``field(occurrence=…)`` / ``repetitions`` /
+  - renumbering OBX-1 within each order, and across the results before the first OBR, which
+    ``groups`` leaves out — the *repeating-segment edit* that the mutable-``Message`` API makes
+    first-class (``count_segments`` / ``field(occurrence=…)`` / ``repetitions`` /
     ``delete_segments(occurrence=…)`` / ``groups``).
 
 Every OBX edit goes through the parsed model, never a re-joined line, so the template keeps every
@@ -94,12 +95,12 @@ def relay_results(msg):  # type: ignore[no-untyped-def]
 
     # 3) Renumber OBX-1 (Set ID) from 1 within each order, closing the gaps the drops left. An OBX
     #    before the first OBR is in no group, so those leading results form their own run from 1.
-    orders = msg.groups("OBR")
-    leading = msg.count_segments("OBX") - sum(order.count("OBX") for order in orders)
+    orders = [(order, order.count("OBX")) for order in msg.groups("OBR")]
+    leading = msg.count_segments("OBX") - sum(count for _, count in orders)
     for n in range(1, leading + 1):
         msg.set("OBX-1", str(n), occurrence=n)
-    for order in orders:
-        for n in range(1, order.count("OBX") + 1):
+    for order, count in orders:
+        for n in range(1, count + 1):
             order.set("OBX-1", str(n), occurrence=n)
 
     # 4) Fan out: relay to the EHR and archive a copy to file.
