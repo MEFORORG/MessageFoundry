@@ -1365,6 +1365,12 @@ async def test_the_message_detail_route_and_page_say_a_cell_was_withheld(
             assert plain["events"][0]["detail_withheld"] is False  # control
             store.outbox_for, store.events_for = outbox, events
             body = (await client.get(f"/messages/{mid}", params={"reveal_errors": True})).json()
+            # The route must pass each flag through the permission gate, not copy the store's.
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr("messagefoundry.api.app.withheld_flag", lambda *_a, **_k: False)
+                gated = (await client.get(f"/messages/{mid}")).json()
+            assert gated["outbox"][0]["last_error_withheld"] is False
+            assert gated["events"][0]["detail_withheld"] is False
     finally:
         await engine.stop()
     assert body["outbox"][0]["last_error"] is None

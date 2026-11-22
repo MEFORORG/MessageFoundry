@@ -641,8 +641,9 @@ def refused_for_key(cipher: Cipher, exc: CipherError, stored: str | None) -> boo
     """Whether ``exc``, from opening ``stored``, is the cipher refusing that cell only because it
     does not hold the key the cell names (BACKLOG #5970): in-process, a key not supplied, a
     retired key version, or an unknown one; under Transit, a retired or unknown key version only.
-    Only such a cell may a list-shaped read withhold (owner ruling 2026-11-19); every other
-    refusal fails the read.
+    Only such a cell may a list-shaped read (owner ruling 2026-11-19) or a per-message detail read
+    (:func:`open_detail_cell`, owner ruling 2026-11-22) withhold; every other refusal fails the
+    read.
 
     Under Transit only a retired or unknown key VERSION counts; a configured key Transit does not
     find is a fault of the whole store, so it fails the read.
@@ -676,14 +677,14 @@ def refused_for_key(cipher: Cipher, exc: CipherError, stored: str | None) -> boo
     return False
 
 
-#: One WARNING per (table, error class) per interval for a cell a list-shaped read withheld for
-#: a key it does not hold; a list view meets the same cells on every refresh.
+#: One WARNING per (table, error class) per interval for a cell a list-shaped or per-message detail
+#: read withheld for a key it does not hold; a list view meets the same cells on every refresh.
 _withheld: _Memo = {}
 
 
 def withhold_refused_cell(cipher: Cipher, table: str, exc: CipherError, stored: str | None) -> None:
-    """For a list-shaped read that met a plain cipher error opening the ``table`` cell ``stored``
-    (BACKLOG #5970): when the cipher refused it only for a key it does not hold
+    """For a list-shaped or per-message detail read that met a plain cipher error opening the
+    ``table`` cell ``stored`` (BACKLOG #5970, #5693): when the cipher refused it only for a key it does not hold
     (:func:`refused_for_key`), log
     that the cell was withheld, once per table and error class per interval, and return; else
     re-raise ``exc``, failing the read as before #5970 (owner ruling 2026-11-19). That raises at
@@ -697,14 +698,15 @@ def withhold_refused_cell(cipher: Cipher, table: str, exc: CipherError, stored: 
             return
         _remember(_withheld, key, now)
     _log.warning(
-        "a %s cell is sealed under a key the store does not hold (%s), so a read withheld it",
+        "a %s cell's marker names a key the store does not hold (%s), so a read withheld it",
         table,
         type(exc).__name__,
     )
 
 
 def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: str) -> str | None:
-    """Open one cell of a table this module does not tag, for a list-shaped read, or ``None`` when
+    """Open one cell of a table this module does not tag, for a list-shaped read or, through
+    :func:`open_detail_cell`, a per-message detail read, or ``None`` when
     the cipher refuses it only because it does not hold the key the cell names: in-process, a key
     not supplied, a retired key version or an unknown one; under Transit, a retired or unknown key
     version only (:func:`refused_for_key`, BACKLOG #5970). So one such cell withholds that cell
