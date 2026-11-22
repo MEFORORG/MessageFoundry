@@ -803,8 +803,16 @@ try {
             # lookup started returning its match count -- sent an operator hunting for a missing file
             # that was in fact present TWICE, which is the one place the cause was visible.
             $matched = if ($lookup) { [int]$lookup.Matched } else { 0 }
-            $unreadable = if ($matched -gt 1) { 0 } else {
-                @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable }).Count
+            # A DIRECTORY ROW IS NOT A WRITE IN PROGRESS. The registry lists a directory named *.json
+            # as an unreadable row, and it stays one on every prompt, so it is counted apart from the
+            # files and the note does not call it "maybe still being written".
+            $unreadable = 0
+            $dirRows = 0
+            if ($matched -le 1) {
+                foreach ($u in @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable })) {
+                    $unreadable++
+                    if (Test-Path -LiteralPath $u.File -PathType Container) { $dirRows++ }
+                }
             }
             # LEAD WITH THE DISCRIMINATOR. Write-Receipt folds this through Get-Clean with an 80-char
             # cap, so anything past that is gone from the only durable record of the decision. The
@@ -813,6 +821,10 @@ try {
             # a duplicated one, which is the failure this note exists to prevent.
             $why = if ($matched -gt 1) {
                 "AMBIGUOUS: $matched config roots hold a record for this id; will not self-resolve"
+            } elseif ($dirRows -gt 0 -and $dirRows -eq $unreadable) {
+                "UNREADABLE: $dirRows registry row(s) are directories; will not self-resolve"
+            } elseif ($dirRows -gt 0) {
+                "UNREADABLE: $unreadable registry row(s) unparsed, $dirRows directories; files maybe mid-write"
             } elseif ($unreadable -gt 0) {
                 "UNREADABLE: $unreadable registry record(s) unparsed, maybe still being written"
             } else {

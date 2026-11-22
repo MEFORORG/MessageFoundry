@@ -795,3 +795,19 @@ def test_a_directory_git_leaves_behind_is_reported_and_exits_non_zero(rig: Rig) 
     assert proc.returncode != 0, _out(proc)
     assert "the directory is still there" in _out(proc), _out(proc)
     assert "Removed worktree" not in _out(proc), _out(proc)
+
+
+def test_a_removal_that_cannot_be_confirmed_gone_is_not_reported_clean(rig: Rig) -> None:
+    """Vault BACKLOG #2985, added item 1, its end-state part. After git removes the tree, the run
+    checks the directory is CONFIRMED gone: a not-found under a folder this user may not list is not
+    a removal. Red with the rule before engine PR 3027 (Test-PresentOrThrow) put back: it read that
+    not-found as gone and said "Removed". The folder holding the tree is denied listing; git still
+    removes the tree by name."""
+    wt = rig.add(rig.primary.parent / "box" / "Repo-unlisted")
+
+    with _denied_listing(rig, wt.parent) as probe:
+        proc = rig.run("-Path", str(wt))
+    assert not wt.exists(), _explain(wt.parent, probe, proc)
+    assert proc.returncode != 0, _explain(wt.parent, probe, proc)
+    assert "could not be confirmed gone" in _out(proc), _explain(wt.parent, probe, proc)
+    assert "Removed worktree" not in _out(proc), _explain(wt.parent, probe, proc)

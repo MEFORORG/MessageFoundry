@@ -123,9 +123,13 @@ function Get-TranscriptAgeHours {
     # NOT Get-ClaudeConfigRoots: that one filters to roots holding a sessions/ directory, which is the
     # right question for the liveness fence and the wrong one here. A root can hold transcripts and no
     # session registry, and dropping it would turn an evaluable signal into a missing one.
+    # -LiteralPath, as Get-ClaudeConfigRoots reads it: -Path takes the profile as a wildcard pattern,
+    # so a profile named home[1] matched only a folder named home1. No profile names no root, because
+    # -LiteralPath throws on a null path where -Path listed the current directory.
     $roots = if ($ConfigRoot) { @($ConfigRoot | Where-Object { Test-Path -LiteralPath $_ }) }
+             elseif (-not $env:USERPROFILE) { @() }
              else {
-                 @(Get-ChildItem -Path $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
+                 @(Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
                        ForEach-Object { $_.FullName })
              }
     foreach ($r in $roots) {
