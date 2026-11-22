@@ -40,19 +40,28 @@ together, is built two ways and raises.
 DDL the reader cannot place raises ``ValueError`` rather than being skipped or misread, at least: a
 ``CREATE ... INDEX``, ``CREATE TABLE``, ``DROP TABLE``, ``DROP INDEX`` or ``sp_rename`` its patterns do
 not match, an ``ALTER TABLE`` with more than one clause or an action it does not know, a table rename,
-a ``USING`` access method, a key column or expression carrying a collation, an operator class or a
-``NULLS`` order, a column type or clause it does not know, a SQL Server column that leaves its
-nullability to the session, and a ``--`` or ``/*`` inside a quoted string, which may be dynamic SQL's
-comment or a literal's text. A unit test reads each shipped batch, so a new form fails there before
-it reaches an open.
+an ``ALTER INDEX``, a second ``CREATE TABLE`` of a table no ``DROP`` removed, a ``USING`` access
+method, a key column or expression carrying a collation, an operator class or a ``NULLS`` order, a key
+that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server
+inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it does not know, a SQL
+Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--``
+or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text. A unit test
+reads each shipped batch, so a new form fails there before it reaches an open.
+
+Not every misread raises (BACKLOG #5062). At least: DDL text inside a string literal is read as run,
+and an ``ALTER COLUMN`` is read as reaching only an older store, whether or not either holds. A
+``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
+``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
+a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
 
 What is NOT compared includes at least: a column's default, other than whether PostgreSQL's is a
 ``nextval()`` call, which reads as numbering; a PostgreSQL column's collation; constraint indexes (a
 ``PRIMARY KEY`` or ``UNIQUE`` declared on the table); ``CHECK`` and foreign keys; an index's
 ``INCLUDE`` list and storage options; and a partial index's predicate, of which only its presence is
 compared. A default is not compared because each catalog prints it in its own rewritten form
-(PostgreSQL ``''::text``, SQL Server ``((0))``), and a missing one fails the first insert that relies
-on it rather than passing silently. An index that exists but cannot serve, such as
+(PostgreSQL ``''::text``, SQL Server ``((0))``). A missing one on a ``NOT NULL`` column fails the
+first insert that relies on it; on a column that takes NULL, that insert stores NULL and nothing
+fails. An index that exists but cannot serve, such as
 an invalid or non-btree one on PostgreSQL or a disabled one on SQL Server, is reported by the backend
 that reads it. A store whose marker already matches is not re-read at open: the ADR 0064 fast path
 skips the batch and this check together, so a change made by hand after the marker was written is not
@@ -67,6 +76,7 @@ kind of object holds. An EXTRA column or index is tolerated.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -117,7 +127,8 @@ _CREATE_INDEX = re.compile(
     re.I,
 )
 _ALTER_TABLE = re.compile(
-    rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?P<table>{_NAME})(?=\s)", re.I
+    rf"\bALTER\s+TABLE\s+(?!(?:IF\s+EXISTS\s+)?#)(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?P<table>{_NAME})(?=\s)",
+    re.I,
 )
 #: What may follow a DROP's last name: the statement's end, or a word that starts the next one. Any
 #: other text, such as ``DROP TABLE public . t``, leaves the strict pattern unmatched, so it raises.
@@ -153,12 +164,16 @@ _SP_RENAME = re.compile(
 )
 #: Every place a table or an index is created, dropped or renamed, read loosely, so a form the
 #: patterns above miss is counted and refused rather than silently left unchecked. A ``#`` temporary
-#: table is not the store's.
+#: table is not the store's, behind an ``IF [NOT] EXISTS`` guard too, but a ``DROP TABLE`` whose
+#: list goes on past one is counted, so the strict pattern's miss raises.
 _LOOSE: Final = (
-    (re.compile(r"\bCREATE\s+TABLE\s+(?!#)", re.I), _CREATE_TABLE),
+    (re.compile(r"\bCREATE\s+TABLE\s+(?!\s|(?:IF\s+NOT\s+EXISTS\s+)?#)", re.I), _CREATE_TABLE),
     (re.compile(r"\bCREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\b", re.I), _CREATE_INDEX),
-    (re.compile(r"\bALTER\s+TABLE\s+(?!#)", re.I), _ALTER_TABLE),
-    (re.compile(r"\bDROP\s+TABLE\s+(?!#)", re.I), _DROP_TABLE),
+    (re.compile(r"\bALTER\s+TABLE\s+(?!\s|(?:IF\s+EXISTS\s+)?#)", re.I), _ALTER_TABLE),
+    (
+        re.compile(r"\bDROP\s+TABLE\s+(?!\s|(?:IF\s+EXISTS\s+)?#[\w$@#]++(?!\s*,))", re.I),
+        _DROP_TABLE,
+    ),
     (re.compile(r"\bDROP\s+INDEX\b", re.I), _DROP_INDEX),
     (re.compile(r"\bsp_rename\b", re.I), _SP_RENAME),
 )
@@ -172,6 +187,9 @@ _NOT_A_COLUMN = frozenset(
     {"constraint", "primary", "unique", "check", "foreign", "exclude", "default", "period", "index"}
 )
 _TABLE_PRIMARY_KEY = re.compile(r"\bPRIMARY\s+KEY\s*(?:(?:NON)?CLUSTERED\s*)?\(", re.I)
+#: PostgreSQL's ``PRIMARY KEY`` or ``UNIQUE`` ``USING INDEX <name>``, which turns an existing index
+#: into the constraint. ``USING INDEX TABLESPACE`` is only a storage option.
+_USING_INDEX = re.compile(r"\bUSING\s+INDEX\b(?!\s*TABLESPACE\b)", re.I)
 _PLAIN_KEY = re.compile(r'^(\[?[A-Za-z_][\w$]*\]?|"[^"]+")(?:\s+(ASC|DESC))?$', re.I)
 _PLAIN_NAME = re.compile(r'^(?:\[?[A-Za-z_][\w$]*\]?|"[^"]+")$')
 #: A key that is an expression: a call such as ``left(actor, 200)``, or a parenthesised expression.
@@ -183,6 +201,17 @@ _DIRECTION = re.compile(r"\s+(ASC|DESC)$", re.I)
 #: The words a statement inside a block starts with, at which an ``ALTER TABLE`` clause has ended
 #: when no ``;`` closes it. None can appear inside a column definition.
 _STATEMENT_START = frozenset({"if", "begin", "end", "exec", "execute", "else", "declare", "go"})
+#: The words after which a data word is a name: a column's, a constraint's, a referenced table's
+#: or a rename's new name. After ``ON`` it is a foreign key's action.
+_NAME_BEFORE = frozenset({"on", "add", "column", "exists", "constraint", "references", "to"})
+#: Words that start a data statement, which a clause ends at unless a word in ``_NAME_BEFORE``
+#: precedes them (BACKLOG #5062: an ``ADD CONSTRAINT`` read on into the next statement took that
+#: statement's ``PRIMARY KEY`` as its own).
+_DATA_STATEMENT = frozenset({"insert", "update", "delete", "merge", "select", "truncate"})
+#: What an ``ALTER`` or ``DROP`` that starts the next statement names, after the word itself.
+_DDL_OBJECT = re.compile(
+    r"\s+(?:TABLE|INDEX|VIEW|PROC|PROCEDURE|TRIGGER|FUNCTION|SEQUENCE|SCHEMA|TYPE|DATABASE)\b", re.I
+)
 _TOKEN = re.compile(r"""N?'(?:[^']|'')*'|"[^"]*"|\[[^\]]*\]|\w+|\S""")
 
 
@@ -312,18 +341,38 @@ def _string_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _quoted_end(text: str, i: int) -> int | None:
+    """The index after the quoted run that opens at ``text[i]``: a ``'`` string, a ``"`` name or a
+    SQL Server ``[...]`` name, in which a doubled close continues the run. ``None`` when ``text[i]``
+    opens none. :func:`_balanced`, :func:`_top_level_items` and :func:`_clause` share it, so a
+    ``[a,b]`` or ``[end]`` reads as one name in each. A ``[`` that holds another ``[``, or that no
+    ``]`` closes, is a PostgreSQL subscript, as in ``a[b[1]]``, and opens none."""
+    ch = text[i]
+    if ch not in "'\"[":
+        return None
+    if ch == "[" and i > 0 and (text[i - 1].isalnum() or text[i - 1] in "_$]"):
+        return None  # a subscript or an ARRAY[...] literal, as in ARRAY[']']
+    close = "]" if ch == "[" else ch
+    j = i + 1
+    while (end := text.find(close, j)) >= 0:
+        if not text.startswith(close * 2, end):
+            return None if ch == "[" and "[" in text[i + 1 : end] else end + 1
+        j = end + 2
+    if ch == "[":
+        return None
+    raise ValueError(f"unterminated quote in DDL near {text[i : i + 40]!r}")
+
+
 def _balanced(text: str, start: int) -> tuple[str, int]:
     """The text inside the parenthesis opened at ``text[start - 1]``, and the index after its close.
     Quoted text is skipped, so a parenthesis inside a string literal does not count."""
-    depth, i, quote = 1, start, ""
+    depth, i = 1, start
     while i < len(text):
+        if (end := _quoted_end(text, i)) is not None:
+            i = end
+            continue
         ch = text[i]
-        if quote:
-            if ch == quote:
-                quote = ""
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "(":
+        if ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
@@ -336,24 +385,21 @@ def _balanced(text: str, start: int) -> tuple[str, int]:
 def _top_level_items(body: str) -> list[str]:
     """``body`` split on its top-level commas, so a ``DECIMAL(10, 2)`` stays one item."""
     items: list[str] = []
-    current: list[str] = []
-    depth, quote = 0, ""
-    for ch in body:
-        if quote:
-            if ch == quote:
-                quote = ""
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "(":
+    depth, i, last = 0, 0, 0
+    while i < len(body):
+        if (end := _quoted_end(body, i)) is not None:
+            i = end
+            continue
+        ch = body[i]
+        if ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
         elif ch == "," and depth == 0:
-            items.append("".join(current))
-            current = []
-            continue
-        current.append(ch)
-    items.append("".join(current))
+            items.append(body[last:i])
+            last = i + 1
+        i += 1
+    items.append(body[last:])
     return [item.strip() for item in items if item.strip()]
 
 
@@ -371,15 +417,13 @@ def _clause(segment: str) -> str:
     """The one clause of an ``ALTER TABLE`` that ``segment`` starts with: up to a top-level ``;``,
     an unmatched ``)``, a word that starts the next statement, or the end. A top-level comma means
     more than one clause, which raises."""
-    depth, quote, i, n = 0, "", 0, len(segment)
+    depth, i, n, prev = 0, 0, len(segment), ""
     while i < n:
+        if (end := _quoted_end(segment, i)) is not None:
+            i, prev = end, ""
+            continue
         ch = segment[i]
-        if quote:
-            if ch == quote:
-                quote = ""
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "(":
+        if ch == "(":
             depth += 1
         elif ch == ")":
             if depth == 0:
@@ -394,15 +438,67 @@ def _clause(segment: str) -> str:
         ):
             word = re.match(r"\w+", segment[i:])
             assert word is not None
+            lower = word.group(0).lower()
             after = segment[i + len(word.group(0)) :]
-            if word.group(0).lower() in _STATEMENT_START and not (
-                word.group(0).lower() == "if" and re.match(r"\s+(?:NOT\s+)?EXISTS\b", after, re.I)
+            if lower in _STATEMENT_START and not (
+                lower == "if" and re.match(r"\s+(?:NOT\s+)?EXISTS\b(?!\s*\()", after, re.I)
             ):
                 break
+            # A data or DDL statement starts here too. ON DELETE and ON UPDATE are a foreign
+            # key's actions, and the word after ADD [COLUMN] [IF NOT EXISTS] is a column's
+            # name; ALTER COLUMN and DROP COLUMN are the clause's own verbs.
+            if (
+                lower == "create"
+                or (lower in _DATA_STATEMENT and prev not in _NAME_BEFORE)
+                or (lower in ("alter", "drop") and _DDL_OBJECT.match(after))
+            ):
+                break
+            prev = lower
             i += len(word.group(0))
             continue
         i += 1
     return segment[:i].strip()
+
+
+def _statement_end(text: str, start: int, dialect: Dialect | None) -> int:
+    """Where the statement that ``text[start:]`` continues ends: a top-level ``;``, an unmatched
+    ``)``, a word that starts the next statement, or the end. Unlike :func:`_clause` it reads on
+    through ``ELSE`` and ``END``, which a ``CASE`` in an index predicate holds, so it may read into a
+    following block. Off SQL Server it reads through a data word too, which PostgreSQL takes as a
+    column's name, so it may also read into a following statement; on SQL Server a data word is
+    reserved and ends it."""
+    depth, i = 0, start
+    while i < len(text):
+        if (end := _quoted_end(text, i)) is not None:
+            i = end
+            continue
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and ch == ";":
+            break
+        elif (
+            depth == 0
+            and (ch.isalpha() or ch == "_")
+            and not (text[i - 1].isalnum() or text[i - 1] in "_$")
+        ):
+            word = re.match(r"[\w$]+", text[i:])
+            assert word is not None
+            lower = word.group(0).lower()
+            if (
+                lower in ("if", "begin", "exec", "execute", "declare", "go", "create")
+                or (dialect == "sqlserver" and lower in _DATA_STATEMENT)
+                or (lower in ("alter", "drop") and _DDL_OBJECT.match(text, i + len(lower)))
+            ):
+                break
+            i += len(lower)
+            continue
+        i += 1
+    return i
 
 
 # The types each catalog spells one way, keyed by every spelling the DDL may use. The live read
@@ -623,7 +719,9 @@ def _read_column(dialect: Dialect, text: str) -> tuple[str, _Column]:
                 i = _skip_group(tokens, i)
         elif w == "default" and i + 1 < len(tokens):
             numbered_default = dialect == "postgres" and _numbers(" ".join(tokens[i + 1 :]))
-            i += 2 if tokens[i + 1] not in "+-" else 3
+            i += 3 if tokens[i + 1] in ("+", "-") else 2
+            if i > len(tokens):  # a sign with nothing after it
+                raise ValueError(f"a default the live-schema check cannot read: {text!r}")
             if tokens[i - 1] == "(":
                 i = _skip_group(tokens, i - 1)
             elif word(i) == "(":
@@ -634,6 +732,11 @@ def _read_column(dialect: Dialect, text: str) -> tuple[str, _Column]:
             if dialect == "postgres":
                 raise ValueError(f"a PostgreSQL column collation is not compared: {text!r}")
             collation, i = _ident(tokens[i + 1]), i + 2
+            if collation == "database_default":
+                collation = None  # the database's own, which an expected None matches
+            elif collation == "catalog_default":
+                # The metadata catalog's collation, which the live read cannot tell apart.
+                raise ValueError(f"a catalog_default collation is not compared: {text!r}")
         elif w == "identity" and dialect == "sqlserver":
             identity, i = True, i + 1
             if word(i) == "(":
@@ -700,6 +803,8 @@ def _declared_key(text: str) -> str:
         inner = inner[1:-1].strip()
     if _PLAIN_NAME.match(inner):
         key = inner
+    elif _casts_a_column(inner):
+        raise ValueError(f"index key {text!r} is a cast the live-schema check cannot place")
     elif inner != key and re.search(r"\bCOLLATE\b", inner, re.I):
         # PostgreSQL stores ((col COLLATE x)) as the column with an index collation.
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
@@ -714,6 +819,22 @@ def _declared_key(text: str) -> str:
     if _NULLS_ORDER.search(key) or (_PLAIN_KEY.match(key) is None and _EXPR_KEY.match(key) is None):
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
     return key_column(key)
+
+
+def _casts_a_column(key: str) -> bool:
+    """Whether ``key`` opens with a cast of a column: ``a::text``, ``(a)::text`` or
+    ``CAST(a AS text)``. PostgreSQL stores a cast to the column's own type as the column, and any
+    other as an expression, and the reader does not know which. Read by hand, not by one pattern, because the parentheses around the name
+    repeat and a pattern for them nests one quantifier in another."""
+    cast = re.match(r"CAST\s*\(", key, re.I)
+    rest = (key[cast.end() :] if cast else key).lstrip("( \t\r\n")
+    name = re.match(r'"[^"]+"|\w+', rest)
+    if name is None:
+        return False
+    after = rest[name.end() :].lstrip(") \t\r\n")
+    if cast:
+        return after != rest[name.end() :] and re.match(r"AS\b", after, re.I) is not None
+    return after.startswith("::")
 
 
 def _expression_end(key: str) -> int | None:
@@ -773,10 +894,46 @@ class _Built:
 
 def _pk_columns(text: str) -> set[str]:
     """The columns of a ``PRIMARY KEY (...)`` in ``text``, a table item or an ``ADD CONSTRAINT``."""
-    if (pk := _TABLE_PRIMARY_KEY.search(text)) is None:
+    # A string literal's text, as in a CHECK, is blanked first, so a PRIMARY KEY or USING INDEX
+    # inside one is not taken for the item's own.
+    parts: list[str] = []
+    last = 0
+    for start, end in _string_spans(text):
+        parts += [text[last : start + 1], " " * (end - start - 2)]
+        last = end - 1
+    blanked = "".join([*parts, text[last:]])
+    if _USING_INDEX.search(blanked):
+        raise ValueError(f"a key built from an existing index is not compared: {text[:120]!r}")
+    if (pk := _TABLE_PRIMARY_KEY.search(blanked)) is None:
         return set()
     inner, _ = _balanced(text, pk.end())
-    return {_bare(k.split()[0]) for k in _top_level_items(inner)}
+    return {_bare(_TOKEN.findall(k)[0]) for k in _top_level_items(inner)}
+
+
+def _is_constraint(item: str, dialect: Dialect | None) -> bool:
+    """Whether a table item, or what follows an ``ADD`` without ``COLUMN``, is a constraint rather
+    than a column. A SQL Server inline ``INDEX`` raises, because it builds a named index the reader
+    does not model, except on PostgreSQL, where ``index`` is a column's name, and so do
+    ``PERIOD`` and ``EXCLUDE`` when what follows is not their constraint's
+    own shape, because each may also be a column's name. A ``NOT NULL`` table constraint raises:
+    the reader does not apply it."""
+    if re.match(
+        r'(?:CONSTRAINT\s+(?:"(?:[^"]|"")*"|\[(?:[^\]]|\]\])*\]|[\w$]+)\s+)?NOT\s+NULL\b',
+        item,
+        re.I,
+    ):
+        # PostgreSQL 18's NOT NULL table constraint, perhaps NOT VALID.
+        raise ValueError(f"a not-null constraint is not compared: {item[:120]!r}")
+    words = [w.lower() for w in _TOKEN.findall(item)[:2]] + [""]
+    if words[0] not in _NOT_A_COLUMN or (words[0] == "index" and dialect == "postgres"):
+        return False
+    if words[0] == "index":
+        raise ValueError(f"an inline index the live-schema check does not compare: {item[:120]!r}")
+    if (words[0] == "period" and words[1] != "for") or (
+        words[0] == "exclude" and words[1] not in ("(", "using")
+    ):
+        raise ValueError(f"a table item the live-schema check cannot place: {item[:120]!r}")
+    return True
 
 
 class _Reader:
@@ -788,15 +945,31 @@ class _Reader:
         self.dialect = dialect
         self.columns: dict[str, dict[str, _Built]] = {}
         self.indexes: dict[str, IndexShape] = {}
+        #: The words of each index whose key, INCLUDE list or predicate may name a column its key
+        #: columns do not show: an expression key, an INCLUDE or a WHERE, with its plain key
+        #: columns. A DROP COLUMN of one of those words that is not a key column raises, because
+        #: PostgreSQL drops such an index and the reader cannot tell. Keyed by table and index,
+        #: because a SQL Server index name is unique only within its table.
+        self.opaque: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {}
+        #: The tables a CREATE TABLE has built and no DROP TABLE has removed since.
+        self.created: set[str] = set()
 
     def table(self, text: str, m: re.Match[str]) -> None:
         body, _end = _balanced(text, m.end())
-        cols = self.columns.setdefault(_bare(m["name"]), {})
+        table = _bare(m["name"])
+        if table in self.created:
+            # A guarded second CREATE TABLE never runs: the first one built the table.
+            raise ValueError(
+                f"a second create table of {table}: its guard skips it, or it names a table of"
+                " another schema, which the reader does not tell apart"
+            )
+        self.created.add(table)
+        cols = self.columns.setdefault(table, {})
         keys: set[str] = set()
         pending: list[tuple[str, _Column, str]] = []
         for item in _top_level_items(body):
-            first = item.split()[0]
-            if first.lower() in _NOT_A_COLUMN:
+            first = _TOKEN.findall(item)[0]
+            if _is_constraint(item, self.dialect):
                 keys |= _pk_columns(item)
             elif self.dialect is None:
                 cols.setdefault(_bare(first), _Built())
@@ -817,16 +990,38 @@ class _Reader:
         if m["using"]:
             raise ValueError(f"index access method not compared: {m.group(0)!r}")
         body, end = _balanced(text, m.end())
+        include = False
         while clause := _INDEX_TAIL.match(text, end):
             end = clause.end()
+            include = include or clause.group(0).lstrip().upper().startswith("INCLUDE")
             if text[end - 1] == "(":
                 end = _balanced(text, end)[1]
-        self.indexes[_bare(m["name"])] = IndexShape(
+        name = _bare(m["name"])
+        shape = IndexShape(
             _bare(m["table"]),
             tuple(_declared_key(item) for item in _top_level_items(body)),
             bool(m["unique"]),
             text[end:].lstrip().upper().startswith("WHERE"),
         )
+        self.indexes[name] = shape
+        self.opaque.pop((shape.table, name), None)
+        if include or shape.partial or any(k.startswith("<expr>") for k in shape.columns):
+            # To the statement's end: a predicate has no closing mark of its own. Inside an
+            # EXEC string, to the string's end, its quotes undoubled, as alter() reads one.
+            tail = text[end:]
+            for start, stop in _string_spans(text):
+                if start < m.start() < stop:
+                    tail = text[end : stop - 1].replace("''", "'")
+                    break
+            tail = " " + tail  # so the scan never starts at index 0
+            # Nested dynamic SQL's quotes can defeat the scan: keep it all, which only raises more.
+            with contextlib.suppress(ValueError):
+                tail = tail[: _statement_end(tail, 1, self.dialect)]
+            definition = text[m.end() : end] + tail
+            self.opaque[(shape.table, name)] = (
+                frozenset(_ident(w) for w in _TOKEN.findall(definition)),
+                frozenset(k.split(" ", 1)[0] for k in shape.columns),
+            )
 
     def _built(self, table: str, name: str, action: str) -> _Built:
         cols = self.columns.get(table)
@@ -846,21 +1041,38 @@ class _Reader:
         words = clause.split()
         verb = [w.lower() for w in words[:2]]
         if verb[:1] == ["add"]:
-            rest = re.sub(r"^ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?", "", clause, flags=re.I)
-            first = rest.split()[0].lower() if rest.split() else ""
-            if first in _NOT_A_COLUMN:
+            head = re.match(r"ADD(\s+COLUMN\b)?\s*(?:IF\s+NOT\s+EXISTS\b\s*)?", clause, re.I)
+            assert head is not None
+            rest = clause[head.end() :]
+            if not rest:
+                raise ValueError(f"an add with nothing to add: {clause!r}")
+            # After ADD COLUMN what follows is a column, whatever its name (BACKLOG #5062).
+            if not head.group(1) and _is_constraint(rest, self.dialect):
                 for key in _pk_columns(rest):
                     self._not_null(table, key)
                 return
             if self.dialect is None:
-                self.columns.setdefault(table, {}).setdefault(_bare(rest.split()[0]), _Built())
+                self.columns.setdefault(table, {}).setdefault(
+                    _bare(_TOKEN.findall(rest)[0]), _Built()
+                )
                 return
             name, col = _read_column(self.dialect, rest)
             built = self.columns.setdefault(table, {}).setdefault(name, _Built())
             built.later.add(_finish(self.dialect, col, rest))
         elif verb == ["drop", "column"]:
             name = re.sub(r"^DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?", "", clause, flags=re.I)
-            column = _bare(name.split()[0])
+            column = _bare(_TOKEN.findall(name)[0])
+            for (on, index), (used, keys) in list(self.opaque.items()):
+                if on != table or column not in used:
+                    continue
+                if column in keys:
+                    # A key column takes the index with it, as _rewrite_keys below does.
+                    del self.opaque[(on, index)]
+                else:
+                    raise ValueError(
+                        f"a drop column of {table}.{column}, which index {index}'s expression,"
+                        " INCLUDE or predicate may use, so the reader cannot tell whether it goes"
+                    )
             self.columns.get(table, {}).pop(column, None)
             # PostgreSQL drops an index on a dropped column; SQL Server refuses the drop.
             self._rewrite_keys(table, column, None)
@@ -870,7 +1082,7 @@ class _Reader:
             return  # a table's storage options, such as LOCK_ESCALATION: not compared
         elif verb == ["alter", "column"]:
             self._alter_column(table, clause, words)
-        elif verb[:1] == ["rename"] and len(words) == 5 and words[1].lower() == "column":
+        elif verb == ["rename", "column"] and len(words) == 5 and words[3].lower() == "to":
             self._rename(table, _bare(words[2]), _bare(words[4]))
         else:
             raise ValueError(f"an alter table the live-schema check cannot read: {clause[:120]!r}")
@@ -943,6 +1155,12 @@ class _Reader:
         if moved is not None:
             built.later |= moved.ways()
         self._rewrite_keys(table, old, new)
+        for (on, index), (used, keys) in list(self.opaque.items()):
+            if on == table:
+                self.opaque[(on, index)] = (
+                    (used - {old}) | ({new} if old in used else set()),
+                    (keys - {old}) | ({new} if old in keys else set()),
+                )
 
     def rename(self, m: re.Match[str]) -> None:
         if m["old"].count(".") != 1:
@@ -954,8 +1172,11 @@ class _Reader:
         for name in _dropped(m, _DROPPED_TABLE):
             table = _bare(name)
             self.columns.pop(table, None)
+            self.created.discard(table)
             for index in [n for n, shape in self.indexes.items() if shape.table == table]:
                 del self.indexes[index]
+            for key in [k for k in self.opaque if k[0] == table]:
+                del self.opaque[key]
 
     def drop_indexes(self, m: re.Match[str]) -> None:
         """Each index named, but on SQL Server only on the table its ``ON`` names: a name is unique
@@ -964,9 +1185,14 @@ class _Reader:
             parts = item.split()
             name = _bare(parts[0])
             on = _bare(parts[-1]) if len(parts) == 3 else None
+            if on is None and self.dialect == "sqlserver" and "." in parts[0]:
+                # SQL Server's legacy DROP INDEX <table>.<index>.
+                on = _bare(parts[0].rsplit(".", 1)[0])
             shape = self.indexes.get(name)
             if shape is not None and (on is None or shape.table == on):
                 del self.indexes[name]
+            for key in [k for k in self.opaque if k[1] == name and on in (None, k[0])]:
+                del self.opaque[key]
 
     def shape(self) -> ServerSchemaShape:
         shapes: dict[str, Mapping[str, ColumnShape]] = {}
@@ -977,8 +1203,8 @@ class _Reader:
                 if len(ways) > 1:
                     listed = " and ".join(sorted(s.describe() for s in ways))
                     raise ValueError(
-                        f"column {table}.{name} is built two ways, as {listed}: a guarded ADD,"
-                        " an alter column or a second create table disagrees with the first"
+                        f"column {table}.{name} is built two ways, as {listed}: its create"
+                        " table, a guarded ADD or an alter column disagree"
                     )
                 if ways:
                     one[name] = next(iter(ways))
@@ -1008,8 +1234,12 @@ def declared_schema(
         for loose, strict in _LOOSE:
             if len(loose.findall(text)) != len(strict.findall(text)):
                 raise ValueError(f"DDL the live-schema check cannot read: {text.strip()[:120]!r}")
-        if re.search(r"\bRENAME\s+TO\b|\bALTER\s+INDEX\b", text, re.I):
+        if re.search(r"\bRENAME\s+TO\b", text, re.I):
             raise ValueError(f"a rename the live-schema check cannot read: {text.strip()[:120]!r}")
+        if re.search(r"\bALTER\s+INDEX\b", text, re.I):
+            raise ValueError(
+                f"an alter index the live-schema check cannot read: {text.strip()[:120]!r}"
+            )
         spans = _string_spans(text)
         events: list[tuple[int, str, re.Match[str]]] = []
         for kind, pattern in (

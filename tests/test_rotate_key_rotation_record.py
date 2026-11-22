@@ -941,3 +941,45 @@ async def test_engine_start_passes_the_chain_answer_and_holds_the_key(tmp_path: 
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
     assert rows[_DEK].last_rotated == _OLD_DATE
     assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
+
+
+async def test_engine_start_before_any_run_on_a_store_with_no_keyed_chain_still_stamps(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #4942's remainder, as the code stands. A ``serve`` start on a new key before any
+    ``rotate-key`` run, on a store with no keyed audit chain: the store is opened through
+    ``open_store`` with no ``before_first_write`` hook, as ``serve`` passes none (only
+    ``rotate-key`` passes one, BACKLOG #4936), and a real ``Engine.start`` runs the reconcile. Nothing tells this
+    start from a key changed by hand after a run, so it stamps the new key and opens no record.
+    Whether this order is to be refused or held, or left to the warning, is the row's open
+    decision; this test pins what the code does until it is made."""
+    from messagefoundry.config.settings import EgressSettings, StoreSettings
+    from messagefoundry.pipeline.engine import Engine
+    from messagefoundry.store.base import open_store
+
+    db, key_a, key_b = tmp_path / "keyless.db", generate_key(), generate_key()
+    await _seed_keyless_chain(db, tmp_path / "uploads", key_a)
+    store = await open_store(
+        StoreSettings(path=str(db), encryption_key=key_b, encryption_keys_retired=key_a),
+        keyless_chain_refusal=None,
+    )
+    try:
+        assert isinstance(store, MessageStore)
+        assert audit_chain_rolled(store) is None  # no keyed chain to answer from
+        engine = Engine(
+            store,
+            secret_rotation_settings=SecretRotationSettings(),
+            security_enforcement=SecurityEnforcement.WARN,
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+    except BaseException:
+        await store.close()  # engine.stop() closes it otherwise
+        raise
+    try:
+        await engine.start()
+        rows = await store.get_secret_rotation_meta()
+    finally:
+        await engine.stop()
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
+    assert rows[_DEK].last_rotated != _OLD_DATE
+    assert ROTATION_RECORD_ID not in rows
