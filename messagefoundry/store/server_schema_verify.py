@@ -190,13 +190,6 @@ _TABLE_PRIMARY_KEY = re.compile(r"\bPRIMARY\s+KEY\s*(?:(?:NON)?CLUSTERED\s*)?\("
 #: PostgreSQL's ``PRIMARY KEY`` or ``UNIQUE`` ``USING INDEX <name>``, which turns an existing index
 #: into the constraint. ``USING INDEX TABLESPACE`` is only a storage option.
 _USING_INDEX = re.compile(r"\bUSING\s+INDEX\b(?!\s*TABLESPACE\b)", re.I)
-#: A key that opens with a cast of a column, ``a::text`` or ``CAST(a AS text)``. PostgreSQL stores
-#: a cast to the column's own type as the column, and any other as an expression, and the reader
-#: does not know which.
-_CAST_KEY = re.compile(
-    r'^(?:\(\s*)*(?:"[^"]+"|\w+)(?:\s*\))*\s*::|^CAST\s*\(\s*\(*\s*(?:"[^"]+"|\w+)\s*\)*\s+AS\b',
-    re.I,
-)
 _PLAIN_KEY = re.compile(r'^(\[?[A-Za-z_][\w$]*\]?|"[^"]+")(?:\s+(ASC|DESC))?$', re.I)
 _PLAIN_NAME = re.compile(r'^(?:\[?[A-Za-z_][\w$]*\]?|"[^"]+")$')
 #: A key that is an expression: a call such as ``left(actor, 200)``, or a parenthesised expression.
@@ -357,6 +350,8 @@ def _quoted_end(text: str, i: int) -> int | None:
     ch = text[i]
     if ch not in "'\"[":
         return None
+    if ch == "[" and i > 0 and (text[i - 1].isalnum() or text[i - 1] in "_$]"):
+        return None  # a subscript or an ARRAY[...] literal, as in ARRAY[']']
     close = "]" if ch == "[" else ch
     j = i + 1
     while (end := text.find(close, j)) >= 0:
@@ -468,8 +463,8 @@ def _clause(segment: str) -> str:
 def _statement_end(text: str, start: int) -> int:
     """Where the statement that ``text[start:]`` continues ends: a top-level ``;``, an unmatched
     ``)``, a word that starts the next statement, or the end. Unlike :func:`_clause` it reads on
-    through ``ELSE`` and ``END``, which a ``CASE`` in an index predicate holds, so it may read into a
-    following block; reading too far only adds words, which raises more, never fewer."""
+    through ``ELSE`` and ``END``, which a ``CASE`` in an index predicate holds, and through a data
+    word, so it may read into a following block or statement."""
     depth, i = 0, start
     while i < len(text):
         if (end := _quoted_end(text, i)) is not None:
@@ -484,14 +479,17 @@ def _statement_end(text: str, start: int) -> int:
             depth -= 1
         elif depth == 0 and ch == ";":
             break
-        elif depth == 0 and (ch.isalpha() or ch == "_") and not text[i - 1].isalnum():
-            word = re.match(r"\w+", text[i:])
+        elif (
+            depth == 0
+            and (ch.isalpha() or ch == "_")
+            and not (text[i - 1].isalnum() or text[i - 1] in "_$")
+        ):
+            word = re.match(r"[\w$]+", text[i:])
             assert word is not None
             lower = word.group(0).lower()
-            if (
-                lower in ("if", "begin", "exec", "execute", "declare", "go", "create")
-                or lower in _DATA_STATEMENT
-                or (lower in ("alter", "drop") and _DDL_OBJECT.match(text, i + len(lower)))
+            # A data word does not end it: PostgreSQL takes merge or delete as a column's name.
+            if lower in ("if", "begin", "exec", "execute", "declare", "go", "create") or (
+                lower in ("alter", "drop") and _DDL_OBJECT.match(text, i + len(lower))
             ):
                 break
             i += len(lower)
@@ -802,7 +800,7 @@ def _declared_key(text: str) -> str:
         inner = inner[1:-1].strip()
     if _PLAIN_NAME.match(inner):
         key = inner
-    elif _CAST_KEY.match(inner):
+    elif _casts_a_column(inner):
         raise ValueError(f"index key {text!r} is a cast the live-schema check cannot place")
     elif inner != key and re.search(r"\bCOLLATE\b", inner, re.I):
         # PostgreSQL stores ((col COLLATE x)) as the column with an index collation.
@@ -818,6 +816,22 @@ def _declared_key(text: str) -> str:
     if _NULLS_ORDER.search(key) or (_PLAIN_KEY.match(key) is None and _EXPR_KEY.match(key) is None):
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
     return key_column(key)
+
+
+def _casts_a_column(key: str) -> bool:
+    """Whether ``key`` opens with a cast of a column: ``a::text``, ``(a)::text`` or
+    ``CAST(a AS text)``. PostgreSQL stores a cast to the column's own type as the column, and any
+    other as an expression, and the reader does not know which. Read by hand, not by one pattern, because the parentheses around the name
+    repeat and a pattern for them nests one quantifier in another."""
+    cast = re.match(r"CAST\s*\(", key, re.I)
+    rest = (key[cast.end() :] if cast else key).lstrip("( \t\r\n")
+    name = re.match(r'"[^"]+"|\w+', rest)
+    if name is None:
+        return False
+    after = rest[name.end() :].lstrip(") \t\r\n")
+    if cast:
+        return after != rest[name.end() :] and re.match(r"AS\b", after, re.I) is not None
+    return after.startswith("::")
 
 
 def _expression_end(key: str) -> int | None:
@@ -929,9 +943,11 @@ class _Reader:
         self.columns: dict[str, dict[str, _Built]] = {}
         self.indexes: dict[str, IndexShape] = {}
         #: The words of each index whose key, INCLUDE list or predicate may name a column its key
-        #: columns do not show: an expression key, an INCLUDE or a WHERE. A DROP COLUMN of one of
-        #: those words raises, because PostgreSQL drops such an index and the reader cannot tell.
-        self.opaque: dict[str, frozenset[str]] = {}
+        #: columns do not show: an expression key, an INCLUDE or a WHERE, with its plain key
+        #: columns. A DROP COLUMN of one of those words that is not a key column raises, because
+        #: PostgreSQL drops such an index and the reader cannot tell. Keyed by table and index,
+        #: because a SQL Server index name is unique only within its table.
+        self.opaque: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {}
         #: The tables a CREATE TABLE has built and no DROP TABLE has removed since.
         self.created: set[str] = set()
 
@@ -985,7 +1001,7 @@ class _Reader:
             text[end:].lstrip().upper().startswith("WHERE"),
         )
         self.indexes[name] = shape
-        self.opaque.pop(name, None)
+        self.opaque.pop((shape.table, name), None)
         if include or shape.partial or any(k.startswith("<expr>") for k in shape.columns):
             # To the statement's end: a predicate has no closing mark of its own. Inside an
             # EXEC string, to the string's end, its quotes undoubled, as alter() reads one.
@@ -999,7 +1015,10 @@ class _Reader:
             with contextlib.suppress(ValueError):
                 tail = tail[: _statement_end(tail, 1)]
             definition = text[m.end() : end] + tail
-            self.opaque[name] = frozenset(_ident(w) for w in _TOKEN.findall(definition))
+            self.opaque[(shape.table, name)] = (
+                frozenset(_ident(w) for w in _TOKEN.findall(definition)),
+                frozenset(k.split(" ", 1)[0] for k in shape.columns),
+            )
 
     def _built(self, table: str, name: str, action: str) -> _Built:
         cols = self.columns.get(table)
@@ -1040,12 +1059,13 @@ class _Reader:
         elif verb == ["drop", "column"]:
             name = re.sub(r"^DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?", "", clause, flags=re.I)
             column = _bare(_TOKEN.findall(name)[0])
-            for index, used in self.opaque.items():
-                shape = self.indexes.get(index)
-                if shape is None or shape.table != table or column not in used:
+            for (on, index), (used, keys) in list(self.opaque.items()):
+                if on != table or column not in used:
                     continue
-                if column not in (k.split(" ", 1)[0] for k in shape.columns):
+                if column in keys:
                     # A key column takes the index with it, as _rewrite_keys below does.
+                    del self.opaque[(on, index)]
+                else:
                     raise ValueError(
                         f"a drop column of {table}.{column}, which index {index}'s expression,"
                         " INCLUDE or predicate may use, so the reader cannot tell whether it goes"
@@ -1132,9 +1152,12 @@ class _Reader:
         if moved is not None:
             built.later |= moved.ways()
         self._rewrite_keys(table, old, new)
-        for index, used in list(self.opaque.items()):
-            if old in used and index in self.indexes and self.indexes[index].table == table:
-                self.opaque[index] = (used - {old}) | {new}
+        for (on, index), (used, keys) in list(self.opaque.items()):
+            if on == table:
+                self.opaque[(on, index)] = (
+                    (used - {old}) | ({new} if old in used else set()),
+                    (keys - {old}) | ({new} if old in keys else set()),
+                )
 
     def rename(self, m: re.Match[str]) -> None:
         if m["old"].count(".") != 1:
@@ -1149,6 +1172,8 @@ class _Reader:
             self.created.discard(table)
             for index in [n for n, shape in self.indexes.items() if shape.table == table]:
                 del self.indexes[index]
+            for key in [k for k in self.opaque if k[0] == table]:
+                del self.opaque[key]
 
     def drop_indexes(self, m: re.Match[str]) -> None:
         """Each index named, but on SQL Server only on the table its ``ON`` names: a name is unique
@@ -1163,6 +1188,8 @@ class _Reader:
             shape = self.indexes.get(name)
             if shape is not None and (on is None or shape.table == on):
                 del self.indexes[name]
+            for key in [k for k in self.opaque if k[1] == name and on in (None, k[0])]:
+                del self.opaque[key]
 
     def shape(self) -> ServerSchemaShape:
         shapes: dict[str, Mapping[str, ColumnShape]] = {}

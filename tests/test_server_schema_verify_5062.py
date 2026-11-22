@@ -462,3 +462,45 @@ def test_a_partial_index_in_nested_dynamic_sql_is_read() -> None:
         "sqlserver",
     )
     assert shape.named_indexes["ix"].partial
+
+
+# --- Wave 3 assembly repair --------------------------------------------------------------------
+
+
+def test_an_array_literal_holding_a_bracket_is_not_a_bracketed_name() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a TEXT)",
+            "EXEC('ALTER TABLE t ADD CONSTRAINT ck CHECK (a <> ARRAY['']''])')",
+        ),
+        "postgres",
+    )
+    assert shape.columns["t"] == frozenset({"a"})
+
+
+@pytest.mark.parametrize("word", ["merge", "delete", "x$delete"])
+def test_a_data_word_in_a_predicate_does_not_end_the_opaque_words(word: str) -> None:
+    with pytest.raises(ValueError, match="drop column"):
+        declared_schema(
+            (
+                f"CREATE TABLE t (a INT, {word} INT, c INT)",
+                f"CREATE INDEX ix ON t (a) WHERE {word} > 0 AND c IS NULL",
+                "ALTER TABLE t DROP COLUMN c",
+            )
+        )
+
+
+def test_opaque_words_are_kept_per_table_on_sqlserver() -> None:
+    """A SQL Server index name is unique only within its table, so a plain ix on u must not hide
+    the partial ix on t."""
+    with pytest.raises(ValueError, match="drop column"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT NULL, c INT NULL)",
+                "CREATE TABLE u (a INT NULL, c INT NULL)",
+                "CREATE INDEX ix ON t (a) WHERE c > 0",
+                "CREATE INDEX ix ON u (a)",
+                "ALTER TABLE t DROP COLUMN c",
+            ),
+            "sqlserver",
+        )
