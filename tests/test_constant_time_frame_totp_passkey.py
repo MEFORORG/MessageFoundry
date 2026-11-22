@@ -3,7 +3,9 @@
 """ASVS 11.2.4 (BACKLOG #1167): frame decrypts and a passkey walk pinned by a count, and one kept.
 
 1. ``backup_codec.decrypt_stream`` runs ONE decrypt per frame, under the AAD the frame's position
-   in the stream names, so the count is the frame count and no AAD is tried and discarded.
+   in the stream names, so on a stream that authenticates the count is the frame count and no AAD
+   is tried and discarded. A frame that fails its tag gets a second decrypt: ``_frame_refusal``
+   tries the other final flag, to word the refusal.
 2. ``AuthService._check_both_factors`` KEEPS its short-circuit: ``consume_totp_step`` is asked only
    once a code matched a step. The comment above that line says why.
 3. ``finish_webauthn_assertion`` compares every held passkey, each in constant time.

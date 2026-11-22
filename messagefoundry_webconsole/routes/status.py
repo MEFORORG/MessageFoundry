@@ -73,7 +73,7 @@ def _derive_health(
     - running on the DR failover box (``dr.active``) → **warn**; a clustered engine with no leader → **down**.
     - a pooled pipeline stage whose claimer died and has not recovered → **down**, naming
       the stage (BACKLOG #1609).
-    - a ``FhirLookup`` isolated at start → **warn**, naming it (vault BACKLOG #3008). Which
+    - a ``FhirLookup`` isolated at start is **warn**, naming it (vault BACKLOG #3008). Which
       callers get the names is ``EngineInfo.fhir_lookups_failed``'s rule. It is appended after the
       two inbound rules below and before the disk, pool, forwarder and DR rules, so at the warn
       level a failed inbound wins the tooltip over it, and it wins over those.
