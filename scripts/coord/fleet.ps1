@@ -467,18 +467,61 @@ foreach ($r in $records) {
     $r | Add-Member -NotePropertyName SessionKey -NotePropertyValue $sk -Force
     $asOfUtc = Get-RecordInstantUtc (Get-RecordField $r.Rec 'asOf')
     $r | Add-Member -NotePropertyName AsOfUtc -NotePropertyValue $asOfUtc -Force
-    # The session's latest instant and lifecycle; a newer legacy copy overrides them below.
+    # seat.ps1's own write order: At, then Writes. A record with no stamp sorts first, as it does there.
+    # TryParse leaves 0 in $writes when the field is absent or malformed.
+    $writes = 0
+    [void][int]::TryParse([string](Get-RecordField $r.Rec 'writes'), [ref]$writes)
+    $r | Add-Member -NotePropertyName WriteAt -NotePropertyValue $(if ($null -ne $asOfUtc) { $asOfUtc } else { [DateTime]::MinValue }) -Force
+    $r | Add-Member -NotePropertyName Writes -NotePropertyValue $writes -Force
+    # The session's latest instant, and the one record its row is rendered from (chosen below).
     $r | Add-Member -NotePropertyName OrderUtc -NotePropertyValue $asOfUtc -Force
-    $r | Add-Member -NotePropertyName LifecycleRec -NotePropertyValue $r.Rec -Force
+    $r | Add-Member -NotePropertyName Voice -NotePropertyValue $r -Force
     # A record is filed under its session key, so the file stem names a record missing the field.
     # 'nosid' is shared by every writer with no session id, so it identifies no one session.
     $identity = if ($sk) { $sk } else { [IO.Path]::GetFileNameWithoutExtension($r.File) }
     $r | Add-Member -NotePropertyName SessionIdentity -NotePropertyValue $(if ($identity -cne 'nosid') { "$tree|$identity" }) -Force
 }
 # Legacy-box records whose OWN SESSION has a record in the new box. The pointer census below skips
-# them: the seat repairs its pointer in the new record. An older seat.ps1 may still write one, so
-# the new-box record takes the instant and lifecycle of a newer copy. A different session's legacy
-# record is still counted, because -ClearHandoff can still reach it.
+# them: the seat repairs its pointer in the new record. A different session's legacy record is still
+# counted, because -ClearHandoff can still reach it.
+#
+# ONE RECORD SPEAKS FOR THE SESSION, AND ITS ROW IS RENDERED WHOLE FROM IT (BACKLOG #5872): fields
+# merged from two writes can describe a state neither record was in. An older seat.ps1 may still
+# write the legacy copy, and it never read the new-box record, so a newer copy is not always a better
+# one. Test-LegacyCopySpeaks says when it is. OrderUtc stays the session's latest instant whichever
+# record speaks: the session did run then, and an older age could fold a crashed seat out of the
+# respawn population.
+function Get-RecordLifecycle($Rec) {
+    $value = Get-RecordField $Rec 'lifecycle'
+    if ($null -ne $value) { return [string]$value }
+    return 'open'
+}
+# At, then Writes, as seat.ps1 orders them. seat.ps1 leaves a full tie unordered, so an explicit close
+# or handback is what survives one.
+function Compare-RecordWrite($A, $B) {
+    $byInstant = $A.WriteAt.CompareTo($B.WriteAt)
+    if ($byInstant -ne 0) { return $byInstant }
+    $byWrites = $A.Writes.CompareTo($B.Writes)
+    if ($byWrites -ne 0) { return $byWrites }
+    return ((Get-RecordLifecycle $A.Rec) -ne 'open').CompareTo((Get-RecordLifecycle $B.Rec) -ne 'open')
+}
+function Test-LegacyCopySpeaks($Copy, $NewBox) {
+    # Nothing here can fence or brief from a copy naming no session or no worktree.
+    if (-not [string](Get-RecordField $Copy.Rec 'sessionId') -or -not [string](Get-RecordField $Copy.Rec 'worktree')) { return $false }
+    if ((Compare-RecordWrite $Copy $NewBox) -le 0) { return $false }
+    $copyLifecycle = Get-RecordLifecycle $Copy.Rec
+    if ($copyLifecycle -eq 'closed') { return $true }
+    # No writer reopens a session, so an open copy beside a closed or handed record is a re-stamp.
+    if ($copyLifecycle -eq 'open' -and (Get-RecordLifecycle $NewBox.Rec) -ne 'open') { return $false }
+    # The same re-stamp can lack what the session declared through the new writer. Without a seat a
+    # crashed session drops off the respawn roster, and without a pointer its handoff is lost.
+    foreach ($field in @('seat', 'goal', 'done', 'outOfScope', 'predecessor', 'notes')) {
+        if ((Get-RecordField $NewBox.Rec $field) -and -not (Get-RecordField $Copy.Rec $field)) { return $false }
+    }
+    $newPointer = [string](Get-RecordField (Get-RecordField $NewBox.Rec 'handoff') 'path')
+    $copyPointer = [string](Get-RecordField (Get-RecordField $Copy.Rec 'handoff') 'path')
+    return (-not $newPointer -or $copyPointer)
+}
 $frozenLegacy = @{}
 $newBoxRecords = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 foreach ($r in $records) {
@@ -488,10 +531,18 @@ foreach ($r in $records) {
     if (-not $r.SessionIdentity -or $r.Box -ceq $r.Tree -or -not $newBoxRecords.ContainsKey($r.SessionIdentity)) { continue }
     $frozenLegacy[$r.File] = $true
     $current = $newBoxRecords[$r.SessionIdentity]
-    if ($null -ne $r.AsOfUtc -and ($null -eq $current.AsOfUtc -or $r.AsOfUtc -gt $current.AsOfUtc)) {
+    if ($null -ne $r.AsOfUtc -and ($null -eq $current.OrderUtc -or $r.AsOfUtc -gt $current.OrderUtc)) {
         $current.OrderUtc = $r.AsOfUtc
-        $current.LifecycleRec = $r.Rec
     }
+    if (-not (Test-LegacyCopySpeaks $r $current)) { continue }
+    # Among copies that may speak the newest does, however they happen to be listed. An exact tie
+    # goes to the lower path, so two runs over one directory cannot pick differently.
+    $held = $current.Voice
+    if ($held.File -cne $current.File) {
+        $order = Compare-RecordWrite $r $held
+        if ($order -lt 0 -or ($order -eq 0 -and [string]::CompareOrdinal($r.File, $held.File) -gt 0)) { continue }
+    }
+    $current.Voice = $r
 }
 
 $rows = @()
@@ -501,7 +552,9 @@ $lookupFailures = @()
 # closed, and the receipt names the file.
 $incompleteRecords = @()
 foreach ($r in $records) {
-    $rec = $r.Rec
+    # The record that speaks for this session, so every field below describes one write. Only the
+    # row's own address (Box, SessionKey, File) stays this record's.
+    $rec = $r.Voice.Rec
     # This loop reads seat-record fields through Get-RecordField, which answers `{}` under StrictMode
     # where `.PSObject.Properties.Name` throws (BACKLOG #5491), as the -Chip briefing below does.
     $wt = [string](Get-RecordField $rec 'worktree')
@@ -546,8 +599,10 @@ foreach ($r in $records) {
         }
     }
 
-    $lifecycleValue = Get-RecordField $r.LifecycleRec 'lifecycle'
-    $lifecycle = if ($null -ne $lifecycleValue) { [string]$lifecycleValue } else { 'open' }
+    # A frozen copy that does not speak has no lifecycle to report, so it falls through to SUPERSEDED.
+    # An incomplete one keeps its own: it is not fenced, and reads POSSIBLY RUNNING unless it says closed.
+    $outVoiced = $frozenLegacy.ContainsKey($r.File) -and $newBoxRecords[$r.SessionIdentity].Voice.File -cne $r.File
+    $lifecycle = if ($outVoiced -and -not $incomplete) { 'open' } else { Get-RecordLifecycle $rec }
     $ageH = Get-AgeHours $r.OrderUtc
 
     # SUPERSEDED: a newer record of the same tree (above). Without the tree, a session that crossed
@@ -595,7 +650,7 @@ foreach ($r in $records) {
 
     $rows += [pscustomobject]@{
         Box         = $r.Box
-        SessionKey  = [string](Get-RecordField $rec 'sessionKey')
+        SessionKey  = $r.SessionKey
         Seat        = $declared
         State       = $state
         Fence       = $fence
@@ -606,6 +661,7 @@ foreach ($r in $records) {
         Host        = Get-CoordRecordHost $rec
         IsHere      = $isHere
         Epoch       = if ($null -ne (Get-RecordField $rec 'poolEpoch')) { [int](Get-RecordField $rec 'poolEpoch') } else { $null }
+        # -Chip and the handoff columns read this, so they describe the same write as the row.
         Rec         = $rec
         File        = $r.File
     }
@@ -644,13 +700,13 @@ $ptrBoxes = @{}
 foreach ($o in $records) {
     # Through Get-RecordField: a seat record or a handoff holding `{}` has no such property, and a
     # bare read throws under StrictMode (BACKLOG #5491).
-    $h = Get-RecordField $o.Rec 'handoff'
+    $h = Get-RecordField $o.Voice.Rec 'handoff'
     $hPath = [string](Get-RecordField $h 'path')
     $hBytes = Get-RecordField $h 'bytes'
     if (-not $hPath) { continue }
     # Another PC's pointer names a path on that PC. Test-Path here would call it dangling and fire the
     # stop below for a document that resolves where it was written, so it is counted apart.
-    if (-not (Test-CoordRecordIsHere $o.Rec)) { $ptrOtherHost++; continue }
+    if (-not (Test-CoordRecordIsHere $o.Voice.Rec)) { $ptrOtherHost++; continue }
     # A frozen legacy copy of a live seat's record; its pointer is the newer record's to answer for.
     if ($frozenLegacy.ContainsKey($o.File)) { continue }
     $ptrTotal++

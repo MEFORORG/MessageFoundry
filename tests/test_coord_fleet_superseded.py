@@ -85,7 +85,14 @@ class Fleet:
         return proc.stdout.strip()
 
     def seat(
-        self, box: str, session: str, as_of: str | None, *, omit_key: bool = False, **extra: Any
+        self,
+        box: str,
+        session: str,
+        as_of: str | None,
+        *,
+        omit_key: bool = False,
+        file_stem: str | None = None,
+        **extra: Any,
     ) -> None:
         rec: dict[str, Any] = {
             "schema": 1,
@@ -107,7 +114,7 @@ class Fleet:
             del rec["sessionKey"]
         d = self.seats / box
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"{session}.json").write_text(json.dumps(rec), encoding="utf-8")
+        (d / f"{file_stem or session}.json").write_text(json.dumps(rec), encoding="utf-8")
 
     def live(self, session: str, cwd: str | None = None) -> None:
         """Register a session on this test's own pid, so the real fence reads it LIVE."""
@@ -121,14 +128,14 @@ class Fleet:
         }
         (self.registry / f"{session}.json").write_text(json.dumps(rec), encoding="utf-8")
 
-    def states(self) -> dict[tuple[str, str], str]:
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env.pop("CLAUDE_CODE_SESSION_ID", None)
         env.pop("CLAUDE_CONFIG_DIR", None)
         env["MEFOR_COORD_ROOT"] = str(self.shared)
         env["USERPROFILE"] = str(self.profile)
-        proc = subprocess.run(
-            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(COORD / "fleet.ps1"), "-Json"],
+        return subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(COORD / "fleet.ps1"), *args],
             cwd=str(self.repo),
             capture_output=True,
             text=True,
@@ -136,11 +143,22 @@ class Fleet:
             check=False,
             env=env,
         )
+
+    def rows(self) -> dict[tuple[str, str], dict[str, Any]]:
+        proc = self._run("-Json")
         assert proc.returncode in (0, 2), proc.stderr
         rows = json.loads(proc.stdout)["rows"]
         if isinstance(rows, dict):
             rows = [rows]
-        return {(r["Box"], r["SessionKey"]): r["State"] for r in rows}
+        return {(r["Box"], r["SessionKey"]): r for r in rows}
+
+    def states(self) -> dict[tuple[str, str], str]:
+        return {key: row["State"] for key, row in self.rows().items()}
+
+    def chip(self, box: str, session: str) -> str:
+        proc = self._run("-Chip", "-BoxKey", box, "-SessionKey", session)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
 
 
 @pytest.fixture
@@ -301,3 +319,104 @@ def test_another_sessions_live_legacy_record_is_not_frozen(fleet: Fleet) -> None
     got = fleet.states()
     assert got[(fleet.legacy_box, "sess-old")] == "RUNNING"
     assert got[(fleet.new_box, "sess-new")] == "INTERRUPTED"
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "state"), [("closed", "CLOSED"), ("handed", "HANDED")], ids=["closed", "handed"]
+)
+def test_an_older_writers_restamp_does_not_reopen_a_session(
+    fleet: Fleet, lifecycle: str, state: str
+) -> None:
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600), lifecycle=lifecycle)
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(10), lifecycle="open")
+    got = fleet.states()
+    assert got[(fleet.new_box, "sess-e")] == state
+    assert got[(fleet.legacy_box, "sess-e")] == "SUPERSEDED"
+
+
+def test_the_whole_row_comes_from_the_newer_legacy_copy(fleet: Fleet) -> None:
+    """A crashed manager declared through the legacy copy keeps its seat on the respawn roster."""
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600), seat=None, branch="old-branch", goal="old goal")
+    fleet.seat(
+        fleet.legacy_box, "sess-e", _ago(10), seat="manager", branch="new-branch", goal="new goal"
+    )
+    row = fleet.rows()[(fleet.new_box, "sess-e")]
+    assert (row["State"], row["Seat"], row["Branch"]) == ("INTERRUPTED", "manager", "new-branch")
+    chip = fleet.chip(fleet.new_box, "sess-e")
+    assert "GOAL AS DECLARED: new goal" in chip
+    assert "old goal" not in chip
+
+
+def test_a_handed_row_keeps_the_handoff_of_the_copy_that_handed_it(
+    fleet: Fleet, tmp_path: Path
+) -> None:
+    doc = tmp_path / "handoff.md"
+    doc.write_text("h", encoding="utf-8")
+    pointer = {"path": str(doc), "bytes": 1}
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600))
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(10), lifecycle="handed", handoff=pointer)
+    row = fleet.rows()[(fleet.new_box, "sess-e")]
+    assert (row["State"], row["HandoffPath"]) == ("HANDED", str(doc))
+
+
+@pytest.mark.parametrize("field", ["seat", "handoff"])
+def test_a_restamp_that_lost_a_declared_field_does_not_speak(
+    fleet: Fleet, tmp_path: Path, field: str
+) -> None:
+    """An older writer never read the new-box record, so its copy can lack what that one holds."""
+    doc = tmp_path / "handoff.md"
+    doc.write_text("h", encoding="utf-8")
+    pointer = {"path": str(doc), "bytes": 1}
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600), seat="manager", handoff=pointer)
+    lost: dict[str, Any] = {"seat": "manager", "handoff": pointer, field: None}
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(10), **lost)
+    row = fleet.rows()[(fleet.new_box, "sess-e")]
+    assert (row["State"], row["Seat"], row["HandoffPath"]) == ("INTERRUPTED", "manager", str(doc))
+
+
+def test_a_restamp_that_lost_the_goal_does_not_brief_the_replacement(fleet: Fleet) -> None:
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600), goal="the declared goal")
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(10), goal=None)
+    assert "GOAL AS DECLARED: the declared goal" in fleet.chip(fleet.new_box, "sess-e")
+
+
+def test_a_close_survives_a_full_tie_between_legacy_copies(fleet: Fleet) -> None:
+    """The open copy sorts first by path, so only the lifecycle key can keep the close."""
+    stamp = _ago(30)
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600))
+    fleet.seat(fleet.legacy_box, "sess-e", stamp, file_stem="a-copy", writes=4)
+    fleet.seat(fleet.legacy_box, "sess-e", stamp, file_stem="z-copy", writes=4, lifecycle="closed")
+    assert fleet.states()[(fleet.new_box, "sess-e")] == "CLOSED"
+
+
+def test_a_complete_copy_speaks_for_a_new_box_record_with_no_worktree(fleet: Fleet) -> None:
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(10), seat="manager")
+    fleet.seat(fleet.new_box, "sess-e", _ago(3600), worktree=None)
+    row = fleet.rows()[(fleet.new_box, "sess-e")]
+    assert (row["State"], row["Seat"], row["Worktree"]) == ("INTERRUPTED", "manager", fleet.top)
+
+
+def test_the_newest_of_several_legacy_copies_speaks(fleet: Fleet) -> None:
+    """The newer copy is listed first, so a compare against the wrong instant keeps the last."""
+    fleet.seat(fleet.new_box, "sess-e", _ago(7200))
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(10), file_stem="a-copy", lifecycle="closed")
+    fleet.seat(fleet.legacy_box, "sess-e", _ago(3600), file_stem="z-copy", seat="stale")
+    row = fleet.rows()[(fleet.new_box, "sess-e")]
+    assert (row["State"], row["Seat"]) == ("CLOSED", "builder")
+
+
+@pytest.mark.parametrize(
+    ("new_writes", "legacy_writes", "new_state", "legacy_state"),
+    [(3, 5, "CLOSED", "CLOSED"), (5, 3, "INTERRUPTED", "SUPERSEDED"), (4, 4, "CLOSED", "CLOSED")],
+    ids=["legacy-wrote-more", "new-wrote-more", "full-tie"],
+)
+def test_an_exact_tie_reads_one_lifecycle(
+    fleet: Fleet, new_writes: int, legacy_writes: int, new_state: str, legacy_state: str
+) -> None:
+    """seat.ps1 orders by At, then Writes. A full tie keeps the explicit close."""
+    stamp = _ago(30)
+    fleet.seat(fleet.new_box, "sess-e", stamp, writes=new_writes)
+    fleet.seat(fleet.legacy_box, "sess-e", stamp, writes=legacy_writes, lifecycle="closed")
+    got = fleet.states()
+    assert got[(fleet.new_box, "sess-e")] == new_state
+    assert got[(fleet.legacy_box, "sess-e")] == legacy_state
