@@ -269,7 +269,7 @@ async def test_a_defect_reading_the_subject_still_serves_the_sender(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The intake record is optional, so an unexpected exception from ``peer_subject`` on a plain
-    mTLS listener must not cut off a sender origin/main served: the message is ACKed and stored
+    mTLS listener must not cut off a sender that was served before the record existed: the message is ACKed and stored
     without a subject, and one ERROR line names the exception's type but not its message."""
     import messagefoundry.pki as pki
 

@@ -2894,9 +2894,11 @@ class MLLPSource(SourceConnector):
                 subject = peer_subject(writer.get_extra_info("ssl_object"))
             except Exception as exc:  # noqa: BLE001 -- the record is optional; the sender is not
                 # peer_subject already turns an unreadable certificate into None, so anything
-                # here is a defect. It is logged, and the sender main served is still served:
-                # an optional record must not cut it off. Its type and frames only, never its
-                # message, which could quote the certificate, and a subject can name a person.
+                # here is a defect. It is logged, and the sender is still served, as it was before
+                # this record existed: an optional record must not cut it off. A BaseException,
+                # such as a pyo3 PanicException, is not caught and still ends the connection.
+                # Its type and frames only, never its message, which could quote the
+                # certificate, and a subject can name a person.
                 frames = "; ".join(
                     f"{frame.filename}:{frame.lineno} in {frame.name}"
                     for frame in traceback.extract_tb(exc.__traceback__)

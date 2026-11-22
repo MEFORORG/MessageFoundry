@@ -66,9 +66,9 @@ class IntakeContext:
     #: The source's transport, lower case, such as ``"mllp"``, ``"tcp"`` or ``"file"``.
     transport: str
     #: The verified client certificate's subject, RFC 4514, when one was required and verified;
-    #: read once per connection. An MLLP listener with ``tls_client_subjects`` refuses a TLS 1.2
-    #: renegotiation; one without it does not, so another certificate presented that way there is
-    #: not re-read.
+    #: read once per connection, after the handshake. A renegotiation that presents another
+    #: certificate is not re-read; OpenSSL 3 refuses a client-initiated one by default (measured on
+    #: 3.5.7), and a listener with ``tls_client_subjects`` also sets ``OP_NO_RENEGOTIATION``.
     cert_subject: str | None = None
     #: How the peer was admitted; ``None`` for a poll source, which admits no peer.
     auth_mode: IntakeAuth | None = None
