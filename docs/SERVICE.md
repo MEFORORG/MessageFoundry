@@ -320,14 +320,15 @@ is left of the budget, less the time kept for the stop steps after it, is under 
 bound, and it still gets at least 0.1 s. The graph supervisor's exit is not budgeted: it waits up
 to its fixed 10 s, and then, once cancelled, for that cancel to land with no bound. It and the
 other stop steps are not held to the budget, so a slow one can still carry the stop past NSSM's
-window, and it spends budget the waits after it would have had. On a tight stop, at least these can be lost:
+window, and it spends budget the waits after it would have had. On a tight stop, at least these
+can be lost:
 
 - **The remote-debug watch's last pass** can be cut to about 0.1 s and cancelled. Every stop step
   before it, the graph supervisor's wait and the stopping of the message graph included, shortens
   its waits by what it took, so a slow graph stop alone can leave the pass only that floor. When
   the budget cuts the pass, a WARNING says so, and a refusal seen since the pass before it may then
-  have no audit row and no alert. A cancel of the stop itself cancels the pass and logs none. A pass
-  whose cancel has not landed when the second wait ends is left running and can outlive the
+  have no audit row and no alert. A cancel of the stop itself, in either wait, logs no WARNING.
+  A pass whose cancel has not landed when the second wait ends is left running and can outlive the
   store's close, so its row may not be written; the WARNING then says it may still be running.
 - **The alert-instance drain** can be cut to about 0.1 s. A raise or clear write still running
   then is not retried, and may fail when the store closes and go unrecorded. A clear still waiting

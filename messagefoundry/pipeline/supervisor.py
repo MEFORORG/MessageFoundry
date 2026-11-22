@@ -1077,9 +1077,9 @@ async def _stop_crl_reload(crl_reload: CrlReloadRunner, install_signal_handlers:
     :func:`_run_supervisor`'s did, so a late signal stays harmless until the loop closes. Where
     the loop takes no signal handler, as on Windows, a Ctrl-C cancels the main task, which cuts
     the wait the same way. A cut skips the runner's stop-time resolve of the alerts it still has
-    open. A signal that arrives once the runner has abandoned the pass, while it waits for the
-    pass's cancel to land, cuts nothing: the runner absorbs it, resolves as usual, and no WARNING
-    is logged here. The abandoned pass's worker thread cannot be cancelled: the process can still wait at
+    open. Where the handlers are installed, a signal that arrives once the runner has abandoned
+    the pass, while it waits for the pass's cancel to land, is absorbed by the runner, which
+    resolves as usual, and no WARNING is logged here. The abandoned pass's worker thread cannot be cancelled: the process can still wait at
     exit for that thread to return, as the runner's :meth:`stop` says."""
     stop = asyncio.ensure_future(crl_reload.stop())
     if install_signal_handlers:
