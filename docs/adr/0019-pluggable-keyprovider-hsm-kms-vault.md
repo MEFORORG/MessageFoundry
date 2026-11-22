@@ -660,13 +660,13 @@ lifetime is Vault's to version. The bound is a no-op there and for the identity 
 > [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
 > 2026-09-28 amendment states the deployment precondition and cites the pages read.
 
-> **Corrected 2026-10-10 (BACKLOG #1173).** The rotation precondition above still stands, and the
-> engine still counts no Transit encrypts. What changed is the record. Since BACKLOG #2337, an
-> operator attests to the precondition with `messagefoundry store attest-transit-bound`, and
-> `Engine.start` reads that record through `enforce_transit_bound_attestation`. So "documented"
-> now undersells it. The R3 ruling above judged the precondition before that record existed;
-> whether the record meets R3 is a scorecard call. ADR 0138's 2026-10-07 amendment says what the
-> check does under each enforcement level, and what it does not change.
+> **Corrected 2026-10-10 (BACKLOG #1173).** The rotation precondition above still stands. What
+> changed is the record: since BACKLOG #2337 an operator attests to the precondition, and the engine
+> reads that attestation at start, so "documented" now undersells it. The R3 ruling above judged the
+> precondition before that record existed. ADR 0138's 2026-10-07 amendment says what was built, what
+> the check does under each enforcement level, what it does not change, and who judges the record
+> against R3. *(Corrected 2026-11-21, vault BACKLOG #1173: this note also restated that amendment's
+> account of the CLI command, the start call, the uncounted encrypts and the scorecard question.)*
 
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
@@ -801,12 +801,13 @@ above.
    96-bit random AES-GCM nonce, and that is a limit on the key, not on the generator. The default path
    counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path
    counts nothing. In its place, `Engine.start` calls `enforce_transit_bound_attestation` in
-   `store/transit_attestation.py`, which checks for a recorded operator attestation naming the
-   configured Transit data key (BACKLOG #2337). Without one, the engine refuses to start under
-   `[security].enforcement = enforce` and only logs a warning under `warn`. An attestation is still
-   weaker than the counted bound. [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
-   2026-10-07 amendment records how that gate works and the forgery it does not catch. Its
-   2026-09-28 amendment states the rotation precondition the operator attests to.
+   `store/transit_attestation.py` (BACKLOG #2337).
+   [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+   2026-10-07 amendment records how that gate works, what it does not catch and what it does not
+   change. Its 2026-09-28 amendment states the rotation precondition the operator attests to.
+   *(Corrected 2026-11-21, vault BACKLOG #1173: this point also restated what the gate checks, what
+   it does under each enforcement level, and that an attestation is weaker than the counted bound.
+   That amendment states each of them.)*
 
 **What this statement does not cover.** How fast the operating system's generator runs is a property
 of Windows and Linux. The 2026-10-10 amendment below says what the platform pages state about
@@ -815,8 +816,9 @@ blocking and failure, and where they say nothing.
 > **Corrected 2026-10-10 (BACKLOG #1173).** Point 2 and the paragraph above each said a page had
 > not been read for this amendment. They now point to the 2026-10-10 amendment, which reads them.
 > Point 4 described the Transit bound as a precondition the operator documents. It now names the
-> shipped attestation check. That check counts no invocations, and the
-> bound stays weaker than the counted one.
+> shipped attestation check. *(Corrected 2026-11-21, vault BACKLOG #1173: this note also restated
+> that the check counts no invocations and is weaker than the counted bound, which ADR 0138's
+> 2026-10-07 amendment states.)*
 
 **What stops a weak generator coming back, and where it stops short.** Bandit B311 now runs in both the
 CI scan and the pre-commit hook, with each seeded non-security `random` use marked per line. B311 is a
