@@ -3741,8 +3741,9 @@ def smtp_login_approved(
     in would have been the WRONG completion, because all three SMTP cells refuse a
     username beside ``use_tls=false`` at CONSTRUCTION *even with the escape set* -- the
     ``refuse_cleartext_credentials`` posture (``transports/rest.py``), which is the shape this repo
-    uses for a CREDENTIAL rather than the escapable shape it uses for a payload hop (the webhook
-    sink, the LDAPS bind, the MLLP/FTPS contexts, the SFTP host-key acceptance). An escapable
+    uses for a CREDENTIAL rather than the escapable shape it uses for a payload hop (at least the
+    MLLP and anonymous FTPS contexts, and the SFTP host-key acceptance for a login with no
+    password). An escapable
     send-time check behind an absolute construction-time gate is weaker than the gate it backs up,
     which is how a backstop becomes a hole. So the parameter is gone rather than wired
     (BACKLOG #1171; zero deployments, so the narrower signature costs nothing).

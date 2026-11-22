@@ -1210,7 +1210,7 @@ bind-guard ladder above:
     builds are refused, and so is the alerts test send. The levers are a `[tls].crl_file`, which
     reaches this hop's context, or `[alerts].email_tls_revocation_attested = true` with its
     reason. A relay with no login stays ungated (the table below).
-  - **The https webhook.** The POST carries the webhook's path token. Its one lever is
+  - **The https webhook.** The URL can carry the webhook's path token. Its one lever is
     `[alerts].webhook_tls_revocation_attested = true` with its reason: it dials through one
     shared opener, so no CRL reaches it, as on the Vault hops.
   - **A build with no instance posture is judged as enforcing**, as on the Vault hops and the
