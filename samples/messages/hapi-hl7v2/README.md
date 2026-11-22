@@ -19,18 +19,18 @@ message rides along at its end. Strip the comment lines first.
   source linked into the engine — using them to drive tests is unaffected by the license.
   If any file is ever modified, MPL-2.0 requires that file to carry its source notice.
 
-All files except `batch_18_messages.txt` and `oml_o21.hl7` are copied **verbatim** (bytes
+All files except `batch_18_messages.txt`, `oml_o21.hl7` and `adt_a03.txt` are copied **verbatim** (bytes
 unchanged) from the upstream paths below; the `hapi-osgi-test` tree carries byte-identical
 duplicates of several of these and was skipped.
 
-Both modified files were scrubbed with the project's own de-identification framework
+All three modified files were scrubbed with the project's own de-identification framework
 ([`messagefoundry_toolkit/anon/`](../../../messagefoundry_toolkit/anon/), ADR 0030), the same
 deterministic, salt-keyed surrogate machinery the tee relay and test harness use, over
 `DEFAULT_RULES` plus a committed rule overlay for each file. **No ad-hoc redaction logic was
 written** (§9: centralize the rules, don't reimplement beside the framework). Each overlay scrubs
 the fields this corpus needs that are not defaults, and lists every other field the leak-check
 walks as reviewed and kept, so no field it walks is undecided. The leak-check does not walk the
-MSH header, so the MSH fields are neither scrubbed nor listed.
+MSH header, so no MSH field is in a keep list. Only `adt_a03.txt`'s overlay scrubs MSH fields.
 [`tests/test_anon_hapi_samples.py`](../../../tests/test_anon_hapi_samples.py) holds each file to its
 overlay. The salt is not recorded: these surrogates are final, not reversible, and the files are
 not intended to be re-derived. Line endings, segment order and every line's field count are
@@ -38,7 +38,8 @@ unchanged.
 
 **What the scrub does not replace.** A run of `DEFAULT_RULES` is not Safe Harbor
 de-identification, and ADR 0030 and [`docs/PHI.md`](../../../docs/PHI.md) §9 say why. In these files,
-at least: `MSH-7` and the other MSH routing fields keep their upstream values, a query time, an
+at least: `MSH-7` and the other MSH routing fields keep their upstream values, except `MSH-4`,
+`MSH-6` and `MSH-7` in `adt_a03.txt`; a query time, an
 order's requested time in `batch_18_messages.txt` and an order's quantity and timing keep their
 timestamps, an identifier keeps its assigning authority (a hospital or system name), and the coded
 clinical content is kept.
@@ -112,6 +113,40 @@ component holds a surname.
 The parser parity record, `tests/golden/python_hl7_oracle.json`, still holds this file's upstream
 bytes as its own frozen input, the upstream names included. Nothing can regenerate that record
 (ADR 0054), so this scrub does not reach it, and those names are still in the repository there.
+
+### `adt_a03.txt` is MODIFIED — de-identified, not verbatim
+
+> **Source notice (MPL-2.0 §3.3).** This file is a **modified** copy of
+> `hapi-test/.../ca/uhn/hl7v2/parser/adt_a03.txt` from
+> https://github.com/hapifhir/hapi-hl7v2 at commit `de1503651040`, licensed MPL-2.0.
+> The modification is de-identification only, described below.
+
+Upstream this one-message file carries a named hospital and ward and a patient key. It also
+carries an identifier shaped like an Italian fiscal code, a birth date, a visit number and two
+clinicians (BACKLOG #5825). The names are placeholders, but the hospital, ward and identifiers are
+not plainly so. So it was scrubbed, by `DEFAULT_RULES` plus
+[`tests/fixtures/anon/adt_a03.anon.toml`](../../../tests/fixtures/anon/adt_a03.anon.toml), which
+also scrubs the message time and the sending and receiving facility in the MSH header and says why.
+
+**What was deliberately preserved:** the five segments in order, their field counts, and the CRLF
+line endings with no final line ending. In the header, the sending and receiving applications, the
+message type, the control id and the version are kept. So are the identifiers' assigning
+authorities and type codes. The procedure is kept on purpose: `PR1-3`, the code with its text,
+because ADR 0030 keeps the PR1 codes, and `PR1-4`, a free-text description, because its one
+generic word was reviewed and names no person, place or date. The same limits as above apply.
+
+**What the scrub changed beyond identifier values**, at least:
+
+- The facility in `MSH-4` and `MSH-6`, and the hospital and ward in `PV1-3` and `PV1-6`, are now
+  `[REDACTED]`.
+- The message, event, discharge and procedure dates keep only their year; the birth date is drawn
+  at random.
+- The fiscal-code and SSN repetitions of `PID-3` held one upstream value and now hold two
+  different surrogates, and the effective and expiration dates of the SSN repetition are blanked.
+- The patient name gained a middle initial, and the clinicians are drawn from the surrogate pool.
+
+The name, sex, birth date and procedure no longer need agree with one another. Do not use this
+sample to test patient matching, ages, sex or clinician identity.
 
 ## Manifest
 
