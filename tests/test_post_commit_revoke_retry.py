@@ -888,3 +888,47 @@ def test_the_cli_pages_a_granted_run_whose_revoke_was_given_up_on(
     assert [u for u, _ in paged] == ["site-admin"]
     assert "synthetic sessions live" in out
     assert "administrator_granted_sessions_live" in out
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+@pytest.mark.parametrize("as_json", [True, False])
+def test_the_cli_reports_whether_the_given_up_runs_page_was_delivered(
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    delivered: bool,
+    as_json: bool,
+) -> None:
+    """Vault BACKLOG #3023 items 11 and 30. The granted give-up path reports the page as a granted
+    run does: the JSON carries ``administrator_granted_alerted``, and the text warns when no
+    transport confirmed delivery. RED when: the page's answer is discarded."""
+    import sys
+    import types
+
+    from messagefoundry import __main__ as cli
+
+    async def granted_then_missed(*_a: object, **_k: object) -> object:
+        raise FirstAdministratorGrantedSessionsLive(
+            "synthetic sessions live", username="site-admin"
+        )
+
+    async def page(*_a: object, username: str, granted_by: str) -> bool:
+        return delivered
+
+    monkeypatch.setattr(AuthService, "provision_first_administrator", granted_then_missed)
+    monkeypatch.setattr(cli, "_raise_offline_administrator_granted", page)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _B1720_PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    argv += ["--db", str(shell / "provision.db")] + (["--json"] if as_json else [])
+    code = cli.main(argv)
+    captured = capsys.readouterr()
+    assert code == 1, captured
+    if as_json:
+        body = json.loads(captured.out.strip().splitlines()[-1])
+        assert body["code"] == "administrator_granted_sessions_live"
+        assert body["administrator_granted_alerted"] is delivered
+    else:
+        assert "synthetic sessions live" in captured.err
+        warned = "no [alerts] transport confirmed delivery" in captured.err
+        assert warned is not delivered

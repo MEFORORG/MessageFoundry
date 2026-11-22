@@ -10959,9 +10959,27 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except FirstAdministratorGrantedSessionsLive as exc:
         # Vault BACKLOG #3023 residual (4): the role is granted, so it pages as any grant does,
         # then the command exits non-zero with the text naming the host command that ends the
-        # earlier holder's session.
-        page_granted(exc.username)
-        return _emit_error(str(exc), as_json=args.json, code="administrator_granted_sessions_live")
+        # earlier holder's session. Whether the page was delivered is reported as a granted run
+        # reports it (vault BACKLOG #3023 items 11 and 30).
+        alerted = page_granted(exc.username)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "code": "administrator_granted_sessions_live",
+                        "administrator_granted_alerted": alerted,
+                    }
+                )
+            )
+            return 1
+        if not alerted:
+            print(
+                "WARNING: no [alerts] transport confirmed delivery of the administrator_granted "
+                "alert for this grant, so it went to the log and nobody may have been paged.",
+                file=sys.stderr,
+            )
+        return _emit_error(str(exc), as_json=False)
     except FirstAdministratorRefused as exc:
         # The service's own text says what to do with the entry it showed, where that is known: a
         # refusal can follow a grant that may have landed (#5067 leaves these as they are).
