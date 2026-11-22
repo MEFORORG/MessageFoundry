@@ -64,6 +64,16 @@ async def _engine(tmp_path: Path) -> Engine:
     )
 
 
+async def _stop(eng: Engine, **kwargs: Any) -> None:
+    """engine.stop(), closing the store if the stop raised, so a failing test cannot leave the
+    store's non-daemon worker holding the test process open."""
+    try:
+        await eng.stop(**kwargs)
+    except BaseException:
+        await eng.store.close()
+        raise
+
+
 def _attach(eng: Engine) -> tuple[_DrainRecorder, _CrlRecorder, _WatchRecorder]:
     drain, crl, watch = _DrainRecorder(), _CrlRecorder(), _WatchRecorder()
     eng._alert_sink = drain  # type: ignore[assignment]
@@ -79,7 +89,7 @@ async def test_a_hung_graph_supervisor_is_cut_inside_the_stop_budget(tmp_path: P
     supervisor = asyncio.ensure_future(_hangs())
     eng._graph_supervisor = supervisor
     began = time.monotonic()
-    await eng.stop(budget_seconds=2.5)
+    await _stop(eng, budget_seconds=2.5)
     took = time.monotonic() - began
     assert supervisor.cancelled()
     assert took < 2.5, took
@@ -88,7 +98,7 @@ async def test_a_hung_graph_supervisor_is_cut_inside_the_stop_budget(tmp_path: P
 async def test_under_a_budget_the_budgeted_waits_are_shortened_to_fit(tmp_path: Path) -> None:
     eng = await _engine(tmp_path)
     drain, crl, watch = _attach(eng)
-    await eng.stop(budget_seconds=2.0)
+    await _stop(eng, budget_seconds=2.0)
     [crl_wait] = crl.timeouts
     [watch_wait] = watch.timeouts
     [drain_wait] = drain.timeouts
@@ -110,7 +120,7 @@ async def test_under_a_budget_the_budgeted_waits_are_shortened_to_fit(tmp_path: 
 async def test_a_budget_with_room_leaves_every_fixed_bound_as_it_was(tmp_path: Path) -> None:
     eng = await _engine(tmp_path)
     drain, crl, watch = _attach(eng)
-    await eng.stop(budget_seconds=60.0)
+    await _stop(eng, budget_seconds=60.0)
     assert crl.timeouts == [crl.stop_timeout_seconds]
     assert watch.timeouts == [watch.stop_seconds()]
     assert drain.timeouts == [engine_module._ALERT_STATE_DRAIN_SECONDS]
