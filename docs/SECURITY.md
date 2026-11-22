@@ -5333,8 +5333,10 @@ flowchart TB
   `auth.gate_refused`, naming the same permission and a `reason` of `throttled` or `step_up`. It
   writes that row only where it would have written the grant row, so a gate that writes no grant
   row writes no refusal row either. A refused second factor writes `auth.mfa_denied`, as the base
-  gate's does. A refusal a route body makes after its gate has passed, such as a step-up proof the
-  route spends itself, still follows a grant row.
+  gate's does. For the step-up refusals of `spend_step_up_action` and
+  `refuse_unless_step_up_window_live`, which a route body makes after its gate has passed,
+  `_record_route_refusal` in `messagefoundry/api/security.py` says what it records. Other refusals
+  a route body makes after its gate has passed write no `auth.gate_refused` row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
   empty for every role except Administrator.
 - Sensitive routes add a step-up re-check on top of this flow. See

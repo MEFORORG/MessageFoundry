@@ -14,6 +14,7 @@ senders and ACK writers use too.
 from __future__ import annotations
 
 import logging
+import time
 
 from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.framing import (
@@ -36,6 +37,8 @@ from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 __all__ = [
     "FRAMING_CODE",
     "MULTIPLE_MESSAGES_CODE",
+    "REPLY_REPLACED_EVENT_SECONDS",
+    "ReplyReplacements",
     "FrameError",
     "FrameByteFault",
     "FramePayloadError",
@@ -49,8 +52,10 @@ __all__ = [
     "codec_for",
     "declared_encoding",
     "encode_reply",
+    "encode_reply_reporting",
     "frame_for_delivery",
     "frame_reply",
+    "frame_reply_reporting",
 ]
 
 logger = logging.getLogger(__name__)
@@ -69,8 +74,43 @@ FRAMING_CODE = "framing"
 _reply_fallback_logged: set[str] = set()
 
 #: The listeners whose reply-character replacement has been logged, once per connection for the
-#: same reason (BACKLOG #5799): a narrow charset meets the same characters on every message.
+#: same reason (BACKLOG #5799): a narrow charset meets the same characters on every message. The
+#: MLLP, raw-TCP and X12 listeners also send a ``reply_replaced`` connection event, which
+#: :class:`ReplyReplacements` throttles; it is stored only when connection events are captured.
 _reply_replacement_logged: set[str] = set()
+
+#: The shortest gap between two ``reply_replaced`` events from one listener, the same window as the
+#: ``tls_handshake_failed`` throttle.
+REPLY_REPLACED_EVENT_SECONDS = 60.0
+
+
+class ReplyReplacements:
+    """One listener's throttle for its ``reply_replaced`` connection events (BACKLOG #5799).
+
+    A narrow charset meets the same characters on every message, so one event per replaced reply
+    would grow with message volume and could crowd other kinds out of the runner's bounded event
+    queue. The first replaced reply is reported at once; after that, at most one report per
+    :data:`REPLY_REPLACED_EVENT_SECONDS`, made by the first replaced reply past the window and
+    carrying the count since the last report. Unlike the ``tls_handshake_failed`` throttle there is
+    no trailing report: replies counted after the last report are not reported until another reply
+    is replaced past the window, and not at all if none is. The reason is a count and fixed text,
+    never the charset setting or any part of the reply. Runs on the listener's event loop."""
+
+    def __init__(self) -> None:
+        self._unreported = 0
+        self._reported_at: float | None = None
+
+    def note(self) -> str | None:
+        """Count one replaced reply, and return the reason of the event due now, if one is."""
+        self._unreported += 1
+        now = time.monotonic()
+        if self._reported_at is not None and now - self._reported_at < REPLY_REPLACED_EVENT_SECONDS:
+            return None
+        count, self._unreported, self._reported_at = self._unreported, 0, now
+        return (
+            f"{count} reply(ies) since the last report held characters the inbound charset "
+            "cannot encode, and each was replaced"
+        )
 
 
 def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
@@ -152,19 +192,31 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     frame, and an echoed control id that held a frame byte simply stops matching. A space is what
     the ACK builder already puts in place of an echoed CR or LF. The replacement is on bytes, for the
     reason :func:`frame_for_delivery` checks bytes. The reply is encoded by :func:`encode_reply`,
-    which says what it does with a charset that cannot hold it."""
-    body = encode_reply(reply, encoding, connection=connection)
+    which says what it does with a charset that cannot hold it. This drops the flag saying whether
+    characters were replaced, so a listener calls :func:`frame_reply_reporting` instead and writes
+    the ``reply_replaced`` event from it (BACKLOG #5799)."""
+    return frame_reply_reporting(codec, reply, encoding, connection=connection)[0]
+
+
+def frame_reply_reporting(
+    codec: FrameCodec, reply: str, encoding: str, *, connection: str = ""
+) -> tuple[bytes, bool]:
+    """:func:`frame_reply`, and whether characters the charset cannot hold were replaced, so a
+    listener can write a ``reply_replaced`` connection event for that reply (BACKLOG #5799)."""
+    body, replaced = encode_reply_reporting(reply, encoding, connection=connection)
     if codec.start in body or codec.end in body:
         logger.warning(
             "reply held a frame start or end byte; each was replaced by a space before framing"
         )
     # The replacement is the leaf's rule, shared with the test harness's ACK writers.
-    return codec.frame(codec.neutralise(body))
+    return codec.frame(codec.neutralise(body)), replaced
 
 
 def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
-    """Encode a listener's post-commit reply in its declared charset, for :func:`frame_reply` and
-    for the X12 listener, which writes its reply unframed (BACKLOG #5958).
+    """Encode a listener's post-commit reply in its declared charset. The listeners call
+    :func:`encode_reply_reporting`, which does this and also says whether characters were replaced:
+    :func:`frame_reply_reporting` for the MLLP and raw-TCP listeners, and the X12 listener directly,
+    since it writes its reply unframed (BACKLOG #5958).
 
     A reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
     that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``
@@ -182,6 +234,16 @@ def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
     the warning each fallback logs, once per connection for each, since a narrow charset meets the
     same characters message after message. The charset setting and the reply are never logged: the
     setting is configuration that may hold anything, and the reply echoes the message."""
+    return encode_reply_reporting(reply, encoding, connection=connection)[0]
+
+
+def encode_reply_reporting(
+    reply: str, encoding: str, *, connection: str = ""
+) -> tuple[bytes, bool]:
+    """:func:`encode_reply`, and whether characters the charset cannot hold were replaced. The
+    warning is logged once per connection; the flag is set on every reply replaced, for the
+    listener's ``reply_replaced`` connection event (BACKLOG #5799). A reply sent in ``utf-8``
+    because the charset name is unusable is not a replacement, and the flag is False."""
     unencodable = False
     try:
         body = reply.encode(encoding)
@@ -200,8 +262,8 @@ def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
             )
         body = reply.encode("utf-8")
     if unencodable:
-        body = _encode_replacing(reply, encoding, connection)
-    return body
+        return _encode_replacing(reply, encoding, connection), True
+    return body, False
 
 
 def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:

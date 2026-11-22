@@ -130,10 +130,11 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.base import cap_setting as _cap_setting
 from messagefoundry.transports.framing import (
     MLLP_CODEC,
+    ReplyReplacements,
     check_frame_bytes,
     declared_encoding,
     frame_for_delivery,
-    frame_reply,
+    frame_reply_reporting,
 )
 
 __all__ = [
@@ -2372,6 +2373,7 @@ class MLLPSource(SourceConnector):
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
+        self._reply_replacements = ReplyReplacements()  # BACKLOG #5799
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
         # is not listed is refused before anything reads its socket -- with TLS on, that is before
         # the handshake, on every loop (BACKLOG #1606; see _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no
@@ -2995,6 +2997,12 @@ class MLLPSource(SourceConnector):
                 logger.warning("MLLP server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
+    async def _note_reply_replaced(self, peer_host: str | None) -> None:
+        """Count one replaced reply, and send the throttled ``reply_replaced`` event if one is due."""
+        reason = self._reply_replacements.note()
+        if reason is not None:
+            await self._emit_event("reply_replaced", peer_host=peer_host, reason=reason)
+
     async def _emit_event(
         self, kind: str, *, peer_host: str | None = None, reason: str | None = None
     ) -> None:
@@ -3038,9 +3046,10 @@ class MLLPSource(SourceConnector):
         """
         return owes_hl7_reply(self.ack_mode, self.content_type)
 
-    def _handler_failure_nak(self, message: bytes) -> bytes | None:
+    def _handler_failure_nak(self, message: bytes) -> tuple[bytes, bool] | None:
         """The framed ``AE`` NAK (``CE`` in enhanced mode) for a frame the inbound handler faulted
-        on, or ``None`` if none can be framed. Call it only when a reply is owed.
+        on, and whether characters its charset cannot hold were replaced in it, or ``None`` if none
+        can be framed. Call it only when a reply is owed.
 
         **Why AE.** It is this engine's code for "not accepted, and not because of what the message
         says". The runner answers ``AR`` for every refusal it treats as final and ``AE`` only for a
@@ -3074,7 +3083,9 @@ class MLLPSource(SourceConnector):
                 nak = build_ack(
                     inbound, code="AE", text=_HANDLER_FAILURE_NAK_TEXT, ack_mode=self.ack_mode
                 )
-                return frame_reply(MLLP_CODEC, nak, self.encoding, connection=self._pacing_name)
+                return frame_reply_reporting(
+                    MLLP_CODEC, nak, self.encoding, connection=self._pacing_name
+                )
             except Exception as exc:  # noqa: BLE001 -- fall back to the defaults, then give up
                 logger.warning(
                     "MLLP-level NAK for a handler fault could not be built: %s", safe_exc(exc)
@@ -3114,7 +3125,8 @@ class MLLPSource(SourceConnector):
         """
         reason = safe_exc(exc)
         owed = self._owes_handler_failure_reply()
-        nak = self._handler_failure_nak(message) if owed else None
+        framed = self._handler_failure_nak(message) if owed else None
+        nak = None if framed is None else framed[0]
         if nak is not None:
             outcome = f"answering MSA-1 {_CODES[self.ack_mode]['AE']}, then closing the connection"
         elif owed:
@@ -3131,6 +3143,8 @@ class MLLPSource(SourceConnector):
             outcome,
         )
         await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
+        if framed is not None and framed[1]:
+            await self._note_reply_replaced(peer_host)
         return owed, nak
 
     async def _on_client(
@@ -3309,14 +3323,18 @@ class MLLPSource(SourceConnector):
                                 failed = False
                             if reply is not None:
                                 # ADR 0205: a reply never carries a second frame boundary.
-                                writer.write(
-                                    frame_reply(
-                                        MLLP_CODEC,
-                                        reply,
-                                        self.encoding,
-                                        connection=self._pacing_name,
-                                    )
+                                wire, replaced = frame_reply_reporting(
+                                    MLLP_CODEC,
+                                    reply,
+                                    self.encoding,
+                                    connection=self._pacing_name,
                                 )
+                                writer.write(wire)
+                                if replaced:
+                                    # BACKLOG #5799: a reply whose characters the charset forced
+                                    # a replacement of, throttled per listener. A frame byte
+                                    # turned into a space is not one, and writes only its warning.
+                                    await self._note_reply_replaced(peer_host)
                                 await self._drain_ack(writer)
                         if unlisted and decoded:
                             # BACKLOG #4907: every frame this read completed was recorded above,

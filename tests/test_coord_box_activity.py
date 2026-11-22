@@ -442,3 +442,49 @@ class TestTheLibraryHasNoSideEffects:
         )
         assert proc.returncode == 0, proc.stderr
         assert "lenient" in proc.stdout
+
+
+class TestTheProfileIsReadByItsOwnName:
+    """Vault BACKLOG #2985, added item 2. With no -ConfigRoot, Get-TranscriptAgeHours listed
+    USERPROFILE with -Path, which reads its argument as a wildcard pattern: a profile named home[1]
+    matched only a folder named home1, so the transcript was never found and the signal read as
+    UNEVALUABLE. Red before the fix: the bracketed case returned null."""
+
+    def _age(self, sandbox: Path, home: Path | None) -> str:
+        env = {k: v for k, v in os.environ.items() if k.upper() != "USERPROFILE"}
+        if home is not None:
+            env["USERPROFILE"] = str(home)
+        ps = (
+            f". '{sandbox / 'scripts' / 'coord' / 'box-activity.ps1'}'; "
+            "$a = Get-TranscriptAgeHours -WorktreePath 'D:\\proj\\App'; "
+            "if ($null -eq $a) { 'null' } else { [string]$a }"
+        )
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+            env=env,
+            cwd=str(sandbox),
+        )
+        assert proc.returncode == 0 and not proc.stderr.strip(), proc.stderr
+        return proc.stdout.strip()
+
+    @pytest.mark.parametrize("home_name", ["home", "home[1]"])
+    def test_a_transcript_under_the_profile_is_found(self, sandbox: Path, home_name: str) -> None:
+        d = sandbox / home_name / ".claude" / "projects" / "D--proj-App"
+        d.mkdir(parents=True)
+        f = d / "turn.jsonl"
+        f.write_text('{"t":1}\n', encoding="utf-8")
+        _back_date(f, 5)
+        age = self._age(sandbox, sandbox / home_name)
+        assert age != "null", f"no transcript found under the profile {home_name}"
+        assert float(age) == pytest.approx(5, abs=0.1)
+
+    def test_an_unset_profile_names_no_root(self, sandbox: Path) -> None:
+        """No profile reads as UNEVALUABLE, not as a throw, and not as the current directory."""
+        d = sandbox / ".claude" / "projects" / "D--proj-App"
+        d.mkdir(parents=True)
+        (d / "turn.jsonl").write_text('{"t":1}\n', encoding="utf-8")
+        assert self._age(sandbox, None) == "null"

@@ -661,12 +661,15 @@ lifetime is Vault's to version. The bound is a no-op there and for the identity 
 > 2026-09-28 amendment states the deployment precondition and cites the pages read.
 
 > **Corrected 2026-10-10 (BACKLOG #1173).** The rotation precondition above still stands, and the
-> engine still counts no Transit encrypts. What changed is the record. Since BACKLOG #2337, an
-> operator attests to the precondition with `messagefoundry store attest-transit-bound`, and
-> `Engine.start` reads that record through `enforce_transit_bound_attestation`. So "documented"
-> now undersells it. The R3 ruling above judged the precondition before that record existed;
-> whether the record meets R3 is a scorecard call. ADR 0138's 2026-10-07 amendment says what the
-> check does under each enforcement level, and what it does not change.
+> engine still counts no Transit encrypts. What changed is the record. Since BACKLOG #2337,
+> `Engine.start` checks for an operator's recorded attestation to the precondition through
+> `enforce_transit_bound_attestation`, so "documented" now undersells it. The R3 ruling above
+> judged the precondition before that record existed. ADR 0138's 2026-10-07 amendment says how the
+> attestation is recorded and what the check does under each enforcement level. It also says what
+> the check does not change. Whether the record meets R3 is, in that amendment's words, "a
+> scorecard call, not this amendment's". *(Corrected 2026-11-21, vault BACKLOG #1173: this note
+> read "an operator attests to the precondition with `messagefoundry store attest-transit-bound`,
+> and `Engine.start` reads that record", which the 2026-10-07 amendment states.)*
 
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
@@ -800,13 +803,14 @@ above.
 4. **Volume wears out a key, not the generator.** The one value whose safety falls with volume is the
    96-bit random AES-GCM nonce, and that is a limit on the key, not on the generator. The default path
    counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path
-   counts nothing. In its place, `Engine.start` calls `enforce_transit_bound_attestation` in
-   `store/transit_attestation.py`, which checks for a recorded operator attestation naming the
-   configured Transit data key (BACKLOG #2337). Without one, the engine refuses to start under
-   `[security].enforcement = enforce` and only logs a warning under `warn`. An attestation is still
-   weaker than the counted bound. [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
-   2026-10-07 amendment records how that gate works and the forgery it does not catch. Its
-   2026-09-28 amendment states the rotation precondition the operator attests to.
+   counts nothing. `Engine.start` instead checks for an operator's recorded attestation to the
+   bound, through `enforce_transit_bound_attestation` in `store/transit_attestation.py` (BACKLOG
+   #2337). An attestation is still weaker than the counted bound. [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+   2026-10-07 amendment records what that gate checks, what it does under each enforcement level,
+   and what it does not catch. Its 2026-09-28 amendment states the rotation precondition the
+   operator attests to. *(Corrected 2026-11-21, vault BACKLOG #1173: this point read "In its
+   place, `Engine.start` calls" and went on to say what the gate checks and what it does under
+   `enforce` and `warn`, which the 2026-10-07 amendment states.)*
 
 **What this statement does not cover.** How fast the operating system's generator runs is a property
 of Windows and Linux. The 2026-10-10 amendment below says what the platform pages state about

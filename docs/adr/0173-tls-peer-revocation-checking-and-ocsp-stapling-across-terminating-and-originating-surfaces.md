@@ -1323,10 +1323,11 @@ ODBC revocation runbook that reached a result. Their contents beyond this summar
 here. It changes no code. For the grade, see the limit headed *What a result would mean for the
 grade*, under the ruling above, and its note of 2026-11-11.
 
-- **Where it ran.** Two runs with results, dated 2026-10-16 and 2026-10-17 in Central time. In
-  UTC, the first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
-  2026-10-17. The first run's record says it ran on a disposable virtual machine built for the
-  test, not on the SQL Server test box, and that the runbook puts the next run there. The second
+- **Where it ran.** Two runs with results. The first run's legs ran from 02:22 to 02:25 UTC and
+  the second's from 05:18 to 05:19 UTC, both on 2026-10-17. The records are dated in Central
+  time: the first 2026-10-16, the second 2026-10-17. The first run's record says it ran
+  on a disposable virtual machine built for the test, not on the SQL Server test box, and that the
+  runbook puts the next run there. The second
   run's record says it ran inside a virtual machine, after a revert to checkpoint
   `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
   `post-3009-acl-2026-10-17`. It writes the machine's name as a placeholder, so it cannot show
@@ -1373,9 +1374,9 @@ grade*, under the ruling above, and its note of 2026-11-11.
   the pin legs mean for the pin is the amendment of 2026-10-17 below. For the strict legs that
   reading is the second record's own, because the runbook's table has no row for them.
 - **The limits.** At least these.
-  - Only that driver build, only Windows Server 2022, and only SQL Server 2022 RTM. Linux, macOS,
-    other Driver 18 builds, and other drivers, which the generic dialect and the `odbc_driver`
-    setting can name, were not measured.
+  - Only the driver, Windows and SQL Server versions above. Linux, macOS, other Driver 18 builds,
+    and other drivers, which the generic dialect and the `odbc_driver` setting can name, were not
+    measured.
   - Only a CRL over HTTP. No OCSP responder was offered, so this does not show that the driver
     never checks revocation.
   - Only a same-machine connection: the client ran on the machine SQL Server ran on, so no
@@ -1384,6 +1385,11 @@ grade*, under the ruling above, and its note of 2026-11-11.
   - Only strings written out in the runbook and the script. No leg ran any engine builder or
     pool, so the result says nothing about how the engine builds or sends its own strings.
   - Only a throwaway root, with no intermediate CA.
+
+*(Corrected 2026-11-21, vault BACKLOG #3009: the first bullet opened "Two runs with results,
+dated 2026-10-16 and 2026-10-17 in Central time. In UTC, the first run's legs ran", and the first
+limit opened "Only that driver build, only Windows Server 2022, and only SQL Server 2022 RTM.",
+which repeated the versions bullet.)*
 
 *(End of the amendment of 2026-11-11. The next paragraph continues the 2026-10-04 note.)*
 

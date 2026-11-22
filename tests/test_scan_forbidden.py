@@ -1317,6 +1317,59 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # A marked identifier is never exempt.
     ("10", "verdict", f"ASVS {_REQ}: the row is not failing but stays {_PARTIAL}."),
     ("10", "verdict", f"| ASVS {_REQ} | the parser | is never failing; the cell is failing |"),
+    # A blank line after a dash placeholder row, or between ASVS tables, ends nothing either.
+    ("9", "verdict", f"{_HEAD}| - | - | - |\n\n{_ROW}"),
+    (
+        "9",
+        "verdict",
+        f"{_HEAD}| a | b | c |\n\n| ASVS {_REQ} | the limb | {_PASS.title()} (12 messages) |",
+    ),
+    ("9", "verdict", f"{_HEAD}| a | b | c |\n\n{_HEAD}{_ROW}"),
+    # Step 8: an escaped pipe in the header and in the row, and an escaped backslash before a real
+    # pipe in the header. Main flags each too; these pin the columns.
+    ("8", "verdict", f"| a \\| b | ASVS | Note | Result |\n|---|---|---|---|\n| a \\| b {_ROW}"),
+    ("8", "verdict", f"| a \\\\| ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
+    # Step 11, the hedge vocabularies: one list (_PR_HEDGE) for every place a hedge stands. Each of
+    # these missed while the lists differed.
+    ("11", "verdict", f"ASVS {_REQ} has likely been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} is only {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} is also {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} never stays {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} will already stay {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} honestly stays {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ} will so stay {_PARTIAL}."),
+    # Step 11: underscore emphasis on the word that ends a modal's clause.
+    ("11", "verdict", f"{_REQ} cannot {_PASS} _yet_."),
+    ("11", "verdict", f"{_REQ} will {_FAIL} _today_."),
+    ("11", "verdict", f"{_REQ} cannot {_PASS} *yet*."),
+    ("11", "verdict", f"{_REQ} will {_FAIL} **today**."),
+    ("11", "verdict", f"{_REQ} cannot {_PASS} `yet`."),
+    # Step 11: a hedge before the negation, and markup or extra space inside "has ... been".
+    ("11", "verdict", f"ASVS {_REQ} has still not been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has likely not been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has *likely* been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has _never_ been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has **not** been {_MET}."),
+    ("11", "verdict", f"ASVS {_REQ} has  likely been {_MET}."),
+    # A hedge after the modal's record verb keeps it strong, beside an unmarked id or a version.
+    # The "already" pair is flagged by main and was lost by an earlier head of this branch.
+    ("11", "verdict", f"{_REQ} will remain already {_PARTIAL} for the parser"),
+    (
+        "11",
+        "verdict",
+        f"Applies to lxml 5.1.1, which will remain already {_PARTIAL} for the parser",
+    ),
+    ("11", "verdict", f"{_REQ} will remain only {_PARTIAL} for the parser"),
+    ("11", "verdict", f"{_REQ} will stay still {_PARTIAL} for the parser"),
+    # Step 11: underscore emphasis on a cell's connective and on a list's "and". Main flags each
+    # through the markup-deleted reading of the cell; these pin it.
+    ("11", "verdict", f"| ASVS {_REQ} | the limb | {_PASS.title()} _until_ the fix |"),
+    ("11", "verdict", f"| {_REQ} _and_ {_REQ_B} | {_PARTIAL} |"),
+    # Step 11: a zero-width character before the first pipe of a data row, a delimiter row or a
+    # header row.
+    ("11", "verdict", f"{_HEAD}{chr(0x200B)}{_ROW}"),
+    ("11", "verdict", f"| ASVS | Note | Result |\n{chr(0x200B)}|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"{chr(0x200B)}{_HEAD}{_ROW}"),
 ]
 #: The six bodies engine PR 2893's review named as false positives: CI prose and a component row about
 #: HL7 v2.5.1. Main flags each. Step 10, which an earlier head of this branch built to drop them, was
@@ -1502,6 +1555,13 @@ _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     ("11", f"| Version (not an ASVS id) | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", f"| Version (not  ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", f"| Not in ASVS | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # Step 11: the same hedges beside a version, or before a CI verdict on an unmarked id; emphasis
+    # on a word that starts an object; a zero-width character before a row under a header that does
+    # not name ASVS.
+    ("11", f"Python 3.9.7 has likely been {_MET}."),
+    ("11", "The parser on 2.5.1 is only passing locally."),
+    ("11", f"{_REQ} will {_FAIL} _the_ handshake."),
+    ("11", f"| Version | Note | Result |\n|---|---|---|\n{chr(0x200B)}{_ROW}"),
 ]
 
 
@@ -2815,8 +2875,9 @@ def _generated_pr_bodies(count: int = 600) -> list[str]:
 
 def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf, sf_frozen_main) -> None:
     """The baseline is one pass of the union, but it runs the head's table model, so this is not true
-    by construction. The test pins it, with no exception, against two oracles: the pre-BACKLOG #5582
-    reading rebuilt here, and the vendored origin/main scanner with #5582's readings."""
+    by construction. The test pins it, with no exception, against two
+    oracles: the pre-BACKLOG #5582 reading rebuilt here, and the vendored origin/main scanner with
+    #5582's readings."""
     harvested = set(_harvested_pr_bodies())
     fired_harvested = fired_generated = 0
     for body in [*harvested, *_generated_pr_bodies()]:

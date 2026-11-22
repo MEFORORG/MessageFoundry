@@ -63,6 +63,7 @@ CONNECTION_EVENT_KIND_ORDER: Final[tuple[str, ...]] = (
     "peer_reset",
     "framing_error",
     "handler_error",  # BACKLOG #1619
+    "reply_replaced",  # BACKLOG #5799
     "tls_handshake_failed",  # vault BACKLOG #2613, #3302
     "row_undecodable",  # BACKLOG #1662
     "file_oversize",  # BACKLOG #1621, and the three below

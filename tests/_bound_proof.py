@@ -16,8 +16,10 @@ A request that needs no proof goes through untouched, and a refusal it cannot an
 password, a second refusal) is returned as the engine sent it. ``tests/test_bound_step_up_injection.py``
 pins the gate itself.
 
-THE REFUSED FIRST TRY IS A REAL REQUEST. It passed the permission check, so it wrote its grant
-audit row and, for a write, charged the admin-write gap. A test that counts those rows or budgets,
+THE REFUSED FIRST TRY IS A REAL REQUEST. It passed the permission check, so where the trail
+records the request it wrote audit rows: an ``auth.gate_refused`` row where the gate refused it,
+or, on a ``proof_in_route`` route whose body refused the spend, a grant row and then an ``auth.gate_refused`` row (BACKLOG #1197). For a write it also
+charged the admin-write gap. A test that counts those rows or budgets,
 reads the re-keyed session afterwards, or runs under a deadline a password hash outlasts should
 prove up front with :func:`prove` instead, and a suite whose retry would be paced turns
 ``admin_write_min_interval_seconds`` off.
