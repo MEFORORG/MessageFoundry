@@ -14682,8 +14682,20 @@ class MessageStore:
 
         BACKLOG #5688: the whole burst is reserved and sealed off the event loop first, before the
         writer lock, so a large set does not stall the loop or hold up other writers while it seals."""
+
+        async def add(key_id: str, count: int) -> int:
+            try:
+                return await self._add_cipher_invocations_locked(key_id, count)
+            except BaseException as exc:
+                await _unwind_and_raise(self._db, exc, role="writer")
+
         sealed = await seal_reference_snapshot(
-            self._cipher, self.add_cipher_invocations, name=name, version=version, rows=rows
+            self._cipher,
+            add,
+            name=name,
+            version=version,
+            rows=rows,
+            reserve_scope=lambda: _writer_guard(self._db, self._lock),
         )
         encrypted = sealed.rows
         async with _writer_txn(self._db, self._lock):
@@ -14700,7 +14712,7 @@ class MessageStore:
                 (name, version, time.time(), len(encrypted)),
             )
             await self._commit()
-            # Commit succeeded → swap the active snapshot in the read cache, sealed (BACKLOG #1174).
+            # Commit succeeded: swap the active snapshot in the read cache, sealed (BACKLOG #1174).
             # Under the writer lock, so overlapping writes of a set swap in their commit order.
             self._reference_cache[name] = sealed.cache
 

@@ -9962,9 +9962,10 @@ class SqlServerStore:
                 )
                 await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # Not a bare rollback: a failed one would pool a connection holding the applock.
+                await self._rollback_or_discard(conn)
                 raise
-            # Commit succeeded → swap the active snapshot in the read cache (sealed, BACKLOG #1174)
+            # Commit succeeded: swap the active snapshot in the read cache (sealed, BACKLOG #1174)
             # AND record the active version, so a follower's converge_reference_cache() (Track B
             # Step 6) can tell this node already reflects it. Before the connection is released, so
             # a later write of this set cannot swap first and then be overwritten by this one.

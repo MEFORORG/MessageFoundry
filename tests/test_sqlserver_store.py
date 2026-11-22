@@ -3737,6 +3737,19 @@ async def _purge_reference_rows(*keys: bytes) -> None:
         await cleanup.close()
 
 
+async def test_reference_snapshot_batches_mixed_value_lengths(store) -> None:
+    """BACKLOG #5688: one multi-row VALUES batch binds short and past-4000-character values alike."""
+    from messagefoundry.store.reference_seal import REFERENCE_INSERT_BATCH
+
+    rows = {f"K{i}": ("x" * 5000 if i % 7 == 0 else "y") for i in range(REFERENCE_INSERT_BATCH + 3)}
+    await store.write_reference_snapshot(name="mixed", version="v1", rows=rows)
+    stored = await store._fetchall("SELECT [key] FROM reference WHERE name='mixed'")
+    assert len(stored) == len(rows)
+    await store._load_reference_cache()
+    assert store.reference_view()["mixed"]["K0"] == "x" * 5000
+    assert store.reference_view()["mixed"]["K1"] == "y"
+
+
 async def test_reference_snapshot_write_and_read(store) -> None:
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.sqlserver import SqlServerStore

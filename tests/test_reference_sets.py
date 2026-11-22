@@ -1250,13 +1250,13 @@ async def test_5688_sqlite_reserves_before_encrypting_off_the_loop(tmp_path: Pat
         events: list[str] = []
         threads: set[int] = set()
         _spy_encrypt(cipher, events, threads)
-        real_add = store.add_cipher_invocations
+        real_add = store._add_cipher_invocations_locked
 
         async def add(key_id: str, count: int) -> int:
             events.append("reserve")
             return await real_add(key_id, count)
 
-        store.add_cipher_invocations = add  # type: ignore[method-assign]
+        store._add_cipher_invocations_locked = add  # type: ignore[method-assign]
         await store.write_reference_snapshot(name="codes", version="v1", rows={"A": "1", "B": "2"})
         assert events[0] == "reserve" and events.count("encrypt") == 2
         assert threading.get_ident() not in threads
@@ -1275,17 +1275,17 @@ async def test_5688_sqlite_refused_reservation_keeps_last_good(tmp_path: Path) -
         _drain_reserve(cipher)
         events: list[str] = []
         _spy_encrypt(cipher, events, set())
-        real_add = store.add_cipher_invocations
+        real_add = store._add_cipher_invocations_locked
 
         async def refuse(key_id: str, count: int) -> int:
             raise sqlite3.OperationalError("database is locked")
 
-        store.add_cipher_invocations = refuse  # type: ignore[method-assign]
+        store._add_cipher_invocations_locked = refuse  # type: ignore[method-assign]
         with pytest.raises(sqlite3.OperationalError):
             await store.write_reference_snapshot(name="codes", version="v2", rows={"A": "new"})
         assert events == []  # nothing was encrypted past a refused reservation
         assert store.reference_view()["codes"]["A"] == "old"
-        store.add_cipher_invocations = real_add  # type: ignore[method-assign]
+        store._add_cipher_invocations_locked = real_add  # type: ignore[method-assign]
     finally:
         await store.close()
     con = sqlite3.connect(db)
@@ -1294,6 +1294,70 @@ async def test_5688_sqlite_refused_reservation_keeps_last_good(tmp_path: Path) -
         assert con.execute("SELECT version FROM reference_version").fetchall() == [("v1",)]
     finally:
         con.close()
+
+
+async def test_5688_sqlite_reservation_keeps_the_writer_then_pass_lock_order(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint takes the writer lock and then the pass lock; a snapshot must not invert that."""
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    store = await MessageStore.open(tmp_path / "r.db", cipher=cipher)
+    try:
+        _drain_reserve(cipher)
+        await store._lock.acquire()
+        checkpoint = asyncio.create_task(store.checkpoint_cipher_invocations())
+        await asyncio.sleep(0.05)
+        write = asyncio.create_task(
+            store.write_reference_snapshot(name="codes", version="v1", rows={"A": "1"})
+        )
+        await asyncio.sleep(0.05)
+        store._lock.release()
+        done, pending = await asyncio.wait((checkpoint, write), timeout=5)
+        for task in pending:
+            task.cancel()
+        assert not pending, "the reservation inverted the writer and pass locks"
+        for task in done:
+            task.result()
+    finally:
+        await store.close()
+
+
+async def test_5688_cancel_stops_the_seal_and_waits_for_its_worker(tmp_path: Path) -> None:
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    store = await MessageStore.open(tmp_path / "r.db", cipher=cipher)
+    try:
+        real = cipher.encrypt
+        started, release = threading.Event(), threading.Event()
+        calls: list[int] = []
+
+        def encrypt(plaintext: str, *, aad: bytes | None = None) -> str:
+            calls.append(1)
+            started.set()
+            assert release.wait(10)
+            return real(plaintext, aad=aad)
+
+        object.__setattr__(cipher, "encrypt", encrypt)
+        rows = {f"K{i}": str(i) for i in range(1000)}
+        write = asyncio.create_task(
+            store.write_reference_snapshot(name="codes", version="v1", rows=rows)
+        )
+        assert await asyncio.to_thread(started.wait, 10)
+        write.cancel()
+        await asyncio.sleep(0.05)
+        assert not write.done(), "the cancelled write returned with its worker still sealing"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await write
+        spent = len(calls)
+        assert spent < len(rows)  # it stopped at a chunk boundary
+        await asyncio.sleep(0.05)
+        assert len(calls) == spent  # and nothing encrypts after the write has returned
+        assert "codes" not in store.reference_view()
+    finally:
+        object.__delattr__(cipher, "encrypt")
+        await store.close()
 
 
 class _PgConn:

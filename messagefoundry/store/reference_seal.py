@@ -10,12 +10,18 @@ persisted AES-GCM invocation bound is charged for the whole burst first, and the
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, MutableMapping
+import threading
+from collections.abc import Callable, Mapping, MutableMapping
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Final
 
 from messagefoundry.store.crypto import Cipher, cell_aad, encrypt_many
-from messagefoundry.store.gcm_bound import AddInvocations, reserve_invocations_ahead
+from messagefoundry.store.gcm_bound import (
+    AddInvocations,
+    bounded_cipher,
+    reserve_invocations_ahead,
+)
 from messagefoundry.store.metadata import encode_reference_value
 from messagefoundry.store.sealed_cache import SealedDict, sealed_reference_set
 
@@ -30,6 +36,9 @@ __all__ = [
 #: statement and four are bound per row. On Postgres it keeps each ``executemany`` well inside the
 #: per-call ``command_timeout``, which one call for a whole large set could exceed.
 REFERENCE_INSERT_BATCH: Final = 500
+
+#: Values sealed between two checks for a cancellation.
+_SEAL_CHUNK: Final = 128
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -48,6 +57,7 @@ async def seal_reference_snapshot(
     name: str,
     version: str,
     rows: Mapping[str, Any],
+    reserve_scope: Callable[[], AbstractAsyncContextManager[None]] | None = None,
 ) -> SealedSnapshot:
     """Encode ``rows``, reserve one invocation per row, then encrypt them, all off the event loop.
 
@@ -55,7 +65,15 @@ async def seal_reference_snapshot(
     failed add on a hydrated cipher and lets the burst proceed, which would spend a whole snapshot
     with the persisted total behind it. Failing here keeps the last-good snapshot and the sync retries
     on its next pass. A reservation whose sync later fails stays charged: an over-count, the safe
-    direction for this bound."""
+    direction for this bound.
+
+    ``reserve_scope`` is entered around the reservation. SQLite passes its writer guard, because the
+    bound's pass lock must be taken INSIDE the writer lock (BACKLOG #5608), and ``add_invocations`` is
+    then its lock-held add.
+
+    A cancellation stops the seal at its next chunk and is held until the worker has exited. A worker
+    left running would go on encrypting after the store's closing settlement, which the persisted
+    bound would then under-count."""
 
     def _encode() -> list[tuple[str, str]]:
         return [(k, encode_reference_value(v)) for k, v in rows.items()]
@@ -72,19 +90,45 @@ async def seal_reference_snapshot(
             failure = exc
             raise
 
-    await reserve_invocations_ahead(cipher, _recording_add, len(encoded))
+    if encoded and bounded_cipher(cipher) is not None:
+        async with reserve_scope() if reserve_scope is not None else nullcontext():
+            await reserve_invocations_ahead(cipher, _recording_add, len(encoded))
     if failure is not None:
-        raise failure
+        try:
+            raise failure
+        finally:
+            # Breaks the exception -> traceback -> this frame cycle, whose locals hold plaintext.
+            failure = None
 
-    def _seal() -> SealedSnapshot:
-        values = encrypt_many(
-            cipher,
-            [(text, cell_aad("reference", "value", name, version, k)) for k, text in encoded],
-        )
+    stop = threading.Event()
+
+    def _seal() -> SealedSnapshot | None:
+        items = [(text, cell_aad("reference", "value", name, version, k)) for k, text in encoded]
+        values: list[str] = []
+        for start in range(0, len(items), _SEAL_CHUNK):
+            if stop.is_set():
+                return None
+            values.extend(encrypt_many(cipher, items[start : start + _SEAL_CHUNK]))
         sealed = [(name, version, k, value) for (k, _), value in zip(encoded, values, strict=True)]
         return SealedSnapshot(rows=sealed, cache=sealed_reference_set(name, encoded))
 
-    return await asyncio.to_thread(_seal)
+    # An executor future, not a task: a shutdown that cancels every task cannot detach the worker.
+    worker = asyncio.get_running_loop().run_in_executor(None, _seal)
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.wait((worker,))
+        except asyncio.CancelledError:
+            cancelled = True
+            stop.set()
+    if cancelled:
+        if not worker.cancelled():
+            worker.exception()  # retrieved, so the loop does not log it with its traceback
+        raise asyncio.CancelledError
+    snapshot = worker.result()
+    if snapshot is None:  # only a set `stop` returns None, and only a cancellation sets it
+        raise asyncio.CancelledError
+    return snapshot
 
 
 def apply_converged(

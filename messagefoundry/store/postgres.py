@@ -5249,7 +5249,7 @@ class PostgresStore:
                     time.time(),
                     len(encrypted),
                 )
-            # Commit succeeded → swap the active snapshot in the read cache (sealed, BACKLOG #1174) and
+            # Commit succeeded: swap the active snapshot in the read cache (sealed, BACKLOG #1174) and
             # record the active version so a follower's converge_reference_cache() (Track B Step 6) can
             # tell this node already reflects it. Before the connection is released, which can await,
             # so a later write of this set cannot swap first and then be overwritten by this one.
