@@ -10,7 +10,7 @@ suite("configEditorModel: code-set custom editor upsert argv (BACKLOG #5834)", (
   const detail = { name: "epic_diets", format: "csv", columns: ["key", "value"], rows: [["A", "B"]] };
 
   test("a save of the opened file passes --name <stem>, so the CLI treats it as an edit", () => {
-    const out = codeSetEditorUpsertArgs("samples/config", "epic_diets", false, detail);
+    const out = codeSetEditorUpsertArgs("samples/config", "epic_diets", { readonly: false, unloaded: false }, detail);
     assert.ok("args" in out, JSON.stringify(out));
     const i = out.args.indexOf("--name");
     assert.ok(i !== -1, `no --name in ${out.args.join(" ")}`);
@@ -20,15 +20,22 @@ suite("configEditorModel: code-set custom editor upsert argv (BACKLOG #5834)", (
   });
 
   test("a read-only (.toml) code set is refused before any write", () => {
-    const out = codeSetEditorUpsertArgs("samples/config", "epic_diets", true, detail);
+    const out = codeSetEditorUpsertArgs("samples/config", "epic_diets", { readonly: true, unloaded: false }, detail);
     assert.ok("error" in out);
     assert.match(out.error, /read-only/);
   });
 
   test("a posted name other than the file's stem is refused, not written as another code set", () => {
-    const out = codeSetEditorUpsertArgs("samples/config", "other_table", false, detail);
+    const out = codeSetEditorUpsertArgs("samples/config", "other_table", { readonly: false, unloaded: false }, detail);
     assert.ok("error" in out);
     assert.match(out.error, /other_table/);
+    assert.match(out.error, /nothing was written/);
+  });
+
+  test("a file whose content never loaded into the grid is refused, not replaced by the empty grid", () => {
+    const out = codeSetEditorUpsertArgs("samples/config", "epic_diets", { readonly: false, unloaded: true }, detail);
+    assert.ok("error" in out);
+    assert.match(out.error, /did not load/);
     assert.match(out.error, /nothing was written/);
   });
 });

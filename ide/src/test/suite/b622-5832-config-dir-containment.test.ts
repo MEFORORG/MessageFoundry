@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
-import { isUnderConfigDir } from "../../configEditorModel";
+import { isConfigDirCodeSetFile, isConfigDirConnectionsFile, isUnderConfigDir } from "../../configEditorModel";
 
 // BACKLOG #5832. isUnderConfigDir decides whether connections.toml or a codesets file opens in the
 // form or falls back to text. It joined the config dir onto the workspace without resolving dot
@@ -47,5 +47,29 @@ suite("configEditorModel: isUnderConfigDir resolves the config dir (BACKLOG #583
 
   test("a file on another Windows drive is outside the config dir", () => {
     assert.strictEqual(isUnderConfigDir("D:\\ws\\config\\connections.toml", "C:\\ws", "config", "win32"), false);
+  });
+});
+
+// The custom editors read and write the exact file the CLI edits, so the guard in front of them asks
+// for that file, not for any file under the config dir. With a config dir of "." every nested
+// connections.toml in the workspace is under it, and each would otherwise be shown and saved as the
+// workspace root's file.
+suite("configEditorModel: the custom editors open only the file the CLI edits", () => {
+  test("connections.toml: the config dir's own, not a nested or wrong-cased one", () => {
+    assert.strictEqual(isConfigDirConnectionsFile("/ws/connections.toml", "/ws", ".", "linux"), true);
+    assert.strictEqual(isConfigDirConnectionsFile("/ws/samples/config/connections.toml", "/ws", ".", "linux"), false);
+    assert.strictEqual(isConfigDirConnectionsFile("/ws/samples/config/connections.toml", "/ws", "./samples/config", "linux"), true);
+    assert.strictEqual(isConfigDirConnectionsFile("/ws/Connections.toml", "/ws", ".", "linux"), false);
+    assert.strictEqual(isConfigDirConnectionsFile("C:\\ws\\Connections.TOML", "C:\\ws", ".", "win32"), true);
+    assert.strictEqual(isConfigDirConnectionsFile("/ws/other/connections.toml", "/ws", "samples/config", "linux"), false);
+  });
+
+  test("a code set: <configDir>/codesets/<stem>.csv or .toml, not one nested deeper", () => {
+    assert.strictEqual(isConfigDirCodeSetFile("/ws/samples/config/codesets/diets.csv", "/ws", "samples/config", "linux"), true);
+    assert.strictEqual(isConfigDirCodeSetFile("/ws/samples/config/codesets/legacy.toml", "/ws", "samples/config", "linux"), true);
+    assert.strictEqual(isConfigDirCodeSetFile("/ws/samples/config/old/codesets/diets.csv", "/ws", "samples/config", "linux"), false);
+    assert.strictEqual(isConfigDirCodeSetFile("/ws/samples/results_relay/codesets/t.csv", "/ws", ".", "linux"), false);
+    assert.strictEqual(isConfigDirCodeSetFile("/ws/samples/config/CodeSets/diets.csv", "/ws", "samples/config", "linux"), false);
+    assert.strictEqual(isConfigDirCodeSetFile("C:\\ws\\cfg\\CodeSets\\diets.csv", "C:\\ws", "cfg", "win32"), true);
   });
 });

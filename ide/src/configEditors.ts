@@ -30,8 +30,9 @@ import {
   ConnectionListItem,
   codeSetEditorUpsertArgs,
   codeSetNameFromPath,
+  isConfigDirCodeSetFile,
+  isConfigDirConnectionsFile,
   isReadOnlyCodeSet,
-  isUnderConfigDir,
   pickCurrentConnection,
   shouldPushDocumentChange,
 } from "./configEditorModel";
@@ -42,20 +43,21 @@ import {
 const SAVE_GUARD_RESET_MS = 1500;
 
 /**
- * F3 guard: if `document` is NOT under the configured config dir, reopen it in the plain text editor
- * (with a notice) and return true. Both providers read/write via the CLI's `--config <configDir>`, so
- * a same-named file elsewhere in the workspace (the selector globs are workspace-wide) would otherwise
- * be shown — and saved — as the config-dir file. Returns false (proceed with the custom editor) for the
- * canonical in-config-dir file, or when there is no workspace folder (a relative configDir can't be
- * resolved, and the CLI-backed editor is already inert there).
+ * F3 guard: if `document` is NOT the config-dir file the CLI edits (`isConfigDirFile`), reopen it in
+ * the plain text editor (with a notice) and return true. Both providers read/write via the CLI's
+ * `--config <configDir>`, so a same-named file elsewhere in the workspace (the selector globs are
+ * workspace-wide) would otherwise be shown — and saved — as the config-dir file. Returns false (proceed
+ * with the custom editor) for the canonical config-dir file, or when there is no workspace folder (a
+ * relative configDir can't be resolved, and the CLI-backed editor is already inert there).
  */
 function reopenAsTextIfOutsideConfigDir(
   document: vscode.TextDocument,
   panel: vscode.WebviewPanel,
   label: string,
+  isConfigDirFile: (fsPath: string, ws: string, dir: string) => boolean,
 ): boolean {
   const ws = workspaceDir();
-  if (!ws || isUnderConfigDir(document.uri.fsPath, ws, configDir())) {
+  if (!ws || isConfigDirFile(document.uri.fsPath, ws, configDir())) {
     return false;
   }
   void vscode.window.showInformationMessage(
@@ -83,7 +85,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
     panel: vscode.WebviewPanel,
     _token: vscode.CancellationToken,
   ): void {
-    if (reopenAsTextIfOutsideConfigDir(document, panel, "connections.toml")) {
+    if (reopenAsTextIfOutsideConfigDir(document, panel, "connections.toml", isConfigDirConnectionsFile)) {
       return; // F3: not the config-dir file — fell back to the text editor
     }
     panel.webview.options = { enableScripts: true };
@@ -309,7 +311,7 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
     panel: vscode.WebviewPanel,
     _token: vscode.CancellationToken,
   ): void {
-    if (reopenAsTextIfOutsideConfigDir(document, panel, "code-set file")) {
+    if (reopenAsTextIfOutsideConfigDir(document, panel, "code-set file", isConfigDirCodeSetFile)) {
       return; // F3: not under the config dir — fell back to the text editor
     }
     panel.webview.options = { enableScripts: true };
@@ -318,6 +320,9 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
     let savingFromWebview = false;
     let guardTimer: ReturnType<typeof setTimeout> | undefined;
     let lastRendered: string | undefined;
+    // What the grid now shown was rendered with, for the save-time refusals (codeSetEditorUpsertArgs).
+    let renderedReadonly = readonly;
+    let renderedUnloaded = false;
     // The webview↔document loop guard (F5) — see the connections provider above for the rationale.
     const clearGuard = (): void => {
       savingFromWebview = false;
@@ -354,7 +359,10 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           existing = [];
         }
       }
-      panel.webview.html = codeSetFormHtml(panel.webview, detail, readonly || detail?.format === "toml", existing);
+      renderedReadonly = readonly || detail?.format === "toml";
+      // A failed show on a file with content means the grid is the empty fallback, not the file.
+      renderedUnloaded = showError !== undefined && document.getText().trim() !== "";
+      panel.webview.html = codeSetFormHtml(panel.webview, detail, renderedReadonly, existing);
       lastRendered = document.getText();
       if (showError && detail && detail.rows.length === 1) {
         // Only surface the load error when we truly fell back to an empty grid (not a populated one).
@@ -375,7 +383,12 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           if (dir === undefined) {
             return;
           }
-          const upsert = codeSetEditorUpsertArgs(dir, name, readonly, m.detail);
+          const upsert = codeSetEditorUpsertArgs(
+            dir,
+            name,
+            { readonly: renderedReadonly, unloaded: renderedUnloaded },
+            m.detail,
+          );
           if ("error" in upsert) {
             postToWebview(panel.webview, { command: "error", message: upsert.error });
             return;
