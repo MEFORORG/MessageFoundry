@@ -19,7 +19,8 @@ correlation clean. See ``docs/LOAD-TESTING.md``.
 
 from __future__ import annotations
 
-from harness.config.load._shape import NO_PER_HOST_CAP, Shape, apply_transform, load_shape
+from _shape import NO_PER_HOST_CAP, Shape, apply_transform, load_shape
+
 from messagefoundry import MLLP, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.wiring import HandlerFn
