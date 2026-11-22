@@ -37,6 +37,10 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     handlers: 4,
     running: true,
     dry_run: false,
+    // The engine sends both on every reply (ReloadResult defaults), and a reply without them is
+    // unreadable rather than clean (BACKLOG #5836).
+    degraded: false,
+    failures: [],
     restart_required: [],
   };
   // The swap's report for `live`, which follows "promoted" on every outcome of a live swap.
