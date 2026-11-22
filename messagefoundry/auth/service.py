@@ -8787,8 +8787,8 @@ class AuthService:
             # sign-in wrote in this window is applied and audited, and it ends the account's
             # other sessions. When another writer had already moved the roles to this sign-in's
             # set, and the set this sign-in first read was a different one, those sessions were
-            # ended too, with no write and no row of this sign-in's own (``_SignInRoleSync``,
-            # vault BACKLOG #3085).
+            # ended too, with no role write and no ``auth.ad_roles_resynced`` row of this
+            # sign-in's own (``_SignInRoleSync``, vault BACKLOG #3085).
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
             elif federated:
@@ -9050,7 +9050,7 @@ class AuthService:
                 # NOT CLOSED HERE: both sign-ins then run the caller's role resync on one new row.
                 # Its write is a compare-and-set on the roles each read (vault BACKLOG #3085), so
                 # the second either finds the roles at its own set or writes once more against what
-                # it read. Found at its set, it writes nothing, but when the set it first read
+                # it read. Found at its set, it writes no role, but when the set it first read
                 # differs it still revokes and notifies as if it had written them (see
                 # ``_SignInRoleSync``), so it can end the session the first minted. The first's
                 # revoke can likewise end a session the second minted between that write and that

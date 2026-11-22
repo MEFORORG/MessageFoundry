@@ -6106,10 +6106,10 @@ another sign-in or a custom role's deletion, wrote the roles in between, the sig
 again. If they are already at the directory's set, the sign-in writes no role and no
 `auth.ad_roles_resynced` row. It runs the Administrator checks from the roles it first read, and
 when those differ from the directory's set it still ends the account's other sessions and sends
-its notice, so a failed revoke by the other writer cannot leave stale sessions live. Otherwise it
-writes once more against what it
-read, and its `auth.ad_roles_resynced` row, its revoke, its notice and any Administrator alert are
-computed from the roles it replaced. If the roles read after that write are at another set still,
+its notice, so it tries the revoke itself in case the other writer's failed. If the roles it reads
+again are not at the directory's set, it writes once more against what it read, and its
+`auth.ad_roles_resynced` row, its revoke, its notice and any Administrator alert are computed from
+the roles it replaced. If the roles read after that write are at another set still,
 the sign-in is refused with an `auth.login_failed` row whose reason is `role_sync_contended`. A
 record gone or failing its seal when read again after a lost write is refused with
 `account_refused`, and one now ineligible, at least disabled, locked or, off the federated leg,

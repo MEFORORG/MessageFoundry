@@ -595,8 +595,7 @@ async def test_a_sign_in_demotion_whose_role_write_raises_before_it_writes_ends_
     directory removed, so they end before the error is raised. The notice still goes although no
     role changed: the engine errs loud, never open."""
     service, first, grants, _audit_pages = await _signed_in(store, ADMIN)
-    # Through the store, not the service, whose map edit would end ``first`` itself.
-    await store.set_ad_group_role_map([("cn=mf-ops,dc=x", VIEWER)])
+    await _move_map(service, store, first, VIEWER)
     service._security_notifier.sent.clear()
 
     async def refused(*_args: object, **_kwargs: object) -> None:

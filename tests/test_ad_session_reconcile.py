@@ -61,6 +61,7 @@ from messagefoundry.auth.service import (
     _UNANSWERED_OUTCOMES,
     AUTHORITY_SEAL_FAILED_ACTION,
     AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+    DIRECTORY_OBJECT_ID_MISSING,
     SESSIONS_REVOKE_FAILED_ACTION,
     AuthService,
     DirectoryObjectIdMissing,
@@ -7446,7 +7447,7 @@ async def test_a_fault_reading_the_evidence_reports_and_still_writes_the_row(
         await store.close()
 
 
-@pytest.mark.parametrize("reason", ["directory_undetermined", "directory_object_id_missing"])
+@pytest.mark.parametrize("reason", ["directory_undetermined", DIRECTORY_OBJECT_ID_MISSING])
 async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet(reason: str) -> None:
     """The 2026-10-17 ruling names disabled and absent only. An undetermined account's revocation
     that ends no session keeps the 2026-10-16 rule: audited, no notice, no alert. So does one for
@@ -7607,7 +7608,7 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
     ("outcome", "cleared", "returned"),
     [("quiet", True, False), ("reported", True, True), ("skipped", False, False)],
 )
-async def test_a_quiet_revocation_reaches_the_clears_as_applied_and_pages_nobody(
+async def test_a_quiet_revocation_reaches_the_clears_as_applied(
     monkeypatch: pytest.MonkeyPatch, outcome: str, cleared: bool, returned: bool
 ) -> None:
     """Vault BACKLOG #3750 item 3. A quiet revocation's account holds no session now, so the pass
@@ -7620,7 +7621,7 @@ async def test_a_quiet_revocation_reaches_the_clears_as_applied_and_pages_nobody
         service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
         await service.initialize()
         assert await _signed_in_ad_user(service, store, "jdoe") is not None
-        ldap.present.clear()  # the account is disabled in AD
+        ldap.present.clear()  # the directory no longer finds the account
         assert (await service.reconcile_directory_sessions()).revocations == ()  # strike 1
 
         async def applied_as(*_args: Any, **_kwargs: Any) -> str:
