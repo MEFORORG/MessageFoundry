@@ -91,8 +91,13 @@ def relay_results(msg):  # type: ignore[no-untyped-def]
     if not msg.count_segments("OBX"):
         return None  # every result cancelled -> nothing to relay (logged FILTERED)
 
-    # 3) Renumber OBX-1 (Set ID) from 1 within each order, closing the gaps the drops left.
-    for order in msg.groups("OBR"):
+    # 3) Renumber OBX-1 (Set ID) from 1 within each order, closing the gaps the drops left. An OBX
+    #    before the first OBR is in no group, so those leading results form their own run from 1.
+    orders = msg.groups("OBR")
+    leading = msg.count_segments("OBX") - sum(order.count("OBX") for order in orders)
+    for n in range(1, leading + 1):
+        msg.set("OBX-1", str(n), occurrence=n)
+    for order in orders:
         for n in range(1, order.count("OBX") + 1):
             order.set("OBX-1", str(n), occurrence=n)
 

@@ -205,3 +205,21 @@ def test_delete_segments_occurrence_reaches_a_leading_batch_header() -> None:
     msg = Message.parse("FHS|^~\\&|A\rBHS|^~\\&|A\rMSH|^~\\&|A|B|C|D|20260101||ORU^R01|1|P|2.5.1")
     assert msg.delete_segments("FHS", occurrence=1) == 1
     assert msg.segments()[0] == "BHS"
+
+
+def test_an_obx_before_the_first_obr_is_renumbered_too() -> None:
+    # origin/main renumbered every kept OBX. An OBX before the first OBR is in no OBR group, and it
+    # must not keep the gap a dropped result leaves.
+    segments = _relay_raw(
+        "MSH|^~\\&|LABCO|LAB|EHR|HOSP|20260613130000||ORU^R01|MSG6|P|2.5.1\r"
+        "OBX|1|NM|GLU^Glucose^L||95||||||F\r"
+        "OBX|2|NM|K^Potassium^L||4.1||||||X\r"
+        "OBX|3|NM|NA^Sodium^L||140||||||F\r"
+        "OBR|1|ORD1\rOBX|7|NM|CL^Chloride^L||101||||||F"
+    )
+    assert segments[1:] == [
+        "OBX|1|NM|GLUC^Glucose^L||95||||||F",
+        "OBX|2|NM|SOD^Sodium^L||140||||||F",
+        "OBR|1|ORD1",
+        "OBX|1|NM|CHLOR^Chloride^L||101||||||F",
+    ]
