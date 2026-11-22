@@ -12025,9 +12025,9 @@ def _module_failure(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
-    file and line it was raised from, each identifier :func:`_failure_detail` can vouch for, and its
-    fixed note when a folder could not be resolved, but never the exception's text (vault BACKLOG
-    #3249).
+    file and line it was raised from, each identifier :func:`_failure_detail` can vouch for, and
+    its fixed note when a folder it could not resolve may make that location short, but never the
+    exception's text (vault BACKLOG #3249).
 
     The text is author code's, or a library's quoting author data, and can carry any value the module
     held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
@@ -12141,19 +12141,19 @@ def _failure_detail(
     The file is the deepest frame in the config directory, so a failing helper is named rather than
     the config module's import of it. A file name and a line number are layout, not data.
 
-    A file whose folder could not be resolved (:func:`_in_dir`) is not named. When one is deeper
-    than the location named, or no location is named, the detail ends with
-    :data:`_FOLDER_UNRESOLVED`, because the location may then be short (vault BACKLOG #3765,
+    A file whose folder could not be resolved (:func:`_in_dir`) is not named. When one is a frame
+    deeper than the last config-directory frame, or is the file a SyntaxError names, the detail ends
+    with :data:`_FOLDER_UNRESOLVED`, because the location may then be short (vault BACKLOG #3765,
     LF10)."""
     located: tuple[str, int] | None = None
     filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
     lineno = getattr(exc, "lineno", None)
-    # The file a SyntaxError names is deeper than any frame, so it is never outweighed.
+    # A SyntaxError's own file is not a frame, so no config-directory frame outweighs it.
     syntax_file_unresolved = False
-    if isinstance(filename, str) and isinstance(lineno, int):
+    if isinstance(filename, str):
         in_dir = _in_dir(filename, config_dir)
         syntax_file_unresolved = in_dir is None
-        if in_dir is True:
+        if in_dir is True and isinstance(lineno, int):
             located = (filename, lineno)
     deeper_unresolved = False
     if located is None:
@@ -12168,11 +12168,11 @@ def _failure_detail(
                 deeper_unresolved = False
             elif seen[name] is None:
                 deeper_unresolved = True
-    unresolved = syntax_file_unresolved or deeper_unresolved
+    note = _FOLDER_UNRESOLVED if syntax_file_unresolved or deeper_unresolved else ""
     detail = _type_name(exc)
     # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
     if located is None or not isinstance(located[1], int):
-        return detail + _FOLDER_UNRESOLVED if unresolved else detail
+        return detail + note
     source_file, line = located
     if Path(source_file).name != own_file:
         detail += f" in {Path(source_file).name}"
@@ -12188,7 +12188,7 @@ def _failure_detail(
         ]
         if idents:
             detail += " naming " + ", ".join(repr(ident) for ident in idents)
-    return detail + _FOLDER_UNRESOLVED if unresolved else detail
+    return detail + note
 
 
 def _claimed_identifiers(exc: BaseException) -> tuple[object, ...]:
@@ -12269,7 +12269,8 @@ def _in_dir(filename: str, directory: Path) -> bool | None:
 
     ``None`` is not a match, and the names are not compared as text in its place. Nothing is logged
     here: this runs while an interrupt is judged (:func:`_is_a_signal`), where a log call would run
-    a handler a module added, so :func:`_failure_detail` says it in its diagnostic instead.
+    a handler a module added. :func:`_failure_detail` says it in its diagnostic when it may make the
+    location short; the interrupt verdict records nothing of it.
 
     Only an absolute filename counts. The loader's modules record one (the import machinery makes the
     spec's path absolute, even for a config directory given as a relative path), while ``<string>``,

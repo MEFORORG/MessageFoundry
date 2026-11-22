@@ -2242,6 +2242,9 @@ def test_an_exception_never_raised_has_no_origin() -> None:
 #: A folder name ``Path.resolve`` refuses under :func:`unresolvable` (vault BACKLOG #3765, LF10).
 _UNRESOLVABLE = "mefor_unresolvable_3765"
 
+#: Each folder :func:`unresolvable` refused, so a test can show the refusal was reached.
+_REFUSED: list[Path] = []
+
 
 @pytest.fixture
 def unresolvable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
@@ -2249,9 +2252,11 @@ def unresolvable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
 
     No portable name makes ``resolve`` fail on every platform, so it is made to fail for this one."""
     real = Path.resolve
+    _REFUSED.clear()
 
     def resolve(self: Path, strict: bool = False) -> Path:
         if _UNRESOLVABLE in self.parts:
+            _REFUSED.append(self)
             raise OSError("unresolvable folder")
         return real(self, strict)
 
@@ -2277,7 +2282,7 @@ def test_a_folder_that_cannot_be_resolved_is_said_in_the_diagnostic(
     _write(tmp_path, "feed.py", body)
     (msg,) = _messages(tmp_path)
     assert f"RuntimeError at line 2{wiring._FOLDER_UNRESOLVED} (" in msg
-    assert NEEDLE not in msg and _UNRESOLVABLE not in msg
+    assert NEEDLE not in msg and "forged.py" not in msg
 
 
 def test_a_syntax_error_in_a_folder_that_cannot_be_resolved_is_said_too(
@@ -2285,7 +2290,7 @@ def test_a_syntax_error_in_a_folder_that_cannot_be_resolved_is_said_too(
 ) -> None:
     _write(tmp_path, "feed.py", _forged_compile("x = (", unresolvable))
     (msg,) = _messages(tmp_path)
-    assert wiring._FOLDER_UNRESOLVED in msg and _UNRESOLVABLE not in msg
+    assert wiring._FOLDER_UNRESOLVED in msg and "forged.py" not in msg
 
 
 def test_an_unresolved_folder_above_the_named_line_is_not_said(
@@ -2313,6 +2318,7 @@ def test_an_interrupt_raised_in_a_folder_that_cannot_be_resolved_stops_the_load(
     # A raise in a folder nobody could place cannot prove a config file raised it, so it is Ctrl-C.
     _write(tmp_path, "feed.py", _forged(f"raise KeyboardInterrupt({NEEDLE!r})", unresolvable))
     _assert_the_load_stops(tmp_path, caplog)
+    assert _REFUSED, "the folder resolved, so this judged no unresolved one"
 
 
 def test_an_optional_helper_failing_in_a_folder_that_cannot_be_resolved_is_still_tolerated(
@@ -2327,4 +2333,4 @@ def test_an_optional_helper_failing_in_a_folder_that_cannot_be_resolved_is_still
     # The detail recorded for that helper is what an unguarded import of it is refused with.
     _write(tmp_path, "feed_b.py", "def g():\n    import _opt\n")
     (msg,) = [m for m in _messages(tmp_path) if "feed_b" in m]
-    assert wiring._FOLDER_UNRESOLVED in msg and _UNRESOLVABLE not in msg
+    assert wiring._FOLDER_UNRESOLVED in msg and "forged.py" not in msg
