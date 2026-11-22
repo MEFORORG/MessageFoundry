@@ -2784,12 +2784,11 @@ def _run_block(
     the reverse for ``if not TYPE_CHECKING:``. A property accessor def does not replace the property
     (:func:`_is_accessor`). A decorator is resolved at the point its ``def`` runs.
 
-    The TARGET is read `generous`ly, since more live alternatives there can only remove refusals:
-    each prefix of a ``with`` body, of a loop body that holds a ``break`` or ``continue``, and of a
+    The TARGET is read `generous`ly: each prefix of a ``with`` body, of a loop body that holds a ``break`` or ``continue``, and of a
     ``try`` body,
     at any depth inside it, is a live alternative too. The mutation is read without them: a ``with``
     body is read as running whole, and a handler follows only a prefix of the ``try`` body's own
-    statements. `sink`, when given, collects the state before each statement read, at any depth.
+    statements.
 
     A class body is read when its ``class`` statement runs, in a scope of its own that starts from
     the enclosing module scope's bindings (`outer`, or `state` at module level). A function body is
