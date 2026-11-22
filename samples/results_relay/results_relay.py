@@ -124,6 +124,9 @@ def _drop_result(msg, i):  # type: ignore[no-untyped-def]
     # takes the ERROR path) rather than delete another result's rows.
     if any(ids.count(seg) != msg.count_segments(seg) for seg in {"OBX", *children}):
         raise ValueError("a fieldless segment line makes the OBX rows ambiguous")
-    for seg in children:  # each deleted child's next sibling takes its occurrence number
-        msg.delete_segments(seg, occurrence=ids[:at].count(seg) + 1)
-    msg.delete_segments("OBX", occurrence=i)
+    # Each deleted child's next sibling takes its occurrence number. A delete that removes nothing
+    # means the numbering disagreed after all, so refuse rather than relay a cancelled result.
+    deletes = [(seg, ids[:at].count(seg) + 1) for seg in children] + [("OBX", i)]
+    for seg, occurrence in deletes:
+        if msg.delete_segments(seg, occurrence=occurrence) != 1:
+            raise ValueError(f"{seg} occurrence {occurrence} is missing; refusing a partial drop")
