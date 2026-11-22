@@ -1052,10 +1052,12 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
 #: Which namespace each alert control action restarts (BACKLOG #2528).
 _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
 
-#: Which side of the graph raises each alert event type, as its emitters do today (BACKLOG #3378):
-#: ``"outbound"`` only an outbound lane, ``"inbound"`` only an inbound, ``"both"`` an inbound or an
-#: outbound lane, ``"none"`` a key that names no connection. ``GET /alerts/rules`` withholds a rule of an ``"outbound"`` type, or of
-#: a type missing here, from a channel-scoped caller. A test pins this to
+#: Which side of the graph raises each alert event type (BACKLOG #3378). ``"outbound"`` marks a type
+#: whose emitters, read on 2026-11-22, raise it only for an outbound lane. ``GET /alerts/rules``
+#: reads only that value: it withholds a rule of an ``"outbound"`` type, or of a type missing here,
+#: from a channel-scoped caller. The other values are notes, not checked per emitter: ``"inbound"``
+#: and ``"both"`` for the side or sides read, ``"none"`` for a type whose settings comment keys it
+#: on something other than a connection name. A test pins the keys to
 #: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
 _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -1069,12 +1071,14 @@ _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
         "queue_buildup": "both",
         "saturation": "both",
         "lane_stuck": "both",
+        # certs_from_registry keys a certificate on an inbound's or an outbound's name, and on labels
+        # such as "api" that are not connection names.
+        "cert_expiry": "both",
         # Keyed by the inbound's name (config.settings).
         "sandbox_worker_refused": "inbound",
         **dict.fromkeys(
             (
                 "storage_threshold",
-                "cert_expiry",
                 "secret_rotation",
                 "integrity_drift",
                 "gcm_invocations",
