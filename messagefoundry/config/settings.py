@@ -6420,6 +6420,22 @@ class AlertsSettings(_Section):
             return [addr.strip() for addr in v.split(",") if addr.strip()]
         return v
 
+    @field_validator("webhook_url")
+    @classmethod
+    def _webhook_url_is_https(cls, v: str | None) -> str | None:
+        """Vault BACKLOG #3533 item 14: refuse a non-https webhook at load, not only at notifier build.
+
+        ``WebhookTransport`` refuses the same URL when the API lifespan builds the notifier, so a
+        settings load, ``check`` and the serve pre-flight passed it before. An empty value stays
+        "not configured", as every consumer reads it. The message names neither the URL nor its
+        scheme, because the path can hold the webhook's token."""
+        if v and urlsplit(v).scheme.lower() != "https":
+            raise ValueError(
+                "[alerts].webhook_url must be an https URL; the value is not repeated here, since "
+                "its path can carry the webhook's token. Refused, with no escape"
+            )
+        return v
+
     @model_validator(mode="after")
     def _refuse_a_login_over_an_unauthenticated_hop(self) -> AlertsSettings:
         """Vault BACKLOG #3533 item 3: a login never crosses a hop that does not authenticate the relay.
