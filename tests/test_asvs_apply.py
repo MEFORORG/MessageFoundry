@@ -3593,3 +3593,159 @@ def test_a_hash_inside_a_string_is_not_a_comment(tmp_path: Path, value: str) -> 
     assert "note" in _cell_after_apply(rec), "the fixture splice did not parse"
     rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
     assert rc == 0
+
+
+# --- BACKLOG #5867: an anchor repair may omit the prose it must not change --------------------------
+#
+# The byte-identity loop reads an omitted prose field as the record's value, so it allows the
+# omission. `render` read the ordered fields from the payload alone and dropped them, and the
+# key-set guard then refused the write as field loss. The carry is for a DECLARED repair and for
+# OMISSION only. Each refusal below is pinned because a wider carry would silently pass it.
+
+
+def _repair_omitting(*fields: str, **over: object) -> dict:
+    """A declared repair of 1.1.1 that re-points its anchors and leaves out `fields`."""
+    cell = _cell_with_repair(**over)
+    for field in fields:
+        del cell[field]
+    return cell
+
+
+@pytest.mark.parametrize("omitted", [("reviewed_by",), ("residual",), ("reviewed_by", "residual")])
+def test_an_anchor_repair_omitting_prose_keeps_the_live_value(
+    tmp_path: Path, omitted: tuple[str, ...]
+) -> None:
+    rec = _record(tmp_path)
+    before = _cell_after_apply(rec)
+    repair = _repair_omitting(*omitted)
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    after = _cell_after_apply(rec)
+    assert after["residual"] == before["residual"]
+    assert after["reviewed_by"] == before["reviewed_by"]
+    assert after["evidence"][0]["line"] == 11, "the repair itself did not land"
+
+
+@pytest.mark.parametrize("live_line", ['residual = ""', 'residual = ["a", "b"]', "residual = 7"])
+def test_an_anchor_repair_carries_a_live_residual_at_its_own_type(
+    tmp_path: Path, live_line: str
+) -> None:
+    """`toml_str` coerces, and the type guard exempts ordered fields because of it, so a carry
+    through it would rewrite a non-string value as its repr with nothing refusing."""
+    rec = _record(tmp_path)
+    text = FIXTURE.replace('residual = "a control exists but ships off"', live_line)
+    rec.write_text(text, encoding="utf-8")
+    before = _cell_after_apply(rec)["residual"]
+    repair = _repair_omitting("residual")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    after = _cell_after_apply(rec)["residual"]
+    assert type(after) is type(before) and after == before
+
+
+def test_an_anchor_repair_refuses_a_carry_toml_cannot_round_trip(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A TOML date has no emission here and would come back a string. Ordered fields are exempt
+    from the type guard, so only the carry's own check stands between that and the record."""
+    rec = _record(tmp_path)
+    text = FIXTURE.replace('residual = "a control exists but ships off"', "residual = 2026-01-01")
+    rec.write_text(text, encoding="utf-8")
+    before = rec.read_bytes()
+    repair = _repair_omitting("residual")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert "would CHANGE carried field(s) ['residual']" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("field", ["residual", "reviewed_by"])
+def test_an_ordinary_payload_omitting_prose_is_still_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str
+) -> None:
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111()
+    del cell[field]
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert f"missing {field}" in out or f"would LOSE field(s) ['{field}']" in out, out
+
+
+@pytest.mark.parametrize(
+    ("field", "empty"),
+    [("residual", ""), ("reviewed_by", ""), ("reviewed_by", {}), ("residual", None)],
+)
+def test_an_explicit_empty_in_an_anchor_repair_is_still_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str, empty: object
+) -> None:
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    repair = _repair_omitting(**{field: empty})
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert f"{field!r} differs from the record" in capsys.readouterr().out
+
+
+def test_an_anchor_repair_omitting_residual_on_a_closed_cell_is_still_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The closed-cell guard reads an omitted residual as a change, and this row leaves it so.
+    The fixture's closed cell is `na`, where the rationale check would refuse first, so a `pass`
+    closure isolates the closed-cell guard."""
+    rec = _record(tmp_path)
+    rec.write_text(FIXTURE.replace('verdict = "na"', 'verdict = "pass"'), encoding="utf-8")
+    before = rec.read_bytes()
+    repair = {
+        "id": "5.4.3",
+        "level": 2,
+        "verdict": "pass",
+        "last_verified": "2026-08-02",
+        "verified_at": "5555555555555555555555555555555555555555",
+        "anchor_repair": True,
+        "anchor_repaired_at": _REPAIR_DATE,
+        "evidence": [{"path": "messagefoundry/m.py", "line": 31, "expect": "_no_scan"}],
+    }
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "is decision_closed and this edit changes ['residual']" in out, out
+
+
+def test_an_anchor_repair_omitting_an_na_rationale_is_still_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = _record(tmp_path)
+    rec.write_text(FIXTURE.replace('verdict = "partial"', 'verdict = "na"'), encoding="utf-8")
+    before = rec.read_bytes()
+    repair = _repair_omitting("residual", verdict="na")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert "verdict 'na' requires a written rationale" in capsys.readouterr().out
+
+
+def test_a_verdict_move_that_empties_the_residual_is_still_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """TODAY'S REFUSAL, PINNED. Excusing it would relax a fail-closed guard and awaits an owner
+    ruling under BACKLOG #5867, so a change here is that decision and not a cleanup."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(verdict="pass", residual="")
+    rc = main(
+        [
+            str(_payload(tmp_path, [cell])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-verdict-change",
+        ]
+    )
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert "would LOSE field(s) ['residual']" in capsys.readouterr().out

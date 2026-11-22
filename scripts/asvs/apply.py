@@ -240,6 +240,14 @@ def _held(key: str, payload: dict[str, Any], live: dict[str, Any]) -> bool:
     return _same(payload[key], live.get(key, _ABSENT))
 
 
+def _repair_carry(cell: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
+    """The optional ordered fields a declared repair omits, at the record's value (BACKLOG #5867).
+    One definition, so `main` checks exactly what `render` carried."""
+    if not cell.get("anchor_repair"):
+        return {}
+    return {k: live[k] for k in _OPTIONAL_ORDERED if k in live and k not in cell}
+
+
 #: Keys the WRITER CONSUMES AS INSTRUCTIONS rather than storing as record fields (BACKLOG #1369).
 #:
 #: `--allow-retirement` requires the payload to DECLARE what it is retiring, and `:468` reads that
@@ -531,9 +539,18 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     # does not make one usable. A literal-string id the regex does read is escaped here too, so
     # `main` re-reads the spliced text's blocks and refuses a write that would lose one (BACKLOG
     # #5455).
+    #
+    # A DECLARED REPAIR MAY OMIT THE OPTIONAL PROSE, AND THE RECORD'S VALUE IS THEN KEPT (BACKLOG
+    # #5867). `main`'s byte-identity loop already reads an omission as the live value. Only a key the
+    # payload does not hold is carried: an explicit empty is a change, which that loop refuses, and
+    # an ordinary payload still has to state these. Written by `_scalar`, because `toml_str` would
+    # coerce a non-string to its repr under a type guard that exempts ordered fields.
+    kept = _repair_carry(cell, live or {})
     out = ["[[cell]]"]
     for key in _ORDERED:
-        if key == "level":
+        if key in kept:
+            out.append(_scalar(key, kept[key]))
+        elif key == "level":
             out.append(f"level = {int(cell[key])}")
         elif key == "reviewed_by" and isinstance(cell.get(key), dict) and cell[key]:
             out.append(f"reviewed_by = {_reviewed_by_table(cell[key])}")
@@ -1430,6 +1447,12 @@ def main(argv: list[str] | None = None) -> int:
                     "re-run with --allow-retirement"
                 )
             print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}{route}")
+            return 1
+        # WHAT A REPAIR CARRIED MUST COME BACK IDENTICAL (BACKLOG #5867). The type guard below skips
+        # `_ORDERED`, and `_toml_value` writes a TOML date as a string, so nothing else would see it.
+        changed_carry = [k for k, v in _repair_carry(c, was).items() if not _same(now.get(k), v)]
+        if changed_carry:
+            print(f"REFUSING: cell {c['id']} would CHANGE carried field(s) {changed_carry}")
             return 1
         # A STRUCTURED reviewed_by MUST COME BACK AS THE TABLE THE PAYLOAD STATED (BACKLOG #2168).
         # The type guard below skips `_ORDERED` because `render` coerces those fields to strings, and
