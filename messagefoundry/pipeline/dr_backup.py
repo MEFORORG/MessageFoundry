@@ -6641,8 +6641,9 @@ def _config_lock_problem(path: Path, dir_grants: Sequence[str] | None) -> str | 
     """Why the restored config file ``path`` does not carry the lock just applied, or ``None``.
 
     The lock functions log rather than raise, so this reads the result back. With ``dir_grants`` the
-    file must carry exactly those principals. Without them, on Windows it must carry one protected
-    full-control entry for this process's account, and on POSIX no group or other permission bit.
+    file must carry exactly those principals. Without them, on Windows its protected list must give
+    this process's account full control and name nobody but it, SYSTEM and Administrators, and on
+    POSIX it must have no group or other permission bit.
     Anything that cannot be read is a problem: an unconfirmed lock is not a lock."""
     from messagefoundry.store.store import (
         _current_user_sid,
@@ -6666,15 +6667,19 @@ def _config_lock_problem(path: Path, dir_grants: Sequence[str] | None) -> str | 
     account = _current_user_sid()
     if account is None:
         return "this process's account could not be read"
+    # The lock removes inherited entries only, so an explicit one for SYSTEM or Administrators can
+    # survive it, and those two reach every file anyway. SDDL writes some accounts as an alias
+    # (`NS`, `LA`), which only Windows can expand.
+    allowed = {account, "S-1-5-18", "S-1-5-32-544"}
+    sids = [atomic_edit._canonical_sid(sid) for _type, _flags, _rights, sid in parsed.aces]
     if (
         parsed.protected
-        and len(parsed.aces) == 1
-        and parsed.aces[0][:3] == ("A", "", "FA")
-        # SDDL writes some accounts as an alias (`NS`, `LA`), which only Windows can expand.
-        and atomic_edit._canonical_sid(parsed.aces[0][3]) == account
+        and all(ace[0] == "A" for ace in parsed.aces)
+        and set(sids) <= allowed
+        and any(s == account and a[2] == "FA" for s, a in zip(sids, parsed.aces, strict=True))
     ):
         return None
-    return "its access list is not the one owner-only entry the lock writes"
+    return "its access list is not limited to this account, SYSTEM and Administrators"
 
 
 def _extract_config_members(
@@ -6705,10 +6710,12 @@ def _extract_config_members(
     On Windows a name :func:`~messagefoundry.parsing.sniff.windows_member_name_reason` refuses is
     refused too, so a member cannot land as an alternate data stream of another (BACKLOG #5618).
 
-    The restored bundle can carry secrets (``connections.toml``), so each file is locked: to the
-    grants of a hardened ``config_dest`` (:func:`~messagefoundry.store.store._store_dir_grants`), so
-    the service account keeps its access, and otherwise to its owner. A lock that
-    :func:`_config_lock_problem` cannot confirm refuses the restore.
+    The restored bundle can carry secrets (``connections.toml``), so each file is locked. Where the
+    destination, or the nearest directory above it that exists when this runs, has the store data
+    directory's hardened shape (:func:`~messagefoundry.store.store._store_dir_grants`), the file
+    takes those grants. Anywhere else it is locked to its owner, and that includes a directory with
+    the installer's read-only config shape, so a service account would not keep access there. A
+    lock that :func:`_config_lock_problem` cannot confirm refuses the restore.
 
     **A hard-link member is restored, never skipped (vault BACKLOG #5233).** ``tar.add`` stores the
     second name of a hard-linked file as a link member (``LNKTYPE``) naming the first, and this loop
@@ -6729,7 +6736,9 @@ def _extract_config_members(
     from messagefoundry.store.store import _secure_store_file, _store_dir_grants
 
     # Read once, before the mkdir, from the nearest directory that exists: one made here only
-    # inherits and would read as not hardened. Unresolved, so a link on the way still reads as one.
+    # inherits and would read as not hardened. The restore's staging may already have made the
+    # destination's parent, and that case falls back to owner-only. Unresolved, so a link on the
+    # way still reads as one.
     grants_from = config_dest
     while not grants_from.exists() and grants_from != grants_from.parent:
         grants_from = grants_from.parent
@@ -6756,8 +6765,8 @@ def _extract_config_members(
                 raise BackupError(
                     "restore", f"archive carries an unsafe config member name ({reason})"
                 )
-            # Only where this restore writes to Windows: the name is judged for this destination,
-            # and a POSIX host opens `aux.py` or `a:b` as the plain file it names.
+            # Keyed on the host, so a POSIX backup's legal `aux.py` or `a:b` stays restorable there.
+            # A POSIX mount of an NTFS volume that exposes streams is not covered.
             reason = windows_member_name_reason(rel) if sys.platform == "win32" else None
             if reason is not None:
                 # Named, because a real config file can have such a name.

@@ -167,6 +167,9 @@ def test_an_unreadable_access_list_is_not_a_lock(
     [
         # NETWORK SERVICE is written as an alias, and is still this account.
         ("O:NSD:PAI(A;;FA;;;NS)", True),
+        ("O:NSD:PAI(A;;FA;;;NS)(A;;FA;;;SY)(A;;FA;;;BA)", True),  # explicit entries that survive
+        ("O:NSD:PAI(A;;FA;;;SY)", False),  # this account is not on it
+        ("O:NSD:PAI(A;;FA;;;NS)(D;;FA;;;SY)", False),  # a deny entry is not the lock's shape
         ("O:NSD:PAI(A;;FA;;;LS)", False),  # another account
         ("O:NSD:PAI(A;;FA;;;NS)(A;;FR;;;BU)", False),  # a second entry
         ("O:NSD:AI(A;;FA;;;NS)", False),  # still inheriting
