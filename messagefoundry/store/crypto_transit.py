@@ -307,11 +307,12 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
 
 
 def _plaintext(value: object) -> str | None:
-    """Transit's base64 ``plaintext`` as text, or ``None`` when it is not base64 of UTF-8. Never
-    raises, so no error carries the decrypted bytes (BACKLOG #2085)."""
+    """Transit's base64 ``plaintext`` as text, or ``None`` when it is not strict base64 of UTF-8
+    (BACKLOG #5964). Never raises, so no error carries the decrypted bytes (BACKLOG #2085)."""
     # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a value that is not text.
+    # validate=True: the default drops characters outside the alphabet, so "!!!!" would open as "".
     with contextlib.suppress(ValueError, TypeError):
-        return base64.b64decode(value).decode("utf-8")  # type: ignore[arg-type]
+        return base64.b64decode(value, validate=True).decode("utf-8")  # type: ignore[arg-type]
     return None
 
 
