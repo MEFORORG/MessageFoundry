@@ -673,8 +673,8 @@ def resolved_secret_refs(settings: ServiceSettings) -> list[str]:
     A reference counts only where its credential is resolved: the AD bind password with AD on, and
     with OIDC on the client secret or, under ``private_key_jwt``, the signing key. The SMTP
     password's reference is resolved whenever ``[alerts]`` is read, with or without an SMTP
-    transport, because ``notifier_from_settings`` resolves it before it decides which transports to
-    build. The single reader: the ``settings:vault.secrets`` hop here
+    transport, because ``notifier_from_settings`` resolves it whether or not an SMTP transport is
+    configured. The single reader: the ``settings:vault.secrets`` hop here
     and the least-privilege table in ``privilege_check`` both call it."""
     auth, alerts = settings.auth, settings.alerts
     oidc_ref = (

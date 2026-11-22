@@ -370,9 +370,9 @@ def test_secret_provider_is_runtime_checkable() -> None:
 # The AD LDAP consumer has a fail-closed-through-the-real-consumer test
 # (test_ldap_authenticator_unresolvable_reference_fails_closed); these give the two SMTP consumers
 # the same coverage. Both notifier_from_settings and security_notifier_from_settings call
-# resolve_connector_secret before any EmailTransport is built, so a bad
+# resolve_connector_secret before they build the SMTP side, so a bad
 # [alerts].email_password_secret reference must propagate SecretProviderError (no blank-credential
-# sink). No production change.
+# sink).
 
 
 def test_notifier_unresolvable_reference_fails_closed() -> None:
