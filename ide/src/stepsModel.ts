@@ -113,14 +113,20 @@ export interface LensRow {
  * (a step after it is dead code); this keys that suppression on return-statement-ness, NOT on the `send`
  * kind — so an append (a real middle-of-body step) allows insert-after. Orthogonal to read-only-ness,
  * which keys on `scaffold`/`kind`. A row with neither flag (every estate return) reads as a return, so
- * behaviour is unchanged. Accepts a minimal shape so DOM-derived contexts (RowDropContext) can call it.
+ * behaviour is unchanged. A Router's `route` row is its return statement (the lens emits one only for a
+ * `return`), so it is a return too (BACKLOG #5838). Accepts a minimal shape so DOM-derived contexts
+ * (RowDropContext) can call it.
  */
 export function isReturnRow(row: {
   kind: RowKind;
   appended?: boolean;
   scaffold?: string;
 }): boolean {
-  return (row.kind === "send" && row.appended !== true) || row.scaffold === "return_collector";
+  return (
+    (row.kind === "send" && row.appended !== true) ||
+    row.kind === "route" ||
+    row.scaffold === "return_collector"
+  );
 }
 
 /** One `@handler`'s contract: its registered name, def line, and ordered rows. */
@@ -1978,9 +1984,8 @@ export function contextMenuEnablement(
     insertBefore: true,
     // Insert AFTER is suppressed on a terminal return (a returned send OR the `return sends` footer) — a
     // step after it is dead code — but ALLOWED on a mid-body `sends.append(...)` (ADR 0104), which is a
-    // normal step, not a return.
-    // A `route` row is a return too: a step after a routing return is dead code.
-    insertAfter: !isReturnRow(row) && row.kind !== "route",
+    // normal step, not a return. A Router's `route` row is a return ({@link isReturnRow}).
+    insertAfter: !isReturnRow(row),
     deleteRow: isRowMutable(row) && !isBindingRead(row),
     moveUp: ctx.canMoveUp && !isBindingRead(row),
     moveDown: ctx.canMoveDown && !isBindingRead(row),
