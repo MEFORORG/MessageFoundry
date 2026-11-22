@@ -251,6 +251,14 @@ def test_refs_are_explicit_and_python_splits_on_commas() -> None:
     assert "'mf-dashboard-build-'" in build and "'mf-dashboard-'" not in build
 
 
+def test_both_ps_sweeps_age_by_creation_time() -> None:
+    # A partial sweep moves the last-write time to now, so neither sweep may read it.
+    for name in ("build.ps1", "scheduled-refresh.ps1"):
+        text = (_DIR / name).read_text(encoding="utf-8")
+        assert "$_.CreationTimeUtc -lt $cutoff" in text, name
+        assert "LastWriteTimeUtc -lt" not in text, name
+
+
 def test_a_failed_fetch_turns_a_clean_run_red() -> None:
     text = (_DIR / "scheduled-refresh.ps1").read_text(encoding="utf-8")
     assert "if ($code -eq 0 -and $fetchFailed) { $code = 3 }" in text

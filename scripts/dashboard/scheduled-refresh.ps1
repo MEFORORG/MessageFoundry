@@ -78,10 +78,12 @@ function Remove-StaleTemp([string]$Base, [string]$Prefix) {
     # A run killed by the task's time limit skips its finally. Two hours is past any live run.
     # build.ps1 holds a stricter sweep for its own prefix, which fails its run, because that
     # directory holds a private snapshot. This one only reports: mf-dashboard-src-* holds the
-    # archived engine scripts. This file must stand alone once installed.
+    # archived engine scripts. This file must stand alone once installed. Aged by creation time,
+    # as build.ps1 ages its own: a sweep that removes only part of a directory moves its
+    # last-write time to now, which would hide the leftover from the next run.
     $cutoff = [DateTime]::UtcNow.AddHours(-2)
     Get-ChildItem -LiteralPath $Base -Directory -Filter "$Prefix*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTimeUtc -lt $cutoff -and -not $_.LinkType } |
+        Where-Object { $_.CreationTimeUtc -lt $cutoff -and -not $_.LinkType } |
         ForEach-Object {
             Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
             if (Test-Path -LiteralPath $_.FullName) {
