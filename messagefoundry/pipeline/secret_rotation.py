@@ -313,7 +313,7 @@ async def open_rotation_record(
     does not, so no start stamps it. ``False`` where the stamp already names ``key_id``, a record
     naming it too included, as a run killed between its stamp and its close leaves them, and where
     it kept a record open for another key. ``rotate-key`` reads it before it names a way out of the
-    record (BACKLOG #4934, #4935)."""
+    record, and before ``--close-without-roll`` closes it (BACKLOG #4934, #4935)."""
     fingerprint = dek_fingerprint(key_id)
     rows = await meta_store.get_secret_rotation_meta()
     record = rows.get(ROTATION_RECORD_ID)
@@ -335,7 +335,8 @@ async def open_rotation_record(
 
 async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -> None:
     """Close the rotation record, once a whole ``rotate-key`` run is done and stamped (BACKLOG
-    #3737). The row is blanked, not deleted: the store protocol has no delete, and a blank reads as
+    #3737), or, under ``--close-without-roll``, before the stamp of a run whose roll refused for
+    good (BACKLOG #4935), so a run stopped between the two leaves the key unstamped. The row is blanked, not deleted: the store protocol has no delete, and a blank reads as
     no rotation in progress. Writes nothing where none is open."""
     record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
     if _record_open(record):

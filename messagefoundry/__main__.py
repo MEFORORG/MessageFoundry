@@ -1033,8 +1033,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--close-without-roll",
         default=None,
         metavar="REASON",
-        help="close the rotation record, with an audit row carrying REASON, when this run "
-        "re-seals the data with no skip and its audit chain step refuses in a way no run clears, "
+        help="close the rotation record, with an audit row carrying REASON, when the record "
+        "holds this run's key, this run re-seals the data with no skip and its audit chain step refuses in a way no run clears, "
         "under any key (BACKLOG #4935). It records the key as a completed run does. "
         "It rolls nothing and repairs nothing in the chain, and the run still exits 1",
     )
@@ -12609,7 +12609,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "MEFOR_STORE_TRANSIT_AUDIT_KEY is set to the name of a different Transit key, and set "
             "empty or to the data key's own name it is still the data key. Trimming a version off "
             "either key does the same to what it sealed or MACed, and the engine cannot undo it; "
-            "a restore of a Vault snapshot taken before the trim may bring the version back. "
+            "a restore of a Vault snapshot taken before the trim may bring the version back, "
+            "and also returns everything else in Vault, every later key version included, to "
+            "that point. "
             "docs/SECURITY.md, under "
             f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
             "does to the attestation. Nothing was changed.",
