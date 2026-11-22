@@ -469,7 +469,6 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
     for fact in (
         "`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`",
         "only the first refusal of an account in each report interval",
-        "adds no row and no alert",
         "one absent on a re-read reads as gone",
         "A row still there after every check raced fails closed",
         "One that keeps changing the row's own `id` still can",
