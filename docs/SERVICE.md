@@ -487,10 +487,11 @@ directory to the service account only, as the installer does.
 
 The engine resolves the account with `LookupAccountSid` each time it opens the store. It refuses
 the directory at least when the lookup fails, when the account resolves to anything but a user, such as a
-group, or when the directory names a second account. A refused directory gets a store restricted
-by `_secure_file` (see ADR 0163, *Note (2026-11-05)*), and the engine logs a WARNING naming the
-reason. Then the service and the operator who provisions the first Administrator can lock each
-other out of the store.
+group, or when the directory names a second account. In a refused directory the engine removes
+each store file's inherited entries and grants the account that opened the store full control of
+it, and any other entry set on the file itself stays (see ADR 0163, *Note (2026-11-05)*). It
+logs a WARNING naming the reason. Then the service and the operator who provisions the first
+Administrator can lock each other out of the store.
 
 At least these are unmeasured:
 
@@ -501,8 +502,8 @@ At least these are unmeasured:
 - **A start with no domain controller.** A gMSA resolves through a domain controller, or through
   the local lookup cache when no controller answers, and a slow or absent controller can delay
   the open or fail the lookup. A later start does not always repair what a failed lookup leaves.
-  Why a time-out can read as an account that does not exist, and what a store restricted by
-  `_secure_file` leaves on each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
+  Why a time-out can read as an account that does not exist, and what that restriction leaves on
+  each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 
