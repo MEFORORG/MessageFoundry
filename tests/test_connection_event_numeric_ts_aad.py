@@ -3,8 +3,9 @@
 """A connection event's sealed reason opens whatever numeric spelling its timestamp was written in.
 
 BACKLOG #5962 fixed this in ``store/crypto.py``'s ``_aad_component``: the column hands back a float,
-so an ``int`` or ``-0.0`` written into it must bind the same AAD. This runs that shared code through
-the SQLite store only. It does not exercise SQL Server, the backend BACKLOG #5690 names.
+so an ``int`` or ``-0.0`` written into it must bind the same AAD. This pins that shared code through
+the SQLite store's write and read only. SQL Server, Postgres and key rotation are not covered, so
+this test does not close BACKLOG #5690.
 """
 
 from __future__ import annotations

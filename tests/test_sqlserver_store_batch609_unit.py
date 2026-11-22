@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""SQL Server store fixes that need no live server: BACKLOG #5663, #5666, #5672, #5675, #5692.
+"""SQL Server store fixes that need no live server: BACKLOG #5663, #5666, #5667, #5672, #5675, #5692.
 
 * #5663: ``_SyncHandoffPool.acquire`` keeps its slot when the lazy reconnect of a placeholder
   raises, and discards a connection a BaseException left mid-transaction.
 * #5666: ``_ensure_database_options`` bounds its one-shot connections by
   ``[store].command_timeout`` and keeps raw driver text out of its errors and logs.
-* #5672, #5675, #5692: three writes read their match from ``OUTPUT`` rather than
+* #5667, #5672, #5675, #5692: four writes read their match from ``OUTPUT`` rather than
   ``cursor.rowcount``, which a session-wide ``SET NOCOUNT ON`` reports as ``-1``. The fake cursor
-  below always reports ``-1``, the NOCOUNT reading. The live counterparts are in
-  ``tests/test_sqlserver_store.py`` and run only on the gated SQL Server legs.
+  below always reports ``-1``, the NOCOUNT reading. The live counterparts of #5672, #5675 and #5692
+  are in ``tests/test_sqlserver_store.py`` and run only on the gated SQL Server legs. No live test
+  there runs the #5667 ingress incref under NOCOUNT.
 """
 
 from __future__ import annotations
