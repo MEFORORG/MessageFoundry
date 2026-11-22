@@ -307,21 +307,24 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
 
 
 #: The ASCII whitespace :func:`_plaintext` removes: space, tab, CR and LF, and no other character.
-_B64_WHITESPACE = str.maketrans("", "", " \t\r\n")
+_B64_WHITESPACE = " \t\r\n"
 
 
 def _plaintext(value: object) -> str | None:
     """Transit's base64 ``plaintext`` as text, with :data:`_B64_WHITESPACE` removed first, since a
     hop that rewraps the reply leaves the same bytes (BACKLOG #5964). ``None`` for at least a
-    value that is not text, any other character outside the alphabet, bad padding, or bytes that
-    are not UTF-8. Non-zero trailing bits in the last character are still accepted, and a reply of
-    whitespace alone opens as the empty string. Never raises, so no error carries the decrypted
-    bytes (BACKLOG #2085)."""
+    value that is neither text nor bytes-like, any other character outside the alphabet, bad
+    padding, or bytes that are not UTF-8. A bytes-like value has no whitespace removed. Non-zero
+    trailing bits in the last character are still accepted, and a reply of whitespace alone opens
+    as the empty string. Short of running out of memory it never raises, so no error carries the
+    decrypted bytes (BACKLOG #2085)."""
     # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a value that is not text.
     # validate=True: the default drops characters outside the alphabet, so "!!!!" would open as "".
     with contextlib.suppress(ValueError, TypeError):
-        text = value.translate(_B64_WHITESPACE) if isinstance(value, str) else value
-        return base64.b64decode(text, validate=True).decode("utf-8")  # type: ignore[arg-type]
+        # Checked first so a clean reply, the normal case, is not copied on the event loop.
+        if isinstance(value, str) and any(c in value for c in _B64_WHITESPACE):
+            value = value.translate(str.maketrans("", "", _B64_WHITESPACE))
+        return base64.b64decode(value, validate=True).decode("utf-8")  # type: ignore[arg-type]
     return None
 
 
