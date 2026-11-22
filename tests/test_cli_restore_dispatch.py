@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ctypes
 import inspect
 import io
 import json
@@ -1393,6 +1394,13 @@ def test_win32_path_key_is_pure_and_matches_win32_naming(path, key) -> None:
     assert dr_backup._win32_path_key(path) == key
 
 
+def test_win32_path_key_does_not_pick_final_sigma_by_context() -> None:
+    # `str.lower` on the whole name would give U+03C2 here, a key U+03C3 could not match.
+    assert dr_backup._win32_path_key("data\u03a3-wal") == dr_backup._win32_path_key(
+        "data\u03c3-wal"
+    )
+
+
 _WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="Win32 path aliasing")
 
 
@@ -1433,6 +1441,64 @@ def test_restore_passes_a_config_member_that_only_resembles_a_store_path(tmp_pat
     d = tmp_path / "dr"
     d.mkdir()
     dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+
+
+@_WINDOWS_ONLY
+def test_restore_refuses_an_alias_of_a_store_nested_below_config_to(tmp_path) -> None:
+    tar = _plain_tar(tmp_path / "forged.tar", [("config/sub/store.db-wal.", b"x")])
+    d = tmp_path / "dr"
+    (d / "sub").mkdir(parents=True)
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "sub" / "store.db", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+def test_restore_refuses_an_alias_through_a_short_name_parent(tmp_path) -> None:
+    d = tmp_path / "dr"
+    parent = d / "restored-store-longname"
+    parent.mkdir(parents=True)
+    buf = ctypes.create_unicode_buffer(600)
+    size = ctypes.windll.kernel32.GetShortPathNameW(str(parent), buf, 600)  # type: ignore[attr-defined]
+    short = Path(buf.value).name
+    if not size or short == parent.name:
+        pytest.skip("this volume has no 8.3 name for the directory")
+    tar = _plain_tar(tmp_path / "forged.tar", [(f"config/{short}/store.db-wal.", b"x")])
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, parent / "store.db", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+def test_restore_protects_the_sidecar_of_a_to_path_with_a_trailing_dot(tmp_path) -> None:
+    tar = _plain_tar(tmp_path / "forged.tar", [("config/store.db-wal", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "store.db.", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+def test_alias_refusal_does_not_echo_the_member_name(tmp_path) -> None:
+    tar = _plain_tar(tmp_path / "forged.tar", [("config/store.db-wal:\x1b[2Jforged\nERROR", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+    message = str(excinfo.value)
+    assert excinfo.value.kind == "destination"
+    assert "\x1b" not in message and "forged" not in message and "\n" not in message
+
+
+@_WINDOWS_ONLY
+def test_alias_check_exempts_the_operators_own_config_to_path(tmp_path) -> None:
+    # The exemption's control: this member adds nothing protected, and `--config-to` at a sidecar
+    # path is the operator's spelling, which this archive-name check leaves as `main` has it.
+    tar = _plain_tar(tmp_path / "ok.tar", [("config/a.toml", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    dr_backup._refuse_colliding_config_members(tar, d / "store.db", d / "store.db-wal")
 
 
 # --- (5b-ter) vault BACKLOG #5233 item 3: the no-config refusal is not a closed list --------------

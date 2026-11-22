@@ -6446,15 +6446,19 @@ def _refuse_colliding_config_members(
     }
     seen: set[str] = set()
     try:
-        win32_root: str | None = None
         win32_root_key: tuple[str, ...] = ()
         win32_published: set[tuple[str, ...]] = set()
+        win32_depth = 0  # the store key's length; 0 off Windows, where this comparison never runs
         if sys.platform == "win32":
-            win32_root = str(_norm_for_compare(config_dest))
-            win32_root_key = _win32_path_key(win32_root)
-            win32_published = {_win32_path_key(str(p)) for p in published}
-        # Only these depths can match, so a forged very deep name costs one slice per length.
-        win32_depths = {len(k) for k in win32_published}
+            win32_root_key = _win32_path_key(str(config_dest.resolve()))
+            store_key = _win32_path_key(str(dest_store_path.resolve()))
+            # Sidecars are suffixed AFTER normalizing: SQLite names them from the file Windows
+            # placed, so `--to D/store.db.` has its WAL at `store.db-wal`, not `store.db.-wal`.
+            win32_published = {
+                store_key,
+                *(store_key[:-1] + (store_key[-1] + s,) for s in _SIDECAR_SUFFIXES),
+            }
+            win32_depth = len(store_key)
         with tarfile.open(tar_path, "r:") as tar:
             for member in tar.getmembers():
                 if not _is_config_payload_member(member):
@@ -6473,20 +6477,20 @@ def _refuse_colliding_config_members(
                 rel = member.name[len(_CONFIG_PREFIX) :]
                 out = config_dest / rel
                 exact = _norm_for_compare(out) in published
-                if not exact and win32_root is not None:
-                    key = _win32_path_key(f"{win32_root}\\{rel}")
+                if not exact and win32_depth:
+                    # Resolved first, so an 8.3 spelling of an existing parent is expanded.
+                    prefix = _win32_path_key(str(out.resolve()))[:win32_depth]
                     # A prefix equal to the root's own is the operator's path, not the member's.
-                    if any(
-                        key[:n] in win32_published and key[:n] != win32_root_key[:n]
-                        for n in win32_depths
-                    ):
+                    if prefix in win32_published and prefix != win32_root_key[:win32_depth]:
+                        # The member's name is not echoed: unlike the exact match below, this arm
+                        # is reachable by a name still carrying control characters.
                         raise BackupError(
                             "destination",
-                            f"the archive's config bundle carries a member at {out}, which Windows "
-                            "resolves to or under a path this restore publishes for the store "
-                            f"({dest_store_path}) — it could replace or corrupt the database this "
-                            "restore just verified. Choose a --config-to directory that does not "
-                            "contain the --to path",
+                            "the archive's config bundle carries a member that Windows resolves "
+                            "to or under a path this restore would publish for the store "
+                            f"({dest_store_path}), so it could replace or corrupt the restored "
+                            "database. Nothing was extracted. Choose a --config-to directory that "
+                            "does not contain the --to path",
                         )
                 if not exact:
                     continue
@@ -6510,13 +6514,14 @@ def _win32_path_key(path: str) -> tuple[str, ...]:
 
     Each component loses an alternate-stream suffix and then its trailing dots and spaces. A component
     of ONLY dots or spaces keeps its spelling: measured on NTFS, ``a/.../b`` is refused rather than
-    collapsed to ``a/b``, so dropping it would fuse two paths that are different. ``lower`` matches
-    :func:`_norm_for_compare`; measured against ``RtlUpcaseUnicodeChar`` over the BMP, it separates no
-    two characters Windows treats as one."""
+    collapsed to ``a/b``, so dropping it would fuse two paths that are different. Case is lowered ONE
+    CHARACTER AT A TIME, because ``str.lower`` on a whole string picks final sigma by context and would
+    separate two names NTFS treats as one. Per character, measured against ``RtlUpcaseUnicodeChar``
+    over the BMP on one Windows 11 host, it separates no two characters that function folds together."""
     key: list[str] = []
     for part in ntpath.normpath(path).split("\\"):
         stem = part.split(":", 1)[0]
-        key.append((stem.rstrip(". ") or stem).lower())
+        key.append("".join(map(str.lower, stem.rstrip(". ") or stem)))
     return tuple(key)
 
 
