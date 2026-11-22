@@ -371,8 +371,9 @@ export async function withStepUpAuth<T>(
       // It rotates the token and queues behind the account's re-proof lock, as the sign-in does,
       // so it gets the sign-in's timeout (vault BACKLOG #2950), named here rather than left to
       // postJson's default so the two cannot drift apart.
-      // Tracked in signInSession.ts as a sign-in is, and it stores the rotated token there, so
-      // peekToken and a later sign-in wait for it and its store cannot overwrite a newer sign-in's.
+      // Tracked in signInSession.ts as a sign-in is, and it stores the rotated token there, so in
+      // this window peekToken and a later sign-in wait for it; reproveTracked says when its store
+      // can still overwrite a newer sign-in's token.
       // A timeout after the engine finished leaves the cached token dead, as a lost sign-in reply
       // does: the next call gets a 401 and signs in again.
       return await reproveTracked(ctx.secrets, secretKey(url), async () => {

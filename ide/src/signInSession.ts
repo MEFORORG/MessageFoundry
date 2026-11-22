@@ -63,7 +63,8 @@ export const SIGN_IN_TIMEOUT_MS = 150_000;
  *  attempt. Point 3 above names what it does not cover. */
 export const SIGN_IN_WAIT_MS = SIGN_IN_TIMEOUT_MS + 5_000;
 
-/** Sign-ins between "request about to leave" and "new token stored", by cache key. Never rejects. */
+/** Sign-ins and re-proofs between "request about to leave" and "new token stored", by cache key.
+ *  Never rejects. */
 const inFlight = new Map<string, Promise<void>>();
 
 /** `pending`, or `ms` elapsing, whichever comes first. Never rejects. */
@@ -154,9 +155,9 @@ function tracked<T>(key: string, waitMs: number, run: () => Promise<T>): Promise
 }
 
 /**
- * Resolves once no sign-in tracked for `key` is still between its request and its store, or after
- * `waitMs`, whichever is first. Never rejects: a failed sign-in settles it too. Resolves at once when
- * none is in flight.
+ * Resolves once no sign-in or re-proof tracked for `key` is still between its request and its store,
+ * or after `waitMs`, whichever is first. Never rejects: a failed attempt settles it too. Resolves at
+ * once when none is in flight.
  */
 export function signInSettled(key: string, waitMs: number = SIGN_IN_WAIT_MS): Promise<void> {
   return bounded(inFlight.get(key), waitMs);

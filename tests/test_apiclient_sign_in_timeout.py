@@ -227,10 +227,11 @@ def test_the_census_of_queued_calls_matches_the_client() -> None:
     assert _methods_calling("_adopt_rotated") == {"reauth", "verify_mfa", "confirm_mfa"}
 
 
-def test_no_method_raises_its_read_timeout_inline() -> None:
+def test_no_method_builds_its_own_read_keyword_timeout() -> None:
     """RED when: an ``EngineClient`` method builds its own ``httpx.Timeout(..., read=...)`` rather
     than calling ``_sign_in_timeout``, so a longer reply wait escapes the census above. Control:
-    the scan finds the one method that does build one, ``_sign_in_timeout`` itself."""
+    the scan finds the one method that does build one, ``_sign_in_timeout`` itself. A positional
+    ``httpx.Timeout(n)`` or a scalar ``timeout=`` is not scanned."""
     assert _methods_setting_a_read_timeout() == {"_sign_in_timeout"}
 
 

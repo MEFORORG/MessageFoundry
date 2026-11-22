@@ -20,7 +20,9 @@ export interface StepUpHost {
   promptPassword(signal: StepUpSignal, retry: boolean): Promise<string | undefined>;
   /** POST /me/reauth with `token`; resolve to the re-keyed token the engine returns, if any. */
   reauth(token: string, password: string, purpose: string | undefined): Promise<string | undefined>;
-  /** Keep the re-keyed token, so later calls and the sign-in cache use the live session. */
+  /** Keep the re-keyed token, so later calls use the live session. The IDE's host stores it in the
+   *  sign-in cache inside `reauth` instead (auth.ts, signInSession.ts `reproveTracked`), where the
+   *  store is tracked, so a store added here would run untracked. */
   storeToken(token: string): Promise<void>;
 }
 

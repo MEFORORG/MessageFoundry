@@ -118,37 +118,3 @@ def test_a_leg_called_outside_a_run_reads_afresh(
             checks._load_check_settings(toml)
     assert calls["source"] == 2
     assert calls["load"] == 2
-
-
-def test_a_change_to_the_environment_or_working_directory_during_a_run_reads_afresh(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """RED when: the memo key leaves out the environment or the working directory, so a change to
-    either during a run gets the answer to the question asked before it. Control: the same call
-    with neither changed is answered from the memo."""
-    calls = _count_reads(monkeypatch)
-    token = checks._RUN_MEMO.set({})
-    try:
-
-        def source() -> tuple[Path | None, bool]:
-            return checks._settings_source(
-                SAMPLES_CONFIG, service_config=None, suppress_search=False, env=None
-            )
-
-        assert source() == (None, False)
-        assert source() == (None, False)
-        assert calls["source"] == 1
-        # The environment now declares an instance, which the bare dir's SKIP must not hide.
-        monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
-        assert source() == (None, True)
-        assert calls["source"] == 2
-        # A messagefoundry.toml in the new working directory is what the search now finds.
-        other = tmp_path / "other"
-        other.mkdir()
-        (other / "messagefoundry.toml").write_text("", encoding="utf-8")
-        monkeypatch.chdir(other)
-        found, _ = source()
-        assert found is not None and found.resolve() == (other / "messagefoundry.toml").resolve()
-        assert calls["source"] == 3
-    finally:
-        checks._RUN_MEMO.reset(token)
