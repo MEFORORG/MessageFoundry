@@ -248,8 +248,19 @@ def _held(key: str, payload: dict[str, Any], live: dict[str, Any]) -> bool:
 
 def _repair_carry(cell: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
     """The optional ordered fields a declared repair omits, at the record's value (BACKLOG #5867).
-    One definition, so `main` checks exactly what `render` carried."""
+    One definition, so `main` checks exactly what `render` carried.
+
+    A flag that only echoes the record's persisted one, with the witness date unchanged, declares
+    no repair and carries nothing, so deleting a field from such an echo is still refused as field
+    loss. The date is compared as a date because the record may hold it as a TOML date literal and
+    a JSON payload can only state a string. A second repair on the witness's own day therefore has
+    to state these fields."""
     if not cell.get("anchor_repair"):
+        return {}
+    witness = live.get(_REPAIR_WITNESS)
+    if live.get("anchor_repair") and _iso_date(cell.get(_REPAIR_WITNESS, witness)) == _iso_date(
+        witness
+    ):
         return {}
     return {k: live[k] for k in _OPTIONAL_ORDERED if k in live and k not in cell}
 
@@ -1033,14 +1044,20 @@ def main(argv: list[str] | None = None) -> int:
     problems: list[str] = []
     for c in payload:
         live = live_cells.get(c.get("id"), {})
-        # An ANCHOR REPAIR re-points citations after the code moved; it must not touch anything else.
+        # An ANCHOR REPAIR re-points citations after the code moved. This guard holds the verdict and
+        # every prose field to the record. IT DOES NOT HOLD THE OTHER FIELDS: a repair can still
+        # change `level` or `posture`, or add a closure by setting `decision_closed`.
+        #
         # Declaring it lets the payload omit `reviewed_by` and `residual`, which keeps the record's
-        # values, and buys that with byte-identity on every prose field, so an omitted empty value
-        # is preserved rather than invented. A stated empty string is not carried, and what happens
-        # to it depends on the record. Over a non-empty value the byte-identity loop below refuses
-        # it. Over a value that is already empty, `render` drops the key and the key-set guard
-        # refuses it as field loss. Over an absent key NOTHING refuses it: the key stays absent and
-        # the run exits 0. A difference in verdict or prose refuses. The glyph scan still runs.
+        # values (`_repair_carry`, which also says when an echoed flag carries nothing), and buys
+        # that with byte-identity on every prose field, so an omitted empty value is preserved
+        # rather than invented. A stated empty string is not carried. Over a non-empty value the
+        # byte-identity loop below refuses it. Over an empty `residual` or `reviewed_by`, `render`
+        # drops the key and the key-set guard refuses it as field loss. Over an absent key the loop
+        # admits it, because it reads the absent key as empty, and the outcome is then the field's
+        # and the cell's: `render` leaves an empty `residual` or `reviewed_by` absent but writes
+        # another prose field as an empty key, and an `na` cell's rationale check refuses an empty
+        # `residual`. The glyph scan still runs.
         anchor_repair = bool(c.get("anchor_repair"))
         if live.get("anchor_repair"):
             # GATED ON THE RECORD, NOT ON THE PAYLOAD, and that is the whole correction. Gating on
@@ -1068,8 +1085,12 @@ def main(argv: list[str] | None = None) -> int:
             #
             # The glyph scan below runs here too, and finds nothing on these fields because they
             # equal the record; it is what covers the evidence a repair DOES rewrite (#1884).
+            #
+            # An absent key reads as empty. `_held` admits an omission without comparing, so a value
+            # holding a nested NaN is carried, and `record != record` keeps refusing a top-level NaN.
             for f in _PROSE_FIELDS:
-                if not _same(c.get(f, live.get(f, "")), live.get(f, "")):
+                record = live.get(f, "")
+                if record != record or not _held(f, c, {f: record}):
                     problems.append(
                         f"{c.get('id')}: declared anchor_repair but {f!r} differs from the record; "
                         "that is a rescore, not a repair"

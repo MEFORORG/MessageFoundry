@@ -3911,3 +3911,92 @@ def test_a_carried_reviewed_by_table_must_survive_the_re_parse(
     assert rc == 1
     assert rec.read_bytes() == before
     assert "reviewed_by did not survive the re-parse" in capsys.readouterr().out
+
+
+# The carry is for a repair THIS payload declares. A payload authored from the live cell can echo a
+# persisted flag without anyone choosing it, and deleting a field from that echo is a clearing
+# attempt, which must fail as it did before the carry existed.
+_PERSISTED_WITNESS = "2026-10-01"
+
+
+@pytest.mark.parametrize("field", ["residual", "reviewed_by"])
+@pytest.mark.parametrize(
+    "witness_line",
+    [f'anchor_repaired_at = "{_PERSISTED_WITNESS}"', f"anchor_repaired_at = {_PERSISTED_WITNESS}"],
+    ids=["string", "toml-date"],
+)
+def test_an_echoed_repair_flag_does_not_carry_an_omitted_field(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str, witness_line: str
+) -> None:
+    """The TOML-date arm states the same day as a string, which is still no new repair."""
+    rec = _record(tmp_path)
+    flag = f"anchor_repair = true\n{witness_line}\n"
+    rec.write_text(FIXTURE.replace(_FIX_LINE, _FIX_LINE + flag, 1), encoding="utf-8")
+    before = rec.read_bytes()
+    echo = _repair_omitting(field, anchor_repaired_at=_PERSISTED_WITNESS)
+    rc = main([str(_payload(tmp_path, [echo])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert f"would LOSE field(s) ['{field}']" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("field", ["residual", "reviewed_by"])
+def test_a_new_repair_on_a_cell_holding_the_flag_still_carries(tmp_path: Path, field: str) -> None:
+    """The other direction: a later witness date is a repair this payload declares."""
+    rec = _record(tmp_path)
+    flag = f'anchor_repair = true\nanchor_repaired_at = "{_PERSISTED_WITNESS}"\n'
+    rec.write_text(FIXTURE.replace(_FIX_LINE, _FIX_LINE + flag, 1), encoding="utf-8")
+    was = _cell_after_apply(rec)
+    repair = _repair_omitting(field, anchor_repaired_at="2026-10-03")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    got = _cell_after_apply(rec)
+    assert got[field] == was[field]
+    assert got["anchor_repaired_at"] == "2026-10-03"
+    assert "anchor_repair" not in got
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["review_notes = [nan]\n", "decision_reopen_requires = { a = nan }\n"],
+    ids=["array", "table"],
+)
+def test_a_repair_may_omit_a_prose_field_holding_a_nested_nan(tmp_path: Path, line: str) -> None:
+    """An omitted field is carried, so it is held without comparing: a NaN never equals itself."""
+    rec = _record(tmp_path)
+    rec.write_text(FIXTURE.replace(_FIX_LINE, _FIX_LINE + line, 1), encoding="utf-8")
+    rc = main([str(_payload(tmp_path, [_cell_with_repair()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    assert _cell_after_apply(rec)["evidence"][0]["line"] == 11
+
+
+def test_a_repair_omitting_a_top_level_nan_prose_field_is_still_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Refused before the carry existed, so the nested-NaN allowance must not widen to it."""
+    rec = _record(tmp_path)
+    text = FIXTURE.replace(_FIX_LINE, _FIX_LINE + "review_notes = nan\n", 1)
+    rec.write_text(text, encoding="utf-8")
+    before = rec.read_bytes()
+    rc = main([str(_payload(tmp_path, [_cell_with_repair()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert "'review_notes' differs from the record" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("line", "stated"),
+    [("review_notes = [nan]\n", [1]), ("review_notes = true\n", 1)],
+    ids=["over-nested-nan", "bool-vs-int"],
+)
+def test_a_repair_stating_a_different_prose_value_is_still_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], line: str, stated: object
+) -> None:
+    rec = _record(tmp_path)
+    rec.write_text(FIXTURE.replace(_FIX_LINE, _FIX_LINE + line, 1), encoding="utf-8")
+    before = rec.read_bytes()
+    repair = _cell_with_repair(review_notes=stated)
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert "'review_notes' differs from the record" in capsys.readouterr().out
