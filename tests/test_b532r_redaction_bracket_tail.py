@@ -4,9 +4,12 @@
 
 Synthetic values only. An empty user's password holding a bracket (added item 3) and a
 ";"-split tail after a user's own "@" (added item 4) each printed on the code before. Each is
-hidden now on every entry point, and the reading still crosses no placeholder except a user's
-whole first password segment, the claim ``support.redact`` and ``docs/PHI.md`` make. The comment
-on ``secretscrub._WIDE_DSN_PASSWORD`` says how, and what each rule still leaves.
+hidden now on every entry point, and neither rule makes the reading cross a placeholder inside a
+password segment. The reading does take a placeholder that is a whole segment: a user's whole first
+password segment, and, since BACKLOG #5386 wave 3, a placeholder alone before the "@" in every
+widened branch (``secretscrub._DSN_WIDE_SEGMENT``, which reads it back); the inputs below hold
+neither shape. The comment on ``secretscrub._WIDE_DSN_PASSWORD`` says how, and what each rule still
+leaves.
 """
 
 from __future__ import annotations
@@ -209,10 +212,10 @@ def test_an_empty_users_dsn_takes_no_semicolon_tail() -> None:
 
 # --- THE PLACEHOLDER CLAIM ------------------------------------------------------------------------
 #
-# ``support.redact`` and ``docs/PHI.md`` say the widened reading crosses a placeholder only where it
-# is the whole first segment of a password with a user. Each line below holds a placeholder some
-# earlier pass could have written; every match the pattern makes on it must hold no placeholder
-# except right after ``user:``.
+# A narrower claim than the one ``support.redact`` and ``docs/PHI.md`` made before BACKLOG #5386
+# wave 3 deleted it as false: on these lines, none of which has an empty user's first segment that
+# is a placeholder alone before an "@" (the shape wave 3 reads back), every match the pattern makes must hold no placeholder except
+# right after ``user:``. Each line holds a placeholder some earlier pass could have written.
 
 _PLACEHOLDER_SHAPE = re.compile(r"(?i)\[[a-z]+\]|<[a-z]+>")
 _CLAIM_TEMPLATES = (

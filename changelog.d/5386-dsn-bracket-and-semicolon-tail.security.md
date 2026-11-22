@@ -2,7 +2,8 @@
   stands alone.** A password with an empty user that holds a bracket, such as
   `postgres://:Kv[9]x@db`, and the part after a password's own `@` that holds a `;`, such as the
   `Zq7;w` of `postgres://svc:Kv9x@Zq7;w@db`, would have printed in a log line, a store error or a
-  support bundle. Each is now hidden when no credential label stands before the DSN. A host with
+  support bundle. Each is now hidden when no credential label stands before the DSN, the `;` tail
+  only after a plain user. A host with
   no `.` or `:`, followed by a `;` and a later `@`, as in `smtp://ops:pw@mail;alerts@corp`, is now
   hidden with the password, and the redacted line then names `corp` as the host. What still prints
   as before, at least: a bracketed run of letters alone, which has a placeholder's shape; a `;`

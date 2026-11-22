@@ -5,7 +5,8 @@
   refused. So would a base64url secret with one `=`, or `=<key>`, in the next item; on the next
   line those two already refused. Each now reads as that secret's value, and the start is refused.
   Only a line under a name Windows itself sets, spelled as Windows spells it, or under
-  `MEFOR_SECRETS_DIRECTORY`, still ends the empty value, and only when it holds no 32-byte key
-  text; under such a name, at least, a key list with an empty entry, such as one with a trailing or
-  doubled comma, which the engine's own retired-keys reading accepts, still ends it too.
+  `MEFOR_SECRETS_DIRECTORY`, still ends the empty value, and only when its whole value is not one
+  key or a comma list of keys. Under such a name, at least, these still end it: a value holding key
+  text beside other text, such as `Path=C:\x;<key>`, and a key list with an empty entry, such as
+  one with a trailing or doubled comma, which the engine's own retired-keys reading accepts.
   (`BACKLOG #5394`)
