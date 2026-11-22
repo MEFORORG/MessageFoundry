@@ -176,11 +176,13 @@ def test_sqlserver_column_inventory_is_one_statement() -> None:
 # --- item 8: no except tuple in cipher-audit lists a subclass of another member -----------------
 
 
-def test_cipher_audit_lists_no_exception_class_beside_its_base() -> None:
-    tree = ast.parse(textwrap.dedent(inspect.getsource(cli._cipher_audit)))
-    redundant = []
-    for node in ast.walk(tree):
+def _redundant_builtin_excepts(source: str) -> tuple[int, list[tuple[str, str]]]:
+    """How many ``except`` tuples ``source`` holds, and each builtin class one lists beside its
+    own base. Only builtin names are resolved."""
+    tuples, redundant = 0, []
+    for node in ast.walk(ast.parse(textwrap.dedent(source))):
         if isinstance(node, ast.ExceptHandler) and isinstance(node.type, ast.Tuple):
+            tuples += 1
             names = [e.id for e in node.type.elts if isinstance(e, ast.Name)]
             classes = {n: getattr(builtins, n, None) for n in names}
             known = {n: c for n, c in classes.items() if isinstance(c, type)}
@@ -189,6 +191,14 @@ def test_cipher_audit_lists_no_exception_class_beside_its_base() -> None:
                 for a, b in product(known, known)
                 if a != b and issubclass(known[a], known[b])
             ]
+    return tuples, redundant
+
+
+def test_cipher_audit_lists_no_builtin_exception_class_beside_its_base() -> None:
+    planted = "try:\n    pass\nexcept (RuntimeError, NotImplementedError, ValueError):\n    pass\n"
+    assert _redundant_builtin_excepts(planted) == (1, [("NotImplementedError", "RuntimeError")])
+    tuples, redundant = _redundant_builtin_excepts(inspect.getsource(cli._cipher_audit))
+    assert tuples >= 1, "the scan read none of cipher-audit's except tuples"
     assert redundant == []
 
 

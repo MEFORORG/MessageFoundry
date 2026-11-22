@@ -13459,9 +13459,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             # too, and neither creates a file.
             _emit_error(f"no store at {path} (check --db / [store].path)", as_json=as_json)
             return 2
-        # The command posture the server branch passes, for the Vault hops the cipher build can
-        # dial (vault BACKLOG #2983): at `warn` it is None, which those hops read as enforcing, so
-        # this branch is no looser than the server one (BACKLOG #1719 item 11).
+        # The posture the server branch opens on, for the Vault hops the cipher build can dial
+        # (vault BACKLOG #2983); `_command_hop_posture` says what it is (BACKLOG #1719 item 11).
         posture = _command_hop_posture(settings)
         try:
             cipher = build_store_cipher(store, posture=posture)
