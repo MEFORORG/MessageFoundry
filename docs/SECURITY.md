@@ -5668,8 +5668,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   answers by revoking the session under both hashes, best effort, and failing the ceremony
   closed (BACKLOG #3023). The SQLite store runs one writer at a time, so it has no lock order to get wrong.
 - **An account with no binding still signs in by Windows SSO, and its first engine factor needs
-  an enrolment code** (ADR 0207). The directory credential alone no longer binds it: the binding
-  step also asks a single-use issued code, and so does a federated session on a
+  an enrolment code** (ADR 0207). The directory credential alone no longer enrols its first engine
+  factor: enrolling it also asks a single-use issued code, and so does a federated session on a
   site that turned `oidc_require_mfa_claim` off. See [Directory-account enrolment
   codes](#directory-account-enrolment-codes-adr-0207). The Kerberos row of the [pathway
   table](#authentication-pathways--comparative-strength) describes that leg.

@@ -17307,14 +17307,9 @@ class SqlServerStore:
         gives (BACKLOG #3023).
 
         LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
-        ROWLOCK`` before its session row, the order the bind, the unbind, the TOTP re-enrolment and
-        the per-account revoke take them in: each locks the account row first and sweeps after. The
-        unbind takes it through its own prior-pair ``UPDLOCK`` read in
-        :meth:`clear_user_federated_subject`, before its account write, and a rebind's first sweep
-        is that transaction's; the bind's own write and the TOTP re-enrolment take it through the
-        write helper, and the per-account revoke through the epoch raise. ``enforce_session_cap``'s
-        trim takes no account row. ``revoke_all_sessions`` locks only the accounts its list read
-        returns, so a session of any other account is not ordered against a re-key. The re-key
+        ROWLOCK`` before its session row, the order the whole-account sweeps read for this change
+        take them in. docs/SECURITY.md, *Limits of the session sweep*, is where those sweeps are
+        listed, with how each takes the account row and which sweeps take none. The re-key
         moves the row to a new clustered key, and a sweep that met the row locked mid-move could
         find the old key gone and the new one out of its read, or deadlock with the re-key,
         depending on the plan. With the account row first, a re-key either commits before a sweep of
