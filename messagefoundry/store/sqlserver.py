@@ -10772,7 +10772,8 @@ class SqlServerStore:
                 "authorize purging any — the caller must skip the phase instead."
             )
         deleted = 0
-        purged_names: list[str] = []
+        # name -> (the version this handle cached before the UPDATE, the purged version it wrote).
+        purged: dict[str, tuple[str | None, str]] = {}
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
@@ -10780,6 +10781,9 @@ class SqlServerStore:
                 )
                 candidates = [r[0] for r in await cur.fetchall() if r[0] not in declared]
                 for name in candidates:
+                    # Read before the UPDATE (BACKLOG #5733). A version that differs from this one
+                    # after the commit was installed by a write the purge did not cover.
+                    cached_before = self._reference_versions.get(name)
                     # Eligibility RE-ASSERTED inside the delete. `declared` is computed by the caller
                     # outside any lock and write_reference_snapshot takes no applock here, so a config
                     # reload can commit a fresh patient-keyed snapshot between the SELECT above and
@@ -10791,30 +10795,40 @@ class SqlServerStore:
                         "             WHERE v.name = ? AND v.synced_at < ?)",
                         (name, name, older_than),
                     )
-                    count = int(cur.rowcount or 0)
-                    if not count:
-                        continue  # a concurrent re-sync won the race — leave it alone
-                    deleted += count
+                    # The count can read -1 under SET NOCOUNT ON, which must not lower the total.
+                    deleted += max(int(cur.rowcount or 0), 0)
                     # KEEP the pointer, BUMP the version — converge_reference_cache only reloads a set
                     # whose active version DIFFERS, so an unchanged version leaves every follower
                     # serving purged PHI from `_reference_cache` until restart, and deleting the
                     # pointer is worse (converge only adds/updates names present in a fresh read).
+                    # Runs even on a zero-row DELETE, so an aged empty set is marked. OUTPUT on this
+                    # cursor, not _execute_output, which would commit apart from the DELETE.
                     await cur.execute(
                         "UPDATE reference_version SET row_count = 0,"
                         " version = 'purged:' + version"
-                        " WHERE name = ? AND version NOT LIKE 'purged:%'",
-                        (name,),
+                        " OUTPUT inserted.version"
+                        " WHERE name = ? AND synced_at < ? AND version NOT LIKE 'purged:%'",
+                        (name, older_than),
                     )
-                    purged_names.append(name)
+                    output = await cur.fetchall()
+                    if output:
+                        purged[name] = (cached_before, output[0][0])
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
         # Evict only AFTER the commit — a rolled-back purge must not leave the cache claiming rows the
-        # store still holds (the same post-commit discipline purge_state follows below).
-        for name in purged_names:
-            self._reference_cache.pop(name, None)
-            self._reference_versions.pop(name, None)
+        # store still holds (the same post-commit discipline purge_state follows below). No await in
+        # this loop: converge may already have installed the purged pointer, so both the pre-bump and
+        # the purged version count as this purge's, and any other version is a newer write's.
+        for name, (cached_before, purged_version) in purged.items():
+            if self._reference_versions.get(name) in (
+                cached_before,
+                purged_version,
+                purged_version.removeprefix("purged:"),
+            ):
+                self._reference_cache.pop(name, None)
+                self._reference_versions.pop(name, None)
         return deleted
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:

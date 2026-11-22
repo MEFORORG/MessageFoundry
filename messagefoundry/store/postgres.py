@@ -12447,30 +12447,47 @@ class PostgresStore:
             # SELECT above and this statement. Postgres has no equivalent of SQLite's process-wide
             # `self._lock`, so this predicate is the ONLY thing standing between a routine reload and
             # deleting live data — do not "simplify" it away because the SELECT already filtered.
-            result = await self._pool.execute(
-                "DELETE FROM reference WHERE name = $1"
-                " AND EXISTS (SELECT 1 FROM reference_version v"
-                "             WHERE v.name = $1 AND v.synced_at < $2)",
-                name,
-                older_than,
-            )
-            count = _rowcount(result)
-            if not count:
-                continue  # a concurrent re-sync won the race — leave it alone
-            deleted += count
-            # KEEP the pointer, BUMP the version. converge_reference_cache only reloads a set whose
-            # active version DIFFERS from the one this handle reflects, so leaving the version alone
-            # would let every follower keep serving the purged PHI out of `_reference_cache` until the
-            # process restarts — and deleting the pointer outright is worse, because converge only ever
-            # adds/updates names present in a fresh read and would never notice. Bumping routes the
-            # deletion through the convergence path that already exists.
-            await self._pool.execute(
-                "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
-                " WHERE name = $1 AND version NOT LIKE 'purged:%'",
-                name,
-            )
-            self._reference_cache.pop(name, None)
-            self._reference_versions.pop(name, None)
+            #
+            # Read before the UPDATE (BACKLOG #5733). A version that differs from this one after the
+            # commit was installed by a write the purge did not cover, so it must stay cached.
+            cached_before = self._reference_versions.get(name)
+            # One read_committed transaction, DELETE first, the order write_reference_snapshot takes
+            # its locks. Each statement takes a fresh snapshot, so the UPDATE's age predicate
+            # re-evaluates after a concurrent re-sync commits and matches nothing.
+            async with self._timed_acquire() as conn, conn.transaction(isolation="read_committed"):
+                result = await conn.execute(
+                    "DELETE FROM reference WHERE name = $1"
+                    " AND EXISTS (SELECT 1 FROM reference_version v"
+                    "             WHERE v.name = $1 AND v.synced_at < $2)",
+                    name,
+                    older_than,
+                )
+                # KEEP the pointer, BUMP the version. converge_reference_cache only reloads a set
+                # whose active version DIFFERS from the one this handle reflects, so leaving the
+                # version alone would let every follower keep serving the purged PHI out of
+                # `_reference_cache` until the process restarts — and deleting the pointer outright
+                # is worse, because converge only ever adds/updates names present in a fresh read and
+                # would never notice. Bumping routes the deletion through the convergence path that
+                # already exists. Runs even on a zero-row DELETE, so an aged empty set is marked.
+                purged_version = await conn.fetchval(
+                    "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
+                    " WHERE name = $1 AND synced_at < $2 AND version NOT LIKE 'purged:%'"
+                    " RETURNING version",
+                    name,
+                    older_than,
+                )
+            deleted += _rowcount(result)
+            if purged_version is None:
+                continue  # a concurrent re-sync won the race, or it was already marked
+            # No await from this read through both pops. converge may already have installed the
+            # purged pointer, so both the pre-bump and the purged version count as this purge's.
+            if self._reference_versions.get(name) in (
+                cached_before,
+                purged_version,
+                purged_version.removeprefix("purged:"),
+            ):
+                self._reference_cache.pop(name, None)
+                self._reference_versions.pop(name, None)
         return deleted
 
     async def purge_dead_letters(

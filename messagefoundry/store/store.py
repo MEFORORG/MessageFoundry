@@ -22633,8 +22633,6 @@ class MessageStore:
                     "             WHERE v.name = ? AND v.synced_at < ?)",
                     (name, name, older_than),
                 )
-                if not cur.rowcount:
-                    continue  # a concurrent re-sync won the race — leave it alone
                 deleted += int(cur.rowcount)
                 # KEEP the pointer row, but BUMP its version. Deleting the pointer is invisible to
                 # converge_reference_cache (it only adds/updates names present in a fresh read), so a
@@ -22643,16 +22641,20 @@ class MessageStore:
                 # unchanged version means the follower's populated cache is never revisited. Bumping it
                 # makes the deletion propagate through the mechanism that already exists, rather than
                 # bolting a second removal path onto every backend.
-                await self._db.execute(
+                #
+                # Runs even when the DELETE matched nothing, so an aged zero-row set is still marked
+                # (BACKLOG #5733). The age predicate is what keeps a re-synced set unmarked.
+                cur = await self._db.execute(
                     "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
-                    " WHERE name = ? AND version NOT LIKE 'purged:%'",
-                    (name,),
+                    " WHERE name = ? AND synced_at < ? AND version NOT LIKE 'purged:%'",
+                    (name, older_than),
                 )
                 # SQLite keeps no per-set version map (it is single-node and the sole writer, which is
                 # why converge_reference_cache is a no-op here) — evicting the read-through cache is
                 # the whole of the local convergence story. The server backends, which DO track
                 # versions, rely on the bumped pointer above.
-                self._reference_cache.pop(name, None)
+                if cur.rowcount > 0:
+                    self._reference_cache.pop(name, None)
             await self._commit()
             return deleted
 

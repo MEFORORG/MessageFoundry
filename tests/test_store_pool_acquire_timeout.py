@@ -903,9 +903,12 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # `_alert_write`, a transaction on the bounded `_timed_acquire`, so each commits its audit row
     # with its change. The CONNECTIONS.md note still says "at least", so this drop also leaves it
     # true as written.
-    assert (len(store_sites), len(cluster_sites)) == (28, 0), (
-        "the measured population of pool borrows OUTSIDE the bounded helper moved from 28 (store)"
-        " + 0 (cluster), measured 2026-10-16. Re-read the CONNECTIONS.md scope note before changing"
+    # Store 28 -> 26 on 2026-11-22, a drop: BACKLOG #5733 moved `purge_reference_snapshots`' DELETE
+    # and UPDATE, which each borrowed with `self._pool.execute`, into one transaction on the bounded
+    # `_timed_acquire`.
+    assert (len(store_sites), len(cluster_sites)) == (26, 0), (
+        "the measured population of pool borrows OUTSIDE the bounded helper moved from 26 (store)"
+        " + 0 (cluster), measured 2026-11-22. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
 
