@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+from math import nan as NAN
 
 import pytest
 
@@ -122,24 +123,44 @@ def test_a_detail_that_names_no_withheld_field_is_left_alone() -> None:
 
 
 def test_a_held_key_is_re_encoded_as_the_genesis_writer_encodes_it() -> None:
-    """``json.dumps``'s defaults, so an escaped U+2028 stays escaped."""
-    kept = audit_tee._withhold_detail(json.dumps({"recovery_wrap": "x", "s": "a b"}))
-    assert kept == json.dumps({"recovery_wrap": "<withheld>", "s": "a b"})
-    assert kept is not None and " " not in kept
+    """``json.dumps``'s defaults, so a line separator stays escaped and NaN stays NaN."""
+    text = f"a{chr(0x2028)}b"
+    kept = audit_tee._withhold_detail(json.dumps({"recovery_wrap": "x", "s": text, "f": NAN}))
+    assert kept == json.dumps({"recovery_wrap": "<withheld>", "s": text, "f": NAN})
+    assert kept is not None and chr(0x2028) not in kept
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        json.dumps({"inner": json.dumps({"recovery_wrap": _WRAP.hex(), "n": 1})}),
+        json.dumps(json.dumps({"recovery_wrap": _WRAP.hex(), "n": 1})),
+    ],
+    ids=["in-a-string-value", "a-json-string"],
+)
+def test_a_json_text_held_in_a_string_is_withheld_too(detail: str) -> None:
+    kept = audit_tee._withhold_detail(detail)
+    assert kept is not None and _WRAP.hex() not in kept
+    assert "<withheld>" in kept and '"n\\": 1' in kept
 
 
 @pytest.mark.parametrize(
     "detail",
     [
         "[" * 100_000 + f'{{"recovery_wrap": "{_WRAP.hex()}"}}' + "]" * 100_000,
-        f'{{"recovery_wrap": "{_WRAP.hex()}", "n": 1e999}}',
+        f'{{"recovery_wrap": "{_WRAP.hex()}", "n": {"1" * 5000}}}',
     ],
-    ids=["too-deep-to-read", "out-of-range-number"],
+    ids=["too-deep-to-read", "an-integer-too-long-to-parse"],
 )
-def test_a_fault_while_withholding_withholds_the_whole_detail(detail: str) -> None:
-    (line,) = _tee(detail)
+def test_a_fault_while_withholding_withholds_the_whole_detail(
+    detail: str, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr(audit_tee, "_WITHHOLD_FAULT_LOGGED", False)
+    with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+        (line,) = _tee(detail)
     assert _WRAP.hex() not in line
     assert json.loads(json.loads(line)["detail"]) == {"withheld": "<withheld>"}
+    assert any("could not withhold" in r.getMessage() for r in caplog.records)
 
 
 def test_an_observer_is_passed_the_rows_own_detail(monkeypatch) -> None:

@@ -113,45 +113,57 @@ _DETAIL_WITHHELD_WHOLE = json.dumps({"withheld": _DETAIL_WITHHELD})
 _FIELD_REDACTED = _REDACTED
 
 
-def _withhold(value: object) -> tuple[object, bool]:
-    """``value`` with every withheld key's value replaced, in every object it nests, and whether
-    any was."""
-    if isinstance(value, dict):
-        out: dict[object, object] = {}
-        changed = False
-        for k, v in value.items():
-            if k in _WITHHELD_DETAIL_FIELDS:
-                out[k], changed = _DETAIL_WITHHELD, True
-            else:
-                out[k], inner = _withhold(v)
-                changed = changed or inner
-        return out, changed
-    if isinstance(value, list):
-        pairs = [_withhold(v) for v in value]
-        return [v for v, _ in pairs], any(c for _, c in pairs)
-    return value, False
+#: Whether this process has logged a fault while withholding; see :func:`_withhold_detail`.
+_WITHHOLD_FAULT_LOGGED = False
+
+
+def _names_a_withheld_field(text: str) -> bool:
+    return any(name in text for name in _WITHHELD_DETAIL_FIELDS)
 
 
 def _withhold_detail(detail: str | None) -> str | None:
-    """``detail`` as the tee may copy it: where it is JSON holding a withheld key, at any depth,
-    with each such key's value as :data:`_DETAIL_WITHHELD`, and otherwise unchanged.
+    """``detail`` as the tee may copy it: where it is JSON holding a withheld key in any object it
+    nests, with each such key's value as :data:`_DETAIL_WITHHELD`, and otherwise unchanged.
 
     The text is parsed only where it holds a withheld field's name, and re-encoded only where a
-    value was replaced, by ``json.dumps``'s defaults as the genesis writer encodes it, except that a
-    number out of range is refused rather than written as a token that is not JSON. A key spelled
-    with a JSON escape is not matched, nor is the value in text that is not JSON; no engine writer
-    writes the wrap so. A fault while withholding, a JSON nest too deep to read among them, ships
-    the whole detail as :data:`_DETAIL_WITHHELD_WHOLE`, since the value may still be in the text."""
-    if not detail or not any(name in detail for name in _WITHHELD_DETAIL_FIELDS):
+    value was replaced, by ``json.dumps``'s defaults, as the genesis writer encodes it. An object's
+    string value that is itself such a JSON text, and a detail that is a JSON string holding one,
+    is withheld the same way. What is not matched includes at least a key spelled with a JSON
+    escape, a JSON text held in a string inside a list, and the value in text that is not JSON; no
+    engine writer writes the wrap in any of those. Any other fault, such as a nest too deep to
+    read or an integer too long to parse, ships the whole detail as
+    :data:`_DETAIL_WITHHELD_WHOLE`, since the value may still be in the text, and is logged once
+    per process."""
+    if not detail or not _names_a_withheld_field(detail):
         return detail
+    changed = False
+
+    def hook(obj: dict[str, object]) -> dict[str, object]:
+        nonlocal changed
+        for key, value in obj.items():
+            if key in _WITHHELD_DETAIL_FIELDS:
+                obj[key], changed = _DETAIL_WITHHELD, True
+            elif isinstance(value, str) and (inner := _withhold_detail(value)) is not value:
+                obj[key], changed = inner, True
+        return obj
+
     try:
         try:
-            parsed = json.loads(detail)
-        except ValueError:  # not JSON; a deep nest raises RecursionError, a fault below
+            parsed = json.loads(detail, object_hook=hook)
+        except json.JSONDecodeError:  # not JSON; an over-long integer is a plain ValueError
             return detail
-        withheld, changed = _withhold(parsed)
-        return json.dumps(withheld, allow_nan=False) if changed else detail
-    except Exception:  # noqa: BLE001 - fail closed; the tee must still ship the record
+        if isinstance(parsed, str) and (inner := _withhold_detail(parsed)) is not parsed:
+            parsed, changed = inner, True
+        return json.dumps(parsed) if changed else detail
+    except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
+        global _WITHHOLD_FAULT_LOGGED
+        if not _WITHHOLD_FAULT_LOGGED:
+            _WITHHOLD_FAULT_LOGGED = True
+            log.warning(
+                "the audit tee could not withhold a field in a detail (%s); that detail ships "
+                "whole as withheld, and further such faults in this process are not logged",
+                type(exc).__name__,
+            )
         return _DETAIL_WITHHELD_WHOLE
 
 
@@ -516,11 +528,12 @@ def emit_audit_tee(
     every backend**.
 
     **A withheld field ships as a placeholder (owner ruling 2026-11-22).** Where ``detail`` is
-    JSON holding a key in :data:`_WITHHELD_DETAIL_FIELDS`, at any depth, that key's value ships as
-    ``<withheld>``, before the passes below read it. At least the genesis row of a store minted
-    under ``[store].key_provider = "host"`` holds one, ``recovery_wrap``. The row in ``audit_log``
-    keeps the value, and the observers are passed it. :func:`_withhold_detail` says what it does
-    not match, and that a fault there ships the whole detail as withheld.
+    JSON holding a key in :data:`_WITHHELD_DETAIL_FIELDS` in an object it nests, that key's value
+    ships as ``<withheld>``, before the passes below read it. At least the genesis row of a store
+    minted under ``[store].key_provider = "host"`` holds one, ``recovery_wrap``. The row in
+    ``audit_log`` keeps the value, and the observers are passed it. :func:`_withhold_detail` names
+    at least what it does not match, and says that a fault there ships the whole detail as
+    withheld.
 
     **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
     ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``
