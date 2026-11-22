@@ -107,7 +107,7 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # `$((` is read again as `$(` and `(`, as bash does; inside it a quote or a backslash keeps a paren
 # from counting. `((` starting a word, outside `${...}`, is read the same way. `$[ ... ]` is
 # arithmetic. A `<<` glued to a plain word (`cat<<EOF`) opens a heredoc, unless the line has
-# already opened arithmetic, it is inside `${...}`, or the word is not a plain name. Every heredoc
+# already opened arithmetic or a `[`, it is inside `${...}`, or the word is not a plain name. Every heredoc
 # opened on a line gets its own body, and each terminator line stays visible. The delimiter is read in place, never from a
 # slice of the text. Past a processed-character budget it gives up and returns $null, and the
 # caller then adds nothing. It still does not read at least these, which stay as the bash view
@@ -159,6 +159,8 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         $pendingQ = [System.Collections.Generic.List[string]]::new()
         $bodyQ = [System.Collections.Generic.List[string]]::new()
         $arithOnLine = $false
+        # An unquoted `[` earlier on the line: bash reads a subscript such as `a[ x<<y ]=1` whole.
+        $bracketOnLine = $false
         $steps = 0
         $budget = 8 * $Text.Length + 4096
         $delimRe = [regex]::new('\G-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
@@ -169,7 +171,7 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
                 Kinds = [System.Collections.Generic.List[string]]::new($kinds)
                 Depths = [System.Collections.Generic.List[int]]::new($depths)
                 PrevDollar = $prevDollar; WordStart = $wordStart; BraceDepth = $braceDepth
-                Pending = $pending; BodyTerm = $bodyTerm; ArithOnLine = $arithOnLine
+                Pending = $pending; BodyTerm = $bodyTerm; ArithOnLine = $arithOnLine; BracketOnLine = $bracketOnLine
                 PendingQ = [System.Collections.Generic.List[string]]::new($pendingQ)
                 BodyQ = [System.Collections.Generic.List[string]]::new($bodyQ)
             }
@@ -223,6 +225,7 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
                         $kinds = $sv.Kinds; $depths = $sv.Depths
                         $prevDollar = $sv.PrevDollar; $wordStart = $sv.WordStart; $braceDepth = $sv.BraceDepth
                         $pending = $sv.Pending; $bodyTerm = $sv.BodyTerm; $arithOnLine = $sv.ArithOnLine
+                        $bracketOnLine = $sv.BracketOnLine
                         $pendingQ = $sv.PendingQ; $bodyQ = $sv.BodyQ
                         $n = $sv.Site; continue
                     }
@@ -329,8 +332,9 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         # starts here. A heredoc opener is read as Hide-HeredocBodies reads it: after a space or at
         # the start, not `<<<`, and a delimiter that starts with a letter or underscore.
         if ($Refined) {
+            if ($ch -ceq '[') { $bracketOnLine = $true }
             if ($ch -ceq "`n") {
-                $arithOnLine = $false
+                $arithOnLine = $false; $bracketOnLine = $false
                 if ($pendingQ.Count -gt 0) {
                     [void]$sb.Append($ch); $bodyQ.AddRange($pendingQ); $pendingQ.Clear()
                     $prevDollar = $false; $wordStart = $true
@@ -340,7 +344,7 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
             if ($ch -ceq '<' -and $next -ceq '<' -and -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '<') -and
                 -not ($n -gt 0 -and $Text[$n - 1] -ceq '<')) {
                 $opens = $n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1])
-                if (-not $opens -and $braceDepth -eq 0 -and -not $arithOnLine) {
+                if (-not $opens -and $braceDepth -eq 0 -and -not $arithOnLine -and -not $bracketOnLine) {
                     # Glued: the word before it must be a plain name, starting after whitespace,
                     # `;`, `&`, `|`, `$(` or a backtick -- never after a bare `(`.
                     $w = $n - 1
@@ -823,8 +827,9 @@ try {
     }
     # THE REFINED VIEW (BACKLOG #5607) IS BUILT LAST, under the same rule: it is built only once every
     # toggle, bash and PowerShell bound has been judged and allowed, and it only appends bounds, so
-    # a throw, a slow path or its budget giving up returns the allow those views reached. Only a
-    # command holding `((`, `<<` or `$[` can read differently under it.
+    # a throw, a slow path or its budget giving up returns the allow those views reached. It is built
+    # only for a command holding at least one of `((`, `<<` or `$[`. Its other change, ending a bound
+    # at a comment, only removes tokens, so skipping the view elsewhere loses no deny.
     $refinedPending = @{ Value = ($tool -cne 'PowerShell' -and
         ($cmd.IndexOf('((', [StringComparison]::Ordinal) -ge 0 -or $cmd.IndexOf('<<', [StringComparison]::Ordinal) -ge 0 -or
          $cmd.IndexOf('$[', [StringComparison]::Ordinal) -ge 0)) }

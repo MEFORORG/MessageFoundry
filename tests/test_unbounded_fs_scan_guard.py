@@ -779,6 +779,8 @@ REFINED_READING_DENY = [
     pytest.param(
         'echo "$(echo $[ a << b ]\nfind /proc)"', id="spaced-shift-in-old-style-arithmetic"
     ),
+    # A comment after the walk: its `#` ends the bound, and the walk before it is still read.
+    pytest.param('echo "$((find /proc) )" # note', id="subshell-substitution-before-a-comment"),
 ]
 
 
@@ -838,6 +840,9 @@ REFINED_FALSE_DENY_ALLOW = [
         id="arithmetic-after-some-nested-subshells",
     ),
     pytest.param('a[x<<y]=1\necho "\ny\nfind /proc\n"', id="glued-shift-in-an-array-subscript"),
+    pytest.param(
+        'a[ x<<y ]=1\necho "\ny\nfind /proc\n"', id="glued-shift-in-a-spaced-array-subscript"
+    ),
     pytest.param(
         'a[(i<<k)]=v\necho "\nk\nfind /proc\n"', id="glued-shift-in-parens-in-a-subscript"
     ),
@@ -925,10 +930,10 @@ EXPECTED_ROW_COUNTS = {
     "POWERSHELL_QUOTE_DENY": 2,
     "TOGGLE_FLOOR_DENY": 5,
     "COMMENT_BOUNDARY_DENY": 6,
-    "REFINED_READING_DENY": 11,
+    "REFINED_READING_DENY": 12,
     "REFINED_FLOOR_DENY": 3,
     "REFINED_CONTROL_ALLOW": 2,
-    "REFINED_FALSE_DENY_ALLOW": 13,
+    "REFINED_FALSE_DENY_ALLOW": 14,
 }
 
 
