@@ -10,9 +10,12 @@ The task runs scheduled-refresh.ps1 through `pwsh -NoProfile -File` at each of -
 PINNED TO ONE COMMIT. -Ref (a 40-hex commit, or origin/<branch> as already fetched in -EngineRepo)
 is resolved to its full commit sha here, and only that sha reaches the task: the runner is
 extracted from that commit with `git archive`, never copied from the work tree this script sits
-in, and the task passes `-Ref <sha>`, so every run builds the scripts of that one commit. Pinning
-proves which code runs, not that it was reviewed: pin a merged main commit for that. To move the
-dashboard to newer code, run this again with the new -Ref.
+in, and the task passes `-Ref <sha>`, so every run builds the scripts of that one commit. The pin
+covers the engine dashboard code only, everything under scripts/ at that commit. It does not cover
+the vault code each run also executes, the ledger census archived from vault origin/main as it
+stands at run time, unpinned and as the same user; collect_metrics.py's docstring says what that
+code can do. Nor does the pin prove the engine code was reviewed: pin a merged main commit for that.
+To move the dashboard to newer code, run this again with the new -Ref.
 
 The runner goes to -RunnerDir (default %USERPROFILE%\.mefor\dashboard), a path no work tree owns.
 Not under AppData: run from a packaged (MSIX) app such as Claude Desktop, a write to %LOCALAPPDATA%

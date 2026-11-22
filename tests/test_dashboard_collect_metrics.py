@@ -63,6 +63,7 @@ def _ctx(
         weeks=weeks,
         workdir=tmp_path,
         run=run,
+        run_tool=run,
         run_raw=_no_raw,
         fetch=_no_fetch,
         stall_runner=_no_stall,
@@ -896,6 +897,34 @@ def test_asvs_reads_counts_and_the_ref_pair(tmp_path: Path) -> None:
     assert m.detail["engine_ref"] == "deadbeef1234"
     assert "partial_error" not in m.detail
     assert cm.asvs_ref_pair(m.detail) == "scorecard=vault-origin-main@abc123 engine=deadbeef1234"
+
+
+def test_asvs_value_is_floored_like_the_ci_series(tmp_path: Path) -> None:
+    # 2 of 3 is 66.67 percent: floored to 66.6, never rounded up to 66.7.
+    printed = "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 3: 2 pass, 1 fail\n"
+    m = cm.Metric("asvs", "", "", "", "")
+    cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
+    assert m.value == 66.6
+
+
+def test_the_scorecard_tool_runs_isolated(tmp_path: Path) -> None:
+    # The default runner for the tool is run_child: -I -X utf8 under the allowlisted env.
+    ctx = cm.Context(vault=tmp_path, through=dt.date(2026, 11, 18), weeks=2, workdir=tmp_path)
+    assert ctx.run_tool is cm.run_child
+    seen: list[Sequence[str]] = []
+
+    def run_tool(argv: Sequence[str], cwd: Path | None) -> str:
+        seen.append(argv)
+        return "# asvs-status scorecard=NO-GIT engine=deadbeef1234\ncells 1: 1 pass\n"
+
+    ctx = _asvs_ctx(tmp_path, "unused")
+    ctx.run = _failing
+    ctx.run_tool = run_tool
+    m = cm.Metric("asvs", "", "", "", "")
+    cm.c_asvs(ctx, m)
+    assert m.value == 100.0
+    # run_child supplies the interpreter, so the argv starts at the script.
+    assert seen and str(seen[0][0]).endswith("scorecard.py")
 
 
 def test_asvs_without_an_engine_ref_is_partial(tmp_path: Path) -> None:

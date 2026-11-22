@@ -24,10 +24,14 @@ THE VAULT'S CODE RUNS IN A CHILD PROCESS. The ledger census is the vault's own
 ``scripts/docs/ledger_weekly_report.py``, archived from vault ``origin/main``. It runs through
 ``_vault_census.py`` under ``python -I`` with an allowlisted environment that holds no token
 variable and no ``GIT_*`` variable, never imported into this process. The vault commit it ran at is
-recorded. That is NO SANDBOX: the child runs as the same user with ``PATH`` intact, so vault code
-could still run ``gh`` or ``git``, which read the user's stored credentials (keyring, ``hosts.yml``)
-and act as that user. What the scrub removes is only a token passed in the environment, and a
-``GIT_*`` variable steering git. The vault's ``main`` is trusted to that extent.
+recorded. That is NO SANDBOX, and the environment scrub does not limit what that code can do: the
+child runs with the full power of the user who runs this script. It can run ``gh`` or ``git`` with
+the user's stored credentials (keyring, ``hosts.yml``), read and write any file that user can, and
+so alter the engine files this process runs after it, such as ``scripts/ci/check_stalled_prs.py``,
+``scripts/asvs/scorecard.py``, ``render_html.py`` and this script. The scrub only keeps a token
+variable and a ``GIT_*`` variable from being handed to it. Running this script therefore trusts
+vault ``origin/main`` as fully as the engine code itself. Pinning the vault code to a reviewed
+commit would narrow that trust; it is not done here.
 
 STDOUT CARRIES NO RAW VALUE. The console summary is each metric's id, status and whether it holds
 an error; the values, the counts and the error text are only in the snapshot. A status is a banded
@@ -305,6 +309,12 @@ def status_max(value: int, metric: str) -> str:
     return "warn" if value <= t["warn_max"] else "bad"
 
 
+def floor_pct(part: int, whole: int) -> float:
+    """``part`` over ``whole`` as a percent rounded DOWN to one decimal: a status is banded on the
+    raw rate, and 89.98 must not read as 90.0."""
+    return math.floor(1000.0 * part / whole) / 10
+
+
 def ci_pass_series(runs: Sequence[dict[str, Any]], labels: Sequence[str]) -> list[dict[str, Any]]:
     """Per-week pass percent over runs that finished pass or fail; ``None`` for a week with none."""
     passed = dict.fromkeys(labels, 0)
@@ -321,9 +331,7 @@ def ci_pass_series(runs: Sequence[dict[str, Any]], labels: Sequence[str]) -> lis
     out: list[dict[str, Any]] = []
     for w in labels:
         n = passed[w] + failed[w]
-        # Rounded DOWN to one decimal: the status is banded on this value, and 89.98 must not
-        # read as 90.0.
-        out.append({"week": w, "value": math.floor(1000.0 * passed[w] / n) / 10 if n else None})
+        out.append({"week": w, "value": floor_pct(passed[w], n) if n else None})
     return out
 
 
@@ -440,8 +448,9 @@ def child_env() -> dict[str, str]:
 
 
 def run_child(argv: Sequence[str], cwd: Path | None = None) -> str:
-    """Run the vault census driver: ``python -I`` under :func:`child_env`, from ``cwd`` (the
-    archive root), so a relative write by the vault code never lands in the caller's work tree."""
+    """Run a Python child, the vault census driver or the scorecard tool: ``python -I -X utf8``
+    under :func:`child_env`, from ``cwd``, so a relative write by the vault code never lands in the
+    caller's work tree."""
     # -X utf8, not PYTHONUTF8: -I ignores every PYTHON* variable.
     return run_bytes([sys.executable, "-I", "-X", "utf8", *argv], cwd, env=child_env()).decode(
         "utf-8"
@@ -546,6 +555,8 @@ class Context:
     run_raw: BytesRunner = run_bytes
     #: Runs the vault census driver in a child process; see :func:`run_child`.
     run_vault: Callable[[Sequence[str], Path | None], str] = run_child
+    #: Runs the engine's scorecard tool the same way; see :func:`run_child`.
+    run_tool: Callable[[Sequence[str], Path | None], str] = run_child
     fetch: Fetcher = fetch_url
     #: False when the caller already fetched both repositories' main this run.
     git_fetch: bool = True
@@ -920,9 +931,10 @@ def c_asvs(ctx: Context, m: Metric) -> None:
     # Archived here, not with the ledger: a moved scorecard must null this metric alone.
     _archive_into(ctx, str(ctx.vault), v.sha, [VAULT_SCORECARD], v.root)
     toml = v.root / VAULT_SCORECARD
-    out = ctx.run(
+    # Under -I and the allowlisted child environment, as the vault code runs: no PYTHON* variable
+    # and no token variable reaches the tool.
+    out = ctx.run_tool(
         [
-            sys.executable,
             str(ctx.engine_root / "scripts" / "asvs" / "scorecard.py"),
             "--scorecard",
             str(toml),
@@ -952,7 +964,7 @@ def c_asvs(ctx: Context, m: Metric) -> None:
         # that tree from this commit, and says so.
         engine_ref = f"{ctx.archive_ref}+archive"
         tool = f"scripts/asvs/scorecard.py from a git archive of engine commit {ctx.archive_ref}"
-    m.value = None if pass_pct is None else round(pass_pct, 1)
+    m.value = floor_pct(counts.get("pass", 0), applicable) if applicable else None
     # Banded on the raw rate, so a value just under a threshold never rounds up into it.
     m.status = status_pct(pass_pct, "asvs")
     if pass_pct is None:
@@ -960,7 +972,8 @@ def c_asvs(ctx: Context, m: Metric) -> None:
 
     m.detail = {
         "counts": counts,
-        "value_means": "pass cells over cells not marked na",
+        "value_means": "pass cells over cells not marked na; needs-review and unverified cells "
+        "are in that denominator and are not passes",
         "provenance": provenance,
         "scorecard_sha": v.sha,
         "engine_ref": engine_ref,
