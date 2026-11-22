@@ -78,7 +78,7 @@ def test_presence_stays_false_when_no_occurrence_holds_the_field() -> None:
 
 def test_a_whole_field_needle_may_still_span_the_repetition_delimiter() -> None:
     """A whole-field read is the structural text. Splitting it by repetition would lose this match,
-    which ``origin/main`` makes."""
+    which the first-occurrence ``Peek.field`` read makes."""
     assert _matches(_body("PID|1||AAA~BBB"), "PID-3", "AAA~BBB") is True
 
 
@@ -206,7 +206,7 @@ def test_a_later_header_with_the_same_separators_does_not_stop_the_walk() -> Non
 
 
 def test_a_first_occurrence_past_a_differing_header_is_still_read() -> None:
-    """``Peek.field`` reads it, so stopping before it would lose a match ``origin/main`` makes."""
+    """``Peek.field`` reads it, so stopping before it would lose that first-occurrence match."""
     raw = _body("MSH$^~\\&$OTHER", "PID|1||Y")
     assert Peek.parse(raw).field("PID-3") == "Y"
     assert _matches(raw, "PID-3", "Y") is True
@@ -246,11 +246,50 @@ def test_a_short_first_occurrence_past_a_differing_header_reads_nothing_later() 
     assert _values(raw, "OBX-5") == []
 
 
-def test_empty_repetitions_are_not_split_into_a_retained_tree() -> None:
-    """A later field of empty repetitions yields nothing, at the cost of one flat split."""
-    raw = _body("OBX|1|ST|A||x", "OBX|2|ST|B||" + "~" * 200_000)
-    assert _walk_cost(raw, "OBX-5.1") < 2_000_000
-    assert _values(raw, "OBX-5.1") == ["x"]
+def test_empty_repetitions_are_not_split_into_a_retained_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The nested split is built only for a non-empty repetition, never for the whole field."""
+    real = _builtin_hl7._split_reps
+    split: list[str] = []
+
+    def spy(text: str, seps: tuple[str, str, str, str, str]) -> list[list[list[str]]]:
+        split.append(text)
+        return real(text, seps)
+
+    raw = _body("OBX|1|ST|A||x", "OBX|2|ST|B||" + "~" * 1_000, "OBX|3|ST|C||y~~z")
+    monkeypatch.setattr(_builtin_hl7, "_split_reps", spy)
+    assert _values(raw, "OBX-5.1") == ["x", "y", "z"]
+    assert split == ["x", "y", "z"]  # a whole-field tree would show its text with `~` here
+
+
+@pytest.mark.parametrize(
+    ("header", "field", "path", "value"),
+    [
+        ("MSH|^|S|F", "A^B~C^D", "PID-3.2", "D"),  # only the component separator is declared
+        ("MSH|^|S|F", "A~B", "PID-3.1", "B"),
+    ],
+)
+def test_an_undeclared_repetition_character_is_not_walked(
+    header: str, field: str, path: str, value: str
+) -> None:
+    raw = f"{header}\rPID|1||{field}\r"
+    assert _values(raw, path) == [Peek.parse(raw).field(path)]
+    assert _matches(raw, path, value) is False
+
+
+def test_later_occurrences_are_still_read_under_an_undeclared_repetition_character() -> None:
+    raw = "MSH|^|S|F\rPID|1||A^B\rPID|1||C^D\r"
+    assert _values(raw, "PID-3.2") == ["B", "D"]
+
+
+@pytest.mark.parametrize("value", ["\\.fi\\", '""', "   ", "x"])
+def test_later_presence_agrees_with_the_first_occurrence_test(value: str) -> None:
+    """Each value is present later exactly when ``Peek.field`` calls it present as a first value.
+    The trailing segment keeps a run of spaces from being stripped with the message's end."""
+    as_first = _body(f"OBX|1|ST|A||{value}", "ZZZ|1")
+    as_later = _body("OBX|1|ST|A||", f"OBX|2|ST|B||{value}", "ZZZ|1")
+    assert _matches(as_later, "OBX-5") is (Peek.parse(as_first).field("OBX-5") is not None)
 
 
 @pytest.mark.parametrize("later", ["~", "^", "&", "~~", "^~&", "&^~^"])
@@ -267,7 +306,7 @@ def test_a_later_occurrence_with_content_is_present(later: str) -> None:
 
 @pytest.mark.parametrize("first", ["~", "^", "&", "~~", "^~&"])
 def test_a_delimiter_only_first_occurrence_reads_as_peek_field_does(first: str) -> None:
-    """``origin/main`` calls this value present, and the first occurrence's result does not move."""
+    """``Peek.field`` reads this value as present, and the first occurrence's result does not move."""
     raw = _body(f"OBX|1|ST|A||{first}", "OBX|2|ST|B||")
     assert Peek.parse(raw).field("OBX-5") == first
     assert _matches(raw, "OBX-5") is True

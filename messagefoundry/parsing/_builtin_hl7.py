@@ -600,8 +600,9 @@ def field_values(
     ``Peek.field`` reads, even when that text is only separators.
 
     Some shapes are not widened, because the parse could misread them, and read as ``Peek.field``
-    does. A repetition character shared with another separator does not mark a repetition, so only
-    the first is read. A split leaving an odd count of escape characters in any piece may have cut
+    does. A repetition character the first header did not declare, or one shared with another
+    separator, does not reliably mark a repetition, so only the first is read; later occurrences
+    still are. A split leaving an odd count of escape characters in any piece may have cut
     an escape sequence, so only the first is read there too. That also catches a stray escape:
     ``AAA~BBB~C:\\DIR`` holds three real repetitions and the walk reads only ``AAA``. The parse
     splits every line on the first header's separators, so the walk stops at a later header declaring
@@ -618,7 +619,8 @@ def field_values(
     """
     seps = msg["seps"]
     _field_sep, comp_sep, rep_sep, sub_sep, esc = seps
-    shared_rep = rep_sep in (comp_sep, sub_sep, esc)
+    declared = _field_text(msg["segments"][0]["fields"][2])
+    unmarked_rep = len(declared) < 2 or rep_sep in (comp_sep, sub_sep, esc)
     seen = crossed = False
     for index, seg in enumerate(msg["segments"]):
         if index and seg["id"] in HEADER_IDS and _extract_separators(header_line_head(seg)) != seps:
@@ -644,7 +646,7 @@ def field_values(
         ):
             continue
         parts = [text]
-        if comp is not None and not (shared_rep or crossed or is_delimiter_field(seg_id, fld)):
+        if comp is not None and not (unmarked_rep or crossed or is_delimiter_field(seg_id, fld)):
             split = text.split(rep_sep)
             if esc not in text or not any(part.count(esc) % 2 for part in split):
                 parts = split
