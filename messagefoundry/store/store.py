@@ -9948,7 +9948,8 @@ not read chain state."""
 def no_audit_row(_result: object) -> None:
     """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
 
-    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Most of its callers end the sessions
+    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Replay, dead-letter replay, resend,
+    re-ingress and purge refuse it for a result that changed the store (BACKLOG #5069). Most of its callers end the sessions
     as the tail of a change that carries its own row, such as a password reset or a disable, so the
     revoke has nothing of its own to record."""
     return None
@@ -10406,8 +10407,8 @@ def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> Operato
         row = audit(result)
         if row is None and mutation_changed(result):
             raise TypeError(
-                f"{mutation}'s audit returned no row for a result that changed the store, so the"
-                " mutation does not commit it (BACKLOG #5069)"
+                f"{mutation}'s audit returned no row for a result that changed the store, which"
+                " an operator mutation refuses (BACKLOG #5069)"
             )
         return row
 

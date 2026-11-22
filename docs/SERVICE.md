@@ -487,12 +487,12 @@ directory to the service account only, as the installer does.
 
 The engine resolves the account with `LookupAccountSid` each time it opens the store. It refuses
 the directory at least when the lookup fails, when the account resolves to anything but a user, such as a
-group, or when the directory names a second account. In a refused directory the engine tries to
-remove each store file's inherited entries and grant the account that opened the store full
-control of it, and any other entry set on the file itself stays (see ADR 0163, *Note
-(2026-11-05)*). Where that fails, the file keeps the entries it inherited, and the engine logs a
-WARNING. It logs a WARNING naming the refusal's reason too. Then the service and the operator who provisions the first
-Administrator can lock each other out of the store.
+group, or when the directory names a second account, and logs a WARNING naming the reason. In a
+refused directory the engine tries to remove each store file's inherited entries and grant the
+account that opened the store full control of it, and any other entry set on the file itself
+stays (see ADR 0163, *Note (2026-11-05)*). Where that fails, the file keeps the entries it
+inherited, and the engine logs a WARNING. With that fallback, the service and the operator who
+provisions the first Administrator can lock each other out of the store.
 
 At least these are unmeasured:
 
