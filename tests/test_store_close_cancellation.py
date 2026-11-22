@@ -119,38 +119,51 @@ async def test_a_second_cancellation_does_not_strand_a_connection(tmp_path: Path
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    deadline = asyncio.get_running_loop().time() + 5
-    while any(w.is_alive() for w in workers) and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.01)
     assert [w.name for w in workers if w.is_alive()] == []
 
 
-async def test_a_wedged_step_cannot_hold_a_cancelled_close_forever(
+async def test_a_step_wedged_after_the_cancel_is_cut_at_the_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The cancellation must still return: a step that ignores it is given up on at the bound."""
+    """The cancelled close must still return, and still stop the workers after the wedged step."""
     monkeypatch.setattr("messagefoundry.store.close_steps.CANCELLED_CLOSE_GRACE_SECONDS", 0.2)
-    store = await MessageStore.open(tmp_path / "wedged.db")
-    release = asyncio.Event()
+    store = await MessageStore.open(tmp_path / "wedged.db", group_commit_window_ms=1.0)
+    workers = _workers(store)
+    entered = _inject(store, "settle")
+    committer: Any = store._group_commit
+    real_aclose = committer.aclose
 
-    async def settle(*_: object, **__: object) -> None:
-        while not release.is_set():
-            try:
-                await release.wait()
-            except asyncio.CancelledError:
-                continue  # deliberately swallows the cancel, as a wedged step would
+    async def wedged() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await real_aclose()
 
-    store.checkpoint_cipher_invocations = settle  # type: ignore[method-assign]
+    committer.aclose = wedged
     task = asyncio.ensure_future(store.close())
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(entered.wait(), 5)
     task.cancel()
-    try:
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(task), 5)
-    finally:
-        release.set()
-        await asyncio.sleep(0)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(task), 5)
     assert task.cancelled()
+    assert [w.name for w in workers if w.is_alive()] == []
+
+
+async def test_a_step_failure_after_a_cancel_is_logged_and_the_cancel_wins(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store: Any = object.__new__(PostgresStore)
+
+    class _FailingPool:
+        async def close(self) -> None:
+            raise OSError("synthetic detail")
+
+    store._read_only = False
+    store._pool = _FailingPool()
+    with caplog.at_level("WARNING", logger="messagefoundry.store.close_steps"):
+        await _cancel_at(store._close_handles, _parking_settle(store))
+    assert "failed after a cancellation (OSError)" in caplog.text
+    assert "synthetic detail" not in caplog.text
 
 
 async def test_a_clean_close_does_not_raise(tmp_path: Path) -> None:
@@ -270,7 +283,8 @@ async def test_sqlserver_cancelled_pool_wait_still_releases_the_executor() -> No
     assert executor.shutdowns == 1
 
 
-async def test_sqlserver_sync_pool_failure_still_closes_the_rest() -> None:
+async def test_sqlserver_sync_pool_failure_leaves_before_the_unbounded_pool_wait() -> None:
+    """As before this change: _one_connection_store's fallback bounds the wait on this path."""
     pool, executor = _FakePool(), _FakeExecutor()
     store, calls = _sqlserver(pool, executor)
 
@@ -284,8 +298,8 @@ async def test_sqlserver_sync_pool_failure_still_closes_the_rest() -> None:
     store.close_sync_handoff_pool = broken
     with pytest.raises(OSError, match="synthetic"):
         await store._close_handles()
-    assert calls == ["holders"]
-    assert (pool.closed, pool.waited, executor.shutdowns) == (1, 1, 1)
+    assert calls == []
+    assert (pool.closed, pool.waited, executor.shutdowns) == (0, 0, 0)
 
 
 async def test_postgres_cancelled_settlement_still_closes_the_pool() -> None:

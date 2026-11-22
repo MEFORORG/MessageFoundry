@@ -3019,8 +3019,10 @@ class PostgresStore:
         try:
             await steps.run(self._settle_at_close(), "the AES-GCM settlement")
             await steps.run(self._pool.close(), "the connection pool")
-        finally:
-            steps.reraise()
+        except Exception as exc:
+            steps.reraise(exc)
+            raise
+        steps.reraise()
 
     async def _settle_at_close(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store

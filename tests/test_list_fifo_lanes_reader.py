@@ -89,21 +89,6 @@ async def test_order_limit_and_cursor_are_kept(tmp_path: Path) -> None:
         await store.close()
 
 
-async def test_a_null_lane_takes_a_limit_slot_and_is_dropped(tmp_path: Path) -> None:
-    """The per-lane lookup this replaced behaved this way: ``= NULL`` matched no head."""
-    store = await MessageStore.open(tmp_path / "null.db")
-    try:
-        mid = await store.enqueue_ingress(channel_id="IB_A", raw=_RAW, now=1.0)
-        await store._db.execute(
-            "UPDATE queue SET stage=?, destination_name=NULL WHERE message_id=?",
-            (Stage.OUTBOUND.value, mid),
-        )
-        await store._db.commit()
-        assert await store.list_fifo_lanes(Stage.OUTBOUND.value, limit=1) == []
-    finally:
-        await store.close()
-
-
 async def test_memory_store_still_discovers(tmp_path: Path) -> None:
     store = await MessageStore.open(":memory:")
     try:

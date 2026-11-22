@@ -13780,16 +13780,21 @@ class MessageStore:
             # and resolves their futures before the write connection is closed — otherwise an
             # in-flight handoff would hang forever on a future no committer will ever complete.
             if self._group_commit is not None:
-                await steps.run(self._close_group_commit(), "the group committer")
+                await steps.run(self._close_group_commit(self._group_commit), "the group committer")
             # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
             # state), then the writer. Best-effort: one failing close must not strand the rest.
             for conn in self._read_conns:
-                await steps.run(self._close_read_connection(conn), "a read-pool connection")
+                try:
+                    await self._close_connection(conn, steps)
+                except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+                    _log_close_failure("error closing read-pool connection", exc)
             self._read_conns = []
             self._read_pool = None
-            await steps.run(self._close_writer(), "the writer connection")
-        finally:
-            steps.reraise()
+            await self._close_connection(self._db, steps)
+        except Exception as exc:
+            steps.reraise(exc)
+            raise
+        steps.reraise()
 
     async def _settle_at_close(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
@@ -13803,30 +13808,41 @@ class MessageStore:
         except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
             _log_close_failure("could not settle the AES-GCM invocation bound at close", exc)
 
-    async def _close_group_commit(self) -> None:
-        assert self._group_commit is not None
+    @staticmethod
+    async def _close_group_commit(committer: _GroupCommitter) -> None:
         try:
-            await self._group_commit.aclose()
+            await committer.aclose()
         except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
             _log_close_failure("error closing group-commit committer", exc)
 
     @staticmethod
-    async def _close_read_connection(conn: aiosqlite.Connection) -> None:
-        try:
-            await conn.close()
-        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
-            _log_close_failure("error closing read-pool connection", exc)
-        finally:
-            await _await_connection_worker_exit(conn)
+    async def _close_connection(conn: aiosqlite.Connection, steps: CloseSteps) -> None:
+        """Close ``conn`` and wait out its non-daemon worker, whatever cancellation arrives.
 
-    async def _close_writer(self) -> None:
-        # Each close returns before the worker thread it stops has actually gone, and those threads
-        # are non-daemon, so a `close`d store could still hold threads interpreter exit has to join.
-        # Wait them out so "the store is closed" means every thread it owned is gone.
+        Once a cancellation is held, ``stop()`` replaces ``await close()``: it queues the close and
+        the worker's exit without awaiting, and ``close()`` could park on a wedged worker past any
+        single cancel. The wait re-enters on a further cancel, against one deadline, so "the store
+        is closed" still means every thread it owned is gone unless that bound was hit and logged.
+        """
         try:
-            await self._db.close()
+            if steps.cancelled:
+                conn.stop()
+            else:
+                await conn.close()
+        except asyncio.CancelledError as exc:
+            steps.hold(exc)
         finally:
-            await _await_connection_worker_exit(self._db)
+            loop = asyncio.get_running_loop()
+            bound = steps.remaining() if steps.cancelled else _CONNECTION_WORKER_EXIT_TIMEOUT
+            deadline = loop.time() + bound
+            while True:
+                try:
+                    await _await_connection_worker_exit(
+                        conn, timeout=max(deadline - loop.time(), 0.0)
+                    )
+                    break
+                except asyncio.CancelledError as exc:
+                    steps.hold(exc)
 
     # --- write path ----------------------------------------------------------
 
@@ -15607,8 +15623,7 @@ class MessageStore:
         every lane with >=1 PENDING row at ``stage``, paired with its HEAD row's (rowid-min pending
         row's) ``next_attempt_at`` — head-of-line-aware by construction. ``DISTINCT`` + per-lane head
         sub-select in ONE statement on a pooled reader (BACKLOG #5673), so a sweep neither holds the
-        write lock nor pays one round trip per lane; no writes, no commit needed. A NULL lane still
-        takes a ``limit`` slot and is then dropped, as the per-lane lookup it replaces dropped it."""
+        write lock nor pays one round trip per lane; no writes, no commit needed."""
         lane_col = (
             "channel_id"
             if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
