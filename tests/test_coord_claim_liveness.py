@@ -535,6 +535,29 @@ def test_one_repositorys_failed_probe_does_not_poison_another(
     assert other_state in out, out
 
 
+def test_a_probe_that_did_not_load_is_looked_up_once_and_reads_present(
+    repo: Path, tmp_path: Path
+) -> None:
+    """-List walks every claim, so the failed lookup must not repeat, or read as anything else."""
+    peer = peer_holding(repo, tmp_path, "a")
+    assert claim(peer, "-Take", "b", "-Note", "n").returncode == 0
+    assert claim(peer, "-Take", "c", "-Note", "n").returncode == 0
+    lookups = tmp_path / "lookups.txt"
+    # Defines no probe. It only counts the lookups of the probe that is missing.
+    (repo / "scripts" / "coord" / "occupancy.ps1").write_text(
+        "function Get-Command { [CmdletBinding()]\n"
+        "  param([Parameter(Position=0)][string[]]$Name, $CommandType)\n"
+        f"  if ($Name -contains 'Get-WorktreeOccupancy') {{ "
+        f"[IO.File]::AppendAllText('{lookups}', 'x') }}\n"
+        "  Microsoft.PowerShell.Core\\Get-Command @PSBoundParameters }\n",
+        encoding="utf-8",
+    )
+    out = claim(repo, "-List").stdout
+    assert out.count("OCCUPANCY UNKNOWN") == 3, out
+    assert "DIRECTORY ONLY" not in out, out
+    assert lookups.read_text(encoding="utf-8") == "x"
+
+
 # --------------------------------------------------------------------------------------------------
 # BACKLOG #1466: merged-work EVIDENCE for a directory-only holder, and never authority
 # --------------------------------------------------------------------------------------------------

@@ -56,6 +56,9 @@ function Enter-CoordLock {
     # Load-bearing. Under a caller's SilentlyContinue, or with no enclosing try, a failed .NET call
     # would not stop this function: it would run on into the block that owns and deletes the lock file.
     $ErrorActionPreference = 'Stop'
+    # With Stop in force, a caller's $true here would turn a failed git call into a raw error ahead of
+    # the exit-code check below.
+    $PSNativeCommandUseErrorActionPreference = $false
     $gitArgs = @()
     if ($Repo) { $gitArgs = @("-C", $Repo) }
     $common = (& git @gitArgs rev-parse --path-format=absolute --git-common-dir 2>$null)
@@ -70,6 +73,7 @@ function Enter-CoordLock {
     # Monotonic, so a clock or daylight-saving step cannot stretch or collapse either bound.
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $deniedAt = $null
+    $absentAt = $null
     while ($true) {
         try {
             $fs = Open-CoordLockFile $lock
@@ -78,19 +82,27 @@ function Enter-CoordLock {
             # 10.0.26300, NTFS, with the legacy disposition; a plain File.Delete there frees the name at
             # once). A real denial raises it too. Pending shows as a file that is still there, and it
             # clears when the last handle closes, so it earns a bounded wait. The bound is short because
-            # a real denial on an existing file looks the same. No file gets 1 s, for a delete that
-            # finished between the two reads. A directory can never clear and fails at once. Each
-            # path reports the denial: the text in a file being deleted names no holder.
+            # a real denial on an existing file looks the same: 5 s from the first denial. A name seen
+            # empty always gets one more try, because a delete may have finished between the two reads,
+            # and then 1 s from when it was first seen empty, inside the same 5 s. A directory can never
+            # clear and fails at once. Each path reports the denial: the text in a file being deleted
+            # names no holder.
             $now = $clock.Elapsed.TotalSeconds
             if ($null -eq $deniedAt) { $deniedAt = $now }
             $isDirectory = Test-Path -LiteralPath $lock -PathType Container
-            $window = if ($isDirectory) { 0 } elseif (Test-Path -LiteralPath $lock -PathType Leaf) { 5 } else { 1 }
-            if ($now -le $TimeoutSeconds -and ($now - $deniedAt) -lt $window) {
+            $isFile = Test-Path -LiteralPath $lock -PathType Leaf
+            $inWindow = ($now - $deniedAt) -lt 5
+            $retry = if ($isDirectory) { $false }
+            elseif ($isFile) { $absentAt = $null; $inWindow }
+            elseif ($null -eq $absentAt) { $absentAt = $now; $true }
+            else { $inWindow -and ($now - $absentAt) -lt 1 }
+            if ($now -le $TimeoutSeconds -and $retry) {
                 Start-Sleep -Milliseconds 50
                 continue
             }
             $advice = if ($isDirectory) { "A directory is at the lock path. Remove it." }
-            else { "The file may still be pending deletion, so retry. If this repeats, check its permissions." }
+            elseif ($isFile) { "The file may still be pending deletion, so retry. If this repeats, check its permissions." }
+            else { "No file is at the lock path, so check the permissions on its directory." }
             throw (
                 "Enter-CoordLock: access denied creating the '$safe' lock at '$lock'.`n" +
                 "  $advice`n" +
@@ -102,6 +114,7 @@ function Enter-CoordLock {
             # Windows codes only (FILE_EXISTS, SHARING_VIOLATION). Elsewhere HResult carries an errno.
             if ($env:OS -eq 'Windows_NT' -and ($io.HResult -band 0xFFFF) -notin 0x50, 0x20) { throw }
             $deniedAt = $null
+            $absentAt = $null
             if ($clock.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
                 $held = "(unreadable)"
                 try { $held = (Get-Content -LiteralPath $lock -Raw -EA Stop).Trim() } catch { }

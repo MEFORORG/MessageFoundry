@@ -97,9 +97,9 @@ def acquire(
     legitimately, and the caller sees two winners against a lock that never misbehaved. With it, the
     claimant signals readiness *after* start-up and waits for the go file, so pwsh cold-start time is
     excluded from the race. It does NOT cover Enter-CoordLock's own prologue: the ``git rev-parse``
-    spawn at lock.ps1:47 runs after the gate and before the deadline is set at lock.ps1:56, and under
-    CPU load that alone spread the cohort's deadline start by 645-2134 ms. ``witness`` is what makes
-    the test sound despite that -- see the test below.
+    spawn runs after the gate and before the function starts its timeout clock, and under CPU load
+    that alone spread the cohort's start by 645-2134 ms. ``witness`` is what makes the test sound
+    despite that -- see the test below.
     """
     gate = ""
     if barrier is not None:
@@ -161,8 +161,8 @@ def test_eight_concurrent_claimants_never_hold_it_at_once(repo: Path, tmp_path: 
     """Eight real processes, one lock, all reaching for it at the same instant.
 
     Asserts OCCUPANCY, not winner count. The barrier releases the cohort together, but each process
-    then runs Enter-CoordLock's own prologue (a ``git rev-parse`` spawn, lock.ps1:47) before its deadline
-    is set (lock.ps1:56), and nothing synchronizes that. A winner-count assertion tolerates only
+    then runs Enter-CoordLock's own prologue (a ``git rev-parse`` spawn) before its timeout clock
+    starts, and nothing synchronizes that. A winner-count assertion tolerates only
     (hold - timeout) of that skew; under CPU load the skew was measured at 645-2134 ms, so counting
     winners tests the scheduler, not the mutex. Measured directly: in five multi-winner rounds the hold
     intervals were strictly DISJOINT -- the extra winners acquired legitimately, after release.
@@ -384,6 +384,7 @@ def test_a_delete_pending_lock_that_outlasts_the_wait_names_no_false_holder(
         proc = acquire(repo, timeout=1)
     assert "ACQUIRED" not in proc.stdout
     assert "access denied" in proc.stderr.lower(), proc.stderr
+    assert "pending deletion" in proc.stderr, proc.stderr
     assert "held by" not in proc.stderr, proc.stderr
 
 
@@ -405,6 +406,67 @@ def test_a_genuine_denial_fails_at_once_and_names_no_holder(repo: Path) -> None:
     assert "Timed out" not in proc.stderr, proc.stderr
     assert counter.read_text(encoding="utf-8") == "x", "retried a denial that cannot clear"
     assert "directory" in proc.stderr.lower(), proc.stderr
+
+
+def test_a_name_that_clears_after_the_first_second_is_acquired(repo: Path) -> None:
+    """A pending file that goes away late must be retried, not reported as a denial on a free name.
+
+    The stub places the clearing on the claimant's own clock, so no holder's timing is involved. Its
+    last denial lands after the file is gone, which is the read order that used to throw.
+    """
+    lock = _lock_file(repo)
+    lock.write_text("pid=1 host=DELETING at=2026-07-29T00:00:00.0000000Z", encoding="utf-8")
+    script = (
+        f". '{LOCK}'\n"
+        "$realOpen = ${function:Open-CoordLockFile}\n"
+        "$script:sw = [Diagnostics.Stopwatch]::StartNew()\n"
+        "function Open-CoordLockFile([string]$Path) {\n"
+        "  if ($script:sw.Elapsed.TotalSeconds -lt 1.3) "
+        "{ throw [UnauthorizedAccessException]::new('simulated pending') }\n"
+        "  if (Test-Path -LiteralPath $Path) { [IO.File]::Delete($Path); "
+        "throw [UnauthorizedAccessException]::new('simulated pending') }\n"
+        "  & $realOpen $Path }\n"
+        f"$l = Enter-CoordLock -Name 't' -TimeoutSeconds 30 -Repo '{repo}'\n"
+        "if ((Get-Content -LiteralPath $l -Raw) -match \"pid=$PID \") { Write-Output 'OWNED' }\n"
+        "Exit-CoordLock $l"
+    )
+    proc = _pwsh(script)
+    assert "OWNED" in proc.stdout, f"{proc.stdout}{proc.stderr}"
+
+
+def test_a_denial_with_no_file_stops_quickly_and_does_not_claim_a_pending_delete(
+    repo: Path,
+) -> None:
+    """Nothing at the path means no delete is pending, so the advice must not say one is."""
+    script = (
+        f". '{LOCK}'\n"
+        "function Open-CoordLockFile([string]$Path) "
+        "{ throw [UnauthorizedAccessException]::new('simulated denial') }\n"
+        "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+        f"try {{ Enter-CoordLock -Name 't' -TimeoutSeconds 30 -Repo '{repo}' }}\n"
+        "catch { Write-Output $_.Exception.Message }\n"
+        'Write-Output "ELAPSED=$($sw.Elapsed.TotalSeconds)"'
+    )
+    proc = _pwsh(script)
+    assert "access denied" in proc.stdout.lower(), f"{proc.stdout}{proc.stderr}"
+    assert "pending deletion" not in proc.stdout, proc.stdout
+    assert "no file" in proc.stdout.lower(), proc.stdout
+    elapsed = float(proc.stdout.split("ELAPSED=")[1].split()[0])
+    assert elapsed < 5, f"a denial with no file waited {elapsed} s"
+
+
+def test_a_failing_git_call_keeps_the_functions_own_error(repo: Path, tmp_path: Path) -> None:
+    """A caller's native-command preference must not replace the message with a raw git failure."""
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    script = (
+        f". '{LOCK}'\n"
+        "$PSNativeCommandUseErrorActionPreference = $true\n"
+        f"try {{ Enter-CoordLock -Name 't' -Repo '{outside}' }} "
+        "catch { Write-Output $_.Exception.Message }"
+    )
+    proc = _pwsh(script)
+    assert "not inside a git repository" in proc.stdout, f"{proc.stdout}{proc.stderr}"
 
 
 def test_lock_is_shared_between_the_primary_and_its_worktrees(repo: Path, tmp_path: Path) -> None:

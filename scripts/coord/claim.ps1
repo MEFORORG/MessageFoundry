@@ -399,10 +399,16 @@ function Add-HistoryLine([string]$Line) {
 # hundreds of claims. A path alone is not a safe key, because a stale listing in one repository can
 # name a path that is now a worktree of another.
 $script:OccupancyProbes = @{}
+$script:OccupancyLoaded = $null   # $null = not looked up yet. Whether occupancy.ps1 loaded cannot change.
 
 function Get-OccupancyForHolder([string]$HeldPath) {
     try {
-        if (-not (Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)) { return $false }
+        if ($null -eq $script:OccupancyLoaded) {
+            # False first, so a lookup that throws is cached as "not loaded" and stays `present`.
+            $script:OccupancyLoaded = $false
+            $script:OccupancyLoaded = [bool](Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)
+        }
+        if (-not $script:OccupancyLoaded) { return $false }
         $key = Get-OwningGitCommonDir $HeldPath
         if (-not $key) { return $false }
         if (-not $script:OccupancyProbes.ContainsKey($key)) {
