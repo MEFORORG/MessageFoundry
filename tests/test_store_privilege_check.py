@@ -638,17 +638,17 @@ _HOSTILE = "a\x1b[31mb\x7fc\x9bd\u202ee\u2028f"
 
 
 def _assert_escaped(out: str) -> None:
-    line = out.rstrip("\n")
-    assert line.isascii() and line.isprintable(), f"--json output carries a raw character: {out!r}"
-    for ch in sorted({ch for ch in _HOSTILE if not (ch.isascii() and ch.isprintable())}):
-        assert f"\\u{ord(ch):04x}" in out, f"--json output lacks the escape for {ch!r}: {out!r}"
+    """Every line of ``out`` is printable ASCII. With the caller's check that ``out`` decodes back
+    to :data:`_HOSTILE`, that proves each of its characters was written as an escape."""
+    raw = [line for line in out.splitlines() if not (line.isascii() and line.isprintable())]
+    assert not raw, f"--json output carries a raw character: {out!r}"
 
 
 def test_the_escape_assertion_fails_on_unescaped_json() -> None:
     """The control for :func:`_assert_escaped`: output written without ``ensure_ascii`` fails it."""
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="carries a raw character"):
         _assert_escaped(json.dumps({"error": _HOSTILE}, ensure_ascii=False))
-    _assert_escaped(json.dumps({"error": _HOSTILE}))
+    _assert_escaped(json.dumps({"error": _HOSTILE}, indent=2))
 
 
 def test_cli_json_result_escapes_controls_and_bidi_in_a_detail(
@@ -660,9 +660,10 @@ def test_cli_json_result_escapes_controls_and_bidi_in_a_detail(
     )
     _stub_probe(monkeypatch, report)
     argv = ["check-privileges", "--service-config", str(_server_toml(tmp_path)), "--json"]
-    assert main(argv) == 4
-    out = capsys.readouterr().out
+    code = main(argv)
+    out = capsys.readouterr().out  # read first, so a failing assert never echoes it raw
     _assert_escaped(out)
+    assert code == EXIT_UNOBSERVABLE
     store = next(h for h in json.loads(out)["hops"] if h["hop"] == "store")
     assert _HOSTILE in store["detail"]
 
@@ -674,9 +675,10 @@ def test_cli_json_error_escapes_controls_and_bidi_in_the_message(
     monkeypatch.setattr(
         "messagefoundry.__main__._load_service_settings", lambda *a, **k: (None, _HOSTILE)
     )
-    assert main(["check-privileges", "--service-config", "unused.toml", "--json"]) == 1
+    code = main(["check-privileges", "--service-config", "unused.toml", "--json"])
     out = capsys.readouterr().out
     _assert_escaped(out)
+    assert code == EXIT_SETTINGS
     assert json.loads(out) == {"error": _HOSTILE}
 
 
