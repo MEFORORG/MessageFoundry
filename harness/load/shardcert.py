@@ -757,8 +757,8 @@ def fidelity_note(
         f"FIDELITY UNKNOWN — the gate's inputs were not recorded (sent={sent} acked={acked} "
         f"offered={offered}); the rung is VOID for the ceiling. An unmeasured gate is never a pass"
     )
-    # Before anything divides by offered: a non-positive offered is what makes a rung UNKNOWN.
-    if fidelity is RungFidelity.UNKNOWN or offered <= 0:
+    # Before anything divides by offered: a non-positive offered is one way a rung becomes UNKNOWN.
+    if fidelity is RungFidelity.UNKNOWN:
         return unknown
     short = f"sent {sent} of {offered} offered ({sent / offered:.1%} < {_FIDELITY_SENT_FLOOR:.0%})"
     causes = f"deferred: backpressure={deferred_backpressure} schedule={deferred_schedule}"

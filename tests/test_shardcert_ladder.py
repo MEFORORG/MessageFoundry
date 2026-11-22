@@ -1142,14 +1142,24 @@ def test_step_record_fidelity_is_fail_closed_when_sent_is_unrecorded() -> None:
     assert rec.fidelity is RungFidelity.UNKNOWN
 
 
-@pytest.mark.parametrize("fidelity", [f for f in RungFidelity if f is not RungFidelity.ADMISSIBLE])
-def test_fidelity_note_for_a_zero_offered_rung_is_the_unknown_note(fidelity: RungFidelity) -> None:
+def test_fidelity_note_for_a_zero_offered_rung_is_the_unknown_note() -> None:
     # BACKLOG #5861: a zero-offered rung classifies UNKNOWN, and its note must say so rather than
-    # divide by the zero that made it UNKNOWN. Every void verdict, because the shortfall and intake
-    # notes each divide by offered.
-    assert shardcert.rung_fidelity(sent=0, acked=0, offered=0) is RungFidelity.UNKNOWN
+    # divide by the zero that made it UNKNOWN.
+    fidelity = shardcert.rung_fidelity(sent=0, acked=0, offered=0)
+    assert fidelity is RungFidelity.UNKNOWN
     note = shardcert.fidelity_note(fidelity, sent=0, acked=0, offered=0)
     assert note is not None and note.startswith("FIDELITY UNKNOWN")
+
+
+@pytest.mark.parametrize(
+    "fidelity",
+    [f for f in RungFidelity if f not in (RungFidelity.ADMISSIBLE, RungFidelity.UNKNOWN)],
+)
+def test_fidelity_note_names_every_measured_void_verdict(fidelity: RungFidelity) -> None:
+    # The note's tail is the UNKNOWN text, so a verdict with no branch of its own would claim its
+    # recorded inputs "were not recorded". This fails for such a verdict.
+    note = shardcert.fidelity_note(fidelity, sent=90, acked=90, offered=100)
+    assert note is not None and not note.startswith("FIDELITY UNKNOWN")
 
 
 def test_step_record_carries_sent_across_from_the_report() -> None:

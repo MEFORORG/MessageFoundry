@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from harness.config.connscale._shape import make_connscale_shape
-from harness.load._lookup import LOCAL_LABEL
+from harness.load._lookup import CONNSCALE_PATTERNS, PROFILES_DIR
 from harness.load.connscale.profile import (
     ConnScaleProfileError,
     get_connscale_profile,
@@ -145,14 +145,16 @@ def test_pooled_ab_builtin_resolves() -> None:
 
 
 @pytest.mark.parametrize(
-    "name",
-    sorted(n for n, desc in list_connscale_profiles().items() if LOCAL_LABEL not in desc),
+    "path",
+    sorted({path for pattern in CONNSCALE_PATTERNS for path in PROFILES_DIR.glob(pattern)}),
+    ids=lambda path: path.stem,
 )
-def test_shipped_profile_band_clears_the_default_sink_at_every_count(name: str) -> None:
+def test_shipped_profile_band_clears_the_default_sink_at_every_count(path: Path) -> None:
     # BACKLOG #5858, #5859, #5860: the documented command passes no --sink-port, so each step builds
     # its shape against the default sink, and the shape guard refuses a band that contains it.
-    # Operator-local profiles are excluded: their ports are that site's to choose.
-    profile = get_connscale_profile(name)
+    # Globbed from the shipped directory, because in the merged listing an operator-local profile
+    # of the same name would replace the shipped one and take it out of this check.
+    profile = load_connscale_profile(path)
     for count in profile.counts:
         make_connscale_shape(count=count, base_port=profile.base_port)
 
