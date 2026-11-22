@@ -168,9 +168,9 @@ def test_webhook_cleartext_is_refused_in_every_posture_even_with_escape(
 def test_webhook_notifier_refuses_cleartext_in_every_posture(
     posture: HopPosture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The settings route meets the same refusal; the warn posture used to build here. The section
-    # is built with model_construct because its own load-time check (#3533 item 14) refuses this
-    # URL first; the test is of the notifier's second line.
+    # The notifier's own refusal, its second line; the warn posture used to build here. The section
+    # is built with model_construct because settings load (#3533 item 14) refuses this URL first,
+    # with a message of its own.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with pytest.raises(ValueError, match="cleartext http"):
         notifier_from_settings(
