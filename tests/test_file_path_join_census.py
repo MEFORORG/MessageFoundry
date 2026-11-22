@@ -850,21 +850,21 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_HeldStagingDir.has": Site(
         1,
         INTERNAL,
-        "A fixed marker name in a staging directory opened as itself, or gone by path; tested "
-        "for existence only.",
+        "A fixed marker name in a staging directory, joined where it goes by path; tested for "
+        "existence only.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_HeldStagingDir.mark": Site(
         3,
         INTERNAL,
-        "Fixed lock and marker names in a staging directory opened as itself (Windows), created "
-        "exclusively and otherwise only lstat'ed as themselves; or, where it goes by path (POSIX "
-        "without O_PATH), created unfollowed.",
+        "Fixed lock and marker names in a staging directory, joined where it goes by path: on "
+        "Windows created exclusively and otherwise only lstat'ed; on POSIX created with "
+        "O_NOFOLLOW.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_HeldStagingDir.open_lock": Site(
-        2,
+        1,
         INTERNAL,
-        "A fixed lock name in a staging directory opened as itself (Windows), opened as itself; or, "
-        "where it goes by path (POSIX without O_PATH), opened unfollowed.",
+        "A fixed lock name in a staging directory, joined where it goes by path, as the sweep "
+        "opened it before.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_teardown_staging": Site(
         2,

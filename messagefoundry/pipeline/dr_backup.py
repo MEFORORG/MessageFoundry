@@ -103,11 +103,8 @@ from messagefoundry.store.gcm_bound import bounded_cipher
 from messagefoundry.store.schema_verify import SchemaMismatchError
 from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.transports.file import (
-    _FILE_LIST_DIRECTORY,
-    _FILE_READ_ATTRIBUTES,
     _FLAG_BACKUP_SEMANTICS,
     _FLAG_OPEN_REPARSE_POINT,
-    _GENERIC_READ,
     _NAME_SURROGATE,
     _SHARE_ALL,
     _WIN_UNSUPPORTED,
@@ -115,7 +112,6 @@ from messagefoundry.transports.file import (
     _fd_for,
     _file_id,
     _handle_final_path,
-    _kernel32,
     _os_handle,
     _Replaced,
     _Unconfined,
@@ -3171,8 +3167,7 @@ def _unlock_and_close(fd: int) -> None:
         os.close(fd)
 
 
-#: Win32 access rights :class:`_HeldStagingDir` asks for beside ``transports/file.py``'s own.
-_READ_CONTROL = 0x00020000
+#: The Win32 access right :func:`_win_create_new` asks for.
 _GENERIC_WRITE = 0x40000000
 
 
@@ -3193,22 +3188,9 @@ def _win_create_new(path: Path) -> None:
     kernel32.CloseHandle(handle)
 
 
-class _StandardInfo(ctypes.Structure):
-    """``FILE_STANDARD_INFO``."""
-
-    _fields_ = (
-        ("allocation_size", ctypes.c_int64),
-        ("end_of_file", ctypes.c_int64),
-        ("number_of_links", ctypes.c_uint32),
-        ("delete_pending", ctypes.c_ubyte),
-        ("directory", ctypes.c_ubyte),
-    )
-
-
 class _HeldStagingDir:
-    """A staging directory opened as itself, through which the sweep reads its owner, opens its lock
-    and tests its marker, and the teardown puts both back (BACKLOG #2420). Used as a context
-    manager, and closed before any removal.
+    """A staging directory through which the sweep reads its owner, opens its lock and tests its
+    marker, and the teardown puts both back (BACKLOG #2420). Used as a context manager.
 
     POSIX opens it with ``O_NOFOLLOW`` and goes relative to that descriptor, so a directory swapped
     for a link has neither its lock opened nor its marks made in the link's target. Where the
@@ -3216,37 +3198,17 @@ class _HeldStagingDir:
     read permission, it goes by path instead, as the opens it replaced did, so such a directory is
     still swept and re-marked.
 
-    Windows opens it as itself, refuses a link or a junction there, and reads its owner from that
-    handle. The handle shares delete, so a sibling's removal of the directory is not refused, and
-    so the directory can also be renamed while it is open: a name below it is opened by path, and
-    reaches whatever has that path then.
+    Windows opens nothing here and goes by path, as the opens it replaced did; only its re-mark
+    differs, by an exclusive create (:meth:`mark`).
 
     What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
     ``mefor-verify-*`` staging row."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        #: None where the directory goes by path (POSIX without `O_PATH`, see above).
+        #: None where the directory goes by path (Windows, and POSIX as said above).
         self.fd: int | None = None
-        if sys.platform == "win32":
-            # READ_CONTROL for the owner, FILE_READ_ATTRIBUTES for the tag. Shared for delete, so
-            # a sibling engine shard's removal of its own live directory is never refused by this.
-            handle = _win_create(
-                path,
-                _FILE_LIST_DIRECTORY | _READ_CONTROL | _FILE_READ_ATTRIBUTES,
-                _SHARE_ALL,
-                _FLAG_OPEN_REPARSE_POINT | _FLAG_BACKUP_SEMANTICS,
-            )
-            fd = _fd_for(handle)
-            try:
-                attributes, tag = _attribute_tag(handle)
-                if not attributes & stat.FILE_ATTRIBUTE_DIRECTORY or tag & _WIN_NAME_SURROGATE:
-                    raise _Unconfined("a link, a junction or not a directory")
-            except BaseException:
-                os.close(fd)
-                raise
-            self.fd = fd
-        else:
+        if sys.platform != "win32":
             flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
             o_path = getattr(os, "O_PATH", None)
             if o_path is not None:
@@ -3266,20 +3228,6 @@ class _HeldStagingDir:
             with contextlib.suppress(OSError):
                 os.close(self.fd)
 
-    def delete_pending(self) -> bool:
-        """Windows: whether the open directory is being deleted, as when a sibling engine shard
-        removed it while it was open here; a volume without POSIX delete semantics then refuses a
-        name below it with access denied rather than "not found". ``False`` elsewhere, and when
-        that cannot be read."""
-        if sys.platform != "win32" or self.fd is None:
-            return False
-        info = _StandardInfo()
-        if not _kernel32().GetFileInformationByHandleEx(
-            _os_handle(self.fd), 1, ctypes.byref(info), ctypes.sizeof(info)
-        ):  # 1 is FileStandardInfo
-            return False
-        return bool(info.delete_pending)
-
     def owner(self) -> object | None:
         """The directory's owner, read from the open directory (:func:`_owner_of_fd`), or by path
         (:func:`_owner_of`) where it goes by path."""
@@ -3288,18 +3236,14 @@ class _HeldStagingDir:
         return _owner_of_fd(self.fd, self.path)
 
     def open_lock(self) -> int:
-        """Open the lock file for reading and writing, never through a link at its own name, and
-        return a descriptor. ``O_NONBLOCK`` on POSIX, so a FIFO planted there does not hold the
-        sweep."""
-        if sys.platform == "win32":
-            # As `os.open(..., O_RDWR)` asks.
-            return _win_open_file(
+        """Open the lock file for reading and writing and return a descriptor. ``O_NONBLOCK``
+        where the platform has it, so a FIFO planted there does not hold the sweep; ``O_NOFOLLOW``
+        where it has that, which Windows does not."""
+        if sys.platform == "win32" or self.fd is None:
+            return os.open(
                 self.path / _LOCK_NAME,
-                _GENERIC_READ | _GENERIC_WRITE,
-                fd_flags=os.O_RDWR | os.O_BINARY,
+                os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK,
             )
-        if self.fd is None:
-            return os.open(self.path / _LOCK_NAME, os.O_RDWR | _O_NOFOLLOW | _O_NONBLOCK)
         return os.open(
             _LOCK_NAME,
             os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
@@ -3309,26 +3253,26 @@ class _HeldStagingDir:
     def has(self, name: str) -> bool:
         """Whether an entry named ``name`` is in the directory, a link included; ``False`` when that
         cannot be read."""
-        if sys.platform == "win32" or self.fd is None:
+        if self.fd is None:
             return os.path.lexists(self.path / name)
         try:
             os.stat(name, dir_fd=self.fd, follow_symlinks=False)
         except OSError:
-            return False  # as `os.path.lexists`, which the Windows arm uses, reads a fault
+            return False  # as `os.path.lexists`, which the by-path arm uses, reads a fault
         return True
 
     def mark(self, name: str) -> None:
         """Create the empty file ``name`` unless an entry has that name; raise ``OSError`` when the
-        entry there is not a plain file. Except where the directory goes by path (below), the
-        create is exclusive, so it never opens an existing name
-        and never follows a link planted there, a dangling one included: on POSIX ``O_EXCL`` with
-        ``O_CREAT`` never follows a final link, and on Windows ``CREATE_NEW`` with
-        ``FILE_FLAG_OPEN_REPARSE_POINT`` takes the link itself as the name in use, where an
-        ``os.open`` create would make the file at a dangling link's target. An entry that goes
+        entry there is not a plain file. On Windows, and on POSIX where the directory is open, the
+        create is exclusive, so it never opens an existing entry at that name and never follows a
+        link planted there, a dangling one included: on POSIX ``O_EXCL`` with ``O_CREAT`` never
+        follows a final link, and on Windows ``CREATE_NEW`` with ``FILE_FLAG_OPEN_REPARSE_POINT``
+        takes the link itself as the name in use, where an ``os.open`` create would make the file
+        at a dangling link's target. Windows still reaches that name by path. An entry that goes
         between the refused create and its check is created once more.
 
-        Where the directory goes by path, the open is the one it replaced: ``O_CREAT`` with
-        ``O_NOFOLLOW`` and ``O_NONBLOCK``, by path."""
+        Where POSIX goes by path, the open is the one it replaced: ``O_CREAT`` with ``O_NOFOLLOW``
+        and ``O_NONBLOCK``, by path."""
         if sys.platform != "win32" and self.fd is None:
             flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
             os.close(os.open(self.path / name, flags, 0o600))
@@ -3534,8 +3478,8 @@ def _teardown_staging(
             ", ".join(unrecorded),
         )
     else:
-        # Through the directory opened as itself, and by an exclusive create, so a directory swapped
-        # for a link, or a link or a FIFO planted at either name, is never opened (BACKLOG #2420).
+        # Through `_HeldStagingDir`, which says where it goes by path; a link or a FIFO planted at
+        # either name is never opened (BACKLOG #2420).
         try:
             with _HeldStagingDir(path) as held_dir:
                 for name in (_LOCK_NAME, _HELD_MARKER_NAME):
@@ -4408,8 +4352,6 @@ def _proven_abandoned(path: Path, owner: object) -> bool:
         except FileNotFoundError:
             return False  # no lock file: no proof either way
         except OSError as exc:
-            if held_dir.delete_pending():
-                return False  # removed while open here: gone, as with no lock file
             # A directory with this account's owner whose lock file this account still cannot
             # open, or one planted there as a link; another owner's directory never reaches here,
             # since the owner is checked first. Said, not skipped silently.

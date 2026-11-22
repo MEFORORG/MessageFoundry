@@ -6,7 +6,7 @@
 - The teardown's removal pass on Windows descended a subdirectory whose name Win32 rewrites, and a
   sibling junction took it outside the staging directory.
 - The POSIX retry of a refused removal changed an entry's mode and removed it by its full path.
-- The sweep's lock open and marker test, and the teardown's re-mark, went by path, so a staging
+- On POSIX the sweep's lock open and marker test, and the teardown's re-mark, went by path, so a staging
   directory swapped for a link had its lock opened, and its marks made, in the link's target.
 - A file renamed after its screen, with a new file made under its name, was emptied as the new one
   and reported clean.
@@ -124,7 +124,7 @@ def test_a_refused_removal_is_retried_by_path_only_on_windows(
         assert entry.read_bytes() == _PLAINTEXT
 
 
-# --- the sweep reads the owner, the lock and the marker through the directory opened as itself ---
+# --- on POSIX the sweep reads the owner, the lock and the marker through the opened directory ---
 
 
 def _swap_for_link_at_owner_read(
@@ -146,6 +146,7 @@ def _swap_for_link_at_owner_read(
     monkeypatch.setattr(dr_backup, "_owner_of", owner_then_swap)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows goes by path here, as before")
 def test_a_candidate_swapped_for_a_link_after_its_owner_read_is_not_torn_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -166,6 +167,7 @@ def test_a_candidate_swapped_for_a_link_after_its_owner_read_is_not_torn_down(
     assert (target / "archive.tar").read_bytes() == _PLAINTEXT
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows goes by path here, as before")
 def test_the_owner_that_decides_is_read_from_the_directory_opened(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -188,9 +190,10 @@ def test_the_owner_that_decides_is_read_from_the_directory_opened(
     assert not candidate.exists()
 
 
-# --- the re-mark goes through the directory opened as itself, by an exclusive create ------------
+# --- on POSIX the re-mark goes through the opened directory, by an exclusive create -------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows goes by path here, as before")
 def test_the_re_mark_makes_nothing_in_a_links_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -322,11 +325,12 @@ def test_the_re_mark_makes_nothing_at_a_dangling_links_target(tmp_path: Path) ->
 def test_a_swept_candidate_whose_name_windows_rewrites_gets_the_verbatim_refusal(
     win_tmp: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A planted `mefor-backup-x.` opens as the abandoned `mefor-backup-x` beside it, which the sweep
-    leaves for its other owner. Red on 9be6759e20a: the held open refused the planted name with a
-    WARNING printing its plain path, which removed by hand would remove `mefor-backup-x`. As on
-    origin/main, it now reaches the teardown's refusal, which names it by its verbatim path and
-    touches neither directory."""
+    """A planted `mefor-backup-x.` opens as the abandoned `mefor-backup-x` beside it. A stand-in has
+    the owner read by the name `mefor-backup-x` alone answer another owner, so the sweep leaves
+    that name and reaches the planted one first; one directory reporting two owners by its two
+    names is the stand-in's, not a real volume's. Through the planted name the sweep proves the
+    other directory abandoned, and the teardown's refusal names the planted name by its verbatim
+    path and touches neither directory."""
     other = win_tmp / "mefor-backup-x"
     other.mkdir()
     (other / "archive.tar").write_bytes(_PLAINTEXT)
@@ -354,17 +358,6 @@ def test_a_swept_candidate_whose_name_windows_rewrites_gets_the_verbatim_refusal
     assert os.path.lexists(_verbatim(win_tmp, "mefor-backup-x."))
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows share modes")
-def test_the_held_directory_does_not_refuse_a_siblings_removal(tmp_path: Path) -> None:
-    """A sibling engine shard removes its own live directory while this sweep has it open. Red on
-    9be6759e20a: the open denied delete sharing, so that removal failed with a sharing violation."""
-    staging = tmp_path / "mefor-backup-live"
-    staging.mkdir()
-    with dr_backup._HeldStagingDir(staging):
-        os.rmdir(staging)
-    assert not os.path.lexists(staging)
-
-
 @pytest.mark.skipif(
     sys.platform == "win32" or os.geteuid() == 0, reason="POSIX permissions, as a non-root account"
 )
@@ -387,40 +380,3 @@ def test_without_o_path_a_directory_it_cannot_read_is_still_swept_by_path(
         assert dr_backup._proven_abandoned(candidate, owner) is True
     finally:
         candidate.chmod(0o700)
-
-
-@pytest.mark.parametrize("pending", [True, False])
-def test_a_lock_refused_because_its_directory_is_being_deleted_is_not_logged(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    pending: bool,
-) -> None:
-    """A sibling engine shard removes its live directory while the sweep has it open, on a volume
-    without POSIX delete semantics, so the lock open is refused with access denied. Stand-ins for
-    that refusal and for the delete-pending read: not measured on such a volume here. Red at
-    18beb68ceed: that was logged as a lock this account cannot open, where origin/main, holding no
-    directory open, found nothing. The control, `pending=False`: a real refusal is still logged."""
-    root = tmp_path / "root"
-    candidate = _abandoned(root)
-    owner = dr_backup._owner_of(candidate)
-    assert owner is not None
-
-    def refused(self: object) -> int:
-        raise PermissionError(13, "synthetic refusal")
-
-    monkeypatch.setattr(dr_backup._HeldStagingDir, "open_lock", refused)
-    monkeypatch.setattr(dr_backup._HeldStagingDir, "delete_pending", lambda self: pending)
-    with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
-        assert dr_backup._proven_abandoned(candidate, owner) is False
-    logged = any("cannot open the lock" in r.getMessage() for r in caplog.records)
-    assert logged is not pending
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="FILE_STANDARD_INFO is Windows-only")
-def test_a_directory_not_being_deleted_reads_as_not_delete_pending(tmp_path: Path) -> None:
-    """The delete-pending read on a live directory: it reads, and says not pending."""
-    staging = tmp_path / "mefor-backup-live"
-    staging.mkdir()
-    with dr_backup._HeldStagingDir(staging) as held_dir:
-        assert held_dir.delete_pending() is False
