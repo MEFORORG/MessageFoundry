@@ -63,7 +63,7 @@ from messagefoundry.transports.framing import (
     frame_for_delivery,
     frame_reply_reporting,
 )
-from messagefoundry.transports.intake import IntakeAuth, deliver, socket_intake
+from messagefoundry.transports.intake import IntakeAuth, IntakeContext, deliver
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_PER_HOST,
@@ -681,12 +681,12 @@ class TcpSource(SourceConnector):
                 )
                 peer = writer.get_extra_info("peername")  # fixed for the connection
                 # Vault BACKLOG #2607: how this connection was admitted, read once. Raw TCP has
-                # no TLS (ADR 0153 decision 4), so the listener and auth mode are all it records.
-                intake = socket_intake(
-                    writer,
+                # no TLS (ADR 0153 decision 4), so the auth mode and allowlist result are all it records.
+                intake = IntakeContext(
                     transport="tcp",
                     auth_mode=IntakeAuth.NONE,
-                    address_allowlist=self.source_ip_allowlist is not None,
+                    # Admitted here, so the address passed source_ip_allowlist when one is set.
+                    address_listed=True if self.source_ip_allowlist is not None else None,
                 )
                 handler = self._handler
                 while True:

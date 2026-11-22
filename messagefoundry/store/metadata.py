@@ -236,9 +236,9 @@ def decode_response_headers(headers_json: StoredJson, *, row_id: object = None) 
 
 
 #: The reserved engine-internal key holding the intake context a source handed over with the body
-#: (vault BACKLOG #2607): the verified certificate subject, the engine's own accepting listener
-#: and how the peer was admitted, or a poll source's path. The context holds no peer address or
-#: port, by the owner's ruling of 2026-11-22. Written once, in the ingress transaction, so a
+#: (vault BACKLOG #2607): the verified certificate subject and how the peer was admitted, or a
+#: poll source's path. The context holds no socket address (peer or listener IP and port), by
+#: the owner's ruling of 2026-11-22. Written once, in the ingress transaction, so a
 #: future reader in the router, which nothing builds yet, would read the same value on a re-run,
 #: as the purity rule requires. A message the engine made from another one (a
 #: pass-through or loopback child, an operator resend or edit-and-resubmit) is written without it:

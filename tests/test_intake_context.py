@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,6 @@ from messagefoundry.transports.intake import (
     IntakeContext,
     deliver,
     intake_handler,
-    socket_address,
 )
 from messagefoundry.transports.mllp import MLLPSource
 from messagefoundry.transports.tcp import TcpSource
@@ -55,6 +55,12 @@ from tests.test_mllp_sender_allowlist import (
 from tests.test_mllp_tls import tls_path as tls_path  # a pytest fixture, used by name below
 
 _INBOUND = "IB_ACME_ADT"
+#: An IPv4 dotted quad, or a run of hex groups joined by colons with a ``::`` or at least three
+#: groups, which is how an IPv6 address reads.
+_IP_SHAPED = re.compile(
+    r"\b\d{1,3}(?:\.\d{1,3}){3}\b|[0-9A-Fa-f]{0,4}::[0-9A-Fa-f:]*|"
+    r"\b[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){2,}\b"
+)
 _ADT = "MSH|^~\\&|ACME|FAC|MF|FAC|20260101||ADT^A01|CTRL2607|P|2.5\rPID|1||MRN1^^^H^MR||Doe^Jane\r"
 
 
@@ -93,7 +99,7 @@ async def _intakes(store: MessageStore) -> list[dict[str, Any] | None]:
 
 async def test_deliver_hands_the_context_only_to_a_handler_that_takes_one() -> None:
     seen: list[tuple[bytes, IntakeContext | None]] = []
-    ctx = IntakeContext(transport="mllp", listener="192.0.2.1:2575", auth_mode=IntakeAuth.NONE)
+    ctx = IntakeContext(transport="mllp", auth_mode=IntakeAuth.NONE)
 
     async def plain(raw: bytes) -> str | None:
         seen.append((raw, None))
@@ -113,23 +119,16 @@ async def test_deliver_hands_the_context_only_to_a_handler_that_takes_one() -> N
 def test_the_context_fields_leave_out_what_the_source_could_not_say() -> None:
     ctx = IntakeContext(
         transport="mllp",
-        listener="192.0.2.1:2575",
         auth_mode=IntakeAuth.MTLS,
     )
-    assert ctx.fields() == {
-        "transport": "mllp",
-        "listener": "192.0.2.1:2575",
-        "auth_mode": "mtls",
-    }
-    assert socket_address(("::1", 2575, 0, 0)) == ("::1", 2575)
-    assert socket_address("/tmp/sock") == (None, None)
+    assert ctx.fields() == {"transport": "mllp", "auth_mode": "mtls"}
 
 
 def test_the_intake_key_survives_a_setmeta_merge_and_never_reaches_the_user_bag() -> None:
-    stored = intake_metadata_json({"transport": "tcp", "listener": "192.0.2.1:2575"})
+    stored = intake_metadata_json({"transport": "tcp", "auth_mode": "none"})
     assert stored is not None and intake_metadata_json(None) is None
     merged = merge_user_metadata(stored, [("k", "v")])
-    assert intake_of(merged) == {"transport": "tcp", "listener": "192.0.2.1:2575"}
+    assert intake_of(merged) == {"transport": "tcp", "auth_mode": "none"}
     assert json.loads(user_metadata(merged) or "{}") == {"k": "v"}
     assert user_metadata(stored) is None
 
@@ -142,7 +141,7 @@ async def test_the_runner_writes_the_context_into_the_committed_message(
 ) -> None:
     runner, ic = _runner(store, ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0})
     handler = runner._make_handler(ic)
-    ctx = IntakeContext(transport="mllp", listener="192.0.2.1:2575", auth_mode=IntakeAuth.NONE)
+    ctx = IntakeContext(transport="mllp", auth_mode=IntakeAuth.NONE)
     reply = await deliver(handler, _ADT.encode(), ctx)
     assert reply is not None and "MSA|AA|CTRL2607" in reply
     # Control: a source that knows no peer still commits, with no context.
@@ -184,16 +183,14 @@ async def test_an_mllp_mtls_sender_is_named_by_its_certificate_not_its_address(
     await source.start(runner._make_handler(ic))
     try:
         reply, _ = await _exchange(source, _bundle(tmp_path, named), _ADT)
-        port = source.sockport
     finally:
         await source.stop()
     assert b"MSA|AA|CTRL2607" in reply
     (intake,) = await _intakes(store)
     assert intake is not None
     assert intake["transport"] == "mllp"
-    # Owner ruling 2026-11-22, "No IP in metadata": the stored context holds no peer address.
-    assert "peer_host" not in intake and "peer_port" not in intake
-    assert intake["listener"] == f"127.0.0.1:{port}"
+    # Owner ruling 2026-11-22, "No IP in metadata": the stored context holds no socket address.
+    assert not _IP_SHAPED.search(json.dumps(intake))
     assert intake["auth_mode"] == IntakeAuth.MTLS_SUBJECTS.value
     assert intake["cert_subject"] == f"CN={_PERSON}"
 
@@ -201,8 +198,8 @@ async def test_an_mllp_mtls_sender_is_named_by_its_certificate_not_its_address(
 async def test_the_stored_context_holds_no_peer_address(
     store: MessageStore,
 ) -> None:
-    """Owner ruling 2026-11-22, "No IP in metadata". Each client's own port, which only the peer
-    side of the socket reports, appears nowhere in the stored cell."""
+    """Owner ruling 2026-11-22, "No IP in metadata". No IP-shaped value, and neither the
+    listener's port nor any client's own port, appears in the stored cell."""
     settings = {"host": "127.0.0.1", "port": 0, "framing": "mllp"}
     runner, ic = _runner(store, ConnectorType.TCP, settings)
     source = TcpSource(Source(type=ConnectorType.TCP, settings=settings, ack_mode=ic.ack_mode))
@@ -224,15 +221,24 @@ async def test_the_stored_context_holds_no_peer_address(
         await source.stop()
     intakes = await _intakes(store)
     assert len(intakes) == 2 and all(i is not None for i in intakes)
-    # Control: the context was stored, naming the listener the clients reached.
-    assert {i["listener"] for i in intakes if i} == {f"127.0.0.1:{listen_port}"}
+    # Control: the context was stored for both connections.
     assert {i["auth_mode"] for i in intakes if i} == {IntakeAuth.NONE.value}
     rows = await store.list_messages(allowed_channels=None)
     cells = [await store.message_metadata_json(row["id"]) or "" for row in rows]
     for cell in cells:
-        assert "peer_host" not in cell and "peer_port" not in cell
-        for port in client_ports:
+        assert cell and not _IP_SHAPED.search(cell), cell
+        for port in [listen_port, *client_ports]:
             assert str(port) not in cell
+
+
+def test_the_ip_shape_check_finds_an_address() -> None:
+    """The positive control for :data:`_IP_SHAPED`, so a check that finds nothing proves something."""
+    assert _IP_SHAPED.search('{"x": "127.0.0.1:2575"}')
+    assert _IP_SHAPED.search('{"x": "[::1]:2575"}')
+    assert _IP_SHAPED.search('{"x": "fe80::1"}')
+    assert not _IP_SHAPED.search(
+        '{"auth_mode": "mtls", "cert_subject": "CN=jane.q.sender.example"}'
+    )
 
 
 async def test_a_file_source_records_the_path_it_read(tmp_path: Path, store: MessageStore) -> None:
@@ -306,7 +312,7 @@ async def test_a_message_the_engine_makes_from_another_carries_no_intake_key(
     ``correlation_root_id`` leads back to the message that carries the context."""
     from tests._store_audit import no_operator_audit
 
-    ctx = IntakeContext(transport="mllp", listener="192.0.2.1:2575", auth_mode=IntakeAuth.NONE)
+    ctx = IntakeContext(transport="mllp", auth_mode=IntakeAuth.NONE)
     origin = await store.enqueue_ingress(
         channel_id=_INBOUND, raw=_ADT, metadata=intake_metadata_json(ctx.fields())
     )

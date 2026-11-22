@@ -27,15 +27,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, cast
 
-from messagefoundry.transports.admission import PeerInfo
-
 __all__ = [
     "IntakeAuth",
     "IntakeContext",
     "deliver",
     "intake_handler",
-    "socket_address",
-    "socket_intake",
 ]
 
 
@@ -57,16 +53,17 @@ class IntakeAuth(StrEnum):
 class IntakeContext:
     """Who handed the engine one body, as the source saw it.
 
-    It holds no peer address or port, by the owner's ruling of 2026-11-22 ("No IP in metadata"):
-    the connection-event log, where capture is on, is where a peer address is kept, under
-    ``[retention].connection_event_retention_hours``. A listen source fills how it admitted the
-    peer; a poll source has no peer and fills :attr:`source` with where it read the body. A
+    It holds no socket address, neither the peer's nor the engine's own, by the owner's ruling of
+    2026-11-22 ("No IP in metadata"). A File source's path keeps the configured directory's
+    spelling, so a UNC directory spelled by IP would carry that IP. The connection-event log,
+    where capture is on, is where a peer address is kept, under
+    ``[retention].connection_event_retention_hours``, and the message row's ``channel_id`` names
+    the inbound connection that took it. A listen source fills how it admitted the peer; a poll
+    source has no peer and fills :attr:`source` with where it read the body. A
     ``None`` field is left out of the stored record; what ``None`` means is on each field."""
 
     #: The source's transport, lower case, such as ``"mllp"``, ``"tcp"`` or ``"file"``.
     transport: str
-    #: The engine's own local ``host:port`` of the socket that accepted the connection.
-    listener: str | None = None
     #: The verified client certificate's subject, RFC 4514, when one was required and verified.
     cert_subject: str | None = None
     #: How the peer was admitted; ``None`` for a poll source, which admits no peer.
@@ -84,44 +81,6 @@ class IntakeContext:
             for f in dataclasses.fields(self)
             if (value := getattr(self, f.name)) is not None
         }
-
-
-def socket_address(name: object) -> tuple[str | None, int | None]:
-    """The host and port of a socket address as ``get_extra_info("sockname")`` reports it, or
-    ``(None, None)`` for a shape that carries neither (a UNIX socket, say)."""
-    if isinstance(name, tuple) and len(name) >= 2 and isinstance(name[0], str):
-        port = name[1] if isinstance(name[1], int) and not isinstance(name[1], bool) else None
-        return name[0], port
-    return None, None
-
-
-def _host_port(name: object) -> str | None:
-    host, port = socket_address(name)
-    if host is None or port is None:
-        return None
-    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-
-
-def socket_intake(
-    peer: PeerInfo,
-    *,
-    transport: str,
-    auth_mode: IntakeAuth,
-    cert_subject: str | None = None,
-    address_allowlist: bool = False,
-) -> IntakeContext:
-    """The intake context of one accepted socket connection, read once after it was admitted.
-
-    ``auth_mode`` and ``cert_subject`` come from the listener, which knows its own TLS setup; this
-    module reads no certificate. ``address_allowlist`` is ``True`` when the listener has a source
-    address allowlist, which the peer passed to get here."""
-    return IntakeContext(
-        transport=transport,
-        listener=_host_port(peer.get_extra_info("sockname")),
-        cert_subject=cert_subject,
-        auth_mode=auth_mode,
-        address_listed=True if address_allowlist else None,
-    )
 
 
 #: The attribute :func:`intake_handler` sets, which :func:`deliver` reads.

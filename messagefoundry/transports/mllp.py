@@ -136,7 +136,7 @@ from messagefoundry.transports.framing import (
     frame_for_delivery,
     frame_reply_reporting,
 )
-from messagefoundry.transports.intake import IntakeAuth, IntakeContext, deliver, socket_intake
+from messagefoundry.transports.intake import IntakeAuth, IntakeContext, deliver
 
 __all__ = [
     "SB",
@@ -2875,10 +2875,9 @@ class MLLPSource(SourceConnector):
             logger.warning("MLLP intake audit emit failed: %s", safe_exc(exc))
 
     def _intake(self, writer: asyncio.StreamWriter) -> IntakeContext:
-        """The intake context of an admitted connection (vault BACKLOG #2607): the engine's
-        accepting socket and how its sender was admitted, with no peer address (owner ruling
-        2026-11-22). A client certificate is
-        required only where ``tls_ca_file`` set ``CERT_REQUIRED``, so only then is its subject
+        """The intake context of an admitted connection (vault BACKLOG #2607): how its sender was
+        admitted, with no IP address (owner ruling 2026-11-22). A client certificate is required
+        only where ``tls_ca_file`` set ``CERT_REQUIRED``, so only then is its subject
         read; with ``tls_client_subjects`` on, reaching here means it was listed."""
         subject: str | None = None
         if self._ssl is None:
@@ -2891,12 +2890,12 @@ class MLLPSource(SourceConnector):
 
             subject = peer_subject(writer.get_extra_info("ssl_object"))
             mode = IntakeAuth.MTLS if self._client_subjects is None else IntakeAuth.MTLS_SUBJECTS
-        return socket_intake(
-            writer,
+        return IntakeContext(
             transport="mllp",
             auth_mode=mode,
             cert_subject=subject,
-            address_allowlist=self.source_ip_allowlist is not None,
+            # Reaching here means the address passed source_ip_allowlist, when one is set.
+            address_listed=True if self.source_ip_allowlist is not None else None,
         )
 
     async def _handle_bounded(
