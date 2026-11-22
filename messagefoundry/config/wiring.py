@@ -12192,7 +12192,17 @@ def _in_dir(filename: str, directory: Path) -> bool:
         # The folder, not the file, is resolved: a config file may be a symlink into another folder
         # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
         return candidate.parent.resolve() == directory
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        # Logged, not silent (vault BACKLOG #3765, LF10): an unresolvable folder makes a diagnostic
+        # name no file and no line. The class only: a frame's file name is whatever string a module
+        # compiled its code under, so it can be the module's own text. A module can also have added
+        # a log handler, and what that raises must not change this answer.
+        with suppress(Exception):
+            _logger.debug(
+                "config diagnostic: a traceback file's folder could not be resolved (%s), so it "
+                "is not named as a config file",
+                type(exc).__name__,
+            )
         return False
 
 
