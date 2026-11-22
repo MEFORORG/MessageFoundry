@@ -91,6 +91,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credential_hop,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
+    request_target_as_sent,
     # Re-exported: it moved to rest.py beside its cleartext twin (vault BACKLOG #3139).
     revocation_attestation_from_settings,
     unsendable_request_target,
@@ -638,12 +639,14 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             )
         self.client_id = client_id
         self.scope = scope or None
-        if not audience and "#" in token_url:
-            # BACKLOG #5911: the POST drops the fragment, but the default aud keeps it, so an
-            # authorization server matching aud against its own URL would refuse every mint.
+        if not audience and request_target_as_sent(token_url) != token_url:
+            # BACKLOG #5911: the POST drops surrounding whitespace and the fragment, but the
+            # default aud keeps both, so an authorization server matching aud against its own URL
+            # would refuse every mint.
             raise SmartAuthError(
-                "smart_token_url must hold no '#' unless smart_audience is set (the client "
-                "assertion's aud defaults to the URL as written, while the POST drops the fragment)"
+                "smart_token_url must hold no whitespace around it and no '#' unless "
+                "smart_audience is set (the client assertion's aud defaults to the URL as "
+                "written, while the POST drops both)"
             )
         # SMART: aud = the token endpoint URL unless the server documents another audience.
         self.audience = audience or token_url

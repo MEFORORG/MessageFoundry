@@ -135,6 +135,7 @@ from messagefoundry.transports.rest import (
     refuse_unsendable_static_request,
     refuse_url_credentials,
     refuse_verify_off,
+    request_target_as_sent,
     url_scheme,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -773,12 +774,14 @@ class SoapDestination(DestinationConnector):
             sent_as_is=True,
             leave_proxy_credential_names=True,
         )
-        if self.ws_addressing and "#" in url:
-            # The POST drops the fragment, but wsa:To carries the url as written, so a server that
-            # matches To against its own address would fault every message.
+        if (self.ws_addressing or digest_selected) and request_target_as_sent(url) != url:
+            # The POST drops both, but wsa:To carries the url as written, so a server that matches
+            # To against its own address would fault every message, and the Digest password is
+            # keyed on the url as written, so every challenge would find none.
             raise ValueError(
-                "SOAP destination 'url' must hold no '#' when ws_addressing is on (it is sent as "
-                "wsa:To as written, while the POST drops the fragment)"
+                "SOAP destination 'url' must hold no whitespace around it and no '#' when "
+                "ws_addressing or HTTP Digest is on (each reads the url as written, while the POST "
+                "drops both)"
             )
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).

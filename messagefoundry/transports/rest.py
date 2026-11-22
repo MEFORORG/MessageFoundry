@@ -141,6 +141,7 @@ __all__ = [
     "refuse_unsendable_static_request",
     "refuse_url_credentials",
     "refuse_verify_off",
+    "request_target_as_sent",
     "unsendable_request_target",
     "url_host_label",
     "url_scheme",
@@ -1864,6 +1865,15 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
     )
 
 
+def request_target_as_sent(url: str) -> str:
+    """``url`` as urllib's ``Request`` holds it for a caller that appends no path (BACKLOG #5911):
+    ``urllib.parse.unwrap`` strips the whitespace around it, and the fragment is split off at the
+    LAST ``#``, as :func:`_url_segments_sent` reads it. A peer sees only this part, except where a
+    forward proxy is sent the full URL."""
+    url = urllib.parse.unwrap(url)
+    return url.rpartition("#")[0] if "#" in url else url
+
+
 def unsendable_request_target(url: str, *, sent_as_is: bool = False) -> bool:
     """Whether ``http.client`` could never send ``url`` as a request target (BACKLOG #5911).
 
@@ -1872,14 +1882,12 @@ def unsendable_request_target(url: str, *, sent_as_is: bool = False) -> bool:
     Latin-1 rather than IDNA. Every whitespace character is a control, a space or not ASCII, so
     all three are refused.
 
-    ``sent_as_is`` is for a caller that sends the URL with no path appended. It is judged as
-    urllib's ``Request`` holds it: ``urllib.parse.unwrap`` strips the whitespace around it and
-    the fragment is split off client-side, so neither reaches the wire. Otherwise the URL is
-    judged as written and a ``#`` is refused too: urllib would split it off with every path the
-    caller appends after it.
+    ``sent_as_is`` is for a caller that sends the URL with no path appended: it is judged as
+    :func:`request_target_as_sent` gives it. Otherwise the URL is judged as written and a ``#`` is
+    refused too: urllib would split it off with every path the caller appends after it.
     """
     if sent_as_is:
-        url = urllib.parse.unwrap(url).partition("#")[0]
+        url = request_target_as_sent(url)
     elif "#" in url:
         return True
     return not url.isascii() or any(ch <= " " or ch == "\x7f" for ch in url)
@@ -1930,12 +1938,15 @@ def refuse_unsendable_static_request(
         proxy_named = is_proxy_credential_header_name(name)
         if proxy_named and leave_proxy_credential_names:
             continue
-        if (not proxy_named and not _FIELD_NAME.fullmatch(name)) or _refusal_by_http_client(
-            name, ""
-        ) is not None:
+        if not proxy_named and not _FIELD_NAME.fullmatch(name):
             raise ValueError(
                 f"{setting} header {_shown_header_key(name)} is not a header name the engine "
                 "sends (RFC 9110 allows only tchar characters in one)"
+            )
+        if _refusal_by_http_client(name, "") is not None:
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} is not a header name http.client "
+                "can send"
             )
         if _latin1_refusal_position(value) is not None:
             raise ValueError(
@@ -3167,6 +3178,13 @@ class RestDestination(DestinationConnector):
             sent_as_is=True,
             leave_proxy_credential_names=True,
         )
+        if digest_selected and request_target_as_sent(url) != url:
+            # The Digest password manager is keyed on the url as written, so a challenge for the
+            # url urllib requests would find no password and every send would end in a 401.
+            raise ValueError(
+                "REST destination 'url' must hold no whitespace around it and no '#' with HTTP "
+                "Digest (its password is keyed on the url as written)"
+            )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
         self._proxy: ProxyConfig | None = (

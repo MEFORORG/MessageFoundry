@@ -164,7 +164,7 @@ def test_a_trailing_space_in_a_dicomweb_base_is_refused() -> None:
 
 def test_a_fragment_is_refused_on_soap_with_ws_addressing() -> None:
     """wsa:To carries the url as written, fragment included, while the POST drops it."""
-    with pytest.raises(ValueError, match="no '#' when ws_addressing is on"):
+    with pytest.raises(ValueError, match="no '#' when ws_addressing"):
         _build(
             ConnectorType.SOAP,
             url=_URLS[ConnectorType.SOAP] + "#part",
@@ -207,3 +207,50 @@ def test_a_control_character_in_a_proxy_named_value_is_refused_on_fhir() -> None
             setting="FHIR destination",
         )
     assert "a\x00bc" not in str(ei.value)
+
+
+@pytest.mark.parametrize("kind", [ConnectorType.REST, ConnectorType.SOAP])
+def test_the_part_between_two_hashes_is_judged(kind: ConnectorType) -> None:
+    """urllib splits the fragment at the LAST '#', so the part before it is sent and judged
+    (round-4104477e09 finding 1)."""
+    with pytest.raises(ValueError, match="'url' must be ASCII with no whitespace"):
+        _build(kind, url=_URLS[kind] + "#a b#c")
+
+
+def test_a_smart_token_url_with_whitespace_and_the_default_audience_is_refused() -> None:
+    """The default aud keeps the whitespace the POST strips (round-4104477e09 finding 3)."""
+    with pytest.raises(ValueError, match="no whitespace around it"):
+        _smart("https://as.example.org/token \n")
+
+
+def test_a_soap_url_with_surrounding_controls_is_refused_with_ws_addressing() -> None:
+    """wsa:To carries the url as written (round-4104477e09 finding 4)."""
+    with pytest.raises(ValueError, match="no whitespace around it"):
+        _build(
+            ConnectorType.SOAP,
+            url=_URLS[ConnectorType.SOAP] + "\x0b",
+            ws_addressing=True,
+            soap_version="1.2",
+        )
+
+
+@pytest.mark.parametrize("kind", [ConnectorType.REST, ConnectorType.SOAP])
+def test_a_url_with_trailing_whitespace_is_refused_with_digest(kind: ConnectorType) -> None:
+    """The Digest password is keyed on the url as written (round-4104477e09 finding 5)."""
+    with pytest.raises(ValueError, match="no whitespace around it"):
+        _build(
+            kind,
+            url=_URLS[kind] + " ",
+            http_auth="digest",
+            http_auth_user="u",
+            http_auth_password="synthetic",
+        )
+
+
+def test_a_proxy_named_name_http_client_refuses_names_that_rule() -> None:
+    """The tchar check is skipped for it, so the refusal names http.client's rule
+    (round-4104477e09 finding 7)."""
+    with pytest.raises(ValueError, match="not a header name http.client can send"):
+        refuse_unsendable_static_request(
+            "https://h.example.org/", {"Proxy-Authorization:x": "1"}, setting="FHIR destination"
+        )

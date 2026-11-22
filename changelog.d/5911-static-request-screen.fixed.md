@@ -8,8 +8,10 @@
   static header whose name is not an RFC 9110 token or whose value holds a control character
   other than HTAB. Where a URL is sent with no path appended (REST, SOAP, DICOMweb's target and
   the token URLs), whitespace around it is not refused, since urllib strips it. On REST, SOAP and
-  the token URLs a fragment is not refused either, since urllib drops it, except on a SOAP
-  destination with `ws_addressing` on, whose `wsa:To` keeps it, and in a `smart_token_url` with
-  no `smart_audience`, whose default `aud` keeps it. On REST, SOAP and DICOMweb a header name that
+  the token URLs a fragment is not refused either, since urllib drops it before sending to the
+  peer. Both are refused where a setting reads the URL as written: on a REST or SOAP destination
+  with HTTP Digest, whose password is keyed on it; on a SOAP destination with `ws_addressing` on,
+  whose `wsa:To` carries it; and in a `smart_token_url` with no `smart_audience`, whose default
+  `aud` is it. On REST, SOAP and DICOMweb a header name that
   reads as `Proxy-Authorization` is left to the proxy-header rule, as before. A refusal names the
   setting and, for a header, its key, never a value. (`BACKLOG #5911`)
