@@ -497,7 +497,8 @@ function Read-GitStatusZ {
         # directory, so a git.exe in the worktree being recorded could run.
         $gitExe = (Get-Command git -CommandType Application -EA Stop | Select-Object -First 1).Source
         $psi = [System.Diagnostics.ProcessStartInfo]::new($gitExe)
-        foreach ($a in @('-C', $Dir, 'status', '--porcelain', '-z')) { $psi.ArgumentList.Add($a) }
+        # --no-optional-locks: this runs on every Stop, beside a seat that may be committing here.
+        foreach ($a in @('-C', $Dir, '--no-optional-locks', 'status', '--porcelain', '-z')) { $psi.ArgumentList.Add($a) }
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
@@ -564,7 +565,9 @@ function Get-GitFacts {
         for ($i = 0; $i -lt $entries.Count; $i++) {
             $entry = $entries[$i]
             if ($entry.Length -lt 4) { continue }
-            $p = $entry.Substring(3)
+            # -z stops git escaping control characters, and these names are printed into a
+            # successor's briefing, so a newline in one must not become a line of its own.
+            $p = $entry.Substring(3) -replace '\p{Cc}', '?'
             if ($entry.StartsWith('??')) { $untrackedPaths += $p } else { $trackedPaths += $p }
             # A rename or copy is `XY new`, then its source as a token of its own. One change, so
             # one path: the new name, which is where the content now is.
@@ -626,7 +629,8 @@ function ConvertTo-StampInstant {
         return [DateTimeOffset]::new($Value.ToUniversalTime())
     }
     $text = [string]$Value
-    if ($text -notmatch '(Z|[+-]\d{2}:?\d{2})\s*\z') { return $null }
+    # Anchored to a time, or the year of a date like 11-22-2026 would read as a -20:26 offset.
+    if ($text -notmatch 'T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})\s*\z') { return $null }
     $parsed = [DateTimeOffset]::MinValue
     if ([DateTimeOffset]::TryParse($text, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
         return $parsed
@@ -673,7 +677,9 @@ function Get-ClaimsFor {
         $out += [ordered]@{
             key         = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
             claimedAt   = $at
-            attribution = (Get-Attribution -At $at -EpisodeStart $EpisodeStart)
+            # `claimed` never moves when a later session re-takes the claim; `refreshed` does, and
+            # a claim this episode re-asserted is this episode's.
+            attribution = (Get-Attribution -At $(if ($j.PSObject.Properties.Name -contains 'refreshed') { $j.refreshed } else { $at }) -EpisodeStart $EpisodeStart)
         }
     }
     return $out
@@ -1228,6 +1234,10 @@ try {
 
     $lifecycle = Prior 'lifecycle' 'open'
     $lifecycleAt = Prior 'lifecycleAt' $now
+    # Its own field because -Close moves lifecycleAt: measured against that stamp, a handback would
+    # call every claim of the closing episode inherited, which is the case attribution exists for.
+    # A record older than this field falls back to lifecycleAt.
+    $episodeStart = Prior 'episodeStart' $lifecycleAt
     if ($Close) {
         $lifecycle = if ($Handback) { 'handed' } else { 'closed' }
         $lifecycleAt = $now
@@ -1290,7 +1300,7 @@ try {
     #
     # CARRIED, NOT RE-RESOLVED, because the resolver's objection would print on every hook pass. The
     # cost: a carried verdict is the roster's answer WHEN THE LABEL WAS RESOLVED, and it goes stale
-    # if the roster changes afterwards, until the seat next declares.
+    # if the roster changes afterwards, until a declaration next names a seat with -Seat.
     $labelUnderTest = if ($Declare -and $Seat) { $Seat }
                       elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { $DerivedSeat }
                       else { $null }
@@ -1315,6 +1325,7 @@ try {
         writes           = [int](Prior 'writes' 0) + 1
         lifecycle        = $lifecycle
         lifecycleAt      = $lifecycleAt
+        episodeStart     = $episodeStart
         boxKey           = $boxKey
         # The machine that wrote this record. Every liveness reader checks it before probing a path
         # on its own disk; see Test-CoordRecordIsHere and docs/COORD-SHARED-ROOT.md.
@@ -1360,8 +1371,8 @@ try {
         dirty            = $g.dirty
         stashSha         = $g.stashSha
         stashCovers      = $g.stashCovers
-        claims           = @(Get-ClaimsFor -Dir (Join-Path $script:SharedRoot 'claims') -Wt $wt -EpisodeStart $lifecycleAt)
-        allocations      = @(Get-AllocationsFor -Dir (Join-Path $script:SharedRoot 'alloc') -Wt $wt -EpisodeStart $lifecycleAt)
+        claims           = @(Get-ClaimsFor -Dir (Join-Path $script:SharedRoot 'claims') -Wt $wt -EpisodeStart $episodeStart)
+        allocations      = @(Get-AllocationsFor -Dir (Join-Path $script:SharedRoot 'alloc') -Wt $wt -EpisodeStart $episodeStart)
         handoff          = $handoffObj
         predecessor      = $pred
         notes            = if ($Declare -and $Notes) { $collapsedNotes } else { Prior 'notes' '' }

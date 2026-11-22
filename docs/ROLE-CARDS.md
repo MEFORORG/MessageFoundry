@@ -98,8 +98,9 @@ The third is partly closed, and not by this design. `scripts/coord/seat.ps1` res
 label against `docs/roles/seats.json` and writes `seatCanonical` and `seatRosterVerdict` beside the
 raw seat. A pass that resolves no label, such as a `hook:Stop` write, carries both fields forward
 from the prior record (BACKLOG #5876), so the grouping key survives it. A record an older copy of
-the script already cleared stays cleared until that seat next declares. A carried verdict is the
-roster's answer when the label was resolved, so it can go stale if the roster changes afterwards.
+the script already cleared stays cleared until that seat next declares with `-Seat`. A carried
+verdict is the roster's answer when the label was resolved, so it can go stale if the roster
+changes afterwards.
 
 ---
 

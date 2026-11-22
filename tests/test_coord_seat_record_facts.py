@@ -197,14 +197,52 @@ def test_a_claim_reads_the_field_claim_ps1_writes(repo: Path, minutes: int, expe
     assert recorded == stamp
 
 
-def test_a_stamp_with_no_zone_is_unknown_rather_than_guessed(repo: Path) -> None:
+@pytest.mark.parametrize("stamp", ["2026-11-22T10:00:00", "11-22-2026"])
+def test_a_stamp_with_no_zone_is_unknown_rather_than_guessed(repo: Path, stamp: str) -> None:
+    """The second shape ends in `-2026`, which a loose offset pattern reads as a zone."""
     rec = declare(repo)
     put_json(
         coord_dir(repo) / "alloc" / "adr" / "9003.json",
-        {"worktree": rec["worktree"], "claimed": "2026-11-22T10:00:00"},
+        {"worktree": rec["worktree"], "claimed": stamp},
     )
     plain_record(repo)
     assert [a["attribution"] for a in read_record(repo)["allocations"]] == ["unknown"]
+
+
+def test_closing_keeps_the_episodes_own_claims_attributed_to_it(repo: Path) -> None:
+    rec = declare(repo)
+    stamp = episode_start(rec)
+    put_json(
+        coord_dir(repo) / "claims" / "9004.json",
+        {"worktree": rec["worktree"], "claimed": stamp.isoformat()},
+    )
+    # Past the one-second stamp resolution, so the close time is later than the claim.
+    subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 2"],
+        check=True,
+        timeout=TIMEOUT,
+    )
+    seat(repo, "-Close", "-Handback")
+    closed = read_record(repo)
+    assert closed["lifecycleAt"] != rec["lifecycleAt"]
+    assert [c["attribution"] for c in closed["claims"]] == ["this-episode"]
+    plain_record(repo)
+    assert [c["attribution"] for c in read_record(repo)["claims"]] == ["this-episode"]
+
+
+def test_a_claim_this_episode_re_took_is_this_episodes(repo: Path) -> None:
+    rec = declare(repo)
+    start = episode_start(rec)
+    put_json(
+        coord_dir(repo) / "claims" / "9005.json",
+        {
+            "worktree": rec["worktree"],
+            "claimed": (start - timedelta(days=2)).isoformat(),
+            "refreshed": (start + timedelta(minutes=5)).isoformat(),
+        },
+    )
+    plain_record(repo)
+    assert [c["attribution"] for c in read_record(repo)["claims"]] == ["this-episode"]
 
 
 # --- BACKLOG #5876 ------------------------------------------------------------------------------
