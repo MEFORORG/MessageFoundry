@@ -420,6 +420,7 @@ from messagefoundry.store.store import (
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
+    rotation_totp_updates,
     run_open_store_hook,
     scope_if_source,
     scope_withdrawal,
@@ -4635,7 +4636,13 @@ class SqlServerStore:
         # DATALENGTH, not `<> ''`: T-SQL pads trailing spaces before comparing, so `N' ' <> N''` is
         # FALSE and a whitespace-only value would be skipped here and then refused forever at read,
         # where the cipher treats only a true '' as blank.
-        pending_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
+        # Binary, so a case-insensitive database does not call `MFENC:` a marker (BACKLOG #5506).
+        pending_where = (
+            f"[{column}] COLLATE Latin1_General_100_BIN2 NOT LIKE ? AND DATALENGTH([{column}]) > 0"
+        )
+        # What the column's own collation calls unmarked. On a sealed surface the opt-out seals only
+        # these, so a value in another case stays as it is rather than being sealed into validity.
+        folded_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
         count_sql = f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}"
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
@@ -4646,7 +4653,7 @@ class SqlServerStore:
                 f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {blank_where}"
             )
         is_sealed = keyed
-        if (blanks or (pending and strict)) and not keyed:
+        if (blanks or pending) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
@@ -4654,6 +4661,10 @@ class SqlServerStore:
                 # stays refused.
                 blanks = 0
                 pending = await self._count_unmarked(count_sql, like)
+        if pending and is_sealed and not strict:
+            pending = await self._count_unmarked(
+                f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {folded_where}", like
+            )
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
@@ -4694,8 +4705,11 @@ class SqlServerStore:
                         report_sealed_surface(log, self._cipher, table, column, left)
                     return 0
                 # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
+                unmarked_where = pending_where if claimed and not is_sealed else folded_where
                 seal_where = (
-                    f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+                    f"({unmarked_where}) OR ({blank_where})"
+                    if blanks and claimed
+                    else unmarked_where
                 )
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
@@ -4746,7 +4760,9 @@ class SqlServerStore:
     async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
         """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
         row = await self._fetchone(
-            f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
+            f"SELECT TOP (1) 1 AS x FROM {table}"
+            f" WHERE [{column}] COLLATE Latin1_General_100_BIN2 LIKE ?",
+            (like,),
         )
         return row is not None
 
@@ -10170,7 +10186,7 @@ class SqlServerStore:
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
         # silently loses them. message_events/connection_event/alert_instance have IDENTITY ids so they
         # bind cell_aad to natural columns and rotate on their own composite passes below (ASVS 11.3.3).
-        # The `<> ''` + NOT LIKE guard is null/empty-safe (NULL excluded by NOT LIKE; '' by <> '').
+        # `_rotation_scan` is null/empty-safe: NOT LIKE excludes NULL, and its length test excludes ''.
         for table, column in (
             ("messages", "raw"),
             ("users", "totp_secret"),
@@ -10191,10 +10207,14 @@ class SqlServerStore:
                     aad_of=partial(row_tag_aad, table, column),
                 )
                 continue
+            if (table, column) == ("users", "totp_secret"):
+                # Its seal covers these bytes; store.py's twin says why (BACKLOG #5611).
+                total += await self._reencrypt_user_totp_to_active(cipher, active_like)
+                continue
             while True:
                 rows = await self._fetchall(
                     f"SELECT TOP (?) id, {column} AS v FROM {table}"
-                    f" WHERE {column} NOT LIKE ? AND {column} <> ''",
+                    f" WHERE {self._rotation_scan(column)}",
                     (batch, active_like),
                 )
                 if not rows:
@@ -10235,7 +10255,7 @@ class SqlServerStore:
         while True:
             rows = await self._fetchall(
                 "SELECT TOP (?) namespace, [key], value FROM state"
-                " WHERE value NOT LIKE ? AND value <> ''",
+                f" WHERE {self._rotation_scan('value')}",
                 (batch, active_like),
             )
             if not rows:
@@ -10270,7 +10290,7 @@ class SqlServerStore:
         while True:
             rows = await self._fetchall(
                 "SELECT TOP (?) name, version, [key], value FROM reference"
-                " WHERE value NOT LIKE ? AND value <> ''",
+                f" WHERE {self._rotation_scan('value')}",
                 (batch, active_like),
             )
             if not rows:
@@ -10307,8 +10327,8 @@ class SqlServerStore:
         while True:
             rows = await self._fetchall(
                 "SELECT TOP (?) attachment_id, seq, ciphertext FROM attachment_chunk"
-                " WHERE ciphertext NOT LIKE ? AND ciphertext <> ''",
-                (batch, active_like),
+                f" WHERE {self._rotation_scan('ciphertext')}",
+                (min(batch, _ATTACHMENT_CHUNK_BATCH), active_like),
             )
             if not rows:
                 break
@@ -10337,14 +10357,13 @@ class SqlServerStore:
             await self._charge_bound_batch()
             total += len(rows)
         # `response` body + detail are ciphertext with a composite PK (message_id, destination_name,
-        # response_seq) — their own passes. IS NOT NULL is explicit/defensive: NOT LIKE already excludes
-        # NULLs (three-valued logic) and a NULL has no ciphertext to rotate — but these columns are
-        # nullable (unlike state.value/messages.raw/queue.payload), so the guard documents that intent.
+        # response_seq) — their own passes. These columns are nullable (unlike state.value/messages.raw/
+        # queue.payload); `_rotation_scan`'s NOT LIKE excludes a NULL, which has no ciphertext to rotate.
         for rcol in ("body", "detail", "resp_headers"):  # #154
             while True:
                 rows = await self._fetchall(
                     f"SELECT TOP (?) message_id, destination_name, response_seq, {rcol} AS v"
-                    f" FROM response WHERE {rcol} NOT LIKE ? AND {rcol} <> '' AND {rcol} IS NOT NULL",
+                    f" FROM response WHERE {self._rotation_scan(rcol)}",
                     (batch, active_like),
                 )
                 if not rows:
@@ -10403,6 +10422,42 @@ class SqlServerStore:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
+    def _rotation_scan(self, column: str) -> str:
+        """The rotation's "not under the active key" filter (one ``?``, the pattern). Binary and by
+        byte length, so a value in another case or of spaces alone is selected and the decrypt
+        refuses it (BACKLOG #5611). Under the opt-out that decrypt would accept it, so the filter
+        stays as it was there. ``column`` is a code constant."""
+        if allows_unmarked(self._cipher):
+            return f"{column} NOT LIKE ? AND {column} <> ''"
+        return f"{column} COLLATE Latin1_General_100_BIN2 NOT LIKE ? AND DATALENGTH({column}) > 0"
+
+    async def _reencrypt_user_totp_to_active(self, cipher: AesGcmCipher, active_like: str) -> int:
+        """Rotate the TOTP secrets the user pass left (``rotation_totp_updates``). One read: a
+        refused row stays selected, and ``users`` is a small table."""
+        rows = await self._fetchall(
+            "SELECT id, totp_secret, authz_seal FROM users"
+            f" WHERE {self._rotation_scan('totp_secret')}",
+            (active_like,),
+        )
+        updates = rotation_totp_updates(
+            cipher,
+            self._row_sealer,
+            [(r["id"], r["totp_secret"], r["authz_seal"]) for r in rows],
+        )
+        if updates:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    for enc, user_id in updates:
+                        await cur.execute(
+                            "UPDATE users SET totp_secret=? WHERE id=?", (enc, user_id)
+                        )
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+            await self._charge_bound_batch()
+        return len(updates)
+
     async def _reencrypt_tagged_to_active(
         self,
         active_like: str,
@@ -10424,7 +10479,7 @@ class SqlServerStore:
         while True:
             rows = await self._fetchall(
                 f"SELECT TOP (?) {select}, {column} AS v FROM {table}"
-                f" WHERE {column} NOT LIKE ? AND {column} <> '' AND id > ? ORDER BY id",
+                f" WHERE {self._rotation_scan(column)} AND id > ? ORDER BY id",
                 (batch, active_like, after),
             )
             if not rows:
@@ -10508,7 +10563,7 @@ class SqlServerStore:
         while True:
             rows = await self._fetchall(
                 f"SELECT TOP (?) id, {pk_select}, {value_col} AS v FROM {table}"
-                f" WHERE {value_col} NOT LIKE ? AND {value_col} <> '' AND {value_col} IS NOT NULL",
+                f" WHERE {self._rotation_scan(value_col)}",
                 (batch, active_like),
             )
             if not rows:
