@@ -219,6 +219,7 @@ from messagefoundry.store.row_seal import (
     RowSealKeyRetiredError,
     SealPager,
     TransitSealUnavailableError,
+    cipher_call,
     classify_unrotated,
     require_seal_for_write,
     revoke_seal_refusals,
@@ -7435,7 +7436,7 @@ async def _store_pin_refusal(
     expected: str | None = None
     if secret is not None:
         with suppress(AuditKeyVersionRefusedError):
-            expected = _audit_row_mac(first, "", secret[0], secret[1])
+            expected = await cipher_call(secret[1], _audit_row_mac, first, "", secret[0], secret[1])
     if expected is None or not hmac.compare_digest(
         audit_mac_bytes(first["row_hash"]), audit_mac_bytes(expected)
     ):
@@ -8296,7 +8297,9 @@ async def settle_audit_ranges(
     if first_secret is not None:
         refused = ""
         try:
-            expected = _audit_row_mac(genesis, "", first_secret[0], first_secret[1])
+            expected = await cipher_call(
+                first_secret[1], _audit_row_mac, genesis, "", first_secret[0], first_secret[1]
+            )
         except AuditKeyVersionRefusedError as exc:  # the genesis row fails, as the walk reports it
             expected, refused = None, f" ({exc})"
         mac_ok = hmac.compare_digest(
@@ -8465,7 +8468,9 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     # different chain from the one the verify passed. The no-op below verifies too: its OK is read
     # as "the rotation is done", so it must not stand over a chain audit-verify fails (#1945).
     rows = await host._audit_rows()
-    ok, msg = verify_audit_rows(
+    ok, msg = await cipher_call(
+        host._audit_mac_fn,
+        verify_audit_rows,
         rows,
         mac_keys=host._audit_mac_keys,
         mac_fn=host._audit_mac_fn,
@@ -11973,6 +11978,29 @@ class MessageStore:
         # a v2 marker with this `aad` — a wrong-cell v2 blob fails the tag → CipherError (fail-closed).
         return self._cipher.decrypt(value, aad=aad)
 
+    # BACKLOG #3929: the async store methods call these, not ``_enc``/``_dec`` and the cipher, so
+    # under a cipher that blocks on I/O (``vault_transit``) the call runs on the Transit pool and
+    # the event loop keeps serving. Under an in-process cipher it runs inline, as before.
+    async def _aenc(self, value: str | None, *, aad: bytes) -> str | None:
+        if not value:
+            return value
+        return await cipher_call(self._cipher, self._enc, value, aad=aad)
+
+    async def _adec(self, value: str | None, *, aad: bytes) -> str | None:
+        if value is None:
+            return value
+        return await cipher_call(self._cipher, self._dec, value, aad=aad)
+
+    async def _aencrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        return await cipher_call(self._cipher, self._cipher.encrypt, plaintext, aad=aad)
+
+    async def _adecrypt(
+        self, stored: str, *, aad: bytes | None = None, allow_unmarked: bool = False
+    ) -> str:
+        return await cipher_call(
+            self._cipher, self._cipher.decrypt, stored, aad=aad, allow_unmarked=allow_unmarked
+        )
+
     def cipher_info(self) -> CipherInfo:
         """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""
         return cipher_info(self._cipher)
@@ -12473,7 +12501,9 @@ class MessageStore:
             # #241 F2: decrypt+json.loads through the fail-closed helper — a keyless open of an
             # encrypted store raises an operator-facing StoreKeylessError (table + remedy), not a raw
             # JSONDecodeError, and never silently drops an encrypted row.
-            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
+            cache[(r["namespace"], r["key"])] = await cipher_call(
+                self._cipher,
+                decrypt_json_cell,
                 self._cipher,
                 r["value"],
                 aad=cell_aad("state", "value", r["namespace"], r["key"]),
@@ -12504,7 +12534,9 @@ class MessageStore:
                 entry = cache[r["name"]] = new_reference_set(r["name"])  # sealed (BACKLOG #1174)
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
                 # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
-                entry[r["key"]] = decrypt_json_cell(
+                entry[r["key"]] = await cipher_call(
+                    self._cipher,
+                    decrypt_json_cell,
                     self._cipher,
                     r["value"],
                     aad=cell_aad("reference", "value", r["name"], r["version"], r["key"]),
@@ -12880,7 +12912,9 @@ class MessageStore:
                 if not rows:
                     break
                 # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
-                sealed_values = encrypt_many(
+                sealed_values = await cipher_call(
+                    self._cipher,
+                    encrypt_many,
                     self._cipher,
                     [
                         (
@@ -13130,7 +13164,9 @@ class MessageStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                resealed = reseal_unless_tag_failure(cipher, r["v"], aad_of(r))
+                resealed = await cipher_call(
+                    self._cipher, reseal_unless_tag_failure, cipher, r["v"], aad_of(r)
+                )
                 if resealed is None:
                     skipped += 1
                 else:
@@ -13911,9 +13947,11 @@ class MessageStore:
                         mid,
                         now,
                         "received",
-                        self._enc(
-                            f"{len(deliveries)} destination(s)",
-                            aad=cell_aad("message_events", "detail", mid, now, "received"),
+                        (
+                            await self._aenc(
+                                f"{len(deliveries)} destination(s)",
+                                aad=cell_aad("message_events", "detail", mid, now, "received"),
+                            )
                         ),
                     ),
                 )
@@ -13975,7 +14013,7 @@ class MessageStore:
             (
                 body_hash,
                 # Content-address cell (ASVS 11.3.3): the hash is over the plaintext, rotation-stable.
-                self._cipher.encrypt(payload, aad=cell_aad("shared_body", "body", body_hash)),
+                await self._aencrypt(payload, aad=cell_aad("shared_body", "body", body_hash)),
                 refs,
                 now,
             ),
@@ -14122,9 +14160,11 @@ class MessageStore:
             )
             async for row in cur:
                 # Bound to (attachment_id, seq) — a chunk relocated to another attachment/seq fails closed.
-                yield self._cipher.decrypt(
-                    row["ciphertext"],
-                    aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
+                yield (
+                    await self._adecrypt(
+                        row["ciphertext"],
+                        aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
+                    )
                 )
 
     async def attachments_for(
@@ -14380,7 +14420,7 @@ class MessageStore:
         # the store gains a key while the row is live, the first keyed open seals it (BACKLOG #3495),
         # because a keyed claim refuses a blank. Once the row is terminal, the blank stays and reads
         # as an erasure.
-        stored_payload = self._cipher.encrypt(
+        stored_payload = await self._aencrypt(
             payload if body_ref is None else body_ref,
             aad=queue_payload_aad(
                 row_id=row_id,
@@ -14442,17 +14482,19 @@ class MessageStore:
                 Stage.ROUTED.value,
                 channel_id,
                 handler_name,
-                self._cipher.encrypt(
-                    payload,
-                    aad=queue_payload_aad(
-                        row_id=row_id,
-                        message_id=mid,
-                        stage=Stage.ROUTED.value,
-                        channel_id=channel_id,
-                        destination_name=None,
-                        handler_name=handler_name,
-                        body_ref=None,
-                    ),
+                (
+                    await self._aencrypt(
+                        payload,
+                        aad=queue_payload_aad(
+                            row_id=row_id,
+                            message_id=mid,
+                            stage=Stage.ROUTED.value,
+                            channel_id=channel_id,
+                            destination_name=None,
+                            handler_name=handler_name,
+                            body_ref=None,
+                        ),
+                    )
                 ),
                 OutboxStatus.PENDING.value,
                 now,
@@ -14532,17 +14574,19 @@ class MessageStore:
                     mid,
                     Stage.INGRESS.value,
                     channel_id,
-                    self._cipher.encrypt(
-                        raw,
-                        aad=queue_payload_aad(
-                            row_id=ingress_row_id,
-                            message_id=mid,
-                            stage=Stage.INGRESS.value,
-                            channel_id=channel_id,
-                            destination_name=None,
-                            handler_name=None,
-                            body_ref=None,
-                        ),
+                    (
+                        await self._aencrypt(
+                            raw,
+                            aad=queue_payload_aad(
+                                row_id=ingress_row_id,
+                                message_id=mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=channel_id,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
+                        )
                     ),
                     OutboxStatus.PENDING.value,
                     now,
@@ -14561,9 +14605,11 @@ class MessageStore:
                         mid,
                         now,
                         "received",
-                        self._enc(
-                            "ingress",
-                            aad=cell_aad("message_events", "detail", mid, now, "received"),
+                        (
+                            await self._aenc(
+                                "ingress",
+                                aad=cell_aad("message_events", "detail", mid, now, "received"),
+                            )
                         ),
                     ),
                 )
@@ -14742,9 +14788,11 @@ class MessageStore:
                 name,
                 version,
                 k,
-                self._cipher.encrypt(
-                    text,
-                    aad=cell_aad("reference", "value", name, version, k),
+                (
+                    await self._aencrypt(
+                        text,
+                        aad=cell_aad("reference", "value", name, version, k),
+                    )
                 ),
             )
             for k, text in encoded
@@ -14812,7 +14860,7 @@ class MessageStore:
             (
                 namespace,
                 key,
-                self._cipher.encrypt(value_json, aad=cell_aad("state", "value", namespace, key)),
+                await self._aencrypt(value_json, aad=cell_aad("state", "value", namespace, key)),
                 now,
                 message_id,
             ),
@@ -14897,7 +14945,9 @@ class MessageStore:
                 prow = await pcur.fetchone()
                 if prow is not None:
                     msg_channel = str(prow["channel_id"])
-                    pmeta_json = open_message_cell(
+                    pmeta_json = await cipher_call(
+                        self._cipher,
+                        open_message_cell,
                         self._cipher,
                         "metadata",
                         prow["metadata"],
@@ -14952,11 +15002,13 @@ class MessageStore:
                 await self._db.execute(
                     "UPDATE messages SET metadata=? WHERE id=?",
                     (
-                        self._enc(
-                            merged,
-                            aad=message_cell_aad(
-                                "metadata", message_id=message_id, channel_id=msg_channel
-                            ),
+                        (
+                            await self._aenc(
+                                merged,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=message_id, channel_id=msg_channel
+                                ),
+                            )
                         ),
                         message_id,
                     ),
@@ -15030,20 +15082,29 @@ class MessageStore:
                 source_type,
                 control_id,
                 message_type,
-                self._cipher.encrypt(
-                    raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aencrypt(
+                        raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                    )
                 ),
                 status,
-                self._enc(
-                    error, aad=message_cell_aad("error", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aenc(
+                        error, aad=message_cell_aad("error", message_id=mid, channel_id=channel_id)
+                    )
                 ),
                 # EF-3: MRN/name is PHI — ciphered at rest like the body
-                self._enc(
-                    summary, aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aenc(
+                        summary,
+                        aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id),
+                    )
                 ),
-                self._enc(
-                    metadata,
-                    aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                (
+                    await self._aenc(
+                        metadata,
+                        aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                    )
                 ),
                 # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
                 origin.value,
@@ -15102,7 +15163,11 @@ class MessageStore:
                         mid,
                         now,
                         event,
-                        self._enc(error, aad=cell_aad("message_events", "detail", mid, now, event)),
+                        (
+                            await self._aenc(
+                                error, aad=cell_aad("message_events", "detail", mid, now, event)
+                            )
+                        ),
                     ),
                 )
             await self._commit()
@@ -15179,7 +15244,9 @@ class MessageStore:
         missing shared body (corruption / premature GC) raises like any undecryptable payload, so the
         caller dead-letters that one row rather than stalling the lane."""
         if row["body_ref"] is None:
-            return OutboxItem.from_row(row, open_queue_cell(self._cipher, row))
+            return OutboxItem.from_row(
+                row, await cipher_call(self._cipher, open_queue_cell, self._cipher, row)
+            )
         async with self._read() as db:
             return OutboxItem.from_row(row, await self._open_queue_body(db, row, alert=False))
 
@@ -15198,7 +15265,7 @@ class MessageStore:
         (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`) takes both paths the same
         way, its alert and audit row saying corrupt rather than drift (BACKLOG #5884)."""
         try:
-            opened = open_queue_cell(self._cipher, row)
+            opened = await cipher_call(self._cipher, open_queue_cell, self._cipher, row)
         except QueueTagError as refused:
             if alert:
                 alert_queue_tag_failure(
@@ -15212,7 +15279,7 @@ class MessageStore:
         if br is None:
             raise CipherError(f"shared body {opened} missing")
         # Deref'd shared body — bound to the shared_body content-address cell, not this queue row.
-        return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
+        return await self._adecrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
 
     async def _dead_letter_unopenable(
         self, row: aiosqlite.Row, exc: Exception
@@ -15753,7 +15820,7 @@ class MessageStore:
                 (
                     OutboxStatus.DEAD.value,
                     now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                 ),
@@ -15810,7 +15877,7 @@ class MessageStore:
                 (
                     OutboxStatus.DEAD.value,
                     now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                 ),
@@ -15986,17 +16053,26 @@ class MessageStore:
                     message_id,
                     destination_name,
                     seq,
-                    self._enc(
-                        body, aad=cell_aad("response", "body", message_id, destination_name, seq)
+                    (
+                        await self._aenc(
+                            body,
+                            aad=cell_aad("response", "body", message_id, destination_name, seq),
+                        )
                     ),
                     outcome,
-                    self._enc(
-                        detail,
-                        aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                    (
+                        await self._aenc(
+                            detail,
+                            aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                        )
                     ),
-                    self._enc(
-                        headers_json,
-                        aad=cell_aad("response", "resp_headers", message_id, destination_name, seq),
+                    (
+                        await self._aenc(
+                            headers_json,
+                            aad=cell_aad(
+                                "response", "resp_headers", message_id, destination_name, seq
+                            ),
+                        )
                     ),
                     now,
                 ),
@@ -16024,17 +16100,19 @@ class MessageStore:
                         reingress_to,
                         None,
                         None,
-                        self._enc(
-                            artifact_ref,
-                            aad=queue_payload_aad(
-                                row_id=work_row_id,
-                                message_id=message_id,
-                                stage=Stage.RESPONSE.value,
-                                channel_id=reingress_to,
-                                destination_name=None,
-                                handler_name=None,
-                                body_ref=None,
-                            ),
+                        (
+                            await self._aenc(
+                                artifact_ref,
+                                aad=queue_payload_aad(
+                                    row_id=work_row_id,
+                                    message_id=message_id,
+                                    stage=Stage.RESPONSE.value,
+                                    channel_id=reingress_to,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            )
                         ),
                         OutboxStatus.PENDING.value,
                         0,
@@ -16171,17 +16249,19 @@ class MessageStore:
                     pt_channel,
                     None,
                     None,
-                    self._cipher.encrypt(
-                        body,
-                        aad=queue_payload_aad(
-                            row_id=pt_ingress_id,
-                            message_id=new_mid,
-                            stage=Stage.INGRESS.value,
-                            channel_id=pt_channel,
-                            destination_name=None,
-                            handler_name=None,
-                            body_ref=None,
-                        ),
+                    (
+                        await self._aencrypt(
+                            body,
+                            aad=queue_payload_aad(
+                                row_id=pt_ingress_id,
+                                message_id=new_mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=pt_channel,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
+                        )
                     ),
                     OutboxStatus.PENDING.value,
                     0,
@@ -16235,17 +16315,19 @@ class MessageStore:
                 channel_id,
                 pt_name,
                 PASSTHROUGH_MARKER_HANDLER,
-                self._cipher.encrypt(
-                    "",
-                    aad=queue_payload_aad(
-                        row_id=marker_id,
-                        message_id=parent_id,
-                        stage=Stage.OUTBOUND.value,
-                        channel_id=channel_id,
-                        destination_name=pt_name,
-                        handler_name=PASSTHROUGH_MARKER_HANDLER,
-                        body_ref=None,
-                    ),
+                (
+                    await self._aencrypt(
+                        "",
+                        aad=queue_payload_aad(
+                            row_id=marker_id,
+                            message_id=parent_id,
+                            stage=Stage.OUTBOUND.value,
+                            channel_id=channel_id,
+                            destination_name=pt_name,
+                            handler_name=PASSTHROUGH_MARKER_HANDLER,
+                            body_ref=None,
+                        ),
+                    )
                 ),
                 status,
                 0,
@@ -16382,7 +16464,11 @@ class MessageStore:
                     " WHERE id=?",
                     (
                         OutboxStatus.DEAD.value,
-                        self._enc(error, aad=cell_aad("queue", "last_error", response_row_id)),
+                        (
+                            await self._aenc(
+                                error, aad=cell_aad("queue", "last_error", response_row_id)
+                            )
+                        ),
                         now,
                         now,
                         response_row_id,
@@ -16394,7 +16480,7 @@ class MessageStore:
                 return True
 
             try:
-                ref = open_queue_cell(self._cipher, wr) or ""
+                ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
             except QueueTagError as err:
@@ -16439,12 +16525,11 @@ class MessageStore:
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
                 )
             body = (
-                self._dec(
+                await self._adec(
                     art["body"],
                     aad=cell_aad("response", "body", origin_msg_id, dest, seq),
                 )
-                or ""
-            )
+            ) or ""
             # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
             cur = await self._db.execute(
                 "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -16455,12 +16540,16 @@ class MessageStore:
             # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
             try:
                 meta_json = (
-                    open_message_cell(
-                        self._cipher,
-                        "metadata",
-                        mrow["metadata"],
-                        message_id=origin_id,
-                        channel_id=mrow["channel_id"],
+                    (
+                        await cipher_call(
+                            self._cipher,
+                            open_message_cell,
+                            self._cipher,
+                            "metadata",
+                            mrow["metadata"],
+                            message_id=origin_id,
+                            channel_id=mrow["channel_id"],
+                        )
                     )
                     if mrow
                     else None
@@ -16482,10 +16571,12 @@ class MessageStore:
                     " WHERE id=?",
                     (
                         OutboxStatus.DEAD.value,
-                        self._enc(
-                            f"re-ingress correlation depth exceeded "
-                            f"({child_depth} > {correlation_depth_cap})",
-                            aad=cell_aad("queue", "last_error", response_row_id),
+                        (
+                            await self._aenc(
+                                f"re-ingress correlation depth exceeded "
+                                f"({child_depth} > {correlation_depth_cap})",
+                                aad=cell_aad("queue", "last_error", response_row_id),
+                            )
                         ),
                         now,
                         now,
@@ -16548,17 +16639,19 @@ class MessageStore:
                             loopback_channel_id,
                             None,
                             None,
-                            self._cipher.encrypt(
-                                body,
-                                aad=queue_payload_aad(
-                                    row_id=reingress_row_id,
-                                    message_id=new_mid,
-                                    stage=Stage.INGRESS.value,
-                                    channel_id=loopback_channel_id,
-                                    destination_name=None,
-                                    handler_name=None,
-                                    body_ref=None,
-                                ),
+                            (
+                                await self._aencrypt(
+                                    body,
+                                    aad=queue_payload_aad(
+                                        row_id=reingress_row_id,
+                                        message_id=new_mid,
+                                        stage=Stage.INGRESS.value,
+                                        channel_id=loopback_channel_id,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
+                                )
                             ),
                             OutboxStatus.PENDING.value,
                             0,
@@ -16613,7 +16706,7 @@ class MessageStore:
             if row is None:
                 return None
             try:
-                ref = open_queue_cell(self._cipher, row) or ""
+                ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, row) or ""
             except QueueTagError as err:
                 refused = err  # reported below, once the read connection is released
             else:
@@ -16634,7 +16727,7 @@ class MessageStore:
             )
             raise refused
         return (
-            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
+            await self._adec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"] is not None)
             else ""
         )
@@ -16672,12 +16765,20 @@ class MessageStore:
             seq = (int(seq_row["m"]) if seq_row else 0) + 1
             # Encrypt AFTER seq is known so body/detail bind to the (message_id, dest, seq) cell.
             enc_body = (
-                self._enc(ack_body, aad=cell_aad("response", "body", message_id, dest, seq))
+                (
+                    await self._aenc(
+                        ack_body, aad=cell_aad("response", "body", message_id, dest, seq)
+                    )
+                )
                 if (ack_body and self._cipher.encrypts)
                 else None
             )
             enc_detail = (
-                self._enc(scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq))
+                (
+                    await self._aenc(
+                        scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq)
+                    )
+                )
                 if scrubbed is not None
                 else None
             )
@@ -16721,40 +16822,46 @@ class MessageStore:
                 destination_name=r["destination_name"],
                 response_seq=r["response_seq"],
                 outcome=r["outcome"],
-                detail=self._dec(
-                    r["detail"],
-                    aad=cell_aad(
-                        "response",
-                        "detail",
-                        r["message_id"],
-                        r["destination_name"],
-                        r["response_seq"],
-                    ),
+                detail=(
+                    await self._adec(
+                        r["detail"],
+                        aad=cell_aad(
+                            "response",
+                            "detail",
+                            r["message_id"],
+                            r["destination_name"],
+                            r["response_seq"],
+                        ),
+                    )
                 ),
                 captured_at=r["captured_at"],
-                body=self._dec(
-                    r["body"],
-                    aad=cell_aad(
-                        "response",
-                        "body",
-                        r["message_id"],
-                        r["destination_name"],
-                        r["response_seq"],
-                    ),
+                body=(
+                    await self._adec(
+                        r["body"],
+                        aad=cell_aad(
+                            "response",
+                            "body",
+                            r["message_id"],
+                            r["destination_name"],
+                            r["response_seq"],
+                        ),
+                    )
                 ),
                 kind=r["kind"],
                 ack_code=r["ack_code"],
                 ack_phase=r["ack_phase"],
                 headers=decode_response_headers(
-                    self._dec(
-                        r["resp_headers"],
-                        aad=cell_aad(
-                            "response",
-                            "resp_headers",
-                            r["message_id"],
-                            r["destination_name"],
-                            r["response_seq"],
-                        ),
+                    (
+                        await self._adec(
+                            r["resp_headers"],
+                            aad=cell_aad(
+                                "response",
+                                "resp_headers",
+                                r["message_id"],
+                                r["destination_name"],
+                                r["response_seq"],
+                            ),
+                        )
                     ),
                     row_id=r["message_id"],
                 ),
@@ -16809,7 +16916,7 @@ class MessageStore:
                 (
                     status,
                     next_at,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                     *(
@@ -16890,7 +16997,7 @@ class MessageStore:
                     (
                         status,
                         next_at,
-                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
                         *(
@@ -16950,7 +17057,7 @@ class MessageStore:
                     (
                         OutboxStatus.DEAD.value,
                         now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
                     ),
@@ -17133,7 +17240,7 @@ class MessageStore:
         skipped: list[Any] = []
         for row in orphans:
             try:
-                reason = self._enc(error, aad=cell_aad("queue", "last_error", row["id"]))
+                reason = await self._aenc(error, aad=cell_aad("queue", "last_error", row["id"]))
             except AADComponentError:
                 skipped.append(row)
                 continue
@@ -17522,7 +17629,9 @@ class MessageStore:
                     )
                 # Correlate the child to the origin (mirrors `reingress`): correlation_id/_root_id/
                 # _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-                raw_meta = open_message_cell(
+                raw_meta = await cipher_call(
+                    self._cipher,
+                    open_message_cell,
                     self._cipher,
                     "metadata",
                     mrow["metadata"],
@@ -17730,7 +17839,9 @@ class MessageStore:
                 return outcome
             # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
             # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-            raw_meta = open_message_cell(
+            raw_meta = await cipher_call(
+                self._cipher,
+                open_message_cell,
                 self._cipher,
                 "metadata",
                 orow["metadata"],
@@ -17787,17 +17898,19 @@ class MessageStore:
                         new_mid,
                         Stage.INGRESS.value,
                         channel_id,
-                        self._cipher.encrypt(
-                            raw,
-                            aad=queue_payload_aad(
-                                row_id=resubmit_row_id,
-                                message_id=new_mid,
-                                stage=Stage.INGRESS.value,
-                                channel_id=channel_id,
-                                destination_name=None,
-                                handler_name=None,
-                                body_ref=None,
-                            ),
+                        (
+                            await self._aencrypt(
+                                raw,
+                                aad=queue_payload_aad(
+                                    row_id=resubmit_row_id,
+                                    message_id=new_mid,
+                                    stage=Stage.INGRESS.value,
+                                    channel_id=channel_id,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            )
                         ),
                         OutboxStatus.PENDING.value,
                         now,
@@ -17998,7 +18111,9 @@ class MessageStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        return open_message_cell(
+        return await cipher_call(
+            self._cipher,
+            open_message_cell,
             self._cipher,
             "metadata",
             row["metadata"],
@@ -18054,7 +18169,9 @@ class MessageStore:
         out: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
-            withhold_message_cells(
+            await cipher_call(
+                self._cipher,
+                withhold_message_cells,
                 self._cipher,
                 d,
                 ("error", "summary", "metadata"),
@@ -18224,13 +18341,17 @@ class MessageStore:
             for r in await cur.fetchall():
                 d = dict(r)
                 # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
-                d["last_error"] = open_listed_cell(
+                d["last_error"] = await cipher_call(
+                    self._cipher,
+                    open_listed_cell,
                     self._cipher,
                     d["last_error"],
                     cell_aad("queue", "last_error", r["outbox_id"]),
                     table="queue",
                 )
-                withhold_message_cells(
+                await cipher_call(
+                    self._cipher,
+                    withhold_message_cells,
                     self._cipher,
                     d,
                     ("summary",),
@@ -18338,7 +18459,12 @@ class MessageStore:
                 (message_id, Stage.OUTBOUND.value),
             )
             return [
-                self._decode_row(r, "queue", (r["id"],), "last_error") for r in await cur.fetchall()
+                (
+                    await cipher_call(
+                        self._cipher, self._decode_row, r, "queue", (r["id"],), "last_error"
+                    )
+                )
+                for r in await cur.fetchall()
             ]
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
@@ -18359,7 +18485,9 @@ class MessageStore:
             )
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
-                d = self._decode_row(r, "queue", (r["id"],), "last_error")
+                d = await cipher_call(
+                    self._cipher, self._decode_row, r, "queue", (r["id"],), "last_error"
+                )
                 dead = r["status"] == OutboxStatus.DEAD.value
                 try:
                     d["payload"] = (
@@ -18380,8 +18508,15 @@ class MessageStore:
                 "SELECT * FROM message_events WHERE message_id=? ORDER BY id", (message_id,)
             )
             return [
-                self._decode_row(
-                    r, "message_events", (r["message_id"], r["ts"], r["event"]), "detail"
+                (
+                    await cipher_call(
+                        self._cipher,
+                        self._decode_row,
+                        r,
+                        "message_events",
+                        (r["message_id"], r["ts"], r["event"]),
+                        "detail",
+                    )
                 )
                 for r in await cur.fetchall()
             ]
@@ -18404,7 +18539,9 @@ class MessageStore:
         # scans `FROM queue`). Deliberately no BEGIN of its own: the #1548 cancel-unwind tests use this
         # writer as their probe for an inherited open transaction
         # (tests/test_backlog1548_writer_txn_cancel_unwind.py). Its guard rolls one back on entry.
-        params = self._connection_event_params(
+        params = await cipher_call(
+            self._cipher,
+            self._connection_event_params,
             ConnectionEventWrite(
                 connection=connection,
                 transport=transport,
@@ -18414,7 +18551,7 @@ class MessageStore:
                 message_id=message_id,
                 reason=reason,
                 now=now,
-            )
+            ),
         )
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(_CONNECTION_EVENT_INSERT, params)
@@ -18424,7 +18561,7 @@ class MessageStore:
         # A burst in ONE transaction (BACKLOG #1731): the runner's drainer hands over everything
         # already queued, so a connect-per-message sender pays one commit per burst, not per event.
         # _writer_txn: the whole burst is one explicit transaction, so it commits or unwinds whole.
-        rows = [self._connection_event_params(ev) for ev in events]
+        rows = [await cipher_call(self._cipher, self._connection_event_params, ev) for ev in events]
         if not rows:
             return
         async with _writer_txn(self._db, self._lock):
@@ -18496,11 +18633,17 @@ class MessageStore:
                     peer_host=r["peer_host"],
                     message_id=r["message_id"],
                     # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
-                    reason=open_listed_cell(
-                        self._cipher,
-                        r["reason"],
-                        cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
-                        table="connection_event",
+                    reason=(
+                        await cipher_call(
+                            self._cipher,
+                            open_listed_cell,
+                            self._cipher,
+                            r["reason"],
+                            cell_aad(
+                                "connection_event", "reason", r["connection"], r["ts"], r["kind"]
+                            ),
+                            table="connection_event",
+                        )
                     ),
                 )
                 for r in await cur.fetchall()
@@ -18553,9 +18696,11 @@ class MessageStore:
         # Bound to (event_type, connection) — the de-dup grain the upsert keys on, so the SAME AAD covers
         # both the INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3).
         reason_enc = (
-            self._enc(
-                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
-                aad=cell_aad("alert_instance", "reason", event_type, connection),
+            (
+                await self._aenc(
+                    safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
+                    aad=cell_aad("alert_instance", "reason", event_type, connection),
+                )
             )
             if reason
             else None
@@ -18611,7 +18756,10 @@ class MessageStore:
                 " ORDER BY last_seen DESC, id DESC LIMIT ?",
                 params,
             )
-            return [self._alert_instance_row(r, listed=True) for r in await cur.fetchall()]
+            return [
+                await cipher_call(self._cipher, self._alert_instance_row, r, listed=True)
+                for r in await cur.fetchall()
+            ]
 
     async def summarize_active_alert_instances(
         self, *, allowed_channels: Sequence[str] | None
@@ -18652,7 +18800,11 @@ class MessageStore:
                 params,
             )
             row = await cur.fetchone()
-            return self._alert_instance_row(row, listed=False) if row is not None else None
+            return (
+                await cipher_call(self._cipher, self._alert_instance_row, row, listed=False)
+                if row is not None
+                else None
+            )
 
     def _alert_instance_row(self, r: aiosqlite.Row, *, listed: bool) -> AlertInstance:
         aad = cell_aad("alert_instance", "reason", r["event_type"], r["connection"])
@@ -19008,7 +19160,9 @@ class MessageStore:
             )
             last = await cur.fetchone()
             # BACKLOG #1904: raises AuditHeadMovedError when the caller sealed a different head.
-            seq, row_hash = audit_seal_next(
+            seq, row_hash = await cipher_call(
+                self._audit_mac_fn,
+                audit_seal_next,
                 None if last is None else (last["seq"], last["row_hash"]),
                 expect_prev,
                 self._audit_append_mac,
@@ -19911,7 +20065,9 @@ class MessageStore:
         ``verify``, which Vault makes with Go's constant-time ``hmac.Equal``, BACKLOG #2720.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
-        return verify_audit_rows(
+        return await cipher_call(
+            self._audit_mac_fn,
+            verify_audit_rows,
             await self._audit_rows(),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
@@ -20432,7 +20588,7 @@ class MessageStore:
         confirmed by :meth:`enable_totp` after the user proves a live code. Returns the stored cell,
         which :meth:`enable_totp` compares against, or ``None`` when nothing was written."""
         now = time.time() if now is None else now
-        sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
+        sealed = await self._aenc(secret, aad=cell_aad("users", "totp_secret", user_id))
         async with _writer_guard(self._db, self._lock):
             written = await self._write_user(user_id, totp_stage(sealed, now))
             await self._commit()
@@ -20558,7 +20714,7 @@ class MessageStore:
         seed in place."""
         now = time.time() if now is None else now
         change = totp_replace(
-            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            sealed_secret=await self._aenc(secret, aad=cell_aad("users", "totp_secret", user_id)),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
@@ -21271,7 +21427,7 @@ class MessageStore:
             row = await cur.fetchone()
             effective_id = str(row["id"]) if row is not None else preset_id
             # Bound to the row id and its owner (BACKLOG #2593).
-            enc = self._enc(
+            enc = await self._aenc(
                 criteria,
                 aad=preset_criteria_aad(preset_id=effective_id, owner_user_id=owner_user_id),
             )
@@ -21325,8 +21481,13 @@ class MessageStore:
             out = dict(row)
             # Bound to the row id and its owner (BACKLOG #2593): a preset moved to another owner
             # outside the store refuses here.
-            out["criteria"] = open_preset_criteria(
-                self._cipher, row["criteria"], preset_id=preset_id, owner_user_id=owner_user_id
+            out["criteria"] = await cipher_call(
+                self._cipher,
+                open_preset_criteria,
+                self._cipher,
+                row["criteria"],
+                preset_id=preset_id,
+                owner_user_id=owner_user_id,
             )
         # Outside the _read() block: on the :memory: fallback path _read() holds self._lock, and the
         # pooled read connections are PRAGMA query_only=ON — the stamp must go to the writer.
@@ -23153,7 +23314,11 @@ class MessageStore:
                 now,
                 event,
                 destination,
-                self._enc(detail, aad=cell_aad("message_events", "detail", message_id, now, event)),
+                (
+                    await self._aenc(
+                        detail, aad=cell_aad("message_events", "detail", message_id, now, event)
+                    )
+                ),
             ),
         )
 
