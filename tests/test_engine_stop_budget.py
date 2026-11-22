@@ -264,11 +264,16 @@ async def _until_cancel_requested(task: asyncio.Task[None]) -> None:
         await asyncio.sleep(0.01)
 
 
-async def test_a_cancel_of_the_crl_runner_stop_caller_propagates() -> None:
+async def test_a_cancel_of_the_crl_runner_stop_caller_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A cancel of the caller while the stop waits for the pass's cancel to land is the caller's,
-    so it is raised. Before, ``suppress(CancelledError)`` around ``await task`` swallowed it."""
+    so it is raised. Before, ``suppress(CancelledError)`` around ``await task`` swallowed it. The
+    open alerts are still resolved first."""
     release = asyncio.Event()
     runner = CrlReloadRunner(stop_timeout_seconds=30.0)
+    resolved: list[bool] = []
+    monkeypatch.setattr(runner, "_resolve_at_stop", lambda: resolved.append(True))
     pass_task = asyncio.ensure_future(_unwinds_slowly(release))
     runner._task = pass_task
     stopping = asyncio.ensure_future(runner.stop(timeout=0.05))
@@ -280,6 +285,7 @@ async def test_a_cancel_of_the_crl_runner_stop_caller_propagates() -> None:
         with pytest.raises(asyncio.CancelledError):
             await stopping
         assert stopping.cancelled()
+        assert resolved == [True]
     finally:
         release.set()
         await asyncio.gather(pass_task, return_exceptions=True)
