@@ -109,9 +109,11 @@ class CipherCell:
     has no ``rowid``); the SQLite walk pages by ``rowid`` and does not read it. On a server cell
     the ``"position"`` locator stands where SQLite's ``rowid`` does: the value's 1-based place, in
     ``order``, among the values the walk fetched for the cell. A walk that reads unmarked values
-    fetches every non-NULL value; a ``sealed_only`` walk fetches only the values that start with
-    the marker in any ASCII case, so one row can hold a different position in each. A later write
-    may shift it.
+    fetches every non-NULL value; a ``sealed_only`` walk fetches the values that start with the
+    marker in any ASCII case, so one row can hold a different position in each. A SQL Server
+    column whose collation ignores width or accents can also match a non-ASCII lookalike there;
+    such a value takes a position and the walk then skips it as unsealed. A later write may shift
+    a position.
 
     ``chunk_cap`` bounds a server walk's chunk for a cell whose rows are large, since a server
     driver fetches a whole chunk at once where SQLite reads it one row at a time."""
@@ -223,6 +225,16 @@ POSITION = "position"
 #: usual chunk would hold hundreds of MiB at once. The store's own seal pass batches it the same.
 _ATTACHMENT_CHUNK_ROWS = 16
 
+#: Rows a server walk reads per chunk of a cell that holds a whole message or response body. One
+#: body has no fixed bound here (an inbound's ``max_message_bytes`` is per connection), so the
+#: usual chunk would fetch hundreds of whole ciphertexts in one statement (BACKLOG #1719 item 2).
+_BODY_CHUNK_ROWS = 16
+
+#: The server cells read :data:`_BODY_CHUNK_ROWS` at a time.
+_BODY_CELLS: frozenset[tuple[str, str]] = frozenset(
+    {("messages", "raw"), ("queue", "payload"), ("shared_body", "body"), ("response", "body")}
+)
+
 #: The id-keyed cells both server stores seal, pinned to each module's ``cell_aad`` calls by a test.
 _SERVER_ID_KEYED: tuple[tuple[str, str], ...] = (
     ("messages", "raw"),
@@ -249,7 +261,11 @@ def _server_cell(cell: CipherCell) -> CipherCell:
     """``cell`` as a server walk reads it: paged by its table's primary key, and located by
     ``position`` where SQLite's ``rowid`` stood."""
     locator = (POSITION,) if cell.locator == ("rowid",) else cell.locator
-    cap = _ATTACHMENT_CHUNK_ROWS if cell.table == "attachment_chunk" else None
+    cap: int | None = None
+    if cell.table == "attachment_chunk":
+        cap = _ATTACHMENT_CHUNK_ROWS
+    elif (cell.table, cell.column) in _BODY_CELLS:
+        cap = _BODY_CHUNK_ROWS
     return replace(
         cell, locator=locator, order=_SERVER_ORDER.get(cell.table, ("id",)), chunk_cap=cap
     )
@@ -770,8 +786,9 @@ def audit_cipher_cells(
 
 
 class CipherCellSource(Protocol):
-    """What a server store offers :func:`read_server_cipher_cells`: four reads, each one statement,
-    implemented by ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes."""
+    """What a server store offers :func:`read_server_cipher_cells`: four reads, implemented by
+    ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes. A read may take
+    more than one statement: SQL Server's column inventory asks once per table."""
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]: ...
 
