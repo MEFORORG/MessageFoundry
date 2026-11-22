@@ -148,9 +148,13 @@ _LOCATOR_LIMIT = 64
 
 def _shown(value: object) -> str:
     text = str(value)
+    if not text.isprintable():
+        text = text.encode("unicode_escape").decode("ascii")
+    # Cut after the escape, which can make one character ten (`\U000e0001`), so a shown value is
+    # at most the limit and the elision mark whatever it holds (BACKLOG #1719).
     if len(text) > _LOCATOR_LIMIT:
         text = text[:_LOCATOR_LIMIT] + "..."
-    return text if text.isprintable() else text.encode("unicode_escape").decode("ascii")
+    return text
 
 
 _RESPONSE_KEY = ("message_id", "destination_name", "response_seq")
