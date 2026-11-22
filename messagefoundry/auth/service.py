@@ -18770,8 +18770,9 @@ class AuthService:
                 # work, while a WRONG code falls through to the recovery-code walk below. Both answer
                 # False, so the wall clock was the only thing telling them apart. So fall through
                 # to the SAME walk (same hashes, same slot count) and refuse after it. A success
-                # stays fast: it already reveals its outcome. The two still differ by one store
-                # call: a wrong code matched no step, so it never reached ``consume_totp_step``.
+                # stays fast: it already reveals its outcome. The two still differ by at least one
+                # store call: a wrong code matched no step, so it never reached
+                # ``consume_totp_step``, and ``verify_mfa`` re-reads more for a matched code.
                 totp_refused = True
         normalized = code.upper()  # recovery codes are minted uppercase
         # The hashes the account's seal covered, not a second read nobody checked (BACKLOG #2592).
