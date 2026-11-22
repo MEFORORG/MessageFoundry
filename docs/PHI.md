@@ -471,12 +471,13 @@ than a path is not checked
   the engine's account may not read is refused: give that account read access to the folder's
   permissions. On both platforms the check also refuses at least a junction or link its walk
   finds on the key file's path that an account it does not trust could change or re-point,
-  through the link itself or a folder that holds it or lies above it. On Windows the walk stops at
-  a network share, so a junction on the server is not found there. On Windows it trusts at least SYSTEM, Administrators,
-  TrustedInstaller and the engine's own account, unless that is LOCAL SERVICE or NETWORK SERVICE;
-  on POSIX, root and the engine's own account. A folder above the one that holds the key file is
-  not judged by owner or access unless a junction or link on the path sits in it or below it, so
-  the folders on a link's target side usually are not. Where the folder that holds the key file is
+  through the link itself or a folder that holds it or lies above it. On Windows it trusts at least
+  SYSTEM, Administrators, TrustedInstaller and the engine's own account, unless that is LOCAL
+  SERVICE or NETWORK SERVICE or cannot be read; on POSIX, root and the engine's own account. A
+  folder above the one that holds the key file is not judged by owner or access unless a junction
+  or link on the path sits in it or below it, so the folders on a link's target side usually are
+  not. A file in the secrets directory is the exception: the directory is checked as a path of its
+  own. Where the folder that holds the key file is
   read, and what is refused on a network share or a mapped network drive, is in the 2026-11-17
   entry of the
   [ADR 0214 amendments](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments),
