@@ -450,6 +450,152 @@ def test_an_unavailable_probe_never_claims_a_live_session(repo: Path, tmp_path: 
 
 
 # --------------------------------------------------------------------------------------------------
+# BACKLOG #5870: occupancy is answered per holder repository, and a missing answer stays a veto
+# --------------------------------------------------------------------------------------------------
+
+
+def other_repo_holding(repo: Path, tmp_path: Path, key: str) -> Path:
+    """A checkout of a DIFFERENT repository holding ``key``, with a session placed in it.
+
+    The session is this test process: its pid is running, and a record with no ``startedAt`` fences
+    as UNVERIFIED, which is a veto state.
+    """
+    other = tmp_path / "other-repo"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True, capture_output=True)
+    git(other, "config", "user.email", "t@example.invalid")
+    git(other, "config", "user.name", "t")
+    (other / "g.txt").write_text("y", encoding="utf-8")
+    git(other, "add", "-A")
+    git(other, "commit", "-qm", "other base")
+    # The route by which one registry holds another repository's worktree: without this key the
+    # claim would be written to the other repository's own registry and never listed here.
+    git(other, "config", "mefor.claimsRoot", str(repo))
+    record = {"cwd": str(other), "pid": os.getpid(), "sessionId": "planted-live-session"}
+    sessions = tmp_path / "fakehome" / ".claude" / "sessions"
+    (sessions / f"{os.getpid()}.json").write_text(json.dumps(record), encoding="utf-8")
+    assert claim(repo, "-Take", key, "-AsWorktree", str(other), "-Note", "n").returncode == 0
+    return other
+
+
+def append_to_probe(repo: Path, text: str) -> None:
+    """Change the sandbox's own occupancy.ps1. A later definition replaces the real function."""
+    probe = repo / "scripts" / "coord" / "occupancy.ps1"
+    probe.write_text(probe.read_text(encoding="utf-8") + "\n" + text + "\n", encoding="utf-8")
+
+
+def test_a_live_holder_in_another_repository_is_not_reported_unoccupied(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """The probe must look in the HOLDER's repository, not the one claim.ps1 lives in."""
+    other_repo_holding(repo_with_occupancy, tmp_path, "k")
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "DIRECTORY ONLY" not in out, out
+    assert "LIVE SESSION in the holder" in out, out
+
+
+def test_a_probe_answering_for_the_wrong_repository_reads_present_never_unoccupied(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """THE POLARITY RULE. An Available answer that does not list the holder says nothing about it."""
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    append_to_probe(
+        repo_with_occupancy,
+        "function Get-WorktreeOccupancy { param([string]$Repo)\n"
+        "  [pscustomobject]@{ Available = $true; Sessions = @();\n"
+        "    Worktrees = @([pscustomobject]@{ Path = 'C:/not/the/holders/repository' }) } }",
+    )
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "DIRECTORY ONLY" not in out, out
+    assert "OCCUPANCY UNKNOWN" in out, out
+    proc = claim(repo_with_occupancy, "-Take", "k", "-Note", "mine now")
+    assert proc.returncode != 0
+    assert "A DIRECTORY, NOT A SESSION" not in proc.stdout
+
+
+def test_an_answer_listing_the_holder_only_by_another_case_reads_present(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """On a case-sensitive filesystem that spelling is another repository's directory.
+
+    The stub stands in for that volume: the listing differs from the holder by case alone, which is
+    all the comparison sees.
+    """
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    append_to_probe(
+        repo_with_occupancy,
+        "function Get-WorktreeOccupancy { param([string]$Repo)\n"
+        "  [pscustomobject]@{ Available = $true; Sessions = @();\n"
+        "    Worktrees = @([pscustomobject]@{ Path = $Repo.ToUpperInvariant() }) } }",
+    )
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "DIRECTORY ONLY" not in out, out
+    assert "OCCUPANCY UNKNOWN" in out, out
+
+
+def test_a_drive_letter_in_another_case_is_still_the_same_path(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """The control for the test above: the exact comparison must not refuse every answer."""
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    append_to_probe(
+        repo_with_occupancy,
+        "function Get-WorktreeOccupancy { param([string]$Repo)\n"
+        "  $c = $Repo.Substring(0, 1)\n"
+        "  $flipped = if ($c -cmatch '[A-Z]') { $c.ToLowerInvariant() } else { $c.ToUpperInvariant() }\n"
+        "  [pscustomobject]@{ Available = $true; Sessions = @();\n"
+        "    Worktrees = @([pscustomobject]@{ Path = $flipped + $Repo.Substring(1) }) } }",
+    )
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "DIRECTORY ONLY" in out, out
+
+
+@pytest.mark.parametrize(
+    ("failing", "other_state"),
+    [("peer-wt", "LIVE SESSION in the holder"), ("other-repo", "DIRECTORY ONLY")],
+)
+def test_one_repositorys_failed_probe_does_not_poison_another(
+    repo_with_occupancy: Path, tmp_path: Path, failing: str, other_state: str
+) -> None:
+    """Both directions, because which holder is probed first depends on the listing order."""
+    peer_holding(repo_with_occupancy, tmp_path, "a")
+    other_repo_holding(repo_with_occupancy, tmp_path, "b")
+    append_to_probe(
+        repo_with_occupancy,
+        "$script:RealProbe = ${function:Get-WorktreeOccupancy}\n"
+        "function Get-WorktreeOccupancy { param([string]$Repo)\n"
+        f"  if ($Repo -like '*{failing}*') {{ throw 'probe failed' }}\n"
+        "  & $script:RealProbe -Repo $Repo }",
+    )
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "OCCUPANCY UNKNOWN" in out, out
+    assert other_state in out, out
+
+
+def test_a_probe_that_did_not_load_is_looked_up_once_and_reads_present(
+    repo: Path, tmp_path: Path
+) -> None:
+    """-List walks every claim, so the failed lookup must not repeat, or read as anything else."""
+    peer = peer_holding(repo, tmp_path, "a")
+    assert claim(peer, "-Take", "b", "-Note", "n").returncode == 0
+    assert claim(peer, "-Take", "c", "-Note", "n").returncode == 0
+    lookups = tmp_path / "lookups.txt"
+    # Defines no probe. It only counts the lookups of the probe that is missing.
+    (repo / "scripts" / "coord" / "occupancy.ps1").write_text(
+        "function Get-Command { [CmdletBinding()]\n"
+        "  param([Parameter(Position=0)][string[]]$Name, $CommandType)\n"
+        f"  if ($Name -contains 'Get-WorktreeOccupancy') {{ "
+        f"[IO.File]::AppendAllText('{lookups}', 'x') }}\n"
+        "  Microsoft.PowerShell.Core\\Get-Command @PSBoundParameters }\n",
+        encoding="utf-8",
+    )
+    out = claim(repo, "-List").stdout
+    assert out.count("OCCUPANCY UNKNOWN") == 3, out
+    assert "DIRECTORY ONLY" not in out, out
+    assert lookups.read_text(encoding="utf-8") == "x"
+
+
+# --------------------------------------------------------------------------------------------------
 # BACKLOG #1466: merged-work EVIDENCE for a directory-only holder, and never authority
 # --------------------------------------------------------------------------------------------------
 #
