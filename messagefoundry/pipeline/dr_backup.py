@@ -4325,10 +4325,10 @@ def _proven_abandoned(path: Path, owner: object) -> bool:
     logged, except at least a live run's lock, a missing lock or marker, and a candidate gone by its
     open.
 
-    The owner is read by path first, so another account's directory is never opened at all, and
-    then again through :class:`_HeldStagingDir`, through which the lock is opened and the marker
-    tested; that second read decides. What that class leaves to a path is said there
-    (BACKLOG #2420)."""
+    The owner is read by path first, so another account's directory is never opened at all. Where
+    :class:`_HeldStagingDir` has the directory open, the owner is read again from it, and that
+    read decides; where it goes by path, the first read is the only one, as before. What that class
+    leaves to a path is said there (BACKLOG #2420)."""
     if _owner_of(path) != owner:
         _another_owner(path)
         return False
@@ -4344,7 +4344,7 @@ def _proven_abandoned(path: Path, owner: object) -> bool:
         )
         return False
     with held_dir:
-        if held_dir.owner() != owner:
+        if held_dir.fd is not None and held_dir.owner() != owner:
             _another_owner(path)
             return False
         try:

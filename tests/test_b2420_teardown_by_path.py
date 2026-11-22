@@ -380,3 +380,25 @@ def test_without_o_path_a_directory_it_cannot_read_is_still_swept_by_path(
         assert dr_backup._proven_abandoned(candidate, owner) is True
     finally:
         candidate.chmod(0o700)
+
+
+def test_the_proof_reads_the_owner_by_path_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One by-path owner read per candidate, as origin/main makes. Red at 97f8dc96943 on Windows,
+    where the directory goes by path: the owner was read by path twice, a second
+    security-descriptor read and a wider window for a candidate that goes between them."""
+    root = tmp_path / "root"
+    candidate = _abandoned(root)
+    owner = dr_backup._owner_of(candidate)
+    assert owner is not None
+    real_owner = dr_backup._owner_of
+    reads: list[Path] = []
+
+    def counted(path: Path) -> object | None:
+        reads.append(Path(path))
+        return real_owner(path)
+
+    monkeypatch.setattr(dr_backup, "_owner_of", counted)
+    assert dr_backup._proven_abandoned(candidate, owner) is True
+    assert reads == [candidate]
