@@ -673,6 +673,8 @@ async def test_start_row_reads_an_env_url_query_credential_against_its_snapshot_
         runner.set_env_values({"q_start_url": url})
         loaded = app_module._LoadedConfig.read(engine)
         assert loaded is not None and loaded.env_values == {"q_start_url": url}
+        # The live values move on after the snapshot, so a row read from them would differ.
+        runner.set_env_values({"q_start_url": "https://p.example.invalid/x?fmt=moved"})
         before = len(await engine.store.list_audit(action="config_loaded"))
         await app_module._record_start_audit(app, engine, loaded=loaded)
         rows = await engine.store.list_audit(action="config_loaded")

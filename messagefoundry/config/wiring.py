@@ -413,8 +413,8 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
     made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
     (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` the builtin's reading with a bool
-    refused (:func:`_cast_float`). Any other callable runs as given, on the environment value as it
-    arrives, a TOML bool included, so ``cast=lambda v: int(v)`` still reads ``true`` as 1; the
+    refused (:func:`_cast_float`). Any other callable runs as given, a builtin such as ``abs`` or
+    ``Decimal`` included, on the environment value as it arrives, a TOML bool included, so ``cast=lambda v: int(v)`` still reads ``true`` as 1; the
     connector's own check sees only what the cast returned. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot

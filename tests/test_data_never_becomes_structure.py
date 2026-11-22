@@ -946,6 +946,8 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
 
     connector_log.warning(markers[0])
     await src._poll_once()
+    # The wrapper fired, or ours() would drop every worker-thread line and the check pass on nothing.
+    assert our_threads, "no asyncio.to_thread job of this poll was seen"
     # The item 30 control: a line from a thread that ran none of this poll's jobs, as another
     # source's worker would log, logs with no task and must not read as this poll's failure.
     other = threading.Thread(target=connector_log.warning, args=("another source's worker line",))

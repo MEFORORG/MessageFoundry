@@ -166,9 +166,9 @@ transport = "mllp"
   #1650). That read sees what a `cast` left. `cast = "int"` is strict too: it refuses a bool and a
   number that is not whole, where the builtin `int` read `true` as 1 and cut a fraction.
   `cast = "float"`, and a code-first `env(..., cast=float)`, refuse a bool too, where the builtin
-  `float` read `true` as 1.0. A code-first cast of the author's own runs as given, on the value as
-  it arrives, so `cast=lambda v: int(v)` still reads `true` as 1, and the port read takes that as
-  port 1. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
+  `float` read `true` as 1.0. Any other code-first cast runs as given, on the value as it arrives,
+  a builtin such as `abs` or `Decimal` included, so `cast=lambda v: int(v)` still reads `true` as
+  1, and the port read takes that as port 1. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin
   of `6661` (BACKLOG #5915). `allowed_db` also compares the SQL Server preset's `port` setting as
   a number when its check runs, but on `dialect="generic"` it refuses a `PORT` keyword with a

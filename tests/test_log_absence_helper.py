@@ -55,8 +55,9 @@ def test_the_probe_leaves_no_text_and_reaches_no_other_handler(
         def emit(self, record: logging.LogRecord) -> None:
             self.messages.append(record.getMessage())
 
-    other = _Keep()
+    other, above = _Keep(), _Keep()
     probe_logger.addHandler(other)
+    logging.getLogger().addHandler(above)  # a handler up the chain, as pytest's own are
     try:
         with caplog.at_level(logging.WARNING, logger=_NAME):
             probe_logger.warning("before the probe")
@@ -64,7 +65,9 @@ def test_the_probe_leaves_no_text_and_reaches_no_other_handler(
             probe_logger.warning("after the probe")
     finally:
         probe_logger.removeHandler(other)
+        logging.getLogger().removeHandler(above)
     assert other.messages == ["before the probe", "after the probe"]
+    assert above.messages == other.messages
     assert "capture probe" not in caplog.text
     assert "before the probe" in caplog.text and "after the probe" in caplog.text
     assert not other.filters  # the drop filter is taken off again

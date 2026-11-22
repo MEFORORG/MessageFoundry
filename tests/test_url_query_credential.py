@@ -781,6 +781,20 @@ def test_a_missing_service_config_is_not_called_a_refusal(tmp_path: Path) -> Non
     assert "refused" not in r.detail
 
 
+def test_values_that_do_not_load_are_named_as_such(tmp_path: Path) -> None:
+    """The settings load and the value file does not: the line names the values, not the
+    settings, and still lists a literal hit."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _write(tmp_path, _CONFIG)
+    (tmp_path / "environments" / "dev.toml").write_text("not = [toml\n", encoding="utf-8")
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    r = next(x for x in report.results if x.name == "url-query-credential")
+    assert "OB_KEYED (sig)" in r.detail
+    assert "the environment values did not load (TOMLDecodeError)" in r.detail
+    assert "settings" not in r.detail.split("default= only")[-1]
+
+
 def test_one_check_run_loads_the_environment_values_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

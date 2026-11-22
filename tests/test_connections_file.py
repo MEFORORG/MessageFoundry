@@ -33,6 +33,7 @@ from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
     WiringError,
+    env,
     load_config,
     parse_env_setting,
     validate_config,
@@ -422,7 +423,9 @@ def test_named_bool_cast_is_not_the_builtin(tmp_path: Path) -> None:
     # `int` is not the builtin either: it is the strict whole-number cast (BACKLOG #1650).
     assert parse_env_setting({"env": "p", "cast": "int"}).cast is not int
     # `float` refuses a bool (BACKLOG #1650); `str` is still the builtin.
-    assert parse_env_setting({"env": "p", "cast": "float"}).cast is not float
+    named_float = parse_env_setting({"env": "p", "cast": "float"}).cast
+    assert named_float is not float and named_float is env("p", cast=float).cast
+    assert named_float is not None and named_float("2.5") == 2.5
     assert parse_env_setting({"env": "p", "cast": "str"}).cast is str
 
 

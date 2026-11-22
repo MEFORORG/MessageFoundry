@@ -2511,8 +2511,9 @@ def _instance_env_values(settings: ServiceSettings) -> dict[str, Any]:
     :func:`~messagefoundry.config.environments.load_environment_values` raises, at least
     ``ValueError`` for a malformed file and ``OSError`` for one that cannot be read.
 
-    Inside :func:`run_checks` the load runs once per distinct environment, base directory and
-    working directory, a refusal included, as :func:`_load_check_settings` memoizes its load, so
+    Inside :func:`run_checks` the load runs once per distinct environment, ``[environments]``
+    ``base_dir`` and ``dir``, and working directory, a refusal included, and the
+    environment-variable and secrets-directory overlays are read in that one load, as :func:`_load_check_settings` memoizes its load, so
     ``build-check`` and ``url-query-credential`` read one set of values (PR 3150 finding 7, vault
     BACKLOG #3766). Each caller gets its own deep copy."""
     import copy
