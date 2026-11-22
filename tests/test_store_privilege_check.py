@@ -631,6 +631,53 @@ def test_cli_json_reports_every_family_and_no_secret(
     assert by_hop["smtp"]["state"] == "not_probed"
 
 
+#: ESC, DEL, a C1 control (CSI), RIGHT-TO-LEFT OVERRIDE and LINE SEPARATOR: each one a terminal or
+#: a line reader acts on. ``--json`` output must carry them as ``\uXXXX`` escapes (BACKLOG #2891,
+#: PR 2390 note 3).
+_HOSTILE = "a\x1b[31mb\x7fc\x9bd‮e f"
+
+
+def _assert_escaped(out: str) -> None:
+    assert out.isascii(), f"--json output carries a non-ASCII character: {out!r}"
+    controls = [ch for ch in out.rstrip("\n") if ch < " " or ch == "\x7f"]
+    assert not controls, f"--json output carries a control: {out!r}"
+    for escape in ("\\u001b", "\\u007f", "\\u009b", "\\u202e", "\\u2028"):
+        assert escape in out
+
+
+def test_cli_json_result_escapes_controls_and_bidi_in_a_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _clear_env(monkeypatch)
+    _stub_probe(
+        monkeypatch,
+        StorePrivilegeReport(
+            backend=StoreBackend.SQLSERVER,
+            status=StorePrivilegeStatus.UNOBSERVABLE,
+            detail=_HOSTILE,
+        ),
+    )
+    argv = ["check-privileges", "--service-config", str(_server_toml(tmp_path)), "--json"]
+    assert main(argv) == 4
+    out = capsys.readouterr().out
+    _assert_escaped(out)
+    store = next(h for h in json.loads(out)["hops"] if h["hop"] == "store")
+    assert _HOSTILE in store["detail"]
+
+
+def test_cli_json_error_escapes_controls_and_bidi_in_the_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._load_service_settings", lambda *a, **k: (None, _HOSTILE)
+    )
+    assert main(["check-privileges", "--service-config", "unused.toml", "--json"]) == 1
+    out = capsys.readouterr().out
+    _assert_escaped(out)
+    assert json.loads(out) == {"error": _HOSTILE}
+
+
 def test_cli_says_serve_would_refuse_an_over_grant_under_enforce(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
