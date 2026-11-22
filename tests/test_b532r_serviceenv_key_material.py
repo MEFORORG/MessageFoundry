@@ -241,17 +241,23 @@ def test_only_an_entry_the_engine_reads_as_the_directory_is_kept(entry: str) -> 
     ("value", "kept"),
     [
         pytest.param(f"C:\\d;{_URL_ONE_PAD}", False, id="base64url-key"),
+        pytest.param(f"C:\\d\\{_URL_ONE_PAD.rstrip('=')}", False, id="base64url-key-as-a-folder"),
         pytest.param(f"C:\\d;{_KEY_B64}", False, id="standard-key"),
+        pytest.param(f"C:\\d\\{_KEY_B64.rstrip('=')}", False, id="standard-key-as-a-folder"),
         pytest.param(
             "D:/MessageFoundrySecrets/ProductionEngineSecretsDirectory", False, id="slash-path-run"
         ),
         pytest.param("Summer!2026", False, id="not-a-path"),
+        pytest.param("C:\\d;Summer!2026", False, id="path-then-text"),
+        pytest.param("C:\\Summer!2026 hunter2", False, id="path-start-then-text"),
+        pytest.param(r"\\srv\share\secrets", True, id="unc-path"),
+        pytest.param("/srv/secrets", True, id="posix-path"),
         pytest.param("C:\\d", True, id="plain-path"),
     ],
 )
 def test_only_a_plain_absolute_path_is_kept(value: str, kept: bool) -> None:
-    """The Lander's sixth hold on PR 3142, H1: the keep sentence fails closed. Only a value that
-    is plainly an absolute path, with no key run in either base64 alphabet, is kept. Anything
+    """The Lander's sixth hold on PR 3142, H1: the keep sentence fails closed. Only a whole value
+    that is plainly an absolute path, with no key run in either base64 alphabet, is kept. Anything
     else is read as key material: the key is protected and nothing says to keep the entry. A
     forward-slash path with a long run of letters is refused the keep sentence too."""
     refusal = service_env_refusal(_read([f"{_KEY}=", f"mefor_secrets_directory={value}"]))

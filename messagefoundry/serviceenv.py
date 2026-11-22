@@ -164,9 +164,9 @@ class ServiceEnvPosture:
     #: Whether a refused name's value, empty in its own string, runs on into the next strings of
     #: its registry value, so the refusal can say to remove those entries too.
     value_runs_on: bool = False
-    #: The refused names whose only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that hold
-    #: no key (:func:`_directory_entry_value`), so the refusal sends none of them to a key file
-    #: or the secrets directory. The remedy alone reads this, never the refusal itself.
+    #: The refused names whose only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that are
+    #: blank or plainly a path (:func:`_directory_entry_value`), so the refusal sends none of them
+    #: to a key file or the secrets directory. The remedy alone reads this, never the refusal itself.
     directory_only_names: tuple[str, ...] = field(default=(), repr=False)
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it. The remedy alone reads this, never the refusal itself.
@@ -357,11 +357,12 @@ _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 #: refusing.
 _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
 
-#: For the remedy only (the Lander's sixth hold on PR 3142, H1): an absolute path's start, a
-#: drive letter, a UNC share or a POSIX root, and a key run in either base64 alphabet. A joined
-#: directory value is kept only when it starts so and holds no such run; anything else may be
-#: key material, so the remedy treats it as one.
-_ABSOLUTE_PATH = re.compile(r"[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/]|/")
+#: For the remedy only (the Lander's sixth hold on PR 3142, H1): a whole value that is plainly
+#: an absolute path, from a drive letter, a UNC share or a POSIX root, in letters, digits,
+#: blanks, ``.``, ``_``, ``-``, parentheses and separators only, and a key run in either base64
+#: alphabet. A joined directory value is kept only when it is such a path and holds no such run;
+#: anything else may be key material, so the remedy treats it as one.
+_PLAIN_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\[A-Za-z0-9._-]+[\\/]|/)[A-Za-z0-9 ._()\\/-]*")
 _EITHER_KEY_RUN = re.compile(r"[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43}")
 
 #: One 32-byte secret, whole (vault BACKLOG #5394 added items 6 and 12): 43 characters of the
@@ -624,8 +625,8 @@ class _Variable:
     #: Whether its value, blank in its own string, takes the strings after it, which
     #: :func:`_variables` joins to that string.
     runs_on: bool = False
-    #: Whether it runs on, and every non-blank string it takes is a directory entry holding no
-    #: key (:func:`_directory_entry_value`). Read by the remedy only.
+    #: Whether it runs on, and every non-blank string it takes is a directory entry that is blank
+    #: or plainly a path (:func:`_directory_entry_value`). Read by the remedy only.
     directory_only: bool = False
     #: Whether it runs on into such an entry that sets the directory to a path. Remedy only.
     keeps_directory: bool = False
@@ -879,7 +880,8 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         # its own, so each line keeps the number ``starts`` gives it.
         joined, _ends = _read_string(where, "\r\n".join(strings), own_lines=starts[1] - 1)
         # For the remedy only, from the last string back: whether the non-blank strings from
-        # each index on are all directory entries holding no key, whether there is one, and
+        # each index on are all directory entries that are blank or plainly a path
+        # (:func:`_directory_entry_value`), whether there is one, and
         # whether one sets the directory to a path. Nothing here feeds ``_names``, so it changes
         # no refusal (the Lander's fifth hold on PR 3142, H2).
         only_after = [True] * (len(strings) + 1)
@@ -919,9 +921,8 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
 def _directory_entry_value(entry: str) -> str | None:
     """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with
     only blanks or line breaks after it and no blank around the name, and the value is blank or
-    plainly a path: an absolute path (:data:`_ABSOLUTE_PATH`) with no key in it
-    (:func:`_is_key_value`, :func:`_holds_key_run`, :data:`_EITHER_KEY_RUN`); else None, as for
-    key material. The engine strips the value it reads, so what trails it does not matter. The
+    plainly a path (:data:`_PLAIN_PATH`) with no key run in it (:data:`_EITHER_KEY_RUN`); else
+    None, as for key material. The engine strips the value it reads, so what trails it does not matter. The
     remedy alone reads it, to tell a joined directory path from key material."""
     line = entry.rstrip()
     if _LINE_BREAK.search(line):
@@ -932,12 +933,7 @@ def _directory_entry_value(entry: str) -> str | None:
     if _still_blank(value):
         return value  # nothing in it, so no key and no path to keep
     path = value.strip()
-    if (
-        not _ABSOLUTE_PATH.match(path)
-        or _EITHER_KEY_RUN.search(path)
-        or _is_key_value(value)
-        or _holds_key_run(value)
-    ):
+    if not _PLAIN_PATH.fullmatch(path) or _EITHER_KEY_RUN.search(path):
         return None
     return value
 
@@ -1195,8 +1191,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     moving_keys = [k for k in keys if k not in only]
     moving_others = [o for o in others if o not in only]
     moving_values = any(
-        v not in posture.contentless_value_names and v != _VALUE_PREFIX and v not in only
-        for v in values
+        v not in posture.contentless_value_names and v != _VALUE_PREFIX for v in values
     )
     steps: list[str] = []
     if moving_keys:
