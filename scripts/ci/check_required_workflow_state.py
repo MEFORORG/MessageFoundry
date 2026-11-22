@@ -39,8 +39,6 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
-import yaml
-
 _ROOT = Path(__file__).resolve().parents[2]
 
 # Reuse the SAME resolver the doc-drift tests use, rather than re-deriving context -> workflow here.
@@ -48,7 +46,15 @@ _ROOT = Path(__file__).resolve().parents[2]
 # catch (ruff/bandit scan scope, the required-set prose). One resolver, two callers.
 sys.path.insert(0, str(_ROOT))
 from scripts.ci.required_contexts import gh_api  # noqa: E402
-from tests._workflow_contexts import required_contexts, resolve  # noqa: E402
+from tests._workflow_contexts import (  # noqa: E402
+    reportable_contexts,
+    required_contexts,
+    resolve,
+)
+
+# isort: split
+# After the resolver, which owns the handling of an absent PyYAML.
+import yaml  # noqa: E402
 
 #: GitHub reports a runnable workflow as ``active``. Everything else -- ``disabled_manually``,
 #: ``disabled_inactivity`` (60 days idle on a fork/scheduled-only repo), ``disabled_fork`` -- means it
@@ -131,17 +137,19 @@ def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, st
     # Only a file directly in .github/workflows can own a required context. The list also carries
     # GitHub's `dynamic/` entries, skipped so a basename match cannot let one stand in for a real
     # file; any other path is malformed. PurePosixPath keeps `..`, so it is refused first: it could
-    # otherwise ride the skip out of `dynamic/`, or be the "filename" in `.github/workflows/..`. A
-    # repeat that disagrees is refused, because last-wins could overwrite a disabled state.
+    # otherwise ride the skip out of `dynamic/`, or be the "filename" in `.github/workflows/..`. The
+    # RAW string is compared because PurePosixPath collapses `./` and `//`, which would let a
+    # non-canonical path pass as the real file. A repeat that disagrees is refused, because
+    # last-wins could overwrite a disabled state.
     states: dict[str, str] = {}
     for path, state in map(_workflow_state, _workflow_entries(payload)):
         where = PurePosixPath(path)
         if ".." in where.parts:
             raise RuntimeError(f"workflow path {path!r} has a `..` segment")
-        if len(where.parts) > 1 and where.parts[0] == "dynamic":  # bare `dynamic` is no entry
+        if path.startswith("dynamic/") and len(where.parts) > 1:  # bare `dynamic/` is no entry
             continue
-        if where.parent != _WORKFLOW_DIR:
-            raise RuntimeError(f"workflow path {path!r} is outside {_WORKFLOW_DIR}")
+        if path != f"{_WORKFLOW_DIR}/{where.name}":
+            raise RuntimeError(f"workflow path {path!r} is not directly in {_WORKFLOW_DIR}")
         if states.setdefault(where.name, state) != state:
             raise RuntimeError(f"workflow {where.name} is listed with conflicting states")
     return states
@@ -160,6 +168,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         contexts = required_contexts()
         resolved = {ctx: resolve(ctx) for ctx in contexts}
+        # A missing or empty directory globs to nothing and raises nothing.
+        if not reportable_contexts():
+            raise RuntimeError("no workflow jobs found in the local .github/workflows")
     except _LOCAL_READ_ERRORS as exc:
         # Exit 1 is the findings code, and an uncaught exception would exit 1 too.
         print(

@@ -272,13 +272,13 @@ _GOOD = {"path": ".github/workflows/ci.yml", "state": "active"}
         pytest.param({"workflows": ["ci.yml"]}, id="workflow-entry-string"),
         pytest.param({"workflows": [None]}, id="workflow-entry-null"),
         pytest.param({"workflows": [{"state": "active"}]}, id="entry-without-path"),
-        pytest.param({"workflows": [{"path": "ci.yml"}]}, id="entry-without-state"),
+        pytest.param({"workflows": [{"path": _GOOD["path"]}]}, id="entry-without-state"),
         pytest.param({"workflows": [{"path": 7, "state": "active"}]}, id="path-not-string"),
-        pytest.param({"workflows": [{"path": "ci.yml", "state": 1}]}, id="state-not-string"),
+        pytest.param({"workflows": [{**_GOOD, "state": 1}]}, id="state-not-string"),
         pytest.param({"workflows": [{"path": "", "state": "active"}]}, id="path-empty"),
-        pytest.param({"workflows": [{"path": "ci.yml", "state": ""}]}, id="state-empty"),
+        pytest.param({"workflows": [{**_GOOD, "state": ""}]}, id="state-empty"),
         pytest.param({"workflows": [{"path": "   ", "state": "active"}]}, id="path-blank"),
-        pytest.param({"workflows": [{"path": "ci.yml", "state": "   "}]}, id="state-blank"),
+        pytest.param({"workflows": [{**_GOOD, "state": "   "}]}, id="state-blank"),
         pytest.param(
             {"workflows": [{"path": " .github/workflows/ci.yml", "state": "active"}]},
             id="path-outside-directory",
@@ -317,6 +317,7 @@ def test_a_malformed_shape_exits_2(tmp_path: Path, payload: object) -> None:
         pytest.param(".github/workflows/..", id="dotdot-as-the-filename"),
         pytest.param("dynamic", id="bare-dynamic"),
         pytest.param("dynamic/", id="bare-dynamic-slash"),
+        pytest.param("./dynamic/x", id="dot-prefixed-dynamic"),
     ],
 )
 def test_a_path_the_dynamic_skip_must_not_take_exits_2(
@@ -347,6 +348,10 @@ def test_a_real_dynamic_entry_is_still_skipped(monkeypatch: pytest.MonkeyPatch) 
         pytest.param(".github/workflows-old/{name}", id="sibling-directory"),
         pytest.param("/.github/workflows/{name}", id="absolute"),
         pytest.param("{name}", id="bare-basename"),
+        pytest.param(".github/workflows/./{name}", id="dot-segment"),
+        pytest.param(".github//workflows/{name}", id="doubled-slash"),
+        pytest.param("./.github/workflows/{name}", id="dot-prefix"),
+        pytest.param(".github/workflows/{name}/", id="trailing-slash"),
     ],
 )
 def test_a_file_elsewhere_cannot_stand_in_by_basename(
@@ -411,6 +416,21 @@ def test_a_bad_local_workflow_file_exits_2(
     workflows = tmp_path / "workflows"
     workflows.mkdir()
     (workflows / "bad.yml").write_bytes(content)
+    repoint_workflows(workflows)
+    assert main(["--states-json", str(states)]) == 2
+
+
+@pytest.mark.parametrize(
+    "create", [pytest.param(True, id="empty"), pytest.param(False, id="absent")]
+)
+def test_a_local_workflow_directory_with_no_jobs_exits_2(
+    tmp_path: Path, repoint_workflows: Callable[[Path], None], create: bool
+) -> None:
+    """A bad checkout globs to nothing, which must not read as every context being unresolved."""
+    states = _write(tmp_path, dict.fromkeys(_required_workflow_files(), "active"))
+    workflows = tmp_path / "workflows"
+    if create:
+        workflows.mkdir()
     repoint_workflows(workflows)
     assert main(["--states-json", str(states)]) == 2
 
