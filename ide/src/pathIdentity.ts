@@ -14,7 +14,7 @@ export const IS_WIN32 = path.sep === "\\";
 
 /** `p` made absolute against `base` (the folder the CLI ran in) when it is relative, and normalized. */
 export function resolveAgainst(base: string, p: string, win32: boolean = IS_WIN32): string {
-  return (win32 ? path.win32 : path.posix).resolve(base, p);
+  return win32 ? path.win32.resolve(base, p) : path.posix.resolve(base, p);
 }
 
 /**

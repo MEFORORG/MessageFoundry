@@ -861,6 +861,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
 | It reads the characters of the Test Bench Debug program's text, which the extension holds itself, to name the program's file by a checksum (BACKLOG #5409) | `testBenchDebugProgram.ts` |
+| It lower-cases the first letter of a promote notification sentence, which always starts with its own words | `promoteOutcome.ts` |
 
 **Extension files that parse text the patterns cannot see.**
 
