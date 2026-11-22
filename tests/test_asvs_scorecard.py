@@ -2805,6 +2805,55 @@ def test_prove_absences_screen_reads_a_decorator_name_in_its_own_scope(tmp_path:
     assert _refused("def f(a):\n    return 1\n", target, tmp_path)
 
 
+def test_prove_absences_screen_keeps_builtins_after_a_star_import(tmp_path: Path) -> None:
+    """A ``from m import *`` is read as rebinding the names already bound, not ``property``: an
+    honest getter override stays accepted, and dropping ``@property`` stays refused. Found by review
+    of this item, where a star import turned builtins off."""
+    prop = (
+        "from os import *\n\nclass C:\n    @property\n    def x(self): ...\n"
+        "    @x.setter\n    def x(self, v): ...\n"
+    )
+    getter = "class C(C):\n    @property\n    def x(self):\n        return 2\n"
+    assert _screen(getter, prop, tmp_path) == []
+    assert _refused("class C(C):\n    def x(self): ...\n", prop, tmp_path)
+
+
+def test_prove_absences_screen_survives_nesting_deeper_than_the_stack(tmp_path: Path) -> None:
+    """A long ``elif`` chain nests deeper than the interpreter's stack. The second check is skipped
+    there rather than aborting the pass, and the first still runs."""
+    chain = "if v == 0:\n    pass\n" + "".join(
+        f"elif v == {i}:\n    pass\n" for i in range(1, 1500)
+    )
+    target = "def scan(p): ...\n" + chain
+    assert _screen("def scan(p):\n    return 1\n", target, tmp_path) == []
+    assert _refused("def scan(): ...\n", target, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_positional_only_self_as_a_bound_parameter(
+    tmp_path: Path,
+) -> None:
+    """``self, /`` and ``self`` are one bound parameter to every caller through the instance, while a
+    method that loses its bound parameter breaks every such call."""
+    target = "class C:\n    def m(self, /, a): ...\n"
+    assert _screen("class C(C):\n    def m(self, a):\n        return 1\n", target, tmp_path) == []
+    plain = "class C:\n    def m(self): ...\n"
+    assert _refused("class C(C):\n    def m(): ...\n", plain, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_walrus_in_a_match_guard(tmp_path: Path) -> None:
+    """A ``:=`` in a ``case`` guard binds in the enclosing scope, so the name may no longer be the
+    target's ``def`` and there is nothing to compare it against."""
+    target = "if X:\n    def f(a): ...\nmatch v:\n    case 1 if (f := 2):\n        pass\n"
+    assert _screen("def f(): ...\n", target, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_both_overload_spellings_as_one(tmp_path: Path) -> None:
+    """``typing_extensions.overload`` and ``typing.overload`` give a call site the same stub."""
+    target = "from typing_extensions import overload\n\n@overload\ndef f(a: int): ...\n"
+    mutation = "from typing import overload\n\n@overload\ndef f(a: int): ...\n"
+    assert _screen(mutation, target, tmp_path) == []
+
+
 def test_signature_fields_name_every_signature_value() -> None:
     """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
     assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))

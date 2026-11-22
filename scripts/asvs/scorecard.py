@@ -2579,8 +2579,12 @@ _SHAPE_DECORATORS: Final = frozenset(
         "pytest.fixture",
     }
 )
-#: Shape decorators that give a call site the same thing: ``cache`` is ``lru_cache(maxsize=None)``.
-_SAME_SHAPE: Final = {"functools.cache": "functools.lru_cache"}
+#: Shape decorators that give a call site the same thing: ``cache`` is ``lru_cache(maxsize=None)``,
+#: and ``typing_extensions`` re-exports ``typing``'s ``overload``.
+_SAME_SHAPE: Final = {
+    "functools.cache": "functools.lru_cache",
+    "typing_extensions.overload": "typing.overload",
+}
 #: The builtins a bare name resolves to while nothing in its scope has rebound it.
 _SHAPE_BUILTINS: Final = frozenset({"property", "staticmethod", "classmethod"})
 #: The property accessor decorators, ``@x.setter`` and its siblings.
@@ -2597,20 +2601,19 @@ class _ScopeState:
     to, or to ``None`` when some live binding of it is not one (an import or an assignment), which
     leaves nothing to compare it against. ``bindings`` maps a name to the origin a decorator naming
     it resolves to (``"functools.cache"``, ``"module:functools"``), or to ``None`` for anything else.
-    ``star`` is set once a ``from m import *`` may have rebound any name.
+    A ``from m import *`` is read as rebinding every name already bound, and not the builtins.
     """
 
     defs: dict[str, tuple[_DefNode, ...] | None] = field(default_factory=dict)
     bindings: dict[str, str | None] = field(default_factory=dict)
-    star: bool = False
 
     def copy(self) -> _ScopeState:
-        return _ScopeState(dict(self.defs), dict(self.bindings), self.star)
+        return _ScopeState(dict(self.defs), dict(self.bindings))
 
     def lookup(self, name: str) -> str | None:
         if name in self.bindings:
             return self.bindings[name]
-        if not self.star and name in _SHAPE_BUILTINS:
+        if name in _SHAPE_BUILTINS:
             return f"builtins.{name}"
         return None
 
@@ -2646,7 +2649,7 @@ def _merge(states: list[_ScopeState]) -> _ScopeState:
     """The scope after exactly one of `states`' paths ran. A name keeps every definition any path
     leaves live, or becomes ``None`` if any path leaves it bound to something else; a binding keeps
     its origin only where every path agrees on it."""
-    out = _ScopeState(star=any(s.star for s in states))
+    out = _ScopeState()
     for name in dict.fromkeys(n for s in states for n in s.defs):
         entries = [s.defs[name] for s in states if name in s.defs]
         if any(e is None for e in entries):
@@ -2689,12 +2692,16 @@ _WALRUS_SKIP: Final = frozenset({"body", "orelse", "finalbody", "handlers", "cas
 def _bind_walrus(node: ast.stmt, state: _ScopeState) -> None:
     """A ``:=`` in `node`'s own expressions binds in this scope; its nested blocks run later, and
     a lambda body is a scope of its own, though its defaults are evaluated here."""
-    stack: list[ast.AST] = []
     for name, value in ast.iter_fields(node):
         if name not in _WALRUS_SKIP:
-            stack.extend(
-                i for i in (value if isinstance(value, list) else [value]) if isinstance(i, ast.AST)
-            )
+            for item in value if isinstance(value, list) else [value]:
+                if isinstance(item, ast.AST):
+                    _bind_walrus_in(item, state)
+
+
+def _bind_walrus_in(expr: ast.AST, state: _ScopeState) -> None:
+    """:func:`_bind_walrus` for one expression."""
+    stack: list[ast.AST] = [expr]
     while stack:
         item = stack.pop()
         if isinstance(item, ast.NamedExpr):
@@ -2783,7 +2790,7 @@ def _run_stmt(
                         state.bind(name)
         if isinstance(node, ast.ClassDef):
             module = outer if outer is not None else state
-            fresh = _ScopeState(bindings=dict(module.bindings), star=module.star)
+            fresh = _ScopeState(bindings=dict(module.bindings))
             reading.classes[node] = _run_block(node.body, fresh, reading, module)
         elif _is_accessor(node, state, reading):
             return state
@@ -2799,7 +2806,6 @@ def _run_stmt(
     elif isinstance(node, ast.ImportFrom):
         for alias in node.names:
             if alias.name == "*":
-                state.star = True
                 for name in list(state.bindings):
                     state.bind(name)
                 for name in list(state.defs):
@@ -2878,6 +2884,8 @@ def _run_stmt(
             matched = state.copy()
             for name in _target_names(case.pattern):
                 matched.bind(name)
+            if case.guard is not None:
+                _bind_walrus_in(case.guard, matched)
             cases.append(_run_block(case.body, matched, reading, outer))
         return _merge([*cases, state])
     return state
@@ -2920,16 +2928,15 @@ def _signature(
     (:data:`_SHAPE_DECORATORS`), which change what the name is bound to.
 
     For a ``method`` other than a ``staticmethod``, the first parameter is bound, never passed by a
-    caller, so its name is not part of the shape (``self`` and ``this`` are one shape).
+    caller, so neither its name nor whether it is positional-only is part of the shape (``self``,
+    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``.
     """
     args = fn.args
     posonly = [p.arg for p in args.posonlyargs]
     positional = [p.arg for p in args.args]
-    if method and "builtins.staticmethod" not in decorators:
-        if posonly:
-            posonly[0] = "<bound>"
-        elif positional:
-            positional[0] = "<bound>"
+    if method and "builtins.staticmethod" not in decorators and (posonly or positional):
+        (posonly if posonly else positional).pop(0)
+        posonly.insert(0, "<bound>")
     return (
         isinstance(fn, ast.AsyncFunctionDef),
         _is_generator(fn),
@@ -2986,8 +2993,9 @@ def _scope_mismatch(
     `src` holds for its name, as a clause for the refusal; ``None`` if there is none.
 
     Only definitions `src` does not already hold are the mutation's. A name is skipped where `src`
-    does not bind it, or where some live binding of it is not a ``def`` or ``class`` (an import, an
-    assignment, ``C = deco(C)``), so it shadows nothing this screen can compare. A class redefined over a class is
+    does not bind it, or where some live binding of it on either side is not a ``def`` or ``class``
+    (an import, an assignment, ``C = deco(C)``, ``scan = lambda: 1``), so neither check compares a
+    name the mutation rebinds that way. A class redefined over a class is
     compared member by member, its methods with :func:`_signature`'s ``method``.
 
     NOT COMPARED, at least: the members, annotated fields (a dataclass's constructor arguments),
@@ -3052,8 +3060,14 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         # leave it to execution, where the baseline will already be red and fail closed.
         return True
     reading = _Reading()
-    live = _run_block(source.body, _ScopeState(), reading)
-    appended = _run_block(mutation.body, live, reading)
+    walked: tuple[_ScopeState, _ScopeState] | None
+    try:
+        live = _run_block(source.body, _ScopeState(), reading)
+        walked = live, _run_block(mutation.body, live, reading)
+    except RecursionError:
+        # Nesting deeper than the interpreter's stack (a long ``elif`` chain). The second check only
+        # adds refusals, so skipping it leaves the first, which reads the decorators it reached.
+        walked = None
     mut_sigs, _ = _toplevel(mutation)
     src_sigs, _ = _toplevel(source)
     mismatch: str | None = None
@@ -3066,9 +3080,9 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         if mine != theirs:
             mismatch = _signature_clause(name, a.mutation_path, mine, theirs)
             break
-    if mismatch is None:
+    if mismatch is None and walked is not None:
         mismatch = _scope_mismatch(
-            appended.defs, live.defs, "", a.mutation_path, reading, method=False
+            walked[1].defs, walked[0].defs, "", a.mutation_path, reading, method=False
         )
     if mismatch is not None:
         findings.problems.append(
