@@ -3106,21 +3106,33 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     carried, such as a duplicate key, so it is withheld. A driver error keeps its SQLSTATE,
     asyncpg's ``sqlstate`` or else ``args[0]``, when that is five characters of SQL's alphabet. A
     link under a driver error is withheld whole, since a driver can raise its error from the
-    builtin one its codec raised, whose text can quote the value too."""
+    builtin one its codec raised, whose text can quote the value too. An attribute that raises
+    when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
     driver = raised_by_a_driver(exc)
     if not (driver or under):
         return None
     if driver:
-        state = getattr(exc, "sqlstate", None)
-        if state is None and exc.args:
-            state = exc.args[0]
-        if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state):
-            return f"[{state}] [driver message withheld]"
-        # SQLite has no SQLSTATE; its result-code name is a fixed word, never a value.
-        name = getattr(exc, "sqlite_errorname", None)
-        if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
-            return f"[driver message withheld {name}]"
+        try:
+            code = _driver_code(exc)
+        except Exception:  # noqa: BLE001 - the message stays withheld; only the code is lost
+            code = None
+        if code is not None:
+            return code
     return "[driver message withheld]"
+
+
+def _driver_code(exc: BaseException) -> str | None:
+    """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code."""
+    state = getattr(exc, "sqlstate", None)
+    if state is None and exc.args:
+        state = exc.args[0]
+    if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state):
+        return f"[{state}] [driver message withheld]"
+    # SQLite has no SQLSTATE; its result-code name is a fixed word, never a value.
+    name = getattr(exc, "sqlite_errorname", None)
+    if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
+        return f"[driver message withheld {name}]"
+    return None
 
 
 def safe_traceback(ei: ExcInfo) -> str:

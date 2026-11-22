@@ -104,17 +104,25 @@ async def test_a_codec_error_in_a_send_is_dead_lettered_naming_no_codec(codec: s
         await dest.send('{"mrn": "1", "val": "x"}')
     assert refused.value.permanent is True
     assert str(refused.value) == (
-        "database driver could not convert the message's text (UnicodeEncodeError)"
+        "database driver could not encode the message's text (UnicodeEncodeError)"
     )
     assert conn.rolledback
 
 
-async def test_a_non_driver_error_in_a_send_still_propagates() -> None:
-    """Control: an error that is neither a driver's nor a codec's is still an internal error."""
-    conn = _FakeConn(_FakeCursor(KeyError("synthetic")))
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(KeyError("synthetic"), id="non-driver error"),
+        pytest.param(UnicodeDecodeError("utf-8", b"\xff", 0, 1, "synthetic"), id="decode error"),
+    ],
+)
+async def test_a_non_driver_error_in_a_send_still_propagates(failure: Exception) -> None:
+    """Control: an error that is no driver's, and a decode of text the driver returned, are still
+    internal errors, as on main for a codec whose name is not SQLSTATE-shaped."""
+    conn = _FakeConn(_FakeCursor(failure))
     dest = _dest()
     dest._pool = _FakePool(conn)
-    with pytest.raises(KeyError):
+    with pytest.raises(type(failure)):
         await dest.send('{"mrn": "1", "val": "x"}')
 
 
@@ -187,6 +195,21 @@ def test_a_class_with_no_text_module_does_not_break_the_traceback() -> None:
     odd = type("Odd", (Exception,), {"__module__": None})
     assert raised_by_a_driver(odd("synthetic")) is False
     assert "Odd: synthetic" in _rendered(_raised(odd("synthetic")))
+
+
+@pytest.mark.usefixtures("_dbapi_driver")
+def test_a_driver_attribute_that_raises_still_withholds_the_message() -> None:
+    """Review round 2: ``_driver_line`` read ``sqlstate`` unguarded, so a property that raises
+    broke the whole traceback."""
+
+    class Raising(_DriverError):
+        @property
+        def sqlstate(self) -> str:
+            raise RuntimeError("synthetic")
+
+    text = _rendered(_raised(Raising(_DUPLICATE)))
+    assert "Raising: [driver message withheld]" in text
+    assert _SYNTHETIC_ID not in text
 
 
 @pytest.mark.usefixtures("_dbapi_driver")

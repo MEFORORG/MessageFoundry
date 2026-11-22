@@ -1441,7 +1441,9 @@ _WINDOWS_UNREACHABLE = frozenset({53, 67})
 #: is off Windows. Read at an ``sslcapath`` folder's open (:func:`_capath_folder_clear`), by the
 #: walk's probe (:func:`_windows_path_verdict`) and at a driver file's read
 #: (:func:`_names_no_file`). CPython raises other Win32 codes as ``FileNotFoundError`` too, at
-#: least 15, 18, 161 and 206, and none of those is read as a missing name. Measured on Windows 11
+#: least 15, 18, 161 and 206, and none of those is read as a missing name where CPython sets the
+#: code. A failure it raises with no ``winerror`` counts as ``None`` whatever caused it, at least
+#: an ``os.open`` on Windows, which reports through the C runtime's errno. Measured on Windows 11
 #: with CPython 3.14 (vault BACKLOG #5197): ``lstat`` and ``scandir`` gave only 2 or 3 for at least a
 #: missing file, a missing folder, a path through a file, a drive letter with no volume, a missing
 #: volume GUID and a missing ``\\?\GLOBALROOT`` device.
@@ -1931,7 +1933,9 @@ def _names_no_file(exc: OSError) -> bool:
     Windows raises as not found does not (vault BACKLOG #5197): 53 and 67, a share it could not
     reach (as :mod:`messagefoundry.config.key_file_access` reads them), where the driver may reach
     that file at a later connect, and at least 161 and 206, which may come from a file that is
-    there. Windows' ``ERROR_INVALID_NAME`` counts too, a padded path for one, and only
+    there. That holds only where the failure carries its ``winerror``: an ``os.open`` failure
+    carries none on Windows, so any not-found it raises counts as a missing name, as on main.
+    Windows' ``ERROR_INVALID_NAME`` counts too, a padded path for one, and only
     by that Win32 code: CPython maps every Win32 error it has no errno for to EINVAL, so testing
     errno would leave a real read failure unchecked. On POSIX an EINVAL is refused too, even from
     a filesystem that rejects a padded spelling with it, because errno cannot tell that from a
@@ -2721,14 +2725,15 @@ def _driver_code(message: str) -> str | None:
 
 def _send_refusal(sqlstate: str | None, exc: BaseException) -> DeliveryError:
     """A destination send's error for ``exc``: :func:`_classify_db_error` for a SQLSTATE, and for
-    a ``UnicodeError`` with none a permanent rejection naming its type alone. Text the driver
-    could not convert, such as a parameter its codec cannot encode, fails on this message's data,
-    not on the code, so it is dead-lettered rather than raised as an internal error, as it was
-    when its codec name read as a SQLSTATE (vault BACKLOG #1661, added item 2)."""
+    a ``UnicodeEncodeError`` with none a permanent rejection naming its type alone. A parameter
+    the driver's codec cannot encode fails on this message's data, not on the code, so it is
+    dead-lettered rather than raised as an internal error, as it was on main for a codec whose name
+    read as a SQLSTATE (vault BACKLOG #1661, added item 2). A ``UnicodeDecodeError``, text the
+    driver returned, is not this message's, and the caller raises it as an internal error."""
     if sqlstate is not None:
         return _classify_db_error(sqlstate, str(exc))
     return NegativeAckError(
-        f"database driver could not convert the message's text ({type(exc).__name__})",
+        f"database driver could not encode the message's text ({type(exc).__name__})",
         code="db",
         permanent=True,
     )
@@ -4629,7 +4634,7 @@ class DatabaseDestination(DestinationConnector):
                         "discarded rather than returned to its pool: %s",
                         _safe_db_error(rollback_exc),
                     )
-                    if state is None and not isinstance(exc, UnicodeError):
+                    if state is None and not isinstance(exc, UnicodeEncodeError):
                         raise  # the send's failure is no driver error: the rollback's propagates
                     # Classified by the send's own error, as it would be had the rollback passed,
                     # never by the rollback's: the send's error is the best evidence of the
@@ -4637,7 +4642,7 @@ class DatabaseDestination(DestinationConnector):
                     # would retry a poison message for as long as the retry budget lasts. A
                     # dead-letter can be replayed. The rollback's error stays the context.
                     raise _send_refusal(state, exc) from exc
-                if state is None and not isinstance(exc, UnicodeError):
+                if state is None and not isinstance(exc, UnicodeEncodeError):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
                 raise _send_refusal(state, exc) from exc
         finally:
