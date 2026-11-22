@@ -1307,7 +1307,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
-        steps.append(
+        add_back = (
             f"The service's lists set no {_DIRECTORY_VARIABLE}. Where install-service.ps1 "
             f"already made the secrets directory, add {_DIRECTORY_VARIABLE} naming that "
             "existing path back to the service's AppEnvironmentExtra, beside its other "
@@ -1315,10 +1315,18 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             "the service does not name. `nssm set` replaces that whole list, so read it first "
             "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
             "back every entry but those refused above: see docs/SERVICE.md, "
-            '"Start / stop / status". Where none exists yet, the bullet "The other secrets: '
-            'a secrets directory" under docs/SERVICE.md, "Protect the store encryption key at '
-            'rest", says how the directory is created'
+            '"Start / stop / status"'
         )
+        # Only where a setting moves, as the create step reads: a store key alone goes to a
+        # key file and needs no secrets directory (the third hold's H2; the Lander's ruling on
+        # handback 7087574833, R1).
+        if moving_others or moving_values:
+            add_back += (
+                '. Where none exists yet, the bullet "The other secrets: a secrets directory" '
+                'under docs/SERVICE.md, "Protect the store encryption key at rest", says how the '
+                "directory is created"
+            )
+        steps.append(add_back)
     if posture.directory_path_joined:
         # A path alone holds no secret, and the service may read it as its directory (fourth
         # hold, H2), so only a joined entry that is plainly a path is spared, and only when

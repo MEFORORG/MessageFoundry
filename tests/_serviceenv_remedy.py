@@ -28,20 +28,30 @@ KEEP = (
     "entry"
 )
 
-#: Printed, as origin/main prints it, where a refusal names more than key-class names, the
-#: lists name no secrets directory, and no joined path entry is kept (the Lander's hold on PR
-#: 3142, comment 7085002242; the Lander's ruling on handback 7085947392, F1).
-ADD_BACK = (
+#: The add-back step, printed where the lists name no secrets directory, no joined path
+#: entry is kept, and a refused name outside the key class is listed or the run-on step removes
+#: a directory string (the Lander's hold on PR 3142, comment 7085002242; the Lander's rulings
+#: on handback 7085947392, F1, and on comment 7087145957).
+ADD_BACK_STEP = (
     "The service's lists set no MEFOR_SECRETS_DIRECTORY. Where install-service.ps1 already "
     "made the secrets directory, add MEFOR_SECRETS_DIRECTORY naming that existing path back to "
     "the service's AppEnvironmentExtra, beside its other entries, before any re-run of the "
     "installer, which refuses an existing directory the service does not name. `nssm set` "
     "replaces that whole list, so read it first with `nssm get`, running the service's own "
     "nssm.exe by its full path, and pass back every entry but those refused above: see "
-    'docs/SERVICE.md, "Start / stop / status". Where none exists yet, the bullet "The other '
-    'secrets: a secrets directory" under docs/SERVICE.md, "Protect the store encryption key '
-    'at rest", says how the directory is created'
+    'docs/SERVICE.md, "Start / stop / status"'
 )
+
+#: Its create clause, added only where a setting moves to the secrets directory (the Lander's
+#: ruling on handback 7087574833, R1).
+ADD_BACK_CREATE = (
+    '. Where none exists yet, the bullet "The other secrets: a secrets directory" under '
+    'docs/SERVICE.md, "Protect the store encryption key at rest", says how the directory is '
+    "created"
+)
+
+#: The step with its create clause, as origin/main prints it.
+ADD_BACK = ADD_BACK_STEP + ADD_BACK_CREATE
 
 #: Printed when a setting goes to the secrets directory and no entry is read as naming it.
 CREATE = (

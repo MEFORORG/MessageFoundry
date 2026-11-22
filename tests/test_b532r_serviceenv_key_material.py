@@ -20,7 +20,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import ADD_BACK, CREATE, KEEP, REMOVE, RUNS_ON
+from tests._serviceenv_remedy import ADD_BACK_STEP, CREATE, KEEP, REMOVE, RUNS_ON
 
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
 #: A base64url stand-in of a 32-byte secret's length, with one ``=``, a "-" and a "_" in it, and
@@ -194,17 +194,22 @@ def test_a_joined_directory_string_is_removed_with_the_value(entries: list[str])
 
 
 def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directory() -> None:
-    """The third hold's H2. For the store key alone, which goes to a key file, the refusal prints
-    no create step. The run-on step removes the directory string joined to it, so the remedy
-    ends by saying to add the directory back (the Lander's ruling on comment 7087145957, F1 on H3's terms). Beside a secret the
-    directory takes, with no entry read as naming it, it says how one is created. The joined
-    entry holds the key, so nothing says to keep it (the fifth hold, H2)."""
+    """The third hold's H2. For the store key alone, which goes to a key file, the refusal says
+    nothing of creating a secrets directory, even with a directory string joined to it. The
+    run-on step removes that string, so the remedy ends by saying to add the directory back,
+    with no create clause (the Lander's rulings on comment 7087145957 and on handback
+    7087574833, R1). Beside a secret the directory takes, with no entry read as naming it, it
+    says how one is created. The joined entry holds the key, so nothing says to keep it (the
+    fifth hold, H2)."""
     key_alone = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
     assert key_alone is not None
     remedy = key_alone.split("each value refused here. ", 1)[1]
     # The key file comes first and the removal last (fourth hold, H1).
     assert remedy.startswith("Keep the store key in a DPAPI-protected key file instead")
-    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK}{_END}")
+    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_STEP}{_END}")
+    # No create guidance anywhere, the add-back step included (the third hold, H2).
+    assert "how it is created" not in remedy and "how the directory is created" not in remedy
+    assert "The other secrets: a secrets directory" not in remedy
     assert CREATE not in remedy and KEEP not in remedy
     beside = service_env_refusal(
         _read([f"{_KEY}=", _DIRECTORY_KEY, "MEFOR_AUTH_AD_BIND_PASSWORD=synthetic"])
