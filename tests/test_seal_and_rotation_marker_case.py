@@ -220,3 +220,67 @@ async def test_rotation_aborts_on_the_uppercase_of_the_active_prefix(tmp_path: P
     finally:
         await store.close()
     assert _reason(path, "plant") == plant
+
+
+async def test_a_refused_secret_under_an_active_key_seal_is_counted(tmp_path: Path) -> None:
+    path = tmp_path / "r.db"
+    old, new = generate_key(), generate_key()
+    old_cipher = make_cipher(old)
+    cipher = make_cipher(new, [old])
+    store = await MessageStore.open(path, cipher=cipher)
+    await _user(store, "u-active")
+    await store.close()
+    stale = old_cipher.encrypt("synthetic", aad=cell_aad("users", "totp_secret", "u-active"))
+    _set_totp(path, "u-active", stale)  # the seal is under the active key and no longer holds
+    store = await MessageStore.open(path, cipher=make_cipher(new, [old]))
+    try:
+        await store.reencrypt_to_active()
+        assert store.reseal_outcome().refused == 1
+    finally:
+        await store.close()
+    assert _user_cell(path, "u-active") == stale
+
+
+async def test_a_tagged_cell_with_a_null_id_aborts_the_rotation(tmp_path: Path) -> None:
+    path = tmp_path / "r.db"
+    key = generate_key()
+    await (await MessageStore.open(path, cipher=make_cipher(key))).close()
+    with sqlite3.connect(path) as db:
+        columns = db.execute("PRAGMA table_info(search_presets)").fetchall()
+        required = {c[1]: ("x" if "TEXT" in c[2] else 0) for c in columns if c[3] and not c[5]}
+        required["criteria"] = "synthetic-unrotated"
+        names = ", ".join(required)
+        marks = ", ".join("?" for _ in required)
+        db.execute(
+            f"INSERT INTO search_presets ({names}) VALUES ({marks})", tuple(required.values())
+        )
+    store = await MessageStore.open(path, cipher=make_cipher(key))
+    try:
+        with pytest.raises(CipherError, match=r"search_presets\.criteria"):
+            await store.reencrypt_to_active()
+    finally:
+        await store.close()
+
+
+async def test_a_row_deleted_between_the_read_and_the_write_does_not_abort_a_rotation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "r.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key()))
+    try:
+        await store._update_every_row(
+            "UPDATE connection_event SET reason=? WHERE id=?",
+            [("x", 999)],
+            "connection_event.reason",
+        )
+        await store._db.rollback()
+        with pytest.raises(CipherError):  # control: a seal's own transaction allows no shortfall
+            await store._update_every_row(
+                "UPDATE connection_event SET reason=? WHERE id=?",
+                [("x", 999)],
+                "connection_event.reason",
+                exact=True,
+            )
+        await store._db.rollback()
+    finally:
+        await store.close()

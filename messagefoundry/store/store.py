@@ -5346,9 +5346,11 @@ def marker_test_sql(column: str, *, present: bool) -> str:
     """SQLite's test of ``column`` against the marker pattern bound as ``?1`` (``<prefix>%``).
 
     Text compares byte-exact, because ``LIKE`` folds ASCII case and ``MFENC:`` is not a marker to
-    the cipher (BACKLOG #5506, #5611). A BLOB keeps ``LIKE``: ``substr`` of a BLOB is a BLOB, which
-    never equals text, so an exact test would call every BLOB unmarked and the seal would encrypt
-    bytes. ``column`` is a code constant. NULL matches neither form."""
+    the cipher (BACKLOG #5506, #5611). A BLOB keeps ``LIKE`` and so reads as it did before: ``substr``
+    of a BLOB is a BLOB, which never equals text, so an exact test would call every BLOB unmarked.
+    What ``LIKE`` does with a BLOB depends on the SQLite build (``cipher_cells._sealed_test`` says
+    how), and on a build where it matches none, every BLOB is unmarked here too. ``column`` is a
+    code constant. NULL matches neither form."""
     compare, like = ("=", "LIKE") if present else ("<>", "NOT LIKE")
     return (
         f"CASE WHEN typeof({column}) = 'blob' THEN {column} {like} ?1"
@@ -5360,30 +5362,35 @@ def rotation_totp_updates(
     cipher: AesGcmCipher,
     sealer: AnyRowSealer | None,
     rows: Iterable[tuple[str, str, str]],
-) -> list[tuple[str, str]]:
+    outcome: ResealOutcome,
+) -> tuple[list[tuple[str, str]], ResealOutcome]:
     """The ``(new value, id)`` writes for the ``(id, totp_secret, authz_seal)`` rows that
-    :func:`rotation_reseal` left off the active key (BACKLOG #5611).
+    :func:`rotation_reseal` left off the active key, and ``outcome`` with the rows it left counted
+    (BACKLOG #5611). ``classify_unrotated`` already counts a seal under another key, but not a
+    failing seal under the active key, whose secret is still under a prior key.
 
     The user pass has already moved every record whose seal holds, so a row here with a seal failed
     it. Its seal covers these bytes and it is left as it is, but its secret is still opened: a cell
     no held key opens raises, as every other cell in a rotation does. A row with no seal has
     nothing to break and rotates. With no sealer, nothing is sealed and every row rotates."""
     updates: list[tuple[str, str]] = []
-    left = 0
+    left = uncounted = 0
     for user_id, stored, seal in rows:
         aad = cell_aad("users", "totp_secret", user_id)
         plaintext = cipher.decrypt(stored, aad=aad)
         if seal and sealer is not None:
             left += 1
+            uncounted += sealer.is_active(seal)
         else:
             updates.append((cipher.encrypt(plaintext, aad=aad), user_id))
     if left:
         log.warning(
-            "rotation left the TOTP secret of %d account(s) that fail their integrity seal under"
-            " the prior key; recreate or remove them before dropping that key (BACKLOG #5611)",
+            "rotation left the TOTP secret of %d account(s) that fail their integrity seal; each"
+            " secret is still under a prior key, so recreate or remove these accounts before"
+            " dropping that key, or a later rotation aborts on them (BACKLOG #5611)",
             left,
         )
-    return updates
+    return updates, replace(outcome, refused=outcome.refused + uncounted)
 
 
 def report_refused_role_holder() -> None:
@@ -12815,7 +12822,7 @@ class MessageStore:
         keys = key_cols if key_cols is not None else aad_cols
         pending_where = f"{marker_test_sql(column, present=False)} AND {column} <> ''"
         # What this column's LIKE calls unmarked. On a sealed surface the opt-out seals only these,
-        # so a value in another case stays as it is rather than being sealed into validity.
+        # as it did before the exact test, so where LIKE folds case an `MFENC:` value is left alone.
         folded_where = f"{column} NOT LIKE ?1 AND {column} <> ''"
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
@@ -12893,6 +12900,7 @@ class MessageStore:
                         for value, r in zip(sealed_values, rows, strict=True)
                     ],
                     f"{table}.{column}",
+                    exact=True,
                 )
                 sealed += len(rows)
             await self._commit()
@@ -12905,15 +12913,19 @@ class MessageStore:
         return sealed
 
     async def _update_every_row(
-        self, sql: str, params: Sequence[Sequence[object]], cell: str
+        self, sql: str, params: Sequence[Sequence[object]], cell: str, *, exact: bool = False
     ) -> None:
-        """Run a seal or rotation UPDATE, refusing when it did not write one row per value.
+        """Run a seal or rotation UPDATE, refusing when a row it had to write stayed unwritten.
 
         SQLite allows NULL in a non-INTEGER primary key, and ``key = NULL`` matches nothing, so such
         a row would stay selected and its pass would encrypt it again forever (BACKLOG #5506). The
-        caller's guard or unwind rolls the uncommitted batch back. Names the cell, never a value."""
+        caller's guard or unwind rolls the uncommitted batch back. Names the cell, never a value.
+        ``exact`` is the seal's, whose read and write share one transaction, so any shortfall is a
+        fault. A rotation reads outside its write, so there only a NULL key refuses: a row another
+        process deleted in between has nothing left to rotate."""
         cur = await self._db.executemany(sql, params)
-        if cur.rowcount != len(params):
+        missed = cur.rowcount != len(params)
+        if missed and (exact or any(v is None for p in params for v in p[1:])):
             raise CipherError(
                 f"cipher column {cell}: an update wrote {cur.rowcount} of {len(params)} row(s), so"
                 " a row's key is NULL or changed. Nothing in this batch was kept; repair or remove"
@@ -12993,8 +13005,8 @@ class MessageStore:
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: first, each sealed account's TOTP secret re-encrypted and the account
         # re-sealed under the active key in one write (rotation_reseal), so the loop below finds those
-        # secrets already under the active key. The loop then rotates the rest, which are accounts
-        # whose record has no seal or fails it and is refused anyway.
+        # secrets already under the active key. The TOTP pass below then rotates accounts with no
+        # seal, and only opens the secret of one that fails its seal (BACKLOG #5611).
         # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
         # under a key this run does not hold leaves the store as this method found it.
         preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
@@ -13106,8 +13118,9 @@ class MessageStore:
         """The rotation's "not under the active key" filter, whose pattern binds as ``?1``.
 
         Byte-exact, so a value in another case is selected and the decrypt refuses it (BACKLOG
-        #5611). Under the opt-out that decrypt would accept it, so the filter stays ``LIKE`` there
-        and such a value is skipped, rather than sealed into validity."""
+        #5611). Under the opt-out that decrypt passes an unmarked value through, so the filter
+        stays the ``LIKE`` it was: this fix widens nothing there. It does not protect such a value
+        either: one that does not fold to the active prefix is selected and re-sealed."""
         if allows_unmarked(self._cipher):
             return f"{column} NOT LIKE ?1 AND {column} <> ''"
         return f"{marker_test_sql(column, present=False)} AND {column} <> ''"
@@ -13121,7 +13134,9 @@ class MessageStore:
             (active_like,),
         )
         rows = [(r["id"], r["totp_secret"], r["authz_seal"]) for r in await cur.fetchall()]
-        updates = rotation_totp_updates(cipher, self._row_sealer, rows)
+        updates, self._reseal_outcome = rotation_totp_updates(
+            cipher, self._row_sealer, rows, self._reseal_outcome
+        )
         if updates:
             await self._update_every_row(
                 "UPDATE users SET totp_secret=? WHERE id=?", updates, "users.totp_secret"
@@ -13164,6 +13179,17 @@ class MessageStore:
         matches the marker filter."""
         total = skipped = 0
         after = ""
+        # The page filter below never selects a NULL id, so such a cell would stay under a prior
+        # key while the rotation reports success (BACKLOG #5506).
+        cur = await self._db.execute(
+            f"SELECT 1 FROM {table} WHERE id IS NULL AND {self._rotation_scan(column)} LIMIT 1",
+            (active_like,),
+        )
+        if await cur.fetchone() is not None:
+            raise CipherError(
+                f"cipher column {table}.{column}: a row with a NULL id cannot be rotated; repair"
+                " or remove that row and retry"
+            )
         while True:
             cur = await self._db.execute(
                 f"SELECT {select}, {column} AS v FROM {table}"

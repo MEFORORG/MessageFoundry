@@ -4641,7 +4641,8 @@ class SqlServerStore:
             f"[{column}] COLLATE Latin1_General_100_BIN2 NOT LIKE ? AND DATALENGTH([{column}]) > 0"
         )
         # What the column's own collation calls unmarked. On a sealed surface the opt-out seals only
-        # these, so a value in another case stays as it is rather than being sealed into validity.
+        # these, as it did before the binary test, so under a case-insensitive collation an `MFENC:`
+        # value is left alone.
         folded_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
         count_sql = f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}"
         strict = not allows_unmarked(self._cipher)
@@ -10425,8 +10426,9 @@ class SqlServerStore:
     def _rotation_scan(self, column: str) -> str:
         """The rotation's "not under the active key" filter (one ``?``, the pattern). Binary and by
         byte length, so a value in another case or of spaces alone is selected and the decrypt
-        refuses it (BACKLOG #5611). Under the opt-out that decrypt would accept it, so the filter
-        stays as it was there. ``column`` is a code constant."""
+        refuses it (BACKLOG #5611). Under the opt-out that decrypt passes an unmarked value through,
+        so the filter stays as it was: this fix widens nothing there, and protects nothing either.
+        ``column`` is a code constant."""
         if allows_unmarked(self._cipher):
             return f"{column} NOT LIKE ? AND {column} <> ''"
         return f"{column} COLLATE Latin1_General_100_BIN2 NOT LIKE ? AND DATALENGTH({column}) > 0"
@@ -10439,10 +10441,11 @@ class SqlServerStore:
             f" WHERE {self._rotation_scan('totp_secret')}",
             (active_like,),
         )
-        updates = rotation_totp_updates(
+        updates, self._reseal_outcome = rotation_totp_updates(
             cipher,
             self._row_sealer,
             [(r["id"], r["totp_secret"], r["authz_seal"]) for r in rows],
+            self._reseal_outcome,
         )
         if updates:
             async with self._acquire() as conn, self._cursor(conn) as cur:

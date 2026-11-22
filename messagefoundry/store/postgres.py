@@ -4248,10 +4248,11 @@ class PostgresStore:
             " WHERE totp_secret NOT LIKE $1 AND totp_secret <> ''",
             active_like,
         )
-        updates = rotation_totp_updates(
+        updates, self._reseal_outcome = rotation_totp_updates(
             cipher,
             self._row_sealer,
             [(r["id"], r["totp_secret"], r["authz_seal"]) for r in rows],
+            self._reseal_outcome,
         )
         if updates:
             async with self._timed_acquire() as conn, conn.transaction():
