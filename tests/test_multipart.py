@@ -838,6 +838,18 @@ _ANCHORED_OUTCOMES: dict[str, tuple[Any, ...]] = {
         "MultipartError",
         "multipart body has no closing boundary delimiter; the upload may be truncated",
     ),
+    # Text after the close marker on its line: RFC 2046 allows only padding there, so it is no close.
+    "close-then-epilogue": (
+        "refused",
+        "MultipartError",
+        "multipart close delimiter is followed by other text on its line",
+    ),
+    # The first delimiter text sits mid-line, so the body is refused rather than read as empty.
+    "close-in-preamble": (
+        "refused",
+        "MultipartError",
+        "multipart body's first boundary delimiter is not at the start of a line",
+    ),
 }
 
 
@@ -896,10 +908,14 @@ def test_the_same_body_without_its_close_marker_is_refused(
     with pytest.raises(MultipartError) as caught:
         parse_multipart_form(content_type, unterminated, max_file_bytes=1024)
     main = _ANCHORED_OUTCOMES.get(case, _MAIN_OUTCOMES[case])
-    if main[0] == "refused":
+    if main[0] == "refused" and case != "close-then-epilogue":
         assert (type(caught.value).__name__, str(caught.value)) == main[1:]
     elif case == "wk-epilogue-delims":
         assert "more parts than the limit" in str(caught.value)
+    elif case == "close-then-epilogue":
+        # Its terminated form is refused for the text after the close; without the close, the
+        # missing terminator is what is left.
+        assert "no closing boundary delimiter" in str(caught.value)
     else:
         assert "no closing boundary delimiter" in str(caught.value)
         assert type(caught.value) is MultipartError  # 400: the body is malformed, not too large
@@ -988,22 +1004,85 @@ def test_delimiter_text_mid_line_stays_inside_the_file() -> None:
 
 @pytest.mark.parametrize(
     "prefix",
-    [b"", b"pre\r\n", b"pre\n", b"pre\r", b"\n", b"\r", b" ", b"\xef\xbb\xbf", b"pre"],
-    ids=["start", "crlf", "lf", "bare-cr", "lone-lf", "lone-cr", "space", "bom", "mid-line"],
+    [b"", b"pre\r\n", b"pre\n", b"pre\r", b"\n", b"\r"],
+    ids=["start", "crlf", "lf", "bare-cr", "lone-lf", "lone-cr"],
 )
-def test_the_first_delimiter_counts_wherever_it_sits(prefix: bytes) -> None:
-    """The first delimiter is the first ``--<boundary>`` anywhere, as before #5787, so a stray
-    byte or a preamble ending mid-line before it does not turn the first part into preamble."""
+def test_a_first_delimiter_at_a_line_start_parses(prefix: bytes) -> None:
+    """The first delimiter is found at the start of the body or after a CRLF, an LF or a bare CR."""
     body = prefix + b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"
     assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
 
 
-def test_a_preamble_ending_mid_line_keeps_both_file_parts() -> None:
-    """Before #5787 this body was refused for its two file parts; it still is, rather than dropping
-    the first one as preamble."""
-    body = b"pre--B\r\n" + _FP + b"A\r\n--B\r\n" + _FP + b"B\r\n--B--"
-    with pytest.raises(MultipartError, match="2 file parts"):
-        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+@pytest.mark.parametrize(
+    "body",
+    [
+        b" --B\r\n" + _FP + b"MSH|x\r\n--B--\r\n",
+        b"\xef\xbb\xbf--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n",
+        b"pre--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n",
+        b"pre--B\r\n" + _FP + b"A\r\n--B\r\n" + _FP + b"B\r\n--B--",
+        b"see --B-- here\r\n--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n",
+        b"see --B here\r\n--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n",
+    ],
+    ids=[
+        "space",
+        "bom",
+        "mid-line-preamble",
+        "two-files",
+        "close-in-preamble",
+        "delim-in-preamble",
+    ],
+)
+def test_delimiter_text_before_the_first_delimiter_line_is_refused(body: bytes) -> None:
+    """Delimiter text that does not start a line, before any that does, is refused with a 400
+    (BACKLOG #5787, added step 1 design item b). Skipping it would make the first part preamble with
+    no error, and close-marker text there would be taken as the close."""
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(
+            MultipartError, match="first boundary delimiter is not at the start"
+        ) as c:
+            parse(_CT_B, body, max_file_bytes=1024)
+        assert type(c.value) is MultipartError
+
+
+@pytest.mark.parametrize(
+    "tail", [b"note", b"  x", b"--", b"\x00"], ids=["text", "padding-then-text", "dashes", "nul"]
+)
+def test_a_close_marker_followed_by_other_text_is_refused(tail: bytes) -> None:
+    """``--<boundary>--`` followed by anything but padding and a line end is no close (RFC 2046),
+    and the body is refused with a 400 (design item a). A file line ``--B--note`` no longer closes
+    the body mid-file, so the rest of the file is not dropped."""
+    body = b"--B\r\n" + _FP + b"line1\n--B--" + tail + b"\nline3\r\n--B--\r\n"
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="close delimiter is followed by other text") as c:
+            parse(_CT_B, body, max_file_bytes=1024)
+        assert type(c.value) is MultipartError
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [b"", b"\r\n", b"\n", b"\r", b" \t \r\n", b"\t", b"\r\nepilogue --B-- text"],
+    ids=["end", "crlf", "lf", "cr", "padding-crlf", "padding-end", "epilogue-line"],
+)
+def test_a_close_marker_with_padding_and_a_line_end_still_closes(tail: bytes) -> None:
+    """Padding and then a CR, an LF or the end of the body after the close marker; the epilogue on a
+    later line is ignored, whatever it holds."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r\n--B--" + tail
+    assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
+
+
+def test_a_long_padding_run_after_the_close_is_read_in_one_scan() -> None:
+    """The padding after a close marker is read by one search for its end, not a Python step per
+    byte, so a long run costs the walk no more Python lines than a short one."""
+
+    def lines(padding: int) -> int:
+        body = b"--B\r\n" + _FP + b"MSH|x\r\n--B--" + b" " * padding + b"\r\n"
+
+        def run() -> None:
+            assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
+
+        return _python_lines(run)
+
+    assert lines(1) == lines(1_000_000)
 
 
 @pytest.mark.parametrize(("body", "at", "expected"), [(b"x\n--B", 2, 2), (b"x\r--B", 2, 2)])
