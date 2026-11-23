@@ -1128,8 +1128,9 @@ by an age + count prune. In `leave` mode a read-only share does not fail start. 
 creates the `.processed`/`.error` subdirs best-effort at start, and a malformed file that can't be moved
 to `.error` is read and logged again on later scans. An `Sftp(...)`/`Ftp(...)` poll in `leave` mode asks
 for no directory until a reject needs `.error`, and then best-effort (BACKLOG #5750). A reject it cannot
-move stays in place, logged, and is read again only once its listing changes or its retry falls due; the
-rule is under *Files left for a retry do not spend the budget*. Either way, fix such a file at the source.
+move stays in place and logged, and is remembered rather than read on every poll; the rule and its
+exceptions are under *Files left for a retry do not spend the budget*. Either way, fix such a file at the
+source.
 
 #### File handling & quarantine policy (ASVS 5.1.1)
 
@@ -5108,13 +5109,15 @@ passes is ingested. At least a restart of the connection and a full memory leave
 and charged again. When a retry falls due is the back-off rule
 stated once at `STUCK_RETRY_SECONDS` in
 [`transports/file.py`](../messagefoundry/transports/file.py). Under `leave` on `File(...)`, the gap
-stands as described. On `Sftp(...)`/`Ftp(...)`, in every `after_read` mode (BACKLOG #5750), it is
-narrowed the same way: such a file is remembered and skipped unread and uncharged until its listed size
-or modification time changes or `STUCK_RETRY_SECONDS` pass. A due retry is judged afresh and charges
-nothing. One poll runs at most a tenth of `poll_max_files` of them (at least one, at most
-`STUCK_RETRIES_PER_SCAN_MAX`), in listing order, so a poll that stops at the ceiling does not reach
-the retries after it. At least a restart of the connection and a full memory leave such a file read
-and charged again. A replacement listing the same size and time is seen only by the retry.
+stands as described. On `Sftp(...)`/`Ftp(...)`, in every `after_read` mode (BACKLOG #5750), a similar
+memory narrows it: such a file is skipped unread and uncharged until its listed size or modification
+time changes or its retry falls due, and the same two exceptions apply. It differs from `File(...)` in
+at least three ways. The first wait is `STUCK_TRANSIENT_RETRY_SECONDS` and each later one
+`STUCK_RETRY_SECONDS`, whatever the failure, because a remote failure does not say reliably whether it
+will clear. One poll retries at most a tenth of `poll_max_files` (at least one, at most
+`STUCK_RETRIES_PER_SCAN_MAX`). And retries run in listing order inside the pass, so one past the
+ceiling's break waits for a later poll, and one sorted first is read before the healthy files behind
+it. A replacement listing the same size and time is seen only by the retry.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it

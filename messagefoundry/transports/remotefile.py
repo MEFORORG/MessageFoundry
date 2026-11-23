@@ -146,6 +146,7 @@ from messagefoundry.transports.file import (
     SETTLE_SEEN_MAX,
     STUCK_RETRIES_PER_SCAN_MAX,
     STUCK_RETRY_SECONDS,
+    STUCK_TRANSIENT_RETRY_SECONDS,
     ScanRejected,
     _check_template_fits,
     _content_matches_encoded,
@@ -683,8 +684,8 @@ class _StuckReject(NamedTuple):
 
 def _same_listing(seen_size: int, seen_mtime: str | None, size: int, mtime: str | None) -> bool:
     """Whether two listings show one version of a file. The times are compared only when both carry
-    one, so a listing that loses its time for a poll (an ``MLSD`` refusal that falls back to
-    ``NLST``) does not read as a change."""
+    one, so losing the time for a poll (an ``MLSD`` refusal that falls back to ``NLST``) is not by
+    itself a change. A fallback that also loses the size does read as one."""
     return seen_size == size and (seen_mtime is None or mtime is None or seen_mtime == mtime)
 
 
@@ -776,9 +777,9 @@ class _RemoteClient(abc.ABC):
     def ensure_dir(self, remote_dir: str) -> bool:
         """Best-effort create ``remote_dir`` (ignore "already exists"). Returns **True only when THIS
         call created it** (#114) — the destination logs that, so a delivery landing in a directory the
-        engine just invented is distinguishable from a normal one. A refused create (no permission, a
-        racing creator) returns False: nothing was created here. Any other fault raises, at least a
-        failed connection and, on SFTP, a refused ``stat`` of the path."""
+        engine just invented is distinguishable from a normal one. A create that fails (at least no
+        permission, a racing creator) returns False: nothing was created here. At least a failed
+        connection and, on SFTP, a refused ``stat`` of the path raise instead."""
 
 
 def _ftps_ssl_context(
@@ -3092,15 +3093,18 @@ class RemoteFileSource(SourceConnector):
                 continue
             if forms is not None and self._stop.is_set():
                 break  # a stop met during the ledger read: retrieve nothing the bound must then cut
+            if not self._settled(name, size, mtime):
+                # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
+                # Nothing is read, moved or charged against the per-tick budget. A due retry settles
+                # too: a file being rewritten in place can pass through the size it was remembered at.
+                continue
             if stuck is not None:
                 # A due retry spends none of the budget, so rejects sorted first cannot hold back
-                # the valid files behind them.
+                # the valid files behind them. Its wait restarts before the read, short, so a read
+                # that fails comes back soon; a reject again takes the long wait (_remember_stuck).
                 retries_left -= 1
-                self._stuck[name] = (stuck._replace(due=time.monotonic() + STUCK_RETRY_SECONDS), 0)
-            elif not self._settled(name, size, mtime):
-                # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
-                # Nothing is read, moved or charged against the per-tick budget.
-                continue
+                due = time.monotonic() + STUCK_TRANSIENT_RETRY_SECONDS
+                self._stuck[name] = (stuck._replace(due=due), 0)
             charge = 0 if stuck is not None else 1
             if self._max_file_bytes is not None and size > self._max_file_bytes:
                 # Transport-level reject *before* any bytes are read — parallels the File source's
@@ -3411,11 +3415,14 @@ class RemoteFileSource(SourceConnector):
 
     def _remember_stuck(self, name: str, size: int, mtime: str | None) -> None:
         """Remember a reject that stays in the poll directory because its move failed (BACKLOG
-        #5750), until its listing changes or ``STUCK_RETRY_SECONDS`` pass. The retry judges it
-        afresh, so a cause fixed outside the file needs no restart and the file goes on being logged.
-        **Nothing is dropped:** the file stays where it is. A replacement that lists the same size
-        and time is seen only by that retry. At ``SETTLE_SEEN_MAX`` a new reject is not remembered,
-        so it is read and charged again. :meth:`_at_ceiling` states what this does to the budget."""
+        #5750), until its listing changes or its retry falls due. The first wait is
+        ``STUCK_TRANSIENT_RETRY_SECONDS``, because a failed move does not say reliably whether it
+        will clear (SFTP reports a refused rename as transient), and a reject that fails again waits
+        ``STUCK_RETRY_SECONDS``. The retry judges it afresh, so a cause fixed outside the file needs
+        no restart and the file goes on being logged. **Nothing is dropped:** the file stays where
+        it is. A replacement that lists the same size and time is seen only by that retry. At
+        ``SETTLE_SEEN_MAX`` a new reject is not remembered, so it is read and charged again.
+        :meth:`_at_ceiling` states what this does to the budget."""
         first = name not in self._stuck
         if first and len(self._stuck) >= SETTLE_SEEN_MAX:
             if not self._stuck_full_logged:
@@ -3427,15 +3434,15 @@ class RemoteFileSource(SourceConnector):
                     SETTLE_SEEN_MAX,
                 )
             return
-        due = time.monotonic() + STUCK_RETRY_SECONDS
-        self._stuck[name] = (_StuckReject(size, mtime, due), 0)
+        wait = STUCK_TRANSIENT_RETRY_SECONDS if first else STUCK_RETRY_SECONDS
+        self._stuck[name] = (_StuckReject(size, mtime, time.monotonic() + wait), 0)
         if first:
             logger.warning(
                 "REMOTEFILE %s: rejected file %s stays in place; it is tried again once it changes "
-                "or %.0f seconds pass",
+                "or %.0f seconds pass, then less often",
                 _where(self._host, self._remote_dir),
                 safe_name(name),
-                STUCK_RETRY_SECONDS,
+                wait,
             )
 
     def _file_key(self, name: str, size: int, mtime: str | None) -> str:

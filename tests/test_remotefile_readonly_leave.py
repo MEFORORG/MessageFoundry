@@ -10,13 +10,19 @@ per-tick budget each time, which held back the valid files sorted after it.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
 
 from messagefoundry.config.models import ContentType
 from messagefoundry.transports import remotefile
-from messagefoundry.transports.file import SETTLE_MISS_LIMIT, _content_matches_declared
+from messagefoundry.transports.file import (
+    SETTLE_MISS_LIMIT,
+    STUCK_RETRY_SECONDS,
+    STUCK_TRANSIENT_RETRY_SECONDS,
+    _content_matches_declared,
+)
 from messagefoundry.transports.remotefile import _RemoteError, _SftpClient
 from tests.test_remotefile_transport import (
     _FakeClient,
@@ -176,10 +182,50 @@ async def test_a_reject_that_cannot_move_is_read_again_once_its_retry_falls_due(
     await _settle(src)
     await src._poll_once()
     _make_due(src, "bad.hl7")
+    await src._poll_once()  # a due retry settles first, like any other read
+    assert _retrieved(client, "/in/bad.hl7") == 1
     await src._poll_once()
     assert _retrieved(client, "/in/bad.hl7") == 2
     await src._poll_once()  # the retry started a new wait
     assert _retrieved(client, "/in/bad.hl7") == 2
+
+
+async def test_a_reject_waits_longer_after_its_first_retry_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed move does not say whether it will clear, so the first wait is the short one."""
+    client = _read_only({"/in/bad.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    before = time.monotonic()
+    await src._poll_once()
+    first = src._stuck["bad.hl7"][0].due - before
+    assert first <= STUCK_TRANSIENT_RETRY_SECONDS + 5
+    _make_due(src, "bad.hl7")
+    await _settle(src)
+    before = time.monotonic()
+    await src._poll_once()
+    assert src._stuck["bad.hl7"][0].due - before >= STUCK_RETRY_SECONDS - 5
+
+
+async def test_a_due_retry_of_a_file_still_being_rewritten_waits_to_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rewrite can pass through the remembered size, so that one listing does not admit it."""
+    client = _read_only({"/in/a.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    _make_due(src, "a.hl7")
+    partial = _GOOD + b"x" * (len(_BAD) - len(_GOOD))  # the remembered size, mid-rewrite
+    client.files["/in/a.hl7"] = partial
+    await src._poll_once()
+    assert src._handler.bodies == [], "one listing at the remembered size must not admit it"
+    client.files["/in/a.hl7"] = partial + b"tail"
+    await src._poll_once()
+    assert src._handler.bodies == []
+    await src._poll_once()
+    assert src._handler.bodies == [partial + b"tail"]
 
 
 async def test_a_retried_reject_that_now_passes_is_ingested_and_forgotten(
@@ -194,6 +240,7 @@ async def test_a_retried_reject_that_now_passes_is_ingested_and_forgotten(
     await src._poll_once()
     assert src._handler.bodies == []
     _make_due(src, "a.hl7")
+    await _settle(src)
     await src._poll_once()
     assert len(src._handler.bodies) == 1
     assert src._stuck == {}
@@ -237,6 +284,7 @@ async def test_retries_due_on_one_poll_are_bounded(monkeypatch: pytest.MonkeyPat
     await src._poll_once()
     for i in range(5):
         _make_due(src, f"bad{i}.hl7")
+    await _settle(src)
     client.ops.clear()
     await src._poll_once()
     assert sum(1 for op, _ in client.ops if op == "retrieve") == 2
@@ -246,14 +294,29 @@ async def test_a_full_memory_leaves_a_reject_read_and_charged_as_before(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(remotefile, "SETTLE_SEEN_MAX", 1)
-    client = _read_only({"/in/a.hl7": _BAD, "/in/b.hl7": _BAD})
+    # z.txt is outside the pattern: the ceiling check it reaches shows what b charged.
+    client = _read_only({"/in/a.hl7": _BAD, "/in/b.hl7": _BAD, "/in/z.txt": b"skip"})
     src = _leave(monkeypatch, client)
-    await src._poll_once()  # a first sighting of a; b waits for settle room
-    await src._poll_once()  # a is read and remembered
-    await src._poll_once()  # b gets its first sighting
-    await src._poll_once()  # b is read, and the memory holds a
+    charged: list[int] = []
+    at_ceiling = src._at_ceiling
+
+    def spy(disposed: int, remaining: int) -> bool:
+        charged.append(disposed)
+        return bool(at_ceiling(disposed, remaining))
+
+    src._at_ceiling = spy
+    await src._poll_once()  # a's first sighting; b waits for room in the settle memory
+    await src._poll_once()  # a is read and remembered, and b gets its first sighting
+    await src._poll_once()  # b is read, and the memory is full of a
     assert list(src._stuck) == ["a.hl7"]
     assert "memory of rejects that cannot be moved is full" in caplog.text
+    assert _retrieved(client, "/in/b.hl7") == 1
+    await src._poll_once()  # b settles again, since it could not be remembered
+    charged.clear()
+    await src._poll_once()
+    assert _retrieved(client, "/in/b.hl7") == 2, "a reject the memory cannot hold is read again"
+    assert _retrieved(client, "/in/a.hl7") == 1
+    assert charged[-1] == 1, "and it charges the budget"
 
 
 async def test_a_reject_no_longer_listed_is_forgotten(monkeypatch: pytest.MonkeyPatch) -> None:

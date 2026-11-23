@@ -63,8 +63,8 @@ documented edge (the ledger only records **successfully-emitted** files).
 
 > **Amended 2026-11-23 (BACKLOG #5750), for the SFTP/FTP(S) source only.** Its `leave` poll no longer
 > asks for either subdir up front, and asks for `.error` only when a reject needs it. A reject it cannot
-> move stays in place and logged, and is read again only once its listing changes or its retry falls due,
-> not on each poll. The ledger still records only successfully-emitted files. The rule is in
+> move stays in place and logged, and is remembered rather than read on every poll. The ledger still
+> records only successfully-emitted files. The rule and its exceptions are in
 > [CONNECTIONS.md](../CONNECTIONS.md), *Files left for a retry do not spend the budget*.
 
 ### §2 The `processed_files` dedup ledger — a HASHED key, IDS-ONLY
