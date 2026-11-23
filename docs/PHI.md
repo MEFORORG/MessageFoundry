@@ -2779,6 +2779,10 @@ colon-written EUI-64 device id such as `00:1A:2B:FF:FE:3C:4D:5E`. At least these
 `Decade::`, whose hex run is too long to be an address group, and `Xfe80::`, which reads as an
 allowed link-local address.
 
+The IPv6 check also refuses, without an address in them, text such as `a:b.c.d::1` and
+`fe80::1.2::3`, and fullwidth or circled-digit text that folds to an address shape. It fails
+closed on these: a shape it cannot rule out counts as an address (BACKLOG #5654).
+
 In a message whose field separator is `:`, every IPv6 address is cut into separate fields, none
 of which holds it, and there is no cut-across-fields check for IPv6 as there is for the SSN and
 phone shapes, so every IPv6 address whose colons are literal field separators there passes, and `1::1234`
@@ -2800,8 +2804,8 @@ these still get through, on both anonymizers:
 - A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
   it. The detectors read that digit as part of a longer number.
 - A cut shape in the header line, which this check skips whole. Of the shape checks, the IPv6
-  one reads the header's unmapped fields, and the SSN and phone ones read there only the
-  components an `id`, `mrn`, `ssn` or `dln` rule keeps.
+  one reads the header's unmapped fields and also the components an `id`, `mrn`, `ssn` or `dln`
+  rule keeps in a header field; the SSN and phone ones read there only those kept components.
 
 With `require_full_coverage` on, such a message is refused for as long as nobody decides the
 fields that carry the rest of the shape. A `keep` on each of them would let it through. That

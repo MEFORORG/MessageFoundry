@@ -25,8 +25,7 @@ Returns **reasons only** (never the matched text), and the token denylist is the
 structural PHI-shape detectors + unmapped-field coverage report below (BACKLOG #331) close that gap —
 they are held byte-for-byte identical with the toolkit copy so the two agree on every input. They
 look for a dashed SSN, a punctuated phone, an ``MR``/``MRN`` id type and a routable IPv6 address
-(BACKLOG #5654) in the fields no rule rewrote; the IPv6 detector alone also reads the MSH header,
-MSH-2 past its encoding characters and the fields from MSH-3 on that no rule rewrites. The dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
+(BACKLOG #5654) in the fields no rule rewrote; the IPv6 detector also reads the MSH header, MSH-2 past its encoding characters and the fields from MSH-3 on that no rule rewrites, and the SSN and phone checks read the components a rule keeps in a header field. The dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
 separator cut across fields, when at least one of them is unmapped (BACKLOG #3465), and scan what
 a retarget of a default field left past its first component (:func:`retarget_residue_hits`,
 BACKLOG #3493), and the components an ``id``, ``mrn``, ``ssn`` or ``dln`` rule keeps as captured
@@ -304,7 +303,8 @@ def _judge_ipv6_run(run: str, ipv4_is_routable: Callable[[str], bool]) -> bool:
 def _dot_joined_pieces(run: str) -> tuple[str, ...]:
     """``run`` cut at each dot that has a colon before it in the run and a colon in the group
     after it, as in ``fe80::1.4000:a1::5`` or ``x:1.2.4000:a1::5``, or nothing when it has no
-    such dot. The run
+    such dot. In the second example the run is ``:1.2.4000:a1::5``, because ``x`` is not a hex
+    character, and its colon before the first dot is what lets the dot after ``2`` cut. The run
     whole parses to the allowed address before the dot, so the address after it is read only as a
     piece (BACKLOG #5654). A dot with no colon before it, as in ``1.2.3::a``, does not cut, so a
     version number before an address is read as before. Each group is visited once, so the cost

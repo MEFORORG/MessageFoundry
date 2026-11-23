@@ -25,8 +25,7 @@ already-pseudonymized field is never re-flagged:
   punctuated NANP phone, an ``MR``/``MRN`` id type in a whole component, its first
   subcomponent or any subcomponent of component 5, 7 or 13, a routable IPv6 address, and a line
   whose segment id is
-  malformed; the IPv6 detector alone also reads the MSH header, MSH-2 past its encoding
-  characters and the fields from MSH-3 on that no rule rewrites), plus a dashed SSN or punctuated phone that the message's own field separator cut
+  malformed; the IPv6 detector also reads the MSH header, MSH-2 past its encoding characters and the fields from MSH-3 on that no rule rewrites, and the SSN and phone checks read the components a rule keeps in a header field), plus a dashed SSN or punctuated phone that the message's own field separator cut
   across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to
   avoid the mass false-positives a broad digit-run search would produce on HL7 bodies (ADR 0030
   §5). A name, an undashed number or a date in an unmapped field
@@ -271,7 +270,8 @@ def _judge_ipv6_run(run: str, ipv4_is_routable: Callable[[str], bool]) -> bool:
 def _dot_joined_pieces(run: str) -> tuple[str, ...]:
     """``run`` cut at each dot that has a colon before it in the run and a colon in the group
     after it, as in ``fe80::1.4000:a1::5`` or ``x:1.2.4000:a1::5``, or nothing when it has no
-    such dot. The run
+    such dot. In the second example the run is ``:1.2.4000:a1::5``, because ``x`` is not a hex
+    character, and its colon before the first dot is what lets the dot after ``2`` cut. The run
     whole parses to the allowed address before the dot, so the address after it is read only as a
     piece (BACKLOG #5654). A dot with no colon before it, as in ``1.2.3::a``, does not cut, so a
     version number before an address is read as before. Each group is visited once, so the cost

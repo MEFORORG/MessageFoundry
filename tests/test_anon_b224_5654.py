@@ -503,8 +503,8 @@ def test_a_long_hex_run_is_scanned_in_linear_time(leak: ModuleType) -> None:
         return time.perf_counter() - started
 
     # Four times the input takes about four times as long when the scan is linear, sixteen when
-    # it is quadratic, which took seconds at 320 KB. The bound sits between them, with a floor
-    # that keeps a noisy runner's sub-millisecond timings from deciding it.
+    # it is quadratic, which took seconds at 320 KB. The bound sits between them: ``small * 10``
+    # decides it, and the 0.25 s floor only covers a noisy runner's sub-millisecond timings.
     small, large = seconds(5_000), seconds(20_000)
     assert large < max(small * 10, 0.25)
 
@@ -579,7 +579,7 @@ def test_a_dot_joined_run_is_cut_in_linear_time(leak: ModuleType) -> None:
         return time.perf_counter() - started
 
     # Large enough that a quadratic cut, sixteen times slower at four times the input, exceeds
-    # the floor.
+    # ``small * 10``, which is the bound that decides.
     small, large = seconds(20_000), seconds(80_000)
     assert large < max(small * 10, 0.25)
 
