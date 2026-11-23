@@ -344,10 +344,16 @@ def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
     # One scan from 0, so markup opened before the Body start tag is known after it.
     outside = _search_outside_markup(_FAULT_OUTSIDE_MARKUP_RE, body, 0, len(body))
     m = _BODY_RE.search(body)
-    if m is not None and (body.find("<!", 0, m.start()) >= 0 or body.find("<?", 0, m.start()) >= 0):
+    if m is not None:
         # Closing step 6: only markup opened ahead of the first plain Body start tag can hide it,
-        # so the Python-level step-over runs only then.
-        m = _search_outside_markup(_BODY_OUTSIDE_MARKUP_RE, body, 0, len(body))
+        # so the Python-level step-over runs only then. A leading XML declaration that ends before
+        # that tag hides nothing, so it alone does not count (most replies open with one).
+        head = 0
+        if body.startswith("<?xml"):
+            decl_end = body.find("?>", 0, m.start())
+            head = 0 if decl_end < 0 else decl_end + 2
+        if body.find("<!", head, m.start()) >= 0 or body.find("<?", head, m.start()) >= 0:
+            m = _search_outside_markup(_BODY_OUTSIDE_MARKUP_RE, body, 0, len(body))
     if m is None:
         return outside or plain, 0
     after = outside

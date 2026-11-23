@@ -3023,7 +3023,8 @@ before BACKLOG #5912. That fallback steps over no markup: a `faultcode` or `Valu
 can decide the class, and a `</Fault>` inside one ends its range, so
 `<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`
 reads no code and dead-letters. The read, its fallback and the one shape read again are stated once,
-in the `_fault_code` docstring in [`transports/soap.py`](../messagefoundry/transports/soap.py). The
+in the `_fault_code` and `_child_code_text` docstrings in
+[`transports/soap.py`](../messagefoundry/transports/soap.py). The
 Fault is the first Fault start tag after the first Body start tag outside terminated markup, or with
 no Fault after it the first in the reply, the Fault start tag also searched for outside such markup; only where every Fault start tag after that Body start tag (with none there, every
 one) is inside such markup is the first of them taken as the Fault, so such a reply never reads as

@@ -81,9 +81,9 @@ Not every function here is pure. At least these do more than read their argument
 :func:`apply_static_credential_gate` and the guard :func:`make_static_credential_guard` returns,
 which log, the guard also reading the ``env()`` values the engine sets around it; ``_digest``,
 which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529); ``_is_https``, which logs
-at debug a proxy target that does not parse; and ``_http_literal_static`` (BACKLOG #5510) and
-``_dicomweb_build_refused`` (vault BACKLOG #5359), whose ``env()`` resolution runs an operator
-``cast`` as the build does. A caller inherits its callee's effect: at least
+at debug a proxy target that does not parse; and ``_http_literal_static`` (BACKLOG #5510),
+``_dicomweb_build_refused`` (vault BACKLOG #5359) and ``_digest`` (BACKLOG #5526 item 9), whose
+``env()`` resolution runs an operator ``cast`` as the build does. A caller inherits its callee's effect: at least
 :func:`static_credential_hops` and :func:`run_static_credential_gate` can run an operator ``cast``
 and log, and :func:`http_hop_credentials` logs through ``_digest`` and resolves no ``env()``.
 
@@ -191,14 +191,18 @@ def _digest(
     credential the hop does not send; the census lists it all the same.
 
     BACKLOG #5526 item 9: an ``env()`` ``http_auth`` is read as the build resolves it, against
-    ``env_values`` (``config.wiring._resolved_setting``). One this reading cannot resolve may
-    resolve to ``digest``, so it reads as Digest, as an unresolved ``oauth2_enabled`` reads as on,
-    except beside a minted bearer (``token``): the build refuses Digest there, so none crosses."""
+    ``env_values``, else its literal ``default=`` (``config.wiring._resolved_setting``), as
+    :func:`_http_literal_static` reads ``headers``. One this reading cannot resolve may resolve to
+    ``digest``, so it reads as Digest, except beside a minted bearer (``token``) whose SMART and
+    OAuth2 flags are not themselves ``env()`` references: the build refuses Digest beside a
+    bearer provider, so none crosses there. Where such a flag is an ``env()`` reference, the
+    provider may resolve off, so the mode still reads as Digest."""
     from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
 
-    mode = _resolved_setting(settings, "http_auth", None, env_values)
+    mode = _resolved_setting(settings, "http_auth", None, env_values or {})
     if mode is _UNRESOLVED:
-        return not token
+        flags = (settings.get("oauth2_enabled"), settings.get("smart_enabled"))
+        return not token or any(isinstance(flag, EnvRef) for flag in flags)
     if mode is not settings.get("http_auth"):
         settings = {**settings, "http_auth": mode}
     try:

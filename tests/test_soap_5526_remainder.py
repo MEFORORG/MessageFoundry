@@ -193,6 +193,27 @@ def test_the_census_reads_no_digest_beside_a_minted_bearer() -> None:
     assert _http_hop("OB_REST", ConnectorType.REST, settings, "peer") is None
 
 
+def test_the_census_reads_digest_beside_a_bearer_whose_flag_is_from_env() -> None:
+    """Item 9, review round 2: an ``env()`` ``oauth2_enabled`` may resolve off, so the provider
+    may not be built and Digest may cross; an unresolved ``http_auth`` there still reads as
+    Digest. Control: the literal flag in the test above lists none."""
+    settings = _oauth(Rest(url=URL)).settings
+    settings["http_auth"] = EnvRef("MF_HTTP_AUTH_SYNTHETIC")
+    settings["oauth2_enabled"] = EnvRef("MF_OAUTH_ON_SYNTHETIC")
+    assert "HTTP Digest" in http_hop_credentials(ConnectorType.REST, settings)
+
+
+def test_the_census_honours_an_env_default_for_http_auth() -> None:
+    """Item 9, review round 2: with no values, an ``env()`` ``default=`` is read, as the headers
+    reader reads it, so a default of no auth lists no Digest on an mTLS SOAP hop."""
+    settings = {
+        "url": URL,
+        "http_auth": EnvRef("MF_HTTP_AUTH_SYNTHETIC", default=""),
+        "client_cert_file": "client.pem",
+    }
+    assert _http_hop("OB_SOAP", ConnectorType.SOAP, settings, "peer") is None
+
+
 # --- item 5: the SOAP Digest refusal names the connection --------------------------------------
 
 

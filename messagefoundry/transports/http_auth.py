@@ -78,7 +78,6 @@ __all__ = [
     "BearerTokenProvider",
     "HttpAuthError",
     "OAuth2ClientCredentialsProvider",
-    "authorization_credential",
     "bearer_provider_from_settings",
     "digest_handler_from_settings",
     "http_digest_selected",

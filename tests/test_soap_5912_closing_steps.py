@@ -173,3 +173,37 @@ def test_a_close_tag_inside_the_fault_start_tag_still_ends_the_fallback_range() 
     the start tag's own text ends it, as before."""
     body = "<Fault </Fault><faultstring>x</faultstring><faultcode>soap:Server</faultcode>"
     assert _fault_code(body) == ""
+
+
+def test_a_leading_xml_declaration_keeps_the_plain_body_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 2: a reply that opens with an XML declaration and holds no other markup ahead
+    of the Body reads the plain Body start tag, without the Python-level step-over. Control: the
+    reply still reads its Body's Receiver fault."""
+    body = (
+        '<?xml version="1.0"?><soap:Envelope><soap:Header><x:Fault><faultcode>soap:Client'
+        "</faultcode></x:Fault></soap:Header><soap:Body><soap:Fault><faultcode>soap:Server"
+        "</faultcode></soap:Fault></soap:Body></soap:Envelope>"
+    )
+    assert _outcome(_classify_soap(200, body)) == "transient"
+    calls: list[object] = []
+    original = soap._search_outside_markup
+
+    def counting(pattern: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(pattern)
+        return original(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(soap, "_search_outside_markup", counting)
+    assert _outcome(_classify_soap(200, body)) == "transient"
+    assert soap._BODY_OUTSIDE_MARKUP_RE not in calls
+
+
+def test_a_body_tag_inside_the_xml_declaration_still_takes_the_step_over() -> None:
+    """A Body start tag inside the declaration itself is not taken as the anchor."""
+    body = (
+        '<?xml version="1.0" <soap:Body> ?><soap:Envelope><soap:Header><x:Fault><faultcode>'
+        "soap:Client</faultcode></x:Fault></soap:Header><soap:Body><soap:Fault><faultcode>"
+        "soap:Server</faultcode></soap:Fault></soap:Body></soap:Envelope>"
+    )
+    assert _outcome(_classify_soap(200, body)) == "transient"
