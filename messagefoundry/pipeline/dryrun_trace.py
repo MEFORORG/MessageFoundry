@@ -78,6 +78,7 @@ from messagefoundry.config.wiring import (
     Payload,
     RouterFn,
     Send,
+    accepts_verdict,
     handler_result_items,
 )
 from messagefoundry.parsing.message import Message
@@ -419,7 +420,7 @@ class _Tracer:
         """Trace an ``accepts=`` predicate (ADR 0084) and record a decline. A pure observer like the
         other two: the verdict is returned unchanged and a raise propagates, so the traced routing
         decision stays byte-identical to the untraced one."""
-        verdict = bool(self._run("accepts", pred, name, payload))
+        verdict = bool(accepts_verdict(name, self._run("accepts", pred, name, payload)))
         if not verdict:
             self.accepts_declined.append(name)
         return verdict

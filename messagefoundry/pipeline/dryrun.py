@@ -39,6 +39,7 @@ from messagefoundry.config.wiring import (
     SetMeta,
     SetState,
     StateValue,
+    accepts_verdict,
     handler_item_fault,
     handler_result_items,
 )
@@ -361,7 +362,7 @@ def _accepted(
         elif tracer is not None:
             verdict = tracer.trace_accepts(pred, hname, payload)
         else:
-            verdict = pred(payload)
+            verdict = accepts_verdict(hname, pred(payload))
         if verdict:
             kept.append(hname)
     return kept

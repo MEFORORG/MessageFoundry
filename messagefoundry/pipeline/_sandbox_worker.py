@@ -341,7 +341,7 @@ def _run_one(
     from messagefoundry.config.db_lookup import DbLookupError
     from messagefoundry.config.fhir_lookup import FhirLookupError
     from messagefoundry.config.run_context import run_contexts
-    from messagefoundry.config.wiring import handler_result_items
+    from messagefoundry.config.wiring import accepts_verdict, handler_result_items
     from messagefoundry.pipeline._sandbox_codec import SandboxError
 
     phase = req.phase
@@ -422,8 +422,9 @@ def _run_one(
             # e.g. ``re.search(...)`` -> re.Match) would otherwise be rejected by the codec's strict
             # JSON-bool slot — content-dependent, since a non-match returns None. Coercing to the
             # contract type here is what lets the parent demand a strict bool, and makes
-            # ``[sandbox].mode`` never change the routing decision (ADR 0087).
-            result = bool(result)
+            # ``[sandbox].mode`` never change the routing decision (ADR 0087). An awaitable or a
+            # generator is refused first, as at mode=off (BACKLOG #5514).
+            result = bool(accepts_verdict(name, result))
     except (DbLookupError, FhirLookupError) as exc:
         if broker is not None:
             # mode=isolated: the lookup ran, or was refused, through the parent, so its error is the

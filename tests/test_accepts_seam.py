@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import gc
+import warnings
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -49,6 +51,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import route_message, route_only
+from messagefoundry.pipeline.dryrun_trace import trace_dry_run
 from messagefoundry.pipeline.sandbox import (
     SandboxError,
     SandboxMode,
@@ -990,3 +993,140 @@ def test_a_walk_that_raises_is_a_configuration_problem(tmp_path: Path) -> None:
         reg.validate()
     assert "RuntimeError" in str(exc.value)
     assert "proxy not ready" not in str(exc.value)
+
+
+# --- BACKLOG #5514: a plain predicate that RETURNS an awaitable or a generator ---
+# The static check refuses an `async def` predicate, but a plain function that returns a coroutine or
+# a generator passes it. Read as a truth value, that object is True, so the handler would accept every
+# message. The verdict is refused at run time instead, as a router-stage error.
+
+
+async def _verdict_coro() -> bool:
+    return False
+
+
+def _returns_coroutine(msg: Any) -> Any:
+    return _verdict_coro()
+
+
+def _verdict_gen() -> Iterator[bool]:
+    yield False
+
+
+def _returns_generator(msg: Any) -> Any:
+    return _verdict_gen()
+
+
+@pytest.mark.parametrize("pred", [_returns_coroutine, _returns_generator])
+def test_an_awaitable_or_generator_verdict_passes_validate_but_raises(
+    tmp_path: Path, pred: Any
+) -> None:
+    reg = _reg(tmp_path, accepts={"h": pred})  # the static check does not see it
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(TypeError, match="accepts= predicate for handler 'h' returned a"):
+            route_only(reg, reg.inbound["IB"], ADT)
+        gc.collect()
+    # The coroutine is closed before the raise, so no "was never awaited" warning leaks.
+    assert [w for w in caught if issubclass(w.category, RuntimeWarning)] == []
+
+
+@pytest.mark.parametrize("pred", [_returns_coroutine, _returns_generator])
+def test_an_awaitable_or_generator_verdict_raises_on_the_traced_path(
+    tmp_path: Path, pred: Any
+) -> None:
+    reg = _reg(tmp_path, accepts={"h": pred})
+    out = trace_dry_run(reg, ADT, inbound="IB", show_phi=True)
+    assert out["disposition"] == MessageStatus.ERROR.value
+    assert out["handlers"] == []
+    assert "returned a" in (out["error"] or "")
+
+
+@pytest.mark.parametrize("pred", [_returns_coroutine, _returns_generator])
+async def test_an_awaitable_or_generator_verdict_dead_letters(
+    store: MessageStore, tmp_path: Path, pred: Any
+) -> None:
+    ran: list[str] = []
+
+    def h(m: Any) -> Send:
+        ran.append("h")
+        return Send("OB", str(m))
+
+    reg = _reg(tmp_path, handlers={"h": h}, accepts={"h": pred})
+    item = await _claimed(store)
+    await RegistryRunner(
+        reg, store, egress=EgressSettings(deny_by_default=False)
+    )._process_ingress_item("IB", item)
+    assert await _routed_rows(store, item.message_id) == []
+    status, rows = await _router_stage_state(store, item.message_id)
+    assert status == MessageStatus.ERROR.value
+    assert rows == [(Stage.INGRESS.value, OutboxStatus.DEAD.value)]
+    assert ran == []
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected"), [(True, ["h"]), (False, []), (1, ["h"]), ("", []), (None, [])]
+)
+def test_a_plain_verdict_is_unchanged(tmp_path: Path, verdict: object, expected: list[str]) -> None:
+    reg = _reg(tmp_path, accepts={"h": lambda m: verdict})
+    assert route_only(reg, reg.inbound["IB"], ADT) == expected
+    assert trace_dry_run(reg, ADT, inbound="IB")["handlers"] == expected
+
+
+_SANDBOX_AWAITABLE_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+
+async def _coro():
+    return False
+
+
+def _gen():
+    yield False
+
+
+def _returns_coroutine(msg):
+    return _coro()
+
+
+def _returns_generator(msg):
+    return _gen()
+
+
+inbound("IB_T", MLLP(port=19513), router="r")
+outbound("OB_T", MLLP(host="127.0.0.1", port=19514))
+
+
+@router("r")
+def r(msg):
+    return ["h_gen"] if msg["MSH-3"] == "ESC" else ["h_coro"]
+
+
+@handler("h_coro", accepts=_returns_coroutine)
+def h_coro(msg):
+    return Send("OB_T", str(msg))
+
+
+@handler("h_gen", accepts=_returns_generator)
+def h_gen(msg):
+    return Send("OB_T", str(msg))
+"""
+
+
+def test_an_awaitable_or_generator_verdict_raises_in_the_sandbox_child(tmp_path: Path) -> None:
+    (tmp_path / "graph.py").write_text(_SANDBOX_AWAITABLE_GRAPH, encoding="utf-8")
+    registry = load_config(tmp_path)
+    ic = registry.inbound["IB_T"]
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
+        config_dir=str(tmp_path),
+        env=None,
+        graph=None,
+    )
+    try:
+        for raw, hname in ((ADT, "h_coro"), (ESC, "h_gen")):
+            with pytest.raises(Exception, match=f"handler '{hname}' returned a"):
+                route_only(registry, ic, raw, sandbox=session, run_context=RunContext())
+    finally:
+        session.close()

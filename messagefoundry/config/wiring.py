@@ -6155,6 +6155,26 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     return found
 
 
+def accepts_verdict[T](hname: str, verdict: T) -> T:
+    """``verdict``, the value an ``accepts=`` predicate returned, unless it is an awaitable, a
+    generator or an async generator, which raises :class:`TypeError` (BACKLOG #5514).
+
+    The router stage reads the verdict as a truth value without awaiting or iterating it, and each of
+    those objects reads as True, so the handler would accept every message. The static check in
+    :func:`_check_accepts_predicate` misses a plain function that returns one. The raise propagates
+    out of ``route_only`` like any predicate raise, into the router-stage error path. A coroutine or
+    generator is closed first, so no "never awaited" warning follows. The text names the handler and
+    the verdict's type, never its value."""
+    if inspect.isawaitable(verdict) or inspect.isgenerator(verdict) or inspect.isasyncgen(verdict):
+        if inspect.iscoroutine(verdict) or inspect.isgenerator(verdict):
+            verdict.close()
+        raise TypeError(
+            f"accepts= predicate for handler {hname!r} returned a {type(verdict).__name__}, which "
+            "the router stage cannot await or iterate and would read as True; it must return a bool"
+        )
+    return verdict
+
+
 def _check_accepts_predicate(hname: str, pred: object) -> None:
     """Fail closed on an ``accepts=`` predicate that can't hold its contract (ADR 0084).
 
@@ -6167,7 +6187,8 @@ def _check_accepts_predicate(hname: str, pred: object) -> None:
     * **Async** — an ``async def`` predicate, or a partial, method, wrapper or callable instance that
       runs one (:func:`_accepts_is_async`), returns a coroutine, which the router stage reads as
       truthy, so the handler would accept every message (BACKLOG #5514). A plain function that returns
-      an awaitable is not seen.
+      an awaitable or a generator is not seen here; :func:`accepts_verdict` refuses that verdict at
+      run time instead, as a router-stage error.
     * **Fail-open run-scoped read** — a predicate that can reach ``state_get``/``response_get`` (ADR
       0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
       suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
