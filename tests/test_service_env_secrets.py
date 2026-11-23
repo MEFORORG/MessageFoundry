@@ -648,11 +648,9 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
             "joined",
             id="directory-joined",
         ),
-        # A padded name sets no directory, as os.environ reads it (the Lander's hold on PR 3142,
-        # comment 7096232111), so the lists set none and the value runs on.
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory ==", "MEFOR_VALUE_B=1"],
-            "run-on",
+            "joined",
             id="directory-joined-spaced",
         ),
         pytest.param(

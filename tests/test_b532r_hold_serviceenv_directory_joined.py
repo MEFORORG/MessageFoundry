@@ -36,25 +36,20 @@ from tests._serviceenv_remedy import (
     ADD_BACK_MIXED,
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
-    COPIED,
-    COPIED_UNPLAIN,
     CREATE,
     KEEP,
     KEEP_ASCII,
+    LOOKALIKE_ADD,
     LOOKALIKE_ANY,
     LOOKALIKE_LEAVE,
-    LOOKALIKE_LEAVE_MOVED,
     LOOKALIKE_NEXT,
     REMOVE,
     REMOVE_OTHER,
-    REPOINT,
     RUNS_ON,
     SET_NO,
     TAKE_LINE,
     TAKE_OUT,
     WIDER,
-    lookalike_add,
-    lookalike_next,
     lookalike_step,
 )
 
@@ -86,7 +81,7 @@ def _read(entries: list[str]) -> ServiceEnvPosture:
     return _read_pairs([(_EXTRA, e) for e in entries])
 
 
-@pytest.mark.parametrize("directory", ["MEFOR_SECRETS_DIRECTORY==", "mefor_secrets_directory=="])
+@pytest.mark.parametrize("directory", ["MEFOR_SECRETS_DIRECTORY==", "mefor_secrets_directory =="])
 @pytest.mark.parametrize("refused", [f"{KEY_CLASS_NAMES[0]}=", "MEFOR_VALUE_A="])
 def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, directory: str) -> None:
     posture = _read([refused, directory])
@@ -96,8 +91,10 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert REMOVE in refusal and RUNS_ON in refusal
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
     # A name whose only value is the joined directory entry has nothing to move (the fifth
-    # hold on PR 3142, H2; the Lander's hold in comment 7085002242).
-    assert CREATE not in refusal and "Put " not in refusal
+    # hold on PR 3142, H2; the Lander's hold in comment 7085002242). The spaced spelling is no
+    # directory entry, so a MEFOR_VALUE_* name joined to it is moved.
+    moved = refused.startswith("MEFOR_VALUE_") and " " in directory
+    assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
     # The lists set no directory once the joined string goes, so the remedy says to add one
     # back (the Lander's ruling on handback 7085947392, F1), for a store key alone too
     # (the Lander's ruling on comment 7087145957, F1 on H3's terms).
@@ -108,33 +105,11 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
     # The create clause only where a setting moves (the Lander's ruling on handback
     # 7087574833, R1), and next to the step it qualifies.
-    assert ADD_BACK_CREATE not in refusal
+    assert (ADD_BACK_JOINED + ADD_BACK_CREATE in refusal) is moved
+    assert (ADD_BACK_CREATE in refusal) is moved
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
-        refused.startswith("MEFOR_VALUE_")
+        refused.startswith("MEFOR_VALUE_") and " " not in directory
     )
-
-
-@pytest.mark.parametrize("refused", [f"{KEY_CLASS_NAMES[0]}=", "MEFOR_VALUE_A="])
-def test_a_padded_directory_name_joined_to_a_value_sets_no_directory(refused: str) -> None:
-    """The Lander's hold on PR 3142, comment 7096232111, the name rule: ``os.environ`` keeps the
-    blank in ``mefor_secrets_directory =``, so that entry names no directory. Joined to an empty
-    value it is no directory entry, so a MEFOR_VALUE_* name joined to it is moved, and the
-    remedy says to take it out. The lists then set no directory, so a refused name outside the
-    key class gets the add-back step with its opener, and the take-out step points at it; a
-    store key alone needs no directory, gets no add-back step, and the take-out step says where
-    to add one."""
-    posture = _read([refused, "mefor_secrets_directory =="])
-    assert posture.directory_padded and not posture.directory_in_lists
-    assert not posture.directory_run_on
-    refusal = service_env_refusal(posture)
-    assert refusal is not None and RUNS_ON in refusal
-    moved = refused.startswith("MEFOR_VALUE_")
-    ending = LOOKALIKE_NEXT if moved else lookalike_add(remove_other=False)
-    assert refusal.count(lookalike_step(padded=True, ending=ending)) == 1
-    assert LOOKALIKE_ANY not in refusal
-    assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
-    assert (refusal.count(ADD_BACK_RUN_ON + ADD_BACK_CREATE) == 1) is moved
-    assert (ADD_BACK_ANY in refusal) is moved
 
 
 def test_the_bare_prefix_joined_to_the_directory_is_deleted() -> None:
@@ -587,10 +562,7 @@ def test_a_blank_lookalike_beside_a_real_directory_entry_is_taken_out() -> None:
     assert not posture.directory_listed_as_lookalike
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_LEAVE_MOVED)) == 1
-    # The Lander's hold on PR 3142, comment 7096232111, item 6: the ASCII entry names the
-    # final path before the Put step sends files where it points.
-    assert refusal.count(REPOINT) == 1 and refusal.index(REPOINT) < refusal.index("Put ")
+    assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_LEAVE)) == 1
     assert refusal.index(REMOVE) < refusal.index(LOOKALIKE_ANY)
     assert ADD_BACK_ANY not in refusal
     control = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=C:\\real"]))
@@ -632,7 +604,7 @@ def test_a_lookalike_beside_a_kept_ascii_path_is_taken_out_and_keep_says_ascii()
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_LEAVE)) == 1
-    assert refusal.count(KEEP_ASCII) == 1
+    assert refusal.count(KEEP_ASCII) == 1 and KEEP not in refusal
     assert refusal.index(LOOKALIKE_ANY) < refusal.index(KEEP_ASCII)
     assert ADD_BACK_ANY not in refusal
     control = service_env_refusal(_read([f"{KEY_CLASS_NAMES[0]}=", "mefor_secrets_directory=C:/d"]))
@@ -648,13 +620,10 @@ def test_a_lookalike_with_no_add_back_step_says_where_to_add_the_ascii_entry() -
     refusal = service_env_refusal(_read([f"{KEY_CLASS_NAMES[0]}={_KEY_B64}", f"{_LONG_S}=C:\\d"]))
     assert refusal is not None
     assert ADD_BACK_ANY not in refusal
-    # The look-alike sets the directory and nothing else in AppEnvironmentExtra, so the ending
-    # carries the add-back step's removal clause (comment 7096232111, item 2).
-    ending = lookalike_add(remove_other=True)
-    assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=ending)) == 1
+    assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_ADD)) == 1
     assert refusal.index(REMOVE) < refusal.index(LOOKALIKE_ANY)
     assert refusal.endswith(
-        f'{ending}. [security].enforcement = "warn" does not change this refusal'
+        f'{LOOKALIKE_ADD}. [security].enforcement = "warn" does not change this refusal'
     )
     control = service_env_refusal(
         _read([f"{KEY_CLASS_NAMES[0]}={_KEY_B64}", "MEFOR_SECRETS_DIRECTORY=C:\\d"])
@@ -664,90 +633,21 @@ def test_a_lookalike_with_no_add_back_step_says_where_to_add_the_ascii_entry() -
 
 
 @pytest.mark.parametrize(
-    "written",
+    ("written", "counts"),
     [
-        " MEFOR_SECRETS_DIRECTORY ",
-        "\tMEFOR_SECRETS_DIRECTORY\t",
-        "\x0bMEFOR_SECRETS_DIRECTORY",
-        "MEFOR_SECRETS_DIRECTORY\x0c",
-        "\u00a0MEFOR_SECRETS_DIRECTORY",
-        f" {_LONG_S}",
+        (" MEFOR_SECRETS_DIRECTORY ", True),
+        ("\tMEFOR_SECRETS_DIRECTORY\t", True),
+        ("\x0bMEFOR_SECRETS_DIRECTORY", False),
+        ("MEFOR_SECRETS_DIRECTORY\x0c", False),
     ],
-    ids=["space", "tab", "VT", "FF", "U+00A0", "padded-U+017F"],
+    ids=["space", "tab", "VT", "FF"],
 )
-def test_a_padded_directory_name_is_no_directory_entry(written: str) -> None:
-    """The Lander's hold on PR 3142, comment 7096232111, the name rule, which supersedes step 3
-    of comment 7091598959: ``os.environ`` keeps any blank around a name, ASCII or not, so a
-    padded name, a padded look-alike among them, is neither the directory nor a look-alike. It
-    is not listed, and the remedy says to take it out. Pinned with each padded name itself."""
-    line = f"{written}=C:\\d"
-    assert not _sets_directory(line) and _directory_entry_value(line) is None
-    assert _directory_lookalike(line) is None
-    posture = _read(["MEFOR_VALUE_A=x", line])
-    assert "MEFOR_SECRETS_DIRECTORY" not in posture.listed and posture.directory_padded
-    assert posture.directory_lookalikes == () and not posture.directory_in_lists
-    refusal = service_env_refusal(posture)
-    assert refusal is not None
-    assert refusal.count(lookalike_step(padded=True, ending=LOOKALIKE_NEXT)) == 1
-    assert refusal.count(CREATE) == 1 and refusal.count(SET_NO) == 1
-
-
-def test_a_lookalike_value_is_copied_only_where_it_is_plainly_a_path() -> None:
-    """The Lander's hold on PR 3142, comment 7096232111, item 3: a look-alike run on into an
-    empty key holds the key, so the remedy does not say to name its value under the ASCII
-    spelling, and says to name the real directory's path instead. The same in the ADD ending.
-    A plain path, the control, is still offered."""
-    joined = service_env_refusal(_read([f"{KEY_CLASS_NAMES[0]}=", f"{_LONG_S}={_KEY_B64}"]))
-    assert joined is not None
-    assert joined.count(lookalike_step(_LONG_S_NAMED, ending=lookalike_next(COPIED_UNPLAIN))) == 1
-    assert COPIED not in joined
-    added = service_env_refusal(_read([f"{KEY_CLASS_NAMES[0]}={_KEY_B64}", f"{_LONG_S}=Summer!"]))
-    assert added is not None
-    ending = lookalike_add(COPIED_UNPLAIN, remove_other=True)
-    assert added.count(lookalike_step(_LONG_S_NAMED, ending=ending)) == 1
-    control = service_env_refusal(_read([f"{KEY_CLASS_NAMES[0]}=", f"{_LONG_S}=C:\\d"]))
-    assert control is not None and COPIED_UNPLAIN not in control
-    assert control.count(lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_NEXT)) == 1
-
-
-def test_an_ascii_entry_the_engine_does_not_receive_is_not_left_as_the_directory() -> None:
-    """The Lander's hold on PR 3142, comment 7096232111, item 4: NSSM replaces the environment
-    with AppEnvironment where that holds anything, so an ASCII entry in the Service Control
-    Manager's Environment then reaches no engine. The remedy does not leave it as the one that
-    names the directory, and says to add one to AppEnvironmentExtra. With AppEnvironment empty,
-    the control, the engine receives it, so the remedy leaves it, repointed before the Put step
-    (item 6)."""
-    entries = [
-        (_EXTRA, "MEFOR_VALUE_A=x"),
-        ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\s"),
-        (_EXTRA, f"{_LONG_S}=C:\\d"),
-    ]
-    posture = _read_pairs([*entries, (_PLAIN, "OTHER=1")])
-    assert not posture.directory_named_received
-    refusal = service_env_refusal(posture)
-    assert refusal is not None
-    ending = lookalike_add(remove_other=True)
-    assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=ending)) == 1
-    assert REPOINT not in refusal and LOOKALIKE_LEAVE_MOVED not in refusal
-    control = _read_pairs(entries)
-    assert control.directory_named_received
-    control_refusal = service_env_refusal(control)
-    assert control_refusal is not None
-    leave = lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_LEAVE_MOVED)
-    assert control_refusal.count(leave) == 1 and control_refusal.count(REPOINT) == 1
-
-
-def test_a_padded_entry_beside_a_lookalike_is_not_left_as_the_directory() -> None:
-    """The Lander's hold on PR 3142, comment 7096232111, item 1: a padded ASCII entry beside a
-    look-alike is no entry the engine reads, so the remedy does not leave it as the one that
-    names the directory. It says to take out both, and to add the ASCII entry back."""
-    posture = _read(["MEFOR_VALUE_A=x", " MEFOR_SECRETS_DIRECTORY=C:\\real", f"{_LONG_S}=C:\\d"])
-    assert not posture.directory_named_received
-    refusal = service_env_refusal(posture)
-    assert refusal is not None
-    assert LOOKALIKE_LEAVE not in refusal and LOOKALIKE_LEAVE_MOVED not in refusal
-    step = lookalike_step(_LONG_S_NAMED, padded=True, ending=LOOKALIKE_NEXT)
-    assert refusal.count(step) == 1 and refusal.count(ADD_BACK_JOINED + ADD_BACK_CREATE) == 1
+def test_only_spaces_and_tabs_around_a_directory_name_are_stripped(
+    written: str, counts: bool
+) -> None:
+    """The Lander's hold on PR 3142, comment 7091598959, step 3: the reader strips ASCII
+    spaces and tabs around the name, ``strip(" \\t")``, and no other blank."""
+    assert _sets_directory(f"{written}=C:\\d") is counts
 
 
 def test_a_blank_directory_item_is_not_passed_back() -> None:

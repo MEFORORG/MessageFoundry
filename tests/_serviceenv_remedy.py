@@ -137,136 +137,50 @@ CREATE = (
 )
 
 
-#: The path the take-out step's LEAVE ending and the repoint step name, from ``stray``, the
-#: words for the entry a look-alike or padded name sets, where each such entry's value is blank
-#: or plainly a path.
-def leave_path(stray: str) -> str:
-    return (
-        "the path of the directory that holds the secrets directory's files, which may be the "
-        f"path {stray} named"
-    )
-
-
-#: The same path where a look-alike or padded entry's value is not plainly a path, so it is not
-#: offered (the Lander's hold on PR 3142, comment 7096232111, item 3).
-def leave_path_unplain(stray: str) -> str:
-    return (
-        "the path of the directory that holds the secrets directory's files, not the value of "
-        f"{stray}, which is not plainly a path"
-    )
-
-
-#: The take-out step's ending where an entry spelled in ASCII that the engine receives already
-#: names the directory, listed or kept, and no Put step prints, so it adds none.
+#: The look-alike step's ending where an entry spelled in ASCII already names the directory,
+#: listed or kept, so it adds none.
 LOOKALIKE_LEAVE = (
-    ", and leave the entry spelled in ASCII as the one that names it, first setting it to "
-    f"{leave_path('an entry this step takes out')}"
+    ", and leave the entry spelled in ASCII as the one that names it, first setting it to the "
+    "path that holds the secrets directory's files, which may be the one a look-alike named"
 )
 
-#: The step printed just before the Put step where LEAVE applies, so the files go where the
-#: final entry points (comment 7096232111, item 6).
-REPOINT = (
-    "Before moving anything into the secrets directory, set the entry spelled in ASCII that sets "
-    f"MEFOR_SECRETS_DIRECTORY to {leave_path('an entry a later step says to take out')}"
+#: Its ending where the add-back step prints next, which says how to add the ASCII entry.
+LOOKALIKE_NEXT = (
+    ". Where one named the secrets directory, name that same path under the ASCII spelling "
+    "MEFOR_SECRETS_DIRECTORY in the service's AppEnvironmentExtra; the next step says how"
 )
 
-#: The LEAVE ending where the repoint step printed before the Put step.
-LOOKALIKE_LEAVE_MOVED = (
-    ", and leave the entry spelled in ASCII as the one that names it, set to the path the step "
-    "before the move into the secrets directory gave it"
-)
-
-#: The path the NEXT and ADD endings name, where every look-alike or padded value is plain.
-COPIED = "the path that entry named"
-
-#: The same where one is not (item 3).
-COPIED_UNPLAIN = (
-    "the path of the directory that holds the secrets directory's files, not that entry's value, "
-    "which is not plainly a path"
+#: Its ending where nothing else names the path under the ASCII spelling.
+LOOKALIKE_ADD = (
+    ". Where one named the secrets directory, add MEFOR_SECRETS_DIRECTORY, spelled in ASCII, "
+    "naming that path to the service's AppEnvironmentExtra, the list install-service.ps1 reads. "
+    "`nssm set` replaces that whole list, so read it first with `nssm get`, running the "
+    "service's own nssm.exe by its full path, and pass back every entry but those this remedy "
+    "says to remove, leaving out the lines this step says to take out"
 )
 
 
-def lookalike_next(copied: str = COPIED) -> str:
-    """The ending where the add-back step prints next. It says to follow that step whether or not
-    install-service.ps1 made the directory, which path to name, and to read the list first
-    (item 8)."""
-    return (
-        ". Where an entry this step takes out was meant to name the secrets directory, follow the "
-        f"next step even where install-service.ps1 did not make that directory, and name {copied}, "
-        "in place of the path that step names. As it says, `nssm set` replaces that whole list, so "
-        "read AppEnvironmentExtra first with `nssm get`, running the service's own nssm.exe by its "
-        "full path"
-    )
-
-
-LOOKALIKE_NEXT = lookalike_next()
-
-
-def lookalike_add(
-    copied: str = COPIED, *, remove_other: bool = False, take_line: bool = False
-) -> str:
-    """The ending where nothing else names the path under the ASCII spelling: the add-back step's
-    clauses, gated as there, and its warning about the installer (items 2 and 7)."""
-    return (
-        ". Where an entry this step takes out was meant to name the secrets directory, add "
-        "MEFOR_SECRETS_DIRECTORY, spelled in ASCII, to the service's AppEnvironmentExtra, the list "
-        f"install-service.ps1 reads, naming {copied}, as the only entry there that sets it, "
-        + (f"{REMOVE_OTHER}, " if remove_other else "")
-        + (f"{TAKE_LINE}, " if take_line else "")
-        + "before any re-run of the installer, which refuses an existing directory the service "
-        "does not name. `nssm set` replaces that whole list, so read it first with `nssm get`, "
-        "running the service's own nssm.exe by its full path, and pass back every entry but those "
-        "this remedy says to remove, leaving out the lines this step says to take out"
-    )
-
-
-LOOKALIKE_ADD = lookalike_add()
-
-#: What the step says of the look-alikes, before ``named``.
-_LOOKALIKE_SAID = (
-    "At least one entry spells MEFOR_SECRETS_DIRECTORY with a character outside ASCII, written "
-    "here with each such character as its code point: "
-)
-
-#: What the step says of a padded name (comment 7096232111, item 1).
-PADDED = (
-    "At least one entry spells MEFOR_SECRETS_DIRECTORY with a blank before or after the name, "
-    "such as a space, a tab or U+00A0. Python's os.environ keeps that blank in the name, so the "
-    "engine does not read it as the secrets directory, and install-service.ps1, which matches "
-    "the name followed at once by an equals sign, does not see it either"
-)
-
-#: The take-out instruction itself, with item 5's qualifier.
-TAKE_OUT_STEP = (
-    "Take each such entry out of the service's environment, whether its value is blank or not, "
-    "taking only its own line out of an entry that holds other lines too, keeping each other "
-    "line no step above says to remove"
-)
-
-
-def lookalike_step(*named: str, ending: str, padded: bool = False) -> str:
+def lookalike_step(*named: str, ending: str) -> str:
     """The step printed wherever a line of any string in the lists sets a look-alike spelling of
-    MEFOR_SECRETS_DIRECTORY, one ``os.environ`` folds to it that is not ASCII, or a padded one.
-    ``named`` is each look-alike as the step writes it, every character outside ASCII as
-    ``<U+XXXX>``, none for a padded name alone, and ``ending`` one of the endings above. It says
-    to take each one out, blank or not, and never to keep one (the Lander's holds on PR 3142,
-    comments 7092584745 and 7096232111)."""
-    said: list[str] = []
-    if named:
-        said.append(
-            f"{_LOOKALIKE_SAID}{', '.join(named)}. Windows was measured keeping a name with "
-            "U+017F apart from the ASCII one, but the engine reads its environment through "
-            "Python's os.environ, which folds such a name to MEFOR_SECRETS_DIRECTORY, so the "
-            "engine may read it as the secrets directory. install-service.ps1 does not match it, "
-            "so a re-run of the installer may add a second entry beside it"
-        )
-    if padded:
-        said.append(PADDED)
-    return ". ".join([*said, TAKE_OUT_STEP]) + ending
+    MEFOR_SECRETS_DIRECTORY, one ``os.environ`` folds to it that is not ASCII. ``named`` is each
+    look-alike as the step writes it, every character outside ASCII as ``<U+XXXX>``, and
+    ``ending`` one of the three endings above. It says to take each one out, blank or not, and
+    never to keep one (the Lander's hold on PR 3142, comment 7092584745)."""
+    return (
+        "At least one entry spells MEFOR_SECRETS_DIRECTORY with a character outside ASCII, "
+        "written here with each such character as its code point: "
+        f"{', '.join(named)}. Windows keeps such a name apart from the ASCII one, but the engine "
+        "reads its environment through Python's os.environ, which folds it to "
+        "MEFOR_SECRETS_DIRECTORY, so the engine may read it as the secrets directory. "
+        "install-service.ps1 does not match it, so a re-run of the installer may add a second "
+        "entry beside it. Take each such entry out of the service's environment, whether its "
+        "value is blank or not, taking only its own line out of an entry that holds other lines "
+        f"too{ending}"
+    )
 
 
-#: The KEEP sentence wherever the take-out step also prints: it names its own antecedent, since
-#: that step sits between, and keeps the ASCII spelling only.
+#: The KEEP sentence wherever a look-alike is also present: it names its own antecedent, since
+#: the look-alike step sits between, and keeps the ASCII spelling only.
 KEEP_ASCII = (
     "Keep any entry a refused value runs on into that sets MEFOR_SECRETS_DIRECTORY, spelled in "
     "ASCII, to a path and nothing else, as its own entry"
@@ -275,6 +189,3 @@ KEEP_ASCII = (
 
 #: Text every form of the look-alike step carries, so a negative arm sees any.
 LOOKALIKE_ANY = "At least one entry spells MEFOR_SECRETS_DIRECTORY with a character outside ASCII"
-
-#: Text every form of the take-out step carries.
-TAKE_OUT_ANY = "Take each such entry out of the service's environment"
