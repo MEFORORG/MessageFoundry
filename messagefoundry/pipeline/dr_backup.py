@@ -4969,8 +4969,9 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
 
 #: What decided a :func:`_decrypt_check` verdict. ``cell`` is, under a key, at least a sealed value
 #: that did not open, other than one :func:`gave_no_verdict` reads as the key service's
-#: (``outage``); a single-value Transit decrypt answered 2xx with no ``data.plaintext`` is one, and
-#: so is a batch result with neither ``plaintext`` nor ``error``. It is also a value that opened
+#: (``outage``). A single-value Transit decrypt answered 2xx with no ``data.plaintext`` is
+#: ``cell``, and so is a batch result that echoes its reference but carries neither ``plaintext``
+#: nor ``error``. It is also a value that opened
 #: but its reader refuses (a ``QueueTagError``); a value whose AAD the open refused (an
 #: ``AADComponentError``); a marker in another ASCII case; and, on a surface the keyed store sealed
 #: and without ``allow_unmarked_ciphertext``, a value with no marker. ``damaged`` is a BLOB, or a
@@ -4997,11 +4998,10 @@ WalkKind = Literal[
 #: such framing. At least two such gaps are known, each a misread where another version wrote the
 #: snapshot. One is kind ``damaged`` (see :data:`WalkKind`), should another version's writer store
 #: what that kind names. The other is a keyed walk of a cipher column with an unregistered
-#: collation ("no such collation sequence"), kind ``sqlite`` where the collation's own
-#: name holds no ``schema_verify._SHAPE_MESSAGES`` entry: :func:`is_schema_step_error` matches
-#: those entries as substrings of the whole message, so it rejects that one, and
-#: :func:`_sqlite_kind` falls through to ``sqlite``. This build's SQLite schema declares no
-#: collation.
+#: collation ("no such collation sequence"), kind ``sqlite`` where the collation's name holds no
+#: ``schema_verify._SHAPE_MESSAGES`` entry, or holds "no such module", which :func:`_sqlite_kind`
+#: excludes. :func:`is_schema_step_error` matches those entries as substrings of the whole
+#: message, so it rejects the first, and :func:`_sqlite_kind` falls through to ``sqlite`` for both.
 _MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
 
 
