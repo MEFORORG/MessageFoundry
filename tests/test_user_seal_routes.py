@@ -17,6 +17,7 @@ and only a row absent on a re-read is gone.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import itertools
 import re
 from collections.abc import AsyncIterator
@@ -39,6 +40,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import USER_KIND
 from messagefoundry.store.store import AdminRemoval, MessageStore, UserRecord
 from tests.test_api_auth import ABSENT_USER_ID, _add, _auth, _login, _reauth
 from tests.test_user_seal import _raw_for
@@ -526,13 +528,18 @@ _CONSOLE_SENTENCES = {
         r"reader gives a failing record\. It is reported under "
         r"`integrity\.authority_seal_unverifiable`"
     ),
-    "the report key is the part and the id": (
-        r"The key is the record's part and the account's id, `\{part\}:\{user_id\}` in "
-        r"`AuthService\._user_seal_failed`"
+    "the report key is user and the stored id": (
+        r"These reads report a failing record under the key `user:` followed by the account's "
+        r"stored id, which `AuthService\._user_seal_failed` builds; a record Vault transit cannot "
+        r"verify is reported on a key of its own"
+    ),
+    "the unverifiable report key": (
+        r"on a report key of its own, `unverifiable:user:` followed by the account's id, which "
+        r"`AuthService\._user_seal_unverifiable` builds"
     ),
     "the single-check refusals are a floor": (
-        r"At least these are refused on the first check, with no re-read: a record Vault transit "
-        r"cannot verify"
+        r"except at least these, refused on the first check with no re-read: a record Vault "
+        r"transit cannot verify"
     ),
     "the confirmation for the caller's own account has no form": (
         r"Where the id in its path is the caller's own, that page shows a note that the caller "
@@ -558,8 +565,8 @@ _UNSCOPED = {
 #: Overclaims Lander hold 7095706239 asked to keep out of the statement, restored from this
 #: branch's earlier bans and widened to the wording the hold found: each regex with the earlier
 #: sentences it was written against, every one of which it must match, as its positive controls.
-#: The throttle keys on the record's part and the account's id (``AuthService._user_seal_failed``),
-#: not on the account; a record Vault transit cannot verify is refused at its first check, not
+#: The throttle keys on ``user:`` and the account's stored id (``AuthService._user_seal_failed``),
+#: and an unverifiable record on a key of its own, not on the account alone; a record Vault transit cannot verify is refused at its first check, not
 #: after the two failing reads a failing record takes; and that is not the only single-check case.
 _REMOVED: dict[str, tuple[str, tuple[str, ...]]] = {
     "any reader of the same account": (
@@ -602,6 +609,17 @@ def test_the_security_doc_does_not_state_the_423_without_the_confirmation(overcl
     text = _SECURITY_MD.read_text("utf-8")
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     assert not re.search(overclaim, body, re.IGNORECASE), overclaim
+
+
+def test_the_report_keys_the_security_doc_names_are_the_ones_the_code_builds() -> None:
+    """The statement names two report keys by the methods that build them (Lander hold
+    7095706239); a change to either key's format must move the statement with it."""
+    assert USER_KIND == "user"
+    failed = inspect.getsource(AuthService._user_seal_failed)
+    assert 'f"{part}:{user_id}"' in failed
+    assert inspect.signature(AuthService._user_seal_failed).parameters["part"].default == USER_KIND
+    unverifiable = inspect.getsource(AuthService._user_seal_unverifiable)
+    assert 'f"unverifiable:{USER_KIND}:{user_id}"' in unverifiable
 
 
 @pytest.mark.parametrize("name", sorted(_REMOVED))
