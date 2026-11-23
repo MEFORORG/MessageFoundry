@@ -3105,7 +3105,7 @@ def test_prove_absences_screen_outer_rule_only_adds_sound_refusals(
         mutation = _decorated(mut, method=method)
         refused = _refused(mutation, target, tmp_path)
         with monkeypatch.context() as patch:
-            patch.setattr(scorecard_module._Reading, "outer_mismatch", lambda *_: None)
+            patch.setattr(scorecard_module._Reading, "outer_mismatch", lambda *_, **__: None)
             refused_before = _refused(mutation, target, tmp_path)
         assert refused or not refused_before, (live, mut, method, binding)
         if refused and not refused_before:
@@ -3128,7 +3128,7 @@ def test_prove_absences_screen_refuses_a_dropped_or_swapped_outer_shape_decorato
     swapped_from = "w = WRAP\n\n" + _decorated(("staticmethod",), method=method)
     swapped = _decorated(("classmethod", "w"), method=method)
     with monkeypatch.context() as patch:
-        patch.setattr(scorecard_module._Reading, "outer_mismatch", lambda *_: None)
+        patch.setattr(scorecard_module._Reading, "outer_mismatch", lambda *_, **__: None)
         assert not _refused(dropped, target, tmp_path)
         assert not _refused(swapped, swapped_from, tmp_path)
     assert _refused(dropped, target, tmp_path)
@@ -3222,6 +3222,11 @@ def test_prove_absences_screen_outer_rule_reads_lru_cache_given_a_callable_as_un
         target = _OUTER_HEAD + _decorated((f"functools.lru_cache({size})", "w"), method=False)
         assert _screen(plain, target, tmp_path) == [], size
         assert _differs_under_every_w(target, plain, method=False) is False, size
+    # A ** mapping may carry a callable maxsize.
+    mapped = _OUTER_HEAD + "opts = {'maxsize': ident}\n\n"
+    mapped += _decorated(("functools.lru_cache(**opts)", "w"), method=False)
+    assert _screen(plain, mapped, tmp_path) == []
+    assert _differs_under_every_w(mapped, plain, method=False) is False
     for size in ("maxsize=1", "None"):
         target = _OUTER_HEAD + _decorated((f"functools.lru_cache({size})", "w"), method=False)
         assert _refused(plain, target, tmp_path), size
@@ -3244,6 +3249,29 @@ def test_prove_absences_screen_outer_rule_distrusts_a_decorator_rebound_in_its_l
     # Control: a name the loop does not bind is still read.
     steady = target.replace("    deco = functools.cache\n", "    other = functools.cache\n")
     assert _refused(mutation, steady, tmp_path)
+    # A name a function declares `global` may be rebound by any call of it, wherever it runs.
+    called = (
+        "import functools\n\nw = WRAP\n\ndef rebind():\n    global deco\n"
+        "    deco = functools.cache\n\ndeco = property\nrebind()\n\n@deco\n@w\ndef f(a):\n"
+        "    return 1\n"
+    )
+    assert _screen(mutation, called, tmp_path) == []
+    assert _differs_under_every_w(called, mutation, method=False) is False
+
+
+def test_prove_absences_screen_outer_rule_reads_a_module_level_staticmethod_as_none(
+    tmp_path: Path,
+) -> None:
+    """Outside a class a ``staticmethod`` is called as the function under it is, so dropping one
+    beside an unnamed decorator is accepted; inside one it is still refused."""
+    plain = _decorated((), method=False)
+    target = "w = WRAP\n\n" + _decorated(("staticmethod", "w"), method=False)
+    assert _screen(plain, target, tmp_path) == []
+    method = "w = WRAP\n\n" + _decorated(("staticmethod", "w"), method=True)
+    assert _refused(_decorated((), method=True), method, tmp_path)
+    # Swapped for a property, the refusal names the staticmethod it reads.
+    (problem,) = _screen(_decorated(("property",), method=False), target, tmp_path)
+    assert "builtins.staticmethod" in problem
 
 
 def test_prove_absences_screen_outer_refusal_says_what_the_change_does(tmp_path: Path) -> None:
@@ -3256,6 +3284,11 @@ def test_prove_absences_screen_outer_refusal_says_what_the_change_does(tmp_path:
     assert "the function the def itself makes" in problem
     assert "a cache wrapper, whose call results are cached" in problem
     # Control: a signature refusal keeps its own text.
+    # A property swapped for a cached_property: the text names what differs.
+    prop = _OUTER_HEAD + _decorated(("property", "w"), method=True)
+    (swapped,) = _screen(_decorated(("functools.cached_property",), method=True), prop, tmp_path)
+    assert "runs its function once per instance" in swapped
+    assert "runs its getter on every read" in swapped
     bare = _OUTER_HEAD + plain
     (renamed,) = _screen("def f(b):\n    return 1\n", bare, tmp_path)
     assert "breaks every call site" in renamed

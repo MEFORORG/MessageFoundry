@@ -2612,8 +2612,9 @@ _PASSTHROUGH_DECORATORS: Final = frozenset(
 )
 #: Decorators that may be called first, the call returning the decorator itself.
 _CALLED_DECORATORS: Final = frozenset({"functools.wraps", "functools.lru_cache", "pytest.fixture"})
-#: Shape decorators whose result hands each call on to what they wrap, so what is applied under
-#: them can decide what a call returns; :attr:`_Reading.outer` reads them as :data:`_UNNAMED`.
+#: Shape decorators whose result is a plain function, the kind of object a bare def makes, that
+#: hands a call on to what they wrap, so the kind of object bound tells nothing;
+#: :attr:`_Reading.outer` reads them as :data:`_UNNAMED`.
 _DELEGATING_DECORATORS: Final = frozenset(
     {"functools.singledispatch", "functools.singledispatchmethod"}
 )
@@ -2621,7 +2622,10 @@ _DELEGATING_DECORATORS: Final = frozenset(
 
 def _lru_cache_factory(call: ast.Call) -> bool:
     """Whether a call of ``lru_cache`` returns a decorator rather than a cache wrapper around its
-    argument: every positional argument, and ``maxsize``, is a literal number or ``None``."""
+    argument: no ``**`` mapping, and every positional argument and ``maxsize`` is a literal number
+    or ``None``."""
+    if any(k.arg is None for k in call.keywords):
+        return False
     sizes = [*call.args, *(k.value for k in call.keywords if k.arg == "maxsize")]
     return all(
         isinstance(s, ast.Constant) and (s.value is None or isinstance(s.value, int)) for s in sizes
@@ -2703,7 +2707,9 @@ class _Reading:
     #: :func:`_outer_decorator`.
     outer: dict[_DefNode, str | None] = field(default_factory=dict)
 
-    def outer_mismatch(self, m: _DefNode, s: _DefNode) -> tuple[str | None, str | None] | None:
+    def outer_mismatch(
+        self, m: _DefNode, s: _DefNode, *, method: bool = True
+    ) -> tuple[str | None, str | None] | None:
         """`m`'s and `s`'s :attr:`outer` decorators where they tell the two shapes apart, else
         ``None``.
 
@@ -2711,13 +2717,19 @@ class _Reading:
         shape decorator and none: with only passthrough decorators above it, the shape decorator
         applied last is what the name is bound to the result of, whatever is applied under it. Any
         other decorator may make that binding anything, so where one is outermost on either side
-        this tells nothing, and :meth:`pair` decides (BACKLOG #5590)."""
+        this tells nothing, and :meth:`pair` decides (BACKLOG #5590). Outside a class, where
+        `method` is false, a ``staticmethod`` is called as the function under it is, so it is
+        read as none."""
         if m not in self.outer or s not in self.outer:
             return None
         mo, so = self.outer[m], self.outer[s]
-        if _SAME_SHAPE.get(mo or "", mo) == _SAME_SHAPE.get(so or "", so) or _UNNAMED in (mo, so):
+        if _UNNAMED in (mo, so):
             return None
-        return mo, so
+        shapes = [
+            None if o == "builtins.staticmethod" and not method else _SAME_SHAPE.get(o or "", o)
+            for o in (mo, so)
+        ]
+        return None if shapes[0] == shapes[1] else (mo, so)
 
     def pair(self, m: _DefNode, s: _DefNode) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """The decorators to compare for `m` against `s`, or none.
@@ -2738,7 +2750,9 @@ class _Reading:
         return all("builtins.staticmethod" in self.decorators.get(n, ()) for n in (m, s))
 
     classes: dict[ast.ClassDef, _ScopeState] = field(default_factory=dict)
-    #: The names the loop bodies enclosing the statement being read bind (:func:`_loop_bound`).
+    #: Names whose origin at a def may not be the one this reading resolves: those the loops
+    #: enclosing the statement being read may bind (:func:`_loop_bound`), and those any function
+    #: declares ``global``, which a call may rebind at any point.
     loop_bound: frozenset[str] = frozenset()
 
 
@@ -2747,8 +2761,10 @@ _ANY_NAME: Final = "*"
 
 
 def _loop_bound(body: list[ast.stmt]) -> frozenset[str]:
-    """Every name a statement anywhere in `body` may bind, nested scopes included, so more than
-    the loop's own scope binds; :data:`_ANY_NAME` stands for all of them."""
+    """A superset of the names the statements in `body` may bind: every name stored, defined or
+    declared ``global`` or ``nonlocal`` anywhere in them, nested scopes, a loop's target and its
+    ``else`` included, and every name an import there mentions; :data:`_ANY_NAME` stands for all
+    of them."""
     names: set[str] = set()
     for stmt in body:
         for node in ast.walk(stmt):
@@ -3207,12 +3223,14 @@ def _signature_clause(
 
 #: What a name is bound to with each shape decorator outermost, for :func:`_outer_clause`.
 _OUTER_BINDS: Final = {
-    "builtins.property": "a property object, which is not callable",
+    "builtins.property": "a property, which is not callable and runs its getter on every read",
     "builtins.staticmethod": "a staticmethod, whose callers pass every parameter",
     "builtins.classmethod": "a classmethod, which a call through its class passes the class first",
     "functools.cache": "a cache wrapper, whose call results are cached",
     "functools.lru_cache": "a cache wrapper, whose call results are cached",
-    "functools.cached_property": "a cached_property object, which is not callable",
+    "functools.cached_property": (
+        "a cached_property, which is not callable and runs its function once per instance"
+    ),
     "contextlib.contextmanager": "a function whose call returns a context manager",
     "contextlib.asynccontextmanager": "a function whose call returns an async context manager",
     "typing.overload": "an overload stub, which raises NotImplementedError when called",
@@ -3227,11 +3245,12 @@ class _OuterClause(str):
     tail: str
 
 
-def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) -> str:
+def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) -> _OuterClause:
     mine, live = (f"shape decorator {o}" if o else "no shape decorator" for o in outer)
     clause = _OuterClause(
-        f"redefines {qual}() with {mine} outermost where {path} has {live} (as this screen "
-        "resolves them), so the name is bound to a different shape"
+        f"redefines {qual}() with {mine} as its outermost decorator, passthrough decorators "
+        f"aside, where {path} has {live} (as this screen resolves them), so the name is bound "
+        "to a different shape"
     )
     binds = [
         _OUTER_BINDS.get(o, f"what {o} returns") if o else "the function the def itself makes"
@@ -3261,7 +3280,7 @@ def _node_mismatch(
             reading.classes[m].defs, reading.classes[s].defs, f"{qual}.", path, reading, method=True
         )
     assert not isinstance(m, ast.ClassDef) and not isinstance(s, ast.ClassDef)
-    outer = reading.outer_mismatch(m, s)
+    outer = reading.outer_mismatch(m, s, method=method)
     if outer is not None:
         return _outer_clause(qual, path, outer)
     mdecs, sdecs = reading.pair(m, s)
@@ -3350,7 +3369,15 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         # The TARGET does not parse. Not this claim's defect, and not something to refuse it over --
         # leave it to execution, where the baseline will already be red and fail closed.
         return True
-    reading = _Reading()
+    reading = _Reading(
+        loop_bound=frozenset(
+            name
+            for tree in (source, mutation)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Global)
+            for name in node.names
+        )
+    )
     walked: tuple[_ScopeState, _ScopeState] | None
     try:
         live = _run_block(source.body, _ScopeState(), reading, generous=True)
