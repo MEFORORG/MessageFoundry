@@ -183,7 +183,7 @@ _DB: dict[str, object] = {
         pytest.param(
             {
                 "auth": "SQL",
-                "encrypt": "yes",
+                "encrypt": True,
                 "trust_server_certificate": True,
                 "password": "}}x}",
                 "odbc_driver": "ODBC Driver 17 for SQL Server",

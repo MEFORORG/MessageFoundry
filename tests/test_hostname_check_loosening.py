@@ -133,9 +133,11 @@ def test_an_unset_value_takes_the_default_on_mllp_ftps_and_email(unset: str | No
     assert bool_setting({}, "k", default=True) is True
     assert bool_setting({"k": False}, "k", default=True) is False
     assert bool_setting({"k": unset}, "k", default=False) is False
-    # Controls: only None and the empty string are unset; whitespace and 0 read with bool().
-    assert bool_setting({"k": " "}, "k", default=False) is True
-    assert bool_setting({"k": 0}, "k", default=True) is False
+    # Controls: only None and the empty string are unset; whitespace and 0 are refused, not read
+    # with bool() (vault BACKLOG #3234).
+    for other in (" ", 0):
+        with pytest.raises(ValueError, match="k must be true or false"):
+            bool_setting({"k": other}, "k", default=True)
 
     blank = {"tls_verify": unset, "tls_check_hostname": unset}
     mllp = _mllp_ssl_context({"tls": True, **blank}, server=False, name="OB_X")

@@ -1952,6 +1952,18 @@ def _token_hop_reads_ca(settings: Mapping[str, Any]) -> bool:
     return smart_auth_configured(settings) or oauth2_auth_configured(settings)
 
 
+def _flag_or_unresolved(settings: Mapping[str, Any], key: str, *, default: bool) -> bool:
+    """``bool_setting``, except that an unresolved ``env()`` reference reads as on: its value is
+    not known yet, so no CA reads as unread on it, and the check after resolution decides. Any
+    other non-bool is refused, as ``bool_setting`` refuses it (vault BACKLOG #3234). Imported here,
+    not at the top, for the reason :func:`_token_hop_reads_ca` gives."""
+    from messagefoundry.config.wiring import EnvRef
+
+    if isinstance(settings.get(key), EnvRef):
+        return True
+    return bool_setting(settings, key, default=default)
+
+
 def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     """Why a dialling connection would never read its ``tls_ca_file``, or ``None`` when it reads
     it or the settings cannot tell yet (vault BACKLOG #2371).
@@ -1971,20 +1983,20 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     # Each flag is read as its connector reads it: an explicit None is the default (vault BACKLOG
     # #3230), so a None that turns nothing off does not make a read CA look unread.
     for key, default in (("tls", False), ("use_tls", True)):
-        if key in settings and not bool_setting(settings, key, default=default):
+        if key in settings and not _flag_or_unresolved(settings, key, default=default):
             return f"{key} is off, so the hop builds no TLS context"
     # Ftp() refuses a CA beside a literal tls=False itself. An env() tls resolves only later, into
     # this protocol (vault BACKLOG #3234), so the resolved check is where that case is caught.
     protocol = settings.get("protocol")
     if isinstance(protocol, str) and remote_file_protocol(settings) == "ftp":
         return "plain FTP (tls=False) builds no TLS context"
-    if not bool_setting(settings, "tls_verify", default=True):
+    if not _flag_or_unresolved(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
     if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
         return "ech_egress sends both hops to an http:// sidecar, which does the TLS itself"
     if _token_hop_reads_ca(settings):
         return None
-    if not bool_setting(settings, "verify_tls", default=True):
+    if not _flag_or_unresolved(settings, "verify_tls", default=True):
         return "verify_tls=False verifies no server certificate, and no token hop reads it"
     if _is_http_url(settings.get("url")):
         return "the url is http://, so the hop has no TLS, and no token hop reads it"
