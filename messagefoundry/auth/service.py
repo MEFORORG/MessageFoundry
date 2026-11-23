@@ -12443,8 +12443,9 @@ class AuthService:
         multi-session revocations record it. The count includes lapsed rows the cap ended, which
         the validator already refused; the store returns one count for both.
         """
+        # 0 = unlimited; the load refuses a negative cap (BACKLOG #5318).
         cap = self._settings.max_sessions_per_user
-        if not cap or cap <= 0:
+        if not cap:
             return
         user = await self._load_user(user_id)
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it
