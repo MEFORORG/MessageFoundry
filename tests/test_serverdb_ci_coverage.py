@@ -41,6 +41,7 @@ Pure text/AST analysis of the repo: no database, no network, and no gate of its 
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from pathlib import Path
 
@@ -201,33 +202,121 @@ def _serverdb_full_pattern() -> re.Pattern[str]:
     )
 
 
-def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
-    """Each ``messagefoundry`` module those suites import, mapped to its repo-relative path.
+def _module_path(module: str) -> str | None:
+    """The repo-relative file a dotted ``messagefoundry`` module name resolves to, if any.
 
     A PACKAGE maps to ``pkg/__init__.py``, never ``pkg.py``. Getting that wrong reports a package as
     unmatched while the directory arm plainly admits it -- a FALSE ALARM, which is the failure that
     trains readers to discount this test. The first draft of this measurement made exactly that
     mistake and over-reported the hole.
+
+    Matched against a listing rather than probed with ``is_file()``: on a case-insensitive
+    filesystem ``from messagefoundry.pipeline import Engine`` would probe ``pipeline/Engine.py`` and
+    find ``pipeline/engine.py``, recording a path no regex arm spells.
     """
+    base = module.replace(".", "/")
+    for candidate in (f"{base}.py", f"{base}/__init__.py"):
+        if candidate in _engine_source_paths():
+            return candidate
+    return None
+
+
+@functools.cache
+def _engine_source_paths() -> frozenset[str]:
+    """Every ``messagefoundry`` source, repo-relative, with the case the tree spells it in."""
+    return frozenset(
+        p.relative_to(REPO_ROOT).as_posix() for p in (REPO_ROOT / "messagefoundry").rglob("*.py")
+    )
+
+
+def _engine_modules_imported_by(text: str) -> dict[str, str]:
+    """Each ``messagefoundry`` module one source's imports reach, mapped to its repo-relative path.
+
+    ``from pkg import name`` is resolved per name: when ``pkg.name`` is itself a module (a
+    submodule import such as ``from messagefoundry import sqlserver_roles``), that module's file is
+    what the suite asserts against, so it is the one recorded. Otherwise ``name`` is an attribute of
+    ``pkg`` and ``pkg``'s own file is recorded. Mapping every ``from`` import to ``pkg`` alone sent a
+    submodule import to ``messagefoundry/__init__.py``, a false alarm that also hid the submodule.
+    """
+    modules: list[str] = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.ImportFrom):
+            if node.level or not (node.module or "").startswith("messagefoundry"):
+                continue
+            package = str(node.module)
+            for alias in node.names:
+                submodule = f"{package}.{alias.name}"
+                if alias.name != "*" and _module_path(submodule) is not None:
+                    modules.append(submodule)
+                else:
+                    modules.append(package)
+        elif isinstance(node, ast.Import):
+            modules += [a.name for a in node.names if a.name.startswith("messagefoundry")]
+    paths: dict[str, str] = {}
+    for module in modules:
+        path = _module_path(module)
+        if path is not None:
+            paths[module] = path
+    return paths
+
+
+def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
+    """Each ``messagefoundry`` module those suites import, mapped to its repo-relative path."""
     paths: dict[str, str] = {}
     for name in sorted(_files_run_by_server_db_steps()):
         source = REPO_ROOT / "tests" / f"{name}.py"
-        if not source.is_file():
-            continue
-        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.ImportFrom):
-                names = [node.module] if (node.module or "").startswith("messagefoundry") else []
-            elif isinstance(node, ast.Import):
-                names = [a.name for a in node.names if a.name.startswith("messagefoundry")]
-            else:
-                continue
-            for module in names:
-                base = str(module).replace(".", "/")
-                for candidate in (f"{base}.py", f"{base}/__init__.py"):
-                    if (REPO_ROOT / candidate).is_file():
-                        paths[str(module)] = candidate
-                        break
+        if source.is_file():
+            paths.update(_engine_modules_imported_by(source.read_text(encoding="utf-8")))
     return paths
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # A submodule named through its package: the submodule, not the package root.
+        (
+            "from messagefoundry import sqlserver_roles",
+            {"messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py"},
+        ),
+        (
+            "from messagefoundry.store import postgres as pg",
+            {"messagefoundry.store.postgres": "messagefoundry/store/postgres.py"},
+        ),
+        # An attribute of a module or package: that module or package's own file.
+        (
+            "from messagefoundry.sqlserver_roles import probed_grant",
+            {"messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py"},
+        ),
+        (
+            "from messagefoundry import Message",
+            {"messagefoundry": "messagefoundry/__init__.py"},
+        ),
+        # A class whose name matches a submodule's but for case is an attribute, on every OS.
+        (
+            "from messagefoundry.pipeline import Engine",
+            {"messagefoundry.pipeline": "messagefoundry/pipeline/__init__.py"},
+        ),
+        # Both on one line: each name resolves on its own.
+        (
+            "from messagefoundry import sqlserver_roles, Message",
+            {
+                "messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py",
+                "messagefoundry": "messagefoundry/__init__.py",
+            },
+        ),
+        # The forms that already resolved stay resolved.
+        (
+            "import messagefoundry.sqlserver_roles as sqlserver_roles",
+            {"messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py"},
+        ),
+        ("import os; from pathlib import Path", {}),
+    ],
+)
+def test_import_scan_resolves_from_imports_to_the_module_path(
+    source: str, expected: dict[str, str]
+) -> None:
+    """``from messagefoundry import X`` must reach X's file when X is a submodule (PR 3206 hold)."""
+    assert _engine_modules_imported_by(source) == expected
 
 
 def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
@@ -280,10 +369,7 @@ def test_the_serverdb_gate_still_refuses_unrelated_paths() -> None:
 
     # And SOME engine source must still be refused. Derived rather than hard-coded, so this keeps
     # working as the tree grows: a named file could legitimately become imported one day.
-    engine = {
-        str(p.relative_to(REPO_ROOT)).replace("\\", "/")
-        for p in (REPO_ROOT / "messagefoundry").rglob("*.py")
-    }
+    engine = _engine_source_paths()
     assert engine, "found no engine sources — the rglob has drifted"
     assert any(not pattern.match(path) for path in engine), (
         "the `serverdb` regex admits EVERY file under messagefoundry/, so it selects nothing and "
