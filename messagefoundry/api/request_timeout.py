@@ -19,11 +19,11 @@ While the 413 is written the deadline is held off to at least :data:`_REFUSAL_WR
 past its start, so a client that keeps reading gets the whole 413 within that grace. Once the host
 has taken the 413, or the write fails, the deadline is back on its own time.
 
-**The deadline cancels only the task running the route.** If the read that crossed the cap ran on
-that task, a client stalling the write past the later of the grace and the deadline's own time is
-cut off with the route, and can be left with a 413 head and no body. If the read ran on a task of
-its own, this deadline does not cancel the write. Whether the client still receives it once the
-request ends is up to the host, which may close the connection.
+The deadline cancels the route's task, and cancellation reaches a read the route is awaiting, so a
+write stalled there past the later of the grace and the deadline's own time is cut with the route
+and can leave a 413 head with no body. A read the route shielded or left detached is not cancelled
+by this deadline. Whether its client still receives the 413 once the request ends is up to the
+host, which may close the connection.
 
 **Pure ASGI, not** ``BaseHTTPMiddleware``: no task hop, and the response-start signal is visible
 directly. It is registered inside :class:`~messagefoundry.api.client_networks.ClientNetworkMiddleware`
