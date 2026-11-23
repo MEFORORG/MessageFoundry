@@ -414,7 +414,7 @@ is **CycloneDX** (native VEX support); an SPDX rendering can be produced on requ
 
 `.github/actions/cla-assistant-lite/` carries 1.18 MB of compiled JavaScript — the archived
 `contributor-assistant/github-action`, vendored on 2026-08-29 because GitHub archived the upstream
-repository and no maintained fork exists. It is **not a released artifact**: `.github/` is outside
+repository and no maintained fork exists. Since 2026-11-23 it is a patched fork of that commit. It is **not a released artifact**: `.github/` is outside
 the sdist's `only-include`, so no wheel, sdist or engine deployment carries it. It runs in CI, on
 `pull_request_target` and on an `issue_comment` posted on a pull request whose body is `recheck` or
 the sign-off sentence, compared ignoring case. `cla.yml` is also triggered by `merge_group`, where the step's `if:` skips the bundle
@@ -456,9 +456,10 @@ Two things are worth stating precisely, because a supply-chain record that impli
 proves is worse than none:
 
 1. **What is proven.** The vendored bundle is the upstream blob at the pinned commit with a
-   176-byte two-line header prepended, and nothing else changed. An auditor strips the first two
-   lines, takes the SHA-256, and compares it with the upstream digest in the record — no network,
-   no Node. The lockfile is derived the same way: `git hash-object` on it reproduces the blob id
+   202-byte two-line header prepended and a short list of recorded patches applied (BACKLOG #5644,
+   #5645; the action's README says what each one does), and nothing else changed. An auditor
+   strips the first two lines, reverts the recorded patches, takes the SHA-256, and compares it
+   with the upstream digest in the record — no network, no Node. The lockfile is derived the same way: `git hash-object` on it reproduces the blob id
    the record names, so neither vendored artifact rests on a number somebody merely wrote down.
 2. **What is not.** A clean audit of the lockfile proves the *declared* dependencies of that
    upstream commit are clean. It does **not** prove the bundle was built from them. Reproducing an
