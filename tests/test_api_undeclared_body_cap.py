@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -22,9 +23,14 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Message, Receive, Scope, Send
 
+from messagefoundry.api import request_timeout
 from messagefoundry.api.app import _MAX_REQUEST_BODY_BYTES, create_app
 from messagefoundry.api.security import public_route
-from tests._deadline_capture import GENEROUS_DEADLINE_SECONDS, capture_deadlines
+from tests._deadline_capture import (
+    GENEROUS_DEADLINE_SECONDS,
+    DeadlineCapture,
+    capture_deadlines,
+)
 from tests.test_api_security_header_floor import _DNS_HOST
 
 _CHUNK = 64 * 1024
@@ -69,12 +75,16 @@ async def _drive(
     headers: tuple[tuple[bytes, bytes], ...] = (),
     send_fails: bool = False,
     query_string: bytes = b"",
+    on_pull: Callable[[], None] | None = None,
+    on_send: Callable[[Message], Awaitable[None]] | None = None,
 ) -> _Run:
     """Send ``chunks`` as a body, one ``receive`` each, with neither framing header by default.
 
     ``ends_early`` is a client that goes away with the body unfinished. ``headers`` adds request
     headers. ``send_fails`` is a client gone by the time a response starts. ``query_string`` is
-    the raw query, which an ASGI host passes through undecoded."""
+    the raw query, which an ASGI host passes through undecoded. ``on_pull`` runs as a chunk is
+    handed over, with no yield before the route gets it. ``on_send`` is the write of a message,
+    awaited before the message counts as sent."""
     scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -102,11 +112,15 @@ async def _drive(
             return {"type": "http.disconnect"}
         run.pulled += 1
         body = pending.pop(0)
+        if on_pull is not None:
+            on_pull()
         return {"type": "http.request", "body": body, "more_body": bool(pending) or ends_early}
 
     async def send(message: Message) -> None:
         if send_fails:
             raise OSError("client gone")
+        if on_send is not None:
+            await on_send(message)
         run.sent.append(message)
 
     await app(scope, receive, send)
@@ -328,6 +342,132 @@ async def test_a_route_running_on_after_the_counted_413_is_still_cut_off_by_its_
     assert capture.deadlines[0].expired()
     assert run.status == 413  # the property asserts one response start: no 503 follows the 413
     assert any("after the body limit's 413" in r.getMessage() for r in caplog.records)
+
+
+_OVER_CAP_ROUTE = "/_test/waits-after-disconnect"
+_REFUSAL_BODY = b'{"detail":"request body too large"}'
+
+
+def _app_whose_route_waits_after_the_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, DeadlineCapture, list[str], list[float], Callable[[], None]]:
+    """The real app, a route only its deadline can end, and the hook that makes that deadline due.
+
+    The hook runs as the over-cap chunk is handed over. Nothing yields between it and the 413's
+    start, so the deadline comes due inside the send and at no earlier point."""
+    app = create_app(allow_no_auth=True)
+    capture = capture_deadlines(monkeypatch, app)
+    outcome: list[str] = []
+    due: list[float] = []
+
+    @app.post(_OVER_CAP_ROUTE)
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
+    async def _waits(request: Request) -> dict[str, str]:
+        with contextlib.suppress(ClientDisconnect):
+            await request.body()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            outcome.append("cut off")
+            raise
+        return {"status": "ran on"}
+
+    def deadline_due_now() -> None:
+        now = asyncio.get_running_loop().time()
+        capture.deadlines[0].reschedule(now)
+        due.append(now)
+
+    return app, capture, outcome, due, deadline_due_now
+
+
+async def test_a_deadline_due_during_the_413s_send_does_not_cut_the_413(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The client gets the 413's start and its body, and the route is cut off right after them."""
+    app, capture, outcome, due, deadline_due_now = _app_whose_route_waits_after_the_disconnect(
+        monkeypatch
+    )
+
+    async def body_write_yields(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.request_timeout"):
+        run = await asyncio.wait_for(
+            _drive(
+                app,
+                [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)],
+                path=_OVER_CAP_ROUTE,
+                on_pull=deadline_due_now,
+                on_send=body_write_yields,
+            ),
+            GENEROUS_DEADLINE_SECONDS,
+        )
+
+    assert [m["type"] for m in run.sent] == ["http.response.start", "http.response.body"]
+    assert run.status == 413
+    assert run.sent[1]["body"] == _REFUSAL_BODY
+    assert outcome == ["cut off"]
+    # Back on its own time once written, so the send's protection gave the route nothing extra.
+    assert capture.deadlines[0].expired() and capture.deadlines[0].when() == due[0]
+    assert any("after the body limit's 413" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_client_stalling_the_413s_write_cannot_hold_the_deadline_open(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The send's protection is bounded: past it the deadline cuts the write and the route."""
+    monkeypatch.setattr(request_timeout, "_REFUSAL_WRITE_GRACE_SECONDS", 0.05)
+    app, capture, _, _, deadline_due_now = _app_whose_route_waits_after_the_disconnect(monkeypatch)
+
+    async def body_write_stalls(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            await asyncio.Event().wait()
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.request_timeout"):
+        run = await asyncio.wait_for(
+            _drive(
+                app,
+                [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)],
+                path=_OVER_CAP_ROUTE,
+                on_pull=deadline_due_now,
+                on_send=body_write_stalls,
+            ),
+            GENEROUS_DEADLINE_SECONDS,
+        )
+
+    assert [m["type"] for m in run.sent] == ["http.response.start"]
+    assert capture.deadlines[0].expired()
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("413 not fully written" in m for m in messages)
+    assert not any("after the body limit's 413" in m for m in messages)
+
+
+async def test_the_deadline_log_does_not_claim_a_413_that_could_not_be_sent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    app, capture, outcome, due, deadline_due_now = _app_whose_route_waits_after_the_disconnect(
+        monkeypatch
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.request_timeout"):
+        run = await asyncio.wait_for(
+            _drive(
+                app,
+                [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)],
+                path=_OVER_CAP_ROUTE,
+                send_fails=True,
+                on_pull=deadline_due_now,
+            ),
+            GENEROUS_DEADLINE_SECONDS,
+        )
+
+    assert run.sent == []
+    assert outcome == ["cut off"]
+    assert capture.deadlines[0].expired() and capture.deadlines[0].when() == due[0]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("413 not fully written" in m for m in messages)
+    assert not any("after the body limit's 413" in m for m in messages)
 
 
 async def test_an_ordinary_response_start_still_ends_the_deadline(
