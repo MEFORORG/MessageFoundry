@@ -423,7 +423,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # the Content-Type names, and one cut before its first ``--<boundary>`` is whole land here.
             # A body built with a boundary the declared one is a prefix of (declared B, body uses
             # BX) does not: it holds delimiter text, so it can get one of the refusals above,
-            # or, where X starts with "--", be read as the close of a body with no parts.
+            # or, where X is "--" and then at most spaces or tabs, be read as the close of a body
+            # with no parts.
             raise MultipartError(
                 "multipart body holds no delimiter for the boundary its Content-Type names"
             )
