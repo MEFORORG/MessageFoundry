@@ -174,10 +174,10 @@ limits apply:
   `0xC010` once it has arrived, so it dead-letters on its first attempt instead of being cut and
   retried. The link also has to carry each whole PDU inside the read deadline above, which is
   `max_pdu_size / timeout_seconds` and which this setting does not move. It moves only this rate. Raising `timeout_seconds` instead would also loosen every read and send
-  deadline above. It takes a whole number of at least 8192, which is 8 KiB a second. A smaller
+  deadline above. It takes a whole number of at least 16384, which is 16 KiB a second. A smaller
   value, zero and `None` are refused when the connection is built, so the deadline cannot be turned
   off. At that least rate one message can hold a `max_associations` slot for `timeout_seconds` plus
-  about 68 minutes, so set it no lower than the link needs.
+  about 34 minutes, so set it no lower than the link needs.
 - **A sender's own timer can cut the object first.** This engine's C-STORE client applies its
   `timeout_seconds` from the start of a store to the response, with nothing coming back in between,
   so at the default 30 seconds it ends a store that takes longer than that on the link, about

@@ -263,9 +263,11 @@ async def test_an_object_in_the_band_is_delivered_once_the_floor_is_set_under_th
     lines = [r.getMessage() for r in caplog.records if "ended an" in r.getMessage()]
     assert len(lines) == 1 and _DEADLINE_REASON in lines[0], lines
     assert "min_message_bytes_per_second" in lines[0], "the line names the remedy"
-    stored, ended = await _send_over_the_link(
-        {"min_message_bytes_per_second": _LINK_BYTES_PER_SECOND // 2}, data
+    least = dicom_module._LEAST_MESSAGE_BYTES_PER_SECOND
+    assert least == _LINK_BYTES_PER_SECOND // 2 == 16 * 1024, (
+        "the object is delivered at the minimum"
     )
+    stored, ended = await _send_over_the_link({"min_message_bytes_per_second": least}, data)
     assert ended == 0
     assert len(stored) == 1
     assert len(stored[0]) >= _BAND_OBJECT_BYTES
@@ -292,12 +294,19 @@ def test_the_floor_setting_moves_the_deadline() -> None:
     assert "16384 bytes a second" in ended[1]
 
 
+def test_the_least_rate_is_the_one_the_band_object_was_measured_delivering() -> None:
+    assert dicom_module._LEAST_MESSAGE_BYTES_PER_SECOND == 16 * 1024
+    _build_scp([], min_message_bytes_per_second=16384)
+    with pytest.raises(ValueError, match="at least 16384"):
+        _build_scp([], min_message_bytes_per_second=16383)
+
+
 def test_the_shipped_floor_is_unchanged_and_unset_means_it() -> None:
     assert dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND == 64 * 1024
     assert _build_scp([])._min_message_bytes_per_second == 64 * 1024
 
 
-@pytest.mark.parametrize("value", [8 * 1024, "8192", 16 * 1024, 64 * 1024, 1024 * 1024])
+@pytest.mark.parametrize("value", [16 * 1024, "16384", 64 * 1024, 1024 * 1024])
 def test_the_floor_setting_takes_a_rate_at_or_over_its_minimum(value: object) -> None:
     built = _build_scp([], min_message_bytes_per_second=value)
     assert built._min_message_bytes_per_second == int(str(value))
@@ -305,7 +314,23 @@ def test_the_floor_setting_takes_a_rate_at_or_over_its_minimum(value: object) ->
 
 @pytest.mark.parametrize(
     "value",
-    [0, "0", -1, 1, 8 * 1024 - 1, None, "", True, False, 8192.5, float("inf"), float("nan"), "off"],
+    [
+        0,
+        "0",
+        -1,
+        1,
+        8 * 1024,
+        16 * 1024 - 1,
+        "16383",
+        None,
+        "",
+        True,
+        False,
+        16384.5,
+        float("inf"),
+        float("nan"),
+        "off",
+    ],
 )
 def test_no_value_can_switch_the_per_message_deadline_off(value: object) -> None:
     # The deadline is the slow-sender defence (vault BACKLOG #5080): a site may lower its rate, and
