@@ -685,7 +685,10 @@ becomes the bottleneck.
 
 **Restore an archive.** `messagefoundry restore <archive> --to <new store path>` verifies the archive,
 decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal`,
-`-shm` or `-journal` sidecar) — point `--to` at a clean path and move the old store aside yourself. Add
+`-shm` or `-journal` sidecar), but that check does not catch a sidecar left as a dangling symlink or,
+on Windows, a leftover sidecar when `--to` is spelled with a trailing dot or space — so spell `--to`
+plainly, point it at a clean path, clear the destination's sidecars by hand, and move the old store
+aside yourself. Add
 `--config-to <dir>` to restore the config bundle alongside it. A config-only archive carries no store,
 so restore its config bundle with `messagefoundry restore <archive> --config-to <dir>` and no `--to`;
 an archive that carries a store is refused that way. Check the archive without writing anything
