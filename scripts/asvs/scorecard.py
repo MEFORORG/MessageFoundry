@@ -2554,7 +2554,8 @@ def _is_generator(fn: _FunctionNode) -> bool:
 #: permission check written as a decorator), and a decorator the reading cannot name turns off the
 #: decorator comparison for that def, unless the other side's decorators it cannot name are the same
 #: ones (:meth:`_Reading.pair`). Two defs are still told apart by their outermost shape decorator
-#: where neither side has one it cannot name above that (:meth:`_Reading.outer_mismatch`).
+#: where neither side has another decorator above it, except a passthrough one
+#: (:meth:`_Reading.outer_mismatch`).
 #: The class decorators here (a generated constructor)
 #: are resolved too, but no check compares a class's decorators (:func:`_scope_mismatch`).
 _SHAPE_DECORATORS: Final = frozenset(
@@ -2595,8 +2596,13 @@ _SHAPE_BUILTINS: Final = frozenset({"property", "staticmethod", "classmethod"})
 _ACCESSORS: Final = frozenset({"setter", "getter", "deleter"})
 #: The prefix of a binding's origin that names a MODULE rather than an object in one.
 _MODULE: Final = "module:"
-#: :attr:`_Reading.outer` for a decorator that resolved to nothing this screen can name.
+#: :attr:`_Reading.outer` for a decorator that resolved to nothing this screen can name, or to
+#: something that is neither a shape decorator nor in :data:`_PASSTHROUGH_DECORATORS`.
 _UNNAMED: Final = "?"
+#: Decorators that hand back the object they are given, so :attr:`_Reading.outer` passes over them.
+_PASSTHROUGH_DECORATORS: Final = frozenset(
+    {"functools.wraps", "abc.abstractmethod", "typing.final", "typing.override"}
+)
 
 
 @dataclass
@@ -2638,19 +2644,19 @@ class _Reading:
     decorators: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
     #: Each def's decorators that resolved to nothing, by :func:`_unknown_key`, sorted.
     unknown: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
-    #: Each function def's outermost decorator that is a shape decorator, after
-    #: :data:`_SAME_SHAPE`, or that resolved to nothing (:data:`_UNNAMED`); ``None`` if it has
-    #: neither. A resolved decorator that is not a shape decorator is passed over.
+    #: Each function def's outermost decorator that is not in :data:`_PASSTHROUGH_DECORATORS`: a
+    #: shape decorator, after :data:`_SAME_SHAPE`, or :data:`_UNNAMED`; ``None`` if it has none.
     outer: dict[_DefNode, str | None] = field(default_factory=dict)
 
     def outer_mismatch(self, m: _DefNode, s: _DefNode) -> tuple[str | None, str | None] | None:
         """`m`'s and `s`'s :attr:`outer` decorators where they tell the two shapes apart, else
         ``None``.
 
-        They do where they are two different shape decorators, or a shape decorator and none: the
-        shape decorator applied last gives the name its binding, whatever is applied under it. A
-        decorator the screen cannot name may make that binding anything, so where one is outermost
-        on either side this tells nothing, and :meth:`pair` decides (BACKLOG #5590)."""
+        They do where they are two different shape decorators, or a shape decorator and none: with
+        only passthrough decorators above it, the shape decorator applied last is what the name is
+        bound to the result of, whatever is applied under it. Any other decorator may make that
+        binding anything, so where one is outermost on either side this tells nothing, and
+        :meth:`pair` decides (BACKLOG #5590)."""
         if m not in self.outer or s not in self.outer:
             return None
         mo, so = self.outer[m], self.outer[s]
@@ -2895,9 +2901,9 @@ def _run_stmt(
         if not isinstance(node, ast.ClassDef):
             reading.outer[node] = next(
                 (
-                    _UNNAMED if o is None else _SAME_SHAPE.get(o, o)
+                    _SAME_SHAPE.get(o, o) if o in _SHAPE_DECORATORS else _UNNAMED
                     for o in origins
-                    if o is None or o in _SHAPE_DECORATORS
+                    if o not in _PASSTHROUGH_DECORATORS
                 ),
                 None,
             )
@@ -3116,10 +3122,10 @@ def _signature_clause(
 
 
 def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) -> str:
-    mine, live = (f"@{o}" if o else "no shape decorator" for o in outer)
+    mine, live = (f"shape decorator {o}" if o else "no shape decorator" for o in outer)
     return (
-        f"redefines {qual}() with {mine} outermost where {path} has {live}, so the name is "
-        "bound to another kind of object"
+        f"redefines {qual}() with {mine} outermost where {path} has {live} (as this screen "
+        "resolves them), so the name is bound to a different shape"
     )
 
 
@@ -3245,15 +3251,8 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         real = src_sigs.get(name)
         if real is None:
             continue  # shadows no module-level function of that name; nothing to compare
-        outer = reading.outer_mismatch(margs, real)
-        if outer is not None:
-            mismatch = _outer_clause(name, a.mutation_path, outer)
-            break
-        mdecs, sdecs = reading.pair(margs, real)
-        mine = _signature(margs, mdecs)
-        theirs = _signature(real, sdecs)
-        if mine != theirs:
-            mismatch = _signature_clause(name, a.mutation_path, mine, theirs)
+        mismatch = _node_mismatch(margs, real, name, a.mutation_path, reading, method=False)
+        if mismatch is not None:
             break
     if mismatch is None and walked is not None:
         mismatch = _scope_mismatch(
