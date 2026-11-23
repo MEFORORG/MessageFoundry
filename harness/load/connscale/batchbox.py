@@ -66,14 +66,10 @@ from harness.load.connscale.runner import (
 )
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import EngineNode, FailoverError, _await_port
-from messagefoundry.support.redact import redact_log_text
 from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
 
-_RESET_ERROR_CHARS = 4000  # the engine log tail's own limit, which carried this refusal before
-_RESET_ERROR_WRAP = len("engine did not start: ")  # the cell error's prefix counts toward the cap
-_RESET_CUT_MARK = "[earlier text cut] "
 _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
 _STOP_GRACE = 5.0
@@ -980,10 +976,15 @@ async def run_batch_engine(
             if reset_store and profile.store_backend is not None:
                 try:
                     await _reset_server_store(profile.store_backend, node_env)
-                except Exception as exc:
-                    # Measuring on the prior cell's rows would be the confound above, so the cell
-                    # is missed.
-                    raise ConnScaleError(_store_reset_failure(exc)) from exc
+                except Exception as reset_exc:
+                    # Type only: a driver error's text can carry connection details or a stored
+                    # value. The cell still runs, so it can measure on the prior cell's rows.
+                    kind = type(reset_exc).__name__
+                    log.warning("batch cell %s: store reset failed: %s", cell.cell_id, kind)
+                    report.notes.append(
+                        f"CELL {cell.cell_id}: store reset failed ({kind}); the cell continues "
+                        "and may measure on the prior cell's rows"
+                    )
             await node.start()
             await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
             # Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a 0.0.0.0 listener);
@@ -1056,37 +1057,6 @@ async def run_batch_engine(
         finally:
             await _stop_cell_node(node, cell.cell_id, report)
     return report
-
-
-def _store_reset_failure(exc: Exception) -> str:
-    """Why a store reset failed, for the cell's error. The store's refusal names its remedy (the RCSI
-    statement a DBA runs, for one), so its text is kept, through the log redactor and escaped to one
-    line because it reaches a terminal.
-
-    The redactor masks credentials, not every connection detail: a host, login or database name can
-    remain, in the READY file and the report. It also over-redacts, so a database name of several
-    words can come out masked inside the remedy. Past the cap the START is cut, because the store
-    puts a driver's diagnostics before the remedy."""
-    prefix = f"store reset failed: {type(exc).__name__}: "
-    room = _RESET_ERROR_CHARS - _RESET_ERROR_WRAP - len(prefix)
-    detail = redact_log_text(str(exc))
-    text = escape_for_terminal(detail, single_line=True)
-    if len(text) > room:
-        text = _RESET_CUT_MARK + _escaped_tail(detail, room - len(_RESET_CUT_MARK))
-    return prefix + text
-
-
-def _escaped_tail(text: str, limit: int) -> str:
-    """The longest tail of ``text`` whose one-line escaped form fits ``limit``. It cuts the text
-    before escaping, so the cut cannot land inside an escape sequence."""
-    low, high = max(0, len(text) - limit), len(text)  # a character escapes to at least one
-    while low < high:
-        mid = (low + high) // 2
-        if len(escape_for_terminal(text[mid:], single_line=True)) <= limit:
-            high = mid
-        else:
-            low = mid + 1
-    return escape_for_terminal(text[high:], single_line=True)
 
 
 async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineReport) -> None:
