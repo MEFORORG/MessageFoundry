@@ -6,7 +6,7 @@ tolerant X12Peek/X12Message hot path (ADR 0012, BACKLOG #32).
 Covers: a clean interchange validates; a conformance-violating interchange reports structural errors +
 emits a 999 ack; non-X12 input raises X12ValidationError (not a generic crash); and the PHI guard —
 an offending element *value* does not appear in the surfaced errors, and a segment id is kept only
-when shaped like one, so a two- or three-character sender value of that shape is the one exception."""
+when pyx12's bundled maps define it. A sender value equal to a real id (``LIN``) is still kept."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import logging
 import threading
 import traceback
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -28,7 +29,11 @@ from messagefoundry.parsing.x12 import (  # noqa: E402 - after importorskip
     X12ValidationResult,
     validate,
 )
-from messagefoundry.parsing.x12._deps import load_x12_code_resolver  # noqa: E402
+from messagefoundry.parsing.x12._deps import (  # noqa: E402
+    _read_map_segment_ids,
+    load_x12_code_resolver,
+    load_x12_map_segment_ids,
+)
 from messagefoundry.redaction import safe_traceback  # noqa: E402
 from tests._content_free import assert_chain_severed  # noqa: E402
 
@@ -721,10 +726,89 @@ def test_a_wrongly_delimited_segment_puts_no_value_in_an_error(segment: str) -> 
     assert all(e.message.startswith("segment ?: error ") for e in dropped)
 
 
-def test_a_well_delimited_unknown_segment_keeps_its_id() -> None:
+def test_a_well_delimited_unknown_segment_shows_no_id() -> None:
     result = validate(_270_with(f"ZZZ*{_PLANT}*ROBERT~"))
-    assert [e.message for e in result.errors if e.segment_id == "ZZZ"] == ["segment ZZZ: error 1"]
+    assert "ZZZ" not in {e.segment_id for e in result.errors}
+    assert "segment ?: error 1" in [e.message for e in result.errors]
     assert _PLANT not in _rendered(result)
+
+
+@pytest.mark.parametrize("template", ["NM1*IL*1*O~{}*A*B~", "{}~", "{}*A~"])
+@pytest.mark.parametrize("name", ["LEE", "KIM", "WU", "NG", "ZZZ", "DOE"])
+def test_sender_text_shaped_like_an_id_is_not_kept(
+    name: str, template: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = _270_with(template.format(name))
+    # Control: with the name in the map set it is kept, so pyx12 really put it where the id goes.
+    with monkeypatch.context() as patched:
+        patched.setattr(_X12_VALIDATE, "load_x12_map_segment_ids", lambda: frozenset({name}))
+        assert name in {e.segment_id for e in validate(raw).errors}
+
+    errors = validate(raw).errors
+    assert name not in {e.segment_id for e in errors}
+    assert not any(e.message.startswith((f"segment {name}:", f"element {name}")) for e in errors)
+    assert any(e.message.startswith("segment ?: error ") for e in errors)
+
+
+def test_a_sender_value_equal_to_a_real_id_is_still_kept() -> None:
+    # The known limit: LIN is a segment the maps define, so nothing tells this value from that id.
+    assert "LIN" in {e.segment_id for e in validate(_270_with("LIN*A~")).errors}
+
+
+def test_no_id_is_kept_when_the_map_set_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_map_segment_ids", frozenset)
+    assert _X12_VALIDATE._structural_segment_id({"seg_id": "NM1"}) is None
+
+
+def test_the_bundled_index_gives_real_ids_of_the_id_shape() -> None:
+    ids = load_x12_map_segment_ids()
+    assert {"ISA", "GS", "ST", "NM1", "N1", "SE", "GE", "IEA"} <= ids
+    assert all(_X12_VALIDATE._SEGMENT_ID.fullmatch(seg_id) for seg_id in ids)
+
+
+_MAP_INDEX = "<maps><version><map>a.xml</map><map>b.xml</map></version></maps>"
+
+
+def test_the_map_reader_reads_only_the_maps_the_index_lists(tmp_path: Path) -> None:
+    (tmp_path / "maps.xml").write_text(_MAP_INDEX, encoding="utf-8")
+    (tmp_path / "a.xml").write_text("<map><segment xid='NM1'/></map>", encoding="utf-8")
+    (tmp_path / "b.xml").write_text("<map><segment xid='N1'/><loop xid='X1'/></map>", "utf-8")
+    (tmp_path / "unlisted.xml").write_text("<map><segment xid='ZZZ'/></map>", encoding="utf-8")
+    assert _read_map_segment_ids(tmp_path) == {"NM1", "N1"}
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        None,
+        {},
+        {"maps.xml": "<maps/>"},
+        {"maps.xml": "<maps"},
+        {"maps.xml": _MAP_INDEX, "a.xml": "<map><segment xid='NM1'/></map>"},
+        {"maps.xml": _MAP_INDEX, "a.xml": "<map><segment xid='NM1'/></map>", "b.xml": "<map"},
+        {"maps.xml": _MAP_INDEX, "a.xml": "<map/>", "b.xml": "<map/>"},
+    ],
+    ids=[
+        "no-directory",
+        "no-index",
+        "empty-index",
+        "unparseable-index",
+        "listed-map-missing",
+        "listed-map-unparseable",
+        "no-segment",
+    ],
+)
+def test_maps_that_cannot_be_read_give_no_ids(
+    contents: dict[str, str] | None, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    map_dir = tmp_path / "map"
+    if contents is not None:
+        map_dir.mkdir()
+        for name, text in contents.items():
+            (map_dir / name).write_text(text, encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        assert _read_map_segment_ids(map_dir) == frozenset()
+    assert "no segment id" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -732,7 +816,9 @@ def test_a_well_delimited_unknown_segment_keeps_its_id() -> None:
     [
         ("NM1", "NM1"),
         ("N1", "N1"),
-        ("ZZZ", "ZZZ"),
+        ("ZZZ", None),  # the shape of an id, but no map defines it
+        ("TST", None),  # only in comp_test.xml, which pyx12's index does not list
+        ("UNU", None),  # likewise
         ("nm1", None),  # lower case
         ("A", None),  # too short
         ("NM1X", None),  # too long
@@ -744,7 +830,7 @@ def test_a_well_delimited_unknown_segment_keeps_its_id() -> None:
         (7, None),
     ],
 )
-def test_only_a_segment_id_shaped_value_is_kept(seg_id: Any, kept: str | None) -> None:
+def test_only_a_segment_id_the_maps_define_is_kept(seg_id: Any, kept: str | None) -> None:
     seg = {"seg_id": seg_id, "cur_line": 3, "name": "Subscriber Name"}
     seg_err = _X12_VALIDATE._segment_error("1", seg, {})
     ele_err = _X12_VALIDATE._element_error("8", seg, {"ele_pos": 2, "name": "Date"})

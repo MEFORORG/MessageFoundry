@@ -18,8 +18,21 @@ This module imports ``pyx12`` (third-party, not an engine package) and nothing f
 
 from __future__ import annotations
 
+import functools
+import logging
+import threading
 from collections.abc import Callable
-from typing import Any
+from importlib.resources import files
+from typing import TYPE_CHECKING, Any
+
+from messagefoundry._vendor.defusedxml.common import DefusedXmlException
+from messagefoundry._vendor.defusedxml.ElementTree import ParseError, parse
+
+if TYPE_CHECKING:
+    from importlib.resources.abc import Traversable
+
+_log = logging.getLogger(__name__)
+_MAP_IDS_LOCK = threading.Lock()
 
 
 def _missing_extra(feature: str) -> RuntimeError:
@@ -42,6 +55,47 @@ def load_x12_validator() -> tuple[Any, Any]:
     except ImportError as exc:  # pragma: no cover - exercised only without the [x12] extra
         raise _missing_extra("strict X12 validation") from exc
     return pyx12.x12n_document.x12n_document, pyx12.params.params
+
+
+def _read_map_segment_ids(map_dir: Traversable) -> frozenset[str]:
+    """The ``xid`` of every ``<segment>`` in the maps that ``maps.xml`` under ``map_dir`` lists.
+
+    pyx12 selects its maps from that index, so a bundled file it omits (``comp_test.xml``, the only
+    source of ``TST`` and ``UNU``) adds no id. All or nothing: an index or listed map that cannot be
+    read or parsed, or a set with no id, gives the empty set, so a caller keeps no id rather than
+    trusting the shape alone."""
+    ids: set[str] = set()
+    try:
+        with map_dir.joinpath("maps.xml").open("rb") as fd:
+            map_files = {name for m in parse(fd).iter("map") if (name := (m.text or "").strip())}
+        for map_file in map_files:
+            with map_dir.joinpath(map_file).open("rb") as fd:
+                ids.update(xid for seg in parse(fd).iter("segment") if (xid := seg.get("xid")))
+    except (OSError, ParseError, DefusedXmlException) as exc:
+        _log.warning(
+            "pyx12's maps could not be read (%s); X12 errors will carry no segment id",
+            type(exc).__name__,
+        )
+        return frozenset()
+    if not ids:
+        _log.warning("pyx12's maps define no segment; X12 errors will carry no segment id")
+    return frozenset(ids)
+
+
+@functools.cache
+def _bundled_map_segment_ids() -> frozenset[str]:
+    return _read_map_segment_ids(files("pyx12").joinpath("map"))
+
+
+def load_x12_map_segment_ids() -> frozenset[str]:
+    """Every segment id the maps in pyx12's bundled index define, read once, on first use.
+
+    ``validate()`` passes pyx12 no map path, so pyx12 selects from this same index. The read takes
+    a noticeable fraction of a second, so it runs only when a violation has an id-shaped value to
+    check. The lock is there because ``functools.cache`` alone lets each thread that misses at once
+    repeat the read."""
+    with _MAP_IDS_LOCK:
+        return _bundled_map_segment_ids()
 
 
 def load_x12_code_resolver() -> Callable[..., str | None]:

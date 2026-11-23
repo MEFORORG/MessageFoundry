@@ -22,15 +22,16 @@ then ``None``). A returned ack echoes sender values unescaped, so it is complete
 well-formed; see :class:`X12ValidationResult`.
 
 **PHI rule (do not break).** A failing X12 element error from pyx12 embeds the *offending data value*
-(potential PHI) in its raw error string, and an exception pyx12 raises can quote the interchange. This
-module surfaces neither: an :class:`X12SegmentError` holds structural locators (its docstring names
-them, and the one limit on its segment id), and a refusal chains no pyx12 exception. The ack does echo
-sender values, so it is left out of the result's repr. The full interchange goes only to the secured
-store (CLAUDE.md §9). The pyx12 logger tree (which logs the raw, value-bearing strings at ERROR) is
-muted from the first validation pass on, and never unmuted.
+(potential PHI) in its raw error string, and an exception pyx12 raises can quote the interchange. An
+:class:`X12SegmentError` drops those strings and holds structural locators (its docstring names them,
+and a limit on its segment id), and a refusal chains no pyx12 exception. The ack does echo sender
+values, so it is left out of the result's repr. The full interchange goes only to the secured store
+(CLAUDE.md §9). The pyx12 logger tree (which logs the raw, value-bearing strings at ERROR) is muted
+from the first validation pass on, and never unmuted.
 
-Pure: no I/O to disk/network, no engine imports. ``pyx12``'s sole runtime dependency is ``defusedxml``
-(already in tree), used to parse its bundled, trusted map XML — not attacker input.
+No network I/O and no engine imports. Disk reads include pyx12's bundled map XML, by pyx12 and by
+the segment id check. ``pyx12``'s sole runtime dependency is ``defusedxml`` (already in tree), used
+to parse that bundled, trusted XML — not attacker input.
 """
 
 from __future__ import annotations
@@ -42,7 +43,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from messagefoundry.parsing.x12._deps import load_x12_code_resolver, load_x12_validator
+from messagefoundry.parsing.x12._deps import (
+    load_x12_code_resolver,
+    load_x12_map_segment_ids,
+    load_x12_validator,
+)
 from messagefoundry.parsing.x12.errors import X12ValidationError
 from messagefoundry.redaction import json_loads_or_refusal
 
@@ -61,11 +66,11 @@ class X12SegmentError:
     walk was at, which for a segment that matched no node is the last node it did match;
     ``element_name`` is the *schema* data-element label (e.g. ``"Transaction Set Creation Date"``).
 
-    ``segment_id`` comes from the input, so it is kept only when shaped like an X12 segment id (a
-    capital, then one or two capitals or digits) and is ``None`` otherwise (BACKLOG #5370). The check
-    reads shape alone, so a two- or three-character sender value of that shape standing where the id
-    goes is kept, in ``segment_id`` and in ``message``, even when it matches no segment in the map.
-    A terminator inside a name can put the name's tail there, with ``loop`` naming the field before."""
+    ``segment_id`` comes from the input, so it is kept only when it has an X12 segment id's shape (a
+    capital, then one or two capitals or digits) and a map in pyx12's bundled index defines it, and
+    is ``None`` otherwise (BACKLOG #5370). A sender value equal to such an id, for example the surname
+    ``LIN``, standing where the id goes is still kept, in ``segment_id`` and in ``message``. A
+    terminator inside a name can put the name's tail there, with ``loop`` naming the field before."""
 
     code: str
     message: str
@@ -190,13 +195,22 @@ def _last_group_version(report: dict[str, Any]) -> str:
 
 
 def _structural_segment_id(seg: dict[str, Any]) -> str | None:
-    """pyx12's ``seg_id`` when it is shaped like an X12 segment id, otherwise ``None``.
+    """pyx12's ``seg_id`` when it has an X12 segment id's shape and a map in pyx12's bundled index
+    defines it, otherwise ``None``.
 
     pyx12 takes everything before the first element separator as the id, so a wrongly delimited
-    segment (``NM1|IL|1|DOE|ROBERT``) puts the sender's whole segment there. The pattern is pyx12's
-    own, matched more strictly (:data:`_SEGMENT_ID`), and every segment id in its bundled maps has it."""
+    segment (``NM1|IL|1|DOE|ROBERT``) puts the sender's whole segment there, and a terminator inside
+    a name (``NM1*IL*1*O~LEE*A*B~``) puts the name's tail there, in an id's shape. The error code
+    cannot tell those apart: pyx12 emits code 1 for sender text and for a real id in the wrong place.
+    The shape is checked first, so text without it never makes this read the maps."""
     seg_id = seg.get("seg_id")
-    return seg_id if isinstance(seg_id, str) and _SEGMENT_ID.fullmatch(seg_id) else None
+    if (
+        isinstance(seg_id, str)
+        and _SEGMENT_ID.fullmatch(seg_id)
+        and seg_id in load_x12_map_segment_ids()
+    ):
+        return seg_id
+    return None
 
 
 def _segment_error(code: str, seg: dict[str, Any], err: dict[str, Any]) -> X12SegmentError:
@@ -284,10 +298,11 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     :meth:`X12Message.parse`). Returns an :class:`X12ValidationResult` carrying the conformance verdict,
     the structural error list, and the generated 997/999 acknowledgment.
 
-    Raises :class:`~messagefoundry.parsing.x12.errors.X12ValidationError` only when no validation pass
-    could run at all (e.g. the bytes are not a parseable X12 data file — there is no envelope to walk).
-    It chains no pyx12 exception. A *failed* validation of a parseable interchange is returned as data
-    (``valid=False``), not raised, so a Handler can still emit the negative ack. Raises
+    Raises :class:`~messagefoundry.parsing.x12.errors.X12ValidationError` when pyx12 could not finish
+    a pass: at least when the bytes are not a parseable X12 data file, and when pyx12 raises partway
+    through a walk, as a non-numeric GE01 makes it do. It chains no pyx12 exception. A pass that
+    finishes with violations is returned as data (``valid=False``), not raised, so a Handler can still
+    emit the negative ack. Raises
     :class:`RuntimeError` if the ``[x12]`` extra is absent (a deploy/config error, distinct from the
     ``ValueError``-rooted data errors)."""
     if isinstance(raw, (bytes, bytearray)):  # noqa: SIM108
