@@ -3,8 +3,7 @@
 """Only a database driver's own error NAMES a SQLSTATE in text (engine PR 3150 open findings 1,
 5 and 6); an error shaped like one is still classified by it. The connector's reading
 (``_log_sqlstate``, ``_shown_state``) and the traceback line's (``redaction.driver_sqlstate_of``)
-are separate and differ in at least one case, an asyncpg error whose ``sqlstate`` attribute is set
-but unusable. Also two log-path changes in the same module (vault BACKLOG #1661, added items 5
+are separate, and neither reads an asyncpg error's ``args[0]``, its message, as a SQLSTATE. Also two log-path changes in the same module (vault BACKLOG #1661, added items 5
 and 6).
 
 Each test was red on the code before its fix, except at least those whose docstring calls it a
@@ -421,22 +420,55 @@ class _AsyncpgClientMessage(Exception):
     __module__ = "asyncpg.exceptions._base"
 
 
-def test_the_traceback_line_never_reads_a_message_as_a_sqlstate() -> None:
-    """Red on 2c4ced1906e: past an unusable ``sqlstate`` the connector's reading fell back to
-    ``args[0]``, asyncpg's message, so ``_log_sqlstate`` returned ``MRN42``. The traceback line
-    already read no state there."""
-    exc = _AsyncpgMessage(_VALUE)
+class _AsyncpgNoneState(Exception):
+    """asyncpg's server shape with no state read: the message in ``args[0]``, ``sqlstate`` None."""
+
+    __module__ = "asyncpg.exceptions._base"
+    sqlstate = None
+
+
+_ASYNCPG_SHAPES = [_AsyncpgMessage, _AsyncpgClientMessage, _AsyncpgNoneState]
+
+
+@pytest.mark.parametrize("make", _ASYNCPG_SHAPES)
+def test_the_traceback_line_never_reads_a_message_as_a_sqlstate(make: type[Exception]) -> None:
+    """Red on the branch head before this fix (2c4ced1906e): the connector's readings fell back to
+    ``args[0]``, asyncpg's message, so ``_log_sqlstate`` returned ``MRN42``, and the traceback line
+    did too for an absent or None ``sqlstate``."""
+    exc = _raised(make(_VALUE))
     assert _VALUE not in safe_traceback((type(exc), exc, None))
     assert database._log_sqlstate(exc) is None
-    assert database._log_sqlstate(_AsyncpgClientMessage(_VALUE)) is None
+    assert database._sqlstate(exc) is None
     assert _VALUE not in database._safe_db_error(exc)
 
 
-@pytest.mark.parametrize("make", [_AsyncpgMessage, _AsyncpgClientMessage])
+def test_an_asyncpg_sqlstate_attribute_is_still_read() -> None:
+    """Control: an asyncpg error's own ``sqlstate`` attribute still names its state."""
+    exc = _AsyncpgMessage(f"duplicate key ({_VALUE})")
+    exc.sqlstate = "23505"
+    assert database._log_sqlstate(exc) == "23505"
+    assert database._safe_db_error(exc) == "_AsyncpgMessage [23505]"
+
+
+async def test_an_asyncpg_message_in_a_send_is_not_named_as_a_state() -> None:
+    """Red on the branch head before this fix (2c4ced1906e): the send's arm read ``args[0]`` and
+    dead-lettered the message as ``database rejected the statement [MRN42]``, code ``MRN42``, the
+    text the alert carries. With no state it is an internal error, which the runner logs and
+    alerts by its type."""
+    conn = _FakeConn(_FakeCursor(_AsyncpgClientMessage(_VALUE)))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(_AsyncpgClientMessage):
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert conn.rolledback
+
+
+@pytest.mark.parametrize("make", _ASYNCPG_SHAPES)
 async def test_an_asyncpg_message_is_never_printed_as_a_sqlstate(
     make: type[Exception], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Red on 2c4ced1906e: an asyncpg error whose ``sqlstate`` is unusable or absent was read by
+    """Red on the branch head before this fix (2c4ced1906e): an asyncpg error whose ``sqlstate`` is
+    unusable or absent was read by
     its ``args[0]``, its message, so the connect error, the ``last_error`` the runner stores from
     it and the log line all printed ``[MRN42]``."""
     exc = make(_VALUE)

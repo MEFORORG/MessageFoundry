@@ -122,6 +122,7 @@ from messagefoundry.odbc_call_gate import (
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import (
+    args_hold_a_message,
     is_a_sqlite_error,
     known_driver_error,
     prints_a_codec_error,
@@ -2806,9 +2807,10 @@ def _sqlstate(exc: BaseException) -> str | None:
     way, but its state may be a value, so only a driver's own error names it in text
     (:func:`_shown_state`; vault BACKLOG #1661, engine PR 3150 finding 1). Never for a
     ``UnicodeError``, whose first argument is the codec name, nor for a SQLite error, whose
-    ``args[0]`` is its message. It reads no attribute but ``args``, with ``getattr`` and a default,
-    so an error arm can call it before its cleanup."""
-    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc):
+    ``args[0]`` is its message, nor for an asyncpg error, whose ``args[0]`` is its message too
+    (:func:`~messagefoundry.redaction.args_hold_a_message`). It reads no attribute but ``args``,
+    with ``getattr`` and a default, so an error arm can call it before its cleanup."""
+    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or args_hold_a_message(exc):
         return None
     return _shaped_state(getattr(exc, "args", ()))
 
@@ -2816,32 +2818,15 @@ def _sqlstate(exc: BaseException) -> str | None:
 def _log_sqlstate(exc: BaseException) -> str | None:
     """:func:`_sqlstate`, read first from asyncpg's ``sqlstate`` attribute when that is a SQLSTATE,
     for the arms that classify an error a PostgreSQL store's driver may raise. An asyncpg error
-    whose attribute is absent, empty or no SQLSTATE reads as none, never by ``args[0]``, which is
-    asyncpg's message: a message such as ``MRN42`` would otherwise be classified, and printed, as
-    a state (:func:`_an_asyncpg_error`). Never for a ``UnicodeError`` or an exception that holds
-    one, whose text a codec name can make read like a SQLSTATE. Like :func:`_sqlstate`, it
+    whose attribute is absent, None or no SQLSTATE reads as none, as :func:`_sqlstate` reads it,
+    never by ``args[0]``, which is asyncpg's message: a message such as ``MRN42`` would otherwise
+    be classified, and printed, as a state. Never for a ``UnicodeError`` or an exception that
+    holds one, whose text a codec name can make read like a SQLSTATE. Like :func:`_sqlstate`, it
     classifies; :func:`_shown_state` says what text names."""
     if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
     state = getattr(exc, "sqlstate", None)
-    if reads_as_a_sqlstate(state):
-        return state
-    if _an_asyncpg_error(exc):
-        return None
-    return _shaped_state(getattr(exc, "args", ()))
-
-
-def _an_asyncpg_error(exc: BaseException) -> bool:
-    """Whether ``exc``'s class, or a class it inherits, is from the ``asyncpg`` package, whose
-    ``args[0]`` is its message rather than a SQLSTATE. A class that cannot be read answers
-    ``False``, so it is classified by shape, as :func:`_sqlstate` classifies it."""
-    try:
-        return any(
-            isinstance(kind.__module__, str) and kind.__module__.split(".")[0] == "asyncpg"
-            for kind in type(exc).__mro__
-        )
-    except Exception:  # noqa: BLE001 - an unreadable class is classified by shape
-        return False
+    return state if reads_as_a_sqlstate(state) else _sqlstate(exc)
 
 
 def _shaped_state(args: object) -> str | None:
@@ -2910,11 +2895,13 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     SQLSTATE (:func:`_raised_by_a_driver`), such as asyncpg's client-side ``DataError``, which quotes
     the argument it could not encode, renders as ``<type> [driver message withheld]``, with SQLite's
     result-code name inside the brackets when it has one (:func:`_withheld`; engine PR 2658, finding
-    4). Anything else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful
-    text for a bug or an unreachable host, unless ``withhold`` says it is held by a driver error, as
-    a link of its chain (:func:`_redacted_copy`), which renders as ``<type> [driver message
-    withheld]``, or it carries a SQLSTATE although it is no driver's (:func:`_shown_state`), which
-    renders as ``<type> [message withheld]``. That is a bound, not a guarantee:
+    4). Under ``withhold``, which says ``exc`` is held by a driver error as a link of its chain
+    (:func:`_redacted_copy`), an error no driver raised renders as ``<type> [driver message
+    withheld]`` before any state is read. Otherwise, an error that carries a SQLSTATE but is no
+    known driver's own (:func:`_shown_state`), a class whose driver test raises included, renders
+    as ``<type> [message withheld]``, and anything else with no SQLSTATE keeps the ``safe_exc``
+    rendering, which is the more useful text for a bug or an unreachable host. That is a bound,
+    not a guarantee:
     an error a driver raises as a builtin type with any other arguments, or wraps in another
     library's, is printed as ``safe_exc`` prints it.
 

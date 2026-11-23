@@ -98,6 +98,7 @@ from typing import Any, Final, TypeIs
 
 __all__ = [
     "RepeatedKeyError",
+    "args_hold_a_message",
     "clamp_untrusted",
     "codec_safe_line",
     "codec_safe_str",
@@ -3100,6 +3101,26 @@ def _a_driver_class(kind: type) -> bool:
     )
 
 
+#: The driver packages whose error holds its MESSAGE in ``args[0]``, never a SQLSTATE: asyncpg
+#: names its state in a ``sqlstate`` attribute, when it names one.
+_MESSAGE_IN_ARGS_DRIVERS = frozenset({"asyncpg"})
+
+
+def args_hold_a_message(exc: BaseException) -> bool:
+    """Whether ``exc``'s class, or a class it inherits, is from a package in
+    :data:`_MESSAGE_IN_ARGS_DRIVERS`, so its ``args[0]`` is its message and is never read as a
+    SQLSTATE, whatever its shape. A class that cannot be read answers ``False``, so it is read by
+    shape, as any other error is; that does not raise, so this runs on every link of a traceback."""
+    try:
+        return any(
+            isinstance(kind.__module__, str)
+            and kind.__module__.split(".")[0] in _MESSAGE_IN_ARGS_DRIVERS
+            for kind in type(exc).__mro__
+        )
+    except Exception:  # noqa: BLE001 - an unreadable class is read by shape, as the docstring says
+        return False
+
+
 #: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters. Lowercase is refused, so
 #: a word such as ``OSError('reset')``'s or a codec name such as ``ascii`` does not read as one.
 _DRIVER_SQLSTATE = re.compile(r"[0-9A-Z]{5}")
@@ -3137,10 +3158,9 @@ def driver_sqlstate_of(
     """The SQLSTATE a database driver's own error names: asyncpg's ``sqlstate`` attribute when it
     :func:`reads_as_a_sqlstate` and ``attribute`` says to read it, else ``args[0]`` when that does.
     ``args[0]`` is read past an attribute that is set but is no SQLSTATE only when
-    ``past_attribute`` says so, since asyncpg's ``args[0]`` is its message. An error with no
-    ``sqlstate`` attribute at all, such as asyncpg's client-side errors, is read from ``args[0]``
-    either way, so such a message of five SQLSTATE characters still reads as one, on the
-    traceback line too. None for any other exception, so a
+    ``past_attribute`` says so. An asyncpg error (:func:`args_hold_a_message`) is never read from
+    ``args[0]``, which is its message, so one whose attribute is absent, None or no SQLSTATE, such
+    as a client-side error, names none. None for any other exception, so a
     ``KeyError('MRN42')`` is never read as one, and None for a SQLite error, whose ``args[0]`` is
     its message (vault BACKLOG #1661). :func:`safe_traceback` names a driver error's SQLSTATE by
     it; the DATABASE connector classifies any error by its shape and names a state only for a
@@ -3158,6 +3178,8 @@ def driver_sqlstate_of(
             return state
         if state is not None and not past_attribute:
             return None
+    if args_hold_a_message(exc):
+        return None
     args = getattr(exc, "args", ())
     first = args[0] if isinstance(args, tuple) and args else None
     return first if reads_as_a_sqlstate(first) else None
