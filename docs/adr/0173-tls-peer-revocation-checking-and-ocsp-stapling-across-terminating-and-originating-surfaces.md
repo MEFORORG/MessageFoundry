@@ -1806,6 +1806,8 @@ at start, naming the root.
 
 **Still leaf only.** At least every outbound hop under `[tls].crl_file`. Such a hop may verify
 against the OS trust store, whose roots no CRL file names, so the start rule would refuse it.
+*(Note 2026-11-23: section 15 makes this hold only while `[tls].crl_check_chain` is unset, and
+its reason for refusing the chain check on the OS trust store replaces the one given here.)*
 `capath=` loading stays out of scope, for the reason the out-of-scope bullet gives.
 
 Pinned by `tests/test_inbound_listener_crl_chain.py` and `tests/test_api_tls_client_trust.py`.
@@ -1826,10 +1828,11 @@ one whose CA file is a connection's `tls_ca_file`, `[alerts].email_tls_ca_file` 
 self-signed root also in it, and applies section 14's start rule, worded for a server chain. An
 intermediate beside its root is admitted: the chain runs on through it to the root, and the start
 rule then asks for the intermediate's own CRL too. The running-hop reload applies the same start
-rule. On the `system` and `augment` arms it refuses the build, since the engine cannot tell at
-build which of the OS trust store's CAs a partner chains through, so it cannot judge the CRL file
-complete. `docs/CONFIGURATION.md`, the `[tls].crl_check_chain` row, gives the operator's choices. A REST connection's ECH sidecar hop checks no `[tls]` CRL against
-its partner, leaf or chain, since the sidecar verifies the partner. LDAPS, OIDC, the log forwarder and the Postgres store, which
+rule. On the `system` and `augment` arms it refuses the build, for the reason
+`OS_ROOTS_CHAIN_CHECK_REASON` in `messagefoundry/config/tls_policy.py` states, and the refusal
+names the settings that avoid it. A REST connection's ECH sidecar hop checks no `[tls]` CRL against
+its partner, leaf or chain, since the sidecar verifies the partner, so its refusal offers no way to
+chain-check it. LDAPS, OIDC, the log forwarder and the Postgres store, which
 have CRL settings of their own, keep the leaf check.
 
 Pinned by `tests/test_outbound_crl_chain.py`.

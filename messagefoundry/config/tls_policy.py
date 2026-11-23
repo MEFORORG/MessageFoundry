@@ -88,7 +88,9 @@ __all__ = [
     "APPROVED_KEX_GROUPS",
     "CONNECTION_TLS_CIPHERS_SETTING",
     "MIRRORED_CONNECTION_SETTING",
+    "OS_ROOTS_CHAIN_CHECK_REASON",
     "OUTBOUND_CRL_SETTING",
+    "refuse_chain_check_on_os_roots",
     "TLS_REVOCATION_ATTESTED_ENV",
     "apply_connection_tls_ciphers",
     "fips_attestation",
@@ -324,7 +326,7 @@ def harden_crl_check(
     the start rule reads the CAs loaded from the operator's own client-CA setting, not an OS trust
     store. The outbound hops under ``[tls].crl_file`` pass it only with ``[tls].crl_check_chain``,
     and only where they trust operator CAs alone (:func:`build_verifying_client_context`): a hop
-    on the OS trust store is refused at build instead (:func:`_refuse_chain_check_on_os_roots`
+    on the OS trust store is refused at build instead (:data:`OS_ROOTS_CHAIN_CHECK_REASON`
     says why).
     The start rule's refusal is worded for a server chain when ``setting`` is
     :data:`OUTBOUND_CRL_SETTING`. Every other hop keeps the leaf check.
@@ -3463,14 +3465,41 @@ def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
 OUTBOUND_CRL_SETTING = "[tls].crl_file"
 
 
-def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
+#: Why ``[tls].crl_check_chain`` is refused on a hop that trusts the OS roots: the one statement of
+#: it (vault BACKLOG #5511). The refusal carries it, so the docs point here rather than restate it.
+#: On a hop that trusts operator CAs alone the rule can be met: the operator chose the CAs,
+#: :func:`_require_rooted_cas` refuses a certificate in the CA file that is no CA, and a CA file is
+#: loaded whole, so the CA list holds each CA in it.
+OS_ROOTS_CHAIN_CHECK_REASON = (
+    "The whole-chain check makes the build ask [tls].crl_file for a CRL from each CA in the list "
+    "of CAs the hop trusts, and the OS trust store cannot meet that rule: it holds the public root CAs, and "
+    "gathering a current CRL from each of them is not practical; it can hold certificates that "
+    "are not CAs, which the CA list the engine reads leaves out; and that list leaves out a CA "
+    "in a hashed CA directory (capath), as OpenSSL's default trust paths name on Linux, until a "
+    "handshake has used it. So the engine could not judge the CRL file complete"
+)
+
+#: What an operator can set instead, named in the refusal itself, since docs/CONFIGURATION.md does
+#: not ship in the wheel.
+_OPERATOR_CA_REMEDY = (
+    "give the hop operator CAs alone, with a CRL in [tls].crl_file from each: a connection's own "
+    "tls_ca_file, [alerts].email_tls_ca_file for the alerts SMTP sink, or [tls].internal_ca_file "
+    'with [tls].trust_anchor_mode = "pinned", which also takes the OS roots away from the other '
+    "non-loopback hops that resolve their CA from [tls] with no CA file of their own"
+)
+
+
+def refuse_chain_check_on_os_roots(anchor: TrustAnchor, *, ech_sidecar: bool = False) -> None:
     """Refuse ``[tls].crl_check_chain`` on a hop that trusts the OS roots (vault BACKLOG #5511).
 
-    The whole-chain check needs a CRL in ``[tls].crl_file`` from each CA in the peer's chain, the
-    root included. On the OS trust store the engine cannot tell at build which of the store's CAs
-    a partner chains through, so it cannot judge the CRL file complete for this hop, and it
-    refuses at build with a remedy rather than leave the gap to a handshake. The operator's
-    choices are in docs/CONFIGURATION.md, the ``crl_check_chain`` row of ``[tls]``."""
+    It refuses at build, with a remedy, rather than leave the gap to a handshake. The reason is
+    :data:`OS_ROOTS_CHAIN_CHECK_REASON`, stated there once.
+
+    ``ech_sidecar`` words it for a REST connection with an ``ech_sidecar``. There the engine
+    builds a verifying context for the partner from the hop's trust anchor, and then sends to the
+    sidecar on a plain loopback opener instead, so no ``[tls]`` CRL is checked against the partner,
+    leaf or chain, and pinning the hop would not make one be. Its refusal says so, and offers the
+    two settings that let it build without promising a check."""
     if not (anchor.crl_check_chain and anchor.load_system_roots):
         return
     arm = (
@@ -3479,13 +3508,23 @@ def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
         if anchor.cafile is not None
         else "the system arm (the OS trust store, with no CA file of its own)"
     )
+    if ech_sidecar:
+        raise ValueError(
+            "[tls].crl_check_chain is set, and this REST connection sends through its ECH "
+            "sidecar (ech_sidecar), which makes the TLS connection to the partner and verifies "
+            "it. So no CRL in [tls].crl_file is checked against the partner on this connection, "
+            "leaf or chain, whatever its CA setting. The engine still builds a context for the "
+            f"partner from this connection's trust anchor, which is {arm}, and refuses the "
+            f"whole-chain check there. {OS_ROOTS_CHAIN_CHECK_REASON}. For this connection to "
+            "build, unset [tls].crl_check_chain, or give the connection a tls_ca_file of "
+            "operator CAs with a CRL in [tls].crl_file from each. Neither makes the engine check "
+            "the partner's revocation, which stays with the sidecar"
+        )
     raise ValueError(
-        f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}. The "
-        "engine cannot tell at build which of the OS trust store's CAs a partner chains through, "
-        "so it cannot judge whether [tls].crl_file holds a CRL from each, and the setting is "
-        "refused here. To chain-check this hop, give it operator CAs alone, or unset "
-        "[tls].crl_check_chain. docs/CONFIGURATION.md, [tls].crl_check_chain, says how, and "
-        "what each choice changes on the other hops"
+        f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}, so the "
+        f"setting is refused here. {OS_ROOTS_CHAIN_CHECK_REASON}. To chain-check this hop, "
+        f"{_OPERATOR_CA_REMEDY}. Or unset [tls].crl_check_chain, and the outbound hops "
+        "[tls].crl_file reaches keep the leaf check"
     )
 
 
@@ -3564,7 +3603,7 @@ def build_verifying_client_context(
     store is refused before anything is built. A CA file that loads a CA with no path to a
     self-signed root in that file is refused once it loads, and on the rest the chain must end at
     such a root."""
-    _refuse_chain_check_on_os_roots(anchor)
+    refuse_chain_check_on_os_roots(anchor)
     ctx: ssl.SSLContext
     if anchor.load_system_roots:
         ctx = ssl.create_default_context(purpose)
@@ -3621,7 +3660,7 @@ def build_anchored_https_handler(
     if not anchor.narrows:
         return build_asserted_https_handler(connector=connector)
     if anchor.load_system_roots:
-        _refuse_chain_check_on_os_roots(anchor)  # vault BACKLOG #5511, before anything is built
+        refuse_chain_check_on_os_roots(anchor)  # vault BACKLOG #5511, before anything is built
         # augment (and the CRL-only shape below): urllib's OWN context, with the internal CA and/or the
         # CRL loaded on top. Nothing is replayed because nothing is rebuilt -- the only changes are one
         # more trusted root and, with a CRL, the revocation flag.

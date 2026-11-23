@@ -1474,7 +1474,7 @@ def cas_not_reaching_a_root(ca_ders: Iterable[bytes]) -> list[str]:
 
 
 #: The CA setting an outbound whole-chain hop loads its CAs from, as a refusal names it.
-_OUTBOUND_CA_SETTINGS = (
+OUTBOUND_CA_SETTINGS = (
     "such as a connection's tls_ca_file, [alerts].email_tls_ca_file, or "
     "[tls].internal_ca_file under trust_anchor_mode = 'pinned'"
 )
@@ -1494,7 +1494,7 @@ def own_crl_reason(
         if outbound:
             return (
                 "it could not be checked against the CAs the hop loaded from its CA setting, "
-                f"{_OUTBOUND_CA_SETTINGS}: {str(exc).replace('loaded client CA', 'loaded CA')}"
+                f"{OUTBOUND_CA_SETTINGS}: {str(exc).replace('loaded client CA', 'loaded CA')}"
             )
         return (
             "it could not be checked against the client CAs the hop loaded from its client-CA "
@@ -1513,7 +1513,7 @@ def own_crl_refusal(missing: Iterable[tuple[str, int]], *, outbound: bool = Fals
         for subject, serial in sorted(missing)
     )
     if outbound:
-        who = f"the CA(s) {named}, loaded from this hop's CA setting ({_OUTBOUND_CA_SETTINGS}),"
+        who = f"the CA(s) {named}, loaded from this hop's CA setting ({OUTBOUND_CA_SETTINGS}),"
         peers = "servers"
         checked = "[tls].crl_check_chain checks the whole server chain against this file"
     else:

@@ -25,18 +25,24 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from messagefoundry.config.settings import TlsSettings
+from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings, TlsSettings
 from messagefoundry.config.tls_policy import (
+    OS_ROOTS_CHAIN_CHECK_REASON,
     TrustAnchor,
     TrustAnchorPolicy,
     _require_rooted_cas,
     build_anchored_https_handler,
     build_verifying_client_context,
+    context_checks_revocation,
     resolve_trust_anchor,
     urllib_handler_context,
 )
+from messagefoundry.config.wiring import Rest
 from messagefoundry.pipeline import crl_reload
 from messagefoundry.pki import cas_not_reaching_a_root
+from messagefoundry.transports import build_destination
+from messagefoundry.transports.rest import opener_tls_context
 from tests import test_api_tls_client_trust as _api_suite
 from tests.test_api_tls_client_trust import _TwoTier
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -47,6 +53,7 @@ _fresh_registry = _api_suite._fresh_registry
 
 _HOST = "partner.example"  # off loopback, so [tls].crl_file reaches the hop
 _CONNECTION = "OB_PARTNER_ADT"
+_ECH_SIDECAR = "http://127.0.0.1:8123"  # nothing here dials it
 
 _Builder = Callable[[TrustAnchor], ssl.SSLContext]
 
@@ -224,8 +231,9 @@ def test_an_anchor_cannot_check_the_chain_without_a_crl() -> None:
 
 @_BUILDERS
 def test_the_os_trust_store_arms_refuse_the_build(build: _Builder, two_tier: _TwoTier) -> None:
-    """The engine cannot judge a CRL file complete against the OS trust store's CAs, so augment
-    and system refuse the build, and each refusal names the two ways out."""
+    """Augment and system refuse the build, each refusal giving the one reason
+    (OS_ROOTS_CHAIN_CHECK_REASON) and naming the settings that get round it, since the docs it
+    once pointed at do not ship in the wheel."""
     augment = _anchor(two_tier.revokes_nothing, internal_ca=two_tier.root_file, mode="augment")
     system = _anchor(two_tier.revokes_nothing)
     for anchor, arm in ((augment, "augment"), (system, "system")):
@@ -234,8 +242,77 @@ def test_the_os_trust_store_arms_refuse_the_build(build: _Builder, two_tier: _Tw
         ) as refused:
             build(anchor)
         text = str(refused.value)
-        assert "give it operator CAs alone, or unset [tls].crl_check_chain" in text
-        assert "docs/CONFIGURATION.md, [tls].crl_check_chain" in text
+        assert OS_ROOTS_CHAIN_CHECK_REASON in text
+        for setting in (
+            "tls_ca_file",
+            "[alerts].email_tls_ca_file",
+            '[tls].internal_ca_file with [tls].trust_anchor_mode = "pinned"',
+            "unset [tls].crl_check_chain",
+        ):
+            assert setting in text
+        assert "docs/CONFIGURATION.md" not in text
+        assert "ech_sidecar" not in text
+
+
+def _ech_rest(policy: TrustAnchorPolicy, settings: dict[str, object] | None = None) -> object:
+    """A REST destination that sends through a loopback ECH sidecar, built as the loader builds
+    it. Revocation is attested so the revocation guard admits it on any posture."""
+    return build_destination(
+        Destination(
+            name=_CONNECTION,
+            type=ConnectorType.REST,
+            settings={
+                **Rest(url=f"https://{_HOST}/x").settings,
+                "ech_egress": True,
+                "ech_sidecar": _ECH_SIDECAR,
+                **(settings or {}),
+            },
+            trust_anchor_policy=policy,
+            tls_revocation_attested=True,
+            tls_revocation_attested_reason="synthetic: the sidecar checks revocation",
+        ),
+        egress=EgressSettings(deny_by_default=False, allowed_ech_sidecar=["127.0.0.1:8123"]),
+    )
+
+
+def test_an_ech_rest_hop_on_the_os_roots_refuses_without_promising_a_check(
+    two_tier: _TwoTier,
+) -> None:
+    """Red before the fix: an ECH hop got the generic refusal, whose "To chain-check this hop,
+    give it operator CAs alone" promised a check the sidecar hop never runs."""
+    for mode, internal in (("system", None), ("augment", str(two_tier.root_file))):
+        policy = TrustAnchorPolicy(
+            internal_ca_file=internal,
+            mode=mode,  # type: ignore[arg-type]
+            crl_file=str(two_tier.revokes_nothing),
+            crl_check_chain=True,
+        )
+        with pytest.raises(ValueError, match=r"crl_check_chain is set, and this REST") as refused:
+            _ech_rest(policy)
+        text = str(refused.value)
+        assert "sends through its ECH sidecar (ech_sidecar)" in text
+        assert "no CRL in [tls].crl_file is checked against the partner" in text
+        assert OS_ROOTS_CHAIN_CHECK_REASON in text
+        assert "unset [tls].crl_check_chain, or give the connection a tls_ca_file" in text
+        assert "Neither makes the engine check the partner's revocation" in text
+        assert "To chain-check" not in text
+
+
+def test_an_ech_rest_hop_pinned_by_its_ca_file_builds_and_checks_no_crl(
+    two_tier: _TwoTier,
+) -> None:
+    """What the ECH refusal says, measured: with the connection's own tls_ca_file the hop builds,
+    and the opener it sends on checks no CRL, leaf or chain, since the sidecar dials the partner."""
+    policy = TrustAnchorPolicy(crl_file=str(two_tier.revokes_nothing), crl_check_chain=True)
+    dest = _ech_rest(policy, {"tls_ca_file": str(two_tier.root_file)})
+    opener = dest._opener  # type: ignore[attr-defined]
+    assert not context_checks_revocation(opener_tls_context(opener, connector="probe"))
+
+
+def test_the_configuration_row_the_settings_comment_names_exists() -> None:
+    """TlsSettings.crl_check_chain's comment points at this row; it must be there to find."""
+    doc = Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md"
+    assert "| `crl_check_chain` | bool | `false` |" in doc.read_text(encoding="utf-8")
 
 
 @_BUILDERS

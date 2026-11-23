@@ -2245,8 +2245,8 @@ class TlsSettings(_Section):
     # Opt-in (vault BACKLOG #5511): check revocation for every certificate in the peer's chain on
     # the outbound hops crl_file reaches, not only the leaf, so a revoked intermediate CA refuses
     # the servers under it. Default False keeps the leaf check. It needs crl_file. A hop on the OS
-    # trust store refuses it at build; docs/CONFIGURATION.md says why, and what each hop refuses
-    # with it on.
+    # trust store refuses it at build, for the reason tls_policy.OS_ROOTS_CHAIN_CHECK_REASON gives;
+    # docs/CONFIGURATION.md says what each hop refuses with it on.
     crl_check_chain: bool = False
 
     @field_validator("crl_file")
