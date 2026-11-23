@@ -307,9 +307,10 @@ def _not_a_plain_file(path: Path) -> str | None:
 
 
 def _sidecar_is_absent(sidecar: Path) -> bool:
-    """Whether the file system says ``sidecar`` is not there; ``False`` when it is, in any form,
-    since an ``lstat`` follows no link. Any failure to find out raises ``OSError`` (BACKLOG #6575).
-    The answer authorises an unlink, so it is :func:`~messagefoundry.path_reach.is_name_absent`'s."""
+    """Whether an ``lstat`` reports ``sidecar`` as not there, by
+    :func:`~messagefoundry.path_reach.is_name_absent`, whose limits apply to a ``True``. ``False``
+    when the ``lstat`` succeeds, in any form of file, since it follows no link. Any other failure
+    raises ``OSError`` (BACKLOG #6575)."""
     try:
         os.lstat(sidecar)
     except FileNotFoundError as exc:
@@ -319,15 +320,17 @@ def _sidecar_is_absent(sidecar: Path) -> bool:
     return False
 
 
-def _root_answers(root: Path) -> bool:
-    """Whether the uploads root still answers a ``stat``, which tells a fault on one entry from
-    the root being lost. An entry's own error cannot: a dangling link raises the codes a lost share
-    does. A POSIX mount that dropped leaves a mount point that still answers."""
+def _root_fault(root: Path) -> str | None:
+    """The reason the uploads root's own ``stat`` failed, or ``None`` when it answers. A failure
+    says the root is lost, which an entry's own error cannot: a dangling link raises the codes a
+    lost share does. An answer proves nothing about the entries under it: a POSIX mount that
+    dropped leaves a mount point that still answers. Text and not the exception, whose traceback
+    would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
     try:
         root.stat()
-    except OSError:
-        return False
-    return True
+    except OSError as exc:
+        return exc.strerror or type(exc).__name__
+    return None
 
 
 def _names_a_link(info: os.stat_result) -> bool:
@@ -4238,15 +4241,23 @@ class UploadStore:
         kept, because this pass checks that the sidecar's name exists without opening it — a
         rotated-away key can no more destroy data here than it can in the age pass.
 
-        **A read fault is never read as a missing sidecar (BACKLOG #6575).** The root is listed
-        once, whole, before anything is removed. A root that is not there is an empty pass, and any
-        other listing failure raises with nothing removed. A body the listing shows with no sidecar
-        goes only once it is past the floor and :func:`_sidecar_is_absent`, asked right before the
-        unlink, says the sidecar is not there. That narrows the race with a sidecar landing after
-        the listing and does not close it: one can land between that check and the unlink, and a
-        network client's cache could answer the check from the listing's stale view. A fault on
-        one entry leaves that entry for the next pass. If the root then fails a ``stat`` too, the
-        pass stops, logged at ERROR once an interval, and returns what it removed.
+        **A read fault that raises is not read as a missing sidecar (BACKLOG #6575).** The root is
+        listed once, whole, before anything is removed. A listing error
+        :func:`~messagefoundry.path_reach.is_absent` reads as no root is an empty pass, and any
+        other raises with nothing removed. A body the listing shows with no sidecar goes only once
+        it is past the floor and :func:`_sidecar_is_absent`, asked right before the unlink, reports
+        the sidecar not there.
+
+        **That report is the file system's answer, not proof that no sidecar exists.**
+        :func:`~messagefoundry.path_reach.is_name_absent` states its limits, at least a POSIX
+        missing parent, a stale client cache and the unmeasured Access-Based Enumeration case. Any
+        of them can send a body whose sidecar still exists to the unlink. The check narrows the
+        race with a sidecar landing after the listing and does not close it: one can land between
+        that check and the unlink.
+
+        A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
+        too, the pass stops and returns what it removed, logged at ERROR with the root's own error,
+        repeats damped by :class:`_OncePerInterval`.
 
         **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
         in this process currently holds, and a held name is skipped outright, so the threshold never
@@ -4308,7 +4319,7 @@ class UploadStore:
                     continue
                 entry.unlink()
             except OSError as exc:
-                if not _root_answers(root):
+                if (root_fault := _root_fault(root)) is not None:
                     _log.log(
                         logging.ERROR
                         if self._link_logged.first("orphan sweep stopped")
@@ -4316,12 +4327,12 @@ class UploadStore:
                         "uploaded-logs orphan sweep stopped at %s: the uploads root stopped "
                         "answering (%s); no further file was removed and the next pass retries",
                         name,
-                        exc.strerror or type(exc).__name__,
+                        root_fault,
                     )
                     break
                 # Already gone (a sibling shard's sweep), held open by another process, or not a file
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
-                # a random tag, never a body. Anything but "already gone" is named once an interval,
+                # a random tag, never a body. Anything but "already gone" is logged, repeats damped,
                 # since a body whose sidecar cannot be checked stays until someone looks.
                 quiet = is_name_absent(exc) or not self._link_logged.first(f"orphan sweep {name}")
                 _log.log(

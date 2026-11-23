@@ -51,10 +51,14 @@ def is_absent(exc: OSError) -> bool:
 
 
 def is_name_absent(exc: OSError) -> bool:
-    """:func:`is_absent`, narrowed for a caller that deletes on the answer: the parent directory
-    answered and holds no such name. On Windows only ERROR_FILE_NOT_FOUND (2) says that, so a
-    missing parent (3), a missing drive (15) or an error with no code is not absence here. POSIX
-    has one ENOENT for both, so there this cannot tell a missing name from a missing parent."""
+    """:func:`is_absent`, narrowed for a caller that deletes on the answer. It reads the error's
+    code and proves no more than that code does. On Windows only ERROR_FILE_NOT_FOUND (2) counts,
+    so a missing parent (3), a missing drive (15) or an error with no code is not absence here.
+
+    A ``True`` has limits. POSIX has one ENOENT for a missing name and a missing parent, so there
+    this cannot tell them apart. A network client can answer from a stale cache on either platform.
+    What a Windows share with Access-Based Enumeration answers for a name it hides from this
+    account has not been measured, so a hidden name may read as absent."""
     if not isinstance(exc, FileNotFoundError):
         return False
     winerror = getattr(exc, "winerror", None)

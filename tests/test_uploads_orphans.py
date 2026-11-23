@@ -23,10 +23,12 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from messagefoundry import path_reach
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.uploads import (
     _BLOB_SUFFIX,
@@ -307,7 +309,7 @@ async def test_the_sweep_does_not_remove_a_body_still_waiting_for_its_sidecar(
     assert await store.read_bytes(listed[0].file_id) == _TXT
 
 
-# --- a read fault is never read as an absence (BACKLOG #6575) ------------------------------------
+# --- a read fault that raises is not read as an absence (BACKLOG #6575) --------------------------
 
 
 _ORPHAN_TEXT = "SYNTHETIC-ORPHAN-BODY-TEXT"
@@ -605,9 +607,10 @@ async def test_a_root_that_stops_answering_stops_the_sweep(
     caplog: pytest.LogCaptureFixture,
     fault: Callable[[], OSError],
 ) -> None:
-    """Only a positive "not there" lets a body go. The fault lands on the second orphan's sidecar
-    and the root then fails its own ``stat``: the first orphan was already confirmed and removed
-    and stays counted, and the third is never reached, which tells stopping from skipping."""
+    """A sidecar check that raises never lets a body go. The fault lands on the second orphan's
+    sidecar and the root then fails its own ``stat``: the first orphan was already confirmed and
+    removed and stays counted, and the third is never reached, which tells stopping from skipping.
+    The ERROR names the root's own fault, not the entry's."""
     store = _store(tmp_path)
     bodies = [_aged_orphan(store) for _ in range(3)]
     real = os.lstat
@@ -636,8 +639,21 @@ async def test_a_root_that_stops_answering_stops_the_sweep(
     assert sidecars == 2
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1, [r.getMessage() for r in errors]
-    assert "orphan sweep stopped" in errors[0].getMessage()
+    message = errors[0].getMessage()
+    assert "orphan sweep stopped" in message
+    assert "Input/output error" in message, "the ERROR must name the root's own fault"
+    assert str(fault().strerror) not in message, "the ERROR named the entry's fault"
     assert _ORPHAN_TEXT not in caplog.text
+
+
+@pytest.mark.parametrize(("platform", "absent"), [("win32", False), ("linux", True)])
+def test_a_not_found_error_with_no_windows_code(
+    monkeypatch: pytest.MonkeyPatch, platform: str, absent: bool
+) -> None:
+    """A Windows lookup failure carries a code, so one with none proves nothing and must not
+    authorise an unlink. POSIX has no such code, so there the class is the whole answer."""
+    monkeypatch.setattr(path_reach, "sys", SimpleNamespace(platform=platform))
+    assert path_reach.is_name_absent(FileNotFoundError(errno.ENOENT, "not found")) is absent
 
 
 # --- drift guard --------------------------------------------------------------------------------
