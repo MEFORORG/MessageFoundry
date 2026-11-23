@@ -1964,7 +1964,9 @@ def _per_connection_ssl_connect(
     Windows, walks the system certificate store. It is bounded by ``connect_timeout``, since it runs
     before asyncpg's own connect timeout starts. ``asyncpg_module.connect`` is looked up per call,
     which keeps a test's stand-in module usable without a ``connect``."""
-    timeout = settings.connect_timeout or None
+    # At least 1: the load refuses 0, which asyncpg would read as a deadline already past (BACKLOG
+    # #5769), so there is no "no bound" spelling to map to None.
+    timeout = settings.connect_timeout
     files = [
         name
         for name, value in (

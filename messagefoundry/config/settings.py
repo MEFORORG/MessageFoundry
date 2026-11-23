@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Self
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
@@ -409,6 +409,25 @@ class _Section(_InputHidingModel, NumbersRefuseBool):
                     raise ValueError(refusal)
         return data
 
+    @model_validator(mode="after")
+    def _refuse_non_finite_floats(self) -> Self:
+        """Refuse NaN or an infinity left in any float field once its own validators ran (BACKLOG
+        #5769).
+
+        No setting gives either a meaning as a number, and each slips past the usual range check:
+        NaN compares False against every bound, so a ``value <= 0`` refusal admits it, and +inf
+        admits ``value > 0``. A consumer then waits on a deadline or a cadence that never arrives,
+        such as a WAL checkpoint that never runs. This runs after the field validators, so a field
+        that already refuses a non-finite value keeps its own message, and one that reads ``inf`` as
+        a spelling of off (the ``[delivery]`` age thresholds) has turned it into ``None`` by now. A
+        model-wide ``allow_inf_nan=False`` would do neither. The message names the field, never
+        the value."""
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number; nan and infinity are refused")
+        return self
+
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
 #: honoured only on an instance at ``[security].enforcement = warn``.
@@ -740,7 +759,8 @@ class StoreSettings(_Section):
     # their connection pool + concurrent submission instead. "Native commit_delay" is PostgreSQL-ONLY
     # (a durability-neutral GUC, a planned gated/off-by-default increment); SQL Server has NO durability-
     # neutral group-commit knob (its DELAYED_DURABILITY relaxes durability and is rejected for the PHI
-    # store), so its scale path is the concurrent pool + sharding (ADR 0037), not a native GUC.
+    # store), so its scale path is the concurrent pool + engine sharding (ADR 0037), not a native
+    # GUC.
     group_commit_window_ms: float = 0.0
     # Flush threshold for the group-commit committer: once this many members are enrolled in the open
     # batch, it commits immediately without waiting out the rest of `group_commit_window_ms` (bounds
@@ -924,10 +944,11 @@ class StoreSettings(_Section):
     # the check reads the sidecars off disk with no cache, so engine shards sharing one dir see each
     # other's files and the budget does NOT multiply (measured 2026-08-10 — two UploadStores over one
     # dir, the second refused the same uploader at quota, against a live positive control). The
-    # check-then-write race that used to survive across them — an overshoot of one file per shard
-    # caught between its scan and its write — is closed by an atomic reservation on the unified store
-    # every shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated once in
-    # `uploads.UploadQuotaError`. Shards given SEPARATE dirs get separate budgets, by construction.
+    # check-then-write race that used to survive across them — an overshoot of one file per engine
+    # shard caught between its scan and its write — is closed by an atomic reservation on the unified
+    # store every engine shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated
+    # once in `uploads.UploadQuotaError`. Engine shards given SEPARATE dirs get separate budgets,
+    # by construction.
     max_upload_files_per_user: int = Field(
         default=100,
         ge=1,
@@ -963,7 +984,8 @@ class StoreSettings(_Section):
     # Default is SQL Server's port (1433); for the Postgres backend a left-at-default 1433 is treated
     # as "use Postgres's conventional 5432" by the model_validator below, so a Postgres deployment that
     # omits `port` still connects (set MEFOR_STORE_PORT explicitly to override either default).
-    port: int = 1433
+    # A TCP port a database server can listen on (BACKLOG #5769).
+    port: int = Field(default=1433, ge=1, le=65535)
     database: str | None = None
     auth: SqlAuth = SqlAuth.SQL
     username: str | None = None
@@ -1033,9 +1055,14 @@ class StoreSettings(_Section):
     # instead of serially waiting out each replica subnet's DNS/TCP timeout on failover. A no-op for
     # Postgres/SQLite (they never see the ODBC string). Default off — only multi-subnet AOAG needs it.
     multi_subnet_failover: bool = False
-    pool_size: int = 40
-    connect_timeout: int = 15  # seconds
-    command_timeout: int = 30  # seconds
+    # At least one connection; a pool of 0 could serve no borrow (BACKLOG #5769).
+    pool_size: int = Field(default=40, ge=1)
+    # Seconds (BACKLOG #5769). The login timeout is at least 1, as a connection's is
+    # (check_db_connect_timeout): asyncpg reads 0 as a deadline already past, so every connect would
+    # fail, and pyodbc reads it as the driver's default. The statement timeout keeps its
+    # documented 0 = no limit (STORE-3) and refuses only a negative.
+    connect_timeout: int = Field(default=15, ge=1)
+    command_timeout: int = Field(default=30, ge=0)
     # Upper bound (seconds) on ONE pooled-connection borrow from the server-DB store pool, and on the
     # throwaway pool a DatabaseRef reference sync opens (BACKLOG #1052, ASVS 13.2.6). Server-DB only —
     # SQLite has no pool. `connect_timeout` bounds the LOGIN and `command_timeout` the STATEMENT;
@@ -1765,7 +1792,9 @@ def _check_ws_allowed_origin(entry: str, position: int) -> None:
 
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
-    port: int = 8765
+    # 0 to 65535 (BACKLOG #5769): 0 asks the OS for a free port, and supervise counts each engine
+    # shard's port up from this one.
+    port: int = Field(default=8765, ge=0, le=65535)
     # Serve the API documentation routes, at least /docs, /redoc and /openapi.json, with no sign-in.
     # Off by default; on, it widens the surface and security_loosenings() names it (#2385).
     expose_docs: bool = False
