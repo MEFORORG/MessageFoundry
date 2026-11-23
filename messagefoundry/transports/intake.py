@@ -92,9 +92,10 @@ class IntakeHandler[R]:
 
     :func:`deliver` recognises it by its class, not by an attribute, so a ``functools.wraps``
     wrapper around it, which copies attributes but not the class, is not mistaken for one and is
-    called with the body alone. Building one checks the wrapped function takes an optional
-    ``intake`` keyword, so a handler that cannot take the context fails when it is wrapped, not on
-    the first message."""
+    called with the body alone. Building one checks only that the wrapped function takes an
+    optional ``intake`` keyword, read from its own signature: a handler that cannot take that
+    keyword fails when it is wrapped. Other signature mismatches, such as no body parameter or an
+    extra required parameter, are not checked at wrap time and fail on the first frame."""
 
     __slots__ = ("_handler",)
 
