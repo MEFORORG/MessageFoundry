@@ -249,11 +249,13 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). **This paragraph is
     where the hold is stated; the code and messages that act on it point here.** What sets it: a
     refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
-    device at the path among them, or an ACL or path that could not be read, since whoever
+    device at the path refused as not a regular file among them (on Windows ``os.stat`` of a
+    device the account cannot open can raise ``PermissionError`` instead, which sets none), or an
+    ACL or path that could not be read, since whoever
     swapped the file can make its ACL unreadable. Some file read faults set nothing
     (:func:`_transient_read_fault`, which lists at least which and names the known residuals,
     and says which of them reach a read at ``enforce``). Any other ``OSError`` sets the hold.
-    What it refuses: at least the new connects the
+    What the hold refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -2968,18 +2970,20 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     network :func:`~messagefoundry.path_reach.is_unreachable` reads as lost, or a Windows error
     code in :data:`_TRANSIENT_WINERRORS`. On Windows at least ``os.stat`` and ``os.fstat`` carry
     a Windows error code; at least some failures of the open and of the read itself carry none,
-    so a share lost at those steps can still set the hold.
+    so where a pin location becomes networked after the store open, a share lost at those steps
+    can still set the hold.
 
-    **A pin whose path verdict is indeterminate or insecure never reaches this read at**
-    ``enforce``. The SQL Server store open refuses both verdicts
+    **A pin whose path verdict at the store open is indeterminate or insecure does not reach this
+    read at** ``enforce``. The SQL Server store open refuses both verdicts
     (:func:`~messagefoundry.store.sqlserver.check_pinned_certificate`), so ``serve`` fails at the
-    open whatever the network does. A share can read as either: at least CIFS or NFS with a
-    foreign uid, or a group or other write bit, reads as ``path_insecure``, and otherwise as
-    indeterminate. On POSIX at least a local disk of a type outside
+    open whatever the network does. A share can read as either: on POSIX at least CIFS or NFS with
+    a foreign uid, or with a group or other write bit and without the sticky bit, reads as
+    insecure, and otherwise as indeterminate. On POSIX at least a local disk of a type outside
     :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, and any
     host without ``/proc/self/mountinfo`` read as indeterminate. So at ``enforce`` this exemption
-    takes effect only for a pin whose path passes, such as on a trusted local file system or on
-    block-level network storage formatted with one; at ``warn`` no refusal sets the hold at all.
+    takes effect only for a pin whose path passed at the store open, such as on a trusted local
+    file system or on block-level network storage formatted with one, or a pin location that
+    becomes networked or insecure after the open; at ``warn`` no refusal sets the hold at all.
 
     **Known residuals.** Every ``PermissionError`` counts, a Windows sharing or lock violation
     among them, since on Windows that is what a scanner holding the file arrives as and the read
@@ -2995,7 +2999,10 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     the hold. On Windows ``os.stat`` of a device the account cannot open can raise
     ``PermissionError``, which sets no hold. Windows also reports at
     least some malformed paths as ``FileNotFoundError``, which then sets no hold either. Each
-    such check still refuses the reload.
+    such check still refuses the reload. The path verdict does not gate this read at a later
+    check: :func:`evaluate_anchor` reads the file before it judges the path, so a pin whose path
+    becomes insecure or indeterminate after the open reaches this read, and a read fault there
+    is judged here first.
 
     What still sets the hold: at least a pipe or device refused as not a regular file, a
     ``BrokenPipeError``, which is how a pipe at the path can fail on Windows, a ``ValueError``
