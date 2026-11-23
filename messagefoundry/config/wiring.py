@@ -349,6 +349,9 @@ class EnvRef:
         # connector's own check saw only the cast's result. The same swap, for the same reason.
         elif self.cast is int:
             object.__setattr__(self, "cast", _cast_int)
+        # The builtin ``float`` reads a TOML ``true`` as 1.0 the same way.
+        elif self.cast is float:
+            object.__setattr__(self, "cast", _cast_float)
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
         # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
@@ -409,7 +412,11 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
     made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
-    (vault BACKLOG #1650, :func:`_cast_int`). Any other callable runs as given. On a boolean
+    (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
+    (:func:`_cast_float`). Any other callable runs as given, a builtin such as ``abs`` or a
+    type such as ``decimal.Decimal`` included, on the environment value as it arrives, a TOML bool
+    included, so ``cast=lambda v: int(v)`` still reads ``true`` as 1; the connector's own check
+    sees only what the cast returned. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
@@ -523,12 +530,31 @@ def _cast_int(raw: Any) -> int:
 _cast_int.__name__ = "int"
 
 
+def _cast_float(raw: Any) -> float:
+    """Read an environment value as a number: the ``cast = "float"`` named cast, and what a
+    code-first ``env(..., cast=float)`` runs, since :class:`EnvRef` swaps the builtin ``float`` for
+    it (vault BACKLOG #1650).
+
+    The builtin turns ``True`` into 1.0, and a TOML ``true`` in ``environments/<env>.toml`` reaches
+    the cast typed. It also takes ``"nan"`` and ``"inf"``, and rounds ``"1e-400"`` to 0.0, so a
+    float cap read through the cast could turn off from a value nobody wrote as zero. So the value
+    is read by the rule ``transports.base.float_setting`` holds, which refuses each of those with a
+    ``ValueError`` that withholds the value, by the rule :func:`_cast_bool` states."""
+    from messagefoundry.transports.base import float_setting
+
+    return float_setting(raw, knob="value", transport="env()")
+
+
+# Named "float" for the reason ``_cast_bool`` is named "bool".
+_cast_float.__name__ = "float"
+
+
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
 #: arbitrary Python callable the way :func:`env` can, so the file form is restricted to these — and
 #: ``int`` is the only cast used across the migration estate today.
 _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
     "int": _cast_int,
-    "float": float,
+    "float": _cast_float,
     "bool": _cast_bool,
     "str": str,
 }
