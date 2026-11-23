@@ -946,6 +946,54 @@ async def test_an_over_grant_summary_names_the_external_grants_it_could_not_read
     assert report.audit_detail()["unread"] == ["create table on database MessageFoundry"]
 
 
+async def test_an_unobserved_report_carries_its_unread_grants_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The structured field is not empty exactly when grants went unread: an UNOBSERVABLE report
+    fills it as well, on the external-only path and on the fixed-role path."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
+    row["create_table"] = None
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert report.unread == ("create table on database MessageFoundry",)
+    role_row = _probe_row(database_roles=("db_datareader", "db_datawriter"), unread=("db_owner",))
+    report = await _sqlserver_probe(monkeypatch, role_row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert report.unread == ("database role db_owner",)
+
+
+def test_an_observed_report_cannot_be_clean_with_grants_unread() -> None:
+    """``finding`` reads only status and excess, so OBSERVED with nothing found and something unread
+    would classify as clean. The type refuses that shape rather than rely on each backend."""
+    with pytest.raises(ValueError, match="unread"):
+        StorePrivilegeReport(
+            backend=StoreBackend.SQLSERVER,
+            status=StorePrivilegeStatus.OBSERVED,
+            unread=("create table on database MessageFoundry",),
+        )
+
+
+async def test_a_held_alter_on_an_unresolved_default_schema_is_still_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NULL default schema beside a held ALTER gave an empty schema name, which the comparator
+    read as no grant: a false clean. It is named under the unresolved label instead."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
+    row["default_schema"] = None
+    row["alter_schema"] = 1
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert "ALTER on schema (unresolved default schema)" in report.excess
+
+
+async def test_an_unread_alter_names_its_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The unread label names the schema, as the held label and the VIEW DEFINITION labels do."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
+    row["alter_schema"] = None
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.unread == ("ALTER on schema dbo",)
+
+
 def test_a_report_with_nothing_unread_keeps_its_summary() -> None:
     """The other direction: no unread grant adds no clause."""
     report = _clean(("database role db_owner",))

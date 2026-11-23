@@ -19,7 +19,8 @@ catalog permission, and both answer NULL, not 0, for a name that does not resolv
 The server set is the eight classic roles. The ``##MS_...##`` fixed server roles SQL Server 2022
 added are not in it, so neither probe reads them.
 
-Both probes read each answer with :func:`probed_grant`, which lives here for the same reason.
+Both probes read each answer with :func:`probed_grant`, which lives here for the same reason. It
+is not SQL Server specific: the PostgreSQL store probe reads its audit-table answers with it too.
 """
 
 from __future__ import annotations
@@ -64,8 +65,9 @@ def probed_grant(value: object) -> bool | None:
     would read as clean, so a probe that read nothing could render as a clean bill of health.
     ``True`` and ``False`` from a driver that returns booleans read as ``1`` and ``0``.
 
-    The store preflight (``store/privilege.py`` re-exports it) and the partner-login probe
-    (``transports/database.py`` ``classify_login_roles``) both call this one function."""
+    Callers include the store preflight of both server backends (``store/privilege.py``
+    re-exports it) and the partner-login probe (``transports/database.py``
+    ``classify_login_roles``), so a change here changes how each of them reads."""
     if isinstance(value, int) and value in (0, 1):
         return bool(value)
     return None

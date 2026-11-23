@@ -5257,14 +5257,14 @@ class SqlServerStore:
         # unread one never turns an over-grant that WAS read into an unobserved report: it is
         # weighed after the excess, below (#6714), so a read db_owner still refuses under enforce.
         external_unread: list[str] = []
+        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
         create_table = probed_grant(row["create_table"])
         if create_table is None:
             external_unread.append(f"create table on database {database}")
         alter_schema = probed_grant(row["alter_schema"])
         if alter_schema is None:
-            external_unread.append("ALTER on the default schema")
+            external_unread.append(f"ALTER on schema {default_schema}")
         # #6714: one column per distinct schema; when the default schema is dbo the two name one.
-        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
         view_def_columns = {default_schema: "view_def_default"}
         view_def_columns.setdefault("dbo", "view_def_dbo")
         view_definition: list[str] = []
@@ -5302,6 +5302,7 @@ class SqlServerStore:
                 database=database,
                 server_roles=server_roles,
                 database_roles=database_roles,
+                unread=tuple(unread + (external_unread if external else [])),
                 detail=(
                     f"the privilege query returned NULL, or a value that is not 0 or 1, for"
                     f" {len(unread)} of the {probed} role and CONTROL grant(s) probed, so they were"
@@ -5342,7 +5343,8 @@ class SqlServerStore:
             database=database,
             external=external,
             create_table=bool(create_table),
-            alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
+            # The unresolved label, never "": an empty name would read as no grant (a false clean).
+            alter_schema=(default_schema if alter_schema else None),
             audit_writes=audit_writes,
             view_definition=tuple(view_definition),
         )
@@ -5363,6 +5365,7 @@ class SqlServerStore:
                     database=database,
                     server_roles=server_roles,
                     database_roles=database_roles,
+                    unread=tuple(external_unread),
                     detail=(
                         f"{note}; [store].schema_management is 'external', which requires INSERT and"
                         " SELECT only on audit_log, no schema DDL right and no view definition on"

@@ -3171,6 +3171,7 @@ class PostgresStore:
                     status=StorePrivilegeStatus.UNOBSERVABLE,
                     principal=str(scalar["principal"] or ""),
                     database=database,
+                    unread=audit_unread,
                     detail=unread_note,
                 )
             unread_note = "; " + unread_note

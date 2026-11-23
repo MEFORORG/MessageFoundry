@@ -481,10 +481,17 @@ class StorePrivilegeReport:
     database_roles: tuple[str, ...] = ()
     excess: tuple[str, ...] = ()
     detail: str = ""
-    #: Grants the probe could NOT read beside an OBSERVED over-grant (BACKLOG #6015 item 2). The
-    #: report stays OBSERVED, since what WAS read already refuses; the summary still names them,
-    #: so the log line and the alert do not imply the rest was read.
+    #: Grants the probe could NOT read (BACKLOG #6015 item 2), on an UNOBSERVABLE report and on an
+    #: OBSERVED one that already found an over-grant. There the report stays OBSERVED, since what
+    #: WAS read already refuses, and the summary names them, so the log line and the alert do not
+    #: imply the rest was read.
     unread: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # `finding` reads status and excess only, so OBSERVED with nothing found and something
+        # unread would classify as clean. Refused here rather than trusted to each backend.
+        if self.status is StorePrivilegeStatus.OBSERVED and self.unread and not self.excess:
+            raise ValueError("an OBSERVED report with unread grants must carry the excess it found")
 
     @property
     def finding(self) -> str | None:
@@ -557,16 +564,15 @@ class PrivilegeProbeStore(Protocol):
     could not observe, which is precisely what that status means."""
 
     async def probe_principal_privileges(self) -> StorePrivilegeReport:
-        """Read this store principal's effective privileges, three ways per grant: held, not held,
-        or not read (BACKLOG #6015 item 3).
+        """Read this store principal's effective privileges (BACKLOG #6015 item 3).
 
-        ``OBSERVED`` with an empty ``excess`` is a clean read. A grant that was not read is never
-        reported as not held: the report is ``UNOBSERVABLE``, or, for a grant the backend weighs
-        after an over-grant it did read, stays ``OBSERVED`` with that over-grant in ``excess`` and
-        the unread grant in ``unread``, so the start still refuses on what WAS read.
-        ``NOT_APPLICABLE`` is SQLite's, which has no principal. Each backend's method says which
-        grants it reads, which unread ones stop the observation, and which count under
-        ``[store].schema_management``."""
+        ``OBSERVED`` with an empty ``excess`` is a clean read; ``UNOBSERVABLE`` is the absence of
+        one; ``NOT_APPLICABLE`` is SQLite's, which has no principal. ``unread`` names grants the
+        backend could not read; :class:`StorePrivilegeReport` refuses an ``OBSERVED`` report that
+        carries them with an empty ``excess``. A backend may also leave a read out of ``unread``:
+        the SQL Server probe notes a failed best-effort enumeration of user-defined roles in
+        ``detail`` only. Which grants a backend reads, how it reads each, and what it does with one
+        it could not read differ by backend; each backend's method says so."""
         ...
 
 
