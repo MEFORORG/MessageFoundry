@@ -224,13 +224,20 @@ def test_an_anchor_cannot_check_the_chain_without_a_crl() -> None:
 
 @_BUILDERS
 def test_the_os_trust_store_arms_refuse_the_build(build: _Builder, two_tier: _TwoTier) -> None:
-    """The check would need a CRL from every CA the OS trust store holds, so augment and system
-    refuse the build."""
+    """The start rule needs a CRL from every CA a hop loads, which the OS trust store's public CAs
+    defeat, so augment and system refuse the build, and the refusal names the ways out."""
     augment = _anchor(two_tier.revokes_nothing, internal_ca=two_tier.root_file, mode="augment")
     with pytest.raises(ValueError, match=r"crl_check_chain is set, .* the augment arm"):
         build(augment)
-    with pytest.raises(ValueError, match=r"crl_check_chain is set, .* the system arm"):
+    with pytest.raises(ValueError, match=r"crl_check_chain is set, .* the system arm") as refused:
         build(_anchor(two_tier.revokes_nothing))
+    text = str(refused.value)
+    assert "give it operator CAs alone" in text
+    assert "a connection's tls_ca_file" in text
+    assert (
+        "replaces the OS trust store on every non-loopback hop with no CA file of its own" in text
+    )
+    assert "turns the whole-chain check off on every hop" in text
 
 
 @_BUILDERS

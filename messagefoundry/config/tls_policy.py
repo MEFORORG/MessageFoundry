@@ -324,8 +324,8 @@ def harden_crl_check(
     the start rule reads the CAs loaded from the operator's own client-CA setting, not an OS trust
     store. The outbound hops under ``[tls].crl_file`` pass it only with ``[tls].crl_check_chain``,
     and only where they trust operator CAs alone (:func:`build_verifying_client_context`): a hop
-    on the OS trust store is refused at build instead: the start rule would need a CRL from every
-    CA that store holds, and on Linux a hashed CA directory cannot be listed at all.
+    on the OS trust store is refused at build instead (:func:`_refuse_chain_check_on_os_roots`
+    says why).
     The start rule's refusal is worded for a server chain when ``setting`` is
     :data:`OUTBOUND_CRL_SETTING`. Every other hop keeps the leaf check.
 
@@ -3466,15 +3466,13 @@ OUTBOUND_CRL_SETTING = "[tls].crl_file"
 def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
     """Refuse ``[tls].crl_check_chain`` on a hop that trusts the OS roots (vault BACKLOG #5511).
 
-    The whole-chain check needs a CRL in ``[tls].crl_file`` from every CA in the peer's chain, the
-    root included. The start rule that refuses a file missing one reads the CAs the hop loaded. On
-    the OS trust store it would need a CRL from every CA that store holds, and on Linux a hashed
-    CA directory cannot be listed at all, so the setting is refused there rather than honoured
-    unchecked.
-
-    The refusal's remedy names the hop's own CA setting only as one choice: at least the AI broker
-    has none, and ``trust_anchor_mode = "pinned"`` drops the public roots from each hop that has
-    no CA setting of its own, so such a hop to a public-CA partner can only leave the setting off."""
+    OpenSSL's whole-chain check needs a CRL only from each CA in the chain the peer presents. The
+    engine's own start rule (:func:`harden_crl_check`) is stricter: it refuses a CRL file that
+    leaves any CA the hop loaded without a CRL of its own, judged over ``get_ca_certs``. On the OS
+    trust store the hop loads many public CAs, and where the store is a hashed directory OpenSSL
+    reads it lazily, so ``get_ca_certs`` does not show it. So the setting is refused here rather
+    than honoured unchecked. The rationale and the operator's choices are stated once, in
+    docs/CONFIGURATION.md, the ``crl_check_chain`` row of ``[tls]``."""
     if not (anchor.crl_check_chain and anchor.load_system_roots):
         return
     arm = (
@@ -3485,13 +3483,15 @@ def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
     )
     raise ValueError(
         f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}. The "
-        "whole-chain check needs a CRL from every CA in the chain, and on the OS trust store that "
-        "means a CRL in [tls].crl_file from every CA the store holds (on Linux a hashed CA "
-        "directory cannot even be listed), so the setting is refused here. Where this hop has a "
-        "CA setting of its own, such as a connection's tls_ca_file, name the partner's CA there. "
-        "A hop with none, such as the AI broker, could pin only through [tls].internal_ca_file "
-        'with [tls].trust_anchor_mode = "pinned", which drops the public roots from each hop '
-        "without a CA setting of its own; for a public-CA partner, unset [tls].crl_check_chain"
+        "engine's start rule needs a CRL in [tls].crl_file from every CA a hop loads, and the OS "
+        "trust store loads many public CAs, so the setting is refused here. To check this hop's "
+        "chain, give it operator CAs alone: a CA file holding the partner's self-signed root and "
+        "any intermediates, with a CRL from each in [tls].crl_file, named in the hop's own CA "
+        "setting where it has one, such as a connection's tls_ca_file, or in "
+        '[tls].internal_ca_file under [tls].trust_anchor_mode = "pinned", which replaces the OS '
+        "trust store on every non-loopback hop with no CA file of its own. Otherwise unset "
+        "[tls].crl_check_chain, which turns the whole-chain check off on every hop. See "
+        "docs/CONFIGURATION.md, [tls].crl_check_chain"
     )
 
 
