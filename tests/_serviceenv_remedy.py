@@ -58,22 +58,26 @@ WIDER = "and the strings this step and any step above say to remove"
 #: comments 7089064404, 7089400537 and 7090314503).
 REMOVE_OTHER = "and remove any other entry that sets MEFOR_SECRETS_DIRECTORY and nothing else"
 
-#: The clause printed wherever a string in AppEnvironmentExtra sets the directory on one line
-#: and something else on another. With REMOVE_OTHER it makes the entry the operator adds the
-#: only one in that list, read line by line, and it removes no such string whole (the
-#: Lander's hold on PR 3142, comment 7090314503).
+#: The clause printed wherever a string in AppEnvironmentExtra holds a line that sets the
+#: directory and a non-blank line that does not. It asks for each directory line to come out of
+#: every such string no step above removes, and removes no such string whole (the Lander's
+#: hold on PR 3142, comment 7090314503).
 TAKE_LINE = (
-    "and take the line that sets MEFOR_SECRETS_DIRECTORY out of any other entry that sets it "
-    "along with another variable, keeping that entry's other lines"
+    "and take each line that sets MEFOR_SECRETS_DIRECTORY out of any other entry that holds "
+    "other lines too and that no step above says to remove, keeping its other lines"
 )
 
-#: The step where a string in AppEnvironmentExtra sets the directory and something else, no
+#: Printed with TAKE_LINE, at the end of the pass-back, so the lines it takes out are not passed
+#: back (the Lander's hold on PR 3142, comment 7090314503).
+TAKE_OUT = ", leaving out the lines this step says to take out"
+
+#: The step where a string in AppEnvironmentExtra holds a directory line and other lines, no
 #: string there sets only the directory, and no value runs on: no opener, the take-line
-#: clause, and no wider exclusion (the Lander's holds on PR 3142, comments 7089064404, B,
-#: 7089400537 and 7090314503).
+#: clause and its pass-back phrase, and no wider exclusion (the Lander's holds on PR 3142,
+#: comments 7089064404, B, 7089400537 and 7090314503).
 ADD_BACK_MIXED = ADD_BACK_BARE.replace(
     "beside its other entries, ", f"beside its other entries, {TAKE_LINE}, ", 1
-)
+).replace("refused above: see", f"refused above{TAKE_OUT}: see", 1)
 
 #: The step where a value runs on and no line of any string sets the directory: the opener,
 #: and the wider exclusion, since the strings the run-on step removes may hold the refused
@@ -89,8 +93,8 @@ ADD_BACK_RUN_ON = (
     'status"'
 )
 
-#: The step where a string in the lists sets the directory and nothing else, joined to a
-#: value or as its own item, and for a store key alone: no opener, main's clause narrowed,
+#: The step where a string sets the directory and nothing else, joined to a value or as its
+#: own item in AppEnvironmentExtra, and for a store key alone: no opener, main's clause narrowed,
 #: and main's wider exclusion, which then leaves out every other such string (the Lander's
 #: holds on PR 3142, comments 7088102723, 7088663896, 7089064404 and 7089400537; the
 #: Lander's rulings on handback 7085947392, F1, and comment 7087145957).
@@ -106,11 +110,11 @@ ADD_BACK_JOINED = (
 )
 
 #: The step where, in AppEnvironmentExtra, one string sets only the directory and another
-#: sets it beside something else: both clauses, and the wider exclusion (the Lander's hold on
-#: PR 3142, comment 7090314503).
+#: holds a directory line and other lines: both clauses, the wider exclusion, and the take-line
+#: pass-back phrase (the Lander's hold on PR 3142, comment 7090314503).
 ADD_BACK_JOINED_MIXED = ADD_BACK_JOINED.replace(
     f"{REMOVE_OTHER}, ", f"{REMOVE_OTHER}, {TAKE_LINE}, ", 1
-)
+).replace(f"{WIDER}: see", f"{WIDER}{TAKE_OUT}: see", 1)
 
 #: Text every form of the step carries, so a negative arm sees any.
 ADD_BACK_ANY = "Where install-service.ps1 already made the secrets directory, add"
