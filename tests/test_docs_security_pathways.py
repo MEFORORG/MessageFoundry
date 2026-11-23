@@ -128,6 +128,7 @@ _PARAGRAPH_TOKENS = (
 _REQUIRE_FACTORIES = frozenset(
     {
         "require",
+        "require_monitoring_read",
         "require_paced",
         "require_phi_read",
         "require_reauth_only",

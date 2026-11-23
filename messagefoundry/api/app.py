@@ -273,6 +273,7 @@ from messagefoundry.api.security import (
     refuse_from_new_address,
     refuse_undeclared_route,
     require,
+    require_monitoring_read,
     require_paced,
     require_phi_read,
     require_service_cert,
@@ -5680,7 +5681,7 @@ def create_app(
     async def list_connections(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
         # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
         # calls this handler in-process, and a call that leaves it out must get None.
         reveal: Annotated[ConnectionName | None, Query()] = None,
@@ -10390,7 +10391,7 @@ def create_app(
     @app.get("/stats", response_model=StatsResponse)
     async def stats(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> StatsResponse:
         # B11 (read-only, additive): the runner's empty-claim counters (idle-poll vs wake-fanout herd)
         # for the connection-scale harness. Default-zero when no runner is attached (graph-less engine).
@@ -10428,7 +10429,7 @@ def create_app(
     @app.get("/metrics")
     async def metrics_endpoint(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> Response:
         """Prometheus exposition (text/plain). Gated by monitoring:read like /stats — a scraper
         authenticates with a service token. Contains only aggregate counts/latency keyed by
@@ -10438,7 +10439,7 @@ def create_app(
     @app.get("/metrics/history", response_model=MetricsHistoryResponse)
     async def metrics_history(
         request: Request,
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> MetricsHistoryResponse:
         """The in-memory metrics-history ring for the console trend charts (BACKLOG #76, ADR 0065
         amendment). Oldest-first samples of the outbound-row-by-status counts, fed by the ~1s /ws/stats
@@ -10458,7 +10459,7 @@ def create_app(
     @app.get("/graph/edges", response_model=GraphResponse)
     async def graph_edges(
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> GraphResponse:
         """The by-name data-flow graph (BACKLOG #76, ADR 0065 amendment): the **static Registry edge
         set** (:func:`messagefoundry.config.graph.build_wiring_graph` — the same inbound → router →
@@ -10723,7 +10724,7 @@ def create_app(
     async def system_status(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> SystemStatus:
         now = time.time()
         total = running = 0

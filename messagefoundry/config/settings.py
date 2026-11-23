@@ -4029,6 +4029,19 @@ class AuthSettings(_Section):
         default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
+    # Per-actor pacing on the cost-bearing monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2):
+    # /graph/edges, /status, /stats, /metrics, /metrics/history and /connections, charged at
+    # admission by require_monitoring_read. The default's measured basis and multiplier are written
+    # once, in docs/SECURITY.md, "Monitoring-read pacing". In-process only, like the PHI-read
+    # throttle. 0 disables that dimension.
+    monitoring_read_rate_limit_enabled: bool = True
+    monitoring_read_rate_limit_per_actor: int = Field(default=600, ge=0)
+    monitoring_read_rate_limit_global: int = Field(default=0, ge=0)  # 0 = off
+    # No nan/inf and capped, for the reason login_rate_limit_window_seconds gives.
+    monitoring_read_rate_limit_window_seconds: float = Field(
+        default=60.0, gt=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
+
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
     # sliding window folded into the step-up gate (require_step_up) for every NON-GET sensitive op —
     # purge, replay, config deploy/reload. It paces scripted admin-write abuse on top of RBAC + step-up
@@ -9842,6 +9855,40 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             off=(
                 "there is no per-account PHI-read limit, so one signed-in account may read PHI "
                 "as fast as the engine answers (only an all-users limit, if one is set, holds)"
+            ),
+        )
+
+    # --- the monitoring-read limiter (vault BACKLOG #1191, ASVS 15.2.2): per actor, on the six
+    # cost-bearing monitoring:read GETs. Its window cannot be 0 or less (gt=0 at load), and the
+    # all-users count ships OFF (0), so neither has an off value to name.
+    if not auth.monitoring_read_rate_limit_enabled:
+        out.append(
+            (
+                "monitoring_read_rate_limit_enabled",
+                "the cost-bearing monitoring reads (the wiring graph, status, stats, metrics and "
+                "the connections dashboard) have NO pace -- one signed-in account may make the "
+                "engine rebuild the graph and scan the store as fast as it answers",
+            )
+        )
+    elif _window(
+        "monitoring_read_rate_limit_window_seconds",
+        auth.monitoring_read_rate_limit_window_seconds,
+        what="the monitoring-read rate-limit window",
+        off=None,
+        counts=(auth.monitoring_read_rate_limit_per_actor, auth.monitoring_read_rate_limit_global),
+    ):
+        _count(
+            "monitoring_read_rate_limit_per_actor",
+            auth.monitoring_read_rate_limit_per_actor,
+            what="the per-account monitoring-read limit",
+            so=(
+                "one signed-in account may make that many cost-bearing monitoring reads per "
+                "window before it is refused"
+            ),
+            off=(
+                "there is no per-account monitoring-read limit, so one signed-in account may "
+                "drive the graph rebuild and the store scans as fast as the engine answers (only "
+                "an all-users limit, if one is set, holds)"
             ),
         )
 

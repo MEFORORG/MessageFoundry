@@ -4292,6 +4292,18 @@ class AuthService:
             if settings.phi_read_rate_limit_enabled
             else None
         )
+        # Per-actor pacing for the cost-bearing monitoring:read GETs (vault BACKLOG #1191, ASVS
+        # 15.2.2), consulted by require_monitoring_read. Its own bucket, so dashboard polling never
+        # spends the PHI-read budget.
+        self._monitoring_read_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.monitoring_read_rate_limit_per_actor,
+                glob=settings.monitoring_read_rate_limit_global,
+                window_seconds=settings.monitoring_read_rate_limit_window_seconds,
+            )
+            if settings.monitoring_read_rate_limit_enabled
+            else None
+        )
         # Per-actor anti-automation pacing for the state-changing admin surface (BACKLOG #193, ASVS
         # 2.4.2). Built like _phi_read_limiter but consulted from the step-up gate for NON-GET sensitive
         # ops. glob=0 (no cross-actor dimension): one operator's write burst must never throttle
@@ -4781,6 +4793,18 @@ class AuthService:
         depends on other accounts' reads (:meth:`SlidingWindowRateLimiter.retry_after`). The JSON
         API and the ``/ui`` console both send it."""
         return _retry_after_seconds(self._phi_read_limiter, actor)
+
+    def allow_monitoring_read(self, actor: str) -> bool:
+        """Per-actor pacing for the cost-bearing monitoring:read GETs (vault BACKLOG #1191, ASVS
+        15.2.2). True = proceed; False = throttle. Always True when the limiter is disabled."""
+        if self._monitoring_read_limiter is None:
+            return True
+        return self._monitoring_read_limiter.allow(actor)
+
+    def monitoring_read_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value for a monitoring read just refused for ``actor``, rounded as
+        :meth:`phi_read_retry_after` rounds it, on the monitoring-read limiter."""
+        return _retry_after_seconds(self._monitoring_read_limiter, actor)
 
     def login_retry_after(self) -> int:
         """The ``Retry-After`` value for a sign-in attempt refused by :meth:`allow_login_attempt`:

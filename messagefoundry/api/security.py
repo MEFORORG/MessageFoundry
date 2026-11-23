@@ -1986,6 +1986,45 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
     return _gate(dependency, before_body)
 
 
+def require_monitoring_read(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
+    """Like :func:`require`, plus a **per-actor pace** on the cost-bearing ``monitoring:read`` GETs
+    (vault BACKLOG #1191, ASVS 15.2.2): the routes that rebuild the wiring graph or scan the store
+    per call. docs/SECURITY.md, *Monitoring-read pacing*, names the routes and the default's basis.
+
+    Charged at ADMISSION, before the route does its work. A throttled read is logged (not silent),
+    answered 429 with the actor's ``Retry-After``, and recorded as an ``auth.gate_refused`` row with
+    reason ``throttled``. It does not ask the new-address question: :func:`refuse_from_new_address`
+    says why the monitoring polls stay outside it. No pace on the embedding/no-auth path (there is
+    no per-actor identity to key on)."""
+
+    async def dependency(request: Request) -> Identity:
+        auth, identity = await _admit(request, permissions, mfa_gate=True)
+        if auth is not None:
+            async with _recorded_decision(request, auth, identity, permissions):
+                enforce_monitoring_read_pacing(request, auth, identity)
+        return identity
+
+    return _gate(dependency, _authenticate_session_before_body)
+
+
+def enforce_monitoring_read_pacing(request: Request, auth: AuthService, identity: Identity) -> None:
+    """Charge the per-actor monitoring-read budget (vault BACKLOG #1191), raising 429 when it is
+    spent. Logged, not silent. Its Retry-After is the actor's own wait, in whole seconds, or the
+    whole window while the all-accounts count is spent (:meth:`AuthService.monitoring_read_retry_after`)."""
+    if not auth.allow_monitoring_read(identity.user_id):
+        log.warning(
+            "monitoring-read throttled (anti-automation): actor=%s path=%s",
+            identity.username,
+            request.url.path,
+        )
+        raise _GateRefusal(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many requests; please slow down",
+            reason="throttled",
+            headers={"Retry-After": str(auth.monitoring_read_retry_after(identity.user_id))},
+        )
+
+
 def enforce_phi_read_pacing(request: Request, identity: Identity) -> None:
     """Charge the per-actor PHI-read budget (WP-8, ASVS 2.4.1), raising 429 when it is spent.
 
