@@ -509,12 +509,33 @@ def test_each_key_file_refusal_points_at_one_service_md_procedure_and_states_no_
     section = " ".join(_service_md_section(title).split())
     for needed in ("-DataDir", "-SecretsDir", "-CustodyDir", "Delete nothing", "Across volumes"):
         assert needed in section, (needed, section)
-    # Manager decision 2026-11-22: a new data directory takes everything the engine keeps there
-    # but the key files; a key file original a copy replaced is kept in an administrator-only
-    # folder, never deleted; and a second copy is read by whoever its access list names.
-    for needed in ("the log spool", "the generated API certificate", "Never delete it"):
+    # PR 3168 hold, items 2 and 4 to 8: a new data directory takes only this store's own files,
+    # the certificate pair together; a kept master.key original has its list set, not only moved;
+    # a handoff original goes once the service has started; machine-scope DPAPI unwraps on this
+    # host only; and its readers are an "at least" list.
+    for needed in (
+        "only files you know are this store's or this service's",
+        "any other database with its `-wal` and `-shm` files",
+        "`api-generated-cert.pem` with `api-generated-key.pem`. Move that pair together",
+        "Moving a file into another folder does not do that",
+        "/remove:g",
+        "/setowner",
+        "A `handoff.key` original:** delete it once the service has started from the copy",
+        "though it does not unwrap on another host",
+        "It is still read by at least SYSTEM",
+        "SeBackupPrivilege",
+        "in this step they may be another store's",
+    ):
         assert needed in section, (needed, section)
-    assert "delete each original" not in section and "by any account" not in section, section
+    for gone in (
+        "Never delete it",
+        "anyone who already has its bytes",
+        "move everything the engine keeps",
+        "or follow step 3",
+        "delete each original",
+        "by any account",
+    ):
+        assert gone not in section, (gone, section)
 
 
 def test_the_custody_and_secrets_overlap_is_compared_where_each_resolves(tmp_path: Path) -> None:
@@ -617,6 +638,30 @@ def test_the_way_on_names_the_custody_directory_of_its_own(tmp_path: Path) -> No
     assert "Copy into it" not in step and "MEFOR_SECRETS_DIRECTORY" not in step, step
     secrets = custody_host.keep_the_key_step(_settings(tmp_path), new_store=False, environ={})
     assert "named by MEFOR_CUSTODY_DIRECTORY here" in secrets, secrets
+
+
+@pytest.mark.parametrize("backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES])
+@pytest.mark.parametrize("named", ["custody", "secrets", "neither"])
+def test_the_way_on_moves_off_every_directory_the_left_behind_check_reads(
+    tmp_path: Path, backend: StoreBackend, named: str
+) -> None:
+    """PR 3168 hold, items 1 and 9: once MEFOR_CUSTODY_DIRECTORY is set, a key file in the secrets
+    directory or beside a SQLite store refuses a mint, so the step names a new one of each that
+    holds the key file it leaves in place, even where its caller keeps the store location."""
+    settings = _settings(tmp_path).model_copy(update={"backend": backend})
+    environ = {
+        "custody": {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")},
+        "secrets": {"MEFOR_SECRETS_DIRECTORY": str(tmp_path / "secrets")},
+        "neither": {},
+    }[named]
+    step = custody_host.keep_the_key_step(settings, new_store=False, environ=environ)
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in step, step
+    assert ("a new secrets directory, named by MEFOR_SECRETS_DIRECTORY" in step) is (
+        named == "secrets"
+    ), step
+    beside = named == "neither" and backend is StoreBackend.SQLITE
+    assert ("a new SQLite path in a directory of its own" in step) is beside, step
+    assert ("Point [store]" in step) is beside, step
 
 
 @windows_only
@@ -2237,11 +2282,13 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
     assert (schema in step) is (backend is StoreBackend.POSTGRES), step
     assert ("a new database" in step) is (backend is StoreBackend.POSTGRES), step
     monkeypatch.setattr(sys, "platform", "win32")
-    windows = custody_host.keep_the_key_step(settings, new_store=False)
+    # A custody directory of its own is in use, so the store location may stay.
+    own = {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")}
+    windows = custody_host.keep_the_key_step(settings, new_store=False, environ=own)
     assert "add --service-account with that account" in windows, windows
     assert "Point [store]" not in windows, windows
     auto = custody_host.keep_the_key_step(
-        settings.model_copy(update={"key_provider": "auto"}), new_store=False
+        settings.model_copy(update={"key_provider": "auto"}), new_store=False, environ=own
     )
     assert "provision-admin" not in auto and "run the command again" in auto, auto
     # No key is minted there, so no new key or recovery key is spoken of.
@@ -2264,8 +2311,9 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     # [store].server/database, here and for the service. With the store kept, the re-run keeps
     # every argument, --db and --service-config among them.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
+    own = {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")}
     step = custody_host.keep_the_key_step(
-        settings, new_store=new_store, service_account=service_account
+        settings, new_store=new_store, service_account=service_account, environ=own
     )
     assert "same arguments" not in step, step
     command = (
@@ -2631,35 +2679,56 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
 
 
 @host_file_platforms
+@pytest.mark.parametrize("kept_in", ["beside the store", "the secrets directory"])
 def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    kept_in: str,
 ) -> None:
-    # PR 2804 fifth hold, item 4: follow the refusal's one way on, a new, empty custody directory
-    # and a new store location, and the re-run mints this store's key there through mint_target
-    # and provisions it. The key file and the store left in place are untouched.
+    # PR 2804 fifth hold, item 4, and PR 3168's hold, items 1 and 9: follow the refusal's way on as
+    # it reads, wherever the key file it leaves in place sits, and the re-run mints this store's
+    # key in the new custody directory MEFOR_CUSTODY_DIRECTORY names, through mint_target, and
+    # provisions it. With that variable set, a key file in the secrets directory or beside the
+    # store refuses a mint (_left_outside_the_custody_directory), so the way on must name new ones
+    # too. The key file and the store left in place are untouched.
     import asyncio
 
     from messagefoundry import __main__ as cli
     from messagefoundry.__main__ import main
 
-    settings = _settings(tmp_path)
+    store_dir = tmp_path / "old"
+    store_dir.mkdir()
+    settings = _settings(store_dir)
     store_path = Path(settings.path)
 
     async def _unstarted() -> None:
         await (await _keyless_store(store_path)).close()
 
     asyncio.run(_unstarted())
+    if kept_in == "beside the store":
+        kept_dir = store_dir
+    else:
+        kept_dir = _own_custody_directory(tmp_path / "secrets")
+        monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(kept_dir))
     _mint(settings)
-    kept = tmp_path / custody_host.HOST_FILE_NAME
+    kept = kept_dir / custody_host.HOST_FILE_NAME
+    assert kept.exists()
     assert _run_provision_admin(tmp_path, monkeypatch, store_path) == 2
-    assert "named by MEFOR_CUSTODY_DIRECTORY here" in " ".join(capsys.readouterr().err.split())
+    err = " ".join(capsys.readouterr().err.split())
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in err, err
+    assert "a new SQLite path in a directory of its own" in err, err
+    new_secrets = "a new secrets directory, named by MEFOR_SECRETS_DIRECTORY"
+    assert (new_secrets in err) is (kept_in == "the secrets directory"), err
     left = {path: path.read_bytes() for path in (kept, store_path)}
-    secrets = tmp_path / "new-secrets"
-    secrets.mkdir()
-    if sys.platform != "win32":
-        secrets.chmod(0o700)
-    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
-    new_store = tmp_path / "new-store.db"
+    custody = _own_custody_directory(tmp_path / "custody")
+    monkeypatch.setenv("MEFOR_CUSTODY_DIRECTORY", str(custody))
+    if kept_in == "the secrets directory":
+        monkeypatch.setenv(
+            "MEFOR_SECRETS_DIRECTORY", str(_own_custody_directory(tmp_path / "new-secrets"))
+        )
+    (tmp_path / "new").mkdir()
+    new_store = tmp_path / "new" / "store.db"
     minted: list[Path] = []
     real_target = custody_host.mint_target
 
@@ -2675,7 +2744,7 @@ def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
     monkeypatch.setattr(cli, "_RecoveryKeyConsole", lambda: _Console("", "wrong"))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     assert main([*argv, "--db", str(new_store)]) == 0, capsys.readouterr().err
-    assert minted and set(minted) == {secrets / custody_host.HOST_FILE_NAME}, minted
+    assert minted and set(minted) == {custody / custody_host.HOST_FILE_NAME}, minted
     assert minted[0].exists()
     assert new_store.exists()
     assert {path: path.read_bytes() for path in left} == left

@@ -344,8 +344,9 @@ directory the service does not name, as after an uninstall. Neither the engine n
 tell whose key a file holds, and either file may be the only copy of a store's key on this host.
 
 1. **Delete nothing, and leave every key file where it is**, in every directory the refusal names,
-   unless step 3 sends you to move one; then move it only as step 5 says, which also says how to
-   keep an original that a copy replaced.
+   except as step 5 says once a copy has replaced an original, and unless step 3 sends you to move
+   one; then move it only as step 5 says, which also says what to
+   do with an original that a copy replaced.
 2. **Stop the service** (`Stop-Service <ServiceName>`) if it is installed, and work from an
    elevated shell.
 3. **If the file holds this store's key**, as when this store was set up under
@@ -378,10 +379,16 @@ tell whose key a file holds, and either file may be the only copy of a store's k
      `AppEnvironmentExtra` list, keeping the other entries.
 
    A new data directory starts a new, empty store. Never copy another store's database, or any
-   key file, into it. To keep this store's own data, move everything the engine keeps in the old
-   data directory into the new one as step 5 says, at least the database with its `-wal` and
-   `-shm` files, the log spool and the generated API certificate, except `master.key` and
-   `handoff.key`, which stay where they are or follow step 3.
+   key file, into it. To keep this store's own data, move into the new one, as step 5 says, only
+   files you know are this store's or this service's, and leave everything else where it is, at
+   least any other database with its `-wal` and `-shm` files, since an old data directory may be
+   shared. Those files are at least this store's database, the file the service's `--db` names,
+   with that file's own `-wal` and `-shm` files; and, only where no other store's database sits
+   in the same directory, the `log-spool` folder and the generated API certificate pair,
+   `api-generated-cert.pem` with `api-generated-key.pem`. Move that pair together or not at all:
+   the engine mints a new pair when it finds either one missing, and a client that pins the old
+   certificate then refuses the new one. Leave `master.key` and `handoff.key` where they are: in
+   this step they may be another store's.
 5. **Moving a file.** Within one volume, move it as an administrator
    (`Move-Item -LiteralPath <file> -Destination <directory>`): the file keeps its own owner and
    access list, which the engine checks exactly on a key file. Across volumes a move is a copy,
@@ -391,12 +398,28 @@ tell whose key a file holds, and either file may be the only copy of a store's k
    `icacls <file>` prints the same entries for the copy as for the original, and that
    `(Get-Acl -LiteralPath <file>).Owner` prints the same owner, and keep the original where it is
    until the service has started and opened its store from the copy. Copy the database files
-   across volumes the same way, and keep their originals until then too. Once it has, retire each
-   key file original rather than delete it: move it, within its volume, into a folder only
-   administrators can read, and keep it there. Never delete it. A second copy of a key file is
-   read by whoever its access list names, SYSTEM, Administrators and the service; a
-   `handoff.key` is machine-scope DPAPI, so anyone who already has its bytes can unwrap it. The
-   database originals may hold PHI; dispose of them as [PHI.md](PHI.md) describes.
+   across volumes the same way, and keep their originals until then too. Copy the generated API
+   certificate pair the same way, both files. Once the service has opened its store from the
+   copies:
+   - **A `master.key` original:** keep it as a second copy of the store's key, but take the
+     service's access to it away first. Moving a file into another folder does not do that: the
+     file keeps its own owner and access list, and an account that list names can still open it
+     by its path. Set the original's owner and list, then check both
+     (`icacls <file> /setowner *S-1-5-32-544`, then
+     `icacls <file> /inheritance:r /grant:r *S-1-5-32-544:F *S-1-5-18:F /remove:g "<service account>"`,
+     then `icacls <file>`, which must print entries for Administrators and SYSTEM only, removing
+     any other with `/remove:g`). Then move it, within its volume, into a folder only
+     administrators can read, and keep it there. It is still read by at least SYSTEM,
+     Administrators, and any account holding a privilege that reads past an access list, such as
+     SeBackupPrivilege, which the `robocopy /B` above uses.
+   - **A `handoff.key` original:** delete it once the service has started from the copy. A
+     handoff is meant to last only from install to the service's first start, which converts it
+     into `master.key` and deletes the copy it read. It is machine-scope DPAPI: on this host, any
+     process that can read the file can unwrap the store key from it, though it does not unwrap
+     on another host.
+   - **An `api-generated-key.pem` original:** delete it with its `api-generated-cert.pem`. It is
+     the private key of a certificate the service still presents.
+   - **The database originals** may hold PHI; dispose of them as [PHI.md](PHI.md) describes.
 6. **Start the service**, and read its log for a refusal ([Verify it's running](#verify-its-running)).
 
 **Without the install scripts**, as on Linux or in a container, the same steps hold with the

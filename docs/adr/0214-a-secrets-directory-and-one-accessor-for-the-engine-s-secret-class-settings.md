@@ -156,10 +156,11 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 - **2026-11-22, the host key provider's files get a custody directory of their own (vault
   BACKLOG #3411).** Under `[store].key_provider = 'host'` the service's first start writes its own
   key file, `master.key`, beside the `handoff.key` an administrator's `provision-admin
-  --service-account` left. The installer's access list makes this directory administrator-written,
-  with the service at read only; the engine does not enforce that, since decision 4's check
-  passes a directory one named account may write. A service right to add a file here would let
-  it supply a secret-class setting. So those two files move to a directory of their own when
+  --service-account` left. The installer adds the service's read grant on this directory and
+  takes no wider grant away, so a write grant the service already holds, such as one the Vault
+  Agent sink route gives it, survives a rerun; the engine does not refuse one either, since
+  decision 4's check passes a directory one named account may write. A service right to add a
+  file here would let it supply a secret-class setting. So those two files move to a directory of their own when
   `MEFOR_CUSTODY_DIRECTORY` names one, an absolute path, which wins over `MEFOR_SECRETS_DIRECTORY`
   for them; unset, they stay where they were, in this directory or beside a SQLite store. Before
   a read or a mint, the engine applies decision 4's check to the directory that variable names,
