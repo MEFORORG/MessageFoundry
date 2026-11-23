@@ -178,7 +178,7 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
-from messagefoundry.parsing.split import batch_member_collides
+from messagefoundry.parsing.split import batch_member_collides, head_control_id
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
@@ -12078,7 +12078,7 @@ class RegistryRunner:
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
-        # the head is PARSED here, for the BHS-11 control id. How encode_batch reads the BHS
+        # the head's MSH-10 is READ here, for the BHS-11 control id. How encode_batch reads the BHS
         # separators, parsing the head where its MSH line alone does not hold them, is in
         # parsing/split.py, _head_separators (BACKLOG #5919).
         refused: list[_RefusedMember] = []
@@ -12169,11 +12169,13 @@ class RegistryRunner:
                 first = kept[0]  # the envelope's head is the first member that survived
                 # The head's own fields: a non-HL7 head faults here, and it is this member's.
                 current = first.id
-                # This parse and encode_batch below each run in a thread (BACKLOG #5706). Both scale
+                # This read and encode_batch below each run in a thread (BACKLOG #5706). Both scale
                 # with the members' size, and on the event loop a large member would stall every
-                # lane, listener and the API while it parsed.
-                parsed = await asyncio.to_thread(Message.parse, first.payload)
-                control_id = parsed.control_id or first.id  # stable
+                # lane, listener and the API while it was read. head_control_id reads MSH-10 as a
+                # parse of the head does, parsing only its first line where that reads the same
+                # (BACKLOG #5919).
+                head_id = await asyncio.to_thread(head_control_id, first.payload)
+                control_id = head_id or first.id  # stable
                 timestamp = _hl7_batch_timestamp(first.created_at)
                 # encode_batch reads the HYDRATED head's MSH-1 and MSH-2 and frames every member in
                 # one call, so a fault inside it cannot be told apart by member; the send is the
