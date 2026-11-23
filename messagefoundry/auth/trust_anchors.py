@@ -1974,8 +1974,9 @@ def _flag_or_unresolved(settings: Mapping[str, Any], key: str, *, default: bool)
 
 
 def unread_ca_flags_refused(settings: Mapping[str, Any]) -> bool:
-    """Whether any flag :func:`unread_ca_reason` reads holds a value its strict read refuses, so a
-    reader that collects problems can leave that connection to the pass naming the literal."""
+    """Whether any flag in ``_UNREAD_CA_FLAGS`` holds a value the strict read refuses, whether or
+    not :func:`unread_ca_reason` would reach that flag on these settings, so a reader that collects
+    problems can leave that connection to the pass naming the literal."""
     for key, default in _UNREAD_CA_FLAGS:
         try:
             _flag_or_unresolved(settings, key, default=default)

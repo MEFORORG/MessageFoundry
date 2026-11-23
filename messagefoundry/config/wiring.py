@@ -976,8 +976,9 @@ def _tls_off_reason(tls: object) -> str | None:
 
 def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: object) -> None:
     """The ``tls_ca_file`` and ``tls_ca_pin`` checks of a factory in :data:`_UNREAD_CA_ON_TLS_OFF`
-    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, since the unread
-    reason reads it by truthiness."""
+    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, so the refusal names
+    the factory: the unread reason reads ``tls`` strictly and would raise a bare ``ValueError``
+    that does not (vault BACKLOG #3234)."""
     factory = _UNREAD_CA_ON_TLS_OFF[type_]
     if ca is not None:
         refuse_bool_literals({"tls": tls}, factory)
@@ -7194,8 +7195,9 @@ class Registry:
             if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
                 continue
             if unread_ca_flags_refused(settings):
-                # The strict read in unread_ca_reason would raise on it, ending validate_config's
-                # collection; bool_literal_problems names the literal.
+                # The strict read in unread_ca_reason may raise on it, ending validate_config's
+                # collection; bool_literal_problems names the literal. The skip covers all four
+                # flags, read or not, so an unread-CA problem here shows once the literal is fixed.
                 continue
             if (unread := unread_ca_reason(settings)) is not None:
                 problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
@@ -7854,12 +7856,15 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
     # An explicit None or an empty string is the default, on, as bool_setting reads it (vault
-    # BACKLOG #3230). Any other value that is not True counts as possibly off, without raising: a
-    # connector refuses a non-bool only where it reads the key, and MLLP reads it only with tls and
-    # tls_verify on, so a directly built hop with tls_verify=False and tls_check_hostname=0 builds
-    # (vault BACKLOG #3234). bool() read 0 as off, so this lists at least what that read listed.
+    # BACKLOG #3230). Any other value counts when bool() reads it as false, without raising, as
+    # before bool_setting turned strict (vault BACKLOG #3234), so this lists at least the hops that
+    # read listed. A Registry build refuses a non-bool literal, but its settings dict stays mutable
+    # afterwards, and a Destination built directly passes no load or build refusal; MLLP reads the
+    # key only with tls and tls_verify on, so such an MLLP hop with tls_verify=False builds with it.
     value = settings.get("tls_check_hostname")
-    return not (value is None or value is True or (isinstance(value, str) and value == ""))
+    if isinstance(value, EnvRef):
+        return True
+    return value is not None and not (isinstance(value, str) and value == "") and not bool(value)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
