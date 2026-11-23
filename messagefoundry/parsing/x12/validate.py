@@ -57,13 +57,15 @@ class X12SegmentError:
     the 997 AK list for 004010, also when no ack is generated, and the 999 IK list otherwise (e.g.
     ``"8"``). pyx12's own error name stands in where that list has no code for it;
     ``message`` is synthesized from the code and the locators below;
-    ``element_position`` / ``line`` are numbers and ``loop`` is the *schema* name of the map node;
+    ``element_position`` / ``line`` are numbers; ``loop`` is the *schema* name of the map node the
+    walk was at, which for a segment that matched no node is the last node it did match;
     ``element_name`` is the *schema* data-element label (e.g. ``"Transaction Set Creation Date"``).
 
     ``segment_id`` comes from the input, so it is kept only when shaped like an X12 segment id (a
     capital, then one or two capitals or digits) and is ``None`` otherwise (BACKLOG #5370). The check
     reads shape alone, so a two- or three-character sender value of that shape standing where the id
-    goes is kept, in ``segment_id`` and in ``message``, even when it matches no segment in the map."""
+    goes is kept, in ``segment_id`` and in ``message``, even when it matches no segment in the map.
+    A terminator inside a name can put the name's tail there, with ``loop`` naming the field before."""
 
     code: str
     message: str
@@ -191,8 +193,8 @@ def _structural_segment_id(seg: dict[str, Any]) -> str | None:
     """pyx12's ``seg_id`` when it is shaped like an X12 segment id, otherwise ``None``.
 
     pyx12 takes everything before the first element separator as the id, so a wrongly delimited
-    segment (``NM1|IL|1|DOE|ROBERT``) puts the sender's whole segment there. The shape is the one
-    pyx12's own id check applies, and every segment id in its bundled maps has it."""
+    segment (``NM1|IL|1|DOE|ROBERT``) puts the sender's whole segment there. The pattern is pyx12's
+    own, matched more strictly (:data:`_SEGMENT_ID`), and every segment id in its bundled maps has it."""
     seg_id = seg.get("seg_id")
     return seg_id if isinstance(seg_id, str) and _SEGMENT_ID.fullmatch(seg_id) else None
 

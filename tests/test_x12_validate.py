@@ -5,7 +5,8 @@ tolerant X12Peek/X12Message hot path (ADR 0012, BACKLOG #32).
 
 Covers: a clean interchange validates; a conformance-violating interchange reports structural errors +
 emits a 999 ack; non-X12 input raises X12ValidationError (not a generic crash); and the PHI guard —
-the offending data *value* never appears in the surfaced errors (only schema-label locators)."""
+an offending element *value* does not appear in the surfaced errors, and a segment id is kept only
+when shaped like one, so a two- or three-character sender value of that shape is the one exception."""
 
 from __future__ import annotations
 
