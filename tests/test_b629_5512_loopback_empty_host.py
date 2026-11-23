@@ -234,8 +234,9 @@ def test_nothing_declared_covers_a_generic_hop_with_no_named_host(
 
 # --- the SQL Server preset: Database, DatabasePoll, DatabaseLookup, DatabaseRef ---------------------
 
-#: "" is left out: the connectors refuse it earlier, as a missing setting.
-_PRESET_NO_HOST = ["  ", ":1433", "[]", ",1433", "[,]", ":1433:"]
+#: "" is left out: the connectors refuse it earlier, as a missing setting. A value holding a comma
+#: is left out too: the preset refuses every comma first, with its own remedy.
+_PRESET_NO_HOST = ["  ", ":1433", "[]", ":1433:"]
 _PRESET_BASE = {"database": "d", "statement": "INSERT INTO t (x) VALUES (:x)"}
 
 

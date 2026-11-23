@@ -285,17 +285,17 @@ def _build_dsn(
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     where = hop_name_prefix(connection)
-    # BACKLOG #5512: before the preset's own refusals and the weakened-TLS check, and at every
-    # posture, as on the generic dialect. `,{port}` is added to whatever `server` holds, so one that
-    # names no host reaches the driver as `SERVER=,1433`. No declaration speaks for a hop with no
-    # named destination.
+    refusal = sqlserver_preset_refusal(s)
+    if refusal is not None:
+        raise ValueError(f"{where}DATABASE {refusal}")
+    # BACKLOG #5512: after the preset's refusals, so a value holding a comma keeps their remedy,
+    # and before the weakened-TLS check, at every posture, as on the generic dialect. `,{port}` is
+    # added to whatever `server` holds, so one that names no host reaches the driver as
+    # `SERVER=,1433`. No declaration speaks for a hop with no named destination.
     if names_no_host(str(s.get("server", ""))):
         raise InsecureHopRefused(
             f"{where}DATABASE server names no host; name the host to connect to"
         )
-    refusal = sqlserver_preset_refusal(s)
-    if refusal is not None:
-        raise ValueError(f"{where}DATABASE {refusal}")
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
