@@ -18,11 +18,15 @@ seen. The differential is skipped in a clone that does not hold ``BASELINE``.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import string
 import subprocess
 import sys
+import time
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -314,6 +318,123 @@ def test_a_rewritten_reading_does_not_refuse_a_harmless_command(
     assert _verdict(rig, row) is None
 
 
+# ------------------------------------------------------------------ the cost of the passes
+
+
+def test_each_git_question_is_asked_once_across_the_passes(
+    rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hoisted string carries the lines before it, so each pass met their invocations again.
+
+    Before Invoke-GitRead cached the hook's git calls, each pass asked git again what an earlier pass
+    had asked, and the Lander measured a 1.7 s command taking 19.9 s. Git's trace2 log records each
+    process the hook starts, with its argument list, so a repeated question shows as a repeated line.
+    """
+    trace = tmp_path / "trace2.log"
+    lines = [f"echo line{i} $(git -C {{o}} checkout -q y{i})" for i in range(9)]
+    command = _fmt(rig, "echo start\n" + "\n".join(lines))
+    monkeypatch.setenv("GIT_TRACE2", str(trace))
+    result = run_gate(shell(command, rig.wt, "Bash"), rig.repos)
+    monkeypatch.delenv("GIT_TRACE2")
+    assert result is None, result
+    starts = [
+        line.split(" start ", 1)[1].strip()
+        for line in trace.read_text(encoding="utf-8", errors="replace").splitlines()
+        if " start " in line
+    ]
+    assert starts, "the hook started no git process, so this measured nothing"
+    repeated = {argv: n for argv, n in Counter(starts).items() if n > 1}
+    assert not repeated, f"{len(starts)} git calls, repeated: {repeated}"
+
+
+_FILLER = "abcdefghij " * 2700
+_NINE = range(9)
+#: (shape, template, cwd, tool): the long commands of the Lander's timing probes on 2026-11-23, nine
+#: judged substitutions each behind about 30 KB of text. Every one is allowed.
+TIMED: list[tuple[str, str, str, str]] = [
+    (
+        "one line, nine hoists, short",
+        "echo " + " ".join(f"$(git -C {{o}}/d{i} checkout -q x{i})" for i in _NINE),
+        "outside",
+        "Bash",
+    ),
+    (
+        "one line, nine hoists, 30 KB before them",
+        f"echo {_FILLER}; echo "
+        + " ".join(f"$(git -C {{o}}/d{i} checkout -q x{i})" for i in _NINE),
+        "outside",
+        "Bash",
+    ),
+    (
+        "nine lines, a substitution each",
+        f"echo {_FILLER}\n"
+        + "\n".join(f"echo line{i} $(git -C {{o}} checkout -q y{i})" for i in _NINE),
+        "wt",
+        "Bash",
+    ),
+    (
+        "nine lines, a substitution each, PowerShell",
+        f"echo {_FILLER}\n"
+        + "\n".join(f"echo line{i} $(git -C {{o}} checkout -q y{i})" for i in _NINE),
+        "wt",
+        "PowerShell",
+    ),
+    (
+        "nine lines, a backtick each",
+        f"echo {_FILLER}\n"
+        + "\n".join(f"echo line{i} {{bt}}git -C {{o}} checkout -q y{i}{{bt}}" for i in _NINE),
+        "wt",
+        "Bash",
+    ),
+]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MEFOR_GATE_TIMING"),
+    reason="a wall-clock measurement; set MEFOR_GATE_TIMING=1 to run it",
+)
+@pytest.mark.parametrize("case", TIMED, ids=lambda c: c[0])
+def test_a_long_command_is_judged_well_inside_the_proof_wait(
+    rig: SimpleNamespace, tmp_path: Path, case: tuple[str, str, str, str]
+) -> None:
+    """Times the shipped hook, and the hook at PRE_CACHE_HEAD where this clone holds it.
+
+    Opt-in, because a shared CI runner's load decides a wall-clock number. Run it with ``-s`` to see
+    the times. The bound is the shell entry's 20 s proof wait (scripts/worktree/install-gate.ps1).
+    """
+    _shape, template, where, tool = case
+    payload = shell(_fmt(rig, template), _cwd(rig, where), tool)
+    gates: list[tuple[str, Path | None]] = [("now", None)]
+    probe = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "show", f"{PRE_CACHE_HEAD}:{_HOOK}"],
+        capture_output=True,
+        check=False,
+    )
+    if probe.returncode == 0:
+        before = tmp_path / "worktree_gate_pre_cache.ps1"
+        before.write_bytes(probe.stdout)
+        gates.append((PRE_CACHE_HEAD[:11], before))
+    times = {}
+    for label, gate in gates:
+        start = time.perf_counter()
+        if gate is None:
+            assert run_gate(payload, rig.repos) is None
+        else:
+            # Not run_gate: its 45 s launch limit is shorter than this hook took on these commands.
+            subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(gate), "-ReposFile"]
+                + [str(rig.repos)],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+        times[label] = round(time.perf_counter() - start, 2)
+    print(f"\n{case[0]}: {times}")
+    assert times["now"] < 20, times
+
+
 # ------------------------------------------------------------------ the differential
 
 
@@ -336,11 +457,9 @@ def _baseline_hook(dest: Path) -> Path | None:
 
 
 @pytest.fixture
-def baseline(tmp_path: Path) -> Path:
-    hook = _baseline_hook(tmp_path / "worktree_gate_baseline.ps1")
-    if hook is None:
-        pytest.skip(f"this clone does not hold {BASELINE}; fetch it to run the differential")
-    return hook
+def baseline(tmp_path: Path) -> Path | None:
+    """The hook at BASELINE, or None where this clone does not hold it; the test skips that part."""
+    return _baseline_hook(tmp_path / "worktree_gate_baseline.ps1")
 
 
 _KNOWN_PLACEHOLDERS = {"p", "tmp", "wt", "o", "b", "k", "bt"}
@@ -428,12 +547,84 @@ def _differential_rows() -> list[tuple[str, str, str]]:
 _REWRITE_TRIGGER = re.compile(r"\$\(|`|\{bt\}|\\git|/git|(?i:git\.exe)|\bGIT\b")
 
 
+#: The rows the harvest adds that the hook denied at PRE_CACHE_HEAD, measured on Windows on 2026-11-23.
+#: With this file's own DENIED, DENIED_WINDOWS and ALREADY_DENIED rows they were that head's whole deny
+#: set over the 124 differential rows then: 69 of them, and the hook with the git cache gave the same
+#: verdict on all 124.
+HARVESTED_DENIED_AT_PRE_CACHE_HEAD: list[tuple[str, str, str]] = [
+    (
+        "(cd {tmp} && ls)\ngit -C '{o}' log $(git -C '{p}' rev-parse HEAD) -- config core.hooksPath x",
+        "outside",
+        "Bash",
+    ),
+    ("(cd {tmp} && ls)\ngit -c a=$(git -C '{p}' log -1) config {k}", "outside", "Bash"),
+    ("cd {p}\necho $(date)\ngit -C {o} status ; git reset --hard", "outside", "Bash"),
+    ("cd {p} && git -C {o} log $(git config {k})", "outside", "Bash"),
+    ("cd {p} && git -C {o} log $(git config {k})", "outside", "PowerShell"),
+    ("cd {p} && git -C {o} log $(git reset --hard)", "outside", "PowerShell"),
+    ("echo $(git -C '{p}' log -1) $(/usr/bin/git config {k})", "outside", "Bash"),
+    ("git -C '{p}' --git-dir=$(pwd)/.git reset --hard", "outside", "Bash"),
+    ("git -C '{p}' -c user.name=$(git log -1 --format=%an) config {k}", "outside", "Bash"),
+    ("git -C '{p}' log $(git rev-parse HEAD) -- config core.hooksPath x", "outside", "Bash"),
+    ("git -C {o} --git-dir=$(echo .git) config {k}", "primary", "Bash"),
+    ("git -C {o} -c user.name=$(git log -1 --format=%an) config {k}", "primary", "Bash"),
+    ("git -C {o} stash list ; git.EXE reset --hard", "primary", "Bash"),
+    ("git -C {o} status ; git.EXE config {k}", "primary", "Bash"),
+    ("git config alias.lg log ; /usr/bin/git -C '{p}' config {k}", "outside", "Bash"),
+    ("git.EXE config {k}", "primary", "Bash"),
+    ("git.EXE config {k}", "primary", "PowerShell"),
+    ("git.Exe -C {p} reset --hard", "outside", "Bash"),
+    ("git.Exe -C {p} reset --hard", "outside", "PowerShell"),
+]
+
+#: The rows the harvest adds that the hook allowed at PRE_CACHE_HEAD, measured with the list above.
+HARVESTED_ALLOWED_AT_PRE_CACHE_HEAD: list[tuple[str, str, str]] = [
+    ("cd {o} && git -C {o} log $(git config {k})", "outside", "Bash"),
+    ("cd {o} && git -C {o} log $(git config {k})", "outside", "PowerShell"),
+    ("cd {o} && git -C {o} log $(git reset --hard)", "outside", "Bash"),
+    ("cd {o} && git -C {o} log $(git reset --hard)", "outside", "PowerShell"),
+    ("git -C '{o}' -c user.name=$(git log -1 --format=%an) config {k}", "outside", "Bash"),
+    ("git -C '{p}' log ; /usr/bin/git config {k}", "outside", "Bash"),
+    ("git -C '{p}' log ; \\git config {k}", "outside", "Bash"),
+    ("git -C {o} --git-dir=$(pwd)/.git reset --hard", "outside", "Bash"),
+    ("git -C {o} log $(git reset --hard)", "outside", "Bash"),
+    ("git -C {o} status ; /usr/bin/git reset --hard", "outside", "Bash"),
+    ("git -C {o} status ; C:/Tools/Git/cmd/git.exe reset --hard", "outside", "Bash"),
+    ("git -C {o} status ; \\git reset --hard", "outside", "Bash"),
+    ("git -C {o} status; C:\\Tools\\Git\\cmd\\git.exe reset --hard", "outside", "PowerShell"),
+    ("git.EXE config {k}", "outside", "Bash"),
+    ("git.EXE config {k}", "outside", "PowerShell"),
+]
+
+#: The PR head before Invoke-GitRead cached the hook's git calls (BACKLOG #5655 step 3, Lander hold of
+#: 2026-11-23 on the run time of the added readings). The cache must change no verdict.
+PRE_CACHE_HEAD = "cf790ecc157987d2e2c0bf408db143c083d64d3e"
+
+
+def _denied_at_pre_cache_head() -> set[tuple[str, str, str]]:
+    own = [(r[0], r[1], r[2]) for r in DENIED + DENIED_WINDOWS] + ALREADY_DENIED
+    return set(own + HARVESTED_DENIED_AT_PRE_CACHE_HEAD)
+
+
 @pytest.mark.parametrize("row", _differential_rows(), ids=lambda r: f"{r[2]}-{r[1]}-{r[0]}")
 def test_every_input_the_baseline_denies_is_still_denied(
-    rig: SimpleNamespace, baseline: Path, row: tuple[str, str, str]
+    rig: SimpleNamespace, baseline: Path | None, row: tuple[str, str, str]
 ) -> None:
-    before = _verdict(rig, row, gate=baseline)
+    """Also: on Windows, where it was measured, each row keeps its verdict at PRE_CACHE_HEAD.
+
+    One launch of the shipped hook serves both checks, so the deny-set pin adds no launch per row. A
+    row added to either file since that head has no recorded verdict there, and is not pinned here.
+    """
     after = _verdict(rig, row)
+    if sys.platform == "win32":
+        allowed = {(r[0], r[1], r[2]) for r in ALLOWED} | set(HARVESTED_ALLOWED_AT_PRE_CACHE_HEAD)
+        if row in _denied_at_pre_cache_head():
+            assert after is not None, f"DENY at {PRE_CACHE_HEAD[:11]}, ALLOW now: {row}"
+        elif row in allowed:
+            assert after is None, f"ALLOW at {PRE_CACHE_HEAD[:11]}, DENY now: {row}"
+    if baseline is None:
+        pytest.skip(f"this clone does not hold {BASELINE}; fetch it to run the differential")
+    before = _verdict(rig, row, gate=baseline)
     if before is not None:
         assert after is not None, f"DENY at {BASELINE[:11]}, ALLOW now: {row}"
     if row in [(r[0], r[1], r[2]) for r in DENIED + DENIED_WINDOWS]:

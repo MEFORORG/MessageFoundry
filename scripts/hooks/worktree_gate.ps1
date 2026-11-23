@@ -962,10 +962,13 @@ function Get-ScanRawIndexMap($Seg) {
 # Rules 3 and 3c do not reliably read a git word that rules 3 and 3c's case-sensitive match of
 # `$gitInvocation` misses, such as `GIT` (an unquoted `.exe` suffix is read in any case since BACKLOG
 # #5655 step 3; a quoted program path ending `git.EXE` is still not, Remove-QuotedSpans says why).
-# On Windows and macOS, Get-AddedCommandReadings spells an unquoted `GIT` at command position `git`,
-# so `GIT reset --hard` and `GIT config core.hooksPath /nope` from the primary, ALLOWED under the
-# PowerShell tool on Windows on 2026-11-18, are refused; on Linux it is not rewritten (a macOS volume
-# formatted case-sensitive gets the rewrite all the same, which costs only a false deny). Also, at least: any line
+# On Windows and macOS, Get-AddedCommandReadings spells `GIT` as `git` where it follows the line start,
+# a separator, an opener, `$(` or a backtick, with only blanks and `NAME=value` assignments between, and
+# the walk reads it as code; its note says where that excludes. So `GIT reset --hard` and `GIT config
+# core.hooksPath /nope` from the primary, ALLOWED under the PowerShell tool on Windows on 2026-11-18,
+# are refused, and `if true; then GIT reset --hard; fi` is not rewritten, nor is a `GIT` after `do`,
+# `!`, `time`, `env` or `exec`. On Linux it is not rewritten (a macOS volume formatted case-sensitive
+# gets the rewrite all the same, which costs only a false deny). Also, at least: any line
 # after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
 # dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell
@@ -1187,34 +1190,58 @@ function Test-TrueSeparatorIn([string]$Text) {
 # THE SPELLINGS IT REWRITES, each measured ALLOW from outside the primary, or from the primary where
 # the cwd decides, before this reading:
 #   * A GIT WORD THE OWNING-WORD SEARCH SKIPS. `\git` (posix) and a path-qualified `/usr/bin/git` or
-#     `C:/x/git.exe` unquoted at command position, and on Windows and macOS `GIT` or `git.EXE`, are
-#     rewritten to `git` (`\git -C '<p>' -c user.name=$(git log -1) config <key>`; `cd <p> && git -C <o>
-#     log $(\git reset --hard)`). A path with whitespace in it, which must be quoted to run (`&
-#     'C:\Program Files\Git\cmd\git.exe'`), is not rewritten.
+#     `C:/x/git.exe`, and on Windows and macOS `GIT` or `git.EXE`, are rewritten to `git` (`\git -C '<p>'
+#     -c user.name=$(git log -1) config <key>`; `cd <p> && git -C <o> log $(\git reset --hard)`) only
+#     where two things hold. The word follows the line start, a separator, an opener, `$(` or a
+#     backtick, with only blanks and `NAME=value` assignments between; so after a keyword or a prefix
+#     command, at least `then`, `do`, `!`, `time`, `env` and `exec`, it is not rewritten (`if true;
+#     then GIT reset --hard; fi`). And the walk reads the word as code outside double quotes: inside
+#     double quotes it is rewritten only within a `"$( )"`, and in an unquoted posix heredoc body it is
+#     not rewritten at all, inside a `$( )` or a backtick there included (`cat <<EOF`, then `$(GIT
+#     reset --hard)`). A path with whitespace in it, which must be quoted to run (`& 'C:\Program
+#     Files\Git\cmd\git.exe'`), is not rewritten.
 #   * A BACKTICK SUBSTITUTION (posix only; in PowerShell a backtick is the escape character), rewritten
 #     to `$( )`, which the rules already read as an inner invocation (`cd <p> && git -C <o> log
 #     `` `git reset --hard` ``; from the primary, `git -C <o> log `` `git config <key>` ``).
 #   * AN INNER INVOCATION READ IN THE WRONG PLACE. A hoisted string per git-bearing `$( )`, described
 #     at the loop below, stands the inner command where the shell runs it.
-#   * AN INNER INVOCATION IN THE OUTER ONE'S FLAGS. A last string replaces every closed one-line `$( )`
-#     with the word `_`, so the outer invocation is read without it (`git -C '<p>' -c
+#   * AN INNER INVOCATION IN THE OUTER ONE'S FLAGS. A last string replaces with the word `_` each
+#     closed one-line `$( )` that holds no bracket, quoted or not, and that starts where the walk reads
+#     code or double-quoted text, repeating so a nested one goes from the inside out. One holding a
+#     bracket, such as `$(git config user.name | tr -d '()')`, stays in place, so its inner `config` can
+#     still anchor the disarm match. Otherwise the outer invocation is read without it (`git -C '<p>' -c
 #     user.name=$(git config user.name) config <key>`, where the inner `config` anchored the disarm
 #     match; `git --git-dir='<p>/.git' -c user.name=$( git log -1) config <key>`; the same behind
 #     `GIT_DIR='<p>/.git'`). The inner invocations are judged by the earlier strings.
 #
-# COST: each string is a full pass of the four rules, git calls included, and a command can yield up to
-# eleven (the command, the rewrite, eight hoists, the outer reading). Under the 60 s timeout a slow pass
-# blocks the command rather than letting it through (install-gate.ps1 installs `onFailure = block`).
+# COST: each string is a full pass of the four rules, and a command can yield up to eleven (the
+# command, the rewrite, eight hoists, the outer reading). A hoist carries the text before its cut, so a
+# pass re-reads that text and re-asks git about the invocations in it; Invoke-GitRead answers a repeated
+# git question from its cache, so a later pass spawns git only for a question no earlier pass asked. A
+# hoist is not cut down to its own segment: the text before it carries the chdir and the assignments
+# the hoist exists to read (`cd <p> && echo $(date); git -C <o> log $(git reset --hard)`). Before the
+# cache, the Lander measured 7.8 s, 1.7 s and 1.5 s commands taking 26.3 s, 19.9 s and 11.8 s (review of
+# 2026-11-23). Under the 60 s timeout a slow run blocks the command rather than letting it through
+# (install-gate.ps1 installs `onFailure = block`).
 #
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
 # quotes, posix `$'...'`, an escaped character, a posix `#` comment, a quoted-delimiter posix heredoc
 # body, a PowerShell `@' '@` here-string -- and no rewrite starts there, so a backticked command NAMED
-# in a single-quoted message or a data heredoc is not read as run. Known misreadings that make it read
-# such text as code, each a false deny (review round b16150a498): a heredoc delimiter holding a
-# character outside `\w` (`<<'END-X'`), a heredoc opened inside parentheses, and a PowerShell `@" "@`
-# here-string holding an odd number of quotes. Inside DOUBLE quotes, and in an
-# unquoted posix heredoc body, a posix backtick and a `$( )` do run, so they are rewritten there: `git
-# commit -m "see `git reset --hard`"` in the primary is refused, because bash runs that reset. A
+# in a single-quoted message or a data heredoc is not read as run. Known misreadings, at least these
+# (review round b16150a498): a heredoc delimiter holding a character outside `\w` (`<<'END-X'`), a
+# heredoc opened inside parentheses, and a PowerShell `@" "@` here-string holding an odd number of
+# quotes. Each reads text the shell takes literally as code, which is a false deny where that text
+# holds a rewritable shape. Each can also open a quote the shell never opens, at the apostrophe of a
+# `don't` in the body or at the odd quote, and read the code after it as literal, so a shape the
+# rewrites would refuse there is allowed as it was before them. The Lander measured three such
+# allows on 2026-11-23: `cat <<'END-X'`, a body line `don't`, `END-X`, then `cd <p> && git -C <o> log
+# `` `git reset --hard` ``; the same heredoc opened inside `( )`; and an `@" "@` here-string holding
+# `"hi` and `it's`, then `cd <p>; echo $(Get-Date); git -C <o> log $(git reset --hard)`. Inside
+# DOUBLE quotes, and in an unquoted posix heredoc body, a posix backtick and a `$( )` do run, so a
+# backtick span is respelled `$( )` there and a `$( )` is hoisted: `git commit -m "see `git reset
+# --hard`"` in the primary is refused, because bash runs that reset. A `GIT` in a backtick span inside
+# double quotes, or anywhere in an unquoted heredoc body, keeps its spelling, as the first bullet above
+# says, and the hoist matches `git` case-sensitively, so that span is not hoisted. A
 # backtick span holding an unpaired quote or a line break is not rewritten, since whether and where it
 # runs then depends on parsing this walk does not do.
 #
@@ -1383,8 +1410,10 @@ function Get-AddedCommandReadings([string]$Cmd, [string]$Convention) {
     $opts = $(if ($IsWindows -or $IsMacOS) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
             [System.Text.RegularExpressions.RegexOptions]::None })
     $plain = [System.Text.RegularExpressions.RegexOptions]::None
-    # At command position: the line start, a separator or opener, `$(` or a backtick, then blanks and
-    # any `NAME=value` assignments. A word ending `/git` elsewhere, such as a `cd` target, is left alone.
+    # After the line start, a separator or opener, `$(` or a backtick, then blanks and any `NAME=value`
+    # assignments; not after a keyword or a prefix command such as `then` or `env`. A word ending `/git`
+    # elsewhere, such as a `cd` target, is left alone. Only where the walk reads code (no -InDouble), so
+    # a `GIT` in double quotes outside a `"$( )"`, or in an unquoted heredoc body, keeps its spelling.
     $at = '(?<=(?:^|[;&|({\r\n`]|\$\()[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|()=]*[ \t]+)*)'
     $qualifier = $(if ($Convention -eq 'posix') { '(?:\\|[^\s;&|(){}''"`$<>=]*[\\/])?' } else { '(?:[^\s;&|(){}''"`$<>=]*[\\/])?' })
     # Each step walks the quoting only where its pattern can change something.
@@ -3228,6 +3257,30 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 "@
 }
 
+# EVERY GIT CALL THIS HOOK MAKES IS A READ, AND EACH IS ASKED ONCE PER RUN (BACKLOG #5655 step 3 review).
+# Get-AddedCommandReadings hands rules 3c, 3d, 3 and 3b up to eleven strings, and each pass asked git
+# again what an earlier pass had asked: a hoisted string carries the command's earlier lines, so their
+# invocations were resolved once per hoist. On the Lander's 30 KB nine-hoist probe that took a run from
+# 7 s to 43 s. A spawn costs 0.1 s to 0.6 s on Windows, and the answers are not cached by anything else.
+# The cache is keyed by the exact argument list, and it keeps the output lines and the exit code, which
+# it puts back in $LASTEXITCODE, so a caller reads what the git call would have given it. The hook runs
+# before the tool call, so nothing it judges has run yet; another process could still change the
+# repository during the run, as it could between two uncached calls.
+$gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
+function Invoke-GitRead([object[]]$GitArgs) {
+    # A $null argument is dropped, as `& git -C $null ...` drops it; a [string[]] parameter would turn it
+    # into an empty argument, which git reads differently.
+    $GitArgs = @($GitArgs | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    $key = $GitArgs -join [char]0
+    if (-not $gitReadCache.ContainsKey($key)) {
+        $out = @(& git @GitArgs 2>$null)
+        $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
+    }
+    $hit = $gitReadCache[$key]
+    $global:LASTEXITCODE = $hit.Code
+    $hit.Out
+}
+
 # WHICH governed root does the SESSION belong to? Every other rule judges a PATH and takes its root from
 # whatever matched. Rule 4 fires on the TOOL NAME alone and has no path to match, so it named $roots[0] --
 # the FIRST allowlist entry, whichever repo the session was actually in (BACKLOG #1036). With one entry
@@ -3255,7 +3308,7 @@ function Get-SessionRoot([string]$CwdCmp, [string]$CwdRaw) {
     # RAW path, never the Get-ComparablePath form: that one is lowercased, and this file warns twice that
     # a lowercased path handed to `git -C` passes on Windows and misses the real directory on a
     # case-sensitive filesystem. Any git failure just means "no answer", which is $null.
-    $common = "$(& git -C $CwdRaw rev-parse --git-common-dir 2>$null)".Trim()
+    $common = "$(Invoke-GitRead @('-C', $CwdRaw, 'rev-parse', '--git-common-dir'))".Trim()
     if ($LASTEXITCODE -ne 0 -or -not $common) { return $null }
     $commonCmp = Get-ComparablePath $common $CwdRaw
     if (-not $commonCmp) { return $null }
@@ -3417,13 +3470,13 @@ function Get-RootCommonDirCmp($Root) {
     # lowercased path handed to `git -C` passes on Windows and misses the real directory on a
     # case-sensitive filesystem. Any git failure just means "no answer", which is the empty string.
     $where = $Root.Display
-    $top = "$(& git -C $where rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    $top = "$(Invoke-GitRead @('-C', $where, 'rev-parse', '--path-format=absolute', '--show-toplevel'))".Trim()
     # CULTURE, LEFT AS IT WAS. Ordinal here would send more roots to rule 3c's path test, which denies
     # more only while the root's git dir sits under it; a separate git dir breaks that, so the change
     # is not shown to deny at least as much. Git reports the toplevel of the directory it was handed,
     # so the two spellings differing by an ignorable character is not a shape this is known to meet.
     if ($LASTEXITCODE -eq 0 -and $top -and (Get-ComparablePath $top) -eq $key) {
-        $common = "$(& git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+        $common = "$(Invoke-GitRead @('-C', $where, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
         if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common }
     }
     $rootCommonCache[$cacheKey] = $value
@@ -3492,10 +3545,10 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Get-CommonDirAnswer([string]$CandRaw) {
     if (-not $commonDirAnswers.ContainsKey($CandRaw)) {
-        $common = "$(& git -C $CandRaw rev-parse --git-common-dir 2>$null)".Trim()
+        $common = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--git-common-dir'))".Trim()
         $git = $null
         if ($LASTEXITCODE -eq 0 -and $common) {
-            $absolute = "$(& git -C $CandRaw rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+            $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
             if ($LASTEXITCODE -ne 0) { $absolute = "" }
             $git = [pscustomobject]@{ Common = $common; Absolute = $absolute }
         }
@@ -3768,7 +3821,7 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
     # worktrees): find the MAIN worktree of whatever repo it belongs to; act only if that main worktree
     # is a governed primary AND $wtRaw is a DIFFERENT (linked) worktree of it. All git calls take the RAW
     # path; only the results are canonicalised for comparison. Any git failure -> fail open.
-    $list = @(& git -C $wtRaw worktree list --porcelain 2>$null)
+    $list = @(Invoke-GitRead @('-C', $wtRaw, 'worktree', 'list', '--porcelain'))
     if ($LASTEXITCODE -ne 0 -or $list.Count -eq 0) { return }
     $mainLine = $list | Where-Object { $_ -match '^worktree ' } | Select-Object -First 1
     if (-not $mainLine) { return }
@@ -3776,7 +3829,7 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
     $gov = Test-Governed $mainWt
     if (-not $gov) { return }                                     # repo's main tree isn't governed
 
-    $selfTopRaw = "$(& git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
+    $selfTopRaw = "$(Invoke-GitRead @('-C', $wtRaw, 'rev-parse', '--show-toplevel'))".Trim()
     $selfTop = Get-ComparablePath $selfTopRaw
     if (-not $selfTop -or [string]::Equals($selfTop, $mainWt, [System.StringComparison]::Ordinal)) { return }        # $wtRaw IS the primary -- Rule 3 owns it
 
@@ -3800,14 +3853,14 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         # What it leaves open is a session standing outside every repository reaching into a worktree
         # with a class B verb; that is narrower than the hole this rule closes, and it is not new.
         if (-not $CwdRaw) { return }
-        $ownTopRaw = "$(& git -C $CwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $ownTopRaw = "$(Invoke-GitRead @('-C', $CwdRaw, 'rev-parse', '--show-toplevel'))".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $ownTopRaw) { return }
         # ORDINAL, because a match ALLOWS. A culture `-eq` ignores a soft hyphen or a zero-width
         # character, so a session in `<p>-wt1` read `<p>-wt1<U+00AD>`, another session's worktree, as
         # its own and was allowed `reset --hard` into it. The same holds for the primary test above.
         if ([string]::Equals((Get-ComparablePath $ownTopRaw), $selfTop, [System.StringComparison]::Ordinal)) { return }   # the session's OWN worktree
 
-        $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+        $head = "$(Invoke-GitRead @('-C', $wtRaw, 'rev-parse', '--abbrev-ref', 'HEAD'))".Trim()
         # EVERY interpolation goes through one of the two helpers, chosen ONLY by whether the value lands
         # in PROSE or in a COMMAND (BACKLOG #1040/#1076) -- the same discipline the class A message keeps,
         # and for the same reason: the branch name below is ATTACKER-CHOSEN from a public fork.
@@ -3874,7 +3927,7 @@ What to do instead:
         return
     }
 
-    $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+    $head = "$(Invoke-GitRead @('-C', $wtRaw, 'rev-parse', '--abbrev-ref', 'HEAD'))".Trim()
     # `--` IS NOT A FLAG HERE: it ends the options and switches off no git guard, so `checkout <b>
     # --` onto a branch live elsewhere is refused by git exactly as `checkout <b>` is (measured). Ordinal,
     # so only `--` itself is excused. A QUOTED flag counts: `checkout <b> "--ignore-other-worktrees"`
@@ -3886,7 +3939,7 @@ What to do instead:
     $denyDest = $null
     foreach ($dest in $dests) {
         # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
-        & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
+        $null = Invoke-GitRead @('-C', $wtRaw, 'rev-parse', '--verify', '--quiet', "refs/heads/$dest")
         if ($LASTEXITCODE -ne 0) { continue }
         # ORDINAL, here and in the checked-out-nowhere test below, because a match ALLOWS: a culture
         # comparison read the branch `fe<U+00AD>at` as the HEAD `feat`, and `ma<U+00AD>in` as the
@@ -5198,10 +5251,10 @@ What to do instead:
         # resolved against the hook process's cwd and returned nothing for every relative spelling,
         # leaving $isSelf false and both branches emitting the generic deny. That is the identical
         # defect the note above this line already records for the $cwd/$cwdRaw case, one call down.
-        $victimTopRaw = "$(& git -C $victimAbs rev-parse --show-toplevel 2>$null)".Trim()
+        $victimTopRaw = "$(Invoke-GitRead @('-C', $victimAbs, 'rev-parse', '--show-toplevel'))".Trim()
         if (-not $victimTopRaw) { $victimTopRaw = $victimAbs }
         $victimTop = Get-ComparablePath $victimTopRaw
-        $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $selfTop = Get-ComparablePath "$(Invoke-GitRead @('-C', $cwdRaw, 'rev-parse', '--show-toplevel'))".Trim()
         $isSelf = $victimTop -and $selfTop -and [string]::Equals($victimTop, $selfTop, [System.StringComparison]::Ordinal)
 
         # FOLD THE OPERATOR'S SPELLING BEFORE IT ENTERS A REASON, which every other rule in this file
@@ -6346,7 +6399,7 @@ $display = Get-SafeForMessage $root.Display
 $worktrees = @()
 try {
     $worktrees = @(
-        & git -C $root.Display worktree list --porcelain 2>$null |
+        Invoke-GitRead @('-C', $root.Display, 'worktree', 'list', '--porcelain') |
             Select-String -Pattern '^worktree (.+)$' |
             ForEach-Object { $_.Matches[0].Groups[1].Value } |
             # `$root` is the PSCustomObject from Test-Governed, NOT a string -- comparing a path to it was
