@@ -1219,7 +1219,7 @@ def read_service_env_posture(
         ),
         directory_listed_as_lookalike=any(name == _DIRECTORY_VARIABLE for name, _w, _l in found)
         and all(
-            not v.written.isascii()
+            not v.written.strip(" \t").isascii()
             for v in variables
             if v.written.upper() == _DIRECTORY_VARIABLE and _names([v])
         ),
@@ -1452,28 +1452,20 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         lookalike = (
             f"At least one entry spells {_DIRECTORY_VARIABLE} with a character outside ASCII, "
             "written here with each such character as its code point: "
-            f"{', '.join(_with_code_points(name) for name in lookalikes)}. Windows keeps such a "
-            "name apart from the ASCII one, but the engine reads its environment through "
-            f"Python's os.environ, which folds it to {_DIRECTORY_VARIABLE}, so the engine may "
-            "read it as the secrets directory. install-service.ps1 does not match it, so a "
-            "re-run of the installer may add a second entry beside it. Take each such entry "
+            f"{', '.join(_with_code_points(name) for name in lookalikes)}. Windows folds such a "
+            f"name to {_DIRECTORY_VARIABLE}, so the engine may read it as the secrets directory, "
+            "but install-service.ps1 does not match it, so a re-run of the installer may add a "
+            "second entry beside it, and the engine may then read either. Take each such entry "
             "out of the service's environment, whether its value is blank or not, taking only "
             "its own line out of an entry that holds other lines too"
         )
         if directory_named or posture.directory_path_joined:
-            # An ASCII entry already names the directory, so adding one would make two. The
-            # engine may be reading the look-alike's path, so the ASCII entry must name the
-            # path that holds the files before the look-alike goes.
-            lookalike += (
-                ", and leave the entry spelled in ASCII as the one that names it, first setting "
-                "it to the path that holds the secrets directory's files, which may be the one a "
-                "look-alike named"
-            )
+            # An ASCII entry already names the directory, so adding one would make two.
+            lookalike += ", and leave the entry spelled in ASCII as the one that names it"
         elif add_back_prints:
             lookalike += (
-                ". Where one named the secrets directory, name that same path under the ASCII "
-                f"spelling {_DIRECTORY_VARIABLE} in the service's AppEnvironmentExtra; the next "
-                "step says how"
+                ". Where one named the secrets directory, the next step names that path under "
+                "the ASCII spelling"
             )
         else:
             lookalike += (
@@ -1481,8 +1473,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "ASCII, naming that path to the service's AppEnvironmentExtra, the list "
                 "install-service.ps1 reads. `nssm set` replaces that whole list, so read it first "
                 "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
-                "back every entry but those this remedy says to remove, leaving out the lines "
-                "this step says to take out"
+                "back every entry but those this remedy says to remove"
             )
         steps.append(lookalike)
     if add_back_prints:
@@ -1548,13 +1539,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # A path alone holds no secret, and the service may read it as its directory (fourth
         # hold, H2), so only a joined entry that is plainly a path is spared, and only when
         # every refused variable that runs on takes nothing else (sixth hold, H1).
-        # Where the look-alike step sits between, "them" would bind to the look-alikes, so the
-        # sentence names its own antecedent there.
-        them = "any entry a refused value runs on into" if lookalikes else "any of them"
         spelled = ", spelled in ASCII," if lookalikes else ""
         steps.append(
-            f"Keep {them} that sets {_DIRECTORY_VARIABLE}{spelled} to a path and nothing else, as "
-            "its own entry"
+            f"Keep any of them that sets {_DIRECTORY_VARIABLE}{spelled} to a path and nothing "
+            "else, as its own entry"
         )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value refused "
