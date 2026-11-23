@@ -1685,8 +1685,8 @@ class Engine:
         # so it runs on a runner that is not installed yet: installed first, a concurrent reload
         # could take it, unstarted, as the live runner in that window. On a single node nothing
         # yields between add_registry below and the start taking the runner's reload lock. On a
-        # cluster the bring-up yields there, with the runner visible to unlocked readers, and
-        # _first_load_lock is what keeps a concurrent reload off it.
+        # cluster the bring-up yields there, with the runner visible to unlocked readers.
+        # _first_load_lock keeps a concurrent reload off it; DR activation does not take that lock.
         checker = self._check_runner(registry, lane_anchor_check=self._lane_anchor_check)
         # Vault BACKLOG #3582: a lookup its CA check fails is isolated, as at a start, and a CA
         # the build could not load is met as a trust anchor first. The
@@ -3784,7 +3784,8 @@ class Engine:
         committed leaves the new graph live. The API reload routes audit such a fault with reason
         ``reload_fault`` and answer a generic error (BACKLOG #3157). A cancellation is not one of the refusals either,
         and is never audited as a fault: one that lands after the swap committed keeps the new
-        values, and so does one during a first load's runner start.
+        values. One during a first load keeps them only if it keeps the runner, which it does
+        when the start began and its teardown did not complete (BACKLOG #5705).
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()

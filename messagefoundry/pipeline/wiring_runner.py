@@ -7056,8 +7056,9 @@ class RegistryRunner:
         #3582). The start isolates those lookups and checks no lookup CA again. That caller's build
         check left them out, so their query-credential WARNING is logged here whatever
         ``warn_query_credentials`` says. ``None`` checks every lookup CA here."""
-        self._start_cancel_unwound = False
         async with self._reload_lock:
+            # Inside the lock, so a start queued behind a cancelled one clears that one's True.
+            self._start_cancel_unwound = False
             self._start_entered = True
             if self._running:
                 return
