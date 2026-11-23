@@ -441,13 +441,15 @@ That gate detects **change**, not vulnerabilities. Advisories are a separate job
 run opens an issue through `nightly-notice.yml`. The tree does not audit clean and cannot be fixed
 here, so the job compares against a baseline of advisories already known,
 [`scripts/security/cla-action-advisories.toml`](../scripts/security/cla-action-advisories.toml),
-and fails on a new one. It also fails when a known one stops being reported. Either the advisory
-was withdrawn, or the audit stopped seeing the package, and a person has to find out which. That
-check is what shows, on each run, that the audit still sees the known-vulnerable packages. *This paragraph used to say nothing in CI scans this closure;
+and fails on a new one. It also fails when a known one stops being reported, and a person has to find
+out why. The causes include at least a withdrawn advisory, an affected range narrowed so it no
+longer covers any locked version of the package, and an audit that stopped seeing the package;
+the script's own advice on a STALE BASELINE ENTRY says what to check. The stale-entry check is
+what shows, on each run, that the audit still sees the known-vulnerable packages. *This paragraph used to say nothing in CI scans this closure;
 that was true until BACKLOG #1578's audit job landed.* The baseline's first entries were recorded as
 found, not triaged for reachability. Some have since been triaged, and the baseline's header says
 how to tell which: a triage comment names each advisory id it covers, and says who triaged it
-and on what reading. Among those still recorded as found are the three lodash advisories, on
+and on what reading. Among those still recorded as found are the two lodash advisories, on
 code the baseline's header records as in the bundle. The exposure is bounded by where the bundle runs — CI only,
 never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no automated
 remediation lane exists for it.
