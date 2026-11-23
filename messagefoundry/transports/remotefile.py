@@ -2872,6 +2872,8 @@ class RemoteFileSource(SourceConnector):
         # polls in a row have not listed it. In memory only and never logged. See _held_for_size.
         self._size_held: dict[str, tuple[_HeldRead, int]] = {}
         self._error_dir_asked = False  # this poll already asked for error_subdir (leave mode)
+        # Retrieves begun, ever. A listing is as old as the count it was taken at (_retry_stuck).
+        self._retrieves = 0
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
         self._validate_directory: bool = bool(s.get("validate_directory", False))
@@ -3060,6 +3062,7 @@ class RemoteFileSource(SourceConnector):
             await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
         self._error_dir_asked = False
         entries = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
+        listed_at = self._retrieves
         newly_recorded = 0  # #142: files marked processed THIS poll — gates one end-of-poll prune
         # Keyed so two entries that list one name never compare a None mtime with a str.
         listing = sorted(entries, key=lambda entry: (entry.name, entry.size))
@@ -3087,7 +3090,7 @@ class RemoteFileSource(SourceConnector):
             elif step is not _Step.FREE:
                 disposed += 1
                 newly_recorded += step is _Step.RECORDED
-        newly_recorded += await self._retry_stuck(listing[reached:], due)
+        newly_recorded += await self._retry_stuck(listing, reached, due, listed_at)
         if newly_recorded and self.processed_ledger is not None:
             # Bound growth (age + count), only when something new. A store call, so the stop bound
             # waits for it rather than cutting it (#4685).
@@ -3095,27 +3098,33 @@ class RemoteFileSource(SourceConnector):
                 await self.processed_ledger.prune()
 
     async def _retry_stuck(
-        self, unreached: list[_Listed], due: dict[str, tuple[float, _Listed]]
+        self,
+        listing: list[_Listed],
+        reached: int,
+        due: dict[str, tuple[float, _Listed]],
+        listed_at: int,
     ) -> int:
         """Examine the remembered rejects due a retry, earliest due first, up to
         :meth:`_stuck_retry_allowance`, and return how many files that recorded in the ledger
         (BACKLOG #5750). The pass mirrors the one in
         :meth:`~messagefoundry.transports.file.FileSource._scan_once`.
 
-        ``due`` holds those the poll's pass met. ``unreached`` is the listing past the ceiling's
-        break, whose due rejects join them, or a sustained backlog would keep them waiting. A due
-        reject with no slot stays due for a later poll. A stop takes every slot away. Every
-        remembered reject without a slot drops any settle sighting, which must come from
-        consecutive polls.
+        ``due`` holds those the poll's pass met. ``listing`` is the poll's listing, and the part of
+        it from ``reached`` on is past the ceiling's break, whose due rejects join them, or a
+        sustained backlog would keep them waiting. A due reject with no slot stays due for a later
+        poll. A stop takes every slot away. Every remembered reject without a slot drops any settle
+        sighting, which must come from consecutive polls.
 
-        A poll with a slot to run lists the directory once more first, whether or not the pass
-        disposed of a file, because a hand-off that failed takes time too. The size check
-        (:meth:`_held_for_size`) cannot see a rewrite on a listing with no size, or one that keeps
-        the length, and a moved time can show either. Slots share that listing, so such a rewrite
-        during an earlier slot's hand-off is still not seen. A slot that listing cannot judge,
-        because it failed or no longer names the file, stays due and drops its sighting."""
+        Before each slot, the directory is listed again if a retrieve has begun since the last
+        listing (``listed_at`` is the retrieve count the poll's listing was taken at), on the main
+        pass or in an earlier slot, whether or not it disposed of a file, because a hand-off that
+        failed takes time too. A poll with no retrieve since its listing does not list again. The
+        size check (:meth:`_held_for_size`) cannot see a rewrite on a listing with no size, or one
+        that keeps the length, and a moved time can show either. A slot that listing cannot judge,
+        because it failed or no longer names the file, stays due and drops its sighting; so does
+        every slot after a listing that failed."""
         now = time.monotonic()
-        for entry in unreached if self._stuck else ():
+        for entry in listing[reached:] if self._stuck else ():
             stuck = self._stuck_reject(entry.name, entry.size, entry.mtime)
             if stuck is not None and stuck.due <= now:
                 due.setdefault(entry.name, (stuck.due, entry))
@@ -3125,23 +3134,26 @@ class RemoteFileSource(SourceConnector):
             del self._settle_seen[name]
         if not slots:
             return 0
-        try:
-            current = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
-        except _RemoteError as exc:
-            logger.warning(
-                "REMOTEFILE %s: could not list the directory again before retrying rejected "
-                "files; they stay due: %s",
-                _where(self._host, self._remote_dir),
-                safe_exc(exc),
-            )
-            for _, slot in slots:
-                self._settle_seen.pop(slot.name, None)
-            return 0
-        latest = {entry.name: entry for entry in current}
+        latest = {entry.name: entry for entry in listing}
         recorded = 0
-        for _, slot in slots:
+        for index, (_, slot) in enumerate(slots):
             if self._stop.is_set():
                 break
+            if self._retrieves != listed_at:
+                try:
+                    current = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
+                except _RemoteError as exc:
+                    logger.warning(
+                        "REMOTEFILE %s: could not list the directory again before retrying "
+                        "rejected files; they stay due: %s",
+                        _where(self._host, self._remote_dir),
+                        safe_exc(exc),
+                    )
+                    for _, rest in slots[index:]:
+                        self._settle_seen.pop(rest.name, None)
+                    return recorded
+                listed_at = self._retrieves
+                latest = {entry.name: entry for entry in current}
             now_listed = latest.get(slot.name)
             if now_listed is None:
                 self._settle_seen.pop(slot.name, None)  # _prune_memories forgets the rest
@@ -3258,6 +3270,7 @@ class RemoteFileSource(SourceConnector):
                     reason=f"listed at {size} bytes, exceeds max_file_bytes {self._max_file_bytes}",
                 )
             return _Step.CHARGED
+        self._retrieves += 1  # counted when begun: a failed read can take time too
         try:
             raw = await asyncio.to_thread(
                 self._client.retrieve, path, max_bytes=self._max_file_bytes
@@ -3421,8 +3434,8 @@ class RemoteFileSource(SourceConnector):
         charged to the budget, and logged each time.
 
         **The budget.** A held read on the poll's main pass was a full download, so it charges the
-        per-tick budget. A hold on a retry pass charges nothing, since no retry does. A
-        server that lists every file at a wrong size does not pull its whole backlog in one poll. A
+        per-tick budget, so a server that lists every file at a wrong size does not pull its whole
+        backlog in one poll. A hold on a retry pass charges nothing, since no retry does. A
         second held read at another length on one listing starts a wait of
         ``STUCK_TRANSIENT_RETRY_SECONDS`` (:meth:`_waiting_on_size`), so a file that keeps
         disagreeing cannot spend the budget on every poll. A changed listing ends the wait.

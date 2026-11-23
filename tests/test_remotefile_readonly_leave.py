@@ -1018,11 +1018,11 @@ def test_each_real_listing_says_whether_it_gave_a_size() -> None:
     assert known == {"sized.hl7": True, "unsized.hl7": False}
 
 
-async def test_a_poll_with_a_due_retry_lists_the_directory_twice(
+async def test_a_poll_with_a_due_retry_and_no_retrieve_before_it_lists_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Open items 3 and 5: the retrieve-time check replaced the second listing, so no poll pays for
-    one and no failed or partial second listing can leave a slot's sighting behind."""
+    """The listing is repeated only after a retrieve has run since it, because nothing else can
+    have outdated it. The one due retry here settles first, so no retrieve precedes its slot."""
     client = _read_only({"/in/z.hl7": _BAD})
     src = _leave(monkeypatch, client)
     await _settle(src)
@@ -1030,7 +1030,40 @@ async def test_a_poll_with_a_due_retry_lists_the_directory_twice(
     _make_due(src, "z.hl7")
     client.list_calls = 0
     await src._poll_once()
-    assert client.list_calls == 2
+    assert client.list_calls == 1
+
+
+async def test_a_second_retry_slot_lists_again_after_the_first_slot_retrieved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two slots on a no-size listing: the first slot's hand-off lets a partner rewrite the second
+    file, and only a listing taken after that retrieve shows the moved time."""
+
+    class _NoSizeClient(_StampedClient):
+        def list_entries(self, remote_dir: str) -> list[_Listed]:
+            return [e._replace(size=0, size_known=False) for e in super().list_entries(remote_dir)]
+
+    client = _NoSizeClient(
+        {"/in/y.hl7": _BAD, "/in/z.hl7": _BAD}, {"/in/y.hl7": "1", "/in/z.hl7": "1"}
+    )
+    client._rename_exc = _REFUSED
+    src = _leave(monkeypatch, client, poll_max_files=20)  # a retry allowance of two
+    await _settle(src)
+    await src._poll_once()  # both are rejected and remembered
+    client.files["/in/y.hl7"] = _GOOD
+    _make_due(src, "y.hl7", 1.0)
+    _make_due(src, "z.hl7", 2.0)
+    await _settle(src)  # both take a slot and settle
+    handler = _RecordingHandler()
+
+    async def rewriting(raw: bytes) -> str | None:
+        client.files["/in/z.hl7"] = b"MSH|^~\\&|PARTIAL"
+        client.mtimes["/in/z.hl7"] = "2"
+        return await handler(raw)
+
+    src._handler = rewriting
+    await src._poll_once()
+    assert handler.bodies == [_GOOD], "z's partial must not be handed over"
 
 
 @pytest.mark.parametrize("time_returns", [True, False])
