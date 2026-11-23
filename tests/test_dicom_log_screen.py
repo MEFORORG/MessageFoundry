@@ -21,6 +21,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ import pytest
 pytest.importorskip("pydicom", reason="DICOM log tests need the [dicom] extra")
 pytest.importorskip("pynetdicom", reason="DICOM log tests need the [dicom] extra")
 
+from messagefoundry.parsing.dicom.errors import DicomBombError  # noqa: E402
 from messagefoundry.store.base import StoreAcquireTimeout  # noqa: E402
 from messagefoundry.transports import _dicom_log_lines as lines  # noqa: E402
 from messagefoundry.transports import dicom as dicom_module  # noqa: E402
@@ -953,21 +955,104 @@ async def test_a_failed_release_keeps_the_peers_answer_and_is_never_a_send(
     assert _UID not in caplog.text
 
 
-async def test_each_refusal_the_scu_raises_carries_no_library_text_on_its_chain(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _bomb_in_the_guard(patch: pytest.MonkeyPatch) -> None:
+    patch.setattr(dicom_module, "guard_part10_deflate", _raiser(DicomBombError(_REFUSAL)))
+
+
+def _unreadable_header(patch: pytest.MonkeyPatch) -> None:
+    patch.setattr(dicom_module, "guard_part10_deflate", _raiser(ValueError(_REFUSAL)))
+
+
+def _unparseable_object(patch: pytest.MonkeyPatch) -> None:
+    patch.setattr(dicom_module, "load_dcmread", lambda: _raiser(ValueError(_REFUSAL)))
+
+
+def _unproposable_context(patch: pytest.MonkeyPatch) -> None:
+    from pynetdicom import AE
+
+    patch.setattr(AE, "add_requested_context", _raiser(ValueError(_REFUSAL)))
+
+
+def _unsendable(patch: pytest.MonkeyPatch) -> None:
     from pynetdicom.association import Association
 
-    from messagefoundry.transports.base import NegativeAckError
+    patch.setattr(Association, "send_c_store", _raiser(ValueError(_REFUSAL)))
+
+
+def _no_instance_uid(patch: pytest.MonkeyPatch) -> None:
+    from pynetdicom.association import Association
+
+    real = dicom_module.load_dcmread()
+
+    def read(*args: Any, **kwargs: Any) -> Any:
+        dataset = real(*args, **kwargs)
+        del dataset.SOPInstanceUID
+        return dataset
+
+    patch.setattr(dicom_module, "load_dcmread", lambda: read)
+    patch.setattr(Association, "send_c_store", _raiser(AttributeError(_REFUSAL)))
+
+
+def _final_unanswered(patch: pytest.MonkeyPatch) -> None:
+    from pynetdicom.association import Association
+
+    patch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", 0)
+    patch.setattr(dicom_module, "_MAX_UNANSWERED_SENDS_OVER_CEILING", 1)
+    patch.setattr(Association, "send_c_store", _raiser(RuntimeError(_REFUSAL)))
+
+
+def _transient_send_fault(patch: pytest.MonkeyPatch) -> None:
+    from pynetdicom.association import Association
+
+    patch.setattr(Association, "send_c_store", _raiser(RuntimeError(_REFUSAL)))
+
+
+#: One case for each ``raise ... from`` in ``_store_object``; the census test below holds the count.
+_CHAINED_REFUSALS: list[tuple[str, Callable[[pytest.MonkeyPatch], None], str | None, type]] = [
+    ("deflate-bomb", _bomb_in_the_guard, "deflate-bomb", DicomBombError),
+    ("unreadable-header", _unreadable_header, "bad-object", ValueError),
+    ("unparseable", _unparseable_object, "bad-object", ValueError),
+    ("unproposable", _unproposable_context, "bad-object", ValueError),
+    ("unsendable", _unsendable, "cstore-unsendable", ValueError),
+    ("no-instance-uid", _no_instance_uid, "bad-object", AttributeError),
+    ("final-unanswered", _final_unanswered, "unanswered-over-ceiling", RuntimeError),
+    ("transient", _transient_send_fault, None, RuntimeError),
+]
+
+
+def test_every_chained_raise_in_the_scu_has_a_refusal_case() -> None:
+    tree = ast.parse(Path(dicom_module.__file__).read_text(encoding="utf-8"))
+    body = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_store_object"
+    )
+    chained = [n for n in ast.walk(body) if isinstance(n, ast.Raise) and n.cause is not None]
+    assert len(chained) == len(_CHAINED_REFUSALS)
+
+
+@pytest.mark.parametrize(
+    ("arrange", "code", "library"),
+    [case[1:] for case in _CHAINED_REFUSALS],
+    ids=[case[0] for case in _CHAINED_REFUSALS],
+)
+async def test_each_refusal_the_scu_raises_carries_no_library_text_on_its_chain(
+    arrange: Callable[[pytest.MonkeyPatch], None],
+    code: str | None,
+    library: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.transports.base import DeliveryError, NegativeAckError
     from tests._dicom_sample import make_sr_part10
     from tests.test_dicom_scu import _carry, _scu, _storage_scp
 
-    def refuse(self: Any, *args: Any, **kwargs: Any) -> Any:
-        raise ValueError(f"cannot encode {_UID}")
-
-    monkeypatch.setattr(Association, "send_c_store", refuse)
-    with _storage_scp() as port, pytest.raises(NegativeAckError) as raised:
+    arrange(monkeypatch)
+    with _storage_scp() as port, pytest.raises(DeliveryError) as raised:
         await _scu(port).send(_carry(make_sr_part10()))
+    if code is None:
+        assert not isinstance(raised.value, NegativeAckError)
+    else:  # CONTROL: this case reached the arm it names
+        assert isinstance(raised.value, NegativeAckError) and raised.value.code == code
     link: BaseException | None = raised.value
     seen = 0
     while link is not None:
@@ -975,3 +1060,5 @@ async def test_each_refusal_the_scu_raises_carries_no_library_text_on_its_chain(
         seen += 1
         link = link.__cause__ or link.__context__
     assert seen == 2  # CONTROL: the cause is still there, by its class
+    assert type(raised.value.__cause__) is library
+    assert _UID not in "".join(traceback.format_exception(raised.value))
