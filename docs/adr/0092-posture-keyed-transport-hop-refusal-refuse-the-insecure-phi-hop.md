@@ -58,7 +58,7 @@ secure hop (a proxy-terminated / trusted-segment hop) that replaces reliance on 
 A thin `enforce_insecure_hop(disp, *, message, cell, audit_sink)` acts on the decision: raise
 `InsecureHopRefused` (a `ValueError`, so it surfaces as a config-load / `build_check` error) on REFUSE;
 loud-log **+ audit** on WARN; no-op on ALLOW. `transports/rest._is_loopback_egress_host` is **hoisted** to
-`tls_policy.is_loopback_hop_host` (literal `127.0.0.0/8`, `::1`, `localhost`, empty host) so the HTTP-egress
+`tls_policy.is_loopback_hop_host` (literal `127.0.0.0/8`, `::1`, `localhost`; BACKLOG #5512 removed the empty host) so the HTTP-egress
 cell and the authority share **one** definition; it **never resolves DNS** — an unprovable name is REMOTE
 (fail-closed), so a hostname can't smuggle an off-box hop past the on-box carve-out.
 

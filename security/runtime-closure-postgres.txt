@@ -1,0 +1,56 @@
+# The POSTGRES runtime closure: every distribution an engine install with the `postgres` extra
+# carries, transitive dependencies included, with NO other extra and NO development toolchain.
+#
+# It is the core closure in security/runtime-closure-core.txt plus what the extra adds, and the
+# Dockerfile's runtime-postgres image installs the same lock (BACKLOG #5933). docs/RISKY-COMPONENTS.md
+# records this file and does NOT yet assess the extra: the name it adds, asyncpg, is classified
+# nowhere on that page. This file is the denominator a `postgres` section would classify.
+#
+# Each line below is a copy of a pin line in docker/locks/requirements-postgres.lock. That file is
+# `uv export --no-emit-project --no-dev --extra postgres` of uv.lock, and the DEP-1 gate in
+# security.yml fails when it differs from a fresh export. Lines are name==version, lowercase and
+# sorted, with markers and hashes dropped. tests/test_risky_component_designation.py holds this copy
+# to that lock in every name and version. A version edited here by hand changes nothing that
+# installs, and the test refuses it.
+#
+# Regenerate after the lock moves (the same command rewrites the other closures too):
+#     python scripts/security/runtime_closure.py
+#
+# On a Dependabot PR, .github/workflows/dependabot-lock-resync.yml runs the command above.
+# .github/dependabot.yml says why, and how far, Dependabot is kept from editing this file directly.
+aiosqlite==0.22.1
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+argon2-cffi==25.1.0
+argon2-cffi-bindings==26.1.0
+asyncpg==0.32.0
+certifi==2026.10.23
+cffi==2.1.1
+click==8.5.0
+cryptography==50.0.2
+fastapi==0.163.1
+h11==0.16.0
+hl7apy==1.3.5
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.20
+ldap3==2.9.1
+opentelemetry-api==1.45.2
+psutil==7.2.2
+pyasn1==0.6.5
+pycparser==3.0
+pydantic==2.14.3
+pydantic-core==2.50.4
+pyspnego==0.12.4
+sspilib==0.6.0
+starlette==1.10.0
+tomlkit==0.15.2
+truststore==0.10.5
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+tzdata==2026.6
+uvicorn==0.54.0
+uvloop==0.23.0
+websockets==17.2

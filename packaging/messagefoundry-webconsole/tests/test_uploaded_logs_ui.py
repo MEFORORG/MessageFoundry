@@ -874,7 +874,7 @@ async def test_browse_filter_refuses_an_over_long_criterion_instead_of_listing_e
             data={"content": "M" * 600, "message_type": "ADT^A01"},
         )
         assert r.status_code == 400, f"an unparseable filter must refuse, got {r.status_code}"
-        assert "longer than that field allows" in r.text, "the refusal must say why"
+        assert "not a value that field accepts" in r.text, "the refusal must say why"
         # The operator's valid criterion is still in the form -- not silently blanked.
         assert 'value="ADT^A01"' in r.text, "a valid criterion was discarded with the invalid one"
         # And the needle never reached the URL even on the refusal path.

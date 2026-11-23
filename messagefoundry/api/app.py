@@ -1833,32 +1833,47 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     and a tight cut would drop the page that explains this refusal. The test that pins #2597,
     test_the_alert_fires_even_when_the_start_then_fails, fails at or after engine.start(), so it
     runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
-    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
+    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered
+    when that count is not zero, or when the cut reached a send still running
+    (NotifierAlertSink.sends_cut), even at a zero count, which a send cut beside a sibling that took
+    the alert leaves. A cut that reached no running send and left nothing counted logs
+    nothing, as a drain that ends in time with nothing counted does. NotifierAlertSink._handle says
+    what that count holds, the same rule on a cut as on a drain that ends in time.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
-    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The count
-    includes an alert one transport delivered while another had not finished. The cut does not
-    end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring say
-    which run on."""
+    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). A send still
+    running at the cut is named by transport in NotifierAlertSink._cut_sends's WARNING. The cut
+    does not end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring
+    say which run on."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
 
         async def _close_notifier(bound: float) -> None:
             notifier.start()
+            sends_cut_before = notifier.sends_cut
             wait = bound * _INNER_SHARE
+            was_cut = False
             try:
                 async with asyncio.timeout(wait) as deadline:
                     await notifier.aclose()
             except TimeoutError:
                 if not deadline.expired():
                     raise
-                if not notifier.undelivered:
-                    return  # the last send ended at the deadline: nothing was lost
-                # A count only: an alert's content can carry a partner's text (docs/PHI.md).
+                was_cut = True
+            # BACKLOG #5907: a cut that reached a running send is logged at a zero count too,
+            # since a send cut beside one that took the alert leaves no count. Counts only: an
+            # alert's content can carry a partner's text (docs/PHI.md).
+            sends_cut = notifier.sends_cut - sends_cut_before if was_cut else 0
+            if sends_cut or notifier.undelivered:
+                cut = (
+                    f"the alert notifier did not drain within {wait:.2f}s, "
+                    f"cutting {sends_cut} running send(s); "
+                    if was_cut
+                    else ""
+                )
                 _log.error(
-                    "startup unwind: the alert notifier did not drain within %.2fs; %d alert(s) "
-                    "not confirmed delivered",
-                    wait,
+                    "startup unwind: %s%d alert(s) not confirmed delivered",
+                    cut,
                     notifier.undelivered,
                 )
 

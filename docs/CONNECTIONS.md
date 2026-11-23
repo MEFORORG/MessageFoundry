@@ -164,9 +164,16 @@ transport = "mllp"
   A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
   digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
   #1650). That read sees what a `cast` left. `cast = "int"` is strict too: it refuses a bool and a
-  number that is not whole, where the builtin `int` read `true` as 1 and cut a fraction. A
-  `cast = "float"` is the builtin `float`, so it still reads `true` as 1.0, which the port read
-  takes as port 1. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
+  number that is not whole, where the builtin `int` read `true` as 1 and cut a fraction.
+  `cast = "float"` reads a value by the rule of `float_setting` in `transports/base.py`. It
+  refuses a bool, where the builtin `float` read `true` as 1.0. It also refuses `nan`, an
+  infinity, and text that reads as zero but is not zero in plain digits, such as `"1e-400"` or `"0e0"`. A TOML
+  literal `1e-400` in a value file is parsed to `0.0` first, so it reads as zero. A code-first
+  `env()` with `cast=int`, `cast=float` or `cast=bool` gets the same strict reading as the named
+  cast. Any other code-first cast runs as given, on the value as it arrives. That includes a
+  builtin such as `abs` and a type such as `decimal.Decimal`. So `cast=lambda v: int(v)` still
+  reads `true` as 1, and the port read takes that as port 1. At least `allowed_mllp`, among the
+  host-and-port `[egress]` lists that pin a port,
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin
   of `6661` (BACKLOG #5915). `allowed_db` also compares the SQL Server preset's `port` setting as
   a number when its check runs, but on `dialect="generic"` it refuses a `PORT` keyword with a
@@ -2193,6 +2200,12 @@ host.
   `DatabasePoll`, which takes only [its allowlist](#the-generic-driver-allowlist).
   `DatabaseLookup` and `DatabaseRef` take only a Microsoft driver.
 - `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
+- `server` must name a host (BACKLOG #5512), at every posture, and neither `tls_hop_attested`
+  nor `cleartext_accepted` crosses the refusal, since the preset would send `SERVER=,<port>` and
+  the driver would pick its own destination. A `server` of `None`, which a `DatabaseRef` can carry,
+  is refused the same way and is never sent as the host `None`. What counts as naming no host is
+  stated once, in the `server` row of the generic dialect's [*Values*](#values-on-the-generic-dialect)
+  table, and the preset reads the same spellings.
 - `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
   the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
   dial a port the check never compared. Set `port` to the instance's port.
@@ -2441,7 +2454,7 @@ built, and the error names the setting and never the value:
 | `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`, `"`, `'`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An `odbc_params` value of `true` or `false` is refused, never sent as the text `True` or `False`; write the driver's own spelling as a string. An unset `database` or `username` is left out of the string |
 | `SSLmode`, in any case of the keyword | plain | for MySQL Connector/ODBC under its registered name, exactly one of `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case; refused on Microsoft's `ODBC Driver <n> for SQL Server`, which reads `Encrypt` instead; for psqlODBC, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
 | `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
-| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused |
+| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused, and so is at least a blank value, a bare `:port`, `[]`, an empty entry on either side of a comma, and a host made only of brackets, colons and digits that is neither all digits nor an IPv6 literal (such as `[,]` or `:1433:`), whatever the posture, `tls_hop_attested` or `cleartext_accepted`. A plain number (`1433`, `[1433]`) or digits-only host with a port (`12:34`), and the IPv6 literals `::` and `[::]`, are accepted. The SQL Server preset (`Database`, `DatabasePoll`, `DatabaseLookup`, `DatabaseRef`) refuses the same spellings the same way, except that a value holding a comma meets the preset's own comma refusal first. A protocol prefix with no host after it, such as `tcp:`, is not caught |
 | `password` | braced, with the `}}` escape | printable ASCII. See below |
 
 Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
@@ -4247,7 +4260,7 @@ that carries no recognized credential crosses in three ways that do not claim th
 
 | | claim | disposition |
 |---|---|---|
-| the hop is **on-box** (loopback / `localhost` / empty host) | not a network exposure | ALLOW |
+| the hop is **on-box** (loopback / `localhost`; an empty host is not on-box) | not a network exposure | ALLOW |
 | `cleartext_accepted = true` + `cleartext_reason` | this hop is **not** secure, and we accept that | **WARN** — crossed, loudly logged **and recorded at every construction** |
 | `[security].enforcement = warn` | the instance-wide refuse/warn dial is at `warn` | WARN — but **only for the raw transports** (`MLLP()`, `Tcp()`, `X12()`, `DICOM()`, `Email()`, `Ftp()`). The HTTP family (`Rest()`, `Soap()`, `FHIR()`, `DICOMweb()`, `FhirLookup()`) shipped these refusals unconditionally, and ADR 0092 decision 5 forbids a cell getting weaker, so a no-loosen floor turns that WARN back into a REFUSE there. The dial is **not** a substitute for the declaration |
 

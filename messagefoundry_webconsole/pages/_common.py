@@ -30,7 +30,7 @@ from .._html import Markup, el, text
 
 REFILLED_FIELD_VALUE = "field_value_refilled"
 """The hidden input that carries the Field value a needle form was refilled with (BACKLOG #6700).
-:func:`messagefoundry_webconsole.routes._common.posted_field_value` reads it back."""
+:func:`messagefoundry_webconsole.routes._common.posted_needle` reads it back."""
 
 
 def _refilled_field_value(field_path: str, field_value: str) -> Markup:
@@ -39,7 +39,7 @@ def _refilled_field_value(field_path: str, field_value: str) -> Markup:
     only with a path: a page re-rendered from a refused value-without-path holds no marker, so
     resubmitting that refusal sends the value again rather than dropping it. It holds the same value
     as the visible box beside it and travels in the POST body, as the box does."""
-    # Blank as posted_field_value and the engine read it: a path of only spaces is no path.
+    # Blank as posted_needle and the engine read it: a path of only spaces is no path.
     value = field_value if field_path.strip() else ""
     return el("input", type="hidden", name=REFILLED_FIELD_VALUE, value=value or None)
 

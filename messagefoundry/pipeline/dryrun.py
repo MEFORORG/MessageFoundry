@@ -39,6 +39,7 @@ from messagefoundry.config.wiring import (
     SetMeta,
     SetState,
     StateValue,
+    accepts_verdict,
     handler_item_fault,
     handler_result_items,
 )
@@ -145,10 +146,13 @@ class TraceHook(Protocol):
 
     When a ``tracer`` is supplied, :func:`route_only` / :func:`transform_one` invoke the Router/Handler
     **through** the hook instead of calling it directly, so the hook can install ``sys.settrace`` around
-    exactly that call. The hook is a *pure observer* — it returns the callable's result unchanged and
-    re-raises any exception — so the traced path is byte-identical to the default (``tracer=None``). The
-    concrete implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps
-    ``dryrun`` free of any dependency on it (one-way import)."""
+    exactly that call. The hook is a *pure observer* — it re-raises any exception, and
+    ``trace_router``/``trace_handler`` return the callable's result unchanged — so the traced path is
+    byte-identical to the default (``tracer=None``). ``trace_accepts`` returns the verdict as a bool,
+    read through :func:`~messagefoundry.config.wiring.accepts_verdict` as the untraced path reads it,
+    so a verdict that function refuses raises ``TypeError`` there too (BACKLOG #5514). The concrete
+    implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps ``dryrun``
+    free of any dependency on it (one-way import)."""
 
     def trace_router(
         self, fn: RouterFn, name: str, payload: Message | RawMessage
@@ -358,10 +362,16 @@ def _accepted(
                     origin=origin,
                 )
             )
-        elif tracer is not None:
-            verdict = tracer.trace_accepts(pred, hname, payload)
         else:
-            verdict = pred(payload)
+            # One refusal for both in-process branches (BACKLOG #5514): an awaitable or iterator
+            # verdict with no truth value of its own would read as True and accept every message,
+            # so it raises here instead; :func:`accepts_verdict` states which verdicts. The
+            # tracer applies it too, so it records no decline for a refused verdict; on its bool
+            # this call is one compare.
+            verdict = accepts_verdict(
+                hname,
+                pred(payload) if tracer is None else tracer.trace_accepts(pred, hname, payload),
+            )
         if verdict:
             kept.append(hname)
     return kept

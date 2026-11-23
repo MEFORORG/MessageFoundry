@@ -116,7 +116,7 @@ def test_unset_internal_ca_falls_back_to_system_even_in_pinned() -> None:
     assert anchor == TrustAnchor(cafile=None, load_system_roots=True)
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "", "::1", "127.5.6.7"])
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "127.5.6.7"])
 def test_loopback_hop_is_exempt(host: str) -> None:
     # An on-box hop needs no org-PKI anchor — the internal CA is for verifying internal NETWORK peers.
     anchor = resolve_trust_anchor(
