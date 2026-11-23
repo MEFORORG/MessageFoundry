@@ -243,19 +243,50 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     part is routable, so the IPv4 allow list stays the publish guard's own. Every text
     :func:`_ipv6_candidates` gives is tried, and any one that parses to a routable address is a
     hit, so a fail-closed check refuses on any reading. When none parses, the texts of
-    :func:`_label_dropped_runs` are tried the same way. What it misses, and what it refuses
-    though it holds no address, is listed in docs/PHI.md section 9."""
-    for match in _IPV6_RUN.finditer(text):
-        run = match.group()
-        if run.count(":") < 2:
-            continue
-        verdict = _judge_ipv6_texts(_ipv6_candidates(run), ipv4_is_routable)
-        if verdict is None:
-            labelled = (c for r in _label_dropped_runs(run) for c in _ipv6_candidates(r))
-            verdict = _judge_ipv6_texts(labelled, ipv4_is_routable)
-        if verdict:
-            return True
+    :func:`_label_dropped_runs` are tried the same way. Each piece :func:`_dot_joined_pieces`
+    cuts from a run is judged as a run of its own too, and ``text`` is also read folded
+    (:func:`.surrogates.folded`), so fullwidth hex digits and colons are read (BACKLOG #5654). What
+    it misses, and what it refuses though it holds no address, is listed in docs/PHI.md section 9."""
+    folded_text = folded(text)
+    for form in (text,) if folded_text == text else (text, folded_text):
+        for match in _IPV6_RUN.finditer(form):
+            for run in (match.group(), *_dot_joined_pieces(match.group())):
+                if run.count(":") >= 2 and _judge_ipv6_run(run, ipv4_is_routable):
+                    return True
     return False
+
+
+def _judge_ipv6_run(run: str, ipv4_is_routable: Callable[[str], bool]) -> bool:
+    """True if one of the texts :func:`_ipv6_candidates` gives for ``run`` parses to a routable
+    address, or, when none parses, one of the texts of :func:`_label_dropped_runs` does."""
+    verdict = _judge_ipv6_texts(_ipv6_candidates(run), ipv4_is_routable)
+    if verdict is None:
+        labelled = (c for r in _label_dropped_runs(run) for c in _ipv6_candidates(r))
+        verdict = _judge_ipv6_texts(labelled, ipv4_is_routable)
+    return bool(verdict)
+
+
+def _dot_joined_pieces(run: str) -> tuple[str, ...]:
+    """``run`` cut at each dot that has two colons or more before it in the run and a colon in
+    the group after it, as in ``fe80::1.4000:a1::5``, or nothing when it has no such dot. The run
+    whole parses to the allowed address before the dot, so the address after it is read only as a
+    piece (BACKLOG #5654). A dot with no colon before it, as in ``1.2.3::a``, does not cut, so a
+    version number before an address is read as before. Each group is visited once, so the cost
+    stays linear in the run's length."""
+    groups = run.split(".")
+    pieces: list[str] = []
+    current = [groups[0]]
+    colons = groups[0].count(":")
+    for group in groups[1:]:
+        if colons >= 2 and ":" in group:
+            pieces.append(".".join(current))
+            current = [group]
+        else:
+            current.append(group)
+        colons += group.count(":")
+    if not pieces:
+        return ()
+    return (*pieces, ".".join(current))
 
 
 def _judge_ipv6_texts(texts: Iterable[str], ipv4_is_routable: Callable[[str], bool]) -> bool | None:
@@ -959,24 +990,32 @@ def _header_ipv6_hits(text: str, mapped_paths: set[str]) -> list[str]:
     found = _split_at_header(text)
     if found is None:
         return []
-    seps, field_sep, lines, header_at = found
-    fields = lines[header_at].split(field_sep)
-    if not _is_skipped_header(fields):
-        return []
+    seps, field_sep = found[0], found[1]
     hits: list[str] = []
-    # The anonymizer and the engine's parser take the first four characters of MSH-2 as the
-    # encoding characters and no more, and no rule may rewrite MSH-2, so text a sender put after
-    # them reaches the output.
-    # After MSH-2, fields[i] is MSH-(i + 1).
-    values = [(_MSH2, fields[1][4:])]
-    values += [(f"MSH-{i + 1}", value) for i, value in enumerate(fields[2:], start=2)]
-    for address, value in values:
+    for address, value in _header_values(found):
         if not value or address in mapped_paths:
             continue
         forms = _shape_forms(value, seps, field_sep)
         if any(_has_routable_ipv6(form, _ipv4_is_routable) for form in forms):
             hits.append(f"unmapped {IPV6_REASON} in {address}")
     return hits
+
+
+def _header_values(found: tuple[Seps, str, list[str], int]) -> list[tuple[str, str]]:
+    """``(address, value)`` for the header :func:`_walk` skips, given what
+    :func:`_split_at_header` found: MSH-2 past its four encoding characters, then each field from
+    MSH-3 on. Empty for a header the walk does not skip, which the walk reads itself."""
+    _seps, field_sep, lines, header_at = found
+    fields = lines[header_at].split(field_sep)
+    if not _is_skipped_header(fields):
+        return []
+    # The anonymizer and the engine's parser take the first four characters of MSH-2 as the
+    # encoding characters and no more, and no rule may rewrite MSH-2, so text a sender put after
+    # them reaches the output.
+    # After MSH-2, fields[i] is MSH-(i + 1).
+    values = [(_MSH2, fields[1][4:])]
+    values += [(f"MSH-{i + 1}", value) for i, value in enumerate(fields[2:], start=2)]
+    return values
 
 
 #: The hit for a header that repeats an MSH-2 encoding character (BACKLOG #5374). No field of such
@@ -1078,7 +1117,8 @@ def past_first_component_hits(
     it only a known TS.2 precision code.
 
     The walk names a segment by every rule's path, so a segment only these rules name keeps its
-    address in a message whose HL7 version does not define it."""
+    address in a message whose HL7 version does not define it. A header field from MSH-3 on is
+    read the same way, though the walk skips the header (BACKLOG #5654)."""
     retargets = retargeted_defaults(rules)
     # A retarget away from an identifier kind is labelled as one. From one identifier kind to
     # another, the default kind keeps components too, so pointing the field back would not
@@ -1093,6 +1133,11 @@ def past_first_component_hits(
     rewritten = {r.path for r in rules if r.kind != SurrogateKind.KEEP}
     hits: list[str] = []
     walk = unmapped_field_values(text, rewritten - paths, version=version, named_by=rewritten)
+    # The walk skips the header, so a header field one of these rules rewrites is read from it
+    # here (BACKLOG #5654).
+    header = _split_at_header(text)
+    if header is not None:
+        walk += _header_values(header)
     for address, value in walk:
         if address not in paths:
             continue
