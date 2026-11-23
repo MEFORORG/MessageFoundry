@@ -195,12 +195,23 @@ def test_batch_envelope_lines_on_a_split_member_keep_the_exemption() -> None:
     assert result.unvalidated_segments == (("BTS", 4), ("BHS", 5), ("FTS", 6), ("FHS", 7))
 
 
-@pytest.mark.parametrize("msh_9", ["MFN^M02^MFN_M01", "MFN^M05^MFN_M01", "MFN^^MFN_M01"])
+@pytest.mark.parametrize(
+    "msh_9",
+    [
+        "MFN^M02^MFN_M01",
+        "MFN^M05^MFN_M01",
+        "MFN^^MFN_M01",
+        "MFN^ ^MFN_M01",
+        "MFN^m02^MFN_M01",
+        "MFN^M02 ^MFN_M01",
+    ],
+)
 def test_a_same_code_borrow_for_an_event_with_its_own_structure_gets_no_exemption(
     msh_9: str,
 ) -> None:
     """MSH-9.2 is compared (BACKLOG #5920 step 1): MFN_M02 and MFN_M05 are structures of their
-    own, so borrowing MFN_M01's slot for either is refused, as is a borrow with no trigger event."""
+    own, so borrowing MFN_M01's slot for either is refused, as is a borrow whose event is not
+    three capital letters or digits (empty, blank, lower-case or padded), which fails closed."""
     borrowed = _MFN_M01.replace("MFN^M01^MFN_M01", msh_9)
     result = validate(borrowed + "\rORC|NW|ORD1\r" + _PV1)
     assert not result.ok
@@ -220,6 +231,30 @@ def test_the_own_structure_or_one_for_an_event_without_one_keeps_the_exemption(
     result = validate(message + "\rORC|NW|ORD1\r" + _PV1)
     assert result.ok, result.errors
     assert result.unvalidated_segments == (("ORC", 4), ("PV1", 5))
+
+
+def test_the_structure_lookup_keeps_no_sender_text() -> None:
+    """The MSH-9.2 lookup is cached by version alone, so distinct events add no cache entry."""
+    validate_module._structures.cache_clear()
+    for n in range(30):
+        validate(_MFN_M01.replace("MFN^M01^MFN_M01", f"MFN^Q{n:02d}^MFN_M01") + "\rORC|NW|1")
+    assert validate_module._structures.cache_info().currsize == 1
+
+
+_PGL = "\rPID|1||1^^^A||DOE^J\rGOL|AD|20260101|G1^Goal|1\rLOC|L1^Loc||C"
+
+
+@pytest.mark.parametrize("msh_9", ["PGL^PC6^PGL_PC6", "PGL^PC7^PGL_PC6"])
+def test_a_structure_serving_several_events_keeps_the_exemption_for_each(msh_9: str) -> None:
+    """PGL_PC6 serves PC6 to PC8, and hl7apy has no PGL_PC7, so the borrow keeps it. hl7apy's
+    2.5 PGL_PC6 has the "any HL7 segment" slot; its 2.5.1 one does not (the control)."""
+    head = "MSH|^~\\&|A|B|C|D|20260101||" + msh_9 + "|N1|P|"
+    result = validate(head + "2.5" + _PGL)
+    assert result.ok, result.errors
+    assert result.unvalidated_segments == (("LOC", 4),)
+    assert validate(head + "2.5.1" + _PGL).errors == [
+        "segment LOC at line 4 has no place in this message's structure"
+    ]
 
 
 _PRR_PC5 = (

@@ -499,10 +499,10 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), run on
     ``norm`` itself, the text encode_batch frames: a head a parse refuses for its escapes raises
     the same ``HL7PeekError`` here, whatever its caller checked. On the delivery path that text is
-    the hydrated head, and the caller's own read of the head's stored payload
-    (:func:`head_control_id`) checks the same budget first, so there this is a second check, not
-    the only one. What else a parse checks in the rest of the head is not checked: at least a
-    later header line too short to read."""
+    the hydrated head. The caller's own read (:func:`head_control_id`) checks the same budget on
+    the head's stored payload, which is other text wherever a document was re-attached, so on
+    the hydrated text this check is the one that runs. What else a parse checks in the rest of
+    the head is not checked: at least a later header line too short to read."""
     line = _first_line_head(norm)
     # The parse's _encoding_chars returns exactly what _extract_separators reads from this line,
     # a short MSH-2 filled with the same defaults (BACKLOG #5972), so any MSH line the parse would
@@ -522,7 +522,7 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
 #: A header line after the first that is too short for the parse to read (``_builtin_hl7.parse``
 #: refuses one): a line that is a header ID alone, or the text's last line once the parse's strip
 #: leaves only a header ID there.
-_SHORT_LATER_HEADER = re.compile(r"\r(?:MSH|BHS|FHS)(?:\r|\s*\Z)")
+_SHORT_LATER_HEADER = re.compile(r"\r(?:" + "|".join(map(re.escape, HEADER_IDS)) + r")(?:\r|\s*\Z)")
 
 
 def head_control_id(text: str) -> str | None:
