@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -39,7 +39,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, VerifiedUser
 
 #: What the tampering writes. None of it may appear in an answer.
 _PLANTED = "planted-outside-the-store"
@@ -90,6 +90,28 @@ async def _setup(engine: Engine) -> tuple[AuthService, list[str], str, str]:
     intact = await provision(service, "intact", [Role.VIEWER.value])
     victim = await provision(service, "victim", [Role.VIEWER.value])
     return service, alerts, intact, victim
+
+
+def _fail_after_the_route_check(
+    service: AuthService,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: Callable[[str], Awaitable[None]],
+) -> None:
+    """Stand ``failing`` in for the service's checked reader after its first call, which is the
+    reset route's own checked read of the account (BACKLOG #5520 items 2 and 13), so the stand-in
+    fails only the name read of the page the landed reset renders."""
+    real = service.checked_user
+    calls = 0
+
+    async def checked_user(user_id: str) -> VerifiedUser | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await real(user_id)
+        await failing(user_id)
+        return None
+
+    monkeypatch.setattr(service, "checked_user", checked_user)
 
 
 async def _seal_failures(engine: Engine, user_id: str) -> int:
@@ -278,7 +300,7 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     one-time credential names the account. That name is read through the checked read; on a
     refusal ``_shown_name`` takes (its docstring states which), the page names the id and the
     credential is still shown, since it was issued. The failure is stood in for at the service's
-    checked reader, after the reset's own read."""
+    checked reader, after the reset's own reads."""
     engine, _path = keyed
     caplog.set_level(logging.DEBUG, logger="messagefoundry_webconsole.routes.admin")
     service, _alerts, intact, victim = await _setup(engine)
@@ -292,7 +314,7 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
         async def failing(user_id: str) -> None:
             raise failure
 
-        monkeypatch.setattr(service, "checked_user", failing)
+        _fail_after_the_route_check(service, monkeypatch, failing)
         path = f"/ui/users/{victim}/reset-password"
         await mint_bound_proof(c, path)
         r = await c.post(path, headers=SAME_ORIGIN)
@@ -349,7 +371,7 @@ async def test_a_defect_in_the_post_action_name_read_still_shows_the_credential(
 
     async with _client(engine, service) as c:
         await cookie_login(c, "root")
-        monkeypatch.setattr(service, "checked_user", failing)
+        _fail_after_the_route_check(service, monkeypatch, failing)
         path = f"/ui/users/{victim}/reset-password"
         await mint_bound_proof(c, path)
         r = await c.post(path, headers=SAME_ORIGIN)
