@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import sys
 from collections.abc import Mapping
@@ -66,6 +67,8 @@ from harness.load.connscale.runner import (
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import EngineNode, FailoverError, _await_port
 from messagefoundry.terminal_text import escape_for_terminal
+
+log = logging.getLogger(__name__)
 
 _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
@@ -971,8 +974,12 @@ async def run_batch_engine(
             # Empty the shared store so THIS cell is apples-to-apples (the pooled/batch handoff never
             # inherits the prior cell's rows — the carryover confound run_connscale fixes per step).
             if reset_store and profile.store_backend is not None:
-                with contextlib.suppress(Exception):
+                try:
                     await _reset_server_store(profile.store_backend, node_env)
+                except Exception as exc:
+                    # Measuring on the prior cell's rows would be the confound above, so the cell
+                    # is missed. Type name only: a driver error's text can carry connection details.
+                    raise ConnScaleError(f"store reset failed: {type(exc).__name__}") from exc
             await node.start()
             await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
             # Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a 0.0.0.0 listener);
@@ -996,10 +1003,16 @@ async def run_batch_engine(
             # Tell the driver this cell is unusable so it skips + posts DONE (keeps the matrix in
             # lockstep instead of hanging both boxes on a READY that never comes).
             cell_coord.post(BATCH_CELL_READY, {"cell_id": cell.cell_id, "error": info.error})
-            with contextlib.suppress(Exception):
+            try:
                 await cell_coord.await_message(BATCH_CELL_DONE, timeout=cell_timeout)
-            with contextlib.suppress(Exception):
-                await node.stop()
+            except Exception as wait_exc:
+                kind = type(wait_exc).__name__
+                log.warning("batch cell %s: wait for DONE failed: %s", cell.cell_id, kind)
+                report.notes.append(
+                    f"CELL {cell.cell_id}: wait for the driver's DONE failed ({kind}) after the "
+                    "engine did not start; moving to the next cell"
+                )
+            await _stop_cell_node(node, cell.cell_id, report)
             continue
 
         pid = getattr(node, "pid", None)
@@ -1037,9 +1050,29 @@ async def run_batch_engine(
             )
             await cell_coord.await_message(BATCH_CELL_DONE, timeout=cell_timeout)
         finally:
-            with contextlib.suppress(Exception):
-                await node.stop()
+            await _stop_cell_node(node, cell.cell_id, report)
     return report
+
+
+async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineReport) -> None:
+    """Stop a cell's engine. A failure is logged and noted by exception type only, and never becomes
+    a cell error: the cell's result is already decided by the time teardown runs (BACKLOG #5857).
+
+    The note reads the process, not the code path: a cell that failed its health or port wait did
+    spawn an engine. ``alive`` sees only the root process's last known state, so neither note
+    claims the whole process tree is gone."""
+    try:
+        await node.stop()
+    except Exception as exc:
+        kind = type(exc).__name__
+        log.warning("batch cell %s: engine stop raised %s", cell_id, kind)
+        report.notes.append(
+            f"CELL {cell_id}: engine stop raised {kind} and its root process still reads as "
+            "RUNNING; check that it exited"
+            if node.alive
+            else f"CELL {cell_id}: cleanup stop raised {kind}; its root process is not running "
+            "(it may never have started; child processes were not checked)"
+        )
 
 
 # --- the DRIVER half ---------------------------------------------------------
