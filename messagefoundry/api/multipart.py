@@ -148,7 +148,7 @@ class _LineStartDelimiters:
     """Finds the delimiters ``--<boundary>`` of a body (BACKLOG #5787). This is the one statement of
     which offsets count.
 
-    The first delimiter is the first ``--<boundary>`` anywhere, as on origin/main, so a preamble
+    The first delimiter is the first ``--<boundary>`` anywhere, as before #5787, so a preamble
     that ends mid-line, or a stray byte before the first delimiter, parses as it did. Each later
     delimiter must start a line: it must come right after a CR or an LF. Delimiter text elsewhere
     after the first delimiter is not a delimiter, so inside a part it is content. A bare CR counts as
@@ -158,7 +158,9 @@ class _LineStartDelimiters:
     2046, which keeps only ``CRLF--<boundary>`` out of content: a content line after a bare CR or a
     bare LF that starts with ``--<boundary>`` is taken as a delimiter here, though a conforming
     sender may write one. Nothing here reads what follows the boundary, so a content line starting
-    with ``--<boundary>--`` and then other text is taken as the close.
+    with ``--<boundary>--`` and then other text is taken as the close. Close-marker text anywhere
+    before the first delimiter, a preamble included, is taken as the first delimiter, and so as the
+    close, however the parts after it end.
 
     After the first, two ``find`` cursors, one for ``\n--B`` and one for ``\r--B``, each only ever
     moving forward, so a body holding the delimiter text mid-line many times is skipped in C and the
@@ -233,7 +235,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     count = 0
     closed = False
     # Anything before the first delimiter is the ignorable preamble; the closing "--boundary--" is
-    # the first later delimiter followed by b"--", and anything after it is the ignorable epilogue.
+    # the first delimiter, the first one included, followed by b"--", and anything after it is the
+    # ignorable epilogue.
     # Which offsets count as a delimiter is stated once, on _LineStartDelimiters.
     delims = _LineStartDelimiters(body, delim)
     pos = delims.first()
@@ -311,7 +314,9 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     # part would otherwise run to the end of the body and be taken as complete. Checked last, so a
     # body that fails a check above gets that refusal. A close marker counts only where a delimiter
     # does (_LineStartDelimiters), so close-marker text in the middle of a content line no longer
-    # makes a cut-short body pass as complete; the cases it still misses are stated there.
+    # makes a cut-short body pass as complete. At least two shapes still do, both stated there: a
+    # content line that starts with the close marker, and close-marker text before the first
+    # delimiter.
     if not closed:
         if not seen:
             # No delimiter at all. At least an empty body, one built with another boundary than the

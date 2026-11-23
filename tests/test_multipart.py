@@ -961,7 +961,8 @@ def test_a_truncated_upload_whose_content_holds_the_close_marker_mid_line_is_ref
     cut: int,
 ) -> None:
     """A cut-short body whose file content holds ``--<boundary>--`` in the middle of a line was taken
-    as complete on origin/main, ending at that text. It is refused now, by both entry points."""
+    as complete before #5787 (at ec75a5f61bf), ending at that text. It is refused now, by both
+    entry points."""
     marker = f"--{_B}--".encode()
     body = _body([_FILE_PART + b"\r\nOBX|1|TX|||quoted " + marker + b" text\r\nPID|1||MRN"])
     truncated = body[: -(_TAIL + cut)]
@@ -976,7 +977,7 @@ def test_a_truncated_upload_whose_content_holds_the_close_marker_mid_line_is_ref
 
 
 def test_delimiter_text_mid_line_stays_inside_the_file() -> None:
-    """``--<boundary>`` in the middle of a content line is content. origin/main split the file there
+    """``--<boundary>`` in the middle of a content line is content. Before #5787 the file was split there
     and returned only its first piece."""
     content = b"MSH|body\r\nNTE|1||see --" + _B.encode() + b"\r\nPID|1||MRN"
     got = parse_single_file_upload(
@@ -991,14 +992,14 @@ def test_delimiter_text_mid_line_stays_inside_the_file() -> None:
     ids=["start", "crlf", "lf", "bare-cr", "lone-lf", "lone-cr", "space", "bom", "mid-line"],
 )
 def test_the_first_delimiter_counts_wherever_it_sits(prefix: bytes) -> None:
-    """The first delimiter is the first ``--<boundary>`` anywhere, as on origin/main, so a stray
+    """The first delimiter is the first ``--<boundary>`` anywhere, as before #5787, so a stray
     byte or a preamble ending mid-line before it does not turn the first part into preamble."""
     body = prefix + b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"
     assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
 
 
 def test_a_preamble_ending_mid_line_keeps_both_file_parts() -> None:
-    """origin/main refused this body for its two file parts; it still does, rather than dropping
+    """Before #5787 this body was refused for its two file parts; it still is, rather than dropping
     the first one as preamble."""
     body = b"pre--B\r\n" + _FP + b"A\r\n--B\r\n" + _FP + b"B\r\n--B--"
     with pytest.raises(MultipartError, match="2 file parts"):
@@ -1033,7 +1034,7 @@ def test_delimiters_after_mixed_line_ends_are_each_found_in_order() -> None:
         b"--B--\r\n",
     ]
     form = parse_multipart_form(_CT_B, b"".join(fields), max_file_bytes=1024)
-    # The line end before a delimiter stays in the content unless it is a CRLF, as on origin/main.
+    # The line end before a delimiter stays in the content unless it is a CRLF, as before #5787.
     assert form.fields == {"a": "1 --B mid\r", "b": "2\n", "c": "3 --B--\r", "d": "4"}
 
 
