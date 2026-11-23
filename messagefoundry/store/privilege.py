@@ -61,6 +61,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
+    probed_grant,
 )
 from messagefoundry.support.redact import redact_log_line
 
@@ -214,17 +215,6 @@ def audit_write_alias(table: str, privilege: str) -> str:
     return f"aw_{table}_{privilege.lower().replace(' ', '_')}"
 
 
-def probed_grant(value: object) -> bool | None:
-    """Read one privilege-probe answer THREE ways: ``True`` held, ``False`` not held, ``None`` **not
-    read**. Only an int or a bool that is 0 or 1 reads; anything else, a NULL, the text ``"1"``, a
-    ``2``, ``1.0`` or bytes, is not read (BACKLOG #6015), as ``classify_login_roles`` reads the
-    partner login. Folding an unexpected value to "not held" would read as clean, so a driver that
-    changed its answer type could turn the probe into a false clean."""
-    if isinstance(value, int) and value in (0, 1):
-        return bool(value)
-    return None
-
-
 def classify_audit_writes(
     row: Mapping[str, object], privileges: Sequence[str]
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -295,7 +285,8 @@ def sqlserver_excess(
     Only ``provision-admin`` needs that grant, to read the catalog before a mint
     (``docs/DEPLOY-SERVER-DB.md`` §1.1), so the runtime login holding it is excess. Counted under
     ``external`` only, like the direct schema-DDL rights, and suppressed when ``db_owner``,
-    ``sysadmin``, database ``CONTROL`` or ``CONTROL SERVER`` is named, since each carries it.
+    ``sysadmin``, database ``CONTROL``, ``CONTROL SERVER`` or ``db_securityadmin`` is named, since
+    each carries it: ``db_securityadmin`` holds ``VIEW DEFINITION`` on the database.
 
     ``audit_writes`` names the row-changing rights the login holds on the append-only audit tables
     (:func:`audit_write_grant` wording, owner ruling R16). ``db_datawriter`` grants them on every table,
@@ -341,7 +332,8 @@ def sqlserver_excess(
         if alter_schema and not ddladmin:
             out.append(f"ALTER on schema {alter_schema}")
         out.extend(w for w in audit_writes if not (ddladmin and w.startswith("ALTER ")))
-        if view_definition:
+        # db_securityadmin, named above, carries VIEW DEFINITION on the database (#6714 item 2).
+        if view_definition and "db_securityadmin" not in database_roles:
             out.append(view_definition_grant(*dict.fromkeys(view_definition)))
     return tuple(out)
 
@@ -489,6 +481,10 @@ class StorePrivilegeReport:
     database_roles: tuple[str, ...] = ()
     excess: tuple[str, ...] = ()
     detail: str = ""
+    #: Grants the probe could NOT read beside an OBSERVED over-grant (BACKLOG #6015 item 2). The
+    #: report stays OBSERVED, since what WAS read already refuses; the summary still names them,
+    #: so the log line and the alert do not imply the rest was read.
+    unread: tuple[str, ...] = ()
 
     @property
     def finding(self) -> str | None:
@@ -522,10 +518,13 @@ class StorePrivilegeReport:
             )
         who = f"{quote(self.principal)} on {quote(self.database)}"
         if self.excess:
+            not_read = (
+                f"; these grants were not read: {', '.join(self.unread)}" if self.unread else ""
+            )
             return (
                 f"store privilege preflight: the {self.backend.value} store principal "
                 f"{who} holds {len(self.excess)} privilege(s) "
-                f"BEYOND the documented least-privilege grant: {', '.join(self.excess)}"
+                f"BEYOND the documented least-privilege grant: {', '.join(self.excess)}{not_read}"
             )
         return (
             f"store privilege preflight: OBSERVED the {self.backend.value} store principal "
@@ -544,6 +543,7 @@ class StorePrivilegeReport:
             "server_roles": list(self.server_roles),
             "database_roles": list(self.database_roles),
             "excess": list(self.excess),
+            "unread": list(self.unread),
             "detail": self.detail,
         }
 
@@ -556,7 +556,18 @@ class PrivilegeProbeStore(Protocol):
     not is reported UNOBSERVABLE rather than skipped: an unimplemented probe is a thing the engine
     could not observe, which is precisely what that status means."""
 
-    async def probe_principal_privileges(self) -> StorePrivilegeReport: ...
+    async def probe_principal_privileges(self) -> StorePrivilegeReport:
+        """Read this store principal's effective privileges, three ways per grant: held, not held,
+        or not read (BACKLOG #6015 item 3).
+
+        ``OBSERVED`` with an empty ``excess`` is a clean read. A grant that was not read is never
+        reported as not held: the report is ``UNOBSERVABLE``, or, for a grant the backend weighs
+        after an over-grant it did read, stays ``OBSERVED`` with that over-grant in ``excess`` and
+        the unread grant in ``unread``, so the start still refuses on what WAS read.
+        ``NOT_APPLICABLE`` is SQLite's, which has no principal. Each backend's method says which
+        grants it reads, which unread ones stop the observation, and which count under
+        ``[store].schema_management``."""
+        ...
 
 
 class PrivilegeAlertSink(Protocol):

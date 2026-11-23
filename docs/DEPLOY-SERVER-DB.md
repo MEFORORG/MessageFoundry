@@ -178,8 +178,11 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
   `UPDATE`, `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`,
   and an `UPDATE` granted on one column, which outranks the table-level `DENY`. So is
   `VIEW DEFINITION` reaching its default schema or `dbo` by any route, at least a grant on the
-  schema, the database or the server, schema ownership, or a role or group membership. Remove it
-  and run the check again.
+  schema, the database or the server, schema ownership, or a role or group membership. When it
+  names `db_owner`, `sysadmin`, `db_securityadmin`, database `CONTROL` or `CONTROL SERVER`, which
+  the gMSA must never hold either, it leaves out the `VIEW DEFINITION` line, since each of those
+  carries it; a `VIEW DEFINITION` held by another route as well shows on the next run. Remove
+  each grant it names and run the check again.
 - It **exits 4** when the probe could not read the login at all, for example on a failed connection
   or a permission read that came back NULL, or as a value that is not 0 or 1. That is not a clean
   result.

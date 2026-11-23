@@ -3556,21 +3556,6 @@ def _any_grant(answers: str) -> str:
     )
 
 
-def _probed_grant(value: Any) -> bool | None:
-    """Classify one privilege-probe column THREE ways: ``True`` held, ``False`` not held, ``None`` **not
-    read**. A NULL never becomes a boolean here, and that is the whole point (BACKLOG #1234).
-
-    ``IS_SRVROLEMEMBER``, ``IS_ROLEMEMBER`` and ``HAS_PERMS_BY_NAME`` each return **NULL** — not 0 —
-    when the name they are asked about does not resolve *for this caller*: an unknown or renamed role,
-    a principal the caller cannot see, a permission name this server version does not carry. Folding
-    that NULL through ``== 1`` yields ``False``, which reads as *"not a member"* and therefore as
-    clean, so a probe that read NOTHING would render as a clean bill of health — the exact false-clean
-    :meth:`SqlServerStore.probe_principal_privileges` names catalog enumeration to avoid, arriving by
-    the other door. ``True``/``False`` from a driver that returns booleans still read as ``1``/``0``;
-    any other value is not read either, by :func:`~messagefoundry.store.privilege.probed_grant`."""
-    return probed_grant(value)
-
-
 class SqlServerStore:
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
@@ -5192,15 +5177,22 @@ class SqlServerStore:
         SERVER``, ``CONTROL`` on the database), so a principal over-granted by direct ``GRANT`` rather
         than by role membership is still seen.
 
-        **A NULL column is NOT READ, and a read that is not complete is never ``OBSERVED``** (BACKLOG
-        #1234). All three built-ins answer NULL when the name does not resolve for the caller, so the
-        argument above — *an empty enumeration must not render as a clean bill of health* — was
-        defeated by its own replacement until this arm distinguished the three states. Any probed
-        grant that reads NULL makes the whole report :attr:`StorePrivilegeStatus.UNOBSERVABLE`, named
-        grant by grant in the detail, because the documented grant is then genuinely UNVERIFIED: a
-        role that was never read is not a role the principal does not hold. Grants that DID read as
-        held are still reported, since a partial read can only understate an over-grant, never invent
-        one."""
+        **A NULL column is NOT READ, and so is any answer but 0 or 1** (BACKLOG #1234, #6015, by
+        :func:`~messagefoundry.sqlserver_roles.probed_grant`). All three built-ins answer NULL when
+        the name does not resolve for the caller, so the argument above — *an empty enumeration must
+        not render as a clean bill of health* — was defeated by its own replacement until this arm
+        distinguished the three states. A fixed role, ``CONTROL SERVER`` or database ``CONTROL``
+        that is not read makes the whole report :attr:`StorePrivilegeStatus.UNOBSERVABLE`, named grant
+        by grant in the detail, even beside a role read as held (#1234 pins that): a role that was
+        never read is not a role the principal does not hold. Grants that DID read as held are still
+        reported, since a partial read can only understate an over-grant, never invent one.
+
+        The grants that count only under ``external`` (``CREATE TABLE``, ``ALTER`` on the default
+        schema, ``VIEW DEFINITION`` on the default schema and ``dbo``, the audit-table rights) are
+        weighed after the excess (#6714): unread with nothing else found, the report is
+        ``UNOBSERVABLE``; unread beside an over-grant that WAS read, it stays ``OBSERVED`` and names
+        them in :attr:`~messagefoundry.store.privilege.StorePrivilegeReport.unread`, so the start
+        still refuses on what was read."""
         server_cols = [
             f"IS_SRVROLEMEMBER(?) AS srv_{i}" for i in range(len(SQLSERVER_FIXED_SERVER_ROLES))
         ]
@@ -5220,7 +5212,8 @@ class SqlServerStore:
             # counted only under external, where the runtime login must hold none.
             " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
             " SCHEMA_NAME() AS default_schema,"
-            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema,"
+            # QUOTENAME: the securable is parsed as a name, as the VIEW DEFINITION columns below say.
+            " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'ALTER') AS alter_schema,"
             # #6714: VIEW DEFINITION on the two schemas a store's tables resolve through. Only
             # provision-admin needs it, so under external the runtime login holding it is excess.
             " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'VIEW DEFINITION')"
@@ -5236,27 +5229,27 @@ class SqlServerStore:
                 detail="the privilege query returned no row",
             )
         database = str(row["db_name"] or self._settings.database or "")
-        # Three-way, never two: held / not held / NOT READ. See _probed_grant for why a NULL folded to
+        # Three-way, never two: held / not held / NOT READ. See probed_grant for why a NULL folded to
         # False is a false-clean rather than a rounding error.
         unread: list[str] = []
         held_server: list[str] = []
         for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
-            grant = _probed_grant(row[f"srv_{i}"])
+            grant = probed_grant(row[f"srv_{i}"])
             if grant is None:
                 unread.append(f"server role {name}")
             elif grant:
                 held_server.append(name)
         held_database: list[str] = []
         for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES):
-            grant = _probed_grant(row[f"dbr_{i}"])
+            grant = probed_grant(row[f"dbr_{i}"])
             if grant is None:
                 unread.append(f"database role {name}")
             elif grant:
                 held_database.append(name)
-        control_server = _probed_grant(row["control_server"])
+        control_server = probed_grant(row["control_server"])
         if control_server is None:
             unread.append("control server")
-        control_database = _probed_grant(row["control_db"])
+        control_database = probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
         external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
@@ -5264,10 +5257,10 @@ class SqlServerStore:
         # unread one never turns an over-grant that WAS read into an unobserved report: it is
         # weighed after the excess, below (#6714), so a read db_owner still refuses under enforce.
         external_unread: list[str] = []
-        create_table = _probed_grant(row["create_table"])
+        create_table = probed_grant(row["create_table"])
         if create_table is None:
             external_unread.append(f"create table on database {database}")
-        alter_schema = _probed_grant(row["alter_schema"])
+        alter_schema = probed_grant(row["alter_schema"])
         if alter_schema is None:
             external_unread.append("ALTER on the default schema")
         # #6714: one column per distinct schema; when the default schema is dbo the two name one.
@@ -5276,7 +5269,7 @@ class SqlServerStore:
         view_def_columns.setdefault("dbo", "view_def_dbo")
         view_definition: list[str] = []
         for schema, column in view_def_columns.items():
-            grant = _probed_grant(row[column])
+            grant = probed_grant(row[column])
             if grant is None:
                 external_unread.append(view_definition_grant(schema))
             elif grant:
@@ -5291,6 +5284,10 @@ class SqlServerStore:
             held_labels += [f"database role {r}" for r in database_roles]
             also_unread = ""
             if external:  # owner ruling R16 and #6714: each is a finding there
+                if create_table:
+                    held_labels.append(f"create table on database {database}")
+                if alter_schema:
+                    held_labels.append(f"ALTER on schema {default_schema}")
                 held_labels += list(audit_writes)
                 if view_definition:
                     held_labels.append(view_definition_grant(*view_definition))
@@ -5307,7 +5304,8 @@ class SqlServerStore:
                 database_roles=database_roles,
                 detail=(
                     f"the privilege query returned NULL, or a value that is not 0 or 1, for"
-                    f" {len(unread)} of {probed} probed grant(s), so they were not read and must not"
+                    f" {len(unread)} of the {probed} role and CONTROL grant(s) probed, so they were"
+                    " not read and must not"
                     f" be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
@@ -5379,6 +5377,8 @@ class SqlServerStore:
             server_roles=server_roles,
             database_roles=database_roles,
             excess=excess,
+            # #6015 item 2: an unread external grant beside a read over-grant reaches the summary.
+            unread=tuple(external_unread) if external else (),
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
