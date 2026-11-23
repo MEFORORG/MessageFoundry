@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +39,10 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.pipeline import Engine
+from messagefoundry.content_type import ContentType
+from messagefoundry.parsing.peek import Peek
+from messagefoundry.parsing.summary import summarize
+from messagefoundry.pipeline import Engine, wiring_runner
 from messagefoundry.store import MessageStatus
 from messagefoundry.store.crypto import AesGcmCipher, IdentityCipher, generate_key, make_cipher
 from messagefoundry.store.store import AuditAppend
@@ -817,6 +821,130 @@ async def test_engine_inject_message_creates_received(engine: Engine) -> None:
     assert row["source_type"] == "upload"
     [audit] = await engine.store.list_audit(action="upload.resend")
     assert (audit["actor"], audit["detail"]) == ("op", mid)
+
+
+async def _inject_fields(
+    engine: Engine, raw: str, *, channel_id: str = "in1"
+) -> tuple[object, object, object]:
+    """Inject ``raw`` and read back the three peek columns of its stored row (BACKLOG #5707)."""
+    mid = await engine.inject_message(
+        channel_id=channel_id,
+        raw=raw,
+        source_type="upload",
+        audit=lambda new_mid: AuditAppend("upload.resend", actor="op", detail=new_mid),
+        actor="op",
+    )
+    row = await engine.store.get_message(mid)
+    assert row is not None
+    return row["control_id"], row["message_type"], row["summary"]
+
+
+async def test_inject_records_hl7_fields(engine: Engine, tmp_path: Path) -> None:
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    control_id, message_type, summary = await _inject_fields(engine, ADT)
+    assert (control_id, message_type) == ("MSG1", "ADT^A01")
+    # The listener's own summary, so an injected row reads as a received one does.
+    assert summary == summarize(Peek.parse(ADT))
+    assert summary
+
+
+async def test_inject_of_malformed_hl7_still_stores_with_no_fields(
+    engine: Engine, tmp_path: Path
+) -> None:
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, "this is not HL7") == (None, None, None)
+
+
+async def test_inject_on_a_non_hl7_inbound_records_its_content_type(
+    engine: Engine, tmp_path: Path
+) -> None:
+    reg = _running_registry(tmp_path)
+    reg.inbound["in1"] = replace(reg.inbound["in1"], content_type=ContentType.JSON)
+    engine.add_registry(reg)
+    await engine.start()
+    # HL7-shaped on purpose: a JSON inbound must not peek it, so no control id or summary appears.
+    assert await _inject_fields(engine, ADT) == (None, "json", None)
+
+
+async def test_inject_peek_honours_the_inbounds_own_ceiling(engine: Engine, tmp_path: Path) -> None:
+    # peek_max_bytes, not the parser's default: at the default this body would yield all three.
+    reg = _running_registry(tmp_path)
+    reg.inbound["in1"] = replace(reg.inbound["in1"], max_message_bytes=len(ADT) - 1)
+    engine.add_registry(reg)
+    await engine.start()
+    assert await _inject_fields(engine, ADT) == (None, None, None)
+
+
+async def test_inject_to_an_unknown_channel_still_stores(engine: Engine, tmp_path: Path) -> None:
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, ADT, channel_id="nope") == (None, None, None)
+
+
+async def test_inject_with_no_runner_still_stores(engine: Engine) -> None:
+    assert engine.registry_runner is None
+    assert await _inject_fields(engine, ADT) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("control_id", "message_type", "expected"),
+    [
+        ("C" * 256, "ADT^A01", ("C" * 256, "ADT^A01")),
+        ("C" * 257, "ADT^A01", (None, "ADT^A01")),
+        ("MSG1", "A" * 64, ("MSG1", "A" * 64)),
+        ("MSG1", "A" * 65, ("MSG1", None)),
+        # SQL Server counts UTF-16 units, so 129 astral characters are 258 units.
+        ("\U0001f600" * 129, "ADT^A01", (None, "ADT^A01")),
+    ],
+)
+async def test_inject_drops_a_label_too_wide_for_the_narrowest_store_column(
+    engine: Engine,
+    tmp_path: Path,
+    control_id: str,
+    message_type: str,
+    expected: tuple[str | None, str | None],
+) -> None:
+    # NVARCHAR(256) and NVARCHAR(64) on SQL Server: a wider label would fail the whole insert there.
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||{message_type}|{control_id}|P|2.5.1\rPID|1||MRN1\r"
+    stored_control, stored_type, _ = await _inject_fields(engine, body)
+    assert (stored_control, stored_type) == expected
+
+
+async def test_inject_drops_a_summary_an_escape_decoded_to_nul(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The body holds no NUL, so the guard admits it; the summary's unescape makes one, which a
+    # keyless Postgres store would refuse at bind.
+    body = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||AB\\X00\\CD^^^H^MR\r"
+    assert "\x00" in summarize(Peek.parse(body))
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
+async def test_inject_survives_a_peek_fault_and_logs_no_body(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # RuntimeError is outside PEEK_READ_FAULTS, and its text carries the body, as a fault's may.
+    def fault(peek: Peek) -> str:
+        raise RuntimeError(f"fault over {ADT}")
+
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    monkeypatch.setattr(wiring_runner, "summarize", fault)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry"):
+        assert await _inject_fields(engine, ADT) == (None, None, None)
+    # The positive control: the capture did see this fault's line, by its type name alone.
+    assert "RuntimeError" in caplog.text
+    assert "fault over" not in caplog.text
+    assert "MRN123" not in caplog.text
 
 
 async def test_browse_requires_step_up_and_audits_shape(engine: Engine, tmp_path: Path) -> None:

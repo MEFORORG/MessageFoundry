@@ -4128,10 +4128,20 @@ class Engine:
         validation (registered/running), RBAC and the target inbound's ingress guards (BACKLOG
         #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
         (BACKLOG #2624). Returns the new message id. The message's origin is ``operator_upload`` with
-        ``actor`` as its acting user (vault BACKLOG #2615)."""
+        ``actor`` as its acting user (vault BACKLOG #2615). The row records the control id, type and
+        summary the listener would (BACKLOG #5707); with no runner to read them they stay ``None``."""
+        runner = self._registry_runner
+        control_id, message_type, summary = (
+            (None, None, None)
+            if runner is None
+            else await runner.ingress_fields_for(channel_id, raw)
+        )
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id,
             raw=raw,
+            control_id=control_id,
+            message_type=message_type,
+            summary=summary,
             source_type=source_type,
             metadata=metadata,
             audit=audit,
