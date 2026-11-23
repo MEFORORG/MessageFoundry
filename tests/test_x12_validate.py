@@ -13,6 +13,7 @@ import importlib
 import io
 import logging
 import threading
+import traceback
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -27,6 +28,8 @@ from messagefoundry.parsing.x12 import (  # noqa: E402 - after importorskip
     validate,
 )
 from messagefoundry.parsing.x12._deps import load_x12_code_resolver  # noqa: E402
+from messagefoundry.redaction import safe_traceback  # noqa: E402
+from tests._content_free import assert_chain_severed  # noqa: E402
 
 _ISA = (
     "ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       "
@@ -589,16 +592,161 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
     assert "20*6" not in caplog.text and "20*6" not in _rendered(result)
 
 
-def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
+def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # pyx12 4.1.0 can raise X12Error on a segment longer than about 1,040,000 characters, as it
     # does on this unterminated one; 4.0.1 could stop reading at a much shorter segment. The pass
-    # raises X12ValidationError, and neither its message nor the message of the pyx12 error it
-    # chains shows the segment's text.
+    # raises X12ValidationError, and neither its message nor the pyx12 error's message shows the
+    # segment's text. The pyx12 error is read from a spy, because it is no longer chained (#5370).
     import pyx12.errors
 
+    seen: list[Exception] = []
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _spying_validator(seen))
     body = "Q" * (1024 * 1024 + 100)
     with pytest.raises(X12ValidationError) as caught:
         validate(_ISA + _GS + "ST*837*0001*005010X222A1~BHT*0019*00*" + body)
-    cause = caught.value.__cause__
-    assert isinstance(cause, pyx12.errors.X12Error) and "terminator" in str(cause)
-    assert "QQQQ" not in str(caught.value) and "QQQQ" not in str(cause)
+    assert len(seen) == 1
+    assert isinstance(seen[0], pyx12.errors.X12Error) and "terminator" in str(seen[0])
+    assert "QQQQ" not in str(caught.value) and "QQQQ" not in str(seen[0])
+    assert_chain_severed(caught.value)
+
+
+# --- BACKLOG #5370: no interchange text through the exception chain, the repr or a segment id. ---
+
+_PLANT = "PLANTEDNAME"
+_PLANT_ISA02 = "AUTHPLANT1"
+_PLANT_ISA04 = "SECPLANT22"
+# 17 elements inside ISA's fixed 106 characters: ISA06 gives up padding for one more separator, so
+# pyx12 finds its terminators, reads the segment, and refuses it with the whole segment quoted.
+_ISA_17_ELEMENTS = (
+    f"ISA*00*{_PLANT_ISA02}*00*{_PLANT_ISA04}*ZZ*SENDER*X       *ZZ*RECEIVER       "
+    "*060501*1200*U*00401*000000001*0*P*:~"
+)
+_TAIL_270 = "ST*270*0001~SE*2*0001~GE*1*1~IEA*1*000000001~"
+# Each makes pyx12 raise an exception that quotes the planted values: X12Error, EngineError
+# ("Map not found", which quotes GS08) and ValueError (int() of GE01).
+_RAISING_INTERCHANGES = {
+    "isa17": (_ISA_17_ELEMENTS + _GS_270 + _TAIL_270, (_PLANT_ISA02, _PLANT_ISA04)),
+    "gs08": (
+        _ISA_270 + "GS*HS*SENDERAPP*RECVAPP*20060501*1200*1*X*PLANTGS08~" + _TAIL_270,
+        ("PLANTGS08",),
+    ),
+    "ge01": (
+        _ISA_270 + _GS_270 + "ST*270*0001~SE*2*0001~GE*PLANTGE01*1~IEA*1*000000001~",
+        ("PLANTGE01",),
+    ),
+}
+
+
+def _spying_validator(seen: list[Exception]) -> Callable[[], tuple[Any, Callable[[], Any]]]:
+    """A ``load_x12_validator`` whose walk records what pyx12 raised. The engine no longer chains it,
+    so this is how a test proves the fixture really made pyx12 quote the planted text."""
+    from messagefoundry.parsing.x12._deps import load_x12_validator
+
+    def load() -> tuple[Any, Callable[[], Any]]:
+        x12n_document, make_params = load_x12_validator()
+
+        def spy(*args: Any) -> Any:
+            try:
+                return x12n_document(*args)
+            except Exception as exc:
+                seen.append(exc)
+                raise
+
+        return spy, make_params
+
+    return load
+
+
+@pytest.mark.parametrize(
+    ("raw", "plants"), list(_RAISING_INTERCHANGES.values()), ids=list(_RAISING_INTERCHANGES)
+)
+def test_a_refused_interchange_chains_no_pyx12_text(
+    raw: str, plants: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Exception] = []
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _spying_validator(seen))
+    with pytest.raises(X12ValidationError) as caught:
+        validate(raw)
+
+    # Control: pyx12's own message holds the values, so their absence below is the engine's doing.
+    assert len(seen) == 1
+    assert all(plant in str(seen[0]) for plant in plants)
+
+    exc = caught.value
+    assert_chain_severed(exc)
+    for text in (
+        safe_traceback((type(exc), exc, exc.__traceback__)),
+        "".join(traceback.format_exception(exc)),
+    ):
+        assert not any(plant in text for plant in plants)
+    # What is kept of the pyx12 error is its class name, so a refusal can still be told apart.
+    assert type(seen[0]).__name__ in str(exc)
+
+
+def _270_with(segment: str) -> str:
+    """The conformant 270 with one extra segment ahead of the subscriber's NM1."""
+    return _conformant_270().replace("NM1*IL*", f"{segment}NM1*IL*", 1)
+
+
+def test_the_repr_of_a_result_leaves_out_the_ack_that_echoes_a_value() -> None:
+    result = validate(_270_with(f"NM1|IL|1|{_PLANT}|ROBERT~"))
+    assert result.ack is not None and _PLANT in result.ack  # control: this ack echoes the value
+    assert _PLANT not in repr(result)
+    # Exact, so a field added to the result later has to be read for the same exposure.
+    assert repr(result) == (
+        f"X12ValidationResult(valid=False, errors={result.errors!r}, "
+        f"ack_transaction={result.ack_transaction!r})"
+    )
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        f"NM1|IL|1|{_PLANT}|ROBERT~",  # the wrong element separator
+        f"NM1{_PLANT}~",  # no separator after the id
+        f"{_PLANT}~",  # the value alone
+        f"{_PLANT}*IL*1~",  # a value where the id goes
+    ],
+)
+def test_a_wrongly_delimited_segment_puts_no_value_in_an_error(segment: str) -> None:
+    result = validate(_270_with(segment))
+    assert result.valid is False
+    assert _PLANT not in repr(result)  # holds every field of every error
+    # The violation is still reported and located, without the id it could not trust.
+    dropped = [e for e in result.errors if e.segment_id is None and e.line is not None]
+    assert dropped, "the bad segment must still be reported"
+    assert all(e.message.startswith("segment ?: error ") for e in dropped)
+
+
+def test_a_well_delimited_unknown_segment_keeps_its_id() -> None:
+    result = validate(_270_with(f"ZZZ*{_PLANT}*ROBERT~"))
+    assert [e.message for e in result.errors if e.segment_id == "ZZZ"] == ["segment ZZZ: error 1"]
+    assert _PLANT not in _rendered(result)
+
+
+@pytest.mark.parametrize(
+    ("seg_id", "kept"),
+    [
+        ("NM1", "NM1"),
+        ("N1", "N1"),
+        ("ZZZ", "ZZZ"),
+        ("nm1", None),  # lower case
+        ("A", None),  # too short
+        ("NM1X", None),  # too long
+        ("1NM", None),  # pyx12's own check requires a leading letter
+        ("N1\n", None),  # ``$`` would match before this newline
+        ("NM" + chr(0x661), None),  # a non-ASCII digit
+        ("", None),
+        (None, None),
+        (7, None),
+    ],
+)
+def test_only_a_segment_id_shaped_value_is_kept(seg_id: Any, kept: str | None) -> None:
+    seg = {"seg_id": seg_id, "cur_line": 3, "name": "Subscriber Name"}
+    seg_err = _X12_VALIDATE._segment_error("1", seg, {})
+    ele_err = _X12_VALIDATE._element_error("8", seg, {"ele_pos": 2, "name": "Date"})
+    shown = kept or "?"
+    assert (seg_err.segment_id, seg_err.message) == (kept, f"segment {shown}: error 1")
+    assert (ele_err.segment_id, ele_err.message) == (kept, f"element {shown}02: error 8")

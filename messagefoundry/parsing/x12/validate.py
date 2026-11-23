@@ -22,11 +22,13 @@ then ``None``). A returned ack echoes sender values unescaped, so it is complete
 well-formed; see :class:`X12ValidationResult`.
 
 **PHI rule (do not break).** A failing X12 element error from pyx12 embeds the *offending data value*
-(potential PHI) in its raw error string. This module **never** surfaces that: each
-:class:`X12SegmentError` carries only structural locators — the error code, the segment/element id, a
-schema-label *type name*, and the line/position — never the input value. The full interchange goes only
-to the secured store (CLAUDE.md §9). The pyx12 logger tree (which logs the raw, value-bearing strings
-at ERROR) is muted from the first validation pass on, and never unmuted.
+(potential PHI) in its raw error string, and an exception pyx12 raises can quote the interchange. This
+module does not surface either: each :class:`X12SegmentError` carries only structural locators — the
+error code, a segment id only when it has a segment id's shape (:class:`X12SegmentError` states what a
+shape cannot rule out), the element position, a schema-label *type name*, and the line — and a refusal
+chains no pyx12 exception. The ack does echo sender values, so it is left out of the result's repr. The
+full interchange goes only to the secured store (CLAUDE.md §9). The pyx12 logger tree (which logs the
+raw, value-bearing strings at ERROR) is muted from the first validation pass on, and never unmuted.
 
 Pure: no I/O to disk/network, no engine imports. ``pyx12``'s sole runtime dependency is ``defusedxml``
 (already in tree), used to parse its bundled, trusted map XML — not attacker input.
@@ -36,8 +38,9 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from messagefoundry.parsing.x12._deps import load_x12_code_resolver, load_x12_validator
@@ -49,14 +52,18 @@ __all__ = ["X12SegmentError", "X12ValidationResult", "validate"]
 
 @dataclass(frozen=True)
 class X12SegmentError:
-    """One conformance violation, reduced to **PHI-safe structural locators only**.
+    """One conformance violation, reduced to **structural locators**.
 
     ``code`` is the X12 error code pyx12 maps it to in one code list, chosen by the last group's GS08:
     the 997 AK list for 004010, also when no ack is generated, and the 999 IK list otherwise (e.g.
     ``"8"``). pyx12's own error name stands in where that list has no code for it;
-    ``message`` is a synthesized, value-free description;
-    ``segment_id`` / ``element_position`` / ``line`` / ``loop`` locate it; ``element_name`` is the
-    *schema* data-element label (e.g. ``"Transaction Set Creation Date"``), never the input value."""
+    ``message`` is synthesized from the code and the locators below;
+    ``element_position`` / ``line`` are numbers and ``loop`` is the *schema* name of the map node;
+    ``element_name`` is the *schema* data-element label (e.g. ``"Transaction Set Creation Date"``).
+
+    ``segment_id`` comes from the input, so it is kept only when shaped like an X12 segment id (a
+    capital, then one or two capitals or digits) and is ``None`` otherwise (BACKLOG #5370). A sender
+    value of that exact shape, standing where the id goes, cannot be told from an id and is kept."""
 
     code: str
     message: str
@@ -70,16 +77,20 @@ class X12SegmentError:
 @dataclass(frozen=True)
 class X12ValidationResult:
     """The outcome of a strict pass. ``valid`` is True iff pyx12 found no errors. ``errors`` is the
-    flattened, PHI-safe violation list (empty when valid). ``ack`` is the generated 997/999
-    Functional Acknowledgment, complete to its closing IEA, or ``None`` when pyx12 emitted none (e.g.
-    for an already-FA transaction) or its ack writer failed before the closing IEA. A fragment such a
-    writer left is dropped, with a WARNING; a writer that failed before writing anything leaves no
-    fragment and no WARNING. ``ack_transaction`` names which (``"997"``/``"999"``), ``None``
-    with no ack. A complete ack echoes sender values unescaped, so it is not thereby well-formed."""
+    flattened violation list of structural locators (empty when valid). ``ack`` is the generated
+    997/999 Functional Acknowledgment, complete to its closing IEA, or ``None`` when pyx12 emitted
+    none (e.g. for an already-FA transaction) or its ack writer failed before the closing IEA. A
+    fragment such a writer left is dropped, with a WARNING; a writer that failed before writing
+    anything leaves no fragment and no WARNING. ``ack_transaction`` names which
+    (``"997"``/``"999"``), ``None`` with no ack. A complete ack echoes sender values unescaped, so
+    it is not thereby well-formed.
+
+    ``ack`` is left out of the repr because those echoed values can be PHI, for example a date of
+    birth in AK404, and logging a result would otherwise write them (BACKLOG #5370)."""
 
     valid: bool
     errors: tuple[X12SegmentError, ...] = ()
-    ack: str | None = None
+    ack: str | None = field(default=None, repr=False)
     ack_transaction: str | None = None
 
 
@@ -160,6 +171,9 @@ class _AckBuffer(io.StringIO):
 # pyx12's ack choice by the last GS08's first six characters; any other version gets no ack.
 _ACK_FOR_VERSION = {"004010": "997", "005010": "999"}
 
+#: Used with ``fullmatch``, since ``$`` would also accept a trailing newline.
+_SEGMENT_ID = re.compile(r"[A-Z][A-Z0-9]{1,2}")
+
 
 def _last_group_version(report: dict[str, Any]) -> str:
     """The GS08 of the last group pyx12 walked, from its report. pyx12 picks the ack from exactly that
@@ -173,10 +187,20 @@ def _last_group_version(report: dict[str, Any]) -> str:
     return vriic
 
 
-def _segment_error(code: str, seg: dict[str, Any], err: dict[str, Any]) -> X12SegmentError:
-    """A PHI-safe :class:`X12SegmentError` from a pyx12 segment-level error dict (drops ``err_str`` /
-    ``err_val`` — they can embed the input value — keeping only structural locators)."""
+def _structural_segment_id(seg: dict[str, Any]) -> str | None:
+    """pyx12's ``seg_id`` when it is shaped like an X12 segment id, otherwise ``None``.
+
+    pyx12 takes everything before the first element separator as the id, so a wrongly delimited
+    segment (``NM1|IL|1|DOE|ROBERT``) puts the sender's whole segment there. The shape is the one
+    pyx12's own id check applies, and every segment id in its bundled maps has it."""
     seg_id = seg.get("seg_id")
+    return seg_id if isinstance(seg_id, str) and _SEGMENT_ID.fullmatch(seg_id) else None
+
+
+def _segment_error(code: str, seg: dict[str, Any], err: dict[str, Any]) -> X12SegmentError:
+    """A :class:`X12SegmentError` from a pyx12 segment-level error dict. It drops ``err_str`` /
+    ``err_val``, which can embed the input value."""
+    seg_id = _structural_segment_id(seg)
     return X12SegmentError(
         code=code,
         message=f"segment {seg_id or '?'}: error {code}",
@@ -187,9 +211,9 @@ def _segment_error(code: str, seg: dict[str, Any], err: dict[str, Any]) -> X12Se
 
 
 def _element_error(code: str, seg: dict[str, Any], ele: dict[str, Any]) -> X12SegmentError:
-    """A PHI-safe :class:`X12SegmentError` from a pyx12 element-level error dict. ``name`` is the
-    data-element *type* label (schema), not the value; ``err_str``/``err_val`` are dropped."""
-    seg_id = seg.get("seg_id")
+    """A :class:`X12SegmentError` from a pyx12 element-level error dict. ``name`` is the data-element
+    *type* label (schema), not the value; ``err_str``/``err_val`` are dropped."""
+    seg_id = _structural_segment_id(seg)
     pos = ele.get("ele_pos")
     name = ele.get("name")
     return X12SegmentError(
@@ -223,7 +247,7 @@ def _flatten_errors(
     report: dict[str, Any], resolve: Callable[..., str | None], prefer_5010: bool
 ) -> list[X12SegmentError]:
     """Walk pyx12's nested JSON error report (interchange → group → transaction → segment → element),
-    flattening every recorded error into a PHI-safe :class:`X12SegmentError`. ``prefer_5010`` is False
+    flattening every recorded error into an :class:`X12SegmentError`. ``prefer_5010`` is False
     when the last group is ``004010``: pyx12 picks one ack per document (from the last GS08), so the
     codes follow that ack rather than each group's own version."""
     out: list[X12SegmentError] = []
@@ -256,13 +280,14 @@ def validate(raw: str | bytes) -> X12ValidationResult:
 
     ``raw`` is the interchange text (bytes are decoded UTF-8/replace, matching
     :meth:`X12Message.parse`). Returns an :class:`X12ValidationResult` carrying the conformance verdict,
-    the PHI-safe error list, and the generated 997/999 acknowledgment.
+    the structural error list, and the generated 997/999 acknowledgment.
 
     Raises :class:`~messagefoundry.parsing.x12.errors.X12ValidationError` only when no validation pass
-    could run at all (e.g. the bytes are not a parseable X12 data file — there is no envelope to walk);
-    a *failed* validation of a parseable interchange is returned as data (``valid=False``), not raised,
-    so a Handler can still emit the negative ack. Raises :class:`RuntimeError` if the ``[x12]`` extra
-    is absent (a deploy/config error, distinct from the ``ValueError``-rooted data errors)."""
+    could run at all (e.g. the bytes are not a parseable X12 data file — there is no envelope to walk).
+    It chains no pyx12 exception. A *failed* validation of a parseable interchange is returned as data
+    (``valid=False``), not raised, so a Handler can still emit the negative ack. Raises
+    :class:`RuntimeError` if the ``[x12]`` extra is absent (a deploy/config error, distinct from the
+    ``ValueError``-rooted data errors)."""
     if isinstance(raw, (bytes, bytearray)):  # noqa: SIM108
         text = bytes(raw).decode("utf-8", "replace")
     else:
@@ -275,12 +300,19 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     fd_json = io.StringIO()
 
     _mute_pyx12_logger()
+    walk_failure: str | None = None
     try:
         valid = bool(x12n_document(params, io.StringIO(text), fd_ack, None, None, fd_json))
     except Exception as exc:  # pyx12 raises bare Exception/EngineError on unwalkable input
+        walk_failure = type(exc).__name__
+    # Raised out here, because pyx12's messages quote the interchange (a whole ISA, GS08, GE01):
+    # `from exc` puts that on __cause__, and `from None` still leaves it on __context__ (BACKLOG
+    # #5370, the pattern of json_loads_or_refusal, #2085). Only the class name is kept.
+    if walk_failure is not None:
         raise X12ValidationError(
-            "strict X12 validation could not run: the bytes are not a parseable X12 interchange"
-        ) from exc
+            "strict X12 validation could not run: the bytes are not a parseable X12 interchange "
+            f"({walk_failure})"
+        )
 
     raw_json = fd_json.getvalue()
     if not raw_json.strip():
