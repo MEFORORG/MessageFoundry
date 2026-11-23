@@ -777,9 +777,9 @@ class _RemoteClient(abc.ABC):
     def ensure_dir(self, remote_dir: str) -> bool:
         """Best-effort create ``remote_dir`` (ignore "already exists"). Returns **True only when THIS
         call created it** (#114) — the destination logs that, so a delivery landing in a directory the
-        engine just invented is distinguishable from a normal one. A create that fails (at least no
-        permission, a racing creator) returns False: nothing was created here. At least a failed
-        connection and, on SFTP, a refused ``stat`` of the path raise instead."""
+        engine just invented is distinguishable from a normal one. A create the server refuses (at
+        least no permission, a racing creator) returns False: nothing was created here. At least a
+        failed connection and, on SFTP, a refused ``stat`` of the path raise instead."""
 
 
 def _ftps_ssl_context(
@@ -3077,10 +3077,15 @@ class RemoteFileSource(SourceConnector):
             if not self._reads(name):
                 continue
             # BACKLOG #5750: a reject that could not be moved, unchanged since, is skipped unread and
-            # uncharged until its retry falls due. Before the ledger read, so it costs no store call.
+            # uncharged until its retry falls due and a retry slot is free. Before the ledger read,
+            # so a skip costs no store call, and a slot bounds the store calls of the retries too.
+            # A skip drops any settle sighting, which must come from consecutive polls.
             stuck = self._stuck_reject(name, size, mtime)
-            if stuck is not None and (retries_left == 0 or time.monotonic() < stuck.due):
-                continue
+            if stuck is not None:
+                if retries_left == 0 or time.monotonic() < stuck.due:
+                    self._settle_seen.pop(name, None)
+                    continue
+                retries_left -= 1
             path = posixpath.join(self._remote_dir, name)
             # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
             # then the durable ledger). Keyed on a HASHED id (path + size + the listed mtime where the
@@ -3100,10 +3105,8 @@ class RemoteFileSource(SourceConnector):
                 continue
             if stuck is not None:
                 # A due retry spends none of the budget, so rejects sorted first cannot hold back
-                # the valid files behind them. Its wait restarts before the read, short, so a read
-                # that fails comes back soon; a reject again takes the long wait (_remember_stuck).
-                retries_left -= 1
-                due = time.monotonic() + STUCK_TRANSIENT_RETRY_SECONDS
+                # the valid files behind them. Its wait restarts before the read.
+                due = time.monotonic() + STUCK_RETRY_SECONDS
                 self._stuck[name] = (stuck._replace(due=due), 0)
             charge = 0 if stuck is not None else 1
             if self._max_file_bytes is not None and size > self._max_file_bytes:
@@ -3232,8 +3235,6 @@ class RemoteFileSource(SourceConnector):
                     safe_exc(exc, file_name=name),
                 )
                 continue
-            # It passed every gate, so it is no longer a reject, whatever the hand-off does.
-            self._stuck.pop(name, None)
             try:
                 stopped = await self._hand_off(raw)
             except Exception as exc:
@@ -3246,7 +3247,13 @@ class RemoteFileSource(SourceConnector):
                     safe_name(name),
                     safe_exc(exc, file_name=name),
                 )
+                if stuck is not None:
+                    # A retry that passed every gate keeps its memory through a store outage, on
+                    # the short wait, so the outage does not re-read it outside the retry slots.
+                    due = time.monotonic() + STUCK_TRANSIENT_RETRY_SECONDS
+                    self._stuck[name] = (stuck._replace(due=due), 0)
                 continue
+            self._stuck.pop(name, None)  # it passed every gate, so it is no longer a reject
             if stopped:
                 # A stop arrived before the file's last message: the whole file stays, and the next
                 # start hands it over again (at-least-once, as the File source does). Break, not
@@ -3408,10 +3415,14 @@ class RemoteFileSource(SourceConnector):
         if held is None:
             return None
         seen = held[0]
-        if _same_listing(seen.size, seen.mtime, size, mtime):
-            return seen
-        del self._stuck[name]
-        return None
+        if not _same_listing(seen.size, seen.mtime, size, mtime):
+            del self._stuck[name]
+            return None
+        if seen.mtime is None and mtime is not None:
+            # Keep the first time a listing supplies, so a later change of it is seen.
+            seen = seen._replace(mtime=mtime)
+            self._stuck[name] = (seen, held[1])
+        return seen
 
     def _remember_stuck(self, name: str, size: int, mtime: str | None) -> None:
         """Remember a reject that stays in the poll directory because its move failed (BACKLOG

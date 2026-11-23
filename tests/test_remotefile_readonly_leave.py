@@ -290,6 +290,82 @@ async def test_retries_due_on_one_poll_are_bounded(monkeypatch: pytest.MonkeyPat
     assert sum(1 for op, _ in client.ops if op == "retrieve") == 2
 
 
+async def test_due_retries_past_the_allowance_cost_no_ledger_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _read_only({f"/in/bad{i}.hl7": _BAD for i in range(5)})
+    src = _leave(monkeypatch, client, poll_max_files=10)  # a retry allowance of one
+    await _settle(src)
+    await src._poll_once()
+    for i in range(5):
+        _make_due(src, f"bad{i}.hl7")
+    reads = 0
+    held = src.processed_ledger.is_processed
+
+    async def counting(file_key: str) -> bool:
+        nonlocal reads
+        reads += 1
+        return bool(await held(file_key))
+
+    src.processed_ledger.is_processed = counting
+    await src._poll_once()
+    assert reads <= 2, "one slot, at most two key forms"
+
+
+async def test_a_retry_held_back_by_the_allowance_does_not_keep_an_old_sighting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """b is due but has no slot while a takes the only one, so what the first poll saw of b must not
+    admit a partial rewrite that only the last poll lists."""
+    client = _read_only({"/in/a.hl7": _BAD, "/in/b.hl7": _BAD})
+    src = _leave(monkeypatch, client, poll_max_files=5)  # a retry allowance of one
+    await _settle(src)
+    await src._poll_once()  # a is rejected and remembered
+    await src._poll_once()  # b too
+    _make_due(src, "a.hl7")
+    _make_due(src, "b.hl7")
+    await src._poll_once()  # a takes the slot and settles
+    await src._poll_once()  # a is read; b has no slot
+    partial = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    client.files["/in/b.hl7"] = partial
+    await src._poll_once()  # b's first sighting of this content
+    assert src._handler.bodies == [], "a single listing must not admit it"
+
+
+async def test_a_retry_whose_hand_off_fails_keeps_its_memory_on_the_short_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _read_only({"/in/a.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    client.files["/in/a.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    _make_due(src, "a.hl7")
+    await _settle(src)
+    src._handler = _RecordingHandler(exc=RuntimeError("synthetic store failure"))
+    before = time.monotonic()
+    await src._poll_once()
+    assert len(src._handler.bodies) == 1
+    assert src._stuck["a.hl7"][0].due - before <= STUCK_TRANSIENT_RETRY_SECONDS + 5
+    await src._poll_once()  # the wait holds, so the outage does not re-read it
+    assert len(src._handler.bodies) == 1
+
+
+async def test_a_time_first_listed_after_the_reject_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reject remembered from a listing with no time still sees a later change of the time."""
+    client = _read_only({"/in/a.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    assert src._stuck["a.hl7"][0].mtime is None
+    size = len(_BAD)
+    assert src._stuck_reject("a.hl7", size, "20261123080000") is not None
+    assert src._stuck_reject("a.hl7", size, "20261123090000") is None
+    assert "a.hl7" not in src._stuck
+
+
 async def test_a_full_memory_leaves_a_reject_read_and_charged_as_before(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
