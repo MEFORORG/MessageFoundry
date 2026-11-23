@@ -2710,7 +2710,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     # an HTTPError its integer status code, with no message and no exc_info
                     # (vault BACKLOG #3533 item 14).
                     failure = type(exc).__name__
-                    if isinstance(exc, urllib.error.HTTPError) and isinstance(exc.code, int):
+                    if isinstance(exc, urllib.error.HTTPError) and type(exc.code) is int:
                         failure = f"{failure} {exc.code}"
                     log.warning(
                         "alert transport %s failed for %s/%r: %s",

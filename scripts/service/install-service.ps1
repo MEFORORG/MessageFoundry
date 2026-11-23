@@ -1144,16 +1144,18 @@ function Get-SettingsKeyProvider {
       READ AS TEXT. Running the install's interpreter would run its code from this elevated prompt,
       which the interpreter check below declines to do. So this reads at least a key_provider line in
       a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table
-      with no table nested before the key, each holding a one-line basic or literal string with no
+      on a line with no triple quote, whose keys and values before key_provider hold no nested
+      table and no escape, each key_provider holding a one-line basic or literal string with no
       escape. It follows strings, comments and array brackets from line to line, and reads a line
       as a header or a key only when the line starts outside a multi-line string and outside a
       multi-line array. A header it classifies names a table, or an array of tables, by bare keys
       and quoted keys with no escape. Any other line that starts with [ there ends the table before
       it, so a key under it is credited to no table. Names compare case-sensitively, as TOML's do.
       Other forms can misread: at least a value or a quoted key with an escape, and a triple-quoted
-      value, are not read, and at least a multi-line inline table (TOML 1.1) and a file that is not
-      valid TOML can misread either way. What the installer does with the answer is an early
-      refusal: the engine applies its own key custody refusals at start whatever this returns.
+      value, are not read, and at least an inline table that spans lines (through a multi-line
+      string or array value, or as TOML 1.1 allows) and a file that is not valid TOML can misread
+      either way. What the installer does with the answer is an early refusal: the engine applies
+      its own key custody refusals at start whatever this returns.
     #>
     param([Parameter(Mandatory)][string]$Path)
     $value = '(?:"(?<v>[^"\\]*)"|''(?<v>[^'']*)'')'
@@ -1222,10 +1224,12 @@ function Get-SettingsKeyProvider {
             }
             continue
         }
-        # A [store] line; a top-level dotted key; a top-level one-line inline table.
+        # A [store] line; a top-level dotted key; a top-level one-line inline table on a line with no
+        # triple quote, since this pattern would read a triple-quoted string as one-line ones.
         if (($table -ceq "store" -and $line -cmatch ('^\s*' + $key + '\s*=\s*' + $value + $tail)) -or
-            ($null -eq $table -and $line -cmatch ('^\s*' + $store + '\s*(?:\.\s*' + $key + '\s*=\s*' +
-                $value + $tail + '|=\s*\{(?:(?:[^{}"''#]|"[^"\\]*"|''[^'']*'')*[,\s])?' + $key + '\s*=\s*' + $value + ')'))) {
+            ($null -eq $table -and $line -cmatch ('^\s*' + $store + '\s*\.\s*' + $key + '\s*=\s*' + $value + $tail)) -or
+            ($null -eq $table -and $line -cnotmatch '"""|''''''' -and $line -cmatch ('^\s*' + $store +
+                '\s*=\s*\{(?:(?:[^{}"''#]|"[^"\\]*"|''[^'']*'')*[,\s])?' + $key + '\s*=\s*' + $value))) {
             $found = $Matches.v
         }
     }

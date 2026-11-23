@@ -79,7 +79,8 @@ _SETTINGS: list[tuple[str, str | None]] = [
     ("# don't '''\n[store]\nkey_provider = \"host\"\n", "host"),
     ('[store]\nn = """a""""\nkey_provider = "host"\n', "host"),
     ('[store]\nn = """a\\"""\n[api]\n"""\nkey_provider = "host"\n', "host"),
-    # Headers: tabs, quoted keys, arrays of tables. One the reader cannot classify ends [store].
+    # Headers: tabs, quoted keys, arrays of tables. One the reader cannot classify, such as a
+    # quoted key with an escape, ends [store].
     ('[\tstore\t]\nkey_provider = "host"\n', "host"),
     ('[store]\n[\tapi\t]\nkey_provider = "host"\n', None),
     ('[store]\n["a:b"]\nkey_provider = "host"\n', None),
@@ -91,6 +92,9 @@ _SETTINGS: list[tuple[str, str | None]] = [
     # The table named "" is not the root, so a dotted or inline store under it is not [store].
     ('[""]\nstore.key_provider = "host"\n', None),
     ("[ '' ]\nstore = { key_provider = \"host\" }\n", None),
+    # Text inside a triple-quoted inline-table value is not a key.
+    ("store = { a = '''x', key_provider = 'host''' }\n", None),
+    ('store = { a = """x", key_provider = "host"""" }\n', None),
     ("", None),
 ]
 
