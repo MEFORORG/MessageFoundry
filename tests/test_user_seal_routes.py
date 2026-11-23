@@ -510,28 +510,36 @@ _CONSOLE_SENTENCES = {
         r"stated in the docstring of `_shown_name`"
     ),
     # Lander hold 7091484059: the confirmation catches the 423 and answers 200, so the two
-    # sentences that say how a refusal is answered name it, and the page's self case is stated.
-    "the interval sentence names the confirmation's 200": (
-        r"answers 423 or lists the account as failed and adds no row and no alert; "
-        r"`GET /ui/users/\{user_id\}/delete-confirm` is the exception to the 423, since it "
-        r"catches that 423 and answers 200 with its confirmation page"
+    # sentences that said every refusal answers 423 or is listed as failed now defer to the
+    # paragraph's per-route answers, and the page's own-account case is stated.
+    "the interval sentence defers to the per-route answers": (
+        r"in that process, is answered as this paragraph answers a failing record and adds no "
+        r"row and no alert"
     ),
-    "the Vault transit sentence names the confirmation's 200": (
-        r"a 423 or listed as failed, or by `GET /ui/users/\{user_id\}/delete-confirm` with 200 "
-        r"and its confirmation page, but reported under `integrity\.authority_seal_unverifiable`"
+    "the Vault transit sentence defers to the per-route answers": (
+        r"a record Vault transit cannot verify is answered as this paragraph answers a failing "
+        r"record, but reported under `integrity\.authority_seal_unverifiable`"
     ),
     "the confirmation for the caller's own account has no form": (
-        r"When the id in its path is the caller's own, that page shows \"You cannot delete your "
-        r"own account\.\" and no delete form"
+        r"Where the id in its path is the caller's own, that page shows a note that the caller "
+        r"cannot delete their own account, and no delete form"
     ),
 }
 
-#: The two answers as main states them, unscoped: each must not stand without the confirmation's
-#: exception beside it (Lander hold 7091484059).
-_UNSCOPED = (
-    r"lists the account as failed and adds no row and no alert\. ",
-    r"a 423 or listed as failed, but reported under",
-)
+#: The pre-hold wording of those two sentences (Lander hold 7091484059), each regex beside the
+#: sentence it was written against: it must match that sentence, its positive control, and must
+#: not match the statement, since the confirmation answers 200 rather than either.
+_UNSCOPED = {
+    r"answers 423 or lists the account as failed": (
+        "A refusal inside that interval, from any of these routes or any other reader of the same "
+        "account in that process, answers 423 or lists the account as failed and adds no row and "
+        "no alert."
+    ),
+    r"answered the same way, a 423 or listed as failed": (
+        "a record Vault transit cannot verify is answered the same way, a 423 or listed as "
+        "failed, but reported under `integrity.authority_seal_unverifiable`"
+    ),
+}
 
 
 @pytest.mark.parametrize("name", sorted(_CONSOLE_SENTENCES))
@@ -549,8 +557,9 @@ def test_the_security_doc_no_longer_offers_the_delete_on_the_list_itself() -> No
     assert not re.search(r"by its id alone, with its delete\b", body, re.IGNORECASE)
 
 
-@pytest.mark.parametrize("overclaim", _UNSCOPED)
+@pytest.mark.parametrize("overclaim", sorted(_UNSCOPED))
 def test_the_security_doc_does_not_state_the_423_without_the_confirmation(overclaim: str) -> None:
+    assert re.search(overclaim, _UNSCOPED[overclaim], re.IGNORECASE), overclaim
     text = _SECURITY_MD.read_text("utf-8")
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     assert not re.search(overclaim, body, re.IGNORECASE), overclaim
