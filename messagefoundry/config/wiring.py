@@ -7188,7 +7188,12 @@ class Registry:
         for kind, name, settings in dialling:
             if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
                 continue
-            if (unread := unread_ca_reason(settings)) is not None:
+            try:
+                unread = unread_ca_reason(settings)
+            except ValueError:
+                # A non-bool literal on a flag it reads, which bool_literal_problems reports.
+                continue
+            if unread is not None:
                 problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
         return problems
 
@@ -7844,10 +7849,13 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
-    if isinstance(settings.get("tls_check_hostname"), EnvRef):
-        return True
-    return not bool_setting(settings, "tls_check_hostname", default=True)
+    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230). Any
+    # other non-bool literal counts too: a connector that reads the key refuses it (vault BACKLOG
+    # #3234), and a register of loosenings reports it rather than raise.
+    value = settings.get("tls_check_hostname")
+    if value is None or value == "":
+        return False
+    return value is not True
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
