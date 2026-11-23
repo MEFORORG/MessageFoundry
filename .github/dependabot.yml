@@ -38,10 +38,13 @@ updates:
     #
     # security/runtime-closure-sqlserver.txt is the same kind of inventory, copied from
     # docker/locks/requirements-sqlserver.lock (BACKLOG #1955), and is excluded for the same reason.
-    # So is security/runtime-closure-harness.txt, copied from security/locks/requirements-harness.lock.
+    # So is security/runtime-closure-harness.txt, copied from security/locks/requirements-harness.lock,
+    # and security/runtime-closure-postgres.txt, copied from docker/locks/requirements-postgres.lock
+    # (BACKLOG #5933).
     exclude-paths:
       - "security/runtime-closure-core.txt"
       - "security/runtime-closure-sqlserver.txt"
+      - "security/runtime-closure-postgres.txt"
       - "security/runtime-closure-harness.txt"
     schedule:
       interval: "weekly"

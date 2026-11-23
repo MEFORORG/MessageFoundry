@@ -30,8 +30,8 @@ x-engine-image: &engine-image messagefoundry:latest
 x-ha-engine: &ha-engine
   profiles: ["ha"]
   # The Postgres variant: the slim *engine-image above carries no asyncpg, so the Postgres store
-  # below could not open on it. Build it with:
-  #   docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres ..
+  # below could not open on it. Build it from the repository root with:
+  #   docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .
   # The revocation-attestation-check runs *engine-image; build both tags from the same checkout so
   # it reads the attestation with the same parser these engines run.
   image: messagefoundry:postgres

@@ -55,6 +55,12 @@ An install that enables any other extra (`postgres`, `sftp`, `dicom`, `fhir`, `x
 `webauthn`, `otel`, `vault`) carries dependencies **outside** all three sets. Those are not assessed
 here, and that is a gap rather than an assertion of safety.
 
+The `postgres` extra's closure is recorded, in
+[`security/runtime-closure-postgres.txt`](../security/runtime-closure-postgres.txt), because the
+container image's `runtime-postgres` variant installs it (BACKLOG #5933). It adds one name to the
+core closure, `asyncpg`. It is still not assessed: an assessed extra needs its own section here and
+a reading in the public-data snapshot below, and that snapshot is re-read whole, on one date.
+
 ## The criterion
 
 A distribution is designated risky if it meets **at least one** of these. The tier is the reason it

@@ -177,9 +177,10 @@ jobs:
       # security/runtime-closure-core.txt is the risky-component inventory's denominator, a copy of the
       # core lock's pins, and tests/test_risky_component_designation.py fails when the two differ
       # (BACKLOG #1812). security/runtime-closure-sqlserver.txt is the same copy of the sqlserver lock
-      # (BACKLOG #1955), and security/runtime-closure-harness.txt the same copy of the harness lock.
-      # The script, run with no arguments, rewrites all three. A PR that moves a core, sqlserver or
-      # harness package would otherwise be red with no bot-reachable path to green.
+      # (BACKLOG #1955), security/runtime-closure-postgres.txt the same copy of the postgres lock
+      # (BACKLOG #5933), and security/runtime-closure-harness.txt the same copy of the harness lock.
+      # The script, run with no arguments, rewrites all four. A PR that moves a core, sqlserver,
+      # postgres or harness package would otherwise be red with no bot-reachable path to green.
       # dependabot.yml's exclude-paths keeps the version track from editing any of them; the security
       # track may ignore that key, so this rewrite is what actually holds each file to its lock.
       #
@@ -188,7 +189,7 @@ jobs:
       # re-exported locks must still be pushed, so a failure here does not skip the commit. The last
       # step marks THIS run red. That red sits on the pre-push commit; on the new head, the signal is
       # the closure test failing in the required test legs.
-      - name: Regenerate the runtime-closure inventories from the core, sqlserver and harness locks
+      - name: Regenerate the runtime-closure inventories from the core, sqlserver, postgres and harness locks
         id: closure
         if: steps.creds.outputs.present == 'true'
         continue-on-error: true
@@ -217,11 +218,11 @@ jobs:
           export GIT_CONFIG_KEY_1='core.fsmonitor' GIT_CONFIG_VALUE_1='false'
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
-          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt; then
+          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt; then
             echo 'Exported lock files and the closure files already in sync; nothing to push.'
             exit 0
           fi
-          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt
+          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt
           git commit -m 'chore(deps): resync exported lock files (DEP-1)'
           # Push with the App token (NOT GITHUB_TOKEN). An App-token push emits a synchronize event so
           # the required checks (DEP-1, ci.yml) re-run on the new commit; a GITHUB_TOKEN push would
