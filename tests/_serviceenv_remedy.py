@@ -26,8 +26,9 @@ RUNS_ON = (
 #: directory line goes (the Lander's hold on PR 3142, comment 7100710066, items 5 and 8).
 KEEP = (
     "Leave exactly one entry that sets MEFOR_SECRETS_DIRECTORY in the service's lists: one in "
-    "AppEnvironmentExtra, which NSSM applies last, written as MEFOR_SECRETS_DIRECTORY=<path> "
-    "naming the secrets directory by its path, so it is the one the engine reads. Take each "
+    "AppEnvironmentExtra, which NSSM applies last, added there where that list has none, written "
+    "as MEFOR_SECRETS_DIRECTORY=<path> naming the secrets directory by its path, so it is the one "
+    "the engine reads. Take each "
     "other line that sets MEFOR_SECRETS_DIRECTORY out of every list, keeping each other line no "
     "step above says to remove, before any re-run of the installer, which refuses an existing "
     "directory the service does not name. `nssm set` replaces a whole list, so read it first "

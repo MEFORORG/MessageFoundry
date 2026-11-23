@@ -1480,9 +1480,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # (code review on PR 3142). AppEnvironmentExtra, because NSSM applies it last.
         steps.append(
             f"Leave exactly one entry that sets {_DIRECTORY_VARIABLE} in the service's lists: "
-            f"one in AppEnvironmentExtra, which NSSM applies last, written as "
-            f"{_DIRECTORY_VARIABLE}=<path> naming the secrets directory by its path, so it is "
-            f"the one the engine reads. Take each other line that sets {_DIRECTORY_VARIABLE} out "
+            f"one in AppEnvironmentExtra, which NSSM applies last, added there where that list "
+            f"has none, written as {_DIRECTORY_VARIABLE}=<path> naming the secrets directory by "
+            f"its path, so it is the one the engine reads. Take each other line that sets {_DIRECTORY_VARIABLE} out "
             "of every list, keeping each other line no step above says to remove, before any "
             "re-run of the installer, which refuses an existing directory the service does not "
             "name. `nssm set` replaces a whole list, so read it first with `nssm get`, running "

@@ -578,6 +578,16 @@ _PLAIN = "Parameters\\AppEnvironment"
             ],
             id="joined-padded-beside-the-scm-one",
         ),
+        # Review round 2 on the repair: the only directory entry is in AppEnvironment, so the
+        # step says to add the one it keeps to AppEnvironmentExtra.
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_STORE_PASSWORD="),
+                (_PLAIN, "mefor_secrets_directory=C:\\d"),
+                (_EXTRA, "MEFOR_VALUE_B=synthetic"),
+            ],
+            id="joined-path-in-appenvironment-only",
+        ),
     ],
 )
 def test_a_joined_directory_entry_keeps_one_entry_and_spares_it_from_removal(
