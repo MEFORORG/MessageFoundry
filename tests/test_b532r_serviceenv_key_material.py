@@ -25,6 +25,7 @@ from tests._serviceenv_remedy import (
     CREATE,
     KEEP,
     LOOKALIKE_ANY,
+    LOOKALIKE_NEXT,
     REMOVE,
     RUNS_ON,
     SET_NO,
@@ -326,7 +327,7 @@ def test_a_lookalike_directory_path_joined_into_an_empty_key_is_never_kept(
     refusal = service_env_refusal(_read([f"{_KEY}=", f"{name}=C:/d"]))
     assert refusal is not None
     assert "Keep any of them" not in refusal
-    assert refusal.count(lookalike_step(named)) == 1
+    assert refusal.count(lookalike_step(named, ending=LOOKALIKE_NEXT)) == 1
     assert refusal.count(ADD_BACK_JOINED) == 1
     control = service_env_refusal(_read([f"{_KEY}=", "mefor_secrets_directory=C:/d"]))
     assert control is not None
