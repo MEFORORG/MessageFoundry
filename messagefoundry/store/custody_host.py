@@ -188,8 +188,28 @@ def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
     link, and the folder that holds it is read by the holder rule. It reads known broad groups
     only, so an entry for one account, the service's or another's, is not refused. A directory
     ``MEFOR_SECRETS_DIRECTORY`` names is judged where the settings load reads it, and a SQLite
-    store's data directory is not judged here."""
+    store's data directory is not judged here.
+
+    Refused first, whether or not it exists: a custody directory that is, holds or sits inside
+    the directory ``MEFOR_SECRETS_DIRECTORY`` names, compared as written after normalizing. The
+    service may add files to its custody directory, and the secrets directory is
+    administrator-written (ADR 0214), so the two must stay apart."""
     raw = environ.get(CUSTODY_DIRECTORY_VARIABLE, "").strip()
+    secrets = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
+    if raw and secrets and os.path.isabs(raw) and os.path.isabs(secrets):
+        own, shared = (os.path.normcase(os.path.normpath(p)) for p in (raw, secrets))
+        try:
+            overlap = os.path.commonpath([own, shared]) in (own, shared)
+        except ValueError:  # different drives
+            overlap = False
+        if overlap:
+            return (
+                f"the custody directory {CUSTODY_DIRECTORY_VARIABLE} names is, holds or sits inside "
+                f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names. The service may add "
+                "files to its custody directory, and must not be able to add one to the secrets "
+                f"directory, so do not give it that right there: set {CUSTODY_DIRECTORY_VARIABLE}, "
+                "here and in the service's environment, to a directory of its own outside it"
+            )
     if not raw or not os.path.lexists(raw):
         # Nothing there: a read finds no file, and a mint refuses the missing directory itself.
         return None
@@ -317,9 +337,11 @@ def foreign_custody_refusal(
 _LEAVE_KEY_FILES_STEP = (
     "Each file named here may be another store's only key: leave it where it is. To go on, run "
     "this store from places that hold neither master.key nor handoff.key. For a file beside the "
-    "store's database, with the engine stopped, copy the database file and any -wal and -shm file "
-    "beside it into a new directory that holds neither, and point the store at the copy by its "
-    "absolute path, with --db or [store].path, here and wherever the service names it. For a file "
+    "store's database, with the engine stopped, copy everything in the database's directory other "
+    "than those two files, the database's -wal and -shm files and any other file or folder the "
+    "engine keeps there among them, into a new directory, and point the "
+    "store at the copied database by its absolute path, with --db or [store].path, here and "
+    "wherever the service names it. For a file "
     "in the directory MEFOR_CUSTODY_DIRECTORY or MEFOR_SECRETS_DIRECTORY names, set that variable, "
     "here and in the service's environment, to a new directory, and copy into it every file the "
     "old one holds other than master.key and handoff.key"

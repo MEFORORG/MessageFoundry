@@ -979,9 +979,13 @@ function New-RestrictedDirectory {
     $acl = Get-Acl -LiteralPath $Path
     $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($owner -ne $OwnerSid -or -not $acl.AreAccessRulesProtected) {
+        # The custody directory may hold a store's only key, so its refusal never says remove.
+        $remedy = if ($What -eq "the custody directory") {
+            "Check who made it. A master.key or handoff.key in it may be a store's only key: do not " +
+                "delete it; follow docs/SERVICE.md 'Reinstalling over a kept custody directory'."
+        } else { "Remove it, check who made it, and re-run the installer." }
         throw ("'$Path' was there before this install made it (its owner is $owner), so it is not " +
-            "the restricted folder the install asked for. Remove it, check who made it, and re-run " +
-            "the installer.")
+            "the restricted folder the install asked for. $remedy")
     }
     # Read again after the create, as Set-SecretsDirAcl does: a folder above may have become a
     # junction since the preflight judged the path.
@@ -3123,8 +3127,8 @@ if (-not $HostCustody) {
         -Named:$CustodyDirNamed -Holds (@($SecretsHolds) + $SecretsDir) `
         -NotWithin (@($SecretsNotWithin) + $SecretsDir)
     if ($custodyProblem) {
-        throw ("-CustodyDir '$CustodyDir' cannot be the custody directory: $custodyProblem. Point it " +
-            "at a folder of its own, such as the default '<DataDir>-custody'.")
+        throw ("'$CustodyDir' cannot be the custody directory: $custodyProblem. Pass -CustodyDir " +
+            "naming a new folder of this service's own, one that does not exist yet.")
     }
 }
 

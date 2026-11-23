@@ -978,10 +978,17 @@ $configAceRemoved = $false
 $secretsAceRemoved = $false
 $custodyAceRemoved = $false
 # Which key files the custody directory holds, so the notice names only those (vault BACKLOG #3411).
-$custodyFiles = @(if ($custodyDir) {
-        foreach ($name in @("master.key", "handoff.key")) {
-            if (Test-Path -LiteralPath (Join-Path $custodyDir $name)) { $name }
-        } })
+# A read that fails, such as a drive that is gone, must not stop the uninstall before its notice.
+$custodyFiles = @()
+if ($custodyDir) {
+    try {
+        $custodyFiles = @(foreach ($name in @("master.key", "handoff.key")) {
+                if (Test-Path -LiteralPath ([IO.Path]::Combine($custodyDir, $name))) { $name } })
+    } catch {
+        $unreadable += ("the key files in the custody directory '$custodyDir' ($($_.Exception.Message)) " +
+            "- check it for master.key and handoff.key, and do not delete either")
+    }
+}
 
 if ($RemoveLogonRight) {
     if (-not $hasAccount) {

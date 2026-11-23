@@ -409,6 +409,23 @@ def test_the_other_provider_refusal_keeps_its_text_through_the_key_seams(
         assert "leave it where it is" in text, (seam.__name__, text)
 
 
+@pytest.mark.parametrize("where", ["same", "inside", "around"])
+def test_a_custody_directory_overlapping_the_secrets_directory_is_refused(
+    tmp_path: Path, where: str
+) -> None:
+    """The custody directory must stay apart from the administrator-written secrets directory, so
+    one that is, sits inside or holds it is refused, and the remedy never tells anyone to give the
+    service add-file there. The control: two sibling directories pass this rule."""
+    secrets = tmp_path / "secrets"
+    custody_dir = {"same": secrets, "inside": secrets / "custody", "around": tmp_path}[where]
+    environ = {"MEFOR_SECRETS_DIRECTORY": str(secrets), "MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+    with pytest.raises(HostCustodyRefused, match="is, holds or sits inside") as refused:
+        load_host_custody(_settings(tmp_path), enforcing=True, environ=environ)
+    assert "add a file to it" not in str(refused.value), refused.value
+    siblings = {**environ, "MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")}
+    assert custody_host._own_directory_refusal(siblings) is None
+
+
 def test_the_stores_own_key_file_beside_it_is_not_taken_for_a_host_blob(tmp_path: Path) -> None:
     """The beside-store directory is read whatever is set, so a store's own key file there named
     master.key is passed over; the control is the same file with no key file setting."""

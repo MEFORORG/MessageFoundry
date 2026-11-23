@@ -374,7 +374,14 @@ def test_the_uninstaller_names_the_custody_directory_and_removes_its_grant(
     notice = _sole_call(facts, "Get-UninstallResidueNotice")
     assert "-CustodyDir $custodyDir" in notice["text"], notice["text"]
     assert "-CustodyAceRemoved:$custodyAceRemoved" in notice["text"], notice["text"]
-    assert 'StartsWith("MEFOR_CUSTODY_DIRECTORY="' in _UNINSTALL.read_text(encoding="utf-8")
+    uninstall = _UNINSTALL.read_text(encoding="utf-8")
+    assert 'StartsWith("MEFOR_CUSTODY_DIRECTORY="' in uninstall
+    # The key-file probe cannot stop the uninstall before its notice: Join-Path throws on a drive
+    # that is gone, so the probe joins without it, inside a try that names what it could not read.
+    probe = uninstall.index('foreach ($name in @("master.key", "handoff.key"))')
+    window = uninstall[uninstall.rindex("try {", 0, probe) : probe + 400]
+    assert "[IO.Path]::Combine($custodyDir, $name)" in window and "$unreadable +=" in window, window
+    assert "Join-Path $custodyDir" not in uninstall
 
 
 def test_the_uninstall_notice_says_what_the_custody_directory_keeps(tmp_path: Path) -> None:
