@@ -103,17 +103,18 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # `#` of a comment, whose body is blanked.
 # THE REFINED VIEW, -Refined, ONLY ADDS DENIES (BACKLOG #5607). It is this bash reading with
 # corrections, and every line it adds sits in an `if ($Refined)` block, so the bash view is
-# unchanged. `$((` is read as arithmetic, but if a `)` at its depth 0 is not followed by `)`, that
-# `$((` is read again as `$(` and `(`, as bash does; inside it a quote or a backslash keeps a paren
-# from counting. `((` starting a word, outside `${...}`, is read the same way. `$[ ... ]` is
+# unchanged. `$((` is arithmetic if a `)` at its depth 0 is followed by `)`, and otherwise `$(` and
+# `(`, as bash reads it; inside it a quote or a backslash keeps a paren from counting. `((`
+# starting a word, outside `${...}`, is read the same way, and so is either one nested in
+# arithmetic. A site that never closes is read as a subshell. `$[ ... ]` is
 # arithmetic. A `<<` glued to a plain word (`cat<<EOF`) opens a heredoc, unless the line has
 # already opened arithmetic or a `[`, it is inside `${...}`, or the word is not a plain name. Every heredoc
 # opened on a line gets its own body, and each terminator line stays visible. The delimiter is read in place, never from a
-# slice of the text. Past a processed-character budget it gives up and returns $null, and the
-# caller then adds nothing. It still does not read at least these, which stay as the bash view
+# slice of the text. Where it cannot tell the two readings of a site apart, it returns $null, and
+# the caller scans the raw command instead. It still does not read at least these, which stay as the bash view
 # reads them: a spaced shift in a command with no quote, `((` glued to a keyword (`do((`), a
 # substitution in the body of a heredoc whose delimiter is unquoted, a glued opener after a bare
-# `(` or later on a line that opened arithmetic, a `$((cmd) )` nested inside arithmetic, a case
+# `(` or later on a line that opened arithmetic, a case
 # pattern's `)`, a terminator compared after trimming, delimiters such as `<<END-X` and
 # `<<E"O"F`, and a glued opener whose word is not a plain name. The older masker in block-blanket-git-stage.ps1 is untouched.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
@@ -150,49 +151,101 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     $bodyTerm = $null
     $n = 0
     if ($Refined) {
-        # One save per open arithmetic frame, to restore when the frame turns out to be a subshell;
-        # the sites already read as subshells; heredoc delimiters opened on this line, then the
-        # bodies still to blank, in order.
-        # A site's reading depends only on the text from it and on the state $siteKey records, so
-        # a site is keyed by both and kept across a restore. Cutting every later site there
-        # instead made each restore re-read the frames nested in it, and about ten nested levels
-        # of `$(($(...) ) )` then spent the budget (BACKLOG #5607). Each restore still re-reads its
-        # own frame, so deeper nesting still spends it, and so can a nesting whose key changes on
-        # the re-read, such as one inside an unclosed `${`.
-        $saves = [System.Collections.Generic.List[object]]::new()
-        $subshellSites = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-        $siteKey = {
-            param([int]$Site)
-            # Delimiters hold no newline, so the counts and newline joins keep each key unambiguous.
-            $p = if ($null -eq $pending) { '-' } else { '+' + $pending }
-            $b = if ($null -eq $bodyTerm) { '-' } else { '+' + $bodyTerm }
-            "$Site $([int]$prevDollar)$([int]$wordStart)$([int]$arithOnLine)$([int]$bracketOnLine) $braceDepth" +
-                "`n$p`n$b`n$($pendingQ.Count)`n$($pendingQ -join "`n")`n$($bodyQ.Count)`n$($bodyQ -join "`n")"
-        }
+        # Heredoc delimiters opened on this line, then the bodies still to blank, in order.
         $pendingQ = [System.Collections.Generic.List[string]]::new()
         $bodyQ = [System.Collections.Generic.List[string]]::new()
         $arithOnLine = $false
         # An unquoted `[` earlier on the line: bash reads a subscript such as `a[ x<<y ]=1` whole.
         $bracketOnLine = $false
+        # ONE PASS, NO BACKTRACKING (BACKLOG #5607). A `$((` or word-start `((` site is pushed as a
+        # `sub` frame, so the code below reads its contents once, as a subshell, and leaves them
+        # visible. Beside each frame, $starts holds where it begins and $meta, for a site, the
+        # record $newSite builds. When the site's paren count closes with `))` it was arithmetic,
+        # and what that reading blanks is blanked then. Where the two readings would consume the
+        # text differently, the view ends and returns $null, and the caller falls back to the raw
+        # command. Restoring a saved state and reading the site again cost a re-read per nested
+        # level, and the budget then gave up on deep nesting and added nothing.
+        $starts = [System.Collections.Generic.List[int]]::new(); $starts.Add(0)
+        $meta = [System.Collections.Generic.List[object]]::new(); $meta.Add($null)
+        # Heredoc openers in undecided sites, which arithmetic would not have opened.
+        $deferredLive = 0
+        $stepAt = 0
+        # Each step consumes at least one character, so this only fires on a bug in this function.
         $steps = 0
         $budget = 8 * $Text.Length + 4096
         $delimRe = [regex]::new('\G-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
-        $newSave = {
-            param([int]$Site, [string]$Key)
-            @{
-                Site = $Site; Key = $Key; Frame = $kinds.Count; SbLen = $sb.Length
-                Kinds = [System.Collections.Generic.List[string]]::new($kinds)
-                Depths = [System.Collections.Generic.List[int]]::new($depths)
-                PrevDollar = $prevDollar; WordStart = $wordStart; BraceDepth = $braceDepth
-                Pending = $pending; BodyTerm = $bodyTerm; ArithOnLine = $arithOnLine; BracketOnLine = $bracketOnLine
-                PendingQ = [System.Collections.Generic.List[string]]::new($pendingQ)
-                BodyQ = [System.Collections.Generic.List[string]]::new($bodyQ)
+        # A site at $Site whose opener is $OL characters long. Any `(` right after the opener is
+        # taken with it: bash would read each `((` pair in that run as a site of its own, and the
+        # pair that starts at offset L from the run closes where the count, started at the run's
+        # length, first drops to L at a `)`. So Next, the level the next such `)` decides, starts
+        # at the run length and counts down to 0, the site itself. The lowest level whose `)` is
+        # followed by `)` is the arithmetic one. Inside `${...}` a `((` is no site, so only level
+        # 0 of a `$((` can be. AB, AA and AK are the brace depth and line flags as arithmetic
+        # would hold them; D is the heredoc openers read in it; KS and KE are the ranges its
+        # nested frames wrote, which arithmetic leaves visible; BLo, BHi and KM record what has
+        # been blanked already.
+        $newSite = {
+            param([int]$Site, [int]$OL)
+            $r = 0
+            while ($Site + $OL + $r -lt $Text.Length -and $Text[$Site + $OL + $r] -ceq '(') { $r++ }
+            $f = @{
+                Amb = $true; Dol = ($OL -eq 3); S = $Site; OL = $OL; R = $r; Next = $r
+                Sites = ($OL -eq 2 -or $braceDepth -eq 0); BtParent = ($OL -eq 2 -and $kind -ceq 'bt')
+                AB = $braceDepth; AA = $true; AK = $bracketOnLine
+                D = [System.Collections.Generic.List[int]]::new()
+                KS = [System.Collections.Generic.List[int]]::new(); KE = [System.Collections.Generic.List[int]]::new()
+                BLo = -1; BHi = -1; KM = 0; Owner = $null
+            }
+            $f.Owner = $f
+            $f
+        }
+        # Whether a frame starting now would read the line under other state than arithmetic.
+        $differs = {
+            param($O)
+            $braceDepth -ne $O.AB -or (($arithOnLine -or $bracketOnLine) -ne ($O.AA -or $O.AK))
+        }
+        # Blank [$Lo, $Hi) of site $F's output, skipping its nested frames from the $K-th and newlines.
+        $blank = {
+            param($F, [int]$Lo, [int]$Hi, [int]$K)
+            $i = $Lo
+            while ($i -lt $Hi) {
+                $stop = $Hi
+                if ($K -lt $F.KS.Count) {
+                    if ($F.KS[$K] -le $i) {
+                        if ($F.KE[$K] -gt $i) { $i = $F.KE[$K] }
+                        $K++; continue
+                    }
+                    if ($F.KS[$K] -lt $stop) { $stop = $F.KS[$K] }
+                }
+                for (; $i -lt $stop; $i++) { if ($sb[$i] -cne [char]10) { $sb[$i] = [char]' ' } }
             }
         }
     }
     while ($n -lt $Text.Length) {
         if ($Refined) {
             if (++$steps -gt $budget) { return $null }
+            # Mirror the push or pop the code below made in the last step.
+            if ($kinds.Count -gt $meta.Count) {
+                $pm = $meta[$meta.Count - 1]
+                $meta.Add($null); $starts.Add($stepAt)
+                # In a site, a frame that starts under other state than arithmetic would see may be
+                # read differently by the two readings.
+                if ($null -ne $pm -and $null -ne $pm.Owner -and (& $differs $pm.Owner)) { return $null }
+            }
+            elseif ($kinds.Count -lt $meta.Count) {
+                $cm = $meta[$meta.Count - 1]
+                $cs = $starts[$starts.Count - 1]
+                $meta.RemoveAt($meta.Count - 1); $starts.RemoveAt($starts.Count - 1)
+                $pm = $meta[$meta.Count - 1]
+                if ($null -ne $pm) {
+                    if ($pm.Amb) { $pm.KS.Add($cs); $pm.KE.Add($sb.Length) }
+                    # A nested frame both readings read alike leaves the state arithmetic would hold.
+                    if ($null -ne $pm.Owner -and ($null -eq $cm -or -not [object]::ReferenceEquals($cm.Owner, $pm.Owner))) {
+                        $pm.Owner.AB = $braceDepth; $pm.Owner.AA = $arithOnLine; $pm.Owner.AK = $bracketOnLine
+                    }
+                }
+            }
+            $stepAt = $sb.Length
             if ($bodyQ.Count -gt 0) {
                 $end = $Text.IndexOf("`n", $n)
                 if ($end -lt 0) { $end = $Text.Length }
@@ -220,35 +273,6 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         $kind = $kinds[$top]
         $next = if ($n + 1 -lt $Text.Length) { $Text[$n + 1] } else { $null }
         if ($kind -ceq 'arith') {
-            if ($Refined) {
-                # A `)` at depth 0 not followed by `)` ends a subshell, so this frame was never
-                # arithmetic: restore the state saved at its site and read the site again as one.
-                if ($ch -ceq ')' -and $depths[$top] -eq 0 -and $saves.Count -gt 0 -and
-                    $saves[$saves.Count - 1].Frame -eq $top) {
-                    $sv = $saves[$saves.Count - 1]
-                    $saves.RemoveAt($saves.Count - 1)
-                    if ($next -cne ')') {
-                        [void]$subshellSites.Add($sv.Key)
-                        $sb.Length = $sv.SbLen
-                        $kinds = $sv.Kinds; $depths = $sv.Depths
-                        $prevDollar = $sv.PrevDollar; $wordStart = $sv.WordStart; $braceDepth = $sv.BraceDepth
-                        $pending = $sv.Pending; $bodyTerm = $sv.BodyTerm; $arithOnLine = $sv.ArithOnLine
-                        $bracketOnLine = $sv.BracketOnLine
-                        $pendingQ = $sv.PendingQ; $bodyQ = $sv.BodyQ
-                        $n = $sv.Site; continue
-                    }
-                }
-                # A quote or an escape keeps a paren from counting, as bash reads the frame.
-                if ($ch -ceq '\' -and $null -ne $next) {
-                    [void]$sb.Append(' ')
-                    [void]$sb.Append($(if ($next -ceq "`n") { $next } else { ' ' }))
-                    $n += 2; continue
-                }
-                if ($ch -ceq "'" -or $ch -ceq '"') {
-                    $kinds.Add($(if ($ch -ceq "'") { 'sq' } else { 'dq' })); $depths.Add(0); [void]$sb.Append($ch)
-                    $n++; continue
-                }
-            }
             # Arithmetic still runs a substitution, so that is left visible as in double quotes.
             if ($ch -ceq '$' -and $next -ceq '(' -and -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(')) {
                 $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $wordStart = $true; $n += 2; continue
@@ -286,21 +310,18 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
             $n++; continue
         }
         if ($Refined -and $ch -ceq '$' -and $kind -cne 'sq' -and $kind -cne 'ansi') {
+            $pm = $meta[$top]
             if ($next -ceq '(' -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(') {
-                $key = & $siteKey $n
-                if ($subshellSites.Contains($key)) {
-                    # Read again as `$(`, then `(`, as the bash view reads a `$(`.
-                    $arithOnLine = $true
-                    if ($kind -cne 'top') { $kinds.Add('sub'); $depths.Add(0) }
-                    [void]$sb.Append('$('); $prevDollar = $false; $wordStart = $true
-                    $n += 2; continue
-                }
-                $saves.Add((& $newSave $n $key))
                 $arithOnLine = $true
-                $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('$(('); $prevDollar = $false
-                $n += 3; continue
+                if ($null -ne $pm -and $null -ne $pm.Owner -and (& $differs $pm.Owner)) { return $null }
+                $f = & $newSite $n 3
+                $kinds.Add('sub'); $depths.Add($f.R); $meta.Add($f); $starts.Add($sb.Length)
+                [void]$sb.Append($Text, $n, 3 + $f.R); $prevDollar = $false; $wordStart = $true
+                $n += 3 + $f.R; continue
             }
             if ($next -ceq '[') {
+                # Arithmetic reads `$[` as two characters and counts the parens inside it.
+                if ($null -ne $pm -and $null -ne $pm.Owner) { return $null }
                 $arithOnLine = $true
                 $kinds.Add('arithb'); $depths.Add(0); [void]$sb.Append('$['); $prevDollar = $false
                 $n += 2; continue
@@ -341,10 +362,71 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         # starts here. A heredoc opener is read as Hide-HeredocBodies reads it: after a space or at
         # the start, not `<<<`, and a delimiter that starts with a letter or underscore.
         if ($Refined) {
+            $fm = $meta[$top]
+            if ($null -ne $fm -and $fm.Amb -and $ch -ceq ')' -and $depths[$top] -eq $fm.Next) {
+                # The `)` that decides level Next of an undecided site.
+                $level = $fm.Next
+                if ($next -ceq ')' -and ($level -eq 0 -or $fm.Sites)) {
+                    # The pair at this level is arithmetic: blank what that reading blanks, drop
+                    # the heredocs it never opened, and take back the state it holds. A lower
+                    # level that is arithmetic too covers this one, so only the difference is
+                    # blanked then.
+                    $lo = $fm.S + $fm.OL + $level
+                    if ($fm.BLo -lt 0) { & $blank $fm $lo $sb.Length 0 }
+                    else { & $blank $fm $lo $fm.BLo 0; & $blank $fm $fm.BHi $sb.Length $fm.KM }
+                    $fm.BLo = $lo; $fm.BHi = $sb.Length; $fm.KM = $fm.KS.Count
+                    for ($i = $fm.D.Count - 1; $i -ge 0; $i--) { $pendingQ.RemoveAt($fm.D[$i]) }
+                    $deferredLive -= $fm.D.Count; $fm.D.Clear()
+                    $braceDepth = $fm.AB; $arithOnLine = $fm.AA; $bracketOnLine = $fm.AK
+                    $prevDollar = $false; $wordStart = $false
+                    if ($level -eq 0) {
+                        [void]$sb.Append('))'); $n += 2
+                        $kinds.RemoveAt($top); $depths.RemoveAt($top); $meta.RemoveAt($top); $starts.RemoveAt($top)
+                        $pm = $meta[$top - 1]
+                        if ($null -ne $pm) {
+                            if ($pm.Amb) { $pm.KS.Add($fm.S); $pm.KE.Add($sb.Length) }
+                            if ($null -ne $pm.Owner) { $pm.Owner.AB = $braceDepth; $pm.Owner.AA = $arithOnLine; $pm.Owner.AK = $bracketOnLine }
+                        }
+                        continue
+                    }
+                }
+                if ($level -gt 0) {
+                    $fm.Next--; $depths[$top]--
+                    [void]$sb.Append($ch); $prevDollar = $false; $wordStart = $false
+                    $n++; continue
+                }
+                # Level 0 is not arithmetic, so the site was a subshell, whatever a higher level
+                # was. A `$((` is then `$(` and `(`, and this `)` closes the `(`;
+                # a `((` is `(` and `(`, and its first `(` belongs to the frame around it. Either
+                # way the text read so far stands, and what it held for arithmetic passes to the
+                # site around it, if any.
+                $pm = $meta[$top - 1]
+                $o = if ($null -ne $pm) { $pm.Owner } else { $null }
+                if ($null -ne $o) {
+                    $o.AB = $fm.AB; $o.AA = $fm.AA; $o.AK = $fm.AK; $o.D.AddRange($fm.D)
+                }
+                else { $deferredLive -= $fm.D.Count }
+                if ($fm.Dol) { $fm.Amb = $false; $fm.Owner = $o }
+                else {
+                    $kinds.RemoveAt($top); $depths.RemoveAt($top); $meta.RemoveAt($top); $starts.RemoveAt($top)
+                    if ($kinds[$top - 1] -ceq 'sub') { $depths[$top - 1]++ }
+                    if ($null -ne $pm -and $pm.Amb) { $pm.KS.AddRange($fm.KS); $pm.KE.AddRange($fm.KE) }
+                }
+                [void]$sb.Append($ch); $prevDollar = $false; $wordStart = $false
+                $n++; continue
+            }
+            # Inside a site, where arithmetic would consume the text differently from a subshell:
+            # a comment, a newline that starts a heredoc body, `$'...'`, and in a `((` inside a
+            # backtick substitution a backtick, which arithmetic nests and a subshell closes on.
+            if ($null -ne $fm -and $null -ne $fm.Owner -and
+                (($ch -ceq '#' -and $wordStart -and $braceDepth -eq 0) -or ($ch -ceq "`n" -and $pendingQ.Count -gt 0) -or
+                 ($ch -ceq "'" -and $prevDollar) -or ($ch -ceq '`' -and $fm.Amb -and $fm.BtParent))) { return $null }
             if ($ch -ceq '[') { $bracketOnLine = $true }
             if ($ch -ceq "`n") {
                 $arithOnLine = $false; $bracketOnLine = $false
                 if ($pendingQ.Count -gt 0) {
+                    # A body would start under an opener arithmetic may not have opened.
+                    if ($deferredLive -gt 0) { return $null }
                     [void]$sb.Append($ch); $bodyQ.AddRange($pendingQ); $pendingQ.Clear()
                     $prevDollar = $false; $wordStart = $true
                     $n++; continue
@@ -364,6 +446,8 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
                 if ($opens) {
                     $d = $delimRe.Match($Text, $n + 2)
                     if ($d.Success) {
+                        # In a site, the opener stands only if the site turns out to be a subshell.
+                        if ($null -ne $fm -and $null -ne $fm.Owner) { $fm.Owner.D.Add($pendingQ.Count); $deferredLive++ }
                         $pendingQ.Add((@($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
                             Where-Object { $_ } | Select-Object -First 1))
                     }
@@ -372,14 +456,14 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
                 }
             }
             if ($ch -ceq '(' -and $next -ceq '(') {
-                $key = if ($wordStart -and $braceDepth -eq 0) { & $siteKey $n } else { $null }
-                if ($null -ne $key -and -not $subshellSites.Contains($key)) {
-                    $saves.Add((& $newSave $n $key))
-                    $arithOnLine = $true
-                    $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('(('); $prevDollar = $false
-                    $n += 2; continue
-                }
                 $arithOnLine = $true
+                if ($wordStart -and $braceDepth -eq 0) {
+                    if ($null -ne $fm -and $null -ne $fm.Owner -and (& $differs $fm.Owner)) { return $null }
+                    $f = & $newSite $n 2
+                    $kinds.Add('sub'); $depths.Add($f.R); $meta.Add($f); $starts.Add($sb.Length)
+                    [void]$sb.Append($Text, $n, 2 + $f.R); $prevDollar = $false; $wordStart = $true
+                    $n += 2 + $f.R; continue
+                }
             }
         }
         if ($ch -ceq "`n" -and $null -ne $pending) {
@@ -837,7 +921,8 @@ try {
     }
     # THE REFINED VIEW (BACKLOG #5607) IS BUILT LAST, under the same rule: it is built only once every
     # toggle, bash and PowerShell bound has been judged and allowed, and it only appends bounds, so
-    # a throw, a slow path or its budget giving up returns the allow those views reached. It is built
+    # a throw or a slow path returns the allow those views reached. Where it cannot read a site, it
+    # appends the raw command's bounds instead. It is built
     # only for a command holding at least one of `((`, `<<` or `$[`. Its other change, ending a bound
     # at a comment, only removes tokens, so skipping the view elsewhere loses no deny.
     $refinedPending = @{ Value = ($tool -cne 'PowerShell' -and
@@ -847,8 +932,9 @@ try {
         if (-not $refinedPending.Value) { return $false }
         $refinedPending.Value = $false
         $refinedMask = Hide-QuotedSpans $cmd -Refined
-        if ($null -eq $refinedMask) { return $false }
-        $refinedScan = Hide-HeredocBodies $cmd $refinedMask
+        # No reading: scan the raw command, so a form the view cannot read adds denies rather than
+        # losing them.
+        $refinedScan = if ($null -eq $refinedMask) { $cmd } else { Hide-HeredocBodies $cmd $refinedMask }
         if ($scans -ccontains $refinedScan) { return $false }
         $before = $bounds.Count
         Add-ScanBounds $refinedScan

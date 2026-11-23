@@ -25,6 +25,7 @@ contract under test is the one Claude Code actually invokes.
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import subprocess
 import time
@@ -883,6 +884,99 @@ def test_the_refined_view_adds_no_deny_main_did_not_have(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
+def _nested_subshell_substitutions(depth: int) -> str:
+    """`echo "$(( $(( ... $((find /proc) ) ... ) ) ) )"`, DEPTH sites deep, every one a subshell."""
+    inner = "$((find /proc) )"
+    for _ in range(depth - 1):
+        inner = "$(( " + inner + " ) )"
+    return 'echo "' + inner + '"'
+
+
+# THE ONE-PASS READING (BACKLOG #5607). The refined view used to read a `$((` site as arithmetic,
+# and on a `)` that refused it, restore a saved state and read the site again as a subshell. Each
+# nested site was read again for each site around it, so past some depth the budget gave up and
+# the view added nothing. The rows at depths 50 and 200, and the twenty sites under an unclosed
+# `${`, were allowed on 4a0c81c3d96 for that reason; depth 12 was denied there and is the shallow
+# end. A `$((cmd) )` nested in arithmetic was never read as a site at all.
+ONE_PASS_DENY = [
+    pytest.param(_nested_subshell_substitutions(12), id="twelve-nested-subshell-substitutions"),
+    pytest.param(_nested_subshell_substitutions(50), id="fifty-nested-subshell-substitutions"),
+    pytest.param(
+        _nested_subshell_substitutions(200), id="two-hundred-nested-subshell-substitutions"
+    ),
+    pytest.param(
+        'echo "' + "$(( ${a:-$(" * 20 + "echo a" + ")} ) )" * 20 + '"; echo "$((find /proc) )"',
+        id="walk-after-nested-sites-under-unclosed-parameter-expansions",
+    ),
+    pytest.param('echo "$(( $((find /proc) ) + 1 ))"', id="subshell-substitution-in-arithmetic"),
+]
+
+
+@pytest.mark.parametrize("command", ONE_PASS_DENY)
+def test_a_walk_in_nested_sites_is_read_in_one_pass(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# WHERE ARITHMETIC AND A SUBSHELL WOULD CONSUME THE TEXT DIFFERENTLY, the view ends and the raw
+# command is scanned instead, which can only add denies. One row per trigger, each in a site that
+# is still undecided: a comment, a heredoc opener whose line ends inside the site, `$'...'`, `$[`,
+# a nested frame opened inside `${...}`, and a backtick in a `((` inside a backtick substitution.
+FALLBACK_DENY = [
+    pytest.param('echo "$(( a #b ))$((find /proc) )"', id="comment-in-a-site"),
+    pytest.param(
+        'echo "$(( x << y\n ))"; echo "$((find /proc) )"', id="heredoc-line-ends-in-a-site"
+    ),
+    pytest.param("echo \"$(( $'1' ))$((find /proc) )\"", id="ansi-c-quote-in-a-site"),
+    pytest.param('echo "$(( $[1] ))$((find /proc) )"', id="old-style-arithmetic-in-a-site"),
+    pytest.param(
+        'echo "$(( ${x:-$(echo 1)} ))$((find /proc) )"', id="frame-opened-inside-braces-in-a-site"
+    ),
+    pytest.param(
+        'echo "`(( `echo 1` ))`"; echo "$((find /proc) )"', id="backtick-in-a-site-in-backticks"
+    ),
+]
+
+# THE PRICE OF FAILING CLOSED, pinned so the fallback cannot stop running unnoticed: the raw scan
+# reads the prose in the second command as a walk. Each was allowed on 4a0c81c3d96.
+FALLBACK_FIRES_DENY = [
+    pytest.param('echo "$(( a #b ))"; echo "x; find /proc"', id="prose-after-a-comment-in-a-site"),
+    pytest.param(
+        'echo "$(( x << y\n ))"; echo "x; find /proc"', id="prose-after-a-heredoc-line-in-a-site"
+    ),
+]
+
+# THE CONTROLS: each holds a trigger's character where both readings agree, so the view runs to
+# the end and the prose stays data. A heredoc opener whose site closes on its line is dropped with
+# the arithmetic, a `#` glued to a word is no comment, and the rest sit in a nested frame, or
+# after the braces closed, or in a `((` outside backticks.
+FALLBACK_CONTROL_ALLOW = [
+    pytest.param('echo "$(( 2#101 ))"; echo "x; find /proc"', id="base-prefix-in-a-site"),
+    pytest.param(
+        'echo "$(( x << y ))"; echo "x; find /proc"', id="shift-in-a-site-closed-on-its-line"
+    ),
+    pytest.param(
+        'echo "$(( $(echo $\'1\') ))"; echo "x; find /proc"', id="ansi-c-quote-in-a-nested-frame"
+    ),
+    pytest.param(
+        'echo "$(( $(echo $[1]) ))"; echo "x; find /proc"', id="old-style-arithmetic-in-a-frame"
+    ),
+    pytest.param(
+        'echo "$(( ${#x} + $(echo 1) ))"; echo "x; find /proc"', id="frame-after-closed-braces"
+    ),
+    pytest.param('(( `echo 1` )); echo "x; find /proc"', id="backtick-in-a-top-level-site"),
+]
+
+
+@pytest.mark.parametrize("command", FALLBACK_DENY + FALLBACK_FIRES_DENY)
+def test_a_form_the_refined_view_cannot_read_denies_through_the_raw_command(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+@pytest.mark.parametrize("command", FALLBACK_CONTROL_ALLOW)
+def test_a_trigger_both_readings_agree_on_does_not_fall_back(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
 def _guard_seconds(command: str) -> float:
     started = time.monotonic()
     run_guard(bash(command))
@@ -905,6 +999,172 @@ def test_many_arithmetic_commands_are_read_in_linear_time() -> None:
 
 def test_deeply_nested_arithmetic_is_read_in_bounded_time() -> None:
     assert _guard_seconds('echo "find"; x=' + "$((" * 5000 + "1" + "))" * 5000) < 30
+
+
+def test_nested_subshell_substitutions_are_read_in_linear_time() -> None:
+    """Doubling the nested `$(( ... ) )` sites must not quadruple the time.
+
+    Every site is a subshell, which the earlier cut found only by reading the site again, once per
+    site around it. The bound allows for pwsh's fixed start cost, as the test above does.
+    """
+    half = _guard_seconds(_nested_subshell_substitutions(2000))
+    full = _guard_seconds(_nested_subshell_substitutions(4000))
+    assert full < 3 * half + 3
+
+
+# ============================================ differentials against origin/main (BACKLOG #5607)
+
+# THE REFINED VIEW MAY ONLY ADD DENIES, AND THE BASH AND PLAIN VIEWS MAY NOT MOVE AT ALL. A row list
+# pins the forms someone thought of; these two compare the guard with origin/main's copy over the
+# whole corpus and a seeded generated set, so a form nobody listed still has to agree. Both run
+# every command inside ONE pwsh process, because a cold start per command would take an hour.
+_BASE_REF = "origin/main"
+
+# Runs Hide-QuotedSpans from two copies of the guard, read out of each file's syntax tree so the
+# hook body never runs, and prints the index and view of every command whose mask differs.
+_MASK_DRIVER = r"""
+param([string]$Old, [string]$New, [string]$Commands)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+function Get-Fn([string]$Path) {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+    $fn = $ast.Find({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $a.Name -eq 'Hide-QuotedSpans' }, $true)
+    $params = ($fn.Parameters | ForEach-Object { $_.Extent.Text }) -join ', '
+    $body = $fn.Body.Extent.Text
+    [scriptblock]::Create("param($params)`n" + $body.Substring(1, $body.Length - 2))
+}
+$o = Get-Fn $Old
+$w = Get-Fn $New
+$cmds = @(Get-Content -Raw -Encoding utf8 $Commands | ConvertFrom-Json)
+for ($i = 0; $i -lt $cmds.Count; $i++) {
+    $c = [string]$cmds[$i]
+    if ((& $o $c -Plain) -cne (& $w $c -Plain)) { "$i plain" }
+    if ((& $o $c) -cne (& $w $c)) { "$i bash" }
+}
+"done"
+"""
+
+# Runs each copy of the hook once per command with the payload on a redirected stdin, and prints
+# one line per copy: a 1 for a deny and a 0 for an allow, per command.
+_VERDICT_DRIVER = r"""
+param([string]$Scripts, [string]$Commands)
+$ErrorActionPreference = 'Stop'
+$cmds = @(Get-Content -Raw -Encoding utf8 $Commands | ConvertFrom-Json)
+$inner = [Console]::In
+$outer = [Console]::Out
+foreach ($s in @(Get-Content -Raw $Scripts | ConvertFrom-Json)) {
+    $line = [System.Text.StringBuilder]::new()
+    foreach ($c in $cmds) {
+        $payload = @{ tool_name = 'Bash'; tool_input = @{ command = [string]$c } } | ConvertTo-Json -Compress
+        $sink = [System.IO.StringWriter]::new()
+        [Console]::SetIn([System.IO.StringReader]::new($payload))
+        [Console]::SetOut($sink)
+        try { & $s *> $null } finally { [Console]::SetIn($inner); [Console]::SetOut($outer) }
+        [void]$line.Append($(if ($sink.ToString().Contains('"deny"')) { '1' } else { '0' }))
+    }
+    $line.ToString()
+}
+"""
+
+
+def _base_guard(tmp_path: Path, ref: str = _BASE_REF) -> Path:
+    proc = subprocess.run(
+        ["git", "show", f"{ref}:scripts/hooks/block-unbounded-fs-scan.ps1"],
+        cwd=GUARD.parents[2],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"{ref} is not readable here: {proc.stderr.decode(errors='replace').strip()}")
+    base = tmp_path / "base-guard.ps1"
+    base.write_bytes(proc.stdout)
+    return base
+
+
+def _run_driver(tmp_path: Path, driver: str, *args: str) -> list[str]:
+    script = tmp_path / "driver.ps1"
+    script.write_text(driver, encoding="utf-8")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script), *args],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    assert proc.returncode == 0, f"driver exited {proc.returncode}: {proc.stderr}"
+    return proc.stdout.splitlines()
+
+
+def _corpus() -> list[str]:
+    rows: list[str] = []
+    for name in EXPECTED_ROW_COUNTS:
+        for row in globals()[name]:
+            rows.append(row.values[0] if hasattr(row, "values") else row)
+    return rows
+
+
+# The pieces the generated commands are built from: each opens, closes or changes a context the
+# refined view reads, and the walk is what a deny needs.
+_ATOMS = [
+    "$((", "((", ") )", "))", ")", "(", '"', "'", "\\", "<<X", " <<X ", "\nX\n", "#", " # ",
+    "${", "}", "$[", "]", "\n", " find /proc", "; find /proc", "$(", "`", " ", "a", ";", "$'",
+    "1", " << ", "<<", "$", "|", "&&",
+]  # fmt: skip
+_WRAPPERS = [
+    ("$((", ") )"), ("$((", "))"), ("((", "))"), ("((", ") )"), ("$(", ")"), ('"$(', ')"'),
+    ("${x:-", "}"), ("$(( ", " ))"), ("(", ")"), ("$[", "]"), ("`", "`"), ("'", "'"),
+]  # fmt: skip
+
+
+def _generated_commands(count: int = 2400, seed: int = 5607) -> list[str]:
+    rng = random.Random(seed)
+    out: list[str] = []
+    while len(out) < count:
+        depth = rng.randint(0, 60)
+        if rng.random() < 0.5:
+            body = "".join(rng.choice(_ATOMS) for _ in range(rng.randint(1, max(1, depth))))
+        else:
+            body = "".join(rng.choice(_ATOMS) for _ in range(rng.randint(0, 4)))
+            for _ in range(depth):
+                left, right = rng.choice(_WRAPPERS)
+                pad = rng.choice(["", " ", "a ", " find /proc ", "'x' ", '"y" '])
+                body = left + pad + body + rng.choice(["", " ", "; find /proc"]) + right
+        lead = rng.choice(['echo "', "echo '", 'x="a"; ', "", 'echo "$(', "echo 'a'; "])
+        tail = rng.choice(['"', "'", ')"', "", '; echo "$((find /proc) )"', "\nfind /proc"])
+        command = lead + body + tail
+        if "find" not in command:
+            command += " find /proc"
+        if '"' not in command and "'" not in command:
+            command = "echo 'q'; " + command
+        out.append(command)
+    return out
+
+
+def test_the_bash_and_plain_masks_match_origin_main_byte_for_byte(tmp_path: Path) -> None:
+    base = _base_guard(tmp_path)
+    commands = tmp_path / "commands.json"
+    commands.write_text(json.dumps(_corpus() + _generated_commands()), encoding="utf-8")
+    lines = _run_driver(tmp_path, _MASK_DRIVER, str(base), str(GUARD), str(commands))
+    assert lines[-1:] == ["done"], lines[-5:]
+    assert lines[:-1] == [], f"masks that moved: {lines[:20]}"
+
+
+_VERDICT_CHUNKS = 8
+
+
+# Split so the parts run in parallel, each well inside its timeout; together they cover every row.
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("chunk", range(_VERDICT_CHUNKS))
+def test_every_command_origin_main_denies_is_still_denied(tmp_path: Path, chunk: int) -> None:
+    base = _base_guard(tmp_path)
+    corpus = (_corpus() + _generated_commands())[chunk::_VERDICT_CHUNKS]
+    commands = tmp_path / "commands.json"
+    commands.write_text(json.dumps(corpus), encoding="utf-8")
+    scripts = tmp_path / "scripts.json"
+    scripts.write_text(json.dumps([str(base), str(GUARD)]), encoding="utf-8")
+    old, new = _run_driver(tmp_path, _VERDICT_DRIVER, str(scripts), str(commands))[-2:]
+    assert len(old) == len(new) == len(corpus)
+    lost = [corpus[i] for i in range(len(corpus)) if old[i] == "1" and new[i] == "0"]
+    assert lost == [], f"{len(lost)} commands origin/main denies are now allowed: {lost[:10]}"
 
 
 # ============================================ the corpora must not quietly shrink
@@ -940,6 +1200,10 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FLOOR_DENY": 3,
     "REFINED_CONTROL_ALLOW": 2,
     "REFINED_FALSE_DENY_ALLOW": 14,
+    "ONE_PASS_DENY": 5,
+    "FALLBACK_DENY": 6,
+    "FALLBACK_FIRES_DENY": 2,
+    "FALLBACK_CONTROL_ALLOW": 6,
 }
 
 
