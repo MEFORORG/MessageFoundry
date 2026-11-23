@@ -16,12 +16,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ctypes
 import inspect
 import io
 import json
 import logging
 import os
 import shutil
+import sys
 import tarfile
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -271,8 +273,182 @@ def test_restore_refuses_existing_wal_sidecar(tmp_path, key_b64, capsys) -> None
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
     err = _refusal(capsys)
-    assert "refusing to overwrite" in err and "-wal" in err
+    assert "refusing to overwrite" in err and str(sidecar) in err
     assert not dest.exists()  # nothing was written next to the sidecar
+
+
+def test_restore_refuses_a_dangling_wal_symlink(tmp_path, key_b64, capsys) -> None:
+    # `Path.exists()` follows a link, so a dangling store.db-wal symlink read as free, and SQLite
+    # would write the new store's WAL through it. Any name at a sidecar path is refused, links too.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dr = tmp_path / "dr"
+    dr.mkdir()
+    link = dr / "restored.db-wal"
+    try:
+        os.symlink(dr / "nowhere", link)
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"this platform cannot create a symlink here: {exc}")
+
+    rc = main(["restore", archive, "--to", str(dr / "restored.db"), "--service-config", toml])
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "refusing to overwrite" in err and str(link) in err
+    assert sorted(p.name for p in dr.iterdir()) == ["restored.db-wal"]  # nothing written
+    assert link.is_symlink() and not (dr / "nowhere").exists()  # the link is left as it was
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        pytest.param(
+            ".", marks=pytest.mark.skipif(sys.platform != "win32", reason="Win32 strips it")
+        ),
+        pytest.param(
+            " ", marks=pytest.mark.skipif(sys.platform != "win32", reason="Win32 strips it")
+        ),
+        # Refused on every host, so one --to means the same everywhere.
+        "::$DATA",
+    ],
+)
+def test_restore_refuses_a_to_that_windows_opens_as_another_name(
+    tmp_path, key_b64, capsys, suffix
+) -> None:
+    # `store.db.`, `store.db ` and `store.db::$DATA` all open `store.db` on Windows, but the sidecar
+    # names derived from them (`store.db.-wal` and so on) are not the ones SQLite will use, so a stale
+    # `store.db-wal` passed the never-overwrite check, beside a store SQLite would replay it over.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dr = tmp_path / "dr"
+    dr.mkdir()
+    stale = dr / "restored.db-wal"
+    stale.write_bytes(b"stale wal")
+
+    rc = main(
+        ["restore", archive, "--to", str(dr / "restored.db") + suffix, "--service-config", toml]
+    )
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "refusing --to" in err
+    expected = "holds no ':'" if ":" in suffix else "does not end in a dot or a space"
+    assert expected in err
+    assert sorted(p.name for p in dr.iterdir()) == ["restored.db-wal"]  # nothing written
+    assert stale.read_bytes() == b"stale wal"
+
+
+@pytest.mark.parametrize("sidecar", ["-wal", "-shm", "-journal"])
+def test_restore_refuses_a_sidecar_planted_before_the_placement(
+    tmp_path, key_b64, capsys, monkeypatch, sidecar
+) -> None:
+    # The up-front check runs before the decrypt; the exclusive create covers only the store's own
+    # name. A sidecar that appears in between is caught by the second read just before placement.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dr = tmp_path / "dr"
+    dr.mkdir()
+    dest = dr / "restored.db"
+    planted = dr / f"restored.db{sidecar}"
+    real_verify = dr_backup._verify_extracted_store
+
+    def _plant_a_sidecar(snap, manifest):
+        counts = real_verify(snap, manifest)
+        planted.write_bytes(b"planted sidecar")
+        return counts
+
+    monkeypatch.setattr(dr_backup, "_verify_extracted_store", _plant_a_sidecar)
+
+    rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "refusing to overwrite" in err and str(planted) in err
+    # nothing placed, and the staging directory is gone
+    assert sorted(p.name for p in dr.iterdir()) == [planted.name]
+    assert planted.read_bytes() == b"planted sidecar"
+
+
+def test_restore_refuses_a_store_name_link_planted_before_the_placement(
+    tmp_path, key_b64, capsys, monkeypatch
+) -> None:
+    # On Windows the copy fallback's exclusive create follows a dangling link and writes the whole
+    # store to the link's target, so the second read covers the store's own name too.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dr = tmp_path / "dr"
+    dr.mkdir()
+    dest = dr / "restored.db"
+    target = tmp_path / "elsewhere.db"
+    try:
+        os.symlink(target, tmp_path / "probe-link")
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"this platform cannot create a symlink here: {exc}")
+    real_verify = dr_backup._verify_extracted_store
+
+    def _plant_a_link(snap, manifest):
+        counts = real_verify(snap, manifest)
+        os.symlink(target, dest)
+        return counts
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(dr_backup, "_verify_extracted_store", _plant_a_link)
+
+    rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "refusing to overwrite" in err and str(dest) in err
+    assert sorted(p.name for p in dr.iterdir()) == ["restored.db"]  # nothing placed
+    assert dest.is_symlink() and not target.exists()  # nothing written through the link
+
+
+def test_a_fault_reading_a_sidecar_name_is_a_refusal_not_a_free_name(tmp_path, monkeypatch) -> None:
+    # `os.path.lexists` answers False for every OSError, so a fault would read as a free name. Only a
+    # name proven absent is free.
+    real_lstat = os.lstat
+
+    def _denied(path, *args, **kwargs):
+        if str(path).endswith("-shm"):
+            raise PermissionError(13, "denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _denied)
+    with pytest.raises(dr_backup.BackupError, match="cannot tell whether") as caught:
+        dr_backup._refuse_existing_destination(tmp_path / "restored.db", None)
+    assert "check that this account can read its directory" in str(caught.value)
+
+
+def test_an_invalid_name_fault_gets_its_own_remedy(tmp_path, monkeypatch) -> None:
+    # WinError 123 is an invalid name, not a permission fault, so the directory-permission remedy
+    # would send the operator the wrong way. The winerror is set by hand so this runs on every host.
+    real_lstat = os.lstat
+
+    class _InvalidName(OSError):
+        winerror = 123  # what Windows reports for an invalid name; a class attribute on every host
+
+    def _invalid(path, *args, **kwargs):
+        if str(path).endswith("-wal"):
+            raise _InvalidName(
+                22, "The filename, directory name, or volume label syntax is incorrect"
+            )
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _invalid)
+    with pytest.raises(dr_backup.BackupError, match="refuses the path as invalid") as caught:
+        dr_backup._refuse_existing_destination(tmp_path / "restored.db", None)
+    text = str(caught.value)
+    assert "choose another --to path" in text
+    assert "check that this account can read its directory" not in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="WinError 123 is a Win32 error")
+def test_a_real_invalid_name_reaches_the_invalid_name_remedy(tmp_path) -> None:
+    # Measures the mapping the test above assumes: a '<' makes lstat raise a plain OSError with
+    # winerror 123, not a FileNotFoundError that would read as free.
+    with pytest.raises(dr_backup.BackupError, match="refuses the path as invalid"):
+        dr_backup._refuse_existing_destination(tmp_path / "a<b.db", None)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a reserved device name is a Win32 rewrite")
+def test_restore_refuses_a_to_that_names_a_device(tmp_path) -> None:
+    with pytest.raises(dr_backup.BackupError) as caught:
+        dr_backup._refuse_existing_destination(tmp_path / "NUL", None)
+    text = str(caught.value)
+    assert "would not open that name as a file of its own" in text
+    assert "holds a ':'" not in text and "ends in a" not in text
 
 
 # --- (3) the archive must verify before anything lands -----------------------
@@ -386,17 +562,16 @@ def test_restore_does_not_delete_the_winner_of_a_create_race(
     # it would turn the refusal into the unrecoverable overwrite the refusal exists to prevent.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored.db"
-    real_verify = dr_backup._verify_extracted_store
+    real_before_copy = dr_backup._unspare_before_copy
 
-    def _plant_a_rival(snap, manifest):
-        # The rival's file must appear AFTER the up-front destination check and before the create --
-        # the only window in which the create race can be lost.
-        counts = real_verify(snap, manifest)
+    def _plant_a_rival(item):
+        # The rival's file must appear AFTER both reads of the destination's names and before the
+        # create -- the only window in which the create race can be lost.
+        real_before_copy(item)
         dest.write_bytes(b"the winner's store")
-        return counts
 
     monkeypatch.setattr(os, "link", _no_hard_links)
-    monkeypatch.setattr(dr_backup, "_verify_extracted_store", _plant_a_rival)
+    monkeypatch.setattr(dr_backup, "_unspare_before_copy", _plant_a_rival)
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
@@ -1362,6 +1537,216 @@ def test_restore_refuses_a_dangling_link_member_before_the_store_is_extracted(tm
         [("config/a.toml", b"[a]\n"), _hard_link("config/b.toml", "config/a.toml")],
     )
     dr_backup._refuse_colliding_config_members(ok, d / "msg.db", tmp_path / "cfg")
+
+
+# --- A config member that reaches a store path by a Win32 spelling ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "key"),
+    [
+        ("D:\\dr\\store.db-wal", ("d", "dr", "store.db-wal")),
+        ("D:/DR/STORE.DB-WAL", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal.", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal ", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal . .", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal::$DATA", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal:x", ("d", "dr", "store.db-wal")),
+        ("D:\\dr\\store.db-wal./x.toml", ("d", "dr", "store.db-wal", "x.toml")),
+        ("D:\\dr\\sub\\..\\store.db-wal.", ("d", "dr", "store.db-wal")),
+        # Measured: a dots-only or spaces-only component stays a component of its own on Windows,
+        # so it must not vanish from the key and fuse its neighbours.
+        ("D:\\dr\\...\\store.db-wal", ("d", "dr", "...", "store.db-wal")),
+        ("D:\\dr\\ \\store.db-wal", ("d", "dr", " ", "store.db-wal")),
+        # Controls: names that are not the protected one keep their own key.
+        ("D:\\dr\\store.db-walnut.toml", ("d", "dr", "store.db-walnut.toml")),
+        ("D:\\dr\\aux.py", ("d", "dr", "aux.py")),
+    ],
+)
+def test_win32_path_key_is_pure_and_matches_win32_naming(path, key) -> None:
+    # Runs on every platform: the normalizer reads no filesystem and no host state.
+    assert dr_backup._win32_path_key(path) == key
+
+
+def test_win32_path_key_does_not_pick_final_sigma_by_context() -> None:
+    # `str.lower` on the whole name would give U+03C2 here, a key U+03C3 could not match.
+    assert dr_backup._win32_path_key("data\u03a3-wal") == dr_backup._win32_path_key(
+        "data\u03c3-wal"
+    )
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="Win32 path aliasing")
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "name",
+    [
+        "store.db-wal.",
+        "store.db-wal ",
+        "store.db-shm.",
+        "STORE.DB-WAL",
+        "store.db-wal::$DATA",
+        "store.db-wal/x.toml",
+        "store.db-wal./x.toml",
+        "store.db",
+        "store.db.",
+        "store.db/x.toml",
+    ],
+)
+def test_restore_refuses_a_config_member_aliasing_a_store_path(tmp_path, name) -> None:
+    tar = _plain_tar(tmp_path / "forged.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+    assert excinfo.value.kind == "destination"
+    assert list(d.iterdir()) == []
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "name",
+    ["feed.py", "aux.py", "handler.py.", "store.db-walnut.toml", "sub/store.db-wal", "a.db-wal."],
+)
+def test_restore_passes_a_config_member_that_only_resembles_a_store_path(tmp_path, name) -> None:
+    # The control: a name that does not resolve to a protected path is not refused by this check.
+    tar = _plain_tar(tmp_path / "ok.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+
+
+@_WINDOWS_ONLY
+def test_restore_refuses_an_alias_of_a_store_nested_below_config_to(tmp_path) -> None:
+    tar = _plain_tar(tmp_path / "forged.tar", [("config/sub/store.db-wal.", b"x")])
+    d = tmp_path / "dr"
+    (d / "sub").mkdir(parents=True)
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "sub" / "store.db", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+def test_restore_refuses_an_alias_through_a_short_name_parent(tmp_path) -> None:
+    d = tmp_path / "dr"
+    parent = d / "restored-store-longname"
+    parent.mkdir(parents=True)
+    buf = ctypes.create_unicode_buffer(600)
+    size = ctypes.windll.kernel32.GetShortPathNameW(str(parent), buf, 600)  # type: ignore[attr-defined]
+    short = Path(buf.value).name
+    if not size or short == parent.name:
+        pytest.skip("this volume has no 8.3 name for the directory")
+    tar = _plain_tar(tmp_path / "forged.tar", [(f"config/{short}/store.db-wal.", b"x")])
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, parent / "store.db", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+def test_restore_protects_the_sidecar_of_a_to_path_with_a_trailing_dot(tmp_path) -> None:
+    tar = _plain_tar(tmp_path / "forged.tar", [("config/store.db-wal", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "store.db.", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+def test_alias_refusal_does_not_echo_the_member_name(tmp_path) -> None:
+    tar = _plain_tar(tmp_path / "forged.tar", [("config/store.db-wal:\x1b[2Jforged\nERROR", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+    message = str(excinfo.value)
+    assert excinfo.value.kind == "destination"
+    assert "\x1b" not in message and "forged" not in message and "\n" not in message
+
+
+@pytest.mark.parametrize(
+    ("planted", "refused"),
+    [("msg.db-journal", True), ("msg.db-journalnotes.toml", False)],
+)
+def test_restore_refuses_a_planted_rollback_journal_end_to_end(
+    tmp_path, key_b64, capsys, planted, refused
+) -> None:
+    # On every platform: SQLite replays a hot `<store>-journal` on first open, after the restore's
+    # integrity_check and row-count compare. The near-miss name is the control.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys, plant={planted: b"journal-bytes"})
+    capsys.readouterr()
+    d = tmp_path / "dr"
+    dest = d / "msg.db"
+    assert main(_restore_argv(archive, toml, dest, d)) == (1 if refused else 0)
+    if refused:
+        assert "restore failed (destination)" in _refusal(capsys)
+        assert not dest.exists() and not (d / planted).exists()
+    else:
+        assert dest.is_file() and (d / planted).read_bytes() == b"journal-bytes"
+
+
+def test_restore_refuses_a_destination_holding_a_stale_journal(tmp_path) -> None:
+    d = tmp_path / "dr"
+    d.mkdir()
+    (d / "msg.db-journal").write_bytes(b"stale")
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_existing_destination(d / "msg.db", None)
+    assert excinfo.value.kind == "destination"
+
+
+def test_alias_check_leaves_posix_names_alone(tmp_path, monkeypatch) -> None:
+    # The `sys.platform` branch, forced off: a Win32 spelling is an ordinary, distinct POSIX name.
+    monkeypatch.setattr(sys, "platform", "linux")
+    names = ["store.db-wal.", "store.db-wal ", "store.db-wal/x.toml", "RESTOR~1.DB:x"]
+    tar = _plain_tar(tmp_path / "posix.tar", [(f"config/{n}", b"x") for n in names])
+    d = tmp_path / "dr"
+    d.mkdir()
+    dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("name", ["store.db-wal /x.toml", "store.db-wal.:x"])
+def test_alias_key_deliberately_over_refuses_a_forged_looking_name(tmp_path, name) -> None:
+    # Each names a path other than the sidecar on NTFS. Refused on purpose: see `_win32_path_key`.
+    tar = _plain_tar(tmp_path / "forged.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "store.db", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("name", ["RESTOR~1.DB:x", "RESTOR~1.DB::$DATA", "RESTOR~2.DB:x/y.toml"])
+def test_restore_refuses_a_stream_on_the_stores_future_short_name(tmp_path, name) -> None:
+    # The short name does not exist until the store is placed, so it cannot be resolved here.
+    tar = _plain_tar(tmp_path / "forged.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "restored-store.db", d)
+    assert excinfo.value.kind == "destination"
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("name", ["notes~1.toml", "sub/RESTOR~1.DB:x"])
+def test_short_name_stream_refusal_stays_in_the_stores_directory(tmp_path, name) -> None:
+    # The controls: a tilde with no stream, and a tilde stream in another directory.
+    tar = _plain_tar(tmp_path / "ok.tar", [(f"config/{name}", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    dr_backup._refuse_colliding_config_members(tar, d / "restored-store.db", d)
+
+
+@_WINDOWS_ONLY
+def test_alias_check_exempts_the_operators_own_config_to_path(tmp_path) -> None:
+    # The exemption's control: this member adds nothing protected, and `--config-to` at a sidecar
+    # path is the operator's spelling, which this archive-name check leaves as `main` has it.
+    tar = _plain_tar(tmp_path / "ok.tar", [("config/a.toml", b"x")])
+    d = tmp_path / "dr"
+    d.mkdir()
+    dr_backup._refuse_colliding_config_members(tar, d / "store.db", d / "store.db-wal")
 
 
 # --- (5b-ter) vault BACKLOG #5233 item 3: the no-config refusal is not a closed list --------------

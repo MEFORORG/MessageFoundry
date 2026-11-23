@@ -679,7 +679,7 @@ _USERINFO_TAIL_MAX = 256
 
 #: The password ``http.client`` quotes as a "port" when an endpoint URL carries userinfo: its
 #: ``InvalidURL("nonnumeric port: 'PW@host'")`` (BACKLOG #1793; the mechanism is on
-#: ``transports/rest.py`` ``refuse_url_credentials``). It is a CREDENTIAL, not PHI. It lives here
+#: ``messagefoundry/urlscreen.py`` ``refuse_url_credentials``). It is a CREDENTIAL, not PHI. It lives here
 #: because :func:`redact` is the one pass that the stored error, the log chain and the support bundle
 #: all run.
 #:
@@ -688,7 +688,7 @@ _USERINFO_TAIL_MAX = 256
 #: the ``@`` is kept so the diagnostic still says where. The bound is load-bearing on
 #: attacker-influenceable log text; the literal prefix limits it to one bounded walk per occurrence.
 #: A password tail longer than the bound is NOT matched -- the construction-time refusal in
-#: ``transports/rest.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
+#: ``messagefoundry/urlscreen.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
 #:
 #: **Its tail never crosses a span it already scrubbed (BACKLOG #2312).** The greedy tail used to.
 #: Each scrub shortens the line, so two spans more than the bound apart on the first pass could fall

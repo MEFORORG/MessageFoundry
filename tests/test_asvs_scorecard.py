@@ -2948,6 +2948,51 @@ def test_prove_absences_screen_skips_decorators_after_the_recursion_fallback(
     assert _refused("def scan(): ...\n", target, tmp_path)
 
 
+# --- BACKLOG #5590 follow-up: the PR 3144 review findings on the decorator rule -----------------
+#
+# The first assertion of each test below is red on the screen PR 3144 merged. Every other
+# assertion is a control that is green on it.
+
+
+def test_prove_absences_screen_compares_shape_decorators_beside_the_same_unnamed_one(
+    tmp_path: Path,
+) -> None:
+    """A decorator the screen cannot name cancels where both sides hold the same one, so dropping
+    ``@cache`` beside it is still a shape change. Where the unnamed decorators differ, none is
+    compared, as before."""
+    target = "from functools import cache\n\ndef deco(f):\n    return f\n\n@deco\n@cache\ndef f(a): ...\n"
+    assert _refused("@deco\ndef f(a):\n    return 1\n", target, tmp_path)
+    assert _screen("@deco\n@cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    # Dropping the unnamed decorator too: the two sides' unnamed decorators differ.
+    assert _screen("@cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    assert _screen("def f(a):\n    return 1\n", target, tmp_path) == []
+    # The same text naming another binding is another decorator: here the new one caches.
+    rebound = "from functools import lru_cache\n\ndef deco(f):\n    return lru_cache(f)\n\n"
+    assert _screen(rebound + "@deco\ndef f(a):\n    return 1\n", target, tmp_path) == []
+
+
+def test_prove_absences_screen_keeps_a_staticmethod_beside_an_unnamed_decorator(
+    tmp_path: Path,
+) -> None:
+    """A ``staticmethod``'s first parameter is passed by its callers, so renaming it breaks a
+    keyword call even when decorators beside it cannot be named and differ. Only one side read as
+    a ``staticmethod`` is compared as before."""
+    target = (
+        "def deco(f):\n    return f\n\ndef deco2(f):\n    return f\n\n"
+        "class C:\n    @staticmethod\n    @deco\n    def m(x): ...\n"
+    )
+    renamed = "class C(C):\n    @staticmethod\n    @deco2\n    def m(y): ...\n"
+    assert _refused(renamed, target, tmp_path)
+    # Control: a decorator that returns a staticmethod is a staticmethod the screen cannot name.
+    wraps = "def deco(f):\n    return staticmethod(f)\n\nclass C:\n    @deco\n    def m(x): ...\n"
+    assert _screen("class C(C):\n    @staticmethod\n    def m(x): ...\n", wraps, tmp_path) == []
+    same = "class C(C):\n    @staticmethod\n    @deco\n    def m(x):\n        return 1\n"
+    assert _screen(same, target, tmp_path) == []
+    # Control: a method's first parameter is still bound, so its name is not part of the shape.
+    method = "def deco(f):\n    return f\n\nclass C:\n    @deco\n    def m(self, x): ...\n"
+    assert _screen("class C(C):\n    @deco\n    def m(this, x): ...\n", method, tmp_path) == []
+
+
 def test_signature_fields_name_every_signature_value() -> None:
     """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
     assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))

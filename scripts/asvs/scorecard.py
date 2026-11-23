@@ -2552,7 +2552,8 @@ def _is_generator(fn: _FunctionNode) -> bool:
 #: a stub that is never the live binding. A decorator that resolves to anything else, or to nothing
 #: this screen can name, may come or go freely, because dropping one can BE the reintroduction (a
 #: permission check written as a decorator), and a decorator the reading cannot name turns off the
-#: decorator comparison for that def (:meth:`_Reading.pair`). The class decorators here (a generated constructor)
+#: decorator comparison for that def, unless the other side's decorators it cannot name are the same
+#: ones (:meth:`_Reading.pair`). The class decorators here (a generated constructor)
 #: are resolved too, but no check compares a class's decorators (:func:`_scope_mismatch`).
 _SHAPE_DECORATORS: Final = frozenset(
     {
@@ -2627,26 +2628,30 @@ class _ScopeState:
 @dataclass
 class _Reading:
     """What :func:`_run_block` records about each ``def`` and ``class`` it reaches: the shape
-    decorators it resolved for it at the point it ran, the defs in ``unresolved`` with a decorator
-    it could not name, and each class body's final scope."""
+    decorators it resolved for it at the point it ran, the ones it could not name, and each class
+    body's final scope."""
 
     decorators: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
-    #: The defs with at least one decorator that resolved to nothing this screen can name.
-    unresolved: set[_DefNode] = field(default_factory=set)
+    #: Each def's decorators that resolved to nothing, by :func:`_unknown_key`, sorted.
+    unknown: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
 
     def pair(self, m: _DefNode, s: _DefNode) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        """The decorators to compare for `m` against `s`: both resolved, or neither compared.
+        """The decorators to compare for `m` against `s`, or none.
 
-        Where either side holds a decorator that did not resolve, or was never read, neither is
-        compared, as before decorators were compared at all."""
-        if (
-            m in self.unresolved
-            or s in self.unresolved
-            or m not in self.decorators
-            or s not in self.decorators
-        ):
+        Decorators that did not resolve cancel where both sides hold the same ones, the same text
+        naming the same bindings (:func:`_unknown_key`), and the shape decorators beside them are
+        compared. Where the two sides' unresolved decorators differ, or a side was never read,
+        neither is compared, as before decorators were compared at all (BACKLOG #5590)."""
+        if m not in self.decorators or s not in self.decorators:
+            return (), ()
+        if self.unknown.get(m, ()) != self.unknown.get(s, ()):
             return (), ()
         return self.decorators[m], self.decorators[s]
+
+    def both_static(self, m: _DefNode, s: _DefNode) -> bool:
+        """Whether `m` and `s` each carry a decorator this reading resolved to ``staticmethod``,
+        whether or not :meth:`pair` compares their decorators."""
+        return all("builtins.staticmethod" in self.decorators.get(n, ()) for n in (m, s))
 
     classes: dict[ast.ClassDef, _ScopeState] = field(default_factory=dict)
 
@@ -2763,6 +2768,25 @@ def _is_accessor(node: _FunctionNode, state: _ScopeState, reading: _Reading) -> 
     )
 
 
+def _unknown_key(
+    decorator: ast.expr, node: _DefNode, state: _ScopeState, outer: _ScopeState | None
+) -> str:
+    """A decorator that resolved to nothing, as its ``ast.dump`` text and the ``def`` or ``class``
+    statements still live for each name in it. Where a name is bound otherwise (an import, an
+    assignment), or not in this scope or the module scope at all, a rebinding of it between the
+    target and the mutation cannot be seen, so the key is `node`'s own and matches no other def's.
+    """
+    names: list[str] = []
+    for sub in ast.walk(decorator):
+        if isinstance(sub, ast.Name):
+            scope = state if sub.id in state.defs or outer is None else outer
+            entry = scope.defs.get(sub.id)
+            if not entry:
+                return f"@{id(node)}"
+            names.append(f"{sub.id}=" + ",".join(str(id(e)) for e in entry))
+    return f"{ast.dump(decorator)} {' '.join(names)}"
+
+
 def _has_break(body: list[ast.stmt]) -> bool:
     """Whether `body` holds a ``break`` or ``continue`` of its own loop, not one of a nested loop:
     either can end the loop's last pass partway."""
@@ -2835,8 +2859,13 @@ def _run_stmt(
     _bind_walrus(node, state)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         origins = [_resolve(d, state) for d in node.decorator_list]
-        if None in origins:
-            reading.unresolved.add(node)
+        reading.unknown[node] = tuple(
+            sorted(
+                _unknown_key(d, node, state, outer)
+                for d, o in zip(node.decorator_list, origins, strict=True)
+                if o is None
+            )
+        )
         reading.decorators[node] = tuple(
             _SAME_SHAPE.get(origin, origin) for origin in origins if origin in _SHAPE_DECORATORS
         )
@@ -2994,7 +3023,11 @@ _SIGNATURE_FIELDS: Final = (
 
 
 def _signature(
-    fn: _FunctionNode, decorators: tuple[str, ...] = (), *, method: bool = False
+    fn: _FunctionNode,
+    decorators: tuple[str, ...] = (),
+    *,
+    method: bool = False,
+    static: bool | None = None,
 ) -> tuple[object, ...]:
     """The call-compatible shape of a signature: what a CALL SITE can observe, one value per
     :data:`_SIGNATURE_FIELDS` entry.
@@ -3016,12 +3049,15 @@ def _signature(
 
     For a ``method`` other than a ``staticmethod``, the first parameter is bound, never passed by a
     caller, so neither its name nor whether it is positional-only is part of the shape (``self``,
-    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``.
+    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``. `static`
+    says whether `fn` is a ``staticmethod``; when it is ``None``, `decorators` says.
     """
     args = fn.args
     posonly = [p.arg for p in args.posonlyargs]
     positional = [p.arg for p in args.args]
-    if method and "builtins.staticmethod" not in decorators and (posonly or positional):
+    if static is None:
+        static = "builtins.staticmethod" in decorators
+    if method and not static and (posonly or positional):
         (posonly if posonly else positional).pop(0)
         posonly.insert(0, "<bound>")
     return (
@@ -3063,8 +3099,9 @@ def _node_mismatch(
         )
     assert not isinstance(m, ast.ClassDef) and not isinstance(s, ast.ClassDef)
     mdecs, sdecs = reading.pair(m, s)
-    mine = _signature(m, mdecs, method=method)
-    live = _signature(s, sdecs, method=method)
+    static = reading.both_static(m, s) or None
+    mine = _signature(m, mdecs, method=method, static=static)
+    live = _signature(s, sdecs, method=method, static=static)
     return None if mine == live else _signature_clause(qual, path, mine, live)
 
 

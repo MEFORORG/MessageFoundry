@@ -8,8 +8,10 @@ acknowledgements, at two strengths, because the engine gives two different guara
 
 * A **positive** acknowledgement (AA or CA) is sent only after ``enqueue_ingress`` commits a row
   carrying the message's control id (ACK-on-receipt). So for each one, the control id the ACK
-  echoes in MSA-2 must name a stored row -- a NEW one, when the campaign could predict that id and
-  count its rows before sending -- with a disposition. This is the per-message check. A positive
+  echoes in MSA-2 must name a stored row with a disposition. This is the per-message check. It
+  needs a NEW row (``stored_checked``) only for an id the ACK's own case carried and re-read just
+  before sending, when no other frame of the case carried that id without a matching ACK. For any
+  other id a row that is not this message's can satisfy it (``stored_presence_only``). A positive
   acknowledgement with an empty MSA-2 breaks it unless the engine's own ACK builder would have
   written that MSA-2 empty for the frame (:func:`echo_owed`), since an id it dropped would leave
   only the batch count to notice a missing row.
@@ -197,9 +199,12 @@ def check_health(client: EngineClient) -> str:
 
 def check_stored(client: EngineClient, control_id: str, before: int, settle: float) -> str:
     """Empty when more than ``before`` stored rows carry ``control_id``, the newest with a
-    disposition. ``before`` is the pre-send count plus the rows earlier positive ACKs of the batch
-    already matched. Polls for up to ``settle`` seconds: ACK-on-receipt makes the row visible before
-    the ACK, so a deploying site's store should need none of it."""
+    disposition. ``before`` is the campaign's floor for that id. For an id the ACK's case carried,
+    it is the count read just before that case was sent, plus the rows earlier frames of the case
+    matched. For an id only another case of the batch carried, it is that id's latest read plus
+    the rows matched since. For an id no case carried, it is only the rows already matched in the
+    batch, with no count behind it. Polls for up to ``settle`` seconds: ACK-on-receipt makes the
+    row visible before the ACK, so a deploying site's store should need none of it."""
     deadline = time.monotonic() + settle
     query = partial(client.list_messages, control_id=control_id, limit=1)
     while True:
