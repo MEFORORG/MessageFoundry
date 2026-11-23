@@ -12,7 +12,9 @@ delimiter, and each part's ``Content-Disposition`` gives its field name + (for a
 What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block over
 ``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
 ``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body with no
-closing delimiter ``--<boundary>--`` where a delimiter counts (BACKLOG #5787), and, in
+closing delimiter ``--<boundary>--`` where a delimiter counts, a body whose first delimiter
+text does not start a line, a close delimiter with other text on its line (all three BACKLOG
+#5787, stated on ``_LineStartDelimiters``), and, in
 :func:`parse_single_file_upload`, a body with no file part or with more than one.
 
 Scope: exactly what an upload form needs — one file part + optional small text fields. It is not a
@@ -159,14 +161,16 @@ class _LineStartDelimiters:
     a line is refused (:attr:`first_starts_line`), so a stray byte (a space, a BOM), a preamble
     ending mid-line, or close-marker text mid-line in a preamble fails loudly. Before #5787 the first
     such text was taken as the first delimiter wherever it sat. The refusal is raised after the
-    walk's size and part checks, so a body that also fails one of those gets that refusal, as before.
+    walk's size and part checks on the parts the walk reached, so a body with such a part gets that
+    refusal, as before. The walk stops at the first close marker, so the parts after it are not
+    checked, and close-marker text before the first delimiter stops it before any part.
 
     A delimiter followed by ``--`` is a close only where transport padding (spaces and tabs) and
     then a CR, an LF or the end of the body follow. RFC 2046 has padding then CRLF or the end of the
     body; a bare CR or LF is accepted here too. :func:`_close_tail_ok` reads that, and a body whose
     close delimiter line carries anything else is refused, rather than closed or read on as content,
-    again after the size and part checks. Refusing keeps the walk linear: reading on would cost one
-    Python step per such line, with nothing bounding their number.
+    again after the checks on the parts before it. Refusing keeps the walk linear: reading on would
+    cost one Python step per such line, with nothing bounding their number.
 
     So the boundary is trusted not to start a line inside a part body. That trust goes past RFC
     2046, which keeps only ``CRLF--<boundary>`` out of content: a content line after a bare CR or a
@@ -174,8 +178,8 @@ class _LineStartDelimiters:
     sender may write one. At least these are still read without a refusal: a content line that is
     ``--<boundary>--`` with only padding after it, taken as the close; a content line that starts
     with ``--<boundary>`` and then anything but ``--``, taken as a delimiter, which nothing after the
-    boundary is checked for; and a preamble line that starts with the close marker, taken as the
-    close of a body with no parts.
+    boundary is checked for; and a preamble line that starts with the close marker and has only
+    padding after it, taken as the close of a body with no parts.
 
     After the first, two ``find`` cursors, one for ``\n--B`` and one for ``\r--B``, each only ever
     moving forward, so a body holding the delimiter text mid-line many times is skipped in C and the
@@ -192,8 +196,9 @@ class _LineStartDelimiters:
         self._lf = -2
         self._cr = -2
         self._last_at = -1
-        #: Whether the first ``--<boundary>`` in the body starts a line; set by :meth:`first`.
-        self.first_starts_line = True
+        self._first = body.find(delim)
+        #: Whether the first ``--<boundary>`` in the body starts a line (true when there is none).
+        self.first_starts_line = self._first <= 0 or body[self._first - 1] in b"\r\n"
 
     def _advance(self, cursor: int, needle: bytes, at: int) -> int:
         if cursor == -1 or cursor + 1 >= at:
@@ -201,11 +206,8 @@ class _LineStartDelimiters:
         return self._body.find(needle, at - 1)
 
     def first(self) -> int:
-        """The offset of the first ``--<boundary>`` anywhere, or -1. Sets
-        :attr:`first_starts_line`."""
-        pos = self._body.find(self._delim)
-        self.first_starts_line = pos <= 0 or self._body[pos - 1] in b"\r\n"
-        return pos
+        """The offset of the first ``--<boundary>`` anywhere, or -1; see :attr:`first_starts_line`."""
+        return self._first
 
     def find(self, at: int) -> int:
         """The offset of the first line-start delimiter at or after ``at`` (at least 1), or -1."""
@@ -344,15 +346,19 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     # part would otherwise run to the end of the body and be taken as complete. Checked last, so a
     # body that fails a check above gets that refusal. A close marker counts only where a delimiter
     # does (_LineStartDelimiters), so close-marker text in the middle of a content line no longer
-    # makes a cut-short body pass as complete. The shapes that still do are stated on
-    # _LineStartDelimiters. Its two refusals are raised here too, after every check above.
+    # makes a cut-short body pass as complete. At least the shapes _LineStartDelimiters names
+    # still do. The first-delimiter and close-tail refusals it describes are raised here too, after
+    # the checks above on the parts the walk reached.
     if not delims.first_starts_line:
         raise MultipartError(
             "multipart body's first boundary delimiter is not at the start of a line, or the body "
             "uses another boundary than its Content-Type names"
         )
     if bad_close:
-        raise MultipartError("multipart close delimiter is followed by other text on its line")
+        raise MultipartError(
+            "multipart close delimiter is followed by other text on its line, or the body uses "
+            "another boundary than its Content-Type names"
+        )
     if not closed:
         if not seen:
             # No delimiter text at all. At least an empty body, one built with another boundary than

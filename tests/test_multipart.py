@@ -844,7 +844,8 @@ _ANCHORED_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "close-then-epilogue": (
         "refused",
         "MultipartError",
-        "multipart close delimiter is followed by other text on its line",
+        "multipart close delimiter is followed by other text on its line, or the body uses "
+        "another boundary than its Content-Type names",
     ),
     # The first delimiter text sits mid-line, so the body is refused rather than read as empty.
     "close-in-preamble": (
@@ -1061,8 +1062,8 @@ def test_delimiter_text_before_the_first_delimiter_line_is_refused(body: bytes) 
 def test_the_new_refusals_rank_after_the_size_and_part_checks(
     make: Callable[[], bytes], message: str
 ) -> None:
-    """A body that also breaks a size or part limit gets that refusal (413 for an oversize file
-    part), as before #5787, not the close-tail or first-delimiter one."""
+    """A body with a part the walk reaches that breaks a size or part limit gets that refusal (413
+    for an oversize file part), as before #5787, not the close-tail or first-delimiter one."""
     with pytest.raises(MultipartError, match=message):
         parse_multipart_form(_CT_B, make(), max_file_bytes=1024)
 
