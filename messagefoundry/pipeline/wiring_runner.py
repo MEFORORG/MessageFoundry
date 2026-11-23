@@ -7019,6 +7019,17 @@ class RegistryRunner:
         self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
+    # Set by a cancelled start() only when its teardown ran to completion (BACKLOG #5705).
+    _start_cancel_unwound: bool = False
+
+    @property
+    def start_cancel_unwound(self) -> bool:
+        """Whether the last :meth:`start` was cancelled and fully tore down what it had built.
+        False means a caller must keep this runner so a later stop can reach what is left:
+        ``has_residual_state`` cannot say, since it omits at least the router, transform and
+        response workers, the background tasks, the executors and the sandbox sessions."""
+        return self._start_cancel_unwound
+
     async def start(
         self,
         *,
@@ -7036,6 +7047,7 @@ class RegistryRunner:
         #3582). The start isolates those lookups and checks no lookup CA again. That caller's build
         check left them out, so their query-credential WARNING is logged here whatever
         ``warn_query_credentials`` says. ``None`` checks every lookup CA here."""
+        self._start_cancel_unwound = False
         async with self._reload_lock:
             if self._running:
                 return
@@ -7241,6 +7253,20 @@ class RegistryRunner:
                 # gate already (BACKLOG #5704), so nothing here needs the dispatchers.
                 if self._log_write_stopped:
                     await self._unbind_for_log_failure()
+            except asyncio.CancelledError:
+                # BACKLOG #5705: a cancel unwinds the partial start too. A teardown that raises must
+                # not replace the cancel, and leaves the flag unset so the caller keeps this runner.
+                try:
+                    await self._teardown_unsafe(TeardownReason.SHUTDOWN)
+                except Exception as exc:
+                    log.error(
+                        "wiring start was cancelled and its teardown failed (%s); the partial "
+                        "start is left for a later stop",
+                        type(exc).__name__,
+                    )
+                else:
+                    self._start_cancel_unwound = True
+                raise
             except Exception:
                 # A truly fatal startup error (store / DB-lookup executor — NOT a single connection, which
                 # is isolated above) must not leave half the graph wired with _running still False:

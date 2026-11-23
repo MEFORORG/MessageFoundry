@@ -1706,12 +1706,18 @@ class Engine:
             # That check warned for this graph, so this start does not (vault BACKLOG #2910),
             # except for a lookup it left out, which the start warns for (vault BACKLOG #3582).
             await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
+        except asyncio.CancelledError:
+            # BACKLOG #5705: cleared only when the cancelled start finished its own teardown.
+            # Otherwise the runner may still hold live state, so it stays, with the values it was
+            # built from, where engine.stop() can reach it.
+            installed = self._registry_runner
+            if installed is not None and installed.start_cancel_unwound:
+                self._registry_runner = None
+                self._env_values = previous_env_values
+            raise
         except Exception:
             # Don't leave a half-started runner: a later reload would take the "runner exists"
             # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
-            # Exception only: RegistryRunner.start() does not tear itself down on a cancellation,
-            # so clearing the reference then would orphan a running runner that engine.stop()
-            # could no longer reach.
             self._registry_runner = None
             self._env_values = previous_env_values
             raise
