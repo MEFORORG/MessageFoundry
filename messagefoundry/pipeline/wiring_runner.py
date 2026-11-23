@@ -2880,6 +2880,10 @@ class RegistryRunner:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
         self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
 
+    #: The longest injected summary stored, in characters (BACKLOG #5707). ``\.inN\`` escapes can
+    #: expand a summary far past its body, and a longer one is stored as ``None``, never cut.
+    _INJECT_SUMMARY_MAX_CHARS = 4096
+
     async def ingress_fields_for(
         self, channel_id: str, raw: str
     ) -> tuple[str | None, str | None, str | None]:
@@ -2889,19 +2893,21 @@ class RegistryRunner:
         content type with no control id or summary.
 
         This only labels a row and never refuses one, because the API's resubmission guard has
-        already admitted the body. An unknown channel or any fault here is three ``None`` values, so
-        no inject fails on it. Only the exception's type is logged: its text can carry the body. The
-        peek runs off the event loop, as that guard's does, because the body can be upload-sized.
+        already admitted the body. An unknown channel or an ``Exception`` raised here is three
+        ``None`` values. Only the exception's type is logged: its text can carry the body. The peek
+        runs off the event loop, as that guard's does, because the body can be upload-sized.
 
-        A value a store column could not hold is dropped to ``None``, because storing it would fail
-        an inject that stores with no labels: wider than SQL Server's ``NVARCHAR(256)`` control id or
-        ``NVARCHAR(64)`` type, counted in UTF-16 units as it counts them, or holding a NUL, which a
-        hex escape can decode into a summary after the guard's NUL check and Postgres refuses. The
-        widths apply on every backend, so an inject can store ``None`` where a listener on SQLite
-        or Postgres would keep a longer value."""
+        What this bounds is the label values, and nothing about the store write that follows, which
+        can still fail for its own reasons. A value is dropped to ``None`` when it is wider than
+        SQL Server's ``NVARCHAR(256)`` control id or ``NVARCHAR(64)`` type, counted in UTF-16 units
+        as it counts them; when it holds a NUL, which a hex escape can decode into a summary after
+        the guard's NUL check and Postgres refuses; or when a summary is over
+        :attr:`_INJECT_SUMMARY_MAX_CHARS`. The widths apply on every backend, so an inject can store
+        ``None`` where a listener on SQLite or Postgres would keep a longer value."""
 
-        def storable(value: str | None, max_units: int | None = None) -> str | None:
-            if value is None or "\x00" in value:
+        def storable(value: str | None, max_chars: int, max_units: int | None = None) -> str | None:
+            # The plain length first: an oversized value is dropped with no scan or encode.
+            if value is None or len(value) > max_chars or "\x00" in value:
                 return None
             if max_units is not None and len(value.encode("utf-16-le")) // 2 > max_units:
                 return None
@@ -2918,9 +2924,9 @@ class RegistryRunner:
             def read() -> tuple[str | None, str | None, str | None]:
                 fields = _read_ingress_fields(Peek.parse(raw, max_bytes=ceiling))
                 return (
-                    storable(fields.control_id, 256),
-                    storable(fields.message_type, 64),
-                    storable(fields.summary),
+                    storable(fields.control_id, 256, 256),
+                    storable(fields.message_type, 64, 64),
+                    storable(fields.summary, self._INJECT_SUMMARY_MAX_CHARS),
                 )
 
             return await asyncio.to_thread(read)

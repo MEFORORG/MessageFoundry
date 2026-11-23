@@ -927,6 +927,33 @@ async def test_inject_drops_a_summary_an_escape_decoded_to_nul(
     assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
 
 
+async def test_inject_drops_a_summary_escapes_expanded_and_keeps_the_other_labels(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # A 64 KB body whose \.in512\ escapes expand its summary to about 16 million characters.
+    body = (
+        f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||A{'\\.in512\\' * 8000}^^^H^MR\r"
+    )
+    assert len(body) < 70_000 and len(summarize(Peek.parse(body))) > 16_000_000
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
+@pytest.mark.parametrize(("mrn_chars", "kept"), [(4092, True), (4093, False)])
+async def test_inject_summary_cap_is_exact(
+    engine: Engine, tmp_path: Path, mrn_chars: int, kept: bool
+) -> None:
+    # "MRN " plus the value, so 4092 characters make a summary of exactly the 4096 cap.
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||{'X' * mrn_chars}^^^H^MR\r"
+    derived = summarize(Peek.parse(body))
+    assert len(derived) == mrn_chars + 4
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    expected = derived if kept else None
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", expected)
+
+
 async def test_inject_survives_a_peek_fault_and_logs_no_body(
     engine: Engine,
     tmp_path: Path,
