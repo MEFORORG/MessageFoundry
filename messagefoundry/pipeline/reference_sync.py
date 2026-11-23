@@ -53,6 +53,7 @@ from messagefoundry.config.wiring import (
     resolve_env_settings,
 )
 from messagefoundry.connection_names import reference_record_name
+from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
@@ -573,6 +574,12 @@ class ReferenceSyncRunner:
         self._unsupported: set[str] = set()
         # BACKLOG #2617: each DATABASE set's login is role-probed once per DSN, not every pass.
         self._roles_probed: set[tuple[str, ...]] = set()
+        # BACKLOG #5892: a background pass can overlap a reload's or promotion's forced sync, so each
+        # load takes a start sequence, and a load does not write over one that started after it.
+        # This orders loads in THIS process only; see _sync_one.
+        self._load_sequence = 0
+        self._written_sequence: dict[str, int] = {}
+        self._write_locks: dict[str, KeyedLock] = {}
 
     @property
     def enabled(self) -> bool:
@@ -729,6 +736,9 @@ class ReferenceSyncRunner:
         return result
 
     async def _sync_one(self, spec: ReferenceSpec) -> None:
+        # BACKLOG #5892: taken first, because the env() read below is part of what this load read.
+        self._load_sequence += 1
+        started = self._load_sequence
         # Resolve env() refs in the source settings against this instance's environment. A hop-policy
         # flag is refused first, while still raw, as build_check does (vault BACKLOG #2232).
         try:
@@ -768,19 +778,32 @@ class ReferenceSyncRunner:
             raise ReferenceSyncError(
                 f"reference set {spec.name!r}: unknown source kind {kind!r} (file, database)"
             )
-        # Unique per write regardless of sub-second timing: a uuid suffix on the wall-clock seconds, so
-        # two re-materializations of the SAME set inside one second still get DISTINCT versions. A
-        # follower's converge compares version strings, so an identical version would make it SKIP a
-        # genuine re-materialization and keep stale data (Track B Step 6 correctness). The leading
-        # seconds keep versions roughly time-ordered for an operator reading reference_version.
-        version = f"v{int(self._clock())}-{uuid4().hex[:8]}"
-        try:
-            await self._store.write_reference_snapshot(name=spec.name, version=version, rows=rows)
-        except ReferenceKeyCollision as exc:
-            # BACKLOG #4917: sync_all logs only the class. This text holds the set's name and two
-            # ordinals, never a key, so it is logged whole: the ordinals find the rows in the source.
-            log.error("%s (not synced)", exc)
-            raise
+        # BACKLOG #5892: held for the check and the write only. Held across the source read above, a
+        # wedged source would block a reload's load of this set. It orders loads in this process, so
+        # it cannot order a former leader's in-flight write against a new leader's on another node.
+        async with hold_keyed_lock(self._write_locks, spec.name):
+            if self._written_sequence.get(spec.name, 0) > started:
+                log.debug("reference set %r: a later-started load already wrote it", spec.name)
+                return
+            # Unique per write regardless of sub-second timing: a uuid suffix on the wall-clock
+            # seconds, so two re-materializations of the SAME set inside one second still get
+            # DISTINCT versions. A follower's converge compares version strings, so an identical
+            # version would make it SKIP a genuine re-materialization and keep stale data (Track B
+            # Step 6 correctness). The leading seconds keep versions roughly time-ordered for an
+            # operator reading reference_version.
+            version = f"v{int(self._clock())}-{uuid4().hex[:8]}"
+            try:
+                await self._store.write_reference_snapshot(
+                    name=spec.name, version=version, rows=rows
+                )
+            except ReferenceKeyCollision as exc:
+                # BACKLOG #4917: sync_all logs only the class. This text holds the set's name and two
+                # ordinals, never a key, so it is logged whole: the ordinals find the rows in the
+                # source.
+                log.error("%s (not synced)", exc)
+                raise
+            # Only after the write returned: a later load that failed must not skip this one's.
+            self._written_sequence[spec.name] = started
         log.info(
             "reference set %r materialized: %d rows (version %s)", spec.name, len(rows), version
         )
