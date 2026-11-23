@@ -1124,9 +1124,12 @@ safe label; for such a server use `move` or `delete`, or have the partner write 
 name. Even where a time is listed, a same-size replacement within its resolution (whole seconds for SFTP
 and many `MLSD` servers) is not re-ingested, and nothing logs it. In the other direction, a remote file
 whose listed time moves with its bytes unchanged is ingested again, a duplicate. The ledger is bounded
-by an age + count prune. In `leave` mode the `.processed`/`.error` subdirs are created best-effort (a read-only share doesn't fail start),
-so a malformed file on a truly read-only share that can't be moved to `.error` re-logs each poll — fix it
-at the source.
+by an age + count prune. In `leave` mode a read-only share does not fail start. The `File(...)` source
+creates the `.processed`/`.error` subdirs best-effort at start, and a malformed file that can't be moved
+to `.error` is read and logged again on later scans. An `Sftp(...)`/`Ftp(...)` poll in `leave` mode asks
+for no directory until a reject needs `.error`, and then best-effort (BACKLOG #5750). A reject it cannot
+move stays in place, logged, and is read again only once its listing changes or its retry falls due; the
+rule is under *Files left for a retry do not spend the budget*. Either way, fix such a file at the source.
 
 #### File handling & quarantine policy (ASVS 5.1.1)
 
@@ -5104,8 +5107,14 @@ ceiling's log line does not count. A due retry is judged afresh, so a file that 
 passes is ingested. At least a restart of the connection and a full memory leave such a file read
 and charged again. When a retry falls due is the back-off rule
 stated once at `STUCK_RETRY_SECONDS` in
-[`transports/file.py`](../messagefoundry/transports/file.py). Under `leave`, and on
-`Sftp(...)`/`Ftp(...)`, the gap stands as described.
+[`transports/file.py`](../messagefoundry/transports/file.py). Under `leave` on `File(...)`, the gap
+stands as described. On `Sftp(...)`/`Ftp(...)`, in every `after_read` mode (BACKLOG #5750), it is
+narrowed the same way: such a file is remembered and skipped unread and uncharged until its listed size
+or modification time changes or `STUCK_RETRY_SECONDS` pass. A due retry is judged afresh and charges
+nothing. One poll runs at most a tenth of `poll_max_files` of them (at least one, at most
+`STUCK_RETRIES_PER_SCAN_MAX`), in listing order, so a poll that stops at the ceiling does not reach
+the retries after it. At least a restart of the connection and a full memory leave such a file read
+and charged again. A replacement listing the same size and time is seen only by the retry.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it

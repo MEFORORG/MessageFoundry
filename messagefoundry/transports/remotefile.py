@@ -143,11 +143,13 @@ from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
     FILENAME_MAX_BYTES,
     LEAVE_SEEN_CACHE_MAX,
-    SETTLE_MISS_LIMIT,
     SETTLE_SEEN_MAX,
+    STUCK_RETRIES_PER_SCAN_MAX,
+    STUCK_RETRY_SECONDS,
     ScanRejected,
     _check_template_fits,
     _content_matches_encoded,
+    _prune_unlisted,
     render_filename,
     scan_inbound_file,
 )
@@ -670,6 +672,22 @@ class _Listed(NamedTuple):
     other_form: bool = False
 
 
+class _StuckReject(NamedTuple):
+    """What the source remembers of a reject it could not move (BACKLOG #5750): the size and
+    modification time it listed at, and the monotonic time its retry falls due."""
+
+    size: int
+    mtime: str | None
+    due: float
+
+
+def _same_listing(seen_size: int, seen_mtime: str | None, size: int, mtime: str | None) -> bool:
+    """Whether two listings show one version of a file. The times are compared only when both carry
+    one, so a listing that loses its time for a poll (an ``MLSD`` refusal that falls back to
+    ``NLST``) does not read as a change."""
+    return seen_size == size and (seen_mtime is None or mtime is None or seen_mtime == mtime)
+
+
 class _RemoteClient(abc.ABC):
     """Connect-per-operation remote-file client. Implementations are **synchronous** (blocking I/O);
     the connector calls them via :func:`asyncio.to_thread`. Each method opens its own connection, does
@@ -758,8 +776,9 @@ class _RemoteClient(abc.ABC):
     def ensure_dir(self, remote_dir: str) -> bool:
         """Best-effort create ``remote_dir`` (ignore "already exists"). Returns **True only when THIS
         call created it** (#114) — the destination logs that, so a delivery landing in a directory the
-        engine just invented is distinguishable from a normal one. A best-effort failure (no permission,
-        a racing creator) returns False: nothing was created here."""
+        engine just invented is distinguishable from a normal one. A refused create (no permission, a
+        racing creator) returns False: nothing was created here. Any other fault raises, at least a
+        failed connection and, on SFTP, a refused ``stat`` of the path."""
 
 
 def _ftps_ssl_context(
@@ -2808,6 +2827,11 @@ class RemoteFileSource(SourceConnector):
         # poll that last saw it, and how many polls in a row have since failed to list it, keyed by
         # name. In memory only and never logged. See _settled.
         self._settle_seen: dict[str, tuple[tuple[int, str | None], int]] = {}
+        # BACKLOG #5750: rejects whose move to error_subdir failed, by name, each with how many polls
+        # in a row have not listed it. In memory only and never logged. See _remember_stuck.
+        self._stuck: dict[str, tuple[_StuckReject, int]] = {}
+        self._stuck_full_logged = False  # the memory filled: logged once until it drains to half
+        self._error_dir_asked = False  # this poll already asked for error_subdir (leave mode)
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
         self._validate_directory: bool = bool(s.get("validate_directory", False))
@@ -2989,13 +3013,18 @@ class RemoteFileSource(SourceConnector):
 
     async def _poll_once(self) -> None:
         assert self._handler is not None
-        await asyncio.to_thread(self._client.ensure_dir, self._processed_dir)
-        await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
+        # BACKLOG #5750: leave mode, meant for a read-only share, asks for no directory up front,
+        # because a refused look at the path would abort the poll before it listed anything.
+        if self._after_read != "leave":
+            await asyncio.to_thread(self._client.ensure_dir, self._processed_dir)
+            await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
+        self._error_dir_asked = False
         entries = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
         newly_recorded = 0  # #142: files marked processed THIS poll — gates one end-of-poll prune
         # Keyed so two entries that list one name never compare a None mtime with a str.
         listing = sorted(entries, key=lambda entry: (entry.name, entry.size))
-        self._prune_settle(listing)
+        self._prune_memories(listing)
+        retries_left = self._stuck_retry_allowance()
         # Counted over the whole listing, not in the loop below, which can stop early. Only an entry
         # the pattern would have read counts. So a narrow pattern such as *.hl7 skips a subdirectory
         # or a stray file, but a broad one such as * counts them, since NLST cannot tell a directory
@@ -3046,6 +3075,11 @@ class RemoteFileSource(SourceConnector):
                 continue
             if not self._reads(name):
                 continue
+            # BACKLOG #5750: a reject that could not be moved, unchanged since, is skipped unread and
+            # uncharged until its retry falls due. Before the ledger read, so it costs no store call.
+            stuck = self._stuck_reject(name, size, mtime)
+            if stuck is not None and (retries_left == 0 or time.monotonic() < stuck.due):
+                continue
             path = posixpath.join(self._remote_dir, name)
             # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
             # then the durable ledger). Keyed on a HASHED id (path + size + the listed mtime where the
@@ -3058,10 +3092,16 @@ class RemoteFileSource(SourceConnector):
                 continue
             if forms is not None and self._stop.is_set():
                 break  # a stop met during the ledger read: retrieve nothing the bound must then cut
-            if not self._settled(name, size, mtime):
+            if stuck is not None:
+                # A due retry spends none of the budget, so rejects sorted first cannot hold back
+                # the valid files behind them.
+                retries_left -= 1
+                self._stuck[name] = (stuck._replace(due=time.monotonic() + STUCK_RETRY_SECONDS), 0)
+            elif not self._settled(name, size, mtime):
                 # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
                 # Nothing is read, moved or charged against the per-tick budget.
                 continue
+            charge = 0 if stuck is not None else 1
             if self._max_file_bytes is not None and size > self._max_file_bytes:
                 # Transport-level reject *before* any bytes are read — parallels the File source's
                 # oversize guard. It never became a "received message", so there's no store
@@ -3076,13 +3116,13 @@ class RemoteFileSource(SourceConnector):
                     size,
                     self._max_file_bytes,
                 )
-                if await self._move(path, self._error_dir, name):
+                if await self._quarantine(path, name, size, mtime):
                     await self._emit_event(
                         "file_oversize",
                         reason=f"listed at {size} bytes, exceeds max_file_bytes "
                         f"{self._max_file_bytes}",
                     )
-                disposed += 1
+                disposed += charge
                 continue
             try:
                 raw = await asyncio.to_thread(
@@ -3099,13 +3139,13 @@ class RemoteFileSource(SourceConnector):
                     safe_name(name),
                     self._max_file_bytes,
                 )
-                if await self._move(path, self._error_dir, name):
+                if await self._quarantine(path, name, size, mtime):
                     await self._emit_event(
                         "file_oversize",
                         reason=f"delivered more than max_file_bytes {self._max_file_bytes} "
                         f"despite listing {size} bytes",
                     )
-                disposed += 1
+                disposed += charge
                 continue
             except _RemoteChanged as exc:
                 # BACKLOG #116: a partner is still writing this file in place, so what was read may be
@@ -3151,12 +3191,12 @@ class RemoteFileSource(SourceConnector):
                     safe_name(name),
                     declared,
                 )
-                if await self._move(path, self._error_dir, name):
+                if await self._quarantine(path, name, size, mtime):
                     await self._emit_event(
                         "file_content_mismatch",
                         reason=f"does not match declared content type {declared}",
                     )
-                disposed += 1
+                disposed += charge
                 continue
             try:
                 await asyncio.to_thread(scan_inbound_file, raw, name)
@@ -3171,9 +3211,9 @@ class RemoteFileSource(SourceConnector):
                     safe_name(name),
                     scrubbed,
                 )
-                if await self._move(path, self._error_dir, name):
+                if await self._quarantine(path, name, size, mtime):
                     await self._emit_event("file_scan_rejected", reason=scrubbed)
-                disposed += 1
+                disposed += charge
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
                 # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
@@ -3188,6 +3228,8 @@ class RemoteFileSource(SourceConnector):
                     safe_exc(exc, file_name=name),
                 )
                 continue
+            # It passed every gate, so it is no longer a reject, whatever the hand-off does.
+            self._stuck.pop(name, None)
             try:
                 stopped = await self._hand_off(raw)
             except Exception as exc:
@@ -3207,7 +3249,7 @@ class RemoteFileSource(SourceConnector):
                 # return, so the prune below still bounds what this poll recorded.
                 break
             await self._after_processing(path, name, len(raw))
-            disposed += 1
+            disposed += charge
             if file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
                 # Only a durable write counts, so a broken ledger does not draw a prune.
@@ -3256,14 +3298,20 @@ class RemoteFileSource(SourceConnector):
         message was received, so there is no disposition to record.
 
         **What charges the budget.** Only a file this poll FINISHED with: one handed to the pipeline, or
-        one quarantined to ``error_subdir`` (over the listed size, over the retrieved size, a
-        content-vs-type mismatch, a scanner rejection). Those leave the poll directory, so the next poll
-        starts on new work. The arms that leave a file **in place** for a later retry — a refused unsafe
+        one rejected (over the listed size, over the retrieved size, a content-vs-type mismatch, a
+        scanner rejection). The arms that leave a file **in place** for a later retry — a refused unsafe
         listing name, a file not yet settled (#2071), a transient retrieve failure, a malfunctioning
         scan hook, a handler failure — do
         NOT charge, because a stuck file that sorts early would otherwise eat the whole budget every
         poll and starve the healthy files behind it. This mirrors
         :meth:`~messagefoundry.transports.file.FileSource._at_ceiling`, which states the rule in full.
+
+        A reject charges even when its move to ``error_subdir`` fails, so one poll reads at most
+        ``poll_max_files`` files for the first time that end in a reject. Such a file is then
+        remembered and skipped unread and uncharged until it changes or its retry falls due
+        (:meth:`_remember_stuck`, BACKLOG #5750). A due retry charges nothing and is bounded by
+        :meth:`_stuck_retry_allowance`, so a poll can read past this ceiling by at most that many. A
+        full memory or a restart leaves a reject read and charged again.
 
         PHI-safe: the log names the redacted host/dir and two counts, never a filename."""
         if self._poll_max_files is None or disposed < self._poll_max_files:
@@ -3302,7 +3350,7 @@ class RemoteFileSource(SourceConnector):
         seen = self._settle_seen.get(name)
         if seen is not None:
             seen_size, seen_mtime = seen[0]
-            if seen_size == size and (seen_mtime is None or mtime is None or seen_mtime == mtime):
+            if _same_listing(seen_size, seen_mtime, size, mtime):
                 del self._settle_seen[name]
                 return True
         recorded = self._remember_size(name, size, mtime)
@@ -3328,21 +3376,67 @@ class RemoteFileSource(SourceConnector):
             return True
         return False
 
-    def _prune_settle(self, listing: list[_Listed]) -> None:
-        """Forget a file once ``SETTLE_MISS_LIMIT`` polls in a row have not listed it (moved, deleted,
-        renamed away), so the settle map is bounded by the poll directory. A file listed again has its
-        count reset. A failed listing raises before this runs, so it never counts as a miss."""
-        if not self._settle_seen:
+    def _prune_memories(self, listing: list[_Listed]) -> None:
+        """Forget a file in the settle or stuck-reject memory once ``SETTLE_MISS_LIMIT`` polls in a
+        row have not listed it (moved, deleted, renamed away), so each is bounded by the poll
+        directory. A file listed again has its count reset. A failed listing raises before this
+        runs, so it never counts as a miss."""
+        if self._settle_seen or self._stuck:
+            listed = {entry.name for entry in listing}
+            _prune_unlisted(self._settle_seen, listed)
+            _prune_unlisted(self._stuck, listed)
+        if self._stuck_full_logged and len(self._stuck) <= SETTLE_SEEN_MAX // 2:
+            self._stuck_full_logged = False  # drained: a memory that fills again is logged again
+
+    def _stuck_retry_allowance(self) -> int:
+        """How many remembered rejects one poll may read again (BACKLOG #5750). One over it stays
+        due for a later poll, and so does one past the point where a poll stops at its ceiling."""
+        cap = self._poll_max_files
+        if cap is None:
+            return STUCK_RETRIES_PER_SCAN_MAX
+        return min(STUCK_RETRIES_PER_SCAN_MAX, max(1, cap // 10))
+
+    def _stuck_reject(self, name: str, size: int, mtime: str | None) -> _StuckReject | None:
+        """The remembered reject at ``name`` if it still lists as it did, else None. A file whose
+        listed size or modification time changed is forgotten here, so it is examined as a new
+        file."""
+        held = self._stuck.get(name)
+        if held is None:
+            return None
+        seen = held[0]
+        if _same_listing(seen.size, seen.mtime, size, mtime):
+            return seen
+        del self._stuck[name]
+        return None
+
+    def _remember_stuck(self, name: str, size: int, mtime: str | None) -> None:
+        """Remember a reject that stays in the poll directory because its move failed (BACKLOG
+        #5750), until its listing changes or ``STUCK_RETRY_SECONDS`` pass. The retry judges it
+        afresh, so a cause fixed outside the file needs no restart and the file goes on being logged.
+        **Nothing is dropped:** the file stays where it is. A replacement that lists the same size
+        and time is seen only by that retry. At ``SETTLE_SEEN_MAX`` a new reject is not remembered,
+        so it is read and charged again. :meth:`_at_ceiling` states what this does to the budget."""
+        first = name not in self._stuck
+        if first and len(self._stuck) >= SETTLE_SEEN_MAX:
+            if not self._stuck_full_logged:
+                self._stuck_full_logged = True
+                logger.warning(
+                    "REMOTEFILE %s: the memory of rejects that cannot be moved is full (%d); "
+                    "further such rejects are read and charged on later polls",
+                    _where(self._host, self._remote_dir),
+                    SETTLE_SEEN_MAX,
+                )
             return
-        listed = {entry.name for entry in listing}
-        for name, (sighting, missed) in list(self._settle_seen.items()):
-            if name in listed:
-                if missed:
-                    self._settle_seen[name] = (sighting, 0)
-            elif missed + 1 >= SETTLE_MISS_LIMIT:
-                del self._settle_seen[name]
-            else:
-                self._settle_seen[name] = (sighting, missed + 1)
+        due = time.monotonic() + STUCK_RETRY_SECONDS
+        self._stuck[name] = (_StuckReject(size, mtime, due), 0)
+        if first:
+            logger.warning(
+                "REMOTEFILE %s: rejected file %s stays in place; it is tried again once it changes "
+                "or %.0f seconds pass",
+                _where(self._host, self._remote_dir),
+                safe_name(name),
+                STUCK_RETRY_SECONDS,
+            )
 
     def _file_key(self, name: str, size: int, mtime: str | None) -> str:
         """The key this release writes for ``name``: the first of :meth:`_file_key_forms`."""
@@ -3541,6 +3635,28 @@ class RemoteFileSource(SourceConnector):
                 read_size,
                 now,
             )
+
+    async def _quarantine(self, path: str, name: str, size: int, mtime: str | None) -> bool:
+        """Move a rejected file to ``error_subdir``, returning whether it left the poll directory,
+        and remember it when it stayed (BACKLOG #5750). Under ``leave`` the poll asks for no directory
+        up front, so the directory is asked for here, best-effort and at most once per poll, since
+        each ask is a connection: a share that refuses leaves the move below to fail and log."""
+        if self._after_read == "leave" and not self._error_dir_asked:
+            self._error_dir_asked = True
+            try:
+                await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
+            except _RemoteError as exc:
+                logger.debug(
+                    "REMOTEFILE %s: could not ensure the error directory: %s",
+                    _where(self._host, self._remote_dir),
+                    safe_exc(exc, file_name=name),
+                )
+        moved = await self._move(path, self._error_dir, name)
+        if moved:
+            self._stuck.pop(name, None)
+        else:
+            self._remember_stuck(name, size, mtime)
+        return moved
 
     async def _move(self, path: str, dest_dir: str, name: str) -> bool:
         """Rename ``path`` into ``dest_dir``; return whether it moved. A failure is logged here, so a
