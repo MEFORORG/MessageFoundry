@@ -916,15 +916,13 @@ def _refuse_back(
     return moves
 
 
-def _fail_referent_write(
-    monkeypatch: pytest.MonkeyPatch, *, interrupt: bool = False, unrestored: list[str] | None = None
-) -> None:
+def _fail_referent_write(monkeypatch: pytest.MonkeyPatch, *, interrupt: bool = False) -> None:
     from messagefoundry.config import impact
 
     def fail(_prepared: object) -> list[object]:
         if interrupt:
             raise KeyboardInterrupt
-        raise impact.RenameWriteError("write failed", unrestored or [])
+        raise impact.RenameWriteError("write failed", [])
 
     monkeypatch.setattr(impact, "write_rename", fail)
 
@@ -1000,7 +998,13 @@ def _unrestored_write(monkeypatch: pytest.MonkeyPatch, *, rewrite: bool) -> None
         (file,) = [f for f, _raw, _new in prepared.files if f.endswith("mod_a.py")]
         if rewrite:
             Path(file).write_bytes(next(new for f, _raw, new in prepared.files if f == file))
-        raise impact.RenameWriteError(f"writing {file} failed", [file])
+        # The wording write_rename uses, which says the file still holds the new name.
+        raise impact.RenameWriteError(
+            f"cannot apply the rename of code_set 'diets': writing {file} failed "
+            f"(PermissionError), so the files already written were restored; these still hold "
+            f"the new name: {file}",
+            [file],
+        )
 
     monkeypatch.setattr(impact, "write_rename", fail)
 
@@ -1042,6 +1046,48 @@ def test_rename_write_with_an_unrestored_but_unchanged_reference_moves_the_code_
     with pytest.raises(WiringError, match="moved back to codesets/diets.csv"):
         codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
     assert sorted(os.listdir(cs_dir)) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_moved_back_after_a_reread_does_not_say_a_file_holds_the_new_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the re-read finds the reported file unchanged, the write's own text, which says it
+    still holds the new name and carries its host path, is false: the error says the file names
+    the old table, config-relative, and that the pair moved back."""
+    _with_referrers(tmp_path)
+    _unrestored_write(monkeypatch, rewrite=False)
+    with pytest.raises(WiringError) as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    message = str(err.value)
+    assert "still hold the new name" not in message
+    assert str(tmp_path) not in message
+    assert "still read as before the rename and name 'diets': mod_a.py." in message
+    assert message.endswith("moved back to codesets/diets.csv and codesets/diets.policy.toml")
+
+
+def test_rename_interrupted_while_rereading_an_unrestored_reference_logs_and_keeps_the_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An interrupt during the re-read cannot tell which name the reference holds, so the pair
+    stays under the new name and the ERROR log says where each file is, config-relative."""
+    from messagefoundry.config import impact
+
+    cs_dir = _with_referrers(tmp_path)
+    _unrestored_write(monkeypatch, rewrite=True)
+
+    def interrupt(_prepared: object) -> list[str]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(impact, "rewritten_files", interrupt)
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.config.codeset_edit"),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(os.listdir(cs_dir)) == ["meals.csv", "meals.policy.toml"]
+    assert "stays as codesets/meals.csv and codesets/meals.policy.toml" in caplog.text
+    assert "may name 'meals': mod_a.py; these name 'diets': mod_b.py" in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 def test_rename_move_back_names_the_sidecar_too(

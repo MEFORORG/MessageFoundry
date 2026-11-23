@@ -284,11 +284,38 @@ def rename_code_set(
         try:
             rewritten = len(impact.write_rename(prepared))
         except impact.RenameWriteError as exc:
-            # A file the write could not restore, read again: one that holds the bytes the plan
-            # read names the old table after all, and one that cannot be read counts as left,
-            # as after an interrupt.
-            unrestored = set(exc.unrestored)
-            still_new = [f for f in impact.rewritten_files(prepared) if f in unrestored]
+            # The write's own text is true only when it restored every file; otherwise the files
+            # it names are read again below, and the message says what that read found.
+            cause = str(exc)
+            still_new: list[str] = []
+            if exc.unrestored:
+                # A file the write could not restore, read again: one that holds the bytes the
+                # plan read names the old table after all, and one that cannot be read counts as
+                # left, as after an interrupt.
+                unrestored = set(exc.unrestored)
+                try:
+                    still_new = [f for f in impact.rewritten_files(prepared) if f in unrestored]
+                except BaseException:
+                    # Interrupted before the read could tell: the table stays where a reported
+                    # file may read it, and the log says where each file is.
+                    left, others = _reference_split(config_dir, prepared, exc.unrestored)
+                    _log.error(
+                        "code set rename interrupted while reading its references again: the "
+                        "code set stays as %s; these were not restored and may name %r: %s; "
+                        "these name %r: %s",
+                        _pair(dest, had_sidecar),
+                        new,
+                        left,
+                        old,
+                        others,
+                    )
+                    raise
+                cause = (
+                    f"cannot rename code set {old!r} to {new!r}: a reference write failed "
+                    f"({_cause_name(exc)}); the files it reported unrestored still read as before "
+                    f"the rename and name {old!r}: "
+                    f"{_reference_split(config_dir, prepared, exc.unrestored)[0]}"
+                )
             if still_new:
                 # A reference that may be left naming the new table would lose it to a move back,
                 # so the code set stays. The message names the files config-relative, and the
@@ -309,10 +336,10 @@ def rename_code_set(
             except _SplitPairError as back:
                 # Its text ends with where each file is.
                 raise WiringError(
-                    f"{exc}. Moving the code set back then failed ({back}), while its references "
-                    f"still name {old!r}: put it back as {home} by hand"
+                    f"{cause}. Moving the code set back then failed ({back}), while its "
+                    f"references still name {old!r}: put it back as {home} by hand"
                 ) from exc
-            raise WiringError(f"{exc}. The code set was moved back to {home}") from exc
+            raise WiringError(f"{cause}. The code set was moved back to {home}") from exc
         except BaseException:
             # An interrupt (Ctrl-C, SystemExit) or an unexpected error. write_rename restores only
             # what was cut off inside a write, so an interrupt after a write returned, or while
