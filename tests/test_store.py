@@ -307,8 +307,8 @@ def test_secure_file_carries_explicit_denies_first_and_drops_inherited_and_full_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # What the one write carries over, read from the file's current list: explicit denies (first,
-    # in canonical order), and an explicit OWNER RIGHTS allow that withholds WRITE_DAC. Dropped:
-    # every other allow, every inherited entry, and an OWNER RIGHTS allow that grants WRITE_DAC,
+    # in canonical order), and an explicit OWNER RIGHTS allow that lacks READ_CONTROL or WRITE_DAC.
+    # Dropped: every other allow, every inherited entry, and an OWNER RIGHTS allow holding both,
     # because without it the owner keeps only READ_CONTROL and WRITE_DAC, which is no wider.
     from pathlib import Path
 
@@ -325,8 +325,33 @@ def test_secure_file_carries_explicit_denies_first_and_drops_inherited_and_full_
     captured = _capture_dacl_writes(monkeypatch, current=current)
     store_mod._secure_file(Path("store.db"))
     assert captured == [
-        ("store.db", f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})(A;;FR;;;OW){oa_read}{oa_full}", True)
+        (
+            "store.db",
+            f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})(A;;FR;;;OW)(A;;WD;;;OW){oa_read}{oa_full}",
+            True,
+        )
     ]
+
+
+@_windows_only
+def test_secure_file_keeps_an_owner_rights_entry_that_withholds_read_control(tmp_path) -> None:
+    # An OWNER RIGHTS allow of WRITE_DAC alone leaves the owner without READ_CONTROL, which
+    # `icacls /grant:r` kept. Dropping it would give the owner READ_CONTROL back. RED before: only
+    # an entry lacking WRITE_DAC was carried, so this one was dropped.
+    import messagefoundry.store.store as store_mod
+    from tests._win_acl import folder_granting, protected_entries
+
+    sid = store_mod._current_user_sid()
+    assert sid is not None
+    path = folder_granting(tmp_path / "store", sid) / "seeded.db"
+    path.write_bytes(b"x")
+    seeded = store_mod._set_security_from_sddl(
+        path, f"D:P(A;;FA;;;{sid})(A;;WD;;;OW)(A;;FR;;;WD)", protected=True
+    )
+    assert seeded.failure is None and seeded.dacl_status == 0, seeded
+    store_mod._secure_file(path)
+    sddl, _, entries = protected_entries(path)
+    assert entries == [("A", "", "FA", sid), ("A", "", "WD", "S-1-3-4")], sddl
 
 
 @_windows_only

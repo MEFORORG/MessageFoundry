@@ -9156,7 +9156,9 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     keeps that owner access, or what a carried OWNER RIGHTS entry leaves it. Where the current list
     cannot be read or parsed, or the write fails other than by access denied, the kept icacls
     rewrite below runs instead, and it keeps every explicit entry, other principals' allows
-    included. Each of these is **logged** (STORE-2). A restriction that is skipped, or refused with
+    included. For an unreadable list that is a deliberate choice: it is what the code before this
+    one-list write did, and the bare list, the other option, would drop a deny or a narrowing OWNER
+    RIGHTS entry it cannot see, so neither is strictly safer. Each of these is **logged** (STORE-2). A restriction that is skipped, or refused with
     access denied, leaves the file's access list as it was.
 
     ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
@@ -9224,33 +9226,49 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
 #: An SDDL right that includes WRITE_DAC: file all, generic all, key all (the renderer may pick
 #: it for a file's mask), or WRITE_DAC itself.
 _SDDL_RIGHTS_WITH_WRITE_DAC = frozenset({"FA", "GA", "KA", "WD"})
+#: An SDDL right that includes READ_CONTROL: READ_CONTROL itself, and each file or generic right,
+#: since a file's generic mapping and each FILE_GENERIC_* right hold it (and key all).
+_SDDL_RIGHTS_WITH_READ_CONTROL = frozenset(
+    {"RC", "FA", "FR", "FW", "FX", "GA", "GR", "GW", "GX", "KA"}
+)
 _WRITE_DAC = 0x40000
+_READ_CONTROL = 0x20000
 _GENERIC_ALL = 0x10000000
+#: GENERIC_ALL, GENERIC_EXECUTE, GENERIC_WRITE and GENERIC_READ: each maps to READ_CONTROL on a file.
+_GENERIC_ANY = 0xF0000000
 #: OWNER RIGHTS, as an SDDL alias and as a SID.
 _OWNER_RIGHTS = frozenset({"OW", "S-1-3-4"})
 _ERROR_ACCESS_DENIED = 5
 
 
-def _grants_write_dac(rights: str) -> bool:
-    """Does the upper-cased SDDL ``rights`` field include WRITE_DAC? A field this cannot read
+def _grants_owner_implicit_rights(rights: str) -> bool:
+    """Does the upper-cased SDDL ``rights`` field include both READ_CONTROL and WRITE_DAC, the
+    access Windows gives an owner when no OWNER RIGHTS entry applies? A field this cannot read
     answers ``False``, so the entry is kept, as ``icacls /grant:r`` kept it."""
     if rights.startswith("0X"):
         try:
-            return bool(int(rights, 16) & (_WRITE_DAC | _GENERIC_ALL))
+            mask = int(rights, 16)
         except ValueError:
             return False
-    return any(rights[i : i + 2] in _SDDL_RIGHTS_WITH_WRITE_DAC for i in range(0, len(rights), 2))
+        return bool(mask & (_WRITE_DAC | _GENERIC_ALL)) and bool(
+            mask & (_READ_CONTROL | _GENERIC_ANY)
+        )
+    tokens = {rights[i : i + 2] for i in range(0, len(rights), 2)}
+    return bool(tokens & _SDDL_RIGHTS_WITH_WRITE_DAC) and bool(
+        tokens & _SDDL_RIGHTS_WITH_READ_CONTROL
+    )
 
 
 def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None:
     """The explicit entries of ``sddl`` that :func:`_secure_file`'s one list carries over, as SDDL
     ACE text: ``(denies, owner_rights)``. ``None`` when the list is not plainly parseable.
 
-    A deny is kept because dropping it widens access. Without any OWNER RIGHTS entry the owner
-    holds READ_CONTROL and WRITE_DAC whatever the list says, so an OWNER RIGHTS entry is kept when
-    it may leave the owner less: an allow that withholds WRITE_DAC, and every object allow (``OA``),
-    which on a file grants the owner nothing while still removing that implicit access (measured).
-    A plain allow that grants WRITE_DAC is dropped, which leaves the owner no more than it had.
+    A deny is kept because ``icacls /grant:r`` kept it; dropping one widens access for a principal
+    the new list allows, this account or the owner. Without any OWNER RIGHTS entry the owner holds
+    READ_CONTROL and WRITE_DAC whatever the list says, so an OWNER RIGHTS entry is kept when it may
+    leave the owner less: a plain allow that lacks READ_CONTROL or WRITE_DAC, and every object allow
+    (``OA``), which on a file grants the owner nothing while still removing that implicit access
+    (measured). A plain allow holding both is dropped, which leaves the owner its implicit rights.
     Inherited entries are not kept. The ACE text is copied as written, so an object entry keeps its
     GUIDs. A null DACL carries nothing, so the bare list is written over it."""
     start = sddl.find("D:")
@@ -9275,7 +9293,7 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
         if kind in _SDDL_DENY_TYPES:
             denies.append(f"({text})")
         elif ace_sid in _OWNER_RIGHTS and (
-            kind == "OA" or (kind == "A" and not _grants_write_dac(rights))
+            kind == "OA" or (kind == "A" and not _grants_owner_implicit_rights(rights))
         ):
             owner_rights.append(f"({text})")
     return denies, owner_rights

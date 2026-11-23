@@ -276,11 +276,13 @@ see its *What it widens* and *Left open*.
   shares one security descriptor, so once the published store is restricted the staged link carries the
   same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** built where the
   write succeeds: for these callers `_secure_file` now writes one protected DACL whole, granting the
-  account the process runs as, so explicit allows for other principals are removed too. It carries over
-  the explicit entries whose loss would widen access, which the icacls rewrite kept: denies, and OWNER
-  RIGHTS entries that may leave the owner less than its implicit access. On some failures it runs the
-  icacls rewrite instead, which keeps every explicit entry, other principals' allows included. The
-  `_secure_file` docstring states which entries and which failures.
+  account the process runs as, and removes explicit allows for other principals, with one kind kept:
+  an OWNER RIGHTS allow that narrows the owner, holding less than the READ_CONTROL and WRITE_DAC Windows
+  otherwise gives an owner. Dropping that entry would hand the owner those implicit rights back, so it
+  is carried, and it is an explicit allow for the file's owner. Explicit denies are carried too, as the
+  icacls rewrite kept them. On some failures it runs the icacls rewrite instead, which keeps every
+  explicit entry, other principals' allows included. The `_secure_file` docstring states which entries
+  and which failures.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 
@@ -316,8 +318,9 @@ replaces only the principals it names (measured while building this); that preda
 **AMENDED 2026-11-23:** this rewrite is unchanged for the store trio, and for a config file
 another account owns whose list writes all failed. At least the DR and restore staging callers and
 the config editors' fallback for a file the editing account owns now get the one protected DACL
-`_secure_file` writes, as the amendment above states, so where that write succeeds no other
-principal's explicit allow is left on those files.
+`_secure_file` writes, as the amendment above states, so where that write succeeds the only
+explicit allows left on those files are this account's and any OWNER RIGHTS entry that narrows the
+owner.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.
 
