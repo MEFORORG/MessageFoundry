@@ -97,7 +97,8 @@ def _run(
 
 
 _BOTH = {"server.crt": b"cert", "server.key": b"key"}
-# Assembled at run time so no complete private-key header sits in source for a secret scanner.
+# Split in source so a secret scanner reading the source sees no complete private-key header.
+# CPython folds the concatenation at compile time, so the bytecode still holds the whole header.
 _ENCRYPTED_KEY_HEADER = b"-----BEGIN " + b"ENCRYPTED PRIVATE KEY-----\n"
 
 
