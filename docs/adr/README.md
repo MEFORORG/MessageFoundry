@@ -43,7 +43,7 @@ what is withheld and what you can request.
 | [0006](0006-external-data-lookups.md) | External data lookups for transforms (reference enrichment) | Accepted; Tier 1 (file + database sources) built — Amended 2026-07-16: reference sets implemented on SQL Server (BACKLOG #235, Plan-12 `store-235-flip`) |
 | [0007](0007-gui-manageable-connections-toml.md) | GUI-manageable connections as a config-as-data TOML artifact | Accepted (2026-06-13) — **built**: Phases 1-3 plus the 2026-07-19 flag amendment (reversed by the 2026-10-31 amendment, BACKLOG #2623), recorded 2026-09-09; this cell read "Proposed" through the whole build. Phase 4's fan-out re-port sits outside this repository and is not claimed |
 | [0008](0008-cluster-observability-api.md) | Read-only cluster observability API (`/cluster/status` + `/cluster/nodes`) | Accepted (ratified-on-build; built) |
-| [0009](0009-run-scoped-context-providers.md) | Run-scoped context providers | Accepted |
+| [0009](0009-run-scoped-context-providers.md) | Run-scoped context providers | Accepted — Amended 2026-11-23: `run_contexts` refuses an unknown phase (BACKLOG #5780) |
 | [0010](0010-handler-callable-db-lookup.md) | Handler-callable live database lookup (`db_lookup`) | Accepted |
 | [0011](0011-timer-scheduled-source.md) | Timer source (scheduled synthetic message emission) | Proposed (built) — Amended 2026-07-17: cron/calendar next-fire built, the reserved `cron_expression` deferral lifted (pure-stdlib 5-field evaluator, no new dep; BACKLOG #160, lane `dg-s4`) |
 | [0012](0012-x12-edi-codec.md) | X12 EDI codec — tolerant codec + raw-framed transport | Accepted (built) |

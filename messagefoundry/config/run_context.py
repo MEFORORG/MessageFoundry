@@ -35,7 +35,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, get_args
 
 from messagefoundry.config.active_environment import activated as _environment_activated
 from messagefoundry.config.code_sets import activated as _code_sets_activated
@@ -58,12 +58,13 @@ __all__ = [
 
 # The two points a router/transform runs. Routers see code sets / references / environment; transforms
 # additionally see committed transform state (state is transform-only — see the built-in phases below).
-# ``RunPhase`` lets strict mypy refuse a bad phase at a call site (BACKLOG #5780); run_contexts still
-# checks at run time, for a caller that reaches it with a plain ``str``.
+# ``RunPhase`` lets strict mypy refuse a bad phase at a ``run_contexts`` call site (BACKLOG #5780), and
+# it is the one source of ``_PHASES``. run_contexts still checks at run time, for a caller that reaches
+# it with a plain ``str``; register_run_context checks its ``phases`` at import.
 RunPhase = Literal["router", "transform"]
 ROUTER: Final = "router"
 TRANSFORM: Final = "transform"
-_PHASES: frozenset[str] = frozenset({ROUTER, TRANSFORM})
+_PHASES: frozenset[str] = frozenset(get_args(RunPhase))
 
 
 @dataclass(frozen=True)
