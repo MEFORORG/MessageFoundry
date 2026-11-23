@@ -1695,7 +1695,8 @@ and in the web console (BACKLOG #5559) at least these. `GET /ui/users` answers 2
 failing account by its id alone; to a caller holding `users:manage` it links that account's
 delete to `GET /ui/users/{user_id}/delete-confirm`, which, for a record its checked read refuses
 with 423, shows a confirmation naming the id alone rather than the 423 this paragraph gives a
-failing record.
+failing record. When the id in its path is the caller's own, that page shows "You cannot delete
+your own account." and no delete form.
 `GET /ui/users/{user_id}`,
 `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
@@ -1709,7 +1710,9 @@ per account and rate-limited, in each engine process: only the first refusal of 
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
 inside that interval, from any of these routes or any other reader of the same account in that
-process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
+process, answers 423 or lists the account as failed and adds no row and no alert;
+`GET /ui/users/{user_id}/delete-confirm` is the exception to the 423, since it catches that 423
+and answers 200 with its confirmation page. Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
@@ -1739,7 +1742,8 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-answered the same way, a 423 or listed as failed, but reported under
+answered the same way, a 423 or listed as failed, or by `GET /ui/users/{user_id}/delete-confirm`
+with 200 and its confirmation page, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
 lists nothing, pages `authority-seal-transit` and writes no audit row.

@@ -509,7 +509,29 @@ _CONSOLE_SENTENCES = {
         r"rather than answering 423\. What those pages show and log when that read fails is "
         r"stated in the docstring of `_shown_name`"
     ),
+    # Lander hold 7091484059: the confirmation catches the 423 and answers 200, so the two
+    # sentences that say how a refusal is answered name it, and the page's self case is stated.
+    "the interval sentence names the confirmation's 200": (
+        r"answers 423 or lists the account as failed and adds no row and no alert; "
+        r"`GET /ui/users/\{user_id\}/delete-confirm` is the exception to the 423, since it "
+        r"catches that 423 and answers 200 with its confirmation page"
+    ),
+    "the Vault transit sentence names the confirmation's 200": (
+        r"a 423 or listed as failed, or by `GET /ui/users/\{user_id\}/delete-confirm` with 200 "
+        r"and its confirmation page, but reported under `integrity\.authority_seal_unverifiable`"
+    ),
+    "the confirmation for the caller's own account has no form": (
+        r"When the id in its path is the caller's own, that page shows \"You cannot delete your "
+        r"own account\.\" and no delete form"
+    ),
 }
+
+#: The two answers as main states them, unscoped: each must not stand without the confirmation's
+#: exception beside it (Lander hold 7091484059).
+_UNSCOPED = (
+    r"lists the account as failed and adds no row and no alert\. ",
+    r"a 423 or listed as failed, but reported under",
+)
 
 
 @pytest.mark.parametrize("name", sorted(_CONSOLE_SENTENCES))
@@ -525,3 +547,10 @@ def test_the_security_doc_no_longer_offers_the_delete_on_the_list_itself() -> No
     text = _SECURITY_MD.read_text("utf-8")
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     assert not re.search(r"by its id alone, with its delete\b", body, re.IGNORECASE)
+
+
+@pytest.mark.parametrize("overclaim", _UNSCOPED)
+def test_the_security_doc_does_not_state_the_423_without_the_confirmation(overclaim: str) -> None:
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert not re.search(overclaim, body, re.IGNORECASE), overclaim
