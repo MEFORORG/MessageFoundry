@@ -420,6 +420,37 @@ async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
     assert sink.undelivered == 2
 
 
+class _FailingTransport:
+    """A transport whose every send raises, as a refused webhook POST does."""
+
+    name = "webhook"
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        raise OSError("synthetic refusal")
+
+
+@pytest.mark.parametrize(
+    ("transports", "expected"),
+    [
+        pytest.param(lambda: [_HealthyEmail()], 0, id="delivered"),
+        pytest.param(lambda: [_FailingTransport()], 2, id="every-send-failed"),
+        pytest.param(lambda: [_FailingTransport(), _HealthyEmail()], 2, id="one-transport-lost-it"),
+    ],
+)
+async def test_undelivered_counts_alerts_not_delivered_rather_than_handled(
+    transports: Callable[[], list[Any]], expected: int
+) -> None:
+    """BACKLOG #5907 step 4: the drain took an alert off the count once it was handled, whether
+    or not any transport took it, so a failed send read as delivered. An alert stays counted
+    unless every transport its rule selected took it."""
+    sink = NotifierAlertSink(transports())
+    sink.start()
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    sink.connection_stopped("IB_TEST_ORU", detail="probe")
+    await asyncio.wait_for(sink.aclose(), 10.0)
+    assert sink.undelivered == expected
+
+
 async def test_a_close_cancelled_on_a_full_queue_still_stops_the_drain() -> None:
     """BACKLOG #5907: an alert notifier close cancelled while its sentinel waited on a full queue
     left the drain task delivering, so the unwind's cut did not stop it."""

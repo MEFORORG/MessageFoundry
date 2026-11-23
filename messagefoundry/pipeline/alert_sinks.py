@@ -359,7 +359,7 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     Subclasses implement :meth:`_handle` for the per-item work. It runs inside the background task,
     must push any blocking I/O off the loop (``asyncio.to_thread``), and must be **best-effort** — it
     swallows its own errors and never raises, since an exception out of ``_handle`` would kill the
-    drain loop. Items are handled one at a time; :class:`NotifierAlertSink` runs each item's sends
+    drain loop. It returns whether the item was delivered, which :attr:`undelivered` counts. Items are handled one at a time; :class:`NotifierAlertSink` runs each item's sends
     concurrently inside its :meth:`_handle` (BACKLOG #5907), and a cancel of the drain task is
     bounded as :meth:`NotifierAlertSink._cut_sends` says. A cancel does not stop a worker thread a
     send started with ``asyncio.to_thread``, so that runs on to its own timeout.
@@ -369,7 +369,8 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     def __init__(self, *, max_queue: int = _MAX_QUEUE) -> None:
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
-        # Queued or in flight, so a drain that is cut can say how many items it never delivered.
+        # Queued, in flight, or handled without being delivered, so a drain that is cut can say how
+        # many items it never delivered (BACKLOG #5907 step 4).
         self._undelivered = 0
 
     def _enqueue(self, item: _T, *, dropped: str | None) -> bool:
@@ -389,8 +390,9 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
 
     @property
     def undelivered(self) -> int:
-        """How many items are queued or being handled, a count only (BACKLOG #5907). An item whose
-        handling was cancelled stays counted."""
+        """How many items were queued and not delivered, a count only (BACKLOG #5907): those still
+        queued or being handled, and those whose handling ended without delivering them, as
+        :meth:`_handle` reports. An item whose handling was cancelled stays counted."""
         return self._undelivered
 
     def start(self) -> None:
@@ -411,12 +413,13 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
             item = await self._queue.get()
             if item is None:
                 return
-            await self._handle(item)
-            self._undelivered -= 1
+            if await self._handle(item):
+                self._undelivered -= 1
 
     @abc.abstractmethod
-    async def _handle(self, item: _T) -> None:
-        """Process one queued item (best-effort, blocking I/O off-loop). Must not raise."""
+    async def _handle(self, item: _T) -> bool:
+        """Process one queued item (best-effort, blocking I/O off-loop) and return whether it was
+        delivered. Must not raise."""
 
 
 class AlertTransport(Protocol):
@@ -1344,7 +1347,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._control_cb: ControlCallback | None = None
         self._control_tasks: set[asyncio.Task[None]] = set()
         # BACKLOG #5907: send tasks a cut drain left still running past its grace.
-        self._left_sends: set[asyncio.Task[None]] = set()
+        self._left_sends: set[asyncio.Task[bool]] = set()
         # BACKLOG #5909: set by stop_control, so a rule firing after the shutdown clear logs why.
         self._control_stopped = False
         # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
@@ -2654,7 +2657,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # connection) must never break alerting or delivery. Swallow + log metadata only (no PHI).
             log.warning("alert control_action %s for %r failed", action, target, exc_info=True)
 
-    async def _handle(self, event: dict[str, Any]) -> None:
+    async def _handle(self, event: dict[str, Any]) -> bool:
+        """Send the event to each transport its rule selected, and return whether every one of
+        them took it (BACKLOG #5907 step 4): an alert one transport lost is not counted delivered,
+        nor is one no configured transport was selected for."""
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
         # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.
@@ -2678,7 +2684,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         def drain_cancelled() -> bool:
             return drain.cancelling() > baseline
 
-        async def deliver(transport: AlertTransport) -> None:
+        async def deliver(transport: AlertTransport) -> bool:
             # A shallow copy per send: the sends run at once, some in worker threads, so a top-level
             # key a transport or the observer adds or drops cannot break a sibling iterating its own.
             # The values, recipients and context stay shared, and every transport only reads them.
@@ -2699,7 +2705,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     event.get("type"),
                     event.get("connection"),
                 )
-                return
+                return False
             except Exception as exc:
                 # Best-effort: a failing transport must not drop the event for the others, nor
                 # ever propagate into the engine. The line names the event's type and connection,
@@ -2729,13 +2735,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                         event.get("connection"),
                         exc_info=True,
                     )
-                return
+                return False
             observer = self._delivery_observer
             if observer is not None:
                 try:
                     observer(transport.name, sent)
                 except Exception:
                     log.warning("alert delivery observer failed", exc_info=True)
+            return True  # the send returned, so this transport took the alert
 
         # BACKLOG #5907: concurrently, one child task per transport the rule selected, waiting for
         # every send to end. A drain cancel is the one case bounded by _DRAIN_CANCEL_GRACE_SECONDS,
@@ -2743,7 +2750,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # stop.)
         chosen = [t for t in self._transports if targets is None or t.name in targets]
         if not chosen:
-            return
+            return False  # nothing took it: the startup cross-check refuses such a rule
         sends = [asyncio.create_task(deliver(t)) for t in chosen]
         try:
             await asyncio.wait(sends)
@@ -2751,8 +2758,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             await self._cut_sends(sends)
             raise
         escaped: list[BaseException] = []
+        delivered = True
         for transport, task in zip(chosen, sends, strict=True):
             if task.cancelled():
+                delivered = False  # not confirmed: the send may or may not have returned
                 # The drain was not cancelled, so this is a child that ended cancelled outside the
                 # send's own handler: at least a send that cancelled its own task and returned
                 # before the cancel landed, or an observer that raised CancelledError. Say so
@@ -2765,10 +2774,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 )
             elif (exc := task.exception()) is not None:
                 escaped.append(exc)  # read for every send, so the loop reports none unretrieved
+            elif not task.result():
+                delivered = False
         if escaped:
             raise escaped[0]  # what deliver let out, raised once every send has ended
+        return delivered
 
-    async def _cut_sends(self, sends: list[asyncio.Task[None]]) -> None:
+    async def _cut_sends(self, sends: list[asyncio.Task[bool]]) -> None:
         """The drain was cancelled during an event's sends (BACKLOG #5907): pass the cancel on to
         each, every repeat of it too, and wait at most :data:`_DRAIN_CANCEL_GRACE_SECONDS` for
         them to end. A send still running then is left, held and counted in one WARNING."""
@@ -2802,7 +2814,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             )
             self._left_sends.update(pending)  # held, so the loop does not drop a running task
 
-    def _settle_cut_send(self, task: asyncio.Task[None]) -> None:
+    def _settle_cut_send(self, task: asyncio.Task[bool]) -> None:
         """Done callback of a send the drain's cancel reached: release it, and read its outcome so
         the loop never reports it unretrieved. Only the exception's type is logged, since its text
         or chain can carry alert content (CLAUDE.md section 9)."""

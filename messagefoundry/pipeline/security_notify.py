@@ -794,7 +794,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # Each one swallows its own failure, so this only waits.
             await asyncio.gather(*self._recording, return_exceptions=True)
 
-    async def _handle(self, event: SecurityEvent) -> None:
+    async def _handle(self, event: SecurityEvent) -> bool:
         try:
             await asyncio.to_thread(self._send, event)
         except Exception:
@@ -813,6 +813,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # The reason only. The exception's text can quote the relay's reply or the address, and
             # even its class would tell the recipient, in their own feed, that the relay is broken.
             await self._record_undelivered(event, {"reason": "send_failed"})
+            return False
+        return True
 
     async def _record_undelivered(self, event: SecurityEvent, why: dict[str, str]) -> None:
         """Write the audit row that says this notice never left the engine (BACKLOG #2383).
