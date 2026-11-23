@@ -33,6 +33,7 @@ from tests._serviceenv_remedy import (
     ADD_BACK_MIXED,
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
+    COUNTED_ONCE,
     CREATE,
     KEEP,
     REMOVE,
@@ -295,16 +296,13 @@ def test_an_empty_value_name_is_told_to_go_and_not_to_move(
     assert not any(text in refusal for text in _VALUE_TEXT)
 
 
-_COUNTED_ONCE = (
-    "Each MEFOR_VALUE_* name is counted once, without regard to case, under the first registry "
-    "value that sets it, so remove it from every value that sets it"
-)
-
-
 @pytest.mark.parametrize(
     "pairs",
     [
         pytest.param([(_PLAIN, "MEFOR_VALUE_A="), (_EXTRA, "MEFOR_VALUE_A=")], id="empty-in-both"),
+        # Only the empty copy is told to go; the other moves.
+        pytest.param([(_PLAIN, "MEFOR_VALUE_A=1"), (_EXTRA, "mefor_value_a=")], id="mixed"),
+        # The control: a name that moves printed the clause before the fix too.
         pytest.param([(_PLAIN, "MEFOR_VALUE_A=1"), (_EXTRA, "mefor_value_a=2")], id="moving"),
     ],
 )
@@ -315,7 +313,7 @@ def test_a_duplicate_value_name_is_told_to_go_from_every_value(
     the remedy says to remove it from every value that sets it whether it moves or is only told
     to go, as origin/main does, or the copy left behind refuses the next start."""
     refusal = service_env_refusal(_read_pairs(pairs))
-    assert refusal is not None and refusal.count(_COUNTED_ONCE) == 1
+    assert refusal is not None and refusal.count(COUNTED_ONCE) == 1
 
 
 def test_an_oddly_spelled_name_told_only_to_go_gets_no_rename() -> None:
@@ -633,7 +631,9 @@ def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert REMOVE in refusal and RUNS_ON in refusal and CREATE not in refusal
-    assert KEEP not in refusal and "naming that existing path back" not in refusal
+    assert refusal.endswith(
+        f'{RUNS_ON}. [security].enforcement = "warn" does not change this refusal'
+    )
 
 
 def test_a_directory_joined_to_an_empty_pem_key_is_removed_with_it() -> None:
