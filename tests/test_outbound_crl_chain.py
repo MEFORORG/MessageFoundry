@@ -269,7 +269,7 @@ def _ech_rest(policy: TrustAnchorPolicy, settings: dict[str, object] | None = No
             },
             trust_anchor_policy=policy,
             tls_revocation_attested=True,
-            tls_revocation_attested_reason="synthetic: the sidecar checks revocation",
+            tls_revocation_attested_reason="synthetic attestation for this test",
         ),
         egress=EgressSettings(deny_by_default=False, allowed_ech_sidecar=["127.0.0.1:8123"]),
     )
@@ -293,8 +293,9 @@ def test_an_ech_rest_hop_on_the_os_roots_refuses_without_promising_a_check(
         assert "sends through its ECH sidecar (ech_sidecar)" in text
         assert "no CRL in [tls].crl_file is checked against the partner" in text
         assert OS_ROOTS_CHAIN_CHECK_REASON in text
-        assert "unset [tls].crl_check_chain, or give the connection a tls_ca_file" in text
-        assert "Neither makes the engine check the partner's revocation" in text
+        assert "To clear this refusal, unset [tls].crl_check_chain" in text
+        assert "a connection's own tls_ca_file" in text
+        assert "None of these makes the engine check the partner's revocation" in text
         assert "To chain-check" not in text
 
 
@@ -307,6 +308,18 @@ def test_an_ech_rest_hop_pinned_by_its_ca_file_builds_and_checks_no_crl(
     dest = _ech_rest(policy, {"tls_ca_file": str(two_tier.root_file)})
     opener = dest._opener  # type: ignore[attr-defined]
     assert not context_checks_revocation(opener_tls_context(opener, connector="probe"))
+
+
+def test_an_ech_rest_hop_pinned_by_its_ca_file_still_meets_the_own_crl_rule(
+    two_tier: _TwoTier, tmp_path: Path
+) -> None:
+    """The ECH hop's build still applies the chain-check refusals to the context it builds for the
+    partner: a CRL file with no CRL from the root is refused, naming the root."""
+    crl = tmp_path / "inter-crl-only.pem"
+    crl.write_bytes(two_tier.inter_crl_file.read_bytes())
+    policy = TrustAnchorPolicy(crl_file=str(crl), crl_check_chain=True)
+    with pytest.raises(ValueError, match=r"the CA\(s\) 'CN=Client Root'"):
+        _ech_rest(policy, {"tls_ca_file": str(two_tier.root_file)})
 
 
 def test_the_configuration_row_the_settings_comment_names_exists() -> None:

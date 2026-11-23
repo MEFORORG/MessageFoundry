@@ -1806,8 +1806,7 @@ at start, naming the root.
 
 **Still leaf only.** At least every outbound hop under `[tls].crl_file`. Such a hop may verify
 against the OS trust store, whose roots no CRL file names, so the start rule would refuse it.
-*(Note 2026-11-23: section 15 makes this hold only while `[tls].crl_check_chain` is unset, and
-its reason for refusing the chain check on the OS trust store replaces the one given here.)*
+*(Note 2026-11-23: section 15 amends this paragraph, its reason included.)*
 `capath=` loading stays out of scope, for the reason the out-of-scope bullet gives.
 
 Pinned by `tests/test_inbound_listener_crl_chain.py` and `tests/test_api_tls_client_trust.py`.
