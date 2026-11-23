@@ -2612,10 +2612,12 @@ _PASSTHROUGH_DECORATORS: Final = frozenset(
 )
 #: Decorators that may be called first, the call returning the decorator itself.
 _CALLED_DECORATORS: Final = frozenset({"functools.wraps", "functools.lru_cache", "pytest.fixture"})
-#: Shape decorators that hand a call on to what they wrap. ``singledispatch`` returns a plain
-#: function, the kind of object a bare def makes; ``singledispatchmethod`` returns a
-#: ``singledispatchmethod`` descriptor, not a function. :attr:`_Reading.outer` reads both as
-#: :data:`_UNNAMED`.
+#: Shape decorators whose result picks what to call from an argument's type: an implementation
+#: registered for it, or else what they wrap. ``singledispatch`` returns a plain function, the kind
+#: of object a bare def makes. ``singledispatchmethod`` returns a ``singledispatchmethod``
+#: descriptor, which is not callable, so a module-level one cannot be called at all; read through a
+#: class or an instance, it gives a callable that dispatches that way. :attr:`_Reading.outer` reads
+#: both as :data:`_UNNAMED`.
 _DELEGATING_DECORATORS: Final = frozenset(
     {"functools.singledispatch", "functools.singledispatchmethod"}
 )
@@ -3225,21 +3227,36 @@ def _signature_clause(
 
 #: What a name is bound to with each shape decorator outermost, for :func:`_outer_clause`.
 _OUTER_BINDS: Final = {
-    "builtins.property": "a property, which is not callable and runs its getter on every read",
+    "builtins.property": (
+        "a property, which is not callable, and which runs its getter on each read through an "
+        "instance of a class that has it as an attribute, and on no read of it at module level"
+    ),
     "builtins.staticmethod": "a staticmethod, whose callers pass every parameter",
     "builtins.classmethod": (
         "a classmethod, which a call through a class passes the class first, and which outside "
         "a class is not callable"
     ),
-    "functools.cache": "a cache wrapper, whose call results are cached",
+    "functools.cache": (
+        "a cache wrapper, whose call results are cached, where what it wraps is callable; the "
+        "decoration raises TypeError where it is not"
+    ),
     "functools.lru_cache": (
-        "a cache wrapper, which caches call results up to its maxsize, and none at maxsize=0"
+        "a cache wrapper, which caches call results up to its maxsize, and none at maxsize=0, "
+        "where what it wraps is callable; the decoration raises TypeError where it is not"
     ),
     "functools.cached_property": (
-        "a cached_property, which is not callable and runs its function once per instance"
+        "a cached_property, which is not callable, and which runs its function on a read through "
+        "an instance of a class that has it as an attribute, where that instance has a __dict__ "
+        "holding no result for it yet, and on no read of it at module level"
     ),
-    "contextlib.contextmanager": "a function whose call returns a context manager",
-    "contextlib.asynccontextmanager": "a function whose call returns an async context manager",
+    "contextlib.contextmanager": (
+        "a function whose call passes its arguments to what it wraps and returns a context "
+        "manager over the result, raising where that call raises"
+    ),
+    "contextlib.asynccontextmanager": (
+        "a function whose call passes its arguments to what it wraps and returns an async "
+        "context manager over the result, raising where that call raises"
+    ),
     "typing.overload": "an overload stub, which raises NotImplementedError when called",
     "typing_extensions.overload": "an overload stub, which raises NotImplementedError when called",
 }
@@ -3422,11 +3439,14 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
     if mismatch is not None:
         findings.problems.append(
             f"{cell_id}: absence claim PROVE-ERROR — the mutation {mismatch}. "
-            "Applied, that changes what a call of the name gets -- a TypeError, a coroutine, "
-            "generator or other object where a value was expected, or, where only the shape "
+            "A difference of this kind can change what a call of the name gets -- a TypeError, a "
+            "coroutine, generator or other object where a value was expected, or, where the shape "
             "decorators differ, a different binding, such as results no longer cached -- so the "
             "observable may go red for that change and not for the reintroduction — a wrecking "
-            "ball wearing the shape of a surgical proof. Copy the live signature and decorators; "
+            "ball wearing the shape of a surgical proof. Some differences refused here change "
+            "nothing a call can see, at least a different name for a positional-only, *args or "
+            "**kwargs parameter, and a staticmethod outside a class; this screen does not tell "
+            "those apart and refuses them too. Copy the live signature and decorators; "
             "the mutation lives in a different repository from the symbol it shadows, so nothing "
             "else keeps the two in step"
         )
