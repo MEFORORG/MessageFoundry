@@ -2336,7 +2336,8 @@ def test_list_operations_prints_each_sites_verdict(
 
 def test_an_out_of_scope_label_variant_is_judged_at_its_own_site() -> None:
     # Added item 4: origin/main confirmed by callee file-wide, so the in-scope sha256 call in f kept
-    # green the md5 variant that only the first-party ``hmac`` in g reaches.
+    # green the md5 variant in g, which the union reading gives through the stdlib ``hmac`` that g's
+    # first-party ``hmac`` shadows.
     gate = _gate()
     ops = gate.crypto_operations
     source = (
@@ -2364,6 +2365,9 @@ def test_the_positive_control_reds_when_judgment_is_file_wide(
     assert gate.operations_self_test() == []
     real = gate._site_key
     monkeypatch.setattr(gate, "_site_key", lambda op: (*real(op)[:1], 0, real(op)[2]))
+    assert gate.operations_self_test()
+    # A key that drops the callee lets an in-scope call confirm another on its line.
+    monkeypatch.setattr(gate, "_site_key", lambda op: (*real(op)[:2], ""))
     assert gate.operations_self_test()
 
 

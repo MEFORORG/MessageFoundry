@@ -2307,11 +2307,13 @@ _SELF_TEST_SOURCES: dict[str, str] = {
     # BACKLOG #5578: the same shape with a call in other(). The union reading gives hashlib.sha1
     # there; the scope-aware reading knows other()'s hashlib is mylib's, so the token is marked.
     # The hashlib.new label variant in other() is marked at its own site, though a() confirms the
-    # callee hashlib.new (added item 4).
+    # callee hashlib.new, and the in-scope hmac.compare_digest on its line confirms neither of the
+    # line's other calls (added item 4).
     _SELF_TEST_SCOPED_PATH: (
-        "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b), hashlib.new('md5', b)\n\n\n"
+        "import hashlib\nimport hmac\n\n\n"
+        "def a(b):\n    return hashlib.md5(b), hashlib.new('md5', b)\n\n\n"
         "def other(b):\n    from mylib import thing as hashlib\n"
-        "    return hashlib.sha1(b), hashlib.new('sha1', b)\n"
+        "    return hashlib.sha1(b), hashlib.new('sha1', b), hmac.compare_digest(b, b)\n"
     ),
 }
 _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
@@ -2339,7 +2341,13 @@ _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "scripts/st/user.py": frozenset({"hash:via scripts.st.helper"}),
     "selftest/shadow.py": frozenset({"hash:hashlib.md5"}),
     _SELF_TEST_SCOPED_PATH: frozenset(
-        {"hash:hashlib.md5", "hash:hashlib.sha1", "hash:hashlib.new[md5]", "hash:hashlib.new[sha1]"}
+        {
+            "hash:hashlib.md5",
+            "hash:hashlib.sha1",
+            "hash:hashlib.new[md5]",
+            "hash:hashlib.new[sha1]",
+            "compare:hmac.compare_digest",
+        }
     ),
 }
 #: What the gate's diff reads for :data:`_SELF_TEST_SCOPED_PATH` once each token is judged.
@@ -2349,6 +2357,7 @@ _SELF_TEST_SCOPED_JUDGED = frozenset(
         "hash:hashlib.new[md5]",
         "hash:hashlib.sha1 (out of scope)",
         "hash:hashlib.new[sha1] (out of scope)",
+        "compare:hmac.compare_digest",
     }
 )
 
@@ -2710,8 +2719,9 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
         if weak:
             reword = (
                 ". A token marked (not code) is one the lexer reads as text, not code. A real call "
-                "can be marked too (THE RESIDUAL in crypto_operations.py says when), and it needs "
-                "node:crypto as above; only if it is prose, reword it so it does not spell the call"
+                "can be marked too (THE RESIDUAL in crypto_operations.py says when), and it still "
+                "needs a strong source; only if it is prose, reword it so it does not spell the "
+                "call"
                 if any(token.endswith(NOT_CODE) for token in weak)
                 else ""
             )
