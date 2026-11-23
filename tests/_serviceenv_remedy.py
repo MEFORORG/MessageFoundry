@@ -60,11 +60,11 @@ REMOVE_OTHER = "and remove any other entry that sets MEFOR_SECRETS_DIRECTORY and
 
 #: The clause printed wherever a string in AppEnvironmentExtra holds a line that sets the
 #: directory and a non-blank line that does not. It asks for each directory line to come out of
-#: every such string no step above removes, and removes no such string whole (the Lander's
-#: hold on PR 3142, comment 7090314503).
+#: every such string, keeping each other line no step above removes, and removes no such
+#: string whole (the Lander's hold on PR 3142, comment 7090314503).
 TAKE_LINE = (
     "and take each line that sets MEFOR_SECRETS_DIRECTORY out of any other entry that holds "
-    "other lines too and that no step above says to remove, keeping its other lines"
+    "other lines too, keeping each other line no step above says to remove"
 )
 
 #: Printed with TAKE_LINE, at the end of the pass-back, so the lines it takes out are not passed

@@ -104,7 +104,8 @@ _INLINE_PEM_NAMES = frozenset({"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY"})
 #: The values that carry a service's environment: NSSM's two under the service's ``Parameters``
 #: key (``AppEnvironment`` replaces the environment, ``AppEnvironmentExtra`` adds to it), and the
 #: Service Control Manager's ``Environment`` on the service's own key.
-NSSM_ENVIRONMENT_VALUES: tuple[str, ...] = ("AppEnvironment", "AppEnvironmentExtra")
+NSSM_EXTRA_VALUE = "AppEnvironmentExtra"
+NSSM_ENVIRONMENT_VALUES: tuple[str, ...] = ("AppEnvironment", NSSM_EXTRA_VALUE)
 SCM_ENVIRONMENT_VALUE = "Environment"
 
 #: What the Windows probe puts before each NSSM value's name in the label of an entry it reads.
@@ -114,7 +115,7 @@ _NSSM_LABEL_PREFIX = "Parameters\\"
 #: step says to read with ``nssm get`` and pass back whole. Its removal clauses read this list
 #: only, so they never name an entry the rest of that step does not cover (the Lander's hold
 #: on PR 3142, comment 7090314503).
-_EXTRA_LIST = f"{_NSSM_LABEL_PREFIX}{NSSM_ENVIRONMENT_VALUES[1]}"
+_EXTRA_LIST = f"{_NSSM_LABEL_PREFIX}{NSSM_EXTRA_VALUE}"
 
 _NSSM_IMAGE = "nssm.exe"
 
@@ -203,8 +204,8 @@ class ServiceEnvPosture:
     #: Whether a string in AppEnvironmentExtra sets ``MEFOR_SECRETS_DIRECTORY`` on one line and
     #: something else on another (:func:`_sets_directory_beside_more`). The remedy alone reads
     #: this: where its add-back step prints, it then says to take each directory line out of
-    #: such a string no step above removes, and to keep and pass back its other lines, never to
-    #: remove the string whole (the Lander's hold on PR 3142, comment 7090314503).
+    #: such a string and keep each other line no step above removes, never to remove the string
+    #: whole (the Lander's hold on PR 3142, comment 7090314503).
     directory_mixed_in_extra: bool = False
 
     @property
@@ -1397,12 +1398,13 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # says to pass back. Where a string there sets the directory and nothing else, it says
         # to remove every other such string, in origin/main's words narrowed to "and nothing
         # else". Where a string there holds a directory line and other lines, it says to take
-        # each directory line out of every such string no step above removes, keeping the other
-        # lines, and to leave those lines out of what it passes back; it removes no such string
-        # whole. Where a value runs on, or a string there sets only the directory, the entries
-        # it says to pass back also leave out the strings this step and the steps above say to
-        # remove, which may hold the refused value or set the directory (the Lander's holds on
-        # PR 3142, comments 7088102723, 7088663896, 7089064404, 7089400537 and 7090314503).
+        # each directory line out of every such string, keeping each other line no step above
+        # removes, and to leave the lines it takes out of what it passes back; it removes no
+        # such string whole. Where a value runs on, or a string there sets only the directory,
+        # the entries it says to pass back also leave out the strings this step and the steps
+        # above say to remove, which may hold the refused value or set the directory (the
+        # Lander's holds on PR 3142, comments 7088102723, 7088663896, 7089064404, 7089400537
+        # and 7090314503).
         none_set = (others or values) and not posture.directory_in_lists
         add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if none_set else "") + (
             f"Where install-service.ps1 already made the secrets directory, add "
@@ -1416,8 +1418,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         if posture.directory_mixed_in_extra:
             add_back += (
                 f"and take each line that sets {_DIRECTORY_VARIABLE} out of any other entry that "
-                "holds other lines too and that no step above says to remove, keeping its other "
-                "lines, "
+                "holds other lines too, keeping each other line no step above says to remove, "
             )
         add_back += (
             "before any re-run of the installer, which refuses an existing directory the "

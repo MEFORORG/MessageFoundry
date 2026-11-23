@@ -460,15 +460,16 @@ def test_a_string_that_sets_the_directory_and_more_has_its_directory_line_taken_
 
 def test_a_string_a_value_runs_on_into_is_left_to_the_run_on_step() -> None:
     """The review of the repair for the Lander's hold on PR 3142, comment 7090314503, finding
-    1: the store password runs on into a string that holds a directory line and a PATH line.
-    The run-on step says to remove that string, so the take-line clause leaves out any string a
-    step above says to remove, rather than telling the operator to keep its other lines."""
+    1, and round 2's finding 3: the store password runs on into a string that holds a
+    directory line and a PATH line. The run-on step says to remove that string, so the
+    take-line clause keeps only the other lines no step above says to remove, rather than
+    telling the operator to keep all of them."""
     refusal = service_env_refusal(
         _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"])
     )
     assert refusal is not None
     assert refusal.count(RUNS_ON) == 1 and refusal.count(TAKE_LINE) == 1
-    assert "that no step above says to remove" in TAKE_LINE
+    assert "keeping each other line no step above says to remove" in refusal
     assert refusal.count(WIDER) == 1 and refusal.count(TAKE_OUT) == 1
     assert refusal.index(RUNS_ON) < refusal.index(TAKE_LINE)
 
