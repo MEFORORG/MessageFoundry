@@ -589,6 +589,115 @@ def test_rename_missing_args(tmp_path: Path) -> None:
         codeset_edit.rename_code_set(tmp_path, "x", "", validate=_validate)
 
 
+# --- the #162 policy sidecar travels with its table (BACKLOG #5776) -----------
+
+
+def _with_policy(config_dir: Path, name: str) -> Path:
+    codeset_edit.upsert_code_set(
+        config_dir, name, ["code", "value"], [["A", "Apple"]], validate=_validate
+    )
+    sidecar = _codesets(config_dir) / f"{name}.policy.toml"
+    sidecar.write_text('kind = "passthrough"\n', encoding="utf-8")
+    return sidecar
+
+
+def test_rename_moves_the_policy_sidecar_with_the_table(tmp_path: Path) -> None:
+    """A rename that left ``diets.policy.toml`` behind dropped the renamed table to the NONE policy
+    and left the sidecar loading as a standalone code set named ``diets.policy``."""
+    _with_policy(tmp_path, "diets")
+    codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["meals.csv", "meals.policy.toml"]
+    sets = load_code_sets(cs_dir)
+    assert sorted(sets) == ["meals"]
+    assert sets["meals"].policy.kind.value == "passthrough"
+
+
+def test_rename_refuses_a_target_whose_policy_sidecar_name_is_taken(tmp_path: Path) -> None:
+    """A ``meals.policy.toml`` with no ``meals`` table is a standalone code set; a rename to
+    ``meals`` would silently turn it into the renamed table's policy, or overwrite it with the
+    moving sidecar. Refused, with nothing moved."""
+    _with_policy(tmp_path, "diets")
+    cs_dir = _codesets(tmp_path)
+    taken = cs_dir / "meals.policy.toml"
+    taken.write_text('A = "Apple"\n', encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in cs_dir.iterdir()}
+    with pytest.raises(WiringError, match=r"meals\.policy\.toml"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert {p.name: p.read_bytes() for p in cs_dir.iterdir()} == before
+
+
+def test_rename_refuses_a_taken_sidecar_name_even_when_the_source_has_no_policy(
+    tmp_path: Path,
+) -> None:
+    """Without a sidecar of its own the renamed table would still adopt the standalone
+    ``meals.policy.toml`` as its policy, and that code set would vanish."""
+    codeset_edit.upsert_code_set(
+        tmp_path, "diets", ["code", "value"], [["A", "Apple"]], validate=_validate
+    )
+    cs_dir = _codesets(tmp_path)
+    (cs_dir / "meals.policy.toml").write_text('A = "Apple"\n', encoding="utf-8")
+    with pytest.raises(WiringError, match=r"meals\.policy\.toml"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "meals.policy.toml"]
+
+
+def test_rename_validates_the_table_before_moving_it(tmp_path: Path) -> None:
+    """The injected ``validate`` is the loader's word on the table and its policy, and a refusal
+    moves nothing (BACKLOG #5776, S10-52: the callback was accepted and never called)."""
+    _with_policy(tmp_path, "diets")
+    seen: list[Path] = []
+
+    def refuse(path: Path) -> None:
+        seen.append(path)
+        raise WiringError("refused by validate")
+
+    cs_dir = _codesets(tmp_path)
+    with pytest.raises(WiringError, match="refused by validate"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=refuse)
+    assert [p.name for p in seen] == ["diets.csv"]
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_moves_the_sidecar_back_when_the_referent_rewrite_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rollback after a failed referent write puts the table AND its sidecar back."""
+    from messagefoundry.config import impact
+
+    _with_policy(tmp_path, "diets")
+
+    def fail(_prepared: object) -> list[object]:
+        raise impact.RenameWriteError("write failed", [])
+
+    monkeypatch.setattr(impact, "write_rename", fail)
+    with pytest.raises(WiringError, match="moved back"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_moves_the_table_back_when_the_sidecar_move_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table and its policy never end up under different names."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.replace_generated
+
+    def refuse_sidecar(staged: Path, live: Path) -> None:
+        if staged.name.endswith(".policy.toml"):
+            raise PermissionError(13, "denied")
+        real(staged, live)
+
+    monkeypatch.setattr(restricted_file, "replace_generated", refuse_sidecar)
+    with pytest.raises(WiringError, match=r"meals\.policy\.toml"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
 # --- remove ------------------------------------------------------------------
 
 
@@ -599,6 +708,14 @@ def test_remove_deletes_file(tmp_path: Path) -> None:
     result = codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
     assert result == {"op": "remove", "name": "diets"}
     assert not (_codesets(tmp_path) / "diets.csv").exists()
+
+
+def test_remove_deletes_the_policy_sidecar_with_the_table(tmp_path: Path) -> None:
+    """A remove that left ``diets.policy.toml`` behind turned it into a standalone code set
+    ``diets.policy`` (a policy file is not a table) the next load would read (BACKLOG #5776)."""
+    _with_policy(tmp_path, "diets")
+    codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert list(_codesets(tmp_path).iterdir()) == []
 
 
 def test_remove_missing_raises(tmp_path: Path) -> None:
