@@ -457,14 +457,17 @@ def test_a_string_that_sets_the_directory_and_more_has_its_directory_line_taken_
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(step)
 
 
-def test_a_directory_entry_outside_the_extra_list_gets_no_removal_clause() -> None:
+@pytest.mark.parametrize(
+    "plain",
+    ["MEFOR_SECRETS_DIRECTORY=", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"],
+    ids=["directory-only", "directory-and-more"],
+)
+def test_a_directory_entry_outside_the_extra_list_gets_no_removal_clause(plain: str) -> None:
     """The Lander's hold on PR 3142, comment 7090314503, item 3: the step's clauses act
-    inside AppEnvironmentExtra, the list it says to read and pass back, so a blank directory
-    entry in AppEnvironment gets
-    neither. The lists still set the directory, so the step never says they set none."""
-    refusal = service_env_refusal(
-        _read_pairs([(_EXTRA, "MEFOR_VALUE_A=x"), (_PLAIN, "MEFOR_SECRETS_DIRECTORY=")])
-    )
+    inside AppEnvironmentExtra, the list it says to read and pass back, so a directory entry
+    in AppEnvironment, whether it sets only the directory or more, gets neither clause. The
+    lists still set the directory, so the step never says they set none."""
+    refusal = service_env_refusal(_read_pairs([(_EXTRA, "MEFOR_VALUE_A=x"), (_PLAIN, plain)]))
     assert refusal is not None
     assert SET_NO not in refusal
     assert REMOVE_OTHER not in refusal and TAKE_LINE not in refusal and WIDER not in refusal
