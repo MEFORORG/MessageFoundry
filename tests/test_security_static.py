@@ -836,6 +836,22 @@ _UNSCANNABLE_RE_PATTERNS = {
 }
 
 
+def test_no_dicom_log_template_has_a_nested_quantifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The scan cannot read these patterns (see the entry above), so the built ones are read here.
+    from messagefoundry.transports import _dicom_log_lines as lines
+
+    def nested(patterns: list[re.Pattern[str]]) -> list[str]:
+        return [p.pattern for p in patterns if _has_nested_quantifier(p.pattern)]
+
+    built = [template.pattern for template in lines.compiled_templates()]
+    assert len(built) == len(lines.TEMPLATES)
+    assert nested(built) == []
+    # CONTROL: a nested quantifier in one slot's body is seen in each template that uses the slot.
+    monkeypatch.setitem(lines._SLOT_PATTERNS, "hex", r"(?:[0-9A-Fa-f]+)+")
+    mutated = [lines.compile_template(t).pattern for t in lines.TEMPLATES if "{hex}" in t]
+    assert mutated and len(nested(mutated)) == len(mutated)
+
+
 def test_no_catastrophic_regex_in_source() -> None:
     files = _py_files()
     assert files
