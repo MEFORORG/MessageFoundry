@@ -10300,7 +10300,7 @@ class SqlServerStore:
             log.warning(
                 "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
                 len(dead),
-                ", ".join(sorted({str(r[2]) for r in dead})),  # a lane name may be NULL
+                ", ".join(sorted({str(r[2]) for r in dead})),  # handler_name is nullable
             )
         return len(dead)
 
@@ -10376,7 +10376,7 @@ class SqlServerStore:
                 "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
                 " inbound(s): %s",
                 len(dead),
-                ", ".join(sorted({str(r[2]) for r in dead})),  # a lane name may be NULL
+                ", ".join(sorted({str(r[2]) for r in dead})),
             )
         return len(dead)
 
@@ -13427,7 +13427,7 @@ class SqlServerStore:
             log.warning(
                 "dead-lettered %d orphaned outbound row(s) at startup for missing destination(s): %s",
                 len(dead),
-                ", ".join(sorted({str(r[2]) for r in dead})),  # a lane name may be NULL
+                ", ".join(sorted({str(r[2]) for r in dead})),  # destination_name is nullable
             )
         return len(dead)
 

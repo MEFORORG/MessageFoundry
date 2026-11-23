@@ -261,6 +261,10 @@ def _purge_q1(status: dict[str, str]) -> None:
     del status["q-1"]
 
 
+def _complete_q1(status: dict[str, str]) -> None:
+    status["q-1"] = "done"
+
+
 _SWEEPS = (
     "dead_letter_missing_handlers",
     "dead_letter_missing_inbounds",
@@ -268,24 +272,36 @@ _SWEEPS = (
 )
 
 
-@pytest.mark.parametrize("move", [_cancel_q1, _purge_q1], ids=["cancelled", "purged"])
+#: Each move, and the state the moved row must keep (None: the row is gone).
+_MOVES: dict[str, tuple[Any, str | None]] = {
+    "cancelled": (_cancel_q1, "cancelled"),
+    "purged": (_purge_q1, None),
+    "completed": (_complete_q1, "done"),
+}
+
+
+@pytest.mark.parametrize("moved", sorted(_MOVES))
 @pytest.mark.parametrize("sweep", _SWEEPS)
-async def test_a_sweep_leaves_a_row_that_moved_after_its_read(sweep: str, move: Any) -> None:
+async def test_a_sweep_leaves_a_row_that_moved_after_its_read(sweep: str, moved: str) -> None:
     """The sweep reads its orphans with no lock, then seals each one on the pool before it locks.
-    A row cancelled or purged in that window keeps its new state: no DEAD update lands on it, no
+    A row cancelled, purged or completed in that window keeps its new state: no DEAD update lands on it, no
     ``dead`` event is written for it, and its message is not finalized. The untouched row is the
     control, and is still dead-lettered (Lander hold 7091043913)."""
+    move, keeps = _MOVES[moved]
     store = h.bare_store()
     store._leader_epoch = None
     cipher = _BlockingCipher()
     store._cipher = cipher
     cur = _OrphanCursor(at_lock=move)
+    # The control row was claimed before the read: INFLIGHT is one of the statuses the read selects,
+    # so the status term must still admit it.
+    cur.status["q-2"] = "inflight"
     cipher.cursor = cur
     dead = await h.drive_async(store, sweep, cursor=cur, conn=h.RecConn(), **_SWEEP)
 
-    # Its new state stands: still cancelled, or still gone.
-    assert cur.status.get("q-1") == ("cancelled" if move is _cancel_q1 else None), cur.status
-    assert cur.status["q-2"] == "dead", "the control row was not dead-lettered"
+    # Its new state stands: still cancelled or done, or still gone.
+    assert cur.status.get("q-1") == keeps, cur.status
+    assert cur.status["q-2"] == "dead", "the in-flight control row was not dead-lettered"
     assert dead == 1
 
     def for_message(sql: str, mid: str) -> list[tuple[Any, ...]]:
@@ -326,15 +342,33 @@ async def test_a_sweep_whose_every_row_moved_writes_and_counts_nothing(
 async def test_a_sweep_logs_only_what_it_dead_lettered(
     sweep: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The warning counts and names the rows written, not the rows read, and survives a NULL lane
-    name (both nullable columns on this backend)."""
+    """The warning counts and names the rows written, not the rows read."""
     store = h.bare_store()
     store._leader_epoch = None
-    cur = _OrphanCursor(at_lock=_cancel_q1, names=("GONE_A", None))
+    cur = _OrphanCursor(at_lock=_cancel_q1)
     with caplog.at_level("WARNING", logger=ss.__name__):
         dead = await h.drive_async(store, sweep, cursor=cur, conn=h.RecConn(), **_SWEEP)
     assert dead == 1
     (message,) = [r.getMessage() for r in caplog.records if "dead-lettered" in r.getMessage()]
     assert message.startswith("dead-lettered 1 ")
-    assert message.endswith(": None") and "GONE_A" not in message, message
+    assert message.endswith(": GONE_B") and "GONE_A" not in message, message
     assert store.committed_txns == 1
+
+
+#: The two sweeps whose lane column is nullable on this backend (``channel_id`` is NOT NULL).
+_NULLABLE_LANE_SWEEPS = ("dead_letter_missing_handlers", "dead_letter_missing_destinations")
+
+
+@pytest.mark.parametrize("sweep", _NULLABLE_LANE_SWEEPS)
+async def test_a_null_lane_name_beside_a_named_one_does_not_break_the_warning(
+    sweep: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A NULL lane name sorted with a named one raised after the commit; both are now joined as text."""
+    store = h.bare_store()
+    store._leader_epoch = None
+    cur = _OrphanCursor(names=("GONE_A", None))
+    with caplog.at_level("WARNING", logger=ss.__name__):
+        dead = await h.drive_async(store, sweep, cursor=cur, conn=h.RecConn(), **_SWEEP)
+    assert dead == 2
+    (message,) = [r.getMessage() for r in caplog.records if "dead-lettered" in r.getMessage()]
+    assert message.endswith(": GONE_A, None"), message
