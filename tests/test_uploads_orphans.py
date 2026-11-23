@@ -517,8 +517,41 @@ async def test_a_sidecar_landing_during_the_age_check_keeps_its_body(
     assert body.exists()
 
 
+_ONE_ENTRY_FAULTS: list[Callable[[], OSError]] = [
+    lambda: PermissionError(13, "Permission denied"),
+    lambda: OSError(errno.ESTALE, "Stale file handle"),
+    lambda: _win_not_found(53),
+    lambda: _win_not_found(3),
+]
+_ONE_ENTRY_FAULT_IDS = ["denied", "stale-handle", "unreachable-share", "missing-parent"]
+
+
+@pytest.mark.parametrize("fault", _ONE_ENTRY_FAULTS, ids=_ONE_ENTRY_FAULT_IDS)
+async def test_a_body_stat_fault_leaves_only_that_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: Callable[[], OSError]
+) -> None:
+    """A dangling link named like a body raises the codes a lost share does, from its target. With
+    the root still answering, that entry is skipped and the orphans listed after it still go."""
+    store = _store(tmp_path)
+    bodies = [_aged_orphan(store) for _ in range(3)]
+    real = Path.stat
+
+    def _one_body_faults(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == bodies[0]:
+            raise fault()
+        return real(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", _one_body_faults)
+    assert store._sweep_orphans_sync(now=time.time()) == 2
+    assert [body.exists() for body in bodies] == [True, False, False]
+
+
+@pytest.mark.parametrize("fault", _ONE_ENTRY_FAULTS, ids=_ONE_ENTRY_FAULT_IDS)
 async def test_a_fault_on_one_sidecar_leaves_only_that_body(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: Callable[[], OSError],
 ) -> None:
     """A lasting fault on one name must not stop the sweep at that name on every pass, or nothing
     listed after it would ever be reclaimed. Its body stays, and it is named once an interval."""
@@ -529,7 +562,7 @@ async def test_a_fault_on_one_sidecar_leaves_only_that_body(
 
     def _one_sidecar_denied(path: Any, **kwargs: Any) -> os.stat_result:
         if Path(path).name == denied:
-            raise PermissionError(13, "Permission denied")
+            raise fault()
         return real(path, **kwargs)
 
     monkeypatch.setattr(os, "lstat", _one_sidecar_denied)
@@ -565,27 +598,20 @@ async def test_a_young_body_with_a_faulting_sidecar_costs_the_pass_nothing(
     assert young.exists() and not aged.exists()
 
 
-@pytest.mark.parametrize(
-    "fault",
-    [
-        lambda: OSError(errno.ESTALE, "Stale file handle"),
-        lambda: _win_not_found(53),
-        lambda: _win_not_found(3),
-    ],
-    ids=["stale-handle", "unreachable-share", "missing-parent"],
-)
-async def test_a_root_out_of_reach_stops_the_sweep(
+@pytest.mark.parametrize("fault", _ONE_ENTRY_FAULTS, ids=_ONE_ENTRY_FAULT_IDS)
+async def test_a_root_that_stops_answering_stops_the_sweep(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     fault: Callable[[], OSError],
 ) -> None:
-    """Only a positive "not there" lets a body go. The fault lands on the second orphan's sidecar:
-    the first was already confirmed and removed and stays counted, and the third is never reached,
-    which is what tells stopping the sweep from skipping one file."""
+    """Only a positive "not there" lets a body go. The fault lands on the second orphan's sidecar
+    and the root then fails its own ``stat``: the first orphan was already confirmed and removed
+    and stays counted, and the third is never reached, which tells stopping from skipping."""
     store = _store(tmp_path)
     bodies = [_aged_orphan(store) for _ in range(3)]
     real = os.lstat
+    real_stat = Path.stat
     sidecars = 0
 
     def _second_sidecar_faults(path: Any, **kwargs: Any) -> os.stat_result:
@@ -596,7 +622,13 @@ async def test_a_root_out_of_reach_stops_the_sweep(
                 raise fault()
         return real(path, **kwargs)
 
+    def _root_lost_after_it(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if sidecars >= 2 and self == store._root:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
     monkeypatch.setattr(os, "lstat", _second_sidecar_faults)
+    monkeypatch.setattr(Path, "stat", _root_lost_after_it)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         assert store._sweep_orphans_sync(now=time.time()) == 1
 

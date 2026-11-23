@@ -7,6 +7,7 @@ other engine package can share the one answer (BACKLOG #5388 added item 3)."""
 from __future__ import annotations
 
 import errno
+import sys
 from typing import Final
 
 #: The Windows errors that say a network path or share cannot be reached, so nothing is known about
@@ -52,6 +53,9 @@ def is_absent(exc: OSError) -> bool:
 def is_name_absent(exc: OSError) -> bool:
     """:func:`is_absent`, narrowed for a caller that deletes on the answer: the parent directory
     answered and holds no such name. On Windows only ERROR_FILE_NOT_FOUND (2) says that, so a
-    missing parent (3) or drive (15) is not absence here. POSIX has one ENOENT for both, so there
-    this cannot tell a missing name from a missing parent."""
-    return isinstance(exc, FileNotFoundError) and getattr(exc, "winerror", None) in (None, 2)
+    missing parent (3), a missing drive (15) or an error with no code is not absence here. POSIX
+    has one ENOENT for both, so there this cannot tell a missing name from a missing parent."""
+    if not isinstance(exc, FileNotFoundError):
+        return False
+    winerror = getattr(exc, "winerror", None)
+    return winerror == 2 if winerror is not None else sys.platform != "win32"

@@ -319,10 +319,15 @@ def _sidecar_is_absent(sidecar: Path) -> bool:
     return False
 
 
-def _root_out_of_reach(exc: OSError) -> bool:
-    """Whether a fault on one entry says the whole uploads root cannot be reached, so the sweep
-    should stop rather than go on to the next entry."""
-    return is_unreachable(exc) or (isinstance(exc, FileNotFoundError) and not is_name_absent(exc))
+def _root_answers(root: Path) -> bool:
+    """Whether the uploads root still answers a ``stat``, which tells a fault on one entry from
+    the root being lost. An entry's own error cannot: a dangling link raises the codes a lost share
+    does. A POSIX mount that dropped leaves a mount point that still answers."""
+    try:
+        root.stat()
+    except OSError:
+        return False
+    return True
 
 
 def _names_a_link(info: os.stat_result) -> bool:
@@ -4240,8 +4245,8 @@ class UploadStore:
         unlink, says the sidecar is not there. That narrows the race with a sidecar landing after
         the listing and does not close it: one can land between that check and the unlink, and a
         network client's cache could answer the check from the listing's stale view. A fault on
-        one entry leaves that entry for the next pass. A fault saying the root is out of reach
-        stops the pass at ERROR, and it returns what it removed.
+        one entry leaves that entry for the next pass. If the root then fails a ``stat`` too, the
+        pass stops, logged at ERROR once an interval, and returns what it removed.
 
         **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
         in this process currently holds, and a held name is skipped outright, so the threshold never
@@ -4285,9 +4290,10 @@ class UploadStore:
             if _ORPHAN_TMP_RE.match(name):
                 kind = "temp file"
             elif _FILE_ID_RE.match(stem):
-                if f"{stem}{_META_SUFFIX}" in names:
+                sidecar_name = f"{stem}{_META_SUFFIX}"
+                if sidecar_name in names:
                     continue
-                sidecar = root / f"{stem}{_META_SUFFIX}"
+                sidecar = root / sidecar_name
                 kind = "body with no sidecar"
             else:
                 continue  # not one of ours — never touched
@@ -4302,22 +4308,22 @@ class UploadStore:
                     continue
                 entry.unlink()
             except OSError as exc:
-                if _root_out_of_reach(exc):
-                    if self._link_logged.first("orphan sweep stopped"):
-                        _log.error(
-                            "uploaded-logs orphan sweep stopped at %s: the uploads root could not "
-                            "be reached (%s); no further file was removed and the next pass retries",
-                            name,
-                            exc.strerror or type(exc).__name__,
-                        )
+                if not _root_answers(root):
+                    _log.log(
+                        logging.ERROR
+                        if self._link_logged.first("orphan sweep stopped")
+                        else logging.DEBUG,
+                        "uploaded-logs orphan sweep stopped at %s: the uploads root stopped "
+                        "answering (%s); no further file was removed and the next pass retries",
+                        name,
+                        exc.strerror or type(exc).__name__,
+                    )
                     break
                 # Already gone (a sibling shard's sweep), held open by another process, or not a file
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
                 # a random tag, never a body. Anything but "already gone" is named once an interval,
                 # since a body whose sidecar cannot be checked stays until someone looks.
-                quiet = isinstance(exc, FileNotFoundError) or not self._link_logged.first(
-                    f"orphan sweep {name}"
-                )
+                quiet = is_name_absent(exc) or not self._link_logged.first(f"orphan sweep {name}")
                 _log.log(
                     logging.DEBUG if quiet else logging.WARNING,
                     "uploaded-logs orphan sweep left %s alone: %s",
