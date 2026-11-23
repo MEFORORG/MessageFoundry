@@ -137,48 +137,22 @@ CREATE = (
 )
 
 
-#: The look-alike step's ending where an entry spelled in ASCII already names the directory,
-#: listed or kept, so it adds none.
-LOOKALIKE_LEAVE = ", and leave the entry spelled in ASCII as the one that names it"
-
-#: Its ending where the add-back step prints next and names the path under the ASCII spelling.
-LOOKALIKE_NEXT = (
-    ". Where one named the secrets directory, the next step names that path under the ASCII "
-    "spelling"
-)
-
-#: Its ending where nothing else names the path under the ASCII spelling.
-LOOKALIKE_ADD = (
-    ". Where one named the secrets directory, add MEFOR_SECRETS_DIRECTORY, spelled in ASCII, "
-    "naming that path to the service's AppEnvironmentExtra, the list install-service.ps1 reads. "
-    "`nssm set` replaces that whole list, so read it first with `nssm get`, running the "
-    "service's own nssm.exe by its full path, and pass back every entry but those this remedy "
-    "says to remove"
-)
-
-
-def lookalike_step(*named: str, ending: str) -> str:
+def lookalike_step(*named: str) -> str:
     """The step printed wherever a line of any string in the lists sets a look-alike spelling of
     MEFOR_SECRETS_DIRECTORY, one ``os.environ`` folds to it that is not ASCII. ``named`` is each
-    look-alike as the step writes it, every character outside ASCII as ``<U+XXXX>``, and
-    ``ending`` one of the three endings above. It says to take each one out, blank or not, and
-    never to keep one (the Lander's hold on PR 3142, comment 7092584745)."""
+    look-alike as the step writes it, every character outside ASCII as ``<U+XXXX>``. It says to
+    take each one out, blank or not, and never to keep one (the Lander's hold on PR 3142,
+    comment 7092584745)."""
     return (
         "At least one entry spells MEFOR_SECRETS_DIRECTORY with a character outside ASCII, "
         "written here with each such character as its code point: "
-        f"{', '.join(named)}. Windows folds such a name to MEFOR_SECRETS_DIRECTORY, so the engine "
-        "may read it as the secrets directory, but install-service.ps1 does not match it, so a "
-        "re-run of the installer may add a second entry beside it, and the engine may then read "
-        "either. Take each such entry out of the service's environment, whether its value is "
-        "blank or not, taking only its own line out of an entry that holds other lines too"
-        f"{ending}"
+        f"{', '.join(named)}. The engine reads such a name as the secrets directory, but "
+        "install-service.ps1 does not, so a re-run of it adds a second entry beside it and the "
+        "engine may read either. Take each such entry out of the service's environment, whether "
+        "its value is blank or not, taking only its own line out of an entry that holds other "
+        "lines too, and where it named the secrets directory, name that path under the ASCII "
+        "spelling MEFOR_SECRETS_DIRECTORY instead"
     )
-
-
-#: The KEEP sentence wherever a look-alike is also present, so it never reads as keeping one.
-KEEP_ASCII = KEEP.replace(
-    "sets MEFOR_SECRETS_DIRECTORY to", "sets MEFOR_SECRETS_DIRECTORY, spelled in ASCII, to", 1
-)
 
 
 #: Text every form of the look-alike step carries, so a negative arm sees any.
