@@ -493,7 +493,8 @@ def _reconcile(
     nothing delivered, a timed-out drain (``drain_seconds`` None), rows still in some stage, or
     engine counters that reset mid-step (``counter_reset``, from
     :func:`harness.load.report._counter_reset`). Both are required, with no default, so a caller
-    that forgets one cannot pass by omission.
+    that forgets one cannot pass by omission. This copy adds one shape the load copy lacks: an
+    outbound dead count that fell during the step (BACKLOG #5436).
     """
     sent = c.sent
     sink_received = c.sink_received
@@ -541,16 +542,17 @@ def _reconcile(
     floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    # A FLOOR, NOT A RECONCILIATION (BACKLOG #5436). Minimum fan-out is 1, so a drained step must
-    # write at least what it read. connscale can treat this as complete because each of its inbounds
-    # routes to exactly one outbound. Estate hubs send to `hub_fanout` destinations
+    # A FLOOR, NOT A RECONCILIATION (BACKLOG #5436). Minimum fan-out is 1, so a drained step that
+    # lost nothing writes at least what it read. connscale's form rests on each inbound routing to
+    # exactly one outbound. Estate hubs send to `hub_fanout` destinations
     # (harness/config/estate/graph.py), so `written` can exceed `read`, and a hub's surplus can hide
-    # a simple feed's shortfall. A clear floor therefore says NOTHING about ingress or routed
-    # dead-letters when hubs exist: that needs an expected-written figure or a store-truth all-stage
-    # dead count. Before the drain, a row still in the pipeline reads like a shortfall, so only a
-    # drained step is judged.
+    # a simple feed's shortfall. A clear floor therefore says NOTHING about at least ingress or
+    # routed dead-letters and cancelled rows when hubs exist; seeing them takes a figure this check
+    # does not have, such as an expected-written count or an all-stage dead count.
+    # A message the listener NAKed is recorded as a row, so it counts in `read` and fails this floor.
+    # Only a completed drain is judged: before it, a row still in the pipeline reads as a shortfall.
     write_short = read - written
-    write_lost = write_short > 0 and drained
+    write_lost = write_short > 0 and drained and drain_seconds is not None
     # Outbound dead-letters only: `out_dead` sums the outbound connections' dead rows.
     engine_lost = (
         read_short > 0 or floor_short > 0 or deliver_short > 0 or write_lost or out_dead > 0
@@ -576,12 +578,12 @@ def _reconcile(
         )
     if drain_seconds is None:
         unproven.append("the drain timed out — the final counts are an unsettled snapshot")
-    # `out_dead` counts rows dead NOW, so a replay or purge lowers it, and `_counter_reset` does not
-    # watch it. A fall can hide new dead-letters behind the removed ones (BACKLOG #5436).
+    # `out_dead` is a current count, so at least a replay or a stats reset lowers it, and
+    # `_counter_reset` does not watch it. A fall can hide new dead-letters (BACKLOG #5436).
     if engine_judged and out_dead < 0:
         unproven.append(
-            f"the outbound dead count fell by {-out_dead} during the step (a replay or a purge) — "
-            f"new dead-letters cannot be told from the removed rows"
+            f"the outbound dead count fell by {-out_dead} during the step (for example a replay "
+            f"or a stats reset) — new dead-letters cannot be told from the removed rows"
         )
     ok = not lost and drained and not unproven
     parts: list[str] = []
@@ -603,7 +605,9 @@ def _reconcile(
     if engine_judged and write_lost:
         parts.append(
             f"engine_written {written} < engine_read {read}: fewer deliveries than messages read "
-            f"(at least {write_short} undelivered)"
+            f"(at least {write_short} undelivered"
+            + (f"; {c.nak} send(s) were NAKed, which can account for some" if c.nak else "")
+            + ")"
         )
     if not drained and final is not None:
         parts.append(

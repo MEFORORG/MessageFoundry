@@ -991,6 +991,22 @@ def test_estate_reconcile_drained_write_shortfall_is_loss() -> None:
     assert "fewer deliveries than messages read" in result.detail
 
 
+def test_estate_reconcile_write_shortfall_names_naks() -> None:
+    c = Counters(sent=100, acked=90, nak=10, sink_received=90)
+    result = estate_reconcile(c, _BASE, _sample(read=100, written=90), unconfirmed_budget=_BUDGET)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "10 send(s) were NAKed" in result.detail
+
+
+def test_estate_reconcile_write_shortfall_after_a_timed_out_drain_is_inconclusive() -> None:
+    c = Counters(sent=100, acked=100, sink_received=99)
+    result = estate_reconcile(
+        c, _BASE, _sample(read=100, written=99), unconfirmed_budget=_BUDGET, drain_seconds=None
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "fewer deliveries" not in result.detail
+
+
 def test_estate_reconcile_undrained_write_shortfall_stays_inconclusive() -> None:
     c = Counters(sent=100, acked=100, sink_received=40)
     final = _staged(read=100, written=40, in_pipeline=60)
@@ -1019,9 +1035,9 @@ def test_estate_reconcile_hub_fanout_surplus_is_not_a_shortfall() -> None:
 
 
 def test_estate_reconcile_known_limit_hub_surplus_masks_a_routed_dead_letter() -> None:
-    # PINS A KNOWN GAP, BACKLOG #5436 stays open on it. 60 simple-feed messages die at routed while
-    # 20 hubs at fan-out 4 write 80: written 120 >= read 100, out_dead 0. This must flip to a LOSS
-    # once the check has an expected-written figure or a store-truth all-stage dead count.
+    # PINS A KNOWN GAP, BACKLOG #5436 stays open on it. Of 80 simple-feed messages, 60 die at routed
+    # and 20 write 20; 20 hub messages at fan-out 5 write 100: written 120 >= read 100, out_dead 0.
+    # This must flip to a LOSS once the check can see a dead-letter at every stage.
     c = Counters(sent=100, acked=100, sink_received=120)
     result = estate_reconcile(c, _BASE, _sample(read=100, written=120), unconfirmed_budget=_BUDGET)
     assert result.ok, result.detail
