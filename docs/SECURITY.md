@@ -5348,8 +5348,8 @@ flowchart TB
   `_record_route_refusal` in `messagefoundry/api/security.py` says what it records. The
   monitoring-read 429 that `require_monitoring_read` holds on a `GET /connections` reveal with a
   valid value is raised
-  by the route body after its scope, permission, serve-hop and new-address checks; its gate wrote
-  no grant row, and
+  by the route body after at least its scope, permission, serve-hop and new-address checks; its
+  gate wrote no grant row, and
   `raise_deferred_monitoring_refusal` writes the `auth.gate_refused` row the gate would have. Other
   refusals a route body makes after its gate has passed write no `auth.gate_refused` row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
@@ -7708,7 +7708,9 @@ that route, they then write no `monitoring:read` grant row. A held 429 the route
 raises, at least because one of those checks refused first, writes no throttled row or log line. A
 reveal value that will fail validation is charged and refused at the gate like any other read.
 The limiter records no refused attempt, so once the budget is spent a reveal those checks refuse
-spends nothing more, while each still writes its denial row: that path is not paced. The six routes share ONE budget per account: a read of any of them spends
+spends nothing more: that path is not paced. Most such refusals write their denial row, but a
+serve-hop refusal, and a new-address refusal whose row was deduped, leave no row of any kind for
+that request. The six routes share ONE budget per account: a read of any of them spends
 it. The budget is in-process, per API process, so N engine shards multiply it by N
 (*Business-logic limits* above).
 
