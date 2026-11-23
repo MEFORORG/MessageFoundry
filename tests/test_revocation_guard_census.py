@@ -1126,6 +1126,10 @@ def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
         ("None if relaxed else self._other", "False", "pass", False),
         ("None if not relaxed else self._other", "False", "pass", True),
         ("None if skips_validity_period(self._other) else self._other", "False", "pass", True),
+        # The strict read of the setting holds; the same reader on another key does not (#3234).
+        ("self._other", 'flag_from_settings(config.settings, "tls_allow_expired")', "pass", False),
+        ("self._other", 'flag_from_settings(config.settings, "tls")', "pass", True),
+        ("self._other", "flag_from_settings(config.settings)", "pass", True),
     ):
         text = _SYNTHETIC_HOP.replace("HANDOFF", handoff).replace("FLAG", flag)
         pre, post = (extra[4:], "pass") if extra.startswith("PRE:") else ("pass", extra)

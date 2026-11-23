@@ -1078,6 +1078,9 @@ class FhirDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        # Read strictly, and first: on every branch, and before a hop guard can log a crossing for
+        # a build this refuses. bool("false") is True (vault BACKLOG #3234 added step 8).
+        allow_expired = flag_from_settings(s, "tls_allow_expired")
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError(
@@ -1306,9 +1309,6 @@ class FhirDestination(DestinationConnector):
             )
 
         verify = bool_setting(s, "verify_tls", default=True)
-        # Read strictly, and before the branch, so a non-bool is refused even where verify_tls=false
-        # never reads it: bool("false") is True (vault BACKLOG #3234 added step 8).
-        allow_expired = flag_from_settings(s, "tls_allow_expired")
         if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
             # but tolerate an expired FHIR-server cert, and at least the other chain certificates' and a

@@ -691,6 +691,9 @@ class SoapDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        # Read strictly, and first: on every branch, and before a hop guard can log a crossing for
+        # a build this refuses. bool("false") is True (vault BACKLOG #3234 added step 8).
+        allow_expired = flag_from_settings(s, "tls_allow_expired")
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("SOAP destination requires a 'url' setting")
@@ -853,9 +856,6 @@ class SoapDestination(DestinationConnector):
             s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
         )
         verify = bool_setting(s, "verify_tls", default=True)
-        # Read strictly, once, so a non-bool is refused on every branch: bool("false") is True
-        # (vault BACKLOG #3234 added step 8).
-        allow_expired = flag_from_settings(s, "tls_allow_expired")
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,

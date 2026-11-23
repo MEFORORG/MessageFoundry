@@ -1791,9 +1791,11 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
     default) loads an unencrypted key exactly as before.
 
     ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
+    # Read strictly, before the pin check reads tls by truthiness, so a non-bool is refused as
+    # itself rather than as an unread pin: bool("false") is True (vault BACKLOG #3234 added step 8).
+    tls = flag_from_settings(s, "tls")
     refuse_an_unread_ca_pin(s, inbound=True, connector="DICOM listener")
-    # Read strictly: bool("false") is True (vault BACKLOG #3234 added step 8).
-    if not flag_from_settings(s, "tls"):
+    if not tls:
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
     if not cert:
@@ -2677,8 +2679,11 @@ def _client_ssl_context(
     CA per the resolved anchor. ``None`` (a direct test build) keeps the historical
     ``create_default_context(cafile=…)`` trust store. It only selects WHICH roots verify the
     peer — verification is never disabled — so the internal CA never weakens a refusal."""
+    # Both read strictly and first, as the listener's tls is (vault BACKLOG #3234 added step 8).
+    tls = flag_from_settings(s, "tls")
+    allow_expired = flag_from_settings(s, "tls_allow_expired")
     refuse_an_unread_ca_pin(s, inbound=False, connector="DICOM destination")
-    if not flag_from_settings(s, "tls"):
+    if not tls:
         return None
     ca = s.get("tls_ca_file")
     # #190 (ADR 0093): the connection's own tls_ca_file wins verbatim, else the internal-CA anchor.
@@ -2708,7 +2713,7 @@ def _client_ssl_context(
     # while STILL validating the chain's signatures, the hostname and key usage. At least the
     # intermediates' and the trust anchor's validity periods, and a CRL's own window, go unchecked too
     # (vault BACKLOG #5089). Verification stays ON; default off = byte-identical.
-    if flag_from_settings(s, "tls_allow_expired"):
+    if allow_expired:
         relax_verify_expiry(ctx, host=str(s.get("host", "")))
     return ctx
 

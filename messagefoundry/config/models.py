@@ -240,9 +240,7 @@ def require_flag(value: object, key: str) -> bool:
 
 def flag_from_settings(settings: Mapping[str, Any], key: str) -> bool:
     """The one reader of a hop-policy flag out of a raw settings mapping (vault BACKLOG #2232), and
-    the strict read of some other default-off boolean connector settings, at least
-    ``tls_allow_expired`` in the DICOM, FHIR, SOAP and remote-file connectors and ``tls`` in the
-    DICOM ones (vault BACKLOG #3234 added step 8).
+    a strict read of another default-off boolean connector setting (vault BACKLOG #3234).
 
     Absent, or ``None``, means ``False``. A real ``bool`` is returned as is. Anything else raises
     :class:`ValueError` naming ``key`` (:func:`require_flag`), so a mapping that was written past

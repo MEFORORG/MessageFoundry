@@ -17,8 +17,11 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.tls_policy import skips_validity_period
 from messagefoundry.transports import dicom as dicom_module
+from messagefoundry.transports import fhir as fhir_module
 from messagefoundry.transports import remotefile as remotefile_module
+from messagefoundry.transports import soap as soap_module
 from messagefoundry.transports.fhir import FhirDestination
 from messagefoundry.transports.soap import SoapDestination
 
@@ -50,6 +53,18 @@ def _refusal(value: Any, key: str = "tls_allow_expired") -> str:
     return f"{key} must be true or false, not {type(value).__name__}"
 
 
+def _spy_expiry_relaxed(monkeypatch: pytest.MonkeyPatch, module: Any) -> list[bool]:
+    """Record the ``expiry_relaxed`` a connector hands its revocation guard, which is how it read
+    ``tls_allow_expired``."""
+    seen: list[bool] = []
+
+    def spy(*args: Any, **kwargs: Any) -> None:
+        seen.append(kwargs["expiry_relaxed"])
+
+    monkeypatch.setattr(module, "refuse_unrevoked_verified_hop", spy)
+    return seen
+
+
 @pytest.mark.parametrize("value", _NON_BOOLS)
 def test_fhir_refuses_a_non_bool_tls_allow_expired(value: Any) -> None:
     with pytest.raises(ValueError, match=_refusal(value)):
@@ -62,9 +77,23 @@ def test_fhir_refuses_a_non_bool_tls_allow_expired_with_verify_off() -> None:
         _fhir(tls_allow_expired="false", verify_tls=False)
 
 
-@pytest.mark.parametrize("value", [True, False, None])
-def test_fhir_builds_on_a_real_bool_tls_allow_expired(value: bool | None) -> None:
+def test_fhir_refuses_a_non_bool_tls_allow_expired_before_its_url_check() -> None:
+    # Read first, so a build it refuses reaches no hop guard that could log a crossing.
+    with pytest.raises(ValueError, match=_REFUSED):
+        FhirDestination(
+            Destination(
+                name="OB_FHIR", type=ConnectorType.FHIR, settings={"tls_allow_expired": "false"}
+            )
+        )
+
+
+@pytest.mark.parametrize(("value", "relaxed"), [(True, True), (False, False), (None, False)])
+def test_fhir_reads_a_real_bool_tls_allow_expired(
+    monkeypatch: pytest.MonkeyPatch, value: bool | None, relaxed: bool
+) -> None:
+    seen = _spy_expiry_relaxed(monkeypatch, fhir_module)
     _fhir(tls_allow_expired=value)
+    assert seen == [relaxed]
 
 
 @pytest.mark.parametrize("value", _NON_BOOLS)
@@ -78,9 +107,22 @@ def test_soap_refuses_a_non_bool_tls_allow_expired_with_verify_off() -> None:
         _soap(tls_allow_expired="false", verify_tls=False)
 
 
-@pytest.mark.parametrize("value", [True, False, None])
-def test_soap_builds_on_a_real_bool_tls_allow_expired(value: bool | None) -> None:
+def test_soap_refuses_a_non_bool_tls_allow_expired_before_its_url_check() -> None:
+    with pytest.raises(ValueError, match=_REFUSED):
+        SoapDestination(
+            Destination(
+                name="OB_SOAP", type=ConnectorType.SOAP, settings={"tls_allow_expired": "false"}
+            )
+        )
+
+
+@pytest.mark.parametrize(("value", "relaxed"), [(True, True), (False, False), (None, False)])
+def test_soap_reads_a_real_bool_tls_allow_expired(
+    monkeypatch: pytest.MonkeyPatch, value: bool | None, relaxed: bool
+) -> None:
+    seen = _spy_expiry_relaxed(monkeypatch, soap_module)
     _soap(tls_allow_expired=value)
+    assert seen == [relaxed]
 
 
 @pytest.mark.parametrize("value", _NON_BOOLS)
@@ -88,6 +130,16 @@ def test_dicom_listener_refuses_a_non_bool_tls(value: Any) -> None:
     # A truthy value used to switch TLS on, here refused for want of a certificate.
     with pytest.raises(ValueError, match=_refusal(value, "tls")):
         dicom_module._server_ssl_context({"tls": value})
+
+
+@pytest.mark.parametrize("value", [0, ""])
+def test_dicom_contexts_refuse_a_falsy_non_bool_tls_before_the_pin_check(value: Any) -> None:
+    # The pin check reads tls by truthiness, and would name an unread pin instead.
+    pinned = {"host": "127.0.0.1", "tls": value, "tls_ca_file": "x.pem", "tls_ca_pin": "a" * 64}
+    with pytest.raises(ValueError, match=_refusal(value, "tls")):
+        dicom_module._server_ssl_context(dict(pinned))
+    with pytest.raises(ValueError, match=_refusal(value, "tls")):
+        dicom_module._client_ssl_context(dict(pinned))
 
 
 def test_dicom_listener_reads_a_real_bool_tls() -> None:
@@ -134,6 +186,13 @@ def test_dicom_destination_refuses_a_non_bool_tls_allow_expired(value: Any) -> N
         )
 
 
+def test_dicom_destination_refuses_a_non_bool_tls_allow_expired_with_tls_off() -> None:
+    with pytest.raises(ValueError, match=_REFUSED):
+        dicom_module._client_ssl_context(
+            {"host": "127.0.0.1", "tls": False, "tls_allow_expired": "false"}
+        )
+
+
 def test_dicom_destination_reads_a_real_bool_tls_and_tls_allow_expired() -> None:
     assert dicom_module._client_ssl_context({"host": "127.0.0.1", "tls": False}) is None
     strict = dicom_module._client_ssl_context({"host": "127.0.0.1", "tls": True})
@@ -141,7 +200,7 @@ def test_dicom_destination_reads_a_real_bool_tls_and_tls_allow_expired() -> None
         {"host": "127.0.0.1", "tls": True, "tls_allow_expired": True}
     )
     assert strict is not None and relaxed is not None
-    assert strict.verify_mode is ssl.CERT_REQUIRED and relaxed.verify_mode is ssl.CERT_REQUIRED
+    assert not skips_validity_period(strict) and skips_validity_period(relaxed)
 
 
 @pytest.mark.parametrize("value", _NON_BOOLS)
@@ -158,10 +217,12 @@ def test_ftps_context_refuses_a_non_bool_tls_allow_expired_with_verify_off() -> 
         )
 
 
-@pytest.mark.parametrize("value", [True, False, None])
-def test_ftps_context_builds_on_a_real_bool_tls_allow_expired(value: bool | None) -> None:
+@pytest.mark.parametrize(("value", "relaxed"), [(True, True), (False, False), (None, False)])
+def test_ftps_context_reads_a_real_bool_tls_allow_expired(
+    value: bool | None, relaxed: bool
+) -> None:
     ctx = remotefile_module._ftps_ssl_context({"host": "127.0.0.1", "tls_allow_expired": value})
-    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert skips_validity_period(ctx) is relaxed
 
 
 def test_ftps_revocation_guard_refuses_a_non_bool_tls_allow_expired() -> None:
@@ -178,7 +239,21 @@ def test_ftps_revocation_guard_refuses_a_non_bool_tls_allow_expired() -> None:
 
 
 @pytest.mark.parametrize("value", [True, False])
-def test_ftps_revocation_guard_reads_a_real_bool_tls_allow_expired(value: bool) -> None:
+def test_ftps_revocation_guard_reads_a_real_bool_tls_allow_expired(
+    monkeypatch: pytest.MonkeyPatch, value: bool
+) -> None:
+    seen: list[bool] = []
+
+    class _Guard:
+        @staticmethod
+        def capture(**kwargs: Any) -> _Guard:
+            seen.append(kwargs["expiry_relaxed"])
+            return _Guard()
+
+        def enforce_construction(self) -> None:
+            return None
+
+    monkeypatch.setattr(remotefile_module, "RevocationHopGuard", _Guard)
     remotefile_module._guard_ftps_revocation(
         ssl.create_default_context(),
         {"host": "127.0.0.1", "tls_allow_expired": value},
@@ -187,3 +262,4 @@ def test_ftps_revocation_guard_reads_a_real_bool_tls_allow_expired(value: bool) 
         attested_reason=None,
         connection="OB_FTPS",
     )
+    assert seen == [value]
