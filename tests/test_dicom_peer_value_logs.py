@@ -21,6 +21,7 @@ import functools
 import io
 import logging
 import socket
+import struct
 import threading
 import time
 import traceback
@@ -1032,3 +1033,87 @@ def test_the_credential_lines_the_filter_reads_are_still_pynetdicoms() -> None:
         source = inspect.getsource(dump)
         assert "f\"  Username: [{primary.decode('utf-8')}]\"" in source
         assert "f\"  Password: [{secondary.decode('utf-8')}]\"" in source
+
+
+# --- A peer's DIMSE response that does not convert (vault BACKLOG #6637, item 4) -------------------
+
+_PLANTED_REFUSED = "1.02." + "9" * 70  # over 64 characters, so set_uid raises rather than warns
+
+
+def _c_echo_rsp_command(class_uid: str) -> bytes:
+    """A whole C-ECHO-RSP command set, implicit VR little endian, naming ``class_uid``."""
+
+    def element(tag: tuple[int, int], value: bytes) -> bytes:
+        return struct.pack("<HHI", *tag, len(value)) + value
+
+    uid = class_uid.encode("ascii")
+    rest = (
+        element((0x0000, 0x0002), uid + b"\x00" * (len(uid) % 2))
+        + element((0x0000, 0x0100), struct.pack("<H", 0x8030))
+        + element((0x0000, 0x0120), struct.pack("<H", 1))
+        + element((0x0000, 0x0800), struct.pack("<H", 0x0101))
+        + element((0x0000, 0x0900), struct.pack("<H", 0x0000))
+    )
+    return element((0x0000, 0x0000), struct.pack("<I", len(rest))) + rest
+
+
+def _scu_echo_answered_with(command: bytes, caplog: pytest.LogCaptureFixture) -> list[str]:
+    """A pynetdicom SCU sends a C-ECHO to a peer that answers with ``command``. Every record logged
+    meanwhile is returned as a handler would write it, its traceback included."""
+    from pynetdicom import AE
+    from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
+
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+
+        def answer() -> None:
+            conn, _ = listener.accept()
+            with conn:
+                conn.settimeout(5.0)
+                _read_pdu(conn)
+                conn.sendall(_captured_ac())
+                _read_pdu(conn)
+                conn.sendall(_p_data(0x03, command))
+                with contextlib.suppress(OSError):
+                    while conn.recv(4096):
+                        pass
+
+        peer = threading.Thread(target=answer)
+        peer.start()
+        ae = AE(ae_title="MODALITY1")
+        ae.acse_timeout = 5
+        ae.dimse_timeout = 5
+        ae.add_requested_context(Verification)
+        with caplog.at_level(logging.DEBUG):
+            assoc = ae.associate("127.0.0.1", listener.getsockname()[1], ae_title="PLAINSCP")
+            assert assoc.is_established
+            assoc.send_c_echo()
+            if assoc.is_established:
+                assoc.abort()
+        peer.join(10.0)
+    return _formatted(list(caplog.records))
+
+
+def test_a_refused_value_in_a_peers_dimse_response_never_reaches_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    command = _c_echo_rsp_command(_PLANTED_REFUSED)
+    with (
+        _filter_removed()
+    ):  # CONTROL: pynetdicom.dimse logs the refusal, and its traceback repeats it
+        unfiltered = _scu_echo_answered_with(command, caplog)
+    assert [
+        line
+        for line in unfiltered
+        if line.startswith("pynetdicom.dimse: Invalid 'Affected SOP Class UID' value ")
+        and line.count(_PLANTED_REFUSED) >= 2
+    ], unfiltered
+    caplog.clear()
+    filtered = _scu_echo_answered_with(command, caplog)
+    assert filtered
+    assert not [line for line in filtered if _PLANTED_REFUSED in line], filtered
+    assert [
+        line
+        for line in filtered
+        if line.startswith("pynetdicom.dimse: Invalid 'Affected SOP Class UID' value '[redacted]'")
+        and "Traceback" in line
+    ], filtered

@@ -532,6 +532,9 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
         _REFUSED_VALUE,
         _Shape(re.compile(r"Unable to decode '"), "' using the ", re.compile(r"' using the [^']*")),
     ),
+    # The refusal a DIMSE message raises as it converts to its primitive, logged with its traceback.
+    # Only the SCU reaches it, from a peer's response: the SCP ends such an association first.
+    "pynetdicom.dimse": (_REFUSED_VALUE,),
     "pydicom": (
         _Shape(
             re.compile(r"Invalid value for VR [A-Z]{2}: "),

@@ -314,7 +314,8 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   least these lines, which stay with the element's name and the reason while the value reads `[redacted]`:
   pynetdicom's non-conformant and refused value lines; its non-conformant transfer syntax and related SOP
   class lines, and its line naming a transfer syntax under the DICOM root that is no transfer syntax; the
-  exception its DUL logs when a received PDU does not decode, with its traceback; pydicom's invalid value
+  exception its DUL logs when a received PDU does not decode, and the one its DIMSE provider logs when a
+  received message does not convert, each with its traceback; pydicom's invalid value
   line; the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
   association acceptance and a DIMSE message; and the username and password of a user identity in the
   dump of an association request, received or sent, which are never kept. A dump field otherwise keeps at
@@ -331,8 +332,7 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   run in, and when a line they read changes, so a change to the lock has to re-read the shapes. They do not
   reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom resolve to any
   release from 3.0.2 below 3.1, and the tests run only the release the lock names. Known shapes not covered
-  yet, at least: the exception pynetdicom logs when a received DIMSE message does not convert, which only the
-  SCU can reach, since the SCP ends such an association first; a flagged UID that spells a name in
+  yet, at least: a flagged UID that spells a name in
   pydicom's UID dictionary, which a dump field keeps; pydicom's `Incorrect value for Specific Character Set`
   and `Value "<value>" is not valid for elements with a VR of` lines, which name the value whole; and
   pynetdicom's `No presentation context for` line, on `pynetdicom.association`, which the filter is not on,
