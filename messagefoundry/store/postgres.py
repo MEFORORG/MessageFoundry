@@ -8463,12 +8463,12 @@ class PostgresStore:
             dead: list[Any] = []
             for row in orphans:
                 # The read took no row lock, so a row's status may change after the read. A change
-                # that committed before this UPDATE applies (at least a cancel, completion,
-                # dead-letter or purge) leaves the row outside the status term, and the zero
-                # rowcount skips the row's event, finalize and count. A change still in flight is
-                # not always skipped: at least mark_done, dead_letter_now and cancel_queued take the
-                # row lock before the message's finalize lock, which this sweep already holds, so
-                # one of them can deadlock against this UPDATE (SQLSTATE 40P01) instead.
+                # that committed before this UPDATE applies and moved the row out of the read's
+                # statuses (at least a cancel, completion or dead-letter) fails the status term,
+                # and the zero rowcount skips the row's event, finalize and count. A change still in
+                # flight is not always skipped: at least mark_done, dead_letter_now and cancel_queued
+                # take the row lock before the message's finalize lock, which this sweep already
+                # holds, so one of them can deadlock against this UPDATE (SQLSTATE 40P01).
                 result = await conn.execute(
                     "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
                     " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status IN ($6, $7)",
