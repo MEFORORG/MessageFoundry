@@ -258,8 +258,7 @@ def test_the_value_count_is_grouped_by_registry_value_not_by_line() -> None:
 
 def test_a_variable_repr_holds_no_value_and_no_name() -> None:
     """The text before an equals sign may be key material, as a line of ``<key>,<key>`` is."""
-    raw = f" {_KEY_B64[:43]} "
-    variable = serviceenv._Variable(_EXTRA, _KEY_B64[:43], "synthetic-repr-value", raw)
+    variable = serviceenv._Variable(_EXTRA, _KEY_B64[:43], "synthetic-repr-value")
     assert "synthetic-repr-value" not in repr(variable)
     assert _KEY_B64[:43] not in repr(variable)
 

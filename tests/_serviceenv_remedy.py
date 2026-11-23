@@ -153,14 +153,10 @@ def target(stray: str | None, *, plain: bool = True) -> str:
     return f"{FILES_PATH}, not the value of {stray}, which is not plainly a path"
 
 
-#: The ASCII entry a LEAVE step leaves, in the list NSSM sets last and install-service.ps1 reads.
-LEFT = "the entry spelled in ASCII in AppEnvironmentExtra that sets MEFOR_SECRETS_DIRECTORY"
-
-#: The take-out step's ending where the one ASCII item in AppEnvironmentExtra names the
-#: directory, a look-alike the engine receives beside it, and no Put step prints, so it adds
-#: none.
+#: The take-out step's ending where the one ASCII entry the engine receives names the directory,
+#: a look-alike it receives beside it, and no Put step prints, so it adds none.
 LOOKALIKE_LEAVE = (
-    f", and leave {LEFT} as the one that names it, first setting it to "
+    ", and leave the entry spelled in ASCII as the one that names it, first setting it to "
     f"{target('a look-alike spelling this step takes out')}"
 )
 
@@ -168,7 +164,10 @@ LOOKALIKE_LEAVE = (
 def repoint(stray: str | None = "a look-alike spelling a later step says to take out") -> str:
     """The step printed just before the Put step where LEAVE applies, so the files go where the
     final entry points (item 6)."""
-    return f"Before moving anything into the secrets directory, set {LEFT} to {target(stray)}"
+    return (
+        "Before moving anything into the secrets directory, set the entry spelled in ASCII that "
+        f"sets MEFOR_SECRETS_DIRECTORY to {target(stray)}"
+    )
 
 
 REPOINT = repoint()
@@ -189,8 +188,8 @@ CHOOSE = choose()
 
 #: The LEAVE ending where the step before the move printed.
 LOOKALIKE_LEAVE_MOVED = (
-    f", and leave {LEFT} as the one that names it, set to the path the step before the move into "
-    "the secrets directory gave it"
+    ", and leave the entry spelled in ASCII as the one that names it, set to the path the step "
+    "before the move into the secrets directory gave it"
 )
 
 #: The path the NEXT and ADD endings name, where every look-alike or padded value is plain.
