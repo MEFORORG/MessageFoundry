@@ -446,6 +446,8 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() 
             "/ui/uploaded-logs/file/{file_id}",
             "/ui/uploaded-logs/file/{file_id}/resend-confirm",
         ),
+        # BACKLOG #5559: the delete confirmation the users list leads to.
+        ("GET", "/ui/users/{user_id}", "/ui/users/{user_id}/delete-confirm"),
         ("GET", "/ui/users/{user_id}", "/ui/users/{user_id}/federated-identity"),
         (
             "POST",
