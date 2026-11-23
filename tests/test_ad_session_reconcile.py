@@ -70,12 +70,14 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     RowSealError,
     RowSealUnverifiableError,
     TransitSealUnavailableError,
+    TransitSealUnverifiableError,
 )
 from messagefoundry.store.store import (
     _REVOKE_CARRY,
@@ -6769,9 +6771,10 @@ def _seal_refusing_rename(
     return refused
 
 
-#: The three answers the store's write helper refuses a rename's write with (ADR 0217 (c) step 1),
-#: the phrase the ERROR line names it by, and the audit row its report writes (an Outage writes
-#: none).
+#: Two of the answers the store's write helper refuses a rename's write with (ADR 0217 (c) step 1),
+#: the phrase the ERROR line names it by, and the audit row its report writes. The third, an
+#: Outage, is raised to the reconcile loop, which stops the renames (vault BACKLOG #3069 item 1;
+#: test_an_outage_at_a_rename_stops_the_renames_and_keeps_the_revocation_alerts).
 _SEAL_REFUSALS = [
     pytest.param(
         lambda uid: RowSealError("user", uid),
@@ -6785,12 +6788,6 @@ _SEAL_REFUSALS = [
         AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
         id="unverifiable",
     ),
-    pytest.param(
-        lambda _uid: TransitSealUnavailableError(),
-        "did not answer",
-        None,
-        id="outage",
-    ),
 ]
 
 
@@ -6802,11 +6799,11 @@ async def test_a_rename_whose_seal_is_refused_at_the_write_does_not_end_the_pass
     reported: str | None,
 ) -> None:
     """Vault BACKLOG #3069 note T2. The store refuses the first rename's write over its seal:
-    Forged, Unverifiable or Outage. The reconciler logs it at ERROR, reports it as an admin read
-    reports the same answer, and goes on, so the second account's rename still applies. No audit
-    write was refused, so the pass pages no ``audit_write_failed``. Forged pages
-    ``integrity_drift`` through the integrity alert; Unverifiable and Outage page through the
-    store's seal pager. Called the way the login path calls it, each refusal is raised."""
+    Forged or Unverifiable. The reconciler logs it at ERROR, reports it as an admin read reports
+    the same answer, and goes on, so the second account's rename still applies. No audit write was
+    refused, so the pass pages no ``audit_write_failed``. Forged pages ``integrity_drift`` through
+    the integrity alert; Unverifiable pages through the store's seal pager. Called the way the
+    login path calls it, each refusal is raised."""
     store, service, notifier = await _two_renamed_accounts()
     try:
         alerts: list[str] = []
@@ -6838,6 +6835,258 @@ async def test_a_rename_whose_seal_is_refused_at_the_write_does_not_end_the_pass
         assert told == ["asmith-new"]
 
         with pytest.raises(type(refusal(jdoe.id))):
+            await service._refresh_cached_username(
+                user_id=jdoe.id,
+                old_username="jdoe",
+                new_username="jdoe-new",
+                held=None,
+                from_plan=False,
+                audit_soft=False,
+            )
+    finally:
+        await store.close()
+
+
+# --- vault BACKLOG #3069 item 1: a Vault transit answer at the rename's reads ---------------------
+
+#: The two answers a checked read raises (a Forged record reads as ``refused`` instead). An
+#: Unverifiable answer skips that one rename; an Outage is paged once and stops the renames, and
+#: the pass still returns its plan.
+_READ_ANSWERS = [
+    pytest.param(lambda: TransitSealUnverifiableError("user", 1, 2), id="unv"),
+    pytest.param(TransitSealUnavailableError, id="outage"),
+]
+
+#: At least these checked reads of one rename: the loop's read of the new name's holder, the
+#: refresh's pre-read of the account's own record, the pre-check's re-read of the holder, and the
+#: re-read by id after a write that wrote nothing.
+_RENAME_READS = ["holder", "pre-read", "re-read", "after-write"]
+
+
+def _seal_answer_at_next_check(service: AuthService, answer: Callable[[], Exception]) -> list[bool]:
+    """Make the next ``_verified`` call on a record raise ``answer()`` once the returned list is
+    armed (``armed.append(True)``); it disarms itself as it raises."""
+    real = service._verified
+    armed: list[bool] = []
+
+    async def verified(user: UserRecord | None) -> Any:
+        if armed and user is not None:
+            armed.clear()
+            raise answer()
+        return await real(user)
+
+    service._verified = verified  # type: ignore[method-assign]
+    return armed
+
+
+@pytest.mark.parametrize("read", _RENAME_READS)
+@pytest.mark.parametrize("answer", _READ_ANSWERS)
+async def test_a_transit_answer_at_a_rename_read(
+    caplog: pytest.LogCaptureFixture,
+    read: str,
+    answer: Callable[[], Exception],
+) -> None:
+    """Vault BACKLOG #3069 item 1. Vault transit could not verify, or did not answer for, the
+    record one of ``jdoe``'s rename reads checked.
+
+    Unverifiable: the loop logs it at ERROR, pages nothing, skips that rename, and the pass returns
+    its plan with ``asmith``'s rename applied (the plan's order is not fixed, so that rename may
+    run first). RED when: the answer escapes the pass, or it pages.
+
+    Outage (Manager decisions, 2026-11-22): the key service is down, so the loop pages it once and
+    stops the renames, and the pass still returns its plan (on main it raised out of the pass,
+    unpaged). RED when: the answer escapes the pass, or the Outage is not paged once.
+
+    Called the way the login path calls it, either answer is raised."""
+    store, service, notifier = await _two_renamed_accounts()
+    try:
+        pages: list[str] = []
+        store.seal_pager().arm(lambda subject, reason: pages.append(subject))
+        jdoe = await store.get_user_by_username("jdoe")
+        asmith = await store.get_user_by_username("asmith")
+        assert jdoe is not None and asmith is not None
+        armed = _seal_answer_at_next_check(service, answer)
+        reached: list[str] = []
+        real_by_id = store.get_user
+        real_by_name = store.get_user_by_username
+        real_rename = store.set_user_username
+        real_refresh = service._refresh_cached_username
+        renaming: list[str] = []
+        wrote: list[bool] = []
+
+        def arm(here: str) -> None:
+            if read == here and not reached:
+                reached.append(read)
+                armed.append(True)
+
+        async def by_id(user_id: str) -> UserRecord | None:
+            if renaming == [jdoe.id] and user_id == jdoe.id:
+                arm("after-write" if wrote else "pre-read")
+            return await real_by_id(user_id)
+
+        async def by_name(username: str) -> UserRecord | None:
+            if read in ("holder", "re-read") and username == "jdoe-new":
+                # A row holds the new name, so a read of it checks a record.
+                arm("re-read" if renaming else "holder")
+                return await real_by_id(asmith.id)
+            return await real_by_name(username)
+
+        async def rename(user_id: str, username: str, **kwargs: Any) -> bool:
+            if read == "after-write" and user_id == jdoe.id:
+                wrote.append(True)
+                return False  # the write wrote nothing, so the refresh reads the row again
+            return await real_rename(user_id, username, **kwargs)
+
+        async def refresh(**kwargs: Any) -> None:
+            renaming.append(kwargs["user_id"])
+            try:
+                await real_refresh(**kwargs)
+            finally:
+                renaming.clear()
+
+        store.get_user = by_id  # type: ignore[method-assign]
+        store.get_user_by_username = by_name  # type: ignore[method-assign]
+        store.set_user_username = rename  # type: ignore[method-assign]
+        service._refresh_cached_username = refresh  # type: ignore[method-assign]
+        outage = answer is TransitSealUnavailableError
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+        assert reached == [read], "the read was not reached"
+        still = await real_by_id(jdoe.id)
+        assert still is not None and still.username == "jdoe"
+        assert plan.aborted is None and len(plan.renames) == 2
+        if outage:
+            assert len(pages) == 1, "the Outage was not paged exactly once"
+            assert _logged_at_error(caplog, f"account {jdoe.id} (renaming to jdoe-new)", "not")
+        else:
+            assert await real_by_name("asmith-new") is not None, "the other rename was skipped"
+            assert _logged_at_error(
+                caplog, f"account {jdoe.id} (renaming to jdoe-new)", "could not verify"
+            )
+            assert pages == [], "an Unverifiable read answer paged"
+            told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+            assert told == ["asmith-new"]
+
+        if read == "pre-read":
+            armed.append(True)
+            with pytest.raises(type(answer())):
+                await real_refresh(
+                    user_id=jdoe.id,
+                    old_username="jdoe",
+                    new_username="jdoe-new",
+                    held=None,
+                    from_plan=False,
+                    audit_soft=False,
+                )
+    finally:
+        await store.close()
+
+
+async def _renames_beside_a_revocation() -> tuple[MessageStore, AuthService, list[str]]:
+    """``jdoe`` and ``asmith`` signed in and renamed in the directory, and ``bob`` signed in and
+    gone from it, so one pass at one strike plans two renames and one revocation."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ("jdoe", "asmith", "bob")
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(
+            store,
+            _ad_settings(ad_session_recheck_strikes=1),
+            ldap=ldap,  # type: ignore[arg-type]
+        )
+        await service.initialize()
+        for name in names:
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ldap.present = {
+            f"{n}-new": _principal(f"{n}-new", object_id=_object_id_for(n))
+            for n in ("jdoe", "asmith")
+        }
+        pages: list[str] = []
+        store.seal_pager().arm(lambda subject, reason: pages.append(subject))
+    except BaseException:
+        await store.close()
+        raise
+    return store, service, pages
+
+
+class _RevokedSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.revoked: list[str] = []
+
+    def ad_session_revoked(self, name: str, *, reason: str) -> None:
+        self.revoked.append(name)
+
+
+@pytest.mark.parametrize("where", ["read", "write"])
+async def test_an_outage_at_a_rename_stops_the_renames_and_keeps_the_revocation_alerts(
+    where: str,
+) -> None:
+    """Vault BACKLOG #3069 item 1, Manager decisions 2026-11-22. An Outage at the first rename's
+    read stops the rename loop, but the pass returns its plan, so ``bob``'s applied revocation
+    still raises its ``ad_session_revoked`` alert, and the Outage is paged exactly once. With
+    ``write`` the first rename's write meets the Outage instead, and the loop stops the same way.
+    RED when: the Outage raises out of the pass (no plan, no alert), a rename after it is applied,
+    or it pages more than once."""
+    from messagefoundry.api.app import _alert_reconcile_plan
+
+    store, service, pages = await _renames_beside_a_revocation()
+    try:
+        real_verified = service._verified
+        real_rename = store.set_user_username
+        renamed: list[str] = []
+
+        async def rename(user_id: str, username: str, **kwargs: Any) -> bool:
+            renamed.append(username)
+            if where == "write" and len(renamed) == 1:
+                raise TransitSealUnavailableError()
+            return await real_rename(user_id, username, **kwargs)
+
+        async def verified(user: UserRecord | None) -> Any:
+            # With ``read``, the first checked read once the renames begin is refused.
+            if where == "read" and renaming and user is not None and not refused:
+                refused.append(user.id)
+                raise TransitSealUnavailableError()
+            return await real_verified(user)
+
+        refused: list[str] = []
+        renaming: list[bool] = []
+        real_load_by_name = service._load_user_by_username
+
+        async def load_by_name(username: str) -> VerifiedUser | None:
+            if username.endswith("-new"):
+                renaming.append(True)
+            return await real_load_by_name(username)
+
+        service._load_user_by_username = load_by_name  # type: ignore[method-assign]
+        service._verified = verified  # type: ignore[method-assign]
+        store.set_user_username = rename  # type: ignore[method-assign]
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert refused or where == "write", "no checked read met the outage"
+        assert len(renamed) == (1 if where == "write" else 0), "a rename ran past the outage"
+        assert plan.aborted is None
+        assert [r.username for r in plan.revocations] == ["bob"]
+        assert len(pages) == 1, f"one outage paged {len(pages)} times"
+        for name in ("jdoe-new", "asmith-new"):
+            assert await store.get_user_by_username(name) is None, name
+        sink = _RevokedSink()
+        _alert_reconcile_plan(plan, service, sink)
+        assert sink.revoked == ["bob"], "the applied revocation lost its alert"
+    finally:
+        await store.close()
+
+
+async def test_a_sign_in_rename_raises_an_outage_at_the_write() -> None:
+    """Vault BACKLOG #3069 item 1. Called the way the login path calls it (``audit_soft`` off), an
+    Outage at the rename's write is raised, as the other seal answers are. RED when: the write arm
+    logs and goes on for a sign-in."""
+    store, service, _notifier = await _two_renamed_accounts()
+    try:
+        jdoe = await store.get_user_by_username("jdoe")
+        assert jdoe is not None
+        _seal_refusing_rename(store, jdoe.id, lambda _uid: TransitSealUnavailableError())
+        with pytest.raises(TransitSealUnavailableError):
             await service._refresh_cached_username(
                 user_id=jdoe.id,
                 old_username="jdoe",
