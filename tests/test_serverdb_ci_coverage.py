@@ -19,7 +19,9 @@ The mechanical invariants, at least these:
    A file a leg runs but the alternation does not match is covered only by the nightly cron: editing
    it does not pull the leg that proves it. The regex's own comment already demands this
    ("Keep this in sync with those steps"); nothing enforced it.
-3. **It also admits every engine SOURCE those suites import** (BACKLOG #1322). Invariant 2 binds the
+3. **It also admits the engine SOURCES those suites import** (BACKLOG #1322), as far as a
+   static read of the suites' own import statements finds them; the scan's docstring names at
+   least four routes it does not follow. Invariant 2 binds the
    ASSERTING file and not the ASSERTED-ON file, so it is structurally blind to a source change that
    breaks a server-DB assertion. That is not hypothetical: a PR added a key to the ``summary_access``
    audit detail built in ``messagefoundry/api/app.py``, touched ``api/`` only, so ``serverdb`` was
@@ -236,40 +238,29 @@ def _repo_package_sources() -> frozenset[str]:
 def _engine_modules_imported_by(text: str) -> dict[str, str]:
     """Each ``messagefoundry*`` module one source's imports reach, mapped to its repo-relative path.
 
-    ``from pkg import name`` is resolved per name. When ``pkg.name`` is itself a module (a submodule
-    import such as ``from messagefoundry import sqlserver_roles``), that module's file is recorded.
-    Otherwise ``name`` is an attribute and ``pkg``'s own file is recorded. Mapping every ``from``
-    import to ``pkg`` alone sent a submodule import to ``messagefoundry/__init__.py``, a false alarm
-    that also hid the submodule.
+    One module is recorded per imported name: the module the statement names, and nothing above
+    it. ``import a.b.c`` records ``a.b.c``. ``from pkg import name`` records ``pkg.name`` when that
+    is itself a module (a submodule import such as ``from messagefoundry import sqlserver_roles``),
+    and ``pkg`` when ``name`` is an attribute. Mapping every ``from`` import to ``pkg`` alone sent a
+    submodule import to ``messagefoundry/__init__.py``, a false alarm that also hid the submodule,
+    and made the verdict depend on which of two spellings of one import a suite used.
 
-    For a submodule import ``pkg``'s own file is recorded too, because Python runs it first, except
-    for the top-level ``messagefoundry`` package: its ``__init__`` resolves its exports lazily and
-    runs nothing for a submodule import, and ``import messagefoundry.x`` does not record it either.
-
-    Not followed: a re-exported attribute to the module that defines it, and the helper modules a
-    suite imports from ``tests/``. Both can reach sources this scan does not record.
+    Not recorded, by at least these routes, though Python runs or reaches the source: the ancestor
+    packages' ``__init__`` files, which run for every spelling; a re-exported attribute's defining
+    module; the helper modules a suite imports from ``tests/``; and ``importlib.import_module``.
     """
-    paths: dict[str, str] = {}
-
-    def record(module: str) -> bool:
-        path = _module_path(module)
-        if path is not None:
-            paths[module] = path
-        return path is not None
-
+    modules: list[str] = []
     for node in ast.walk(ast.parse(text)):
         if isinstance(node, ast.ImportFrom):
             if node.level or not (node.module or "").startswith("messagefoundry"):
                 continue
             package = str(node.module)
             for alias in node.names:
-                if not record(f"{package}.{alias.name}") or "." in package:
-                    record(package)
+                submodule = f"{package}.{alias.name}"
+                modules.append(submodule if _module_path(submodule) else package)
         elif isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.startswith("messagefoundry"):
-                    record(alias.name)
-    return paths
+            modules += [a.name for a in node.names if a.name.startswith("messagefoundry")]
+    return {module: path for module in modules if (path := _module_path(module)) is not None}
 
 
 def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
@@ -285,16 +276,14 @@ def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
-        # A submodule named through its package: the submodule, not the package root.
+        # A submodule named through its package: the submodule, as ``import pkg.sub`` records it.
         (
             "from messagefoundry import sqlserver_roles",
             {"messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py"},
         ),
-        # Below the top-level package, the package's own file runs first, so it is recorded too.
         (
             "from messagefoundry.store import postgres as pg, sqlserver",
             {
-                "messagefoundry.store": "messagefoundry/store/__init__.py",
                 "messagefoundry.store.postgres": "messagefoundry/store/postgres.py",
                 "messagefoundry.store.sqlserver": "messagefoundry/store/sqlserver.py",
             },
@@ -330,7 +319,7 @@ def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
             "import messagefoundry.sqlserver_roles as sqlserver_roles",
             {"messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py"},
         ),
-        # Other packages named messagefoundry* resolve as before.
+        # Other packages named messagefoundry* resolve by the same rule.
         (
             "from messagefoundry_toolkit import anon",
             {"messagefoundry_toolkit.anon": "messagefoundry_toolkit/anon/__init__.py"},
@@ -358,11 +347,11 @@ def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
     shape.
 
     IMPORT-REACHABILITY IS A PROXY FOR "ASSERTS AGAINST". It is what a machine can check without
-    running anything. It is wider than the assertion set in one way, since a suite may import a
-    module it asserts nothing about, which costs extra leg-runs. It is NARROWER in others: it reads
-    only the suites' own direct imports, so a source reached through a ``tests/`` helper module, or
-    an attribute re-exported by a package from the module that defines it, is not checked. A green
-    here does not show that every source a server-DB leg exercises pulls that leg.
+    running anything. It is wider than the assertion set in some ways, for example a module a suite
+    imports and asserts nothing about, which costs extra leg-runs. It is NARROWER in others: it
+    reads only the static import statements in the suites themselves, and
+    ``_engine_modules_imported_by`` names at least four routes to a source it does not record. A
+    green here does not show that every source a server-DB leg exercises pulls that leg.
     """
     pattern = _serverdb_full_pattern()
     imported = _engine_modules_imported_by_server_db_suites()
