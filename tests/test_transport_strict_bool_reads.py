@@ -273,7 +273,8 @@ def test_ftps_revocation_guard_reads_a_real_bool_tls_allow_expired(
 # Vault BACKLOG #3234's remainder after engine PRs 3169 and 3176: MLLP ``tls`` and
 # ``tls_allow_expired``, REST ``tls_allow_expired`` and DATABASE ``trust_server_certificate``. Each
 # was read with ``bool(...)`` or by truthiness, so ``"false"`` switched MLLP TLS on, relaxed an MLLP
-# or REST expiry check, or sent ``TrustServerCertificate=yes``. A real ``bool`` reads as before.
+# or REST expiry check, or, on an attested DATABASE hop, sent ``TrustServerCertificate=yes``. A real
+# ``bool`` reads as before.
 
 
 @pytest.mark.parametrize("value", _NON_BOOLS)
@@ -283,13 +284,26 @@ def test_mllp_context_refuses_a_non_bool_tls(value: Any, server: bool) -> None:
         mllp_module._mllp_ssl_context({"host": "127.0.0.1", "tls": value}, server=server)
 
 
+_PINNED: dict[str, Any] = {"host": "127.0.0.1", "tls_ca_file": "x.pem", "tls_ca_pin": "a" * 64}
+
+
 @pytest.mark.parametrize("value", [0, ""])
-def test_mllp_listener_refuses_a_falsy_non_bool_tls_before_the_pin_check(value: Any) -> None:
-    # The pin check's inbound arm reads tls by truthiness, and would name an unread pin instead.
-    # Its outbound arm reads tls strictly already, so only the listener is pinned here.
-    pinned = {"tls": value, "tls_ca_file": "x.pem", "tls_ca_pin": "a" * 64}
+@pytest.mark.parametrize("server", [True, False])
+def test_mllp_context_refuses_a_falsy_non_bool_tls_before_the_pin_check(
+    value: Any, server: bool
+) -> None:
+    # The pin check reads tls by truthiness on its inbound arm and through bool_setting on its
+    # outbound arm, which reads "" as off; either would name an unread pin instead. Its outbound
+    # arm already refused 0 on origin/main, so that one case is a control, not a pin.
     with pytest.raises(ValueError, match=_refusal(value, "tls")):
-        mllp_module._mllp_ssl_context(pinned, server=True)
+        mllp_module._mllp_ssl_context({**_PINNED, "tls": value}, server=server)
+
+
+@pytest.mark.parametrize("server", [True, False])
+def test_mllp_context_pin_fixture_reaches_the_pin_check(server: bool) -> None:
+    # The control: with a real False the same fixture is refused by the pin check itself.
+    with pytest.raises(ValueError, match="tls_ca_pin is set"):
+        mllp_module._mllp_ssl_context({**_PINNED, "tls": False}, server=server)
 
 
 def test_mllp_context_reads_a_real_bool_tls() -> None:
@@ -396,7 +410,7 @@ def test_database_dsn_refuses_a_non_bool_trust_server_certificate(
 
 @pytest.mark.parametrize("value", _NON_BOOLS)
 def test_database_connection_refuses_a_non_bool_trust_server_certificate(value: Any) -> None:
-    # _build_connection reads the flag again for its weakened report.
+    # The dispatcher every DATABASE connector builds through refuses it too.
     with pytest.raises(ValueError, match=_refusal(value, "trust_server_certificate")):
         database_module._build_connection(
             {**_SQLSERVER, "trust_server_certificate": value}, attested=True
