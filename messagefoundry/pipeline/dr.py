@@ -1690,7 +1690,7 @@ def _parse_restore_token(text: str) -> str | None:
 #: The rows that end the activation before them, with what each says (BACKLOG #5965). On a box
 #: that is not an engine shard, an active box writes none of them: a POST /dr/activate on an
 #: active box returns before any seed marker or abort row, and a lapse is written only by a passive
-#: start.
+#: start under ``[dr].activate = false``.
 _ENDS_AN_ACTIVATION: dict[str, str] = {
     _ACTION_RELEASE: "the last activation was released by POST /dr/release",
     _ACTION_LAPSED: "the box has started passive since the last activation",
@@ -1721,17 +1721,23 @@ def _detail(row: Mapping[str, Any]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _made_here(activation: Mapping[str, Any]) -> bool:
+    """Whether a ``dr.activate`` row was written on this host."""
+    return _detail(activation).get("node") == socket.gethostname()
+
+
 async def note_passive_start(store: Store, *, now: float) -> None:
     """Record, on a DR box starting passive, that the activation its store shows has ended.
 
     Without it a later start under ``[dr].activate = true`` would resume an activation the box
     stopped serving at this start, however long ago, as when a box fails back by restarting
     passive rather than through ``POST /dr/release``, or comes up over a restored store that
-    carries an earlier incident's activation (BACKLOG #5965). Written whatever host the activation
-    names, and only while one is live, so one passive box that keeps restarting adds one row. The
-    engine does not call it on an engine shard, whose siblings' activations it cannot tell apart."""
+    carries an earlier incident's activation (BACKLOG #5965). Written only for a live activation
+    of this host, so one passive box that keeps restarting adds one row; another host's activation
+    is not this box's to end. The engine calls it only under ``[dr].activate = false``, and not on
+    an engine shard, whose siblings' activations it cannot tell apart."""
     activation, _ended = await _live_activation(store)
-    if activation is None:
+    if activation is None or not _made_here(activation):
         return
     await store.record_audit(
         _ACTION_LAPSED,
@@ -1759,8 +1765,8 @@ def alert_resume_refused(sink: AlertSink | None, reason: str) -> None:
     stop the passive start. Nothing resolves the instance on its own; an operator does, once the
     box is promoted or ``[dr].activate`` is set false."""
     text = (
-        f"[dr].activate = true found no activation of this box to resume: {reason}. The box "
-        "started PASSIVE and binds no priority feed. A DR box is promoted by POST /dr/activate "
+        f"[dr].activate = true found no activation of this box to resume: {reason}. This start "
+        "does not take the DR run-profile. A DR box is promoted by POST /dr/activate "
         "(dr:operate), which verifies the cold seed, runs the takeover hook and writes the "
         "dr.activate audit row; [dr].activate = true only keeps such a box active across a restart"
     )
@@ -1801,10 +1807,9 @@ async def resumable_activation(
     if live[0] is None:
         return live
     activation = live[0]
-    detail = _detail(activation)
-    if detail.get("node") != socket.gethostname():
+    if not _made_here(activation):
         return None, "the last activation was not recorded on this host"
-    if detail.get("threshold") != settings.priority_threshold.value:
+    if _detail(activation).get("threshold") != settings.priority_threshold.value:
         return None, "the last activation ran at a different [dr].priority_threshold"
     return int(activation["id"]), None
 
@@ -1813,8 +1818,8 @@ async def record_resume(
     store: Store, settings: DrSettings, activation_id: int, *, now: float
 ) -> None:
     """Write the ``dr.resume`` row naming ``activation_id``, which :func:`resumable_activation`
-    found, and log the re-latch. The engine calls it once the start's own refusals have passed,
-    so a start refused later leaves no row (BACKLOG #5965)."""
+    found, and log the re-latch. The engine calls it at the end of its start, once every refusal
+    has passed, so a start refused anywhere leaves no row (BACKLOG #5965)."""
     await store.record_audit(
         _ACTION_RESUME,
         actor="system",

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import (
     BackupSettings,
     DrSettings,
@@ -28,6 +29,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.wiring import load_config
+from messagefoundry.engine_secrets import SecretsDirectoryError
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dr import (
@@ -178,7 +180,10 @@ async def test_activate_true_with_no_prior_activation_starts_passive_and_alerts(
         assert "dr.resume" not in await _actions(engine)
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1
-        assert "records no POST /dr/activate" in errors[0] and "started PASSIVE" in errors[0]
+        assert (
+            "records no POST /dr/activate" in errors[0]
+            and "does not take the DR run-profile" in errors[0]
+        )
         assert "POST /dr/activate (dr:operate)" in errors[0]
         assert [name for name, _ in spy.stopped] == [RESUME_ALERT_SUBJECT]
         assert "records no POST /dr/activate" in spy.stopped[0][1]
@@ -405,3 +410,93 @@ async def test_an_engine_shard_never_resumes(tmp_path: Path) -> None:
         assert activation is not None and activation > 0 and why is None
     finally:
         await store.close()
+
+
+async def test_a_refused_mismatch_ends_nothing_and_a_corrected_restart_resumes(
+    tmp_path: Path,
+) -> None:
+    """A resume refused for a mismatched ``priority_threshold`` writes no ``dr.lapsed`` row: the
+    activation is not that start's to end, so correcting the threshold brings the resume back."""
+    archive, ss, key = await _seed(tmp_path)
+    activation_id = await _activate_once(ss, key, archive)
+    spy = _StopSpy()
+    typo = DrSettings(
+        enabled=True, activate=True, seed_archive=archive, priority_threshold=Priority.NORMAL
+    )
+    wrong = await _engine(ss, key, typo, alert_sink=spy)
+    try:
+        await wrong.start()
+        assert not wrong.dr_active
+        assert "different [dr].priority_threshold" in spy.stopped[0][1]
+        actions = await _actions(wrong)
+        assert "dr.lapsed" not in actions and "dr.resume" not in actions
+    finally:
+        await wrong.stop()
+    fixed = await _engine(ss, key, DrSettings(enabled=True, activate=True, seed_archive=archive))
+    try:
+        await fixed.start()
+        assert fixed.dr_active
+        resumed = await fixed.store.list_audit(action="dr.resume", limit=1)
+        assert json.loads(resumed[0]["detail"])["activation_id"] == activation_id
+    finally:
+        await fixed.stop()
+
+
+async def test_a_passive_start_does_not_end_another_hosts_activation(tmp_path: Path) -> None:
+    """``dr.lapsed`` ends only an activation of this host: one another host recorded in the store
+    is not this box's to end. The control is this host's own activation, which a passive start
+    does end."""
+    archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(ss.path, cipher=make_cipher(key))
+    try:
+        await _record(store, "dr.activate", {"node": "another-host", "threshold": "critical"})
+    finally:
+        await store.close()
+    passive = DrSettings(enabled=True, seed_archive=archive)
+    engine = await _engine(ss, key, passive)
+    try:
+        await engine.start()
+        assert "dr.lapsed" not in await _actions(engine)
+        here = json.dumps({"node": socket.gethostname(), "threshold": "critical"})
+        await engine.store.record_audit("dr.activate", actor="alice", detail=here, now=1.0)
+    finally:
+        await engine.stop()
+    again = await _engine(ss, key, passive)
+    try:
+        await again.start()
+        assert (await _actions(again)).count("dr.lapsed") == 1
+    finally:
+        await again.stop()
+
+
+async def test_a_start_refused_after_the_graph_step_writes_no_resume_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The resume latches before the graph comes up, but its ``dr.resume`` row is written only once
+    the start has passed every refusal, so a service that crash-loops on a later refusal adds no
+    row per restart. The control: the start that succeeds writes exactly one."""
+    archive, ss, key = await _seed(tmp_path)
+    await _activate_once(ss, key, archive)
+    dr = DrSettings(enabled=True, activate=True, seed_archive=archive)
+
+    async def _refuse(self: Engine) -> None:
+        raise SecretsDirectoryError("a secrets file the engine must not use")
+
+    for _ in range(2):
+        engine = await _engine(ss, key, dr)
+        try:
+            engine.add_registry(load_config(_write_cfg(tmp_path / "cfg", tmp_path, [None])))
+            with monkeypatch.context() as patch:
+                patch.setattr(Engine, "_start_graph", _refuse)
+                with pytest.raises(SecretsDirectoryError):
+                    await engine.start()
+            assert "dr.resume" not in await _actions(engine)
+        finally:
+            await engine.stop()
+    engine = await _engine(ss, key, dr)
+    try:
+        await engine.start()
+        assert engine.dr_active
+        assert (await _actions(engine)).count("dr.resume") == 1
+    finally:
+        await engine.stop()

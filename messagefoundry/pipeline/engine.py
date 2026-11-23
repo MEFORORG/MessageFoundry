@@ -2222,9 +2222,11 @@ class Engine:
         if disarm is not None:
             disarm()
 
-    async def _resume_or_start_passive(self) -> None:
+    async def _resume_or_start_passive(self) -> Callable[[], Awaitable[None]] | None:
         """BACKLOG #5965: on a DR box, resume an earlier activation under ``[dr].activate = true``,
-        or record that a passive start ended one.
+        or note that a passive start ends one. Returns the audit write that records which, for
+        :meth:`start` to run once the start has passed every refusal, so a service that
+        crash-loops on a later refusal adds no row per restart; ``None`` when there is none.
 
         ``[dr].activate = true`` keeps a box promoted by ``POST /dr/activate`` active across a
         restart. It resumes only an activation the store records on this host with nothing ending
@@ -2239,26 +2241,31 @@ class Engine:
         with no graph yet cannot say, so it counts as an engine shard."""
         dr = self._dr_settings
         if not dr.enabled or self._dr_active:
-            return
+            return None
         engine_shard = self._shares_transform_state() or (
             self.filters_its_graph and self._registry_runner is None
         )
         if dr.activate:
             found = await resumable_activation(self.store, dr, engine_shard=engine_shard)
-            if found[0] is not None:
-                await record_resume(self.store, dr, found[0], now=time.time())
-                self._set_dr_active(True)
-                self._dr_profile_applied = True
-                if self._dr_coordinator is not None:
-                    # Built before start, it read the latch as off; a repeated POST /dr/activate
-                    # must find the box active rather than seed it again.
-                    self._dr_coordinator.note_resumed()
-                return
-            alert_resume_refused(self._alert_sink, found[1])
-        if not engine_shard:
-            # A passive start ends any activation the store still shows, so a later start under
-            # [dr].activate = true cannot resume one this box stopped serving here.
-            await note_passive_start(self.store, now=time.time())
+            if found[0] is None:
+                # Ends nothing: a host or threshold mismatch leaves an activation that is not this
+                # start's to end, so correcting the setting brings the resume back.
+                alert_resume_refused(self._alert_sink, found[1])
+                return None
+            activation_id = found[0]
+            # The latch is taken here, before the graph comes up under it; the row waits.
+            self._set_dr_active(True)
+            self._dr_profile_applied = True
+            if self._dr_coordinator is not None:
+                # Built before start, it read the latch as off; a repeated POST /dr/activate
+                # must find the box active rather than seed it again.
+                self._dr_coordinator.note_resumed()
+            return lambda: record_resume(self.store, dr, activation_id, now=time.time())
+        if engine_shard:
+            return None
+        # A passive start ends a live activation of this host, so a later start under
+        # [dr].activate = true cannot resume one this box stopped serving here.
+        return lambda: note_passive_start(self.store, now=time.time())
 
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
@@ -2413,9 +2420,9 @@ class Engine:
             # refused here, before any sync, rather than surfacing later as a failed sync, and so
             # is a non-bool literal on a boolean source setting (vault BACKLOG #3234).
             refuse_reference_hop_flags(self._registry_runner.registry)
-        # After the refusals above, so a start they refuse writes no dr.resume or dr.lapsed row,
-        # and before the graph comes up below, which takes the latch.
-        await self._resume_or_start_passive()
+        # Before the graph comes up below, which takes the latch. Its audit row is written at the
+        # end of start(), once every refusal has passed (BACKLOG #5965).
+        record_dr_boot = await self._resume_or_start_passive()
         if self._registry_runner is not None:
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
@@ -2731,6 +2738,9 @@ class Engine:
             # so this is a no-op and the supervisor brings the graph up on promotion.
             await self._reconcile_graph()
             self._graph_supervisor = asyncio.create_task(self._graph_supervisor_loop())
+        # Last, so a start refused anywhere above writes no dr.resume or dr.lapsed row.
+        if record_dr_boot is not None:
+            await record_dr_boot()
 
     # --- active-passive graph gating (Workstream A1/A3/A4) -------------------
 

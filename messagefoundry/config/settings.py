@@ -7708,22 +7708,19 @@ class DrSettings(_Section):
 
     ``enabled``/``activate`` are read at engine start; a deployment is either a DR box
     (``enabled = true``) or it is not. ``POST /dr/activate`` is the only way to promote a box.
-    ``activate = true`` keeps a box that endpoint promoted active across a restart: the engine
-    resumes that activation only when the store shows it was made on this host and not released,
-    and otherwise starts passive, logging an ERROR and raising an alert, so a boot never binds the
-    priority feeds without the seed verification, takeover hook and ``dr.activate`` audit row the
-    endpoint runs (BACKLOG #5965).
-    Without ``enabled`` it is refused at load, where it was silently ignored.
+    ``activate = true`` keeps a box that endpoint promoted active across a restart and never
+    promotes one by itself (BACKLOG #5965); which activation a start resumes is stated once, in
+    ``messagefoundry.pipeline.dr.resumable_activation``. Without ``enabled`` it is refused at load,
+    where it was silently ignored.
     """
 
     # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
     # NORMAL run-profile (every connection starts subject only to ADR 0031), byte-unchanged.
     enabled: bool = False
-    # Whether this DR box comes back UNDER the DR run-profile after a restart (BACKLOG #5965). It
-    # resumes only an activation POST /dr/activate made on this host and did not release, as the
-    # store's audit rows show; with none, the box starts passive, with an ERROR and an alert. It
-    # never promotes a box by itself. false = the box always boots provisioned-but-passive: it does NOT bind the priority
-    # feeds until an operator activates it. Refused at load unless enabled.
+    # Whether this DR box comes back UNDER the DR run-profile after a restart (BACKLOG #5965); the
+    # rule is in pipeline.dr.resumable_activation. false = the box always boots
+    # provisioned-but-passive: it does NOT bind the priority feeds until an operator activates it.
+    # Refused at load unless enabled.
     activate: bool = False
     activation_mode: DrActivationMode = DrActivationMode.MANUAL
     # The DR run-profile threshold: start ONLY connections whose resolved priority rank >= this tier's
