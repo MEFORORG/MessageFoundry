@@ -2342,30 +2342,40 @@ _SELF_TEST_SCOPED_JUDGED = frozenset({"hash:hashlib.md5", "hash:hashlib.sha1 (ou
 
 
 def judge_operations(
-    modules: list[crypto_operations.ParsedModule], found: dict[str, frozenset[str]]
+    modules: list[crypto_operations.ParsedModule], operations: list[crypto_operations.Operation]
 ) -> dict[str, frozenset[str]]:
-    """``found`` (the union-of-imports reading, :func:`crypto_operations.aggregate` of it) judged by
+    """``operations`` (the union-of-imports reading of ``modules``) aggregated, each token judged by
     the scope-aware reading of the same ``modules``, per :func:`judge_tokens` (BACKLOG #5578).
 
-    The scope-aware reading confirms a CALL, not its algorithm label. A found token whose callee
-    (the text before its ``[label]``) the scope-aware reading also gives in the file is confirmed,
-    so a real ``hmac.new`` whose union label names one binding's algorithm too many is not spelled
-    out of scope; that the union reading merges labels across bindings is its own open item. A TLS
-    posture value is part of its token's callee text, so an out-of-scope value is still marked."""
-    scoped = crypto_operations.aggregate(
-        crypto_operations.discover_operations_in_modules(modules, scope_aware=True)
+    The scope-aware reading confirms a CALL at a SITE, not its algorithm label. A found token is
+    confirmed when, at one of its own sites (file and line), the scope-aware reading gives an
+    operation with the same callee (the text before its ``[label]``). So a real ``hmac.new`` whose
+    union label names one binding's algorithm too many is not spelled out of scope, and a label
+    variant none of whose sites the scope-aware reading reaches is, even when another site in the
+    file confirms the callee. That the union reading merges labels across bindings is its own
+    open item. A TLS posture value is part of its token's callee text, so an out-of-scope value is
+    still marked."""
+    reached = {
+        (op.path, op.line, crypto_operations.operation_token(op).split("[", 1)[0])
+        for op in crypto_operations.discover_operations_in_modules(modules, scope_aware=True)
+    }
+    confirmed: dict[str, set[str]] = {}
+    for op in operations:
+        token = crypto_operations.operation_token(op)
+        if (op.path, op.line, token.split("[", 1)[0]) in reached:
+            confirmed.setdefault(op.path, set()).add(token)
+    return judge_map(
+        crypto_operations.aggregate(operations),
+        {path: frozenset(tokens) for path, tokens in confirmed.items()},
+        OUT_OF_SCOPE,
     )
-    confirmed: dict[str, frozenset[str]] = {}
-    for path, tokens in found.items():
-        callees = {token.split("[", 1)[0] for token in scoped.get(path, ())}
-        confirmed[path] = frozenset(t for t in tokens if t.split("[", 1)[0] in callees)
-    return judge_map(found, confirmed, OUT_OF_SCOPE)
 
 
 def operations_self_test() -> list[str]:
     """Run the operation instrument over :data:`_SELF_TEST_SOURCES`. Returns violation lines."""
     modules = crypto_operations.parse_sources(_SELF_TEST_SOURCES)
-    got = crypto_operations.aggregate(crypto_operations.discover_operations_in_modules(modules))
+    discovered = crypto_operations.discover_operations_in_modules(modules)
+    got = crypto_operations.aggregate(discovered)
     if got != _SELF_TEST_EXPECTED:
         return [
             f"operation arm POSITIVE CONTROL did not fire as planted: expected "
@@ -2376,7 +2386,7 @@ def operations_self_test() -> list[str]:
     # stopped, every token would read confirmed and an extra one could keep a row green again.
     # Every OTHER fixture must stay unmarked, or a reading that marks genuine calls would pass.
     expected = {**_SELF_TEST_EXPECTED, _SELF_TEST_SCOPED_PATH: _SELF_TEST_SCOPED_JUDGED}
-    judged = judge_operations(modules, got)
+    judged = judge_operations(modules, discovered)
     if judged != expected:
         return [
             f"operation arm POSITIVE CONTROL for the scope-aware reading did not fire as planted: "
@@ -2391,8 +2401,9 @@ def check_operations(
     *,
     check_stale: bool,
     modules: list[crypto_operations.ParsedModule] | None = None,
-) -> tuple[list[str], list[crypto_operations.Operation]]:
-    """Run the operation arm (BACKLOG #1164). Returns ``(violation lines, operations found)``.
+) -> tuple[list[str], list[crypto_operations.Operation], dict[str, frozenset[str]]]:
+    """Run the operation arm (BACKLOG #1164). Returns ``(violation lines, operations found, judged
+    tokens)``, the last the map the diff reads (:func:`judge_operations`).
 
     Three diffs, all bidirectional when ``check_stale``: the tree's operation tokens against
     :data:`OPERATION_INVENTORY`, and the import inventory against :data:`IMPORT_ONLY` in both
@@ -2403,8 +2414,9 @@ def check_operations(
         modules = crypto_operations.parse_files(files, repo)
     operations = crypto_operations.discover_operations_in_modules(modules)
     actual = crypto_operations.aggregate(operations)
+    judged = judge_operations(modules, operations)
     undocumented, stale = find_violations(
-        judge_operations(modules, actual),
+        judged,
         OPERATION_INVENTORY,
         check_stale=check_stale,
         noun="crypto operation",
@@ -2428,7 +2440,7 @@ def check_operations(
                 )
             if path not in INVENTORY:
                 violations.append(f"{path}: IMPORT_ONLY entry with no INVENTORY row to explain")
-    return violations, operations
+    return violations, operations, judged
 
 
 def find_violations(
@@ -2680,8 +2692,10 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
         weak = sorted(judge_tokens(tokens & weak_tokens, verified.get(path, ()), NOT_CODE))
         if weak:
             reword = (
-                ". A token marked (not code) is one the lexer reads as text, not code; if it is "
-                "prose, reword it so it does not spell the call"
+                ". A token marked (not code) is one the lexer reads as text, not code. A real call "
+                "can be marked too, at least one in a template literal's ${} hole on a later line "
+                "(THE RESIDUAL in crypto_operations.py), and it needs node:crypto as above; if it "
+                "is prose, reword it so it does not spell the call"
                 if any(token.endswith(NOT_CODE) for token in weak)
                 else ""
             )
@@ -3516,16 +3530,15 @@ def main(argv: list[str] | None = None) -> int:
         modules = crypto_operations.parse_files(files, repo)
 
     undocumented, stale = find_violations(actual, INVENTORY, check_stale=scanning_default)
-    operation_violations, operations = check_operations(
+    operation_violations, operations, judged = check_operations(
         files, repo, check_stale=scanning_default, modules=modules
     )
 
     # The corpus first, then the verdict: a red must say what was read as plainly as a green does.
     print(scanned_line(len(files), len(roots), operations))
     if args.list_operations:
-        # Each site with the verdict the diff reads for its token (BACKLOG #5578), which is
-        # file-wide by callee (:func:`judge_operations`), so every site of one token shares it.
-        judged = judge_operations(modules, crypto_operations.aggregate(operations))
+        # Each site with the verdict the diff reads for its token (BACKLOG #5578). A token is
+        # confirmed when one of its sites is (:func:`judge_operations`), so its sites share it.
         for op in operations:
             token = crypto_operations.operation_token(op)
             mark = OUT_OF_SCOPE if token + OUT_OF_SCOPE in judged.get(op.path, ()) else ""

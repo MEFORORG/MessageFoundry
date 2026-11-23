@@ -87,9 +87,9 @@ seen:
   bound without a module-level statement (at least a submodule of the same name, or a
   ``globals()`` or ``sys.modules`` write) still reads as served, so a call the hook never
   answers can be confirmed;
-* A union token is confirmed by its callee before ``[`` file-wide, so an out-of-scope label
-  variant of a callee confirmed in scope elsewhere in the same file stays confirmed; per-site
-  judgment would close it.
+* A union token is confirmed by its callee before ``[`` at one of its own sites, a file and a
+  line, so an out-of-scope label variant on a line that also holds an in-scope call of the same
+  callee stays confirmed.
 * A provider ``via`` token is marked out of scope when the module's only direct operation is out
   of scope, though the call reaches crypto in scope.
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
