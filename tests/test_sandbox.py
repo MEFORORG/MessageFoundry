@@ -1259,35 +1259,38 @@ def test_a_generator_routers_body_runs_inside_the_childs_run_context(tmp_path: P
     """BACKLOG #5780: a generator Router's body runs when something iterates it. The child must do
     that inside ``with run_contexts(...)`` and inside its exception arms, as ``mode=off`` does.
 
-    Outside the context, a ``code_set(...)`` read in the body resolves nothing under
-    ``mode=subprocess`` while it works under ``mode=off``. Outside the arms, a code_set error raised
-    in the body escapes and ends the worker, so the message reads as a crash and the next dispatch
-    pays a respawn. Both halves run against one worker."""
+    Iterated anywhere else, a ``code_set(...)`` read in the body raises "called with no active code
+    sets" under ``mode=subprocess`` while it resolves under ``mode=off``, and a body error comes back
+    as an "unmarshallable result" instead of the Router's own error. So each half compares with
+    ``mode=off`` exactly. The worker survives either way, because ``_respond`` has caught every raise
+    since BACKLOG #5890; survival is checked here, but it is not what pins this fix."""
     registry = _codeset_graph(tmp_path, "MAPPED")
     gen_ic = registry.inbound["IB_C_GEN"]
     miss_ic = registry.inbound["IB_C_MISS"]
     rc = RunContext(code_sets=registry.code_sets)
     with run_contexts(rc, phase="router"):
         off = route_only(registry, gen_ic, RAW, run_context=rc)
-        with pytest.raises(Exception, match="no_such_set"):
+        with pytest.raises(Exception, match="no such code set 'no_such_set'") as off_err:
             route_only(registry, miss_ic, RAW, run_context=rc)
     assert off == ["h"]
-    session = _session(str(tmp_path), inbound="IB_C_GEN", code_sets=registry.code_sets)
+    off_text = f"{type(off_err.value).__name__}: {off_err.value}"
+
+    # One session per inbound, as production runs them.
+    gen_session = _session(str(tmp_path), inbound="IB_C_GEN", code_sets=registry.code_sets)
     try:
-        assert route_only(registry, gen_ic, RAW, sandbox=session, run_context=rc) == off
-        proc = session._proc
-        assert proc is not None and proc.poll() is None
-        pid = proc.pid
-        with pytest.raises(
-            SandboxError, match=r"sandbox failed router 'r_gen_missing'.*no_such_set"
-        ):
-            route_only(registry, miss_ic, RAW, sandbox=session, run_context=rc)
-        # The worker answered with the Router's error; it did not die, and it serves the next one.
-        assert session._proc is proc and proc.poll() is None
-        assert route_only(registry, gen_ic, RAW, sandbox=session, run_context=rc) == off
-        assert session._proc is not None and session._proc.pid == pid
+        assert route_only(registry, gen_ic, RAW, sandbox=gen_session, run_context=rc) == off
     finally:
-        session.close()
+        gen_session.close()
+    miss_session = _session(str(tmp_path), inbound="IB_C_MISS", code_sets=registry.code_sets)
+    try:
+        for _ in range(2):
+            with pytest.raises(SandboxError) as sub_err:
+                route_only(registry, miss_ic, RAW, sandbox=miss_session, run_context=rc)
+            assert str(sub_err.value) == f"sandbox failed router 'r_gen_missing': {off_text}"
+            proc = miss_session._proc
+            assert proc is not None and proc.poll() is None
+    finally:
+        miss_session.close()
 
 
 def test_an_unreloaded_codeset_edit_does_not_brick_the_inbound(tmp_path: Path) -> None:

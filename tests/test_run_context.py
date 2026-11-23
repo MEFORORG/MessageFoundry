@@ -90,9 +90,11 @@ def test_unknown_phase_rejected() -> None:
 
 
 @pytest.mark.parametrize("phase", ["bogus", "accepts", "Router", ""])
-def test_run_contexts_refuses_an_unknown_phase(phase: str) -> None:
+def test_run_contexts_refuses_an_unknown_phase(phase: Any) -> None:
     """BACKLOG #5780 item S10-98: an unknown phase used to activate zero providers silently, so the
-    run read every accessor as unset. ``"accepts"`` is a dispatch phase, not a run phase."""
+    run read every accessor as unset. ``"accepts"`` is a dispatch phase, not a run phase. ``phase``
+    is typed ``Any`` because ``RunPhase`` makes mypy refuse these strings; this pins the run-time
+    check behind it, for a caller that reaches ``run_contexts`` with a plain ``str``."""
     log: list[str] = []
     register_run_context("probe_any", _order_probe("any", log), phases={ROUTER, TRANSFORM})
     with pytest.raises(ValueError, match="unknown phase"), run_contexts(RunContext(), phase=phase):

@@ -47,7 +47,7 @@ import os
 import sys
 import threading
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 from messagefoundry.logging_setup import configure_stderr_logging
 
@@ -354,6 +354,8 @@ def _run_one(
         req.run_context, code_sets=registry.code_sets if code_sets is None else code_sets
     )
 
+    # The run phase run_contexts takes; "accepts" is a dispatch phase and maps to the router phase.
+    phase_key: Literal["router", "transform"]
     if phase == "router":
         fn = registry.routers.get(name)
         phase_key = "router"

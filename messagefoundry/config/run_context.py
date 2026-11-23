@@ -35,7 +35,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final, Literal
 
 from messagefoundry.config.active_environment import activated as _environment_activated
 from messagefoundry.config.code_sets import activated as _code_sets_activated
@@ -48,6 +48,7 @@ from messagefoundry.config.state import activated as _state_activated
 __all__ = [
     "RunContext",
     "RunContextProvider",
+    "RunPhase",
     "ROUTER",
     "TRANSFORM",
     "register_run_context",
@@ -57,9 +58,12 @@ __all__ = [
 
 # The two points a router/transform runs. Routers see code sets / references / environment; transforms
 # additionally see committed transform state (state is transform-only — see the built-in phases below).
-ROUTER = "router"
-TRANSFORM = "transform"
-_PHASES = frozenset({ROUTER, TRANSFORM})
+# ``RunPhase`` lets strict mypy refuse a bad phase at a call site (BACKLOG #5780); run_contexts still
+# checks at run time, for a caller that reaches it with a plain ``str``.
+RunPhase = Literal["router", "transform"]
+ROUTER: Final = "router"
+TRANSFORM: Final = "transform"
+_PHASES: frozenset[str] = frozenset({ROUTER, TRANSFORM})
 
 
 @dataclass(frozen=True)
@@ -119,7 +123,7 @@ def register_run_context(
 
 
 @contextmanager
-def run_contexts(context: RunContext, *, phase: str) -> Iterator[None]:
+def run_contexts(context: RunContext, *, phase: RunPhase) -> Iterator[None]:
     """Activate every provider registered for ``phase`` (in registration order) for the ``with`` body.
 
     Replaces the hand-written ``with (activated(...), …)`` tuples the router worker, transform worker,

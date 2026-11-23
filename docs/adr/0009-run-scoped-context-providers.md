@@ -48,7 +48,9 @@ Introduce a single **provider registry** in `config/run_context.py`:
 - `run_contexts(context, *, phase)` enters every provider registered for `phase`, in **registration
   order**, through one `contextlib.ExitStack`. The three call sites each call it (the engine builds a
   `RunContext` from its live store/registry per run; dry-run builds one from its simulated views). No
-  call site enumerates providers anymore.
+  call site enumerates providers anymore. `phase` is typed `RunPhase` (`"router"` or `"transform"`),
+  and any other value raises `ValueError` (BACKLOG #5780), so a dispatch-level phase such as the
+  sandbox's `"accepts"` must be mapped to a run phase first.
 - The four existing activations are **pre-registered** in `run_context.py` so the seam is byte-identical:
   registration order `code_sets → reference → state → environment` reproduces the old nesting, `state` is
   tagged transform-only, and the others apply in both phases.
