@@ -6,7 +6,7 @@
 // check fails closed: a refusal names what is wrong and nothing is run.
 import * as path from "node:path";
 
-import { nonAsciiCaseVariant, sameIgnoringAnyCase, segmentsBelow } from "./pathFold";
+import { isSamePath, nonAsciiCaseVariant, sameIgnoringAnyCase, segmentsBelow } from "./pathFold";
 import type { Field, FieldType } from "./securityEditorWebview";
 import {
   CASE_RULE,
@@ -41,10 +41,13 @@ export function securityConfigInput(
 export type ConfigTarget = { readonly ok: true; readonly path: string } | { readonly ok: false; readonly problem: string };
 
 /** The file-system reads the link check makes, as fs.lstatSync and fs.realpathSync.native make
- *  them: each throws an error carrying `code` for a path it cannot read. */
+ *  them: each throws an error carrying `code` for a path it cannot read. `fileId`, a file's device
+ *  and file id as text, as fs.statSync reads them, places a case-variant spelling of the workspace
+ *  where its real path keeps the spelling's case; without it such a spelling is refused. */
 export interface LinkFs {
   lstat(p: string): { isSymbolicLink(): boolean };
   realpath(p: string): string;
+  fileId?(p: string): string;
 }
 
 /** Whether `e` says only that the path does not exist, the one lstat error the check passes over. */
@@ -85,9 +88,10 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
   }
 }
 
-/** Whether `head` is the folder `root` by real path: true, false when `head` does not exist, or
- *  undefined when `root`'s real path, or `head`'s for any reason but its absence, cannot be read, a
- *  dangling link at `head` included, as escapesByLink refuses one. */
+/** Whether `head` is the folder `root`, by real path and then by {@link LinkFs.fileId}, as
+ *  escapesByLink places it: true, false when `head` does not exist or its file id differs, or
+ *  undefined when a read fails for any reason but absence, a dangling link at `head` included, or
+ *  when the real paths differ and there is no `fileId` to settle it. */
 function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | undefined {
   let realRoot: string;
   try {
@@ -96,7 +100,10 @@ function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | u
     return undefined;
   }
   try {
-    return segmentsBelow(realRoot, fsx.realpath(head))?.length === 0;
+    if (isSamePath(realRoot, fsx.realpath(head))) {
+      return true;
+    }
+    return fsx.fileId === undefined ? undefined : fsx.fileId(root) === fsx.fileId(head);
   } catch (e) {
     if (!missing(e)) {
       return undefined;
@@ -135,7 +142,9 @@ function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | u
  *    ({@link hasReservedDeviceName}), which a Win32 open can read as the device. Then
  *    every existing path below the workspace folder, down to the target, must lstat as not a link,
  *    a dangling one included; the walk stops at the first that does not exist. The deepest
- *    existing one must then realpath to the folder's own realpath joined with the same parts,
+ *    existing one must then realpath to the folder's own realpath, ASCII case only on Windows,
+ *    joined with the same parts in any case (pathFold.sameIgnoringAnyCase), since NTFS may have
+ *    folded the spelling's case onto the disk's and the result stays inside the folder,
  *    because lstat does not report every reparse point as a link, at least not a junction onto a
  *    volume GUID path. An lstat error other than ENOENT or ENOTDIR, or any realpath error, the
  *    folder's own included, refuses. An 8.3 short name below the folder is refused too, since
@@ -153,9 +162,8 @@ function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | u
  * settings, the real path of the folder it names at the workspace's depth is read: when that is the
  * workspace folder, the path gets rule 2's checks, spelled from the workspace folder; when it does
  * not exist or is another folder, it is accepted as written; any other error, a dangling link
- * included, refuses. That compare reads real paths, and so is subject to the fold the file system
- * reports; unlike escapesByLink it does not compare file ids, so on a volume whose real path keeps
- * the spelling's case it reads the folder as another one.
+ * included, refuses. Where the real paths differ, the file ids decide, as escapesByLink decides;
+ * a caller that passes no `fileId` refuses then.
  *
  * Open limit: rule 3 compares spellings only, but for the case variant above. A user-set path that reaches the workspace folder by
  * an alias is accepted as written, and no link the repository holds is checked on it. That covers at

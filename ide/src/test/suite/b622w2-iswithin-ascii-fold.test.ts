@@ -197,8 +197,12 @@ windowsSuite("escapesByLink still checks a value that names the workspace by a n
     fs.realpathSync.native = ((): never => {
       throw Object.assign(new Error("EISDIR"), { code: "EISDIR" });
     }) as unknown as typeof fs.realpathSync.native;
+    fs.mkdirSync(path.join(ws, "plain"));
     try {
       assert.strictEqual(escapesByLink(ws, path.join(base, `ws-${E_ACUTE_UPPER}`, "cfg")), true);
+      // Control: under the same mock a plain folder is placed and passes, so the refusal above is
+      // the junction's, not an unreadable path's.
+      assert.strictEqual(escapesByLink(ws, path.join(base, `ws-${E_ACUTE_UPPER}`, "plain")), false);
     } finally {
       fs.realpathSync.native = native;
     }
@@ -214,6 +218,8 @@ windowsSuite("escapesByLink still checks a value that names the workspace by a n
     fs.mkdirSync(sibling);
     fs.symlinkSync(outside, path.join(sibling, "cfg"), "junction");
     assert.strictEqual(escapesByLink(ws, path.join(sibling, "cfg")), false);
+    // A `..` in the operator's own path to another folder is not refused either.
+    assert.strictEqual(escapesByLink(ws, `${sibling}\\a\\..\\cfg`), false);
     // Control: the same junction inside the workspace is refused.
     fs.symlinkSync(outside, path.join(ws, "cfg"), "junction");
     assert.strictEqual(escapesByLink(ws, path.join(ws, "cfg")), true);
@@ -229,6 +235,7 @@ windowsSuite("the Security Settings target folds ASCII case only (BACKLOG #5404,
     return {
       lstat: (p: string) => ({ isSymbolicLink: () => links.includes(p) }),
       realpath: (p: string): string => realpaths[p] ?? p,
+      fileId: (p: string): string => foldAsciiCase(realpaths[p] ?? p),
     };
   }
 
@@ -247,6 +254,21 @@ windowsSuite("the Security Settings target folds ASCII case only (BACKLOG #5404,
     assert.deepStrictEqual(got, { ok: true, path: value });
   });
 
+  test("a user value whose real path keeps its case is refused without a file id, placed with one", () => {
+    const ws = `C:\\ws\\${E_ACUTE}`;
+    const value = `C:\\ws\\${E_ACUTE_UPPER}\\cfg\\messagefoundry.toml`;
+    const keeps: LinkFs = { lstat: () => ({ isSymbolicLink: () => false }), realpath: (p: string) => p };
+    const blind = securityConfigTarget(ws, value, { ...trusted, fromWorkspace: false }, keeps);
+    assert.strictEqual(blind.ok, false, JSON.stringify(blind));
+    const linked: LinkFs = {
+      lstat: (p: string) => ({ isSymbolicLink: () => p === `${ws}\\cfg` }),
+      realpath: (p: string) => p,
+      fileId: (p: string) => p.toLowerCase(),
+    };
+    const placed = securityConfigTarget(ws, value, { ...trusted, fromWorkspace: false }, linked);
+    assert.ok(!placed.ok && placed.problem.includes("passes through a link"), JSON.stringify(placed));
+  });
+
   test("a user value naming the workspace by an E-acute case still gets the link check", () => {
     const ws = `C:\\ws\\${E_ACUTE}`;
     const head = `C:\\ws\\${E_ACUTE_UPPER}`;
@@ -260,7 +282,7 @@ windowsSuite("the Security Settings target folds ASCII case only (BACKLOG #5404,
     assert.deepStrictEqual(plain, { ok: true, path: `${ws}\\cfg\\messagefoundry.toml` });
   });
 
-  test("the real-path compare below the folder folds ASCII case only", () => {
+  test("the real-path compare folds the workspace folder's own segments ASCII case only", () => {
     // A junction lstat does not report as a link, whose real path names the KELVIN SIGN sibling.
     const ws = "C:\\ws\\kit";
     const fsx = fakeFs([], { "C:\\ws\\kit\\cfg": `C:\\ws\\${KELVIN}it\\cfg` });

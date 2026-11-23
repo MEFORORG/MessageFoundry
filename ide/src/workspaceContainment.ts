@@ -10,7 +10,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 // ASCII-only case fold on Windows, not path.relative's toLowerCase() (pathFold.ts, BACKLOG #5832).
-import { isPathWithin as isWithin, isSamePath, nonAsciiCaseVariant } from "./pathFold";
+import { isPathWithin as isWithin, isSamePath, nonAsciiCaseVariant, segmentsBelow } from "./pathFold";
 
 function realpath(p: string): string {
   try {
@@ -106,12 +106,12 @@ export function resolveInsideWorkspace(ws: string, dir: string): string | undefi
  */
 export function committedRelativePath(ws: string, value: string): string | undefined {
   const root = path.resolve(ws);
-  const target = path.resolve(root, value);
-  if (!isWithin(root, target)) {
+  // The segments the ASCII-fold containment found, not path.relative's toLowerCase() reading.
+  const below = segmentsBelow(root, path.resolve(root, value));
+  if (below === undefined) {
     return undefined;
   }
-  const rel = path.relative(root, target);
-  return rel === "" ? "." : rel.split(path.sep).join("/");
+  return below.length === 0 ? "." : below.join("/");
 }
 
 /** `name` without its trailing spaces, in linear time. A `/ +$/` replace backtracks quadratically on
@@ -211,7 +211,8 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * folder, and if so it is checked (escapesUnderCaseVariant, BACKLOG #5832).
  *
  * For a value spelled inside the folder, at least these spellings are refused outright, before any
- * I/O; for a variant value the real-path reads that place it come first. A `..` component: the real-path check collapses
+ * I/O; for a variant value the real-path and file-id reads that place it as the workspace come
+ * first, and a value placed as another folder is not checked. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
  * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
  * {@link hasTrailingDotOrSpaceName}, {@link hasColonInName} or {@link hasReservedDeviceName} names,
@@ -255,18 +256,18 @@ function climbs(value: string, win32: boolean): boolean {
  * the spelling's case (the fallback realpath() takes on some volumes), by device and file id, the
  * value is the workspace spelled another way, and it is checked as the same path spelled from the
  * workspace, links included; before this, the ASCII fold read it as outside and skipped the check.
- * When it is another folder, the value is the operator's own and is not checked. A `..`, or a path
- * that cannot be read, refuses. A value outside under every case fold makes no file-system call;
- * nor does one when `win32` is false, which reads paths exactly.
+ * When it is another folder, the value is the operator's own and is not checked, a `..` in it
+ * included. A path that cannot be read refuses. A value outside under every case fold makes no
+ * file-system call; nor does one when `win32` is false, which reads paths exactly. Open limit:
+ * `win32` selects the variant probe and the name checks only; the real-path compares and the
+ * recursive containment read the host's path module, so the flag pins no Windows reading on a
+ * POSIX host.
  */
 function escapesUnderCaseVariant(ws: string, value: string, win32: boolean): boolean {
   const root = path.resolve(ws);
   const variant = nonAsciiCaseVariant(root, path.resolve(root, value), win32);
   if (variant === undefined) {
     return false;
-  }
-  if (climbs(value, win32)) {
-    return true;
   }
   const realRoot = realpathOfNearestExisting(root);
   const realHead = realpathOfNearestExisting(variant.head);
@@ -282,7 +283,9 @@ function escapesUnderCaseVariant(ws: string, value: string, win32: boolean): boo
       return false;
     }
   }
-  return escapesByLink(ws, path.join(root, ...variant.rest), win32);
+  // The workspace, spelled another way. A `..` is checked on the value as written, since the path
+  // rebuilt below has it collapsed.
+  return climbs(value, win32) || escapesByLink(ws, path.join(root, ...variant.rest), win32);
 }
 
 /**
