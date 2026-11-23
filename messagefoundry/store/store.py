@@ -9145,9 +9145,14 @@ def _secure_file(path: Path) -> None:
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
     starting (``docs/PHI.md``'s ops checklist covers directory-level ACLs as the backstop). On
-    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so we set
-    an owner-only DACL via ``icacls`` (inheritance disabled) instead. A skipped or failed
-    restriction is **logged** (STORE-2) so it isn't silently world-readable.
+    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so it
+    writes one protected DACL whole instead, granting full control to the account read from this
+    process's token and naming nobody else. Written whole, the list replaces every entry the file
+    carried, explicit ones included (an explicit grant on a moved-in file, or the entries a temp
+    directory hands a file), which the ``icacls /inheritance:r /grant:r`` rewrite this replaced
+    left in place. The owner is not changed, and an owner keeps the access Windows gives it beyond
+    the list. A skipped or failed restriction is **logged** (STORE-2), and leaves the file's access
+    list as it was.
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
     exists, and only logs when it cannot, so a key written and then passed here would sit under the
@@ -9166,33 +9171,16 @@ def _secure_file(path: Path) -> None:
                     path,
                 )
                 return
-            # The principal is the token's SID in icacls's ``*S-...`` form, never a name, so no
-            # environment variable or name lookup chooses who is granted (vault BACKLOG #5612).
-            # icacls is pinned to its absolute System32 path and invoked without a shell; the
-            # principal is a single argv token, never a shell word, so it can't inject a flag
-            # (low-27/STORE-5). The pin is what makes "fixed system tool" true:
-            # CreateProcess resolves an unqualified name through a search path that reaches the
-            # caller's working directory, and because this call only logs on a non-zero exit, a
-            # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
-            # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
-            result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
-                check=False,
-                env=system_tool_environment(),  # the platform's start-up names only (#2716)
-                capture_output=True,
-                text=True,
-                # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
-                # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
-                # failed decode loses the output this warning logs. Only logged, so replace.
-                encoding="oem",
-                errors="replace",
-            )
-            if result.returncode != 0:
+            # The principal is the token's SID, never a name, so no environment variable or name
+            # lookup chooses who is granted (vault BACKLOG #5612). One SetNamedSecurityInfoW call,
+            # as _write_trio_dacl makes, rather than icacls: icacls cannot drop an unnamed
+            # principal's explicit entry while granting, and an API call has no program to plant.
+            result = _set_security_from_sddl(path, f"D:P(A;;FA;;;{sid})", protected=True)
+            if result.failure is not None or result.dacl_status != 0:
                 log.warning(
-                    "icacls could not restrict %s (exit %s): %s",
+                    "could not restrict %s to this account: %s",
                     path,
-                    result.returncode,
-                    (result.stderr or result.stdout or "").strip(),
+                    result.failure or f"Win32 status {result.dacl_status}",
                 )
         else:
             os.chmod(path, _OWNER_ONLY)
@@ -9219,7 +9207,10 @@ def _grant_read(path: Path, principal: str) -> None:
             env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
-            encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
+            # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+            # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+            # failed decode loses the output this warning logs. Only logged, so replace.
+            encoding="oem",
             errors="replace",
         )
     except OSError as exc:
@@ -9237,8 +9228,9 @@ def _grant_read(path: Path, principal: str) -> None:
 async def _secure_file_async(path: Path) -> None:
     """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
-    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
-    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    On Windows the restriction was an ``icacls`` subprocess, measured at 21 to 28 ms per file. It is
+    now one blocking security-descriptor write, unmeasured, still file I/O. Called straight from a
+    coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
     ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD

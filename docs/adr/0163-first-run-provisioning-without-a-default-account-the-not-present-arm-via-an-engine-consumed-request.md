@@ -274,7 +274,10 @@ see its *What it widens* and *Left open*.
   file carries explicitly -- and the hosted runners showed Python 3.13+ temp-directory entries arriving
   as explicit ones (CI run 36039014999). Placement hard-links the store where it can, and a hard link
   shares one security descriptor, so once the published store is restricted the staged link carries the
-  same DACL (measured); on the copy fallback it does not.
+  same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** `_secure_file` now
+  writes one protected DACL whole, granting the operator's user SID alone, so where that write
+  succeeds the explicit entries are removed too. Where it fails, or the token cannot be read, it
+  logs a WARNING and the file keeps the list it had.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 
@@ -307,6 +310,9 @@ checks resolve the path by name, so someone able to swap an ancestor for a junct
 create and the check could misdirect it. Outside a hardened directory, the owner-only rewrite still
 leaves any explicit entry for another principal in place, because `icacls /inheritance:r /grant:r`
 replaces only the principals it names (measured while building this); that predates this change.
+**AMENDED 2026-11-23:** the owner-only rewrite is now one protected DACL written whole, granting the
+account in the process token alone, so where that write succeeds no other principal's entry is left.
+Where it fails it logs a WARNING and the file keeps the list it had.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.
 
@@ -385,7 +391,13 @@ from the process token (vault BACKLOG #5612; it read a name from the environment
 it names (measured, above). A file that already exists keeps any trio entries it carries: the main
 database file, and a `-wal` or `-shm` still on disk because another process has the store open or a
 crash left them. A file that start creates, a `-wal`, a `-shm` or a new store, carries no explicit
-entries, so where `icacls` succeeds it is left to that account alone. A later start that resolves
+entries, so where `icacls` succeeds it is left to that account alone. **AMENDED 2026-11-23:** the
+fallback now writes one protected DACL whole, so where that write succeeds a file that already
+exists is left to that account alone as well, and the trio entries it carried are removed, the
+service account's included. On such a start by an elevated operator, the main database file then
+shuts the service out until an elevated open with the lookup working rewrites the trio, where
+before this change it kept the service's entry. The sentences on the operator's full-control entry
+below describe the file as it was before this change. A later start that resolves
 the account rewrites the trio only after it has opened the store, so an opener the fallback shut
 out cannot heal it that way. That rewrite also needs WRITE_DAC on each file, which the service,
 holding Modify, lacks on a file it does not own. So where an elevated operator's open took the

@@ -81,42 +81,46 @@ _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="icacls DACL 
 _TOKEN_SID = "S-1-5-21-1000000001-1000000002-1000000003-1001"
 
 
-def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Capture the icacls argv _secure_file would run (no real icacls), with the process token
-    reporting ``_TOKEN_SID`` and ``USERNAME`` naming someone else entirely."""
+def _capture_dacl_writes(
+    monkeypatch: pytest.MonkeyPatch, *, written: object = None
+) -> list[tuple[str, str, bool]]:
+    """Capture the access-list writes _secure_file makes (none reach a file), with the process
+    token reporting ``_TOKEN_SID`` and ``USERNAME`` naming someone else entirely. ``written`` is what
+    each write reports, a successful DACL write when ``None``. No process may be started."""
     import messagefoundry.store.store as store_mod
 
-    captured: list[list[str]] = []
-
-    class _R:
-        returncode = 0
-        stderr = ""
-        stdout = ""
+    captured: list[tuple[str, str, bool]] = []
+    result = store_mod._SddlWrite(dacl_status=0) if written is None else written
 
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _TOKEN_SID)
     monkeypatch.setenv("USERNAME", "minter")
 
-    def _run(argv: list[str], **kw: object) -> _R:
-        captured.append(argv)
-        return _R()
+    def _write(path: object, sddl: str, *, protected: bool) -> object:
+        captured.append((str(path), sddl, protected))
+        return result
 
-    # The same module object store.py calls run() on.
-    monkeypatch.setattr(subprocess, "run", _run)
+    def _no_process(*_a: object, **_kw: object) -> None:
+        raise AssertionError("_secure_file started a process; it writes the list in-process")
+
+    monkeypatch.setattr(store_mod, "_set_security_from_sddl", _write)
+    monkeypatch.setattr(subprocess, "run", _no_process)
     return captured
+
+
+#: The one list _secure_file writes for the token account: protected, that account at full control.
+_OWNER_ONLY_SDDL = f"D:P(A;;FA;;;{_TOKEN_SID})"
 
 
 @_windows_only
 def test_secure_file_default_is_owner_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The store DB/WAL path: an owner-only DACL, and nothing else.
+    # The store DB/WAL path: one protected access list, written whole, granting the token account.
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
 
-    captured = _capture_icacls(monkeypatch)
+    captured = _capture_dacl_writes(monkeypatch)
     store_mod._secure_file(Path("store.db"))
-    argv = captured[0]
-    assert os.path.basename(argv[0]).lower() == "icacls.exe"  # the pin has its own test
-    assert argv[1:] == ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
+    assert captured == [("store.db", _OWNER_ONLY_SDDL, True)]
 
 
 @_windows_only
@@ -126,16 +130,16 @@ def test_secure_file_grants_the_token_account_whatever_username_says(
 ) -> None:
     # Vault BACKLOG #5612. The grant used to name %USERNAME%, so an inherited value naming another
     # principal would have been granted Full Control of a PHI store, and an empty one skipped the
-    # restriction, leaving the file its inherited access list. Neither may reach the argv now.
+    # restriction, leaving the file its inherited access list. Neither may reach the list now.
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
 
-    captured = _capture_icacls(monkeypatch)
+    captured = _capture_dacl_writes(monkeypatch)
     monkeypatch.setenv("USERNAME", username)
     store_mod._secure_file(Path("store.db"))
     assert captured, "the restriction was skipped"
-    assert captured[0][1:] == ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
+    assert captured[0][1:] == (_OWNER_ONLY_SDDL, True)
 
 
 @_windows_only
@@ -146,12 +150,41 @@ def test_secure_file_logs_and_grants_nobody_when_the_token_cannot_be_read(
 
     import messagefoundry.store.store as store_mod
 
-    captured = _capture_icacls(monkeypatch)
+    captured = _capture_dacl_writes(monkeypatch)
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: None)
     with caplog.at_level("WARNING"):
         store_mod._secure_file(Path("store.db"))
     assert captured == []
     assert "could not read this process's account from its token" in caplog.text
+
+
+@_windows_only
+@pytest.mark.parametrize(
+    ("failure", "status"),
+    [
+        pytest.param("its DACL did not convert", None, id="not-built"),
+        pytest.param(None, 5, id="refused"),
+    ],
+)
+def test_secure_file_logs_a_list_it_could_not_write(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str | None,
+    status: int | None,
+) -> None:
+    # Best-effort, as the icacls rewrite was: a write that did not take is logged, never raised.
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    captured = _capture_dacl_writes(
+        monkeypatch, written=store_mod._SddlWrite(failure=failure, dacl_status=status)
+    )
+    with caplog.at_level("WARNING"):
+        store_mod._secure_file(Path("store.db"))
+    assert len(captured) == 1
+    assert "could not restrict store.db to this account" in caplog.text
+    assert (failure or f"Win32 status {status}") in caplog.text
 
 
 @_windows_only
@@ -167,9 +200,9 @@ def test_current_user_sid_is_the_process_token_account(monkeypatch: pytest.Monke
 
 @_windows_only
 def test_secure_file_leaves_the_real_token_account_owner_only(tmp_path) -> None:
-    # The real icacls, with a SID principal: the file ends with one explicit entry, the token's,
-    # and no inherited ones. The folder grants this account alone, not the SYSTEM, Administrators
-    # and OWNER RIGHTS entries pytest's tmp_path carries (tests/_win_acl.py says why).
+    # The real write: the file ends with one explicit entry, the token's, and no inherited ones.
+    # The folder grants this account alone, not the SYSTEM, Administrators and OWNER RIGHTS entries
+    # pytest's tmp_path carries (tests/_win_acl.py says why).
     import messagefoundry.store.store as store_mod
     from tests._win_acl import assert_owner_only, folder_granting
 
@@ -182,19 +215,57 @@ def test_secure_file_leaves_the_real_token_account_owner_only(tmp_path) -> None:
 
 
 @_windows_only
-def test_secure_file_pins_icacls_to_the_system_directory(monkeypatch: pytest.MonkeyPatch) -> None:
-    # This call WRITES the ACL restricting the store DB and the DPAPI key file, so it must name
-    # icacls by absolute path: CreateProcess resolves an unqualified name through a search path that
-    # reaches the caller's working directory. _secure_file logs only on a non-zero exit, so a planted
-    # icacls.exe that exits 0 would leave the file its inherited (possibly broad) ACL and report
-    # nothing — the hardening becomes a silent no-op (BACKLOG #1769).
+@pytest.mark.parametrize(
+    "others",
+    [
+        pytest.param("(A;;FR;;;WD)", id="explicit-everyone-read"),
+        # What a mode-0700 or mkdtemp folder on Python 3.13+ was measured handing a file, explicitly.
+        pytest.param("(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)", id="explicit-temp-dir-entries"),
+    ],
+)
+def test_secure_file_drops_another_principals_explicit_entry(tmp_path, others: str) -> None:
+    # The file already carries an EXPLICIT entry for someone else, as a moved-in file or one made in
+    # a temp directory can. RED before the one-list write: `icacls /inheritance:r /grant:r` removed
+    # only inherited entries and replaced only the principal it named, so these survived, unlogged.
+    import messagefoundry.store.store as store_mod
+    from tests._win_acl import assert_owner_only, folder_granting, protected_entries
+
+    sid = store_mod._current_user_sid()
+    assert sid is not None
+    path = folder_granting(tmp_path / "store", sid) / "seeded.db"
+    path.write_bytes(b"x")
+    seeded = store_mod._set_security_from_sddl(path, f"D:P(A;;FA;;;{sid}){others}", protected=True)
+    assert seeded.failure is None and seeded.dacl_status == 0, seeded
+    _, _, entries = protected_entries(path)
+    assert len(entries) > 1, f"fixture: {entries}"
+    store_mod._secure_file(path)
+    assert_owner_only(path, sid)
+
+
+@_windows_only
+def test_grant_read_pins_icacls_to_the_system_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    # _grant_read is the store's remaining icacls call, and it WRITES an access list, so it must
+    # name icacls by absolute path: CreateProcess resolves an unqualified name through a search path
+    # that reaches the caller's working directory. It logs only on a non-zero exit, so a planted
+    # icacls.exe that exits 0 would turn the grant into a silent no-op (BACKLOG #1769).
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
     from messagefoundry import service_status
 
-    captured = _capture_icacls(monkeypatch)
-    store_mod._secure_file(Path("store.db"))
+    captured: list[list[str]] = []
+
+    class _R:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def _run(argv: list[str], **kw: object) -> _R:
+        captured.append(argv)
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    store_mod._grant_read(Path("api.crt"), "*S-1-5-32-545")
     # Guard the guard: with no call recorded, every assertion below passes over nothing.
     assert captured, "icacls was never invoked; the pin assertions would pass vacuously"
     program = captured[0][0]

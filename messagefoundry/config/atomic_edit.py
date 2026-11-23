@@ -627,11 +627,12 @@ def _restrict_to_editor(
     the write failed. Windows only. The candidate takes ``editor_writes`` (the module docstring says
     why).
 
-    The whole list in one write, never ``store._secure_file``'s ``icacls /inheritance:r``. The
-    private directory ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER
-    RIGHTS, and an own-account edit whose replaced file went through that icacls rewrite was
-    measured granting all four rather than its owner alone; that rewrite does not remove every
-    entry a file carries. :func:`replace_validated` calls this on the candidate before its first
+    The whole list in one write, never an ``icacls /inheritance:r`` rewrite. The private directory
+    ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER RIGHTS, and an
+    own-account edit whose replaced file went through that icacls rewrite, which
+    ``store._secure_file`` made until it too wrote one whole list, was measured granting all four
+    rather than its owner alone; that rewrite does not remove an entry a file carries explicitly.
+    :func:`replace_validated` calls this on the candidate before its first
     byte, with the live file's owner when that is another account so it can still read the file
     once it is renamed into place, and again on an own-account replaced file."""
     from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl

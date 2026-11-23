@@ -5495,10 +5495,9 @@ def _restore_blocking(
         # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
         # primitive's contract.
         # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
-        # archive.tar and extracted_store.db keep what `_secure_file` leaves, which is NOT owner-only when
-        # a file carries the temp directory's entries explicitly (it removes inherited entries only;
-        # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
-        # published DACL. A follow-up recorded in ADR 0163.
+        # archive.tar and extracted_store.db keep what `_secure_file` leaves: one protected DACL
+        # granting this process's account, where that write succeeds, or the list the file had, logged,
+        # where it does not. A hard-linked placement then shares the published DACL. ADR 0163 records it.
         #
         # Staged under the backup's and verify's lock-and-sweep, not in a `TemporaryDirectory`
         # (BACKLOG #5617). That `__exit__` raised when one unlink was refused (on Windows, a scanner
