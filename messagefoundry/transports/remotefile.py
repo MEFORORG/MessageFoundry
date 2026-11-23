@@ -3087,7 +3087,7 @@ class RemoteFileSource(SourceConnector):
             elif step is not _Step.FREE:
                 disposed += 1
                 newly_recorded += step is _Step.RECORDED
-        newly_recorded += await self._retry_stuck(listing[reached:], due, relist=disposed > 0)
+        newly_recorded += await self._retry_stuck(listing[reached:], due)
         if newly_recorded and self.processed_ledger is not None:
             # Bound growth (age + count), only when something new. A store call, so the stop bound
             # waits for it rather than cutting it (#4685).
@@ -3095,7 +3095,7 @@ class RemoteFileSource(SourceConnector):
                 await self.processed_ledger.prune()
 
     async def _retry_stuck(
-        self, unreached: list[_Listed], due: dict[str, tuple[float, _Listed]], *, relist: bool
+        self, unreached: list[_Listed], due: dict[str, tuple[float, _Listed]]
     ) -> int:
         """Examine the remembered rejects due a retry, earliest due first, up to
         :meth:`_stuck_retry_allowance`, and return how many files that recorded in the ledger
@@ -3108,12 +3108,12 @@ class RemoteFileSource(SourceConnector):
         remembered reject without a slot drops any settle sighting, which must come from
         consecutive polls.
 
-        ``relist`` says the pass finished with at least one file, so time has passed since its
-        listing. A poll with a slot to run then lists the directory once more, because the size
-        check (:meth:`_held_for_size`) cannot see a rewrite on a listing with no size, or one that
-        keeps the length, and a moved time can show either. Slots share that listing, so such a
-        rewrite during an earlier slot's hand-off is still not seen. A slot that listing cannot
-        judge, because it failed or no longer names the file, stays due and drops its sighting."""
+        A poll with a slot to run lists the directory once more first, whether or not the pass
+        disposed of a file, because a hand-off that failed takes time too. The size check
+        (:meth:`_held_for_size`) cannot see a rewrite on a listing with no size, or one that keeps
+        the length, and a moved time can show either. Slots share that listing, so such a rewrite
+        during an earlier slot's hand-off is still not seen. A slot that listing cannot judge,
+        because it failed or no longer names the file, stays due and drops its sighting."""
         now = time.monotonic()
         for entry in unreached if self._stuck else ():
             stuck = self._stuck_reject(entry.name, entry.size, entry.mtime)
@@ -3125,21 +3125,19 @@ class RemoteFileSource(SourceConnector):
             del self._settle_seen[name]
         if not slots:
             return 0
-        latest = {entry.name: entry for _, entry in slots}
-        if relist:
-            try:
-                current = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
-            except _RemoteError as exc:
-                logger.warning(
-                    "REMOTEFILE %s: could not list the directory again before retrying rejected "
-                    "files; they stay due: %s",
-                    _where(self._host, self._remote_dir),
-                    safe_exc(exc),
-                )
-                for name in latest:
-                    self._settle_seen.pop(name, None)
-                return 0
-            latest = {entry.name: entry for entry in current}
+        try:
+            current = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
+        except _RemoteError as exc:
+            logger.warning(
+                "REMOTEFILE %s: could not list the directory again before retrying rejected "
+                "files; they stay due: %s",
+                _where(self._host, self._remote_dir),
+                safe_exc(exc),
+            )
+            for _, slot in slots:
+                self._settle_seen.pop(slot.name, None)
+            return 0
+        latest = {entry.name: entry for entry in current}
         recorded = 0
         for _, slot in slots:
             if self._stop.is_set():
@@ -3408,16 +3406,22 @@ class RemoteFileSource(SourceConnector):
         before the transfer began. So it stays in place, unrecorded, and settles again from the
         length read.
 
-        **A steady disagreement is not held for good.** RFC 3659 calls the ``MLSD`` size
-        approximate, so a server can list a size no read ever matches. When a later read returns
-        the same length while the listing has not changed, the file is not moving, so it is logged
-        and goes on. That costs such a server a second download of each file. The record stays
-        until the file is finished with, so a later gate that leaves it in place does not cost
-        another. Two cases are not told apart from a wrong listing: a writer paused across both
-        reads, as the settle gate cannot tell one either, and a transfer that ends early at the
-        same byte twice on a server that also refuses ``SIZE`` or ``stat`` during the retrieve.
+        **A steady disagreement is not held for good, except as the exception below says.** RFC 3659 calls the
+        ``MLSD`` size approximate, so a server can list a size no read ever matches. When a later
+        read returns the same length while the listing has not changed, the file is not moving, so
+        it is logged and goes on. That costs such a server a second download of each file. The
+        record stays until the file is finished with, so a later gate that leaves it in place does
+        not cost another. Two cases are not told apart from a wrong listing: a writer paused across
+        both reads, as the settle gate cannot tell one either, and a transfer that ends early at
+        the same byte twice on a server that also refuses ``SIZE`` or ``stat`` during the retrieve.
 
-        **The budget.** A held read was a full download, so it charges the per-tick budget, and a
+        **The exception.** A server whose ``SIZE`` or ``stat`` repeats the wrong listed size during
+        the retrieve makes the transfer's own check (#116) raise ``_RemoteChanged`` on every read,
+        before this check runs. That file is never released: it is read again on every poll, not
+        charged to the budget, and logged each time.
+
+        **The budget.** A held read on the poll's main pass was a full download, so it charges the
+        per-tick budget. A hold on a retry pass charges nothing, since no retry does. A
         server that lists every file at a wrong size does not pull its whole backlog in one poll. A
         second held read at another length on one listing starts a wait of
         ``STUCK_TRANSIENT_RETRY_SECONDS`` (:meth:`_waiting_on_size`), so a file that keeps

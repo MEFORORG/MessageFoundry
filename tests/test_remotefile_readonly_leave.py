@@ -861,6 +861,39 @@ async def test_a_no_size_retry_rewritten_during_a_hand_off_is_caught_by_the_seco
     assert handler.bodies == [_GOOD], "the partial must not be handed over"
 
 
+async def test_a_failed_hand_off_still_leaves_the_retry_a_current_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed hand-off disposes of nothing, yet it takes time, and a no-size retry that runs on the
+    listing from before it cannot see a rewrite made meanwhile."""
+
+    class _NoSizeClient(_StampedClient):
+        def list_entries(self, remote_dir: str) -> list[_Listed]:
+            return [e._replace(size=0, size_known=False) for e in super().list_entries(remote_dir)]
+
+    client = _NoSizeClient({"/in/z.hl7": _BAD}, {"/in/z.hl7": "1", "/in/a.hl7": "1"})
+    client._rename_exc = _REFUSED
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()  # z is rejected and remembered
+    client.files["/in/a.hl7"] = _GOOD
+    _make_due(src, "z.hl7")
+    await src._poll_once()  # a is first seen; z takes the slot and settles
+    handler = _RecordingHandler()
+
+    async def failing(raw: bytes) -> str | None:
+        client.files["/in/z.hl7"] = b"MSH|^~\\&|PARTIAL"
+        client.mtimes["/in/z.hl7"] = "2"
+        if not handler.bodies:
+            handler.bodies.append(b"")  # only the first call fails
+            raise RuntimeError("synthetic store outage")
+        return await handler(raw)
+
+    src._handler = failing
+    await src._poll_once()
+    assert b"MSH|^~\\&|PARTIAL" not in handler.bodies, "the partial must not be handed over"
+
+
 def test_the_nlst_fallback_asks_for_sizes_in_binary_mode() -> None:
     """ftplib's NLST leaves the session in ASCII mode, where several servers refuse SIZE."""
 
@@ -985,7 +1018,7 @@ def test_each_real_listing_says_whether_it_gave_a_size() -> None:
     assert known == {"sized.hl7": True, "unsized.hl7": False}
 
 
-async def test_a_poll_with_a_due_retry_lists_the_directory_once(
+async def test_a_poll_with_a_due_retry_lists_the_directory_twice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Open items 3 and 5: the retrieve-time check replaced the second listing, so no poll pays for
@@ -997,7 +1030,7 @@ async def test_a_poll_with_a_due_retry_lists_the_directory_once(
     _make_due(src, "z.hl7")
     client.list_calls = 0
     await src._poll_once()
-    assert client.list_calls == 1
+    assert client.list_calls == 2
 
 
 @pytest.mark.parametrize("time_returns", [True, False])
