@@ -72,9 +72,17 @@ from messagefoundry.pipeline.dr_backup import VerifyResult, join_before_checks, 
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import Store
+from messagefoundry.store.base import Row
 from messagefoundry.store.store import OwnedLanes
 
-__all__ = ["DrCoordinator", "DrActivationError", "DrProfileNotLeading", "DrResult"]
+__all__ = [
+    "DrActivationError",
+    "DrCoordinator",
+    "DrProfileNotLeading",
+    "DrResult",
+    "DrResumeRefused",
+    "resume_prior_activation",
+]
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +97,10 @@ _ACTION_ABORTED = "dr_activation_aborted"
 #: #2752). The box stays active and the release can be retried. Kept apart from ``dr.release``, which
 #: only a completed hand-back writes, so a filter on that action still finds only fail-backs.
 _ACTION_RELEASE_FAILED = "dr_release_failed"
+#: A boot under ``[dr].activate = true`` that re-latched an activation this box had already made
+#: through ``POST /dr/activate`` and not released (BACKLOG #5965). Its own action, so a filter on
+#: ``dr.activate`` still finds only audited promotions.
+_ACTION_RESUME = "dr.resume"
 
 
 def _vip_note(cause: str) -> str:
@@ -147,6 +159,12 @@ class DrProfileNotLeading(RuntimeError):
     coordinator no longer reads it as leader, before the reload changed any lane (BACKLOG #5906).
     The engine raises it from the runner's own refusal, so this module does not import the
     runner."""
+
+
+class DrResumeRefused(RuntimeError):
+    """A boot under ``[dr].activate = true`` found no activation of this box to resume, so the
+    engine refuses to start rather than latch the DR run-profile unaudited (BACKLOG #5965). The
+    message names no configured value."""
 
 
 class DrActivationError(RuntimeError):
@@ -242,6 +260,7 @@ class DrCoordinator:
         profile_provenance: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
         after_release: Callable[[], Awaitable[None]] | None = None,
         hop_posture: HopPosture | None = None,
+        active: bool = False,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -275,17 +294,18 @@ class DrCoordinator:
         # cross-shard clobber the scoped startup reset removes. None/None-returning = global (the
         # unsharded DR box, where "no live siblings" genuinely holds).
         self._owned_lanes = owned_lanes
-        # Whether the DR run-profile is currently on (mirrors the engine's _dr_active, seeded from
-        # [dr].activate, which a loaded config keeps False since BACKLOG #5965; this coordinator
-        # flips it on activate/release).
-        self._active = bool(settings.enabled and settings.activate)
+        # Whether the DR run-profile is currently on (mirrors the engine's _dr_active; this
+        # coordinator flips it on activate/release). The engine passes its own latch, which a boot
+        # sets only by resuming an audited activation (resume_prior_activation, BACKLOG #5965).
+        # Never read from [dr].activate, which alone proves no activation.
+        self._active = active
         # An activation whose run-profile is applied but whose dr.activate row is not yet known to be
         # written: (detail, actor, now). Set before the write and cleared after it, so a write that a
         # cancellation or a store error cut short is written by the next activate or release call
         # rather than that call answering success with no row (vault BACKLOG #2751). Held in memory
-        # only, so a restart loses it; the refusal and its log line are what record that. Only a
-        # settings object built in code can start a box active, since the load refuses
-        # [dr].activate = true (BACKLOG #5965); such a box never set it.
+        # only, so a restart loses it; the refusal and its log line are what record that. A box
+        # active from a boot never set it: that boot resumed an activation whose row was written
+        # (BACKLOG #5965).
         self._unrecorded_activation: tuple[dict[str, object], str, float] | None = None
         # The same for a completed hand-back whose dr.release row is not yet known to be written
         # (vault BACKLOG #2752). The next activate or release call writes it first.
@@ -315,6 +335,11 @@ class DrCoordinator:
     @property
     def settings(self) -> DrSettings:
         return self._settings
+
+    def note_resumed(self) -> None:
+        """Record that the engine's start resumed an earlier activation (BACKLOG #5965), for a
+        coordinator built before that start read the latch."""
+        self._active = True
 
     def note_profile_preflight(self, running: bool) -> None:
         """Record whether the ``activate_profile`` callback is inside its preflight.
@@ -558,6 +583,9 @@ class DrCoordinator:
             "threshold": self._settings.priority_threshold.value,
             "seed_segment": progress.seed_segment,
             "vip_hook_ran": progress.hook_ran,
+            # The host this activation ran on, so a boot under [dr].activate = true resumes only an
+            # activation made on this box, never one carried in a restored store (BACKLOG #5965).
+            "node": self._node,
         }
         if step_failures:
             # Step labels only, as the config_reload row records them. The detail text, which
@@ -1657,3 +1685,81 @@ def _parse_restore_token(text: str) -> str | None:
     if isinstance(expected, str) and expected.strip():
         return expected.strip()
     return None
+
+
+async def _latest_audit_row(store: Store, action: str) -> Row | None:
+    """The newest audit row with ``action``, or ``None``. ``list_audit`` reads newest first."""
+    rows = await store.list_audit(action=action, limit=1)
+    return rows[0] if rows else None
+
+
+def _row_id(row: Row | None) -> int:
+    """An audit row's id, or -1 for no row. Ids grow with each write on every backend."""
+    if row is None:
+        return -1
+    value = row["id"]
+    return value if isinstance(value, int) else -1
+
+
+async def resume_prior_activation(store: Store, settings: DrSettings, *, now: float) -> int:
+    """Resume, at boot, an activation this box already made through ``POST /dr/activate``.
+
+    ``[dr].activate = true`` keeps a promoted box active across a restart (BACKLOG #5965). It
+    re-latches the run-profile without seeding again: the store is the one that activation
+    verified and has served since, and a second seed check could refuse it, because on a server-DB
+    box the box's own ``dr_backup`` rows are by then the latest anchor a restore token is compared
+    with. It never stands in for the activation itself, which alone runs the seed verify, the
+    takeover hook and writes the ``dr.activate`` row.
+
+    So the store must show that activation: the newest ``dr.activate`` row, written on this host,
+    with no ``dr.release`` after it and no ``dr_seed`` marker after it (a marker after it is a
+    later attempt from a passive box, so the activation it followed had already ended). A boot
+    that finds none raises :class:`DrResumeRefused`, which refuses the start, and binds nothing.
+    One that finds it writes a ``dr.resume`` row naming that activation and returns its row id.
+    A store error propagates, so a store that cannot be read refuses the start too."""
+    node = socket.gethostname()
+    activation = await _latest_audit_row(store, _ACTION_ACTIVATE)
+    activation_id = _row_id(activation)
+    reason: str | None = None
+    if activation is None:
+        reason = "this store records no POST /dr/activate"
+    elif _row_id(await _latest_audit_row(store, _ACTION_RELEASE)) > activation_id:
+        reason = "the last activation was released by POST /dr/release"
+    elif _row_id(await _latest_audit_row(store, _ACTION_SEED)) > activation_id:
+        reason = "a later activation attempt did not complete, so the last activation had ended"
+    else:
+        raw = activation["detail"]
+        try:
+            detail = json.loads(raw) if isinstance(raw, str) else None
+        except ValueError:
+            detail = None
+        if not isinstance(detail, dict) or detail.get("node") != node:
+            reason = "the last activation was not recorded on this host"
+    if reason is not None:
+        raise DrResumeRefused(
+            f"[dr].activate = true found no activation of this box to resume: {reason}. A DR box "
+            "is promoted by POST /dr/activate (dr:operate), which verifies the cold seed, runs the "
+            "takeover hook and writes the dr.activate audit row; [dr].activate = true only keeps "
+            "such a box active across a restart. Set [dr].activate = false, start the box passive, "
+            "and promote it with POST /dr/activate"
+        )
+    await store.record_audit(
+        _ACTION_RESUME,
+        actor="system",
+        detail=json.dumps(
+            {
+                "activation_id": activation_id,
+                "node": node,
+                "threshold": settings.priority_threshold.value,
+            },
+            sort_keys=True,
+        ),
+        now=now,
+    )
+    log.warning(
+        "DR: [dr].activate = true resumed the activation recorded as audit row %d; serving feeds "
+        "at priority >= %s without a new seed check or takeover hook",
+        activation_id,
+        settings.priority_threshold.value,
+    )
+    return activation_id

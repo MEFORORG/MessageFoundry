@@ -36,6 +36,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import DrParkedError, RegistryRunner
 from messagefoundry.store import MessageStore, Store
 from messagefoundry.transports.file import FileDestination
+from tests._dr_prior_activation import record_prior_activation
 from tests.test_connection_scheduler import (
     _IN_WINDOW,
     _Clock,
@@ -269,9 +270,9 @@ async def test_an_active_dr_box_over_the_same_store_delivers_its_critical_rows(
     """The control arm: the recorder sees a delivery, so the empty lists above are not a dead
     probe, and the park is the passive state's and not the seed's."""
     cfg = await _seeded(tmp_path, sent)
-    # The load refuses activate=true (BACKLOG #5965); model_construct builds the boot-latched
-    # box the engine still models, which only code can hand it now.
-    latched = DrSettings.model_construct(enabled=True, activate=True)
+    # A boot under activate=true resumes an activation this host made (BACKLOG #5965).
+    await record_prior_activation(tmp_path / _DB)
+    latched = DrSettings(enabled=True, activate=True, seed_archive="seed.mfbak")
     async with _served(tmp_path, cfg, latched) as engine:
         await _until_sent(sent, 4)
         await asyncio.sleep(_SETTLE_SECONDS)

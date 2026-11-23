@@ -2055,15 +2055,14 @@ def test_vip_enabled_warns_that_nothing_moves_the_address(
 
 def test_dr_activate_with_cluster_is_rejected(tmp_path: Path) -> None:
     # A DR box coming up under the DR run-profile must not also contend for the cluster lease (it could
-    # win leadership and drive the primary store cross-WAN). Refused at config load: activate = true
-    # is refused on its own since BACKLOG #5965, before the cluster check runs.
+    # win leadership and drive the primary store cross-WAN). Refused at config load, naming the key.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
         "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = true\n"
         "seed_archive = 'seed.mfbak'\n",
     )
-    with pytest.raises(ValidationError, match=r"\[dr\]\.activate = true is not supported"):
+    with pytest.raises(ValidationError, match=r"\[dr\]\.activate cannot be combined"):
         load_settings(config_path=cfg, environ={})
 
 
@@ -2092,24 +2091,16 @@ def test_a_cluster_member_with_dr_off_loads(tmp_path: Path) -> None:
     assert s.cluster.enabled is True and s.dr.enabled is False
 
 
-def test_dr_activate_without_cluster_is_refused_too(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # BACKLOG #5965: this posture used to load, and latched the DR run-profile at boot without
-    # what POST /dr/activate runs. The passive box loads; the endpoint promotes it.
+def test_dr_activate_without_cluster_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The classic DR posture: keep the DR profile across a restart with [cluster] disabled. It loads;
+    # the engine checks at start that the store shows an activation to resume (BACKLOG #5965).
     monkeypatch.chdir(tmp_path)
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         "[dr]\nenabled = true\nactivate = true\nseed_archive = 'seed.mfbak'\n",
     )
-    with pytest.raises(ValidationError, match=r"POST /dr/activate"):
-        load_settings(config_path=cfg, environ={})
-    passive = _write(
-        tmp_path / "passive.toml",
-        "[dr]\nenabled = true\nseed_archive = 'seed.mfbak'\n",
-    )
-    s = load_settings(config_path=passive, environ={})
-    assert s.dr.enabled is True and s.dr.activate is False and s.cluster.enabled is False
+    s = load_settings(config_path=cfg, environ={})
+    assert s.dr.activate is True and s.cluster.enabled is False
 
 
 # --- [integrity] startup self-attestation (ADR 0041 D3) + dual-control config_reload (D2) ----
@@ -2239,12 +2230,12 @@ def test_delivery_priority_default_and_dr_section(tmp_path: Path) -> None:
     cfg = _write(
         tmp_path / "h.toml",
         "[delivery]\npriority = 'critical'\n"
-        "[dr]\nenabled = true\npriority_threshold = 'normal'\nseed_archive = 'seed.mfbak'\n"
-        "takeover_hook = 'echo ok'\ntakeover_timeout_seconds = 5\n",
+        "[dr]\nenabled = true\nactivate = true\npriority_threshold = 'normal'\n"
+        "seed_archive = 'seed.mfbak'\ntakeover_hook = 'echo ok'\ntakeover_timeout_seconds = 5\n",
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.delivery.priority.value == "critical"
-    assert s.dr.enabled and not s.dr.activate and s.dr.priority_threshold.value == "normal"
+    assert s.dr.enabled and s.dr.activate and s.dr.priority_threshold.value == "normal"
     assert s.dr.takeover_hook == "echo ok"
 
 
@@ -2290,9 +2281,10 @@ def test_dr_seed_dir_parses_and_defaults_off(tmp_path: Path) -> None:
     seeds = (tmp_path / "seeds").as_posix()  # absolute on the platform running the test
     cfg = _write(tmp_path / "dr_seed_dir.toml", f"[dr]\nenabled = true\nseed_dir = '{seeds}'\n")
     assert load_settings(config_path=cfg, environ={}).dr.seed_dir == seeds
-    # Blank-but-present reads as off. It must never reach the engine as a path, where it would
-    # resolve to the working directory.
-    assert DrSettings(seed_dir="   ").seed_dir == ""
+    # Blank-but-present is refused, as seed_archive's is (BACKLOG #5965). It must never reach the
+    # engine as a path, where it would resolve to the working directory.
+    with pytest.raises(ValidationError, match=r"\[dr\]\.seed_dir must be a non-blank path"):
+        DrSettings(seed_dir="   ")
     # "Absolute" is this platform's. A rooted path with no drive is relative on Windows, and a
     # drive-letter path is a relative name anywhere else.
     other_platform = "/srv/dr/seeds" if os.name == "nt" else "D:/dr/seeds"

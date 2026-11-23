@@ -25,6 +25,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.store import MessageStore
+from tests._dr_prior_activation import record_prior_activation
 
 
 def _backup_settings(tmp_path: Path, schedule_at: str = "") -> BackupSettings:
@@ -165,14 +166,14 @@ async def test_the_scheduled_pass_is_not_due_on_a_passive_standby(tmp_path: Path
 
 async def test_a_boot_latched_active_backs_up(tmp_path: Path) -> None:
     db = tmp_path / "e.db"
+    # A boot under activate=true resumes an activation this host made (BACKLOG #5965).
+    await record_prior_activation(db)
     engine = Engine(
         await MessageStore.open(db),
         poll_interval=0.05,
         store_settings=StoreSettings(path=str(db)),
         backup_settings=_backup_settings(tmp_path),
-        # The load refuses activate=true (BACKLOG #5965); model_construct builds the
-        # boot-latched box the engine still models, which only code can hand it now.
-        dr_settings=DrSettings.model_construct(enabled=True, activate=True),
+        dr_settings=DrSettings(enabled=True, activate=True, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:

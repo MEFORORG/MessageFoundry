@@ -3953,8 +3953,8 @@ class AuthSettings(_Section):
     oidc_jwks_uri: str | None = None  # https, pinned
     # Defence-in-depth allow-list: every OIDC endpoint host must appear here. Only the
     # model-validator reads it, at load; no OIDC runtime module checks it again before an outbound
-    # call (BACKLOG #5318 item 1). The pinned URLs cannot change without a reload, which re-runs the
-    # validator. Refused empty when enabled.
+    # call (BACKLOG #5318 item 1). The pinned URLs cannot change without a restart, which re-runs
+    # the validator. Refused empty when enabled.
     oidc_allowed_endpoints: list[str] = Field(default_factory=list)
     # The engine's OWN back-channel TLS trust for the IdP. transports/rest.py uses OpenSSL's default
     # trust, which does NOT consult the Windows machine store — a domain-issued / self-signed IdP cert
@@ -4044,7 +4044,8 @@ class AuthSettings(_Section):
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
     # deployment must also front the API with a proxy/WAF limiter. 0 disables a limit, and a window
     # of 0 disables both. A negative count or window is refused at load (BACKLOG #5318): a negative
-    # count refused every attempt after the first, and a negative window was a second spelling of 0.
+    # per-address count refused every attempt after an address's first, a negative global count
+    # refused every attempt, the first included, and a negative window was a second spelling of 0.
     # A count above its default, a window below it, and each off value is
     # a LOOSENING that `security_loosenings()` names (BACKLOG #1131); so are the
     # PHI-read, admin-write, session-cap and OIDC flow-cache limits below.
@@ -7704,20 +7705,23 @@ class DrSettings(_Section):
     the fence; ``takeover_hook`` is optional belt-and-braces for non-LB topologies). **Activation is
     MANUAL** (``POST /dr/activate``, gated by the ``dr:operate`` permission); ``auto`` is rejected at load.
 
-    ``enabled`` is read at engine start; a deployment is either a DR box (``enabled = true``) or it
-    is not. A DR box always boots passive, and ``POST /dr/activate`` is the only way to promote it
-    (BACKLOG #5965). ``activate = true`` is refused at load: as a startup latch it bound the priority
-    feeds without the seed verification, takeover hook and ``dr.activate`` audit row that endpoint
-    runs, and without ``enabled`` it was silently ignored.
+    ``enabled``/``activate`` are read at engine start; a deployment is either a DR box
+    (``enabled = true``) or it is not. ``POST /dr/activate`` is the only way to promote a box.
+    ``activate = true`` keeps a box that endpoint promoted active across a restart: the engine
+    resumes that activation only when the store shows it was made on this host and not released,
+    and refuses to start otherwise, so a boot never binds the priority feeds without the seed
+    verification, takeover hook and ``dr.activate`` audit row the endpoint runs (BACKLOG #5965).
+    Without ``enabled`` it is refused at load, where it was silently ignored.
     """
 
     # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
     # NORMAL run-profile (every connection starts subject only to ADR 0031), byte-unchanged.
     enabled: bool = False
-    # REFUSED when true (BACKLOG #5965). It was a startup latch that made the box come up under the
-    # DR run-profile, binding the priority feeds with no seed verification, takeover hook or
-    # dr.activate audit row, and it was ignored unless enabled. Only false loads: the box boots
-    # provisioned-but-passive and binds nothing until POST /dr/activate promotes it.
+    # Whether this DR box comes back UNDER the DR run-profile after a restart (BACKLOG #5965). It
+    # resumes only an activation POST /dr/activate made on this host and did not release, as the
+    # store's audit rows show; with none, the engine refuses to start. It never promotes a box by
+    # itself. false = the box always boots provisioned-but-passive: it does NOT bind the priority
+    # feeds until an operator activates it. Refused at load unless enabled.
     activate: bool = False
     activation_mode: DrActivationMode = DrActivationMode.MANUAL
     # The DR run-profile threshold: start ONLY connections whose resolved priority rank >= this tier's
@@ -7788,7 +7792,7 @@ class DrSettings(_Section):
             )
         return value
 
-    @field_validator("seed_archive", "restore_token")
+    @field_validator("seed_archive", "seed_dir", "restore_token")
     @classmethod
     def _path_not_blank(cls, value: str, info: ValidationInfo) -> str:
         # "" switches each off. A blank or space-padded value is a path activation would try to open
@@ -7821,11 +7825,11 @@ class DrSettings(_Section):
     @field_validator("seed_dir")
     @classmethod
     def _seed_dir_absolute(cls, value: str) -> str:
-        # "" switches request-named archives off. A blank-but-present or relative value would
-        # instead resolve against the service's working directory and quietly open that. So blank
-        # reads as "" and relative fails at load. "Absolute" is judged for THIS platform, the one
-        # that will resolve it: a rooted path with no drive is relative on Windows.
-        value = value.strip()
+        # "" switches request-named archives off. A relative value would instead resolve against
+        # the service's working directory and quietly open that, so it fails at load; a blank or
+        # padded one is refused above, as seed_archive's is (BACKLOG #5965). "Absolute" is judged
+        # for THIS platform, the one that will resolve it: a rooted path with no drive is relative
+        # on Windows.
         if value and not os.path.isabs(value):
             # The value is not quoted: a URL that _looks_like_url missed could carry a
             # credential (vault BACKLOG #2600).
@@ -7857,23 +7861,18 @@ class DrSettings(_Section):
             )
         return self
 
-    @field_validator("activate")
-    @classmethod
-    def _activate_only_through_the_endpoint(cls, value: bool) -> bool:
-        # BACKLOG #5965. A boot-time activation skipped what POST /dr/activate runs: the cold-seed
-        # verify, the server-DB seed gate, the takeover hook and the dr.activate audit row. Routing
-        # it through DrCoordinator.activate is not contained (a server-DB activation needs a
-        # per-activation DBA attestation no boot has, and a failed boot activation has no owner),
-        # so the latch is refused. Without enabled it was silently ignored, so it is refused there
-        # too; the message names no configured value.
-        if value:
+    @model_validator(mode="after")
+    def _activate_needs_enabled(self) -> DrSettings:
+        # BACKLOG #5965: without enabled the engine never read activate, so a box an operator
+        # meant to keep active came up as an ordinary engine with nothing said. What activate does
+        # with enabled is checked at start (pipeline.dr.resume_prior_activation), against the store.
+        if self.activate and not self.enabled:
             raise ValueError(
-                "[dr].activate = true is not supported: a DR box boots passive and is promoted only "
-                "by POST /dr/activate (dr:operate), which verifies the cold seed, runs the takeover "
-                "hook and writes the dr.activate audit row that a boot-time activation skipped. "
-                "Remove [dr].activate, keep [dr].enabled = true, and activate with POST /dr/activate"
+                "[dr].activate = true needs [dr].enabled = true: it keeps a DR box that POST "
+                "/dr/activate promoted active across a restart, and has no meaning on a box that "
+                "is not a DR box"
             )
-        return value
+        return self
 
     @model_validator(mode="after")
     def _enabled_names_a_seed(self) -> DrSettings:
@@ -8563,14 +8562,16 @@ class ServiceSettings(_InputHidingModel):
         moment it activates. Refuse the combination at config load rather than let it silently co-elect.
         Spans two sections, so it lives here (not on either section, which can't see the other).
 
-        ``[dr].enabled`` is the key refused (vault BACKLOG #3263): ``[dr].activate = true`` is
-        refused on its own (BACKLOG #5965), so every DR box boots passive. A passive box binds no
-        listener and delivers nothing (ADR 0048). As a cluster member it could win the lease and
-        then serve nothing, and ``POST /dr/activate`` would make it the lease-contending DR box
-        described above."""
+        ``[dr].enabled`` is refused with ``[cluster].enabled`` as well, whatever ``activate`` says
+        (vault BACKLOG #3263); ``activate`` without ``enabled`` is refused on its own (BACKLOG
+        #5965). A provisioned DR box that is not activated is passive: it binds no listener and
+        delivers nothing (ADR 0048). As a cluster member it could win the lease and then serve
+        nothing, and ``POST /dr/activate`` would make it the lease-contending DR box described
+        above."""
         if self.dr.enabled and self.cluster.enabled:
+            key = "[dr].activate" if self.dr.activate else "[dr].enabled"
             raise ValueError(
-                "[dr].enabled cannot be combined with [cluster].enabled: the DR run-profile gates which "
+                f"{key} cannot be combined with [cluster].enabled: the DR run-profile gates which "
                 "connections start, not leadership acquisition, so a DR box that also contends for the "
                 "cluster lease could win leadership and drive the primary store cross-WAN, and one "
                 "that is not activated is passive, so as leader it would serve nothing. Run the DR "

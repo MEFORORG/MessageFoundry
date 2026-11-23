@@ -80,6 +80,7 @@ from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 from messagefoundry.pipeline.dr import (
     DrCoordinator,
     DrProfileNotLeading,
+    resume_prior_activation,
     warn_unset_pass_environment,
 )
 from messagefoundry.pipeline.dr_backup import BackupRunner
@@ -887,10 +888,11 @@ class Engine:
         self._intake_monitor: IntakeBoundMonitor | None = None
         # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
         # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
-        # active only when this box is a DR standby that POST /dr/activate has promoted (the load
-        # refuses [dr].activate = true, BACKLOG #5965, so no boot starts active): then the runner
-        # binds only connections whose resolved tier rank >= dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
-        # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
+        # active only when this box is a DR standby that POST /dr/activate has promoted, on this
+        # boot or, under [dr].activate = true, on an earlier one that start() resumes (BACKLOG
+        # #5965): then the runner binds only connections whose resolved tier rank >=
+        # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the
+        # runner → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
         # A DR box that is not activated passes dr_standby instead, and binds no inbound listener
         # until it is (vault BACKLOG #3140).
         self._priority_default = priority_default
@@ -901,15 +903,18 @@ class Engine:
             # At start, not only when a hook runs, which on a DR box is during the disaster: the
             # coordinator that runs hooks is built only at the first activate or release.
             warn_unset_pass_environment(self._dr_settings.pass_environment)
-        # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Seeded from [dr].enabled
-        # AND [dr].activate, which a loaded config keeps False (BACKLOG #5965); flipped True by the
-        # DR coordinator on a successful POST /dr/activate (which then reloads the graph so the run-profile filter applies)
-        # and back False on POST /dr/release. A runner takes dr_threshold from _dr_run_threshold() when
-        # it is built, and _set_dr_active hands a running one the new value on each flip (#3067).
-        self._dr_active = bool(self._dr_settings.enabled and self._dr_settings.activate)
+        # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). False at construction;
+        # flipped True by the DR coordinator on a successful POST /dr/activate (which then reloads
+        # the graph so the run-profile filter applies), or by start() when [dr].activate = true
+        # and the store shows an earlier audited activation of this box that was not released
+        # (BACKLOG #5965). Back False on POST /dr/release. A runner takes dr_threshold from
+        # _dr_run_threshold() when it is built, and _set_dr_active hands a runner the new value on
+        # each flip (#3067).
+        self._dr_active = False
         # Whether an activation's reload has completed, so the run-profile is applied and not only
-        # latched; :meth:`_dr_backup_paused` reads it. A boot latched active needs no reload.
-        self._dr_profile_applied = self._dr_active
+        # latched; :meth:`_dr_backup_paused` reads it. A resumed boot needs no reload: its graph
+        # comes up under the profile.
+        self._dr_profile_applied = False
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -1239,6 +1244,9 @@ class Engine:
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
                 hop_posture=self._hop_posture,
+                # The engine's own latch, so a boot that resumed an activation reads as active and
+                # one that has not started yet does not (BACKLOG #5965).
+                active=self._dr_active,
             )
         return self._dr_coordinator
 
@@ -2286,6 +2294,19 @@ class Engine:
                 "set audit_verify_on_start = true to arm it",
                 self._audit_anchor_file,
             )
+        # BACKLOG #5965: [dr].activate = true keeps a box promoted by POST /dr/activate active across
+        # a restart. It resumes only an activation the store shows this box made and did not
+        # release, and refuses the start otherwise, before any listener binds, so a boot can never
+        # latch the run-profile without the seed verify, takeover hook and dr.activate row that
+        # endpoint runs. The latch goes to the runner before the graph comes up below.
+        if self._dr_settings.enabled and self._dr_settings.activate and not self._dr_active:
+            await resume_prior_activation(self.store, self._dr_settings, now=time.time())
+            self._set_dr_active(True)
+            self._dr_profile_applied = True
+            if self._dr_coordinator is not None:
+                # Built before start, it read the latch as off; a repeated POST /dr/activate must
+                # find the box active rather than seed it again.
+                self._dr_coordinator.note_resumed()
         # Bring cluster membership + leader election up BEFORE the workers run, so the node's heartbeat
         # is registered and leadership is contended the moment it starts processing (Track B Step 3/4).
         # NullCoordinator (the single-node default) is a no-op here, so this line is free for SQLite /

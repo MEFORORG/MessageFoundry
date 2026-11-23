@@ -13317,9 +13317,9 @@ def create_managed_app(
                 security_enforcement=security_enforcement,
                 update_check_settings=update_check_settings,
                 backup_settings=backup_settings,
-                # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). A DR box boots
-                # passive; once POST /dr/activate promotes it, the engine binds only connections
-                # at/above dr.priority_threshold.
+                # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). Once POST
+                # /dr/activate promotes a DR box (or a boot under dr.activate resumes that, BACKLOG
+                # #5965), the engine binds only connections at/above dr.priority_threshold.
                 dr_settings=dr_settings,
                 # [backup] DR archive is encrypted under the store DEK (its KEY SOURCE) and bundles the
                 # config dir; pass the resolved store settings (the KeyProvider seam) + version metadata.

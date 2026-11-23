@@ -27,10 +27,13 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from tests._dr_prior_activation import record_prior_activation
 
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
+    # A boot under activate=true resumes an activation this host made (BACKLOG #5965).
+    await record_prior_activation(tmp_path / "status.db")
     store = await MessageStore.open(tmp_path / "status.db")
     eng = Engine(
         store,
@@ -39,10 +42,11 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         store_settings=StoreSettings(path=str(tmp_path / "status.db")),
         # A DR box ALREADY activated under the profile this boot (enabled + activate): the run-profile
         # threshold is CRITICAL, so a normal-tier inbound is parked status:"filtered" at start.
-        # The load refuses activate=true (BACKLOG #5965); model_construct builds the
-        # boot-latched box the engine still models, which only code can hand it now.
-        dr_settings=DrSettings.model_construct(
-            enabled=True, activate=True, priority_threshold=Priority.CRITICAL
+        dr_settings=DrSettings(
+            enabled=True,
+            activate=True,
+            seed_archive="seed.mfbak",
+            priority_threshold=Priority.CRITICAL,
         ),
         egress_settings=EgressSettings(deny_by_default=False),
     )

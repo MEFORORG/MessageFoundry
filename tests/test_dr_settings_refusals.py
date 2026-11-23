@@ -2,10 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``[dr]`` misconfigurations refused at load rather than found during a disaster (BACKLOG #5965).
 
-A boot-time ``[dr].activate = true`` skipped what ``POST /dr/activate`` runs (the cold-seed verify,
-the takeover hook and the ``dr.activate`` audit row), and without ``[dr].enabled`` it was ignored.
-Item 1 (S09-42): a DR box that names no seed, a blank seed or token path, and a restore token on a
-SQLite store where nothing reads it.
+``[dr].activate = true`` without ``[dr].enabled`` was ignored, so it is refused. With ``enabled`` it
+loads, and the engine decides at start whether there is an activation to resume
+(``tests/test_dr_boot_resume.py``). Item 1 (S09-42): a DR box that names no seed, a blank or padded
+seed or token path, and a restore token on a SQLite store where nothing reads it.
 """
 
 from __future__ import annotations
@@ -20,26 +20,23 @@ from messagefoundry.config.settings import DrSettings, load_settings
 _SEED = {"seed_archive": "C:/dr/seed.mfbak"}
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_activate_true_is_refused_with_or_without_enabled(enabled: bool) -> None:
-    with pytest.raises(ValidationError, match=r"POST /dr/activate") as info:
-        DrSettings.model_validate({"enabled": enabled, "activate": True, **_SEED})
-    assert "[dr].activate" in str(info.value)
+def test_activate_without_enabled_is_refused() -> None:
+    """The engine never read it there, so a box meant to stay active came up as a plain engine."""
+    with pytest.raises(ValidationError, match=r"\[dr\]\.activate = true needs \[dr\]\.enabled"):
+        DrSettings.model_validate({"activate": True, **_SEED})
 
 
-def test_activate_false_still_loads() -> None:
-    """The control: the passive box the endpoint promotes."""
-    dr = DrSettings.model_validate({"enabled": True, "activate": False, **_SEED})
-    assert dr.enabled and not dr.activate
+@pytest.mark.parametrize("activate", [True, False])
+def test_an_enabled_box_loads_either_way(activate: bool) -> None:
+    """The control: with enabled, activate = true loads; start checks the store for it."""
+    dr = DrSettings.model_validate({"enabled": True, "activate": activate, **_SEED})
+    assert dr.enabled and dr.activate is activate
 
 
-def test_activate_true_from_a_file_is_refused(tmp_path: Path) -> None:
+def test_activate_true_without_enabled_from_a_file_is_refused(tmp_path: Path) -> None:
     cfg = tmp_path / "messagefoundry.toml"
-    cfg.write_text(
-        "[dr]\nenabled = true\nactivate = true\nseed_archive = 'C:/dr/seed.mfbak'\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValidationError, match=r"\[dr\]\.activate = true is not supported"):
+    cfg.write_text("[dr]\nactivate = true\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match=r"\[dr\]\.activate = true needs \[dr\]\.enabled"):
         load_settings(config_path=cfg, environ={})
 
 
@@ -60,7 +57,7 @@ def test_a_disabled_box_needs_no_seed() -> None:
     assert not DrSettings().enabled
 
 
-@pytest.mark.parametrize("field", ["seed_archive", "restore_token"])
+@pytest.mark.parametrize("field", ["seed_archive", "seed_dir", "restore_token"])
 @pytest.mark.parametrize("blank", [" ", "\t", "  \n"])
 def test_a_blank_path_is_refused(field: str, blank: str) -> None:
     """A blank is truthy, so activation would try to open it and abort every time."""
@@ -68,11 +65,13 @@ def test_a_blank_path_is_refused(field: str, blank: str) -> None:
         DrSettings.model_validate({field: blank})
 
 
-@pytest.mark.parametrize("field", ["seed_archive", "restore_token"])
+@pytest.mark.parametrize("field", ["seed_archive", "seed_dir", "restore_token"])
 def test_a_padded_path_is_refused(field: str) -> None:
-    """Activation would open the padded path as written and abort."""
+    """Activation would open the padded path as written and abort. ``seed_dir`` used to strip the
+    padding where the other two refused it; all three refuse now."""
+    value = f" {Path.cwd().resolve()} " if field == "seed_dir" else " C:/dr/seed.mfbak "
     with pytest.raises(ValidationError, match=rf"\[dr\]\.{field} must not begin or end"):
-        DrSettings.model_validate({field: " C:/dr/seed.mfbak "})
+        DrSettings.model_validate({field: value})
 
 
 def _toml(tmp_path: Path, store: str, dr: str) -> Path:

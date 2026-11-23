@@ -495,10 +495,10 @@ class BackupRunner:
         # THIS IS THE ONE STATEMENT OF WHAT STILL WRITES SUCH A ROW ON A DR BOX; the probe's
         # docstrings point here. At least: the `messagefoundry backup` command, which builds its
         # runner without this gate; a pass already running when the gate turns True, which
-        # finishes and records its row; and an activated box's own passes, which are not paused,
-        # so a later re-activation's restore-token check reads this box's own archive as the latest
-        # anchor. A box booted with `[dr].activate = true` used to be one too; the load refuses
-        # that now (BACKLOG #5965).
+        # finishes and records its row; and an activated box's own passes, a box that resumed an
+        # activation at boot under `[dr].activate = true` included (BACKLOG #5965), which are not
+        # paused, so a later re-activation's restore-token check reads this box's own archive as
+        # the latest anchor.
         self._dr_paused = dr_paused
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.

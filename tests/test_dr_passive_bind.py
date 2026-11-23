@@ -26,6 +26,7 @@ from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.config.wiring import PortConflictError
 from messagefoundry.pipeline import Engine
+from tests._dr_prior_activation import record_prior_activation
 from tests.test_connection_scheduler import _hold_port
 from tests.test_dr_running_config_dir import _BOTH_OUTBOUNDS, _CRIT, _NORM, _free_ports
 from tests.test_dr_running_config_dir import _write_tiered_graph as _write_graph
@@ -162,12 +163,13 @@ async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_criti
 
 
 async def test_a_box_activated_at_startup_binds_only_the_critical_feed(tmp_path: Path) -> None:
-    """``activate = true`` is not passive: the box serves its critical feed from the start."""
+    """``activate = true`` resuming an activation is not passive: the box serves its critical
+    feed from the start."""
     cfg = tmp_path / "cfg"
     crit_port, norm_port = _write_graph(cfg, tmp_path)
-    # The load refuses activate=true (BACKLOG #5965); model_construct builds the boot-latched
-    # box the engine still models, which only code can hand it now.
-    latched = DrSettings.model_construct(enabled=True, activate=True)
+    # A boot under activate=true resumes an activation this host made (BACKLOG #5965).
+    await record_prior_activation(tmp_path / _DB)
+    latched = DrSettings(enabled=True, activate=True, seed_archive="seed.mfbak")
     async with _served(tmp_path, cfg, latched) as engine:
         rr = engine.registry_runner
         assert rr is not None
