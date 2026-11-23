@@ -80,6 +80,7 @@ from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 from messagefoundry.pipeline.dr import (
     DrCoordinator,
     DrProfileNotLeading,
+    note_passive_start,
     resume_prior_activation,
     warn_unset_pass_environment,
 )
@@ -2307,6 +2308,10 @@ class Engine:
                 # Built before start, it read the latch as off; a repeated POST /dr/activate must
                 # find the box active rather than seed it again.
                 self._dr_coordinator.note_resumed()
+        elif self._dr_settings.enabled and not self._dr_active:
+            # A passive start ends any activation the store still shows, so a later start under
+            # [dr].activate = true cannot resume one this box stopped serving here (BACKLOG #5965).
+            await note_passive_start(self.store, now=time.time())
         # Bring cluster membership + leader election up BEFORE the workers run, so the node's heartbeat
         # is registered and leadership is contended the moment it starts processing (Track B Step 3/4).
         # NullCoordinator (the single-node default) is a no-op here, so this line is free for SQLite /

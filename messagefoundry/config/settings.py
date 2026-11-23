@@ -9845,7 +9845,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             f"the window of the per-address and all-clients sign-in limits, and of {ceremonies},"
         ),
         off=(
-            "the sign-in rate-limit window is zero or negative, which ages every attempt out "
+            "the sign-in rate-limit window is zero, which ages every attempt out "
             "before it is counted -- neither the per-address nor the all-clients sign-in "
             f"limit holds, and nor does {ceremonies}, although login_rate_limit_enabled "
             "still reads as on"
@@ -9952,7 +9952,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         auth.phi_read_rate_limit_window_seconds,
         what="the PHI-read rate-limit window",
         off=(
-            "the PHI-read rate-limit window is zero or negative, which ages every read out before "
+            "the PHI-read rate-limit window is zero, which ages every read out before "
             "it is counted -- no PHI-read limit holds, although phi_read_rate_limit_enabled still "
             "reads as on"
         ),

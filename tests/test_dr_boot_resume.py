@@ -134,8 +134,10 @@ async def test_activate_true_with_no_prior_activation_refuses_the_start(tmp_path
         await engine.stop()
 
 
-async def test_activate_false_boots_passive_over_a_prior_activation(tmp_path: Path) -> None:
-    """The control: the resume is activate's, not the store's."""
+async def test_a_passive_start_ends_the_activation_it_starts_over(tmp_path: Path) -> None:
+    """The resume is activate's, not the store's: a passive start over a live activation stays
+    passive, and records that the activation ended, so a later start under activate = true does
+    not resume one the box stopped serving."""
     archive, ss, key = await _seed(tmp_path)
     passive = DrSettings(enabled=True, seed_archive=archive)
     first = await _engine(ss, key, passive)
@@ -150,9 +152,22 @@ async def test_activate_false_boots_passive_over_a_prior_activation(tmp_path: Pa
     try:
         await engine.start()
         assert not engine.dr_active
-        assert "dr.resume" not in await _actions(engine)
+        actions = await _actions(engine)
+        assert "dr.resume" not in actions and actions.count("dr.lapsed") == 1
     finally:
         await engine.stop()
+    again = await _engine(ss, key, passive)  # a second passive start adds no second marker
+    try:
+        await again.start()
+        assert (await _actions(again)).count("dr.lapsed") == 1
+    finally:
+        await again.stop()
+    kept = await _engine(ss, key, DrSettings(enabled=True, activate=True, seed_archive=archive))
+    try:
+        with pytest.raises(DrResumeRefused, match=r"started passive since the last activation"):
+            await kept.start()
+    finally:
+        await kept.stop()
 
 
 async def test_a_released_activation_is_not_resumed(tmp_path: Path) -> None:
@@ -188,8 +203,11 @@ async def _record(store: MessageStore, action: str, detail: dict[str, object]) -
         # Written before the row named its host.
         ([("dr.activate", {})], "not recorded on this host"),
         # A later attempt from a passive box opened a seed segment: the activation had ended.
-        ([("dr.activate", {"node": "HERE"}), ("dr_seed", {})], "did not complete"),
+        ([("dr.activate", {"node": "HERE"}), ("dr_seed", {})], "passive box"),
         ([("dr.activate", {"node": "HERE"}), ("dr.release", {})], "released"),
+        # A later attempt refused before its seed marker came from a passive box too.
+        ([("dr.activate", {"node": "HERE"}), ("dr_activation_aborted", {})], "passive box"),
+        ([("dr.activate", {"node": "HERE"}), ("dr.lapsed", {})], "started passive"),
     ],
 )
 async def test_an_activation_that_is_not_this_boxes_live_one_is_refused(

@@ -5963,8 +5963,9 @@ def _supervise(args: argparse.Namespace) -> int:
         db_base += "/."
     # BACKLOG #5817: every engine shard's port counts up from [api].port (or --base-port, which
     # reaches it through the load and is range-checked above under its own name). The load refuses
-    # a value outside 0 to 65535 (BACKLOG #5769), before the TLS renewal below writes anything. How many engine shards the graph has is known
-    # only once the supervisor loads it, so the range several of them need is checked there.
+    # a value outside 0 to 65535 (BACKLOG #5769), before the TLS renewal below writes anything. How
+    # many engine shards the graph has is known only once the supervisor loads it, so the range
+    # several of them need is checked there.
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.

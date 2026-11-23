@@ -81,6 +81,7 @@ __all__ = [
     "DrProfileNotLeading",
     "DrResult",
     "DrResumeRefused",
+    "note_passive_start",
     "resume_prior_activation",
 ]
 
@@ -101,6 +102,9 @@ _ACTION_RELEASE_FAILED = "dr_release_failed"
 #: through ``POST /dr/activate`` and not released (BACKLOG #5965). Its own action, so a filter on
 #: ``dr.activate`` still finds only audited promotions.
 _ACTION_RESUME = "dr.resume"
+#: A DR box that started passive over an activation its store showed as live: that activation has
+#: ended, so a later start under ``[dr].activate = true`` must not resume it (BACKLOG #5965).
+_ACTION_LAPSED = "dr.lapsed"
 
 
 def _vip_note(cause: str) -> str:
@@ -1701,33 +1705,78 @@ def _row_id(row: Row | None) -> int:
     return value if isinstance(value, int) else -1
 
 
+#: The rows that end the activation before them, each with what it says (BACKLOG #5965). A box
+#: that is active writes none of them: a POST /dr/activate on an active box returns before any
+#: seed marker or abort row, and a lapse is written only by a passive boot.
+_ENDS_AN_ACTIVATION: tuple[tuple[str, str], ...] = (
+    (_ACTION_RELEASE, "the last activation was released by POST /dr/release"),
+    (_ACTION_LAPSED, "the box has started passive since the last activation"),
+    (_ACTION_SEED, "a later activation attempt was made from a passive box"),
+    (_ACTION_ABORTED, "a later activation attempt was made from a passive box"),
+)
+
+
+async def _live_activation(store: Store) -> tuple[Row | None, str | None]:
+    """The newest ``dr.activate`` row, and why it is not live, or ``None`` when it is."""
+    activation = await _latest_audit_row(store, _ACTION_ACTIVATE)
+    if activation is None:
+        return None, "this store records no POST /dr/activate"
+    activation_id = _row_id(activation)
+    for action, reason in _ENDS_AN_ACTIVATION:
+        if _row_id(await _latest_audit_row(store, action)) > activation_id:
+            return activation, reason
+    return activation, None
+
+
+async def note_passive_start(store: Store, *, now: float) -> None:
+    """Record, on a DR box starting passive, that the activation its store shows has ended.
+
+    Without it a later start under ``[dr].activate = true`` would resume an activation the box
+    stopped serving at this start, however long ago, as when a box fails back by restarting
+    passive rather than through ``POST /dr/release``, or comes up over a restored store that
+    carries an earlier incident's activation (BACKLOG #5965). Written whatever host the activation
+    names, and only when one is live, so a passive box that keeps restarting adds no rows."""
+    activation, ended = await _live_activation(store)
+    if activation is None or ended is not None:
+        return
+    activation_id = _row_id(activation)
+    await store.record_audit(
+        _ACTION_LAPSED,
+        actor="system",
+        detail=json.dumps({"activation_id": activation_id}, sort_keys=True),
+        now=now,
+    )
+    log.warning(
+        "DR: this box started passive over the activation recorded as audit row %d, which has "
+        "ended; [dr].activate = true will not resume it",
+        activation_id,
+    )
+
+
 async def resume_prior_activation(store: Store, settings: DrSettings, *, now: float) -> int:
-    """Resume, at boot, an activation this box already made through ``POST /dr/activate``.
+    """Resume, at start, an activation this box already made through ``POST /dr/activate``.
 
     ``[dr].activate = true`` keeps a promoted box active across a restart (BACKLOG #5965). It
-    re-latches the run-profile without seeding again: the store is the one that activation
-    verified and has served since, and a second seed check could refuse it, because on a server-DB
-    box the box's own ``dr_backup`` rows are by then the latest anchor a restore token is compared
-    with. It never stands in for the activation itself, which alone runs the seed verify, the
-    takeover hook and writes the ``dr.activate`` row.
+    re-latches the run-profile without seeding again and without the takeover hook: the store is
+    the one that activation verified and has served since, and a second seed check could refuse
+    it, because on a server-DB box the box's own ``dr_backup`` rows are by then the latest anchor a
+    restore token is compared with. It never stands in for the activation itself, which alone runs
+    the seed verify and the takeover hook and writes the ``dr.activate`` row.
 
     So the store must show that activation: the newest ``dr.activate`` row, written on this host,
-    with no ``dr.release`` after it and no ``dr_seed`` marker after it (a marker after it is a
-    later attempt from a passive box, so the activation it followed had already ended). A boot
-    that finds none raises :class:`DrResumeRefused`, which refuses the start, and binds nothing.
-    One that finds it writes a ``dr.resume`` row naming that activation and returns its row id.
-    A store error propagates, so a store that cannot be read refuses the start too."""
+    with no row of :data:`_ENDS_AN_ACTIVATION` after it. A start that finds none raises
+    :class:`DrResumeRefused`, which refuses the start, and binds nothing. One that finds it writes
+    a ``dr.resume`` row naming that activation, before the rest of the start, and returns its row
+    id. A store error propagates, so a store that cannot be read refuses the start too.
+
+    The checks read what the store records, and at least these cases pass them: an activation
+    this host made in an earlier incident, carried in a restored store, when no passive start or
+    attempt has followed it there; a completed release whose ``dr.release`` row could not be
+    written; and, on an engine-shard fleet, a shard that was not itself activated, since the rows
+    name the host and not the shard."""
     node = socket.gethostname()
-    activation = await _latest_audit_row(store, _ACTION_ACTIVATE)
-    activation_id = _row_id(activation)
-    reason: str | None = None
-    if activation is None:
-        reason = "this store records no POST /dr/activate"
-    elif _row_id(await _latest_audit_row(store, _ACTION_RELEASE)) > activation_id:
-        reason = "the last activation was released by POST /dr/release"
-    elif _row_id(await _latest_audit_row(store, _ACTION_SEED)) > activation_id:
-        reason = "a later activation attempt did not complete, so the last activation had ended"
-    else:
+    activation, reason = await _live_activation(store)
+    if activation is not None and reason is None:
         raw = activation["detail"]
         try:
             detail = json.loads(raw) if isinstance(raw, str) else None
@@ -1735,7 +1784,7 @@ async def resume_prior_activation(store: Store, settings: DrSettings, *, now: fl
             detail = None
         if not isinstance(detail, dict) or detail.get("node") != node:
             reason = "the last activation was not recorded on this host"
-    if reason is not None:
+    if activation is None or reason is not None:
         raise DrResumeRefused(
             f"[dr].activate = true found no activation of this box to resume: {reason}. A DR box "
             "is promoted by POST /dr/activate (dr:operate), which verifies the cold seed, runs the "
@@ -1743,6 +1792,7 @@ async def resume_prior_activation(store: Store, settings: DrSettings, *, now: fl
             "such a box active across a restart. Set [dr].activate = false, start the box passive, "
             "and promote it with POST /dr/activate"
         )
+    activation_id = _row_id(activation)
     await store.record_audit(
         _ACTION_RESUME,
         actor="system",
@@ -1757,9 +1807,9 @@ async def resume_prior_activation(store: Store, settings: DrSettings, *, now: fl
         now=now,
     )
     log.warning(
-        "DR: [dr].activate = true resumed the activation recorded as audit row %d; serving feeds "
-        "at priority >= %s without a new seed check or takeover hook",
-        activation_id,
+        "DR: [dr].activate = true re-latched the DR run-profile (priority >= %s) from the "
+        "activation recorded as audit row %d, with no new seed check or takeover hook",
         settings.priority_threshold.value,
+        activation_id,
     )
     return activation_id

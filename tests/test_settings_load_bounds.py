@@ -8,7 +8,8 @@ Where 0 is a documented off value, 0 still loads and only a negative is refused.
 
 from __future__ import annotations
 
-from typing import Any, get_args
+import types
+from typing import Any, Union, get_args, get_origin
 
 import pytest
 from pydantic import ValidationError
@@ -115,14 +116,26 @@ def test_the_wal_checkpoint_cadence_refuses_nan_and_infinity(value: float) -> No
         RetentionSettings(wal_checkpoint_seconds=value)
 
 
+def _is_float_field(annotation: object) -> bool:
+    """``float`` or an optional/union of it; never a container such as ``dict[str, float]``,
+    which the root refusal does not walk."""
+    if annotation is float:
+        return True
+    return get_origin(annotation) in (Union, types.UnionType) and float in get_args(annotation)
+
+
 def _section_float_fields() -> list[tuple[type[_Section], str]]:
+    # Only the shipped sections: a test module's own _Section subclass would otherwise join the
+    # census or not, by import order.
     found: set[tuple[type[_Section], str]] = set()
     pending: list[type[_Section]] = list(_Section.__subclasses__())
     while pending:
         cls = pending.pop()
         pending.extend(cls.__subclasses__())
+        if not cls.__module__.startswith("messagefoundry."):
+            continue
         for name, info in cls.model_fields.items():
-            if info.annotation is float or float in get_args(info.annotation):
+            if _is_float_field(info.annotation):
                 found.add((cls, name))
     return sorted(found, key=lambda pair: (pair[0].__name__, pair[1]))
 
