@@ -258,6 +258,7 @@ from messagefoundry.api.security import (
     authorize_ws,
     authorizes_in_body,
     bearer_token,
+    charge_deferred_monitoring_read,
     client_ip,
     deadline_utc,
     enforce_phi_read_hop,
@@ -5681,7 +5682,9 @@ def create_app(
     async def list_connections(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
+        identity: Identity = Depends(
+            require_monitoring_read(Permission.MONITORING_READ, defer_when_query="reveal")
+        ),
         # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
         # calls this handler in-process, and a call that leaves it out must get None.
         reveal: Annotated[ConnectionName | None, Query()] = None,
@@ -5699,11 +5702,12 @@ def create_app(
         # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
         # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
         # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
-        # behind the PHI-read 429. It can still be hidden behind the monitoring-read 429: that pace
-        # (require_monitoring_read) is charged in this route's dependency, before this check runs.
-        # A scoped caller's dashboard carries no outbound rows at all.
+        # behind a 429. The gate defers its monitoring-read charge on a reveal for that reason, and
+        # it is charged here, after this check (vault BACKLOG #1191). A scoped caller's dashboard
+        # carries no outbound rows at all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
+        await charge_deferred_monitoring_read(request)
         await _admit_reveal(request, identity, reveal)
         out = await _dashboard_rows(engine, identity, reveal=reveal)
         if reveal is not None:

@@ -1989,7 +1989,9 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
     return _gate(dependency, before_body)
 
 
-def require_monitoring_read(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
+def require_monitoring_read(
+    *permissions: Permission, defer_when_query: str | None = None
+) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus a **per-actor pace** on six ``monitoring:read`` GETs (vault BACKLOG
     #1191, ASVS 15.2.2). Five of them cost store or parse work per call: ``/graph/edges`` rebuilds
     the wiring graph, and ``/status``, ``/stats``, ``/metrics`` and ``/connections`` read aggregates
@@ -2006,16 +2008,55 @@ def require_monitoring_read(*permissions: Permission) -> Callable[[Request], Awa
     recorded as an ``auth.gate_refused`` row with reason ``throttled`` wherever
     :func:`_audited_permission` names one (on by default). It does not ask the new-address
     question: :func:`refuse_from_new_address` says why these reads stay outside it. No pace on the
-    embedding/no-auth path (there is no per-actor identity to key on)."""
+    embedding/no-auth path (there is no per-actor identity to key on).
+
+    ``defer_when_query`` names a query parameter that moves the charge into the route body: when
+    the request carries it, the gate admits without charging and the route calls
+    :func:`charge_deferred_monitoring_read` itself, after its own checks. ``GET /connections``
+    defers on ``reveal``, so a reveal naming a connection outside the caller's scope is denied and
+    audited as a channel denial before the pace can answer 429 (vault BACKLOG #1191)."""
 
     async def dependency(request: Request) -> Identity:
         auth, identity = await _admit(request, permissions, mfa_gate=True)
         if auth is not None:
+            deferred = defer_when_query is not None and defer_when_query in request.query_params
             async with _recorded_decision(request, auth, identity, permissions):
-                enforce_monitoring_read_pacing(request, auth, identity)
+                if deferred:
+                    setattr(
+                        request.state,
+                        _DEFERRED_MONITORING_READ_ATTR,
+                        _AdmittedDecision(auth, identity, permissions),
+                    )
+                else:
+                    enforce_monitoring_read_pacing(request, auth, identity)
         return identity
 
     return _gate(dependency, _authenticate_session_before_body)
+
+
+#: The ``request.state`` attribute :func:`require_monitoring_read` leaves its decision on when it
+#: defers the charge to the route body.
+_DEFERRED_MONITORING_READ_ATTR = "mefor_deferred_monitoring_read"
+
+
+async def charge_deferred_monitoring_read(request: Request) -> None:
+    """Charge the monitoring-read pace a :func:`require_monitoring_read` gate deferred to the route
+    body, raising its 429 when the budget is spent. The refusal writes ``auth.gate_refused`` with
+    reason ``throttled`` through the writer the gate's own refusals use, after the gate's grant row.
+    A no-op where no gate deferred on this request: the no-auth path, a request without the
+    deferring parameter (the gate charged it already), and the web console's in-process call,
+    whose own request carries no deferred decision."""
+    admitted = getattr(request.state, _DEFERRED_MONITORING_READ_ATTR, None)
+    if not isinstance(admitted, _AdmittedDecision):
+        return
+    delattr(request.state, _DEFERRED_MONITORING_READ_ATTR)
+    try:
+        enforce_monitoring_read_pacing(request, admitted.auth, admitted.identity)
+    except _GateRefusal as refusal:
+        await _record_gate_refusal(
+            request, admitted.auth, admitted.identity, admitted.permissions, refusal
+        )
+        raise
 
 
 def enforce_monitoring_read_pacing(request: Request, auth: AuthService, identity: Identity) -> None:

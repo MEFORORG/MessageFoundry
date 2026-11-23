@@ -200,6 +200,42 @@ async def test_retry_after_is_the_whole_window_while_the_global_count_is_spent(
         assert (refused.status_code, refused.headers["Retry-After"]) == (429, "38")
 
 
+async def test_an_out_of_scope_reveal_is_denied_and_audited_with_the_budget_spent(
+    engine: Engine,
+) -> None:
+    """As on main, the scope check and its ``auth.channel_denied`` row come before the monitoring
+    pace: an account whose budget is spent still gets the channel denial for an out-of-scope
+    reveal, not a 429 that hides the probe."""
+    service = await _service(engine, monitoring_read_rate_limit_per_actor=1)
+    scoped = await service.store.get_user_by_username("vw")
+    assert scoped is not None
+    await service.set_channel_scope(scoped.id, ["IB_MINE"], actor="test")
+    async with _client(engine, service) as c:
+        h = await _bearer(c, "vw")
+        assert (await c.get("/status", headers=h)).status_code == 200
+        assert (await c.get("/status", headers=h)).status_code == 429  # the budget is spent
+        denied = await c.get("/connections", params={"reveal": "IB_THEIRS"}, headers=h)
+        assert denied.status_code == 403, denied.text
+        # An in-scope reveal past the budget is still paced.
+        paced = await c.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
+        assert paced.status_code == 429
+        assert int(paced.headers["Retry-After"]) >= 1
+    rows = await engine.store.list_audit(limit=1000)
+    denials = [
+        json.loads(str(row["detail"] or "{}"))
+        for row in rows
+        if row["action"] == "auth.channel_denied"
+    ]
+    assert any("IB_THEIRS" in json.dumps(d) for d in denials), denials
+    # The in-scope reveal's 429, charged in the route body, still writes its throttled row.
+    refused = [
+        json.loads(str(row["detail"] or "{}"))
+        for row in rows
+        if row["action"] == "auth.gate_refused"
+    ]
+    assert any(d.get("path") == "/connections" and d.get("reason") == "throttled" for d in refused)
+
+
 async def test_the_web_console_reads_are_not_charged(engine: Engine) -> None:
     """The console calls the paced handlers in process through ``require_ui``, so the route's own
     dependency never runs and the account's budget is untouched (docs/SECURITY.md, *Monitoring-read
@@ -215,8 +251,10 @@ async def test_the_web_console_reads_are_not_charged(engine: Engine) -> None:
         assert r.status_code == 303 and c.cookies.get("mf_session"), r.status_code
         # Signed out, these pages answer 303; a 200 here means the signed-in handler ran. Each
         # calls a paced handler (``/ui/connections`` the ``GET /connections`` one,
-        # ``/ui/monitoring/live`` the ``GET /graph/edges`` and ``/metrics/history`` ones).
-        for path in ("/ui/connections", "/ui/monitoring/live"):
+        # ``/ui/monitoring/live`` the ``GET /graph/edges`` and ``/metrics/history`` ones,
+        # ``/ui/nav-status`` the ``GET /status`` one, though it answers 200 even if that call
+        # fails). The bearer reads below are what prove none of them spent the budget.
+        for path in ("/ui/connections", "/ui/monitoring/live", "/ui/nav-status"):
             for _ in range(3):
                 assert (await c.get(path)).status_code == 200, path
         # The same account's budget of 1 is still whole: one bearer read is admitted, the next

@@ -7692,7 +7692,9 @@ them cost work per call: `/graph/edges` rebuilds the wiring graph, and `/status`
 copies the in-memory metrics ring and reads no store; it was put in the set because the console's
 Flow and trends page reads it beside `/graph/edges`, but the console is not charged (below), so
 its pace bounds only JSON clients. The gate charges a per-actor sliding window at
-admission, before the route's own work. The six routes share ONE budget per account: a read of any
+admission, before the route's own work. One exception: on `GET /connections?reveal=`, the charge
+waits until the route has run its channel-scope check, so a reveal naming a connection outside the
+caller's scope is still denied and audited as `auth.channel_denied` when the budget is spent. The six routes share ONE budget per account: a read of any
 of them spends it. The budget is in-process, per API process, so N engine shards multiply it by N
 (*Business-logic limits* above).
 
