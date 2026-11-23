@@ -920,8 +920,8 @@ default; the [revocation gate](#revocation-guard-behavior) can still refuse that
 - The AI-broker `http` endpoint, refused with no escape since vault BACKLOG #3533, since every call
   sends `[ai].api_key`.
 - The webhook alert sink: an `http` `[alerts].webhook_url`, which can carry the hop's credential as a
-  path token, refuses the start in every posture when `serve` builds the alert notifier (vault
-  BACKLOG #3533 item 5), and no setting turns off the `https` webhook's certificate chain or hostname
+  path token, refuses the start in every posture: settings load refuses it (vault BACKLOG #3533
+  items 5 and 14), and no setting turns off the `https` webhook's certificate chain or hostname
   check.
 - A SMART or OAuth2 token URL over `http` to a host off this machine: the token request carries a
   credential, so it is refused with no escape, and only a loopback host passes.

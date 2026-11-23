@@ -17,11 +17,15 @@ with no escape, because every call sends the api_key. Its tests below pin that r
 
 from __future__ import annotations
 
+import asyncio
+import http.client
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
@@ -34,10 +38,19 @@ from messagefoundry.config.settings import (
     EgressSettings,
     SecurityEnforcement,
     SecuritySettings,
+    load_settings,
 )
-from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.alert_sinks import WebhookTransport, notifier_from_settings
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    InsecureHopRefused,
+    active_hop_posture,
+)
+from messagefoundry.pipeline import Engine, alert_sinks
+from messagefoundry.pipeline.alert_sinks import (
+    NotifierAlertSink,
+    WebhookTransport,
+    notifier_from_settings,
+)
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import ai_broker as ai_broker_mod
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_broker_from_settings
@@ -166,12 +179,217 @@ def test_webhook_cleartext_is_refused_in_every_posture_even_with_escape(
 def test_webhook_notifier_refuses_cleartext_in_every_posture(
     posture: HopPosture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The settings route meets the same refusal; the warn posture used to build here.
+    # The notifier's own refusal, its second line; the warn posture used to build here. The section
+    # is built with model_construct because settings load (#3533 item 14) refuses this URL first,
+    # with a message of its own.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with pytest.raises(ValueError, match="cleartext http"):
         notifier_from_settings(
-            AlertsSettings(webhook_url="http://hooks.example/x"), posture=posture
+            AlertsSettings.model_construct(webhook_url="http://hooks.example/x"), posture=posture
         )
+
+
+_WEBHOOK_TOKEN = "T0KEN-in-the-path"
+_SETTING_NAMED = r"\[alerts\]\.webhook_url"
+
+#: Each refused by the build's posture-free checks, which settings load runs too (#3533 item 14).
+_REFUSED_WEBHOOK_URLS = [
+    pytest.param(f"http://hooks.example/{_WEBHOOK_TOKEN}", (), id="http"),
+    pytest.param(f"HTTP://hooks.example/{_WEBHOOK_TOKEN}", (), id="upper-http"),
+    pytest.param(f"ftp://hooks.example/{_WEBHOOK_TOKEN}", (), id="ftp"),
+    pytest.param(f"hooks.example/{_WEBHOOK_TOKEN}", (), id="no-scheme"),
+    # Shapes whose urlsplit ValueError would quote the netloc. The http.client screen now
+    # refuses the non-ASCII one first; the bracket one still reaches the split.
+    pytest.param(f"https://svc:{_WEBHOOK_TOKEN}\uff03x@hooks.example/x", (), id="nfkc-netloc"),
+    pytest.param(f"https://svc:pw@[{_WEBHOOK_TOKEN}]/x", (), id="bad-bracket"),
+    pytest.param(f"https://svc:{_WEBHOOK_TOKEN}@hooks.example/x", (), id="userinfo"),
+    # urlsplit drops these, so it would read the scheme as https.
+    pytest.param(f"ht\ttps://hooks.example/{_WEBHOOK_TOKEN}", (), id="tab"),
+    pytest.param(f"https\n://hooks.example/{_WEBHOOK_TOKEN}", (), id="lf"),
+    # Stripped by urllib's dial but not by urlsplit, so it is not stripped: refused at load as at
+    # the build, by the whitespace-at-either-end check.
+    pytest.param(f"\xa0https://hooks.example/{_WEBHOOK_TOKEN}", (), id="nbsp"),
+    pytest.param(f"\u3000https://hooks.example/{_WEBHOOK_TOKEN}", (), id="ideographic-space"),
+    # At the end, urlsplit keeps it in the host it judges and the dial strips it.
+    pytest.param("https://localhost\u2003", ("localhost",), id="trailing-em-space"),
+    pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\x85", (), id="trailing-nel"),
+    # Inside the URL: http.client could never send these, and for a space it raises InvalidURL
+    # quoting the path, so each alert POST would log the token.
+    pytest.param(f"https://hooks.example/services/T0 {_WEBHOOK_TOKEN}", (), id="inner-space"),
+    pytest.param(f"https://hooks.example/x\x85{_WEBHOOK_TOKEN}", (), id="inner-nel"),
+    pytest.param(f"https://hooks.example\u2003/{_WEBHOOK_TOKEN}", (), id="em-space-in-host"),
+    pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\ufeff", (), id="trailing-bom"),
+    pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}\udc80", (), id="lone-surrogate"),
+    # Percent-encoded in the host: urllib decodes it before http.client refuses it at every POST.
+    pytest.param(f"https://hooks.example%20/{_WEBHOOK_TOKEN}", (), id="encoded-space-in-host"),
+    pytest.param(f"https://hooks%0d%0aexample/{_WEBHOOK_TOKEN}", (), id="encoded-crlf-in-host"),
+    pytest.param(f"https://hooks.example%7f/{_WEBHOOK_TOKEN}", (), id="encoded-del-in-host"),
+    # A path written into the authority: the decoded host would hold the token.
+    pytest.param(
+        f"https://hooks.example%2Fservices%2F{_WEBHOOK_TOKEN}%2Fpath",
+        (),
+        id="encoded-slash-in-host",
+    ),
+    pytest.param(
+        f"https://hooks.example%2Fservices%2F{_WEBHOOK_TOKEN}%2Fpath",
+        ("hooks.example",),
+        id="encoded-slash-in-host-listed",
+    ),
+    pytest.param(f"https://hooks.example%3F{_WEBHOOK_TOKEN}/x", (), id="encoded-query-in-host"),
+    pytest.param(f"https://hooks.example\\{_WEBHOOK_TOKEN}/x", (), id="backslash-in-host"),
+    # Whitespace both readers strip is stripped, so an http URL inside it is still refused.
+    pytest.param(f" http://hooks.example/{_WEBHOOK_TOKEN}\n", (), id="space-http"),
+    pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}", ("other.example",), id="off-allowlist"),
+    pytest.param(f"https://h.example/{_WEBHOOK_TOKEN}" + "x" * 8192, (), id="over-length"),
+    # No host, with no allowlist: the build's revocation guard refuses these in every posture.
+    pytest.param(f"https:///{_WEBHOOK_TOKEN}", (), id="hostless"),
+    pytest.param(f"https://:443/{_WEBHOOK_TOKEN}", (), id="port-only"),
+]
+
+
+@pytest.mark.parametrize(("url", "allowed"), _REFUSED_WEBHOOK_URLS)
+def test_a_webhook_the_build_refuses_is_refused_at_load_without_echoing_it(
+    url: str, allowed: tuple[str, ...]
+) -> None:
+    # Vault BACKLOG #3533 item 14: settings load runs the build's own checks, so check and the
+    # serve pre-flight refuse what the build refuses. The path can hold the webhook's token, so
+    # no message repeats the token.
+    with pytest.raises(ValueError, match=_SETTING_NAMED) as built:
+        WebhookTransport(url, allowed_hosts=allowed, posture=STAGING_PHI)
+    with pytest.raises(ValidationError) as info:
+        AlertsSettings(webhook_url=url, webhook_allowed_hosts=list(allowed))
+    text = str(info.value)
+    assert str(built.value) in text  # one refusal, the same at load and at the build
+    # Case-folded: urlsplit lower-cases a host, so an echo through one is lower-case.
+    token = _WEBHOOK_TOKEN.lower()
+    assert token not in text.lower() and token not in info.value.json().lower()
+    assert "ftp" not in text.lower()
+
+
+def test_a_non_https_webhook_is_refused_by_the_settings_loader(tmp_path: Path) -> None:
+    config = tmp_path / "messagefoundry.toml"
+    config.write_text(
+        f'[alerts]\nwebhook_url = "http://hooks.example/{_WEBHOOK_TOKEN}"\n', encoding="utf-8"
+    )
+    with pytest.raises(ValidationError, match="cleartext http") as info:
+        load_settings(config_path=config, environ={})
+    assert _WEBHOOK_TOKEN not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [None, "", "https://hooks.example/x", "HTTPS://hooks.example/x", " https://hooks.example/x\n"],
+)
+def test_an_https_or_unset_webhook_loads(url: str | None) -> None:
+    # Negative control: an https URL loads, inside whitespace both readers strip too, and an empty
+    # value stays "not configured". The value is kept as written.
+    assert AlertsSettings(webhook_url=url).webhook_url == url
+
+
+def test_the_allowlist_judges_the_host_urllib_dials() -> None:
+    # An encoded dot dials hooks.example, so a list naming hooks.example admits it, and an entry
+    # that decodes to another host does not.
+    url = "https://hooks%2Eexample/x"
+    assert AlertsSettings(webhook_url=url, webhook_allowed_hosts=["hooks.example"]).webhook_url
+    with pytest.raises(ValidationError, match="not in"):
+        AlertsSettings(webhook_url=url, webhook_allowed_hosts=["hooks%2eother"])
+
+
+def test_an_ipv6_zone_entry_written_as_the_url_spells_it_still_matches() -> None:
+    # Regression control: before the host was decoded, an entry spelled as in the URL ("%25")
+    # matched. It still does, since each entry is decoded too.
+    url = "https://[fe80::1%25eth0]/x"
+    alerts = AlertsSettings(webhook_url=url, webhook_allowed_hosts=["fe80::1%25eth0"])
+    assert alerts.webhook_url == url
+
+
+@pytest.mark.parametrize("posture", [PROD_PHI, STAGING_PHI], ids=["enforcing", "warn"])
+def test_a_token_in_the_host_reaches_no_text_at_the_build(
+    posture: HopPosture, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Finding 2: refused before the revocation guard runs, so neither its refusal nor its
+    # crossing WARNING can name the decoded host that holds the token.
+    url = f"https://hooks.example%2Fservices%2F{_WEBHOOK_TOKEN}%2Fpath"
+    with caplog.at_level(logging.DEBUG), pytest.raises(ValueError) as info:
+        WebhookTransport(url, posture=posture)
+    assert _WEBHOOK_TOKEN not in str(info.value)
+    assert _WEBHOOK_TOKEN.lower() not in str(info.value).lower()
+    assert _WEBHOOK_TOKEN.lower() not in caplog.text.lower()
+
+
+def test_the_revocation_guard_judges_the_decoded_host() -> None:
+    # Finding 1: "[::1%3a2]" dials ::1:2, an off-box address, not ::1 in zone "3a2", so under an
+    # enforcing posture with no attestation the guard refuses it as it refuses any off-box host.
+    with pytest.raises(InsecureHopRefused):
+        WebhookTransport("https://[::1%3a2]/x", posture=PROD_PHI)
+    # The control: the loopback host itself still crosses unattested.
+    WebhookTransport("https://[::1]/x", posture=PROD_PHI)
+
+
+def test_a_listed_webhook_host_loads() -> None:
+    # Negative control for the allowlist case above.
+    alerts = AlertsSettings(
+        webhook_url="https://hooks.example/x", webhook_allowed_hosts=["HOOKS.example"]
+    )
+    assert alerts.webhook_allowed_hosts == ["HOOKS.example"]
+
+
+class _TokenQuotingTransport:
+    """A transport whose send raises an exception quoting a webhook path, as http.client's
+    InvalidURL does for a URL with a space in it."""
+
+    name = "webhook"
+
+    async def send(self, event: object, **_: object) -> None:
+        raise http.client.InvalidURL(f"URL can't contain control characters. '/{_WEBHOOK_TOKEN}'")
+
+
+async def test_a_failed_send_logs_the_exception_class_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Vault BACKLOG #3533 item 14: the notifier's WARNING for a failed transport names the class
+    # and carries no message and no exc_info, so a send whose exception quotes the URL logs no token.
+    sink = NotifierAlertSink([_TokenQuotingTransport()])
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
+        sink.connection_stopped("OB_X", detail="synthetic")
+        sink.start()
+        for _ in range(500):
+            if any("alert transport webhook failed" in r.getMessage() for r in caplog.records):
+                break
+            await asyncio.sleep(0.01)
+        await sink.aclose()
+    [record] = [r for r in caplog.records if "alert transport webhook failed" in r.getMessage()]
+    assert record.exc_info is None and record.exc_text is None
+    assert record.getMessage().endswith(": InvalidURL")
+    assert _WEBHOOK_TOKEN not in caplog.text
+
+
+def test_post_re_raises_invalid_url_with_fixed_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Defence in depth (#3533 item 14): an InvalidURL the screen did not foresee is re-raised with
+    # text that holds nothing of the URL, and with no chain link holding the original.
+    transport = WebhookTransport(f"https://hooks.example/{_WEBHOOK_TOKEN}", posture=STAGING_PHI)
+
+    class _Opener:
+        def open(self, req: object, timeout: float) -> object:
+            raise http.client.InvalidURL(
+                f"URL can't contain control characters. '/{_WEBHOOK_TOKEN}'"
+            )
+
+    monkeypatch.setattr(alert_sinks, "_shared_no_redirect_opener", lambda: _Opener())
+    with pytest.raises(http.client.InvalidURL) as info:
+        transport._post({"type": "synthetic"})
+    assert _WEBHOOK_TOKEN not in str(info.value)
+    assert info.value.__context__ is None and info.value.__cause__ is None
+
+
+def test_the_build_dials_the_value_it_judged() -> None:
+    # The screen strips surrounding ASCII whitespace, and the transport keeps the stripped value.
+    # The whitespace here sits outside the host, so this does not show which value the
+    # revocation guard read; it pins the stored URL.
+    transport = WebhookTransport(
+        " https://localhost/x \n", allowed_hosts=("localhost",), posture=PROD_PHI
+    )
+    assert transport.url == "https://localhost/x"
 
 
 def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:
