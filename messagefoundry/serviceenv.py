@@ -180,12 +180,11 @@ class ServiceEnvPosture:
     #: removal steps. It prints a step that says to take every line that may name the directory
     #: (:func:`_may_name_directory`) out of every list, and then the add-back step, which says
     #: to add one entry naming the path wherever the directory exists, even where a directory
-    #: entry is listed. Where a setting moves to the secrets directory, the create step also prints
-    #: up front, before the step that moves it, even where a directory entry is listed, and says
-    #: to run the installer only once those lines are out. Where it is False, every directory
-    #: entry is plainly a path on its own, so the keep-one step prints
-    #: where a refused value runs on into one (``directory_run_on``), and no step removes one
-    #: otherwise. The remedy alone reads this, never the refusal itself (the Lander's ruling B on
+    #: entry is listed. Where a setting moves to the secrets directory, the create step also
+    #: prints up front, before the step that moves it, even where a directory entry is listed,
+    #: and says to run the installer only once those lines are out. Where it is False, every
+    #: directory entry is plainly a path on its own, so the keep-one step prints where a refused
+    #: value runs on into one (``directory_run_on``), and no step removes one otherwise. The remedy alone reads this, never the refusal itself (the Lander's ruling B on
     #: PR 3142's repair handback, comment 7106776128).
     directory_in_doubt: bool = False
     #: Whether a refused value runs on into a string whose first non-blank line sets
@@ -1314,10 +1313,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # hold's H2, the fourth hold's H1). Where a directory entry is in doubt, the doubt step
         # below takes out every line that may name the directory, so a listed name settles
         # nothing and the step prints before the Put step all the same (round-3 open finding 1
-        # on PR 3142's repair handback, comment 7110577570). The installer drops whole each
-        # string that starts with the name, joined lines and all, and may echo the value it
-        # reads, so there the step says to run it only once those lines are out (code review
-        # round 1 on this repair).
+        # on PR 3142's repair handback, comment 7110577570). install-service.ps1 drops whole
+        # each AppEnvironmentExtra entry that starts with the name and "=", joined lines and
+        # all, and may echo the value it reads, so there the step says to run it only once those
+        # lines are out (code review rounds 1 and 2 on this repair).
         if (_DIRECTORY_VARIABLE not in posture.listed or posture.directory_in_doubt) and (
             moving_others or moving_values
         ):
@@ -1326,10 +1325,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
                 "says how it is created"
                 + (
-                    f", but run the installer only once the steps below have taken out each "
-                    f"line that may set {_DIRECTORY_VARIABLE}, since it drops whole each entry "
-                    f"that starts with {_DIRECTORY_VARIABLE}= in any letter case, every line in "
-                    "it included, and may print the value it reads"
+                    ", but run install-service.ps1 only once the steps below have taken out each "
+                    f"line that may set {_DIRECTORY_VARIABLE}, since it drops whole each "
+                    f"AppEnvironmentExtra entry that starts with {_DIRECTORY_VARIABLE}= in any "
+                    "letter case, every line in it included, and may print the value it reads"
                     if posture.directory_in_doubt
                     else ""
                 )

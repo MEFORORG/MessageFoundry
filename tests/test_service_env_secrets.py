@@ -435,13 +435,17 @@ def test_every_other_secret_class_name_on_a_later_line_refuses(name: str) -> Non
 
 def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
     """NSSM may take the whole item as one variable, so a later line's MEFOR_SECRETS_DIRECTORY is
-    not evidence the service has one, and the refusal still says to add it."""
+    not evidence the service has one, and the refusal still says to add it. The line shares its
+    string with others, so it is in doubt, unlisted, and the create step carries the installer
+    clause (code review round 2 on the repair of PR 3142's round-3 open finding 1)."""
     posture = _service(
         ["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_SECRETS_DIRECTORY=C:\\s\nMEFOR_VALUE_X=1"]
     )
+    assert "MEFOR_SECRETS_DIRECTORY" not in posture.listed and posture.directory_in_doubt
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert CREATE in refusal
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith(f"{CREATE_DOUBT}. Put each MEFOR_VALUE_* variable")
 
 
 def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
