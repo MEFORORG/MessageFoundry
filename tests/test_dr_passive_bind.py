@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import socket
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -27,6 +26,7 @@ from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.config.wiring import PortConflictError
 from messagefoundry.pipeline import Engine
+from tests.test_connection_scheduler import _hold_port
 from tests.test_dr_running_config_dir import _BOTH_OUTBOUNDS, _CRIT, _NORM, _free_ports
 from tests.test_dr_running_config_dir import _write_tiered_graph as _write_graph
 
@@ -375,14 +375,15 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
     Cause of the 2026-10-13 ubuntu failure (BACKLOG #3456), read from job 115229267670's log and
     the code at that run's head, ``a6e9a49f5b``: most consistent with the probe, and not proven.
     The control after the operator start read False, and that start had returned. At that head a
-    bind that failed raised ``PortConflictError`` out of ``start_inbound``
-    (:func:`test_an_operator_start_onto_a_held_port_raises_rather_than_reading_unbound` pins that),
-    so a port something else held would have failed the start, not the probe. A passive box holds
+    bind that failed raised ``PortConflictError`` out of ``start_inbound``, read from that head's
+    ``_start_inbound_unsafe`` (the test after this one checks the same raise at today's code), so
+    a port something else held would have failed the start, not the probe. A passive box holds
     no source for this feed, so the start did not return early on an old one. The probe of that
     day read any ``OSError`` and its own 2s timeout as "not bound", in a suite that ran 26:25.
     At least one other suspect stays open: a listener that bound and then closed before the probe
     would be refused, and that probe read a refusal the same way. The control now names whether
-    the runner holds the listener, and the probe fails on no answer, so a recurrence says more."""
+    the runner still holds the feed's source, which that case does not settle, and the probe
+    fails on no answer rather than reading it as unbound."""
     cfg = tmp_path / "cfg"
     _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
@@ -411,20 +412,18 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
 async def test_an_operator_start_onto_a_held_port_raises_rather_than_reading_unbound(
     tmp_path: Path,
 ) -> None:
-    """Pins a step the cause in
-    :func:`test_an_activation_parks_the_normal_feed_before_its_reload_runs` rests on (BACKLOG
-    #3456): a port another socket holds fails the operator start itself, so the start cannot
-    return and the probe then read the feed as unbound. The ``inbound_failed`` record came later
-    than the 2026-10-13 failure, and is checked here as today's behaviour."""
+    """A port another socket holds fails the operator start itself, at today's code: the step the
+    cause in :func:`test_an_activation_parks_the_normal_feed_before_its_reload_runs` reads from
+    an older head (BACKLOG #3456). The ``inbound_failed`` record came after that head."""
     cfg = tmp_path / "cfg"
     _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=False)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
         rr = engine.registry_runner
         assert rr is not None
-        holder = socket.create_server(("127.0.0.1", norm_port))
+        holder = _hold_port(norm_port)
         try:
             assert await _accepts(norm_port)  # control: the holder answers on the feed's port
-            with pytest.raises(PortConflictError):
+            with pytest.raises(PortConflictError, match="already bound there"):
                 await rr.start_inbound(_NORM, operator=True)
             assert not rr.inbound_running(_NORM)
             assert rr.inbound_failed(_NORM) is not None

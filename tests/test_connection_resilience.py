@@ -149,7 +149,9 @@ def _mllp_in_reg(outdir: Path) -> Registry:
 async def test_hung_outbound_does_not_block_graceful_stop(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    """Cause of the 2026-10-12 windows-2025 failure (BACKLOG #3456), read from job 114945524918's
+    """An outbound stuck in send() must not wedge stop().
+
+    Cause of the 2026-10-12 windows-2025 failure (BACKLOG #3456), read from job 114945524918's
     log: most consistent with a slow runner rather than a hang, and not proven. The
     ``TimeoutError`` came from the 3s setup wait for send() to be entered, not from the stop, in a
     suite that ran 33:05. The teardown log shows the routed
