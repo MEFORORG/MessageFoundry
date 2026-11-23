@@ -815,6 +815,20 @@ _UNSCANNABLE_RE_PATTERNS = {
     # it, a tchar, so each character is read once; the optional tail is one ``.*`` with nothing
     # after it. ``is_authorization_header_name`` uses ``fullmatch``, so there is one start position.
     "messagefoundry/transports/http_auth.py": ("f'[^{_TCHARS}]*authorization(?:[^{_TCHARS}].*)?'",),
+    # BACKLOG #6637 item 10 -- the DICOM log line templates. Unresolvable BY CONSTRUCTION:
+    # ``compile_template`` builds each pattern from one ``TEMPLATES`` entry, so the line's wording and
+    # the slot grammar stay in one table the library census pins. Both are constants in that file, and
+    # no log line or peer value reaches a pattern: the text around each slot goes through
+    # ``re.escape``, and a slot's body comes from ``_SLOT_PATTERNS`` by its kind.
+    #
+    # Read on 2026-11-23 by running this file's own matchers over every built pattern:
+    # ``_has_nested_quantifier`` flagged none. ``_has_many_starts_shape`` flagged six, and that shape
+    # costs only under a scanning call. The one call site, ``_screened_line`` in ``transports/dicom.py``,
+    # uses ``fullmatch``, so there is one start position; a switch to ``.search`` would make those six
+    # quadratic. A template has at most two unbounded runs. Where it has two, they cannot trade
+    # characters: ``quoted_uid`` stops at the quote that follows it, and ``{indent}{hex_dump}`` is
+    # spaces then a hex digit. Nothing re-reads this when a template or slot changes.
+    "messagefoundry/transports/_dicom_log_lines.py": ("''.join(parts)",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
