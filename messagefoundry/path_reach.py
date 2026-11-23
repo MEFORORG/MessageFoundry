@@ -7,6 +7,7 @@ other engine package can share the one answer (BACKLOG #5388 added item 3)."""
 from __future__ import annotations
 
 import errno
+import sys
 from typing import Final
 
 #: The Windows errors that say a network path or share cannot be reached, so nothing is known about
@@ -47,3 +48,18 @@ def is_unreachable(exc: OSError) -> bool:
 def is_absent(exc: OSError) -> bool:
     """Whether ``exc`` says nothing is at the path, as against saying the path cannot be reached."""
     return isinstance(exc, FileNotFoundError) and not is_unreachable(exc)
+
+
+def is_name_absent(exc: OSError) -> bool:
+    """:func:`is_absent`, narrowed for a caller that deletes on the answer. It reads the error's
+    code and proves no more than that code does. On Windows only ERROR_FILE_NOT_FOUND (2) counts,
+    so a missing parent (3), a missing drive (15) or an error with no code is not absence here.
+
+    A ``True`` has limits. POSIX has one ENOENT for a missing name and a missing parent, so there
+    this cannot tell them apart. A network client can answer from a stale cache on either platform.
+    What a Windows share with Access-Based Enumeration answers for a name it hides from this
+    account has not been measured, so a hidden name may read as absent."""
+    if not is_absent(exc):
+        return False
+    winerror = getattr(exc, "winerror", None)
+    return winerror == 2 if winerror is not None else sys.platform != "win32"

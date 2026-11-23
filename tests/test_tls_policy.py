@@ -419,7 +419,7 @@ def test_tls_revocation_attested_unset_is_false(monkeypatch: pytest.MonkeyPatch)
         ("::1", True),
         ("localhost", True),
         ("LOCALHOST", True),  # case-insensitive
-        ("", True),  # empty host = on-box bind with no host component
+        ("", False),  # names no destination; each caller says what empty means (BACKLOG #5512)
         ("10.0.0.5", False),
         ("example.com", False),
         # A name that WOULD resolve to loopback is still remote — is_loopback_hop_host never resolves DNS.

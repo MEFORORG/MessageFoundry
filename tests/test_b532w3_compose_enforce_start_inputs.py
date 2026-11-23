@@ -200,12 +200,16 @@ _ANCHOR = _compose_doc().get("x-ha-engine") or {}
 
 
 def _anchored(doc: dict[str, Any]) -> list[str]:
-    """The services built on x-ha-engine: the ha profile's services that run the anchor's image."""
+    """The services built on x-ha-engine: the ha profile's services that run the anchor's image.
+    The attestation checks are excluded by name: revocation-attestation-check-ha runs that image too,
+    but merges x-revocation-attestation-check, not this anchor, and deliberately mounts nothing."""
     anchor = doc.get("x-ha-engine") or {}
     return sorted(
         name
         for name, svc in doc["services"].items()
-        if "ha" in (svc.get("profiles") or []) and svc.get("image") == anchor.get("image")
+        if "ha" in (svc.get("profiles") or [])
+        and svc.get("image") == anchor.get("image")
+        and not name.startswith("revocation-attestation-check")
     )
 
 

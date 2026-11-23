@@ -345,7 +345,7 @@ jobs:
       # from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1374,7 +1374,7 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1566,7 +1566,7 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1725,7 +1725,7 @@ jobs:
       #
       # WINDOWS-2025's MARGIN CAP WENT FROM 6 TO 9, AND THE CAUSE WAS RUNNER VARIANCE RATHER THAN SUITE
       # GROWTH. The BACKLOG #1842 re-derivation under "THE MARGIN CAPS ARE RE-DERIVED" below re-sized it
-      # to 8 on a post-xdist pool, the fourth re-derivation there to 12, and the fifth to 14. This paragraph is the 2026-09-13 reasoning for 9, kept
+      # to 8 on a post-xdist pool, the fourth re-derivation there to 12, the fifth to 14 and the sixth to 15. This paragraph is the 2026-09-13 reasoning for 9, kept
       # as a record. Every "cap" in this note means `webconsole_margin_cap`, which is what these four
       # runs were measured against; it was spelled `webconsole_step_timeout` when the note was
       # written, because that one variable was then both the ruler and the wall. The numbers are
@@ -1764,13 +1764,13 @@ jobs:
       # and so admits a setup longer than the 5:22 alone would cover. Read the second column as
       # headroom the sum deliberately buys, not as time anyone has measured twice.
       #
-      #   ubuntu-latest   5:22 + 4:30 + kill 12:00 = 21:52   under 23:00, slack 1:08
-      #   windows-2022    4:05 + 4:30 + kill 15:00 = 23:35   under 24:00, slack 0:25
-      #   windows-2025    2:32 + 4:30 + kill 19:00 = 26:02   under 27:00, slack 0:58
+      #   ubuntu-latest   5:22 + 4:30 + kill 17:00 = 26:52   under 28:00, slack 1:08
+      #   windows-2022    4:05 + 4:30 + kill 17:00 = 25:35   under 26:00, slack 0:25
+      #   windows-2025    2:32 + 4:30 + kill 20:00 = 27:02   under 28:00, slack 0:58
       #
       # windows-2022 is the tightest and is the leg to watch, since the third re-derivation raised its
-      # kill to 11 (15 since the fifth). Its setup has to reach 9:00 before the JOB cap fires ahead of
-      # the step cap and the failure stops naming the step. That is 0:25 past the 8:35 this table budgets and 4:55 past the
+      # kill to 11 (15 since the fifth, 17 since the sixth). Its setup has to reach 9:00 before the JOB
+      # cap fires ahead of the step cap and the failure stops naming the step. That is 0:25 past the 8:35 this table budgets and 4:55 past the
       # 4:05 actually recorded for the leg, so the pad is most of what protects it. windows-2025 was
       # the tightest until then, at 0:58. The lever if it ever bites is `webconsole_job_timeout`, which is
       # a deadlock backstop rather than a tightness gate -- not a smaller kill, which would re-narrow
@@ -1784,7 +1784,11 @@ jobs:
       #
       # THE FIFTH RE-DERIVATION PULLED IT ON ALL THREE, the same way: each job cap moved by exactly what
       # its kill moved, ubuntu 10 -> 12 and 21 -> 23, windows-2022 11 -> 15 and 20 -> 24, windows-2025
-      # 16 -> 19 and 24 -> 27. So every leg keeps the slack the table above gives it.
+      # 16 -> 19 and 24 -> 27.
+      #
+      # THE SIXTH PULLED IT ON ALL THREE, the same way: ubuntu 12 -> 17 and 23 -> 28, windows-2022
+      # 15 -> 17 and 24 -> 26, windows-2025 19 -> 20 and 27 -> 28. So every leg keeps the slack the
+      # table above gives it.
       # tests/test_ci_step_margin.py parses this table and re-adds every row.
       #
       # THE RULER AND THE WALL: THE MARGIN CAP AND THE KILL ARE NOW TWO NUMBERS, DELIBERATELY.
@@ -1809,7 +1813,7 @@ jobs:
       # re-size together would bury the one change that can be reasoned about, so the re-size is
       # deliberately a later, separate change with its own measurement.
       #
-      # THE CAPS ARE NOW 9 / 11 / 14 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
+      # THE CAPS ARE NOW 13 / 13 / 15 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
       # "THE MARGIN CAPS ARE RE-DERIVED". BACKLOG #1879 did the first re-derivation this paragraph
       # defers and came back "unchanged". BACKLOG #1842 did the second, on the first hosted pool taken
       # under xdist, and moved windows-2025 from 9 to 8. The third, by owner request 2026-09-30, moved
@@ -1818,7 +1822,9 @@ jobs:
       # moved ubuntu from 6 to 7 and windows-2025 from 8 to 12; it is "THE FOURTH RE-DERIVATION",
       # directly after the third. The fifth, the web console step-margin gate re-measure of
       # 2026-10-17, moved all three: ubuntu 7 to 9, windows-2022 8 to 11 and windows-2025 12 to 14;
-      # it is "THE FIFTH RE-DERIVATION", directly after the fourth. The notes are far apart and could be
+      # it is "THE FIFTH RE-DERIVATION", directly after the fourth. The sixth, the re-measure of
+      # 2026-11-23, moved all three, to 13 / 13 / 15; it is "THE SIXTH RE-DERIVATION",
+      # directly after the fifth. The notes are far apart and could be
       # read as contradicting, which is the only reason this pointer exists. Do not restate the
       # arithmetic here -- one copy, per SDS-3.5.
       #
@@ -1830,11 +1836,11 @@ jobs:
       # of it -- why a decoupling and a re-size do not ship together -- is still the governing reason
       # and #1879 followed it. What that pool says about the caps is set out above the suite step.
       #
-      # THE KILLS ARE 12 / 15 / 19, and each is at least 1.30x its leg's margin cap. windows-2022's went
+      # THE KILLS ARE 17 / 17 / 20, and each is at least 1.30x its leg's margin cap. windows-2022's went
       # from 10 to 11 in the third re-derivation, because its margin cap went to 8 and 10 would be
       # under 1.30x that; the fourth moved ubuntu's from 9 to 10 and windows-2025's from 12 to 16 for
-      # the same reason, and the fifth moved all three, to the smallest whole minute at or over 1.30x
-      # the new cap -- the same ratio
+      # the same reason, the fifth and sixth moved all three, to the smallest whole minute at
+      # or over 1.30x the new cap -- the same ratio
       # the gate's own floor reserves below the cap, so the band a run may be observed in ABOVE the cap
       # is at least as wide, in ratio, as the band the floor reserves below it.
       # tests/test_ci_step_margin.py asserts that headroom per leg, reading BOTH numbers out of the
@@ -1853,8 +1859,8 @@ jobs:
       # is derived from four measured runs and set so the OBSERVED WORST clears the floor, so it is the
       # second. The detector is not disarmed either: at 9:00 it warns again above 6:55, which is outside
       # the entire observed range. That 9 became 8, re-sized by BACKLOG #1842 below; at 8:00 the gate
-      # warned above 6:09. It was 12 after the fourth re-derivation, warning above 9:13, and is 14 now,
-      # re-sized by the fifth; at 14:00 the gate warns above 10:46.
+      # warned above 6:09. It was 12 after the fourth re-derivation, warning above 9:13, 14 after the fifth,
+      # warning above 10:46, and is 15 now, re-sized by the sixth; at 15:00 it warns above 11:32.
       #
       # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 a green suite came within 35 seconds of being
       # KILLED, because the 6:00 that was then the margin cap was also the `timeout-minutes` -- the
@@ -1877,12 +1883,13 @@ jobs:
       # 7:38 on 2026-09-22, nine days later. Not necessarily its FIRST: the pool above is twelve hours
       # wide, so it can date a breach and cannot date the earliest one.
       #
-      # THE MARGIN CAPS ARE RE-DERIVED, FIVE TIMES. The first re-derivation came back "UNCHANGED" -- 5 /
+      # THE MARGIN CAPS ARE RE-DERIVED, SIX TIMES. The first re-derivation came back "UNCHANGED" -- 5 /
       # 6 / 9 -- and saying so out loud is the point of the next few paragraphs. The second, BACKLOG
       # #1842, moved windows-2025 to 8; it is the group headed "THE SECOND RE-DERIVATION" below. The
       # third moved ubuntu to 6 and windows-2022 to 8; it is "THE THIRD RE-DERIVATION". The fourth
       # moved ubuntu to 7 and windows-2025 to 12; it is "THE FOURTH RE-DERIVATION". The fifth moved
-      # all three, to 9 / 11 / 14; it is "THE FIFTH RE-DERIVATION". A cap that
+      # all three, to 9 / 11 / 14; it is "THE FIFTH RE-DERIVATION". The sixth moved all three, to
+      # 13 / 13 / 15; it is "THE SIXTH RE-DERIVATION". A cap that
       # nobody moved and a cap that was checked and found right look identical in a diff, so here is
       # the first one's arithmetic. Each cap divided by the 1.30x floor gives the longest the step may
       # take on that leg, set beside the WORST SERIAL run in the 66-observation pool above:
@@ -1942,7 +1949,7 @@ jobs:
       # LOWERING windows-2025 TO 8 HAS A COST, AND IT IS TAKEN ON PURPOSE. At 9 the gate reds above
       # 6:55; at 8 it reds above 6:09, 14 percent over the worst pooled run of 5:24. In that pool the
       # rule left windows-2022 10 percent (4:37 over 4:11) and ubuntu 20 percent (3:51 over 3:13), so 8
-      # put windows-2025 between them. The fifth re-derivation's figures supersede these. The rule keeps the ruler close to the work, so the gate speaks when
+      # put windows-2025 between them. The sixth re-derivation's figures supersede these. The rule keeps the ruler close to the work, so the gate speaks when
       # the suite grows. Holding 9 would keep a cap that no run in this pool supports, which is the
       # "bound derived from another bound" #344 closed. If windows-2025 starts ejecting merge groups
       # at 8, re-measure; do not restore 9 by hand.
@@ -2054,8 +2061,9 @@ jobs:
       # and 2371, and on merge-group runs 39012965647 (6:10) and 39012997644 (6:22), against its 6:09 red line,
       # and the queue ejected both groups. Same instrument and rule as the fourth. The filter adds one
       # clause, executions under 60s dropped, which removed no success row here. The pool's
-      # definition, n, percentiles and worst runs live ONCE, in the three web console rows of
-      # scripts/ci/step_margin_baseline.toml. The sizing input:
+      # definition, n, percentiles and worst runs live ONCE, in scripts/ci/step_margin_baseline.toml,
+      # which kept them in a comment when the sixth re-derivation replaced those rows. The sizing
+      # input:
       #
       #   leg             worst passing   x 1.35   cap
       #   ubuntu-latest   6:23            8:37     9    was 7
@@ -2099,6 +2107,24 @@ jobs:
       # path, and splitting it was what would shorten the wall. One run on a different machine is a
       # pointer, not a hosted measurement.
       #
+      # THE SIXTH RE-DERIVATION, the web console step-margin gate re-measure of 2026-11-23. That day
+      # the gate reddened ubuntu with every test passing on at least engine PRs 3172, 3192 and 3145.
+      # Same instrument, filter and rule as the fifth, over a narrower window. The pool, the worst
+      # runs and the attribution check live ONCE, in the web console rows of
+      # scripts/ci/step_margin_baseline.toml and the note above them. The sizing input:
+      #
+      #   leg             worst passing   x 1.35   cap
+      #   ubuntu-latest   9:15            12:29    13   was 9
+      #   windows-2022    9:27            12:45    13   was 11
+      #   windows-2025    10:54           14:43    15   was 14
+      #
+      # The kills moved with the caps, to 17 / 17 / 20, and the job caps with the kills; the nesting
+      # table above carries both sums. Each cap rests on one run; its row says what the next worst
+      # would size. Excluding a run would change the sizing rule.
+      #
+      # AT THESE CAPS the gate reds above 10:00 on ubuntu and windows-2022 and 11:32 on windows-2025
+      # -- 8.1, 5.8 and 5.9 percent over each leg's worst pooled run.
+      #
       # THE CONSOLE SUITE HAS ITS OWN TIMING-SENSITIVE TESTS, and contention is the cost this change
       # pays rather than one it avoids. `test_webui_account.py`'s TOTP helper,
       # `_totp_not_near_a_step_boundary`, waits out the step before minting a code when fewer than 3s
@@ -2120,7 +2146,7 @@ jobs:
       #
       # WHAT IT DOES NOT BUY, SO NOBODY RELIES ON IT FOR MORE. The lead time is set by the sizing rule,
       # not the annotation: ceil_minute(1.35x) against a 1.30x floor puts the red line 3.8 percent
-      # over the row plus up to 46 seconds of rounding, so the gap varies by leg; "THE FIFTH
+      # over the row plus up to 46 seconds of rounding, so the gap varies by leg; "THE SIXTH
       # RE-DERIVATION" note above gives each leg's. A pull_request run shows
       # the annotation first only when one pull request's growth crosses the row. Growth that crosses
       # it only when several queued pull requests combine is first annotated on a merge-group run,
@@ -2580,7 +2606,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2773,7 +2799,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3098,9 +3124,9 @@ jobs:
           # `webconsole_margin_cap`, so sizing this close to the observed run would buy no detection and
           # cost false reds on green suites. That knob is the gate's ruler and `webconsole_step_timeout`
           # is only the wall -- this sentence named the wall until they were split.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":58,"step_timeout":46,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":23,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":78,"step_timeout":71,"webconsole_margin_cap":11,"webconsole_step_timeout":15,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":78,"step_timeout":71,"webconsole_margin_cap":14,"webconsole_step_timeout":19,"webconsole_job_timeout":27,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":58,"step_timeout":46,"webconsole_margin_cap":13,"webconsole_step_timeout":17,"webconsole_job_timeout":28,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":78,"step_timeout":71,"webconsole_margin_cap":13,"webconsole_step_timeout":17,"webconsole_job_timeout":26,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":78,"step_timeout":71,"webconsole_margin_cap":15,"webconsole_step_timeout":20,"webconsole_job_timeout":28,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
             LEGS=("$U" "$W22" "$W25")
@@ -3766,7 +3792,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -4353,7 +4379,7 @@ jobs:
           python-version-file: ci/python-version
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -4701,7 +4727,7 @@ jobs:
           python-version-file: ci/python-version
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -4825,7 +4851,7 @@ jobs:
           python-version-file: ci/python-version
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -5123,7 +5149,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -5343,7 +5369,7 @@ jobs:
           python-version-file: ci/python-version
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -6418,6 +6444,14 @@ jobs:
         # Build-only: it pulls the Microsoft ODBC repo + installs from requirements-sqlserver.lock, so a
         # broken hashed dep or the Debian/MS-key issue the Dockerfile warns about turns the job red here.
         run: docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver-ci .
+
+      - name: Build the -postgres variant and import asyncpg and the Postgres store in it
+        # The `ha` compose profile and docker/k8s/ha-postgres.yaml run the Postgres store on this
+        # variant. The import runs on the image's own interpreter, so a lock that dropped asyncpg turns
+        # the job red here rather than at a deploying site's first store open.
+        run: |
+          docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres-ci .
+          docker run --rm --entrypoint /opt/venv/bin/python messagefoundry:postgres-ci -I -c "import asyncpg, messagefoundry.store.postgres"
 
       - name: Build the test smoke image (baked minimal config + MLLP sender)
         run: docker build -f docker/smoke/Dockerfile --build-arg BASE=messagefoundry:ci -t messagefoundry:smoke .

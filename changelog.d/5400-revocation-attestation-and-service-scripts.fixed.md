@@ -3,7 +3,7 @@
   refused only an unset or empty value, so a value such as `0` would have started engines that
   exit 2 at the API revocation gate and restart forever. A one-shot `revocation-attestation-check`
   service now reads the value with the engine's own parser, from the same image, and every serving
-  engine waits on it.
+  engine waits on it or on its copy in the engine's own image.
   At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip that
   check, so an engine started with `up --no-deps` and a false value would still restart forever.
   The Postgres password's missing-value message now says that `--env-file` reads its file instead of
