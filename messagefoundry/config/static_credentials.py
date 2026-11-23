@@ -80,12 +80,14 @@ redaction screen's header test and the query-credential reader; ``_http_literal_
 Not every function here is pure. At least these do more than read their arguments:
 :func:`apply_static_credential_gate` and the guard :func:`make_static_credential_guard` returns,
 which log, the guard also reading the ``env()`` values the engine sets around it; ``_digest``,
-which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529); ``_is_https``, which logs
-at debug a proxy target that does not parse; and ``_http_literal_static`` (BACKLOG #5510),
-``_dicomweb_build_refused`` (vault BACKLOG #5359) and ``_digest`` (BACKLOG #5526 item 9), whose
-``env()`` resolution runs an operator ``cast`` as the build does. A caller inherits its callee's effect: at least
-:func:`static_credential_hops` and :func:`run_static_credential_gate` can run an operator ``cast``
-and log, and :func:`http_hop_credentials` logs through ``_digest`` and resolves no ``env()``.
+which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529) and, like
+``_http_literal_static`` (BACKLOG #5510) and ``_dicomweb_build_refused`` (vault BACKLOG #5359),
+resolves ``env()`` with an operator ``cast`` as the build does (BACKLOG #5526 item 9); and
+``_is_https``, which logs at debug a proxy target that does not parse. A caller inherits its
+callee's effect: at least :func:`static_credential_hops` and :func:`run_static_credential_gate`
+can run an operator ``cast`` and log, and :func:`http_hop_credentials` logs through ``_digest``
+and, through it, resolves an ``env()`` ``http_auth`` against its ``default=``, which can run an
+operator ``cast`` too.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -194,15 +196,18 @@ def _digest(
     ``env_values``, else its literal ``default=`` (``config.wiring._resolved_setting``), as
     :func:`_http_literal_static` reads ``headers``. One this reading cannot resolve may resolve to
     ``digest``, so it reads as Digest, except beside a minted bearer (``token``) whose SMART and
-    OAuth2 flags are not themselves ``env()`` references: the build refuses Digest beside a
-    bearer provider, so none crosses there. Where such a flag is an ``env()`` reference, the
-    provider may resolve off, so the mode still reads as Digest."""
+    OAuth2 flags and token URLs are not themselves ``env()`` references: the build refuses Digest
+    beside a bearer provider, so none crosses there. Where such a flag or token URL is an
+    ``env()`` reference, the provider may resolve off (a flag off, or a token URL empty), so the
+    mode still reads as Digest."""
     from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
 
     mode = _resolved_setting(settings, "http_auth", None, env_values or {})
     if mode is _UNRESOLVED:
-        flags = (settings.get("oauth2_enabled"), settings.get("smart_enabled"))
-        return not token or any(isinstance(flag, EnvRef) for flag in flags)
+        # Round 3 finding 1: a token URL from env() may resolve empty, which also leaves the
+        # provider off, so it counts as an env() flag does.
+        keys = ("oauth2_enabled", "smart_enabled", "oauth2_token_url", "smart_token_url")
+        return not token or any(isinstance(settings.get(key), EnvRef) for key in keys)
     if mode is not settings.get("http_auth"):
         settings = {**settings, "http_auth": mode}
     try:
