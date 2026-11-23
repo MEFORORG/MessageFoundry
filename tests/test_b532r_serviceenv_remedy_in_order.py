@@ -8,7 +8,9 @@ registry, must still find each refused value there when the step that moves it r
 protect-key step for a store key and the Put step for the rest. The walk below applies each step
 it reaches to a simulated registry, models install-service.ps1 where the create step sends the
 operator to it, and stops at the Put step. A sentence it does not know before the Put step fails
-the test, so new wording cannot pass unread. Synthetic values only.
+the test. It also reads 6c6b514's wording, the doubt step's old pass-back and the create step's
+old installer clause, so the test fails on that revision rather than stopping at an unknown
+sentence there. Synthetic values only.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import pytest
 from messagefoundry.serviceenv import (
     KEY_CLASS_NAMES,
     _installer_reads,
+    _may_name_directory,
     _variables,
     read_service_env_posture,
     service_env_refusal,
@@ -60,14 +63,15 @@ class _Registry:
     entries: list[tuple[str, str]]
     #: The strings a refused value runs on into, as the run-on step names them to the operator.
     runs_on_into: frozenset[str] = frozenset()
-    #: Whether a secrets directory exists. None does in any case here, as in the round-3 example.
+    #: Whether a secrets directory already exists.
     directory: bool = False
     #: Each string install-service.ps1 read as setting the directory, and so dropped.
     installer_read: list[str] = field(default_factory=list)
     #: The refused names a step has already moved out, the store key to its key file.
     moved: set[str] = field(default_factory=set)
-    #: The refused names the create step's installer clause says to put in from where they came.
-    put_from_source: set[str] = field(default_factory=set)
+    #: The refused names whose value the operator read out of the registry, as the create step's
+    #: installer clause says, before removing the string that held it.
+    read_out: set[str] = field(default_factory=set)
 
     def readable(self, name: str, secret: str) -> bool:
         """Whether the registry still sets ``name`` to a value holding ``secret``, as the
@@ -78,12 +82,13 @@ class _Registry:
         )
 
 
-def _may_set_directory(line: str) -> bool:
-    return line.partition("=")[0].strip().upper() == _DIR
-
-
-def _sets_refused(line: str, refused: frozenset[str]) -> bool:
+def _names_refused(line: str, refused: frozenset[str]) -> bool:
+    """Whether ``line`` sets, or names alone, a refused variable."""
     return line.partition("=")[0].strip().upper() in refused
+
+
+def _holds_refused(string: str, refused: frozenset[str]) -> bool:
+    return any(_names_refused(line, refused) for line in _LINE_BREAK.split(string))
 
 
 def _doubt_step(steps: list[str]) -> str:
@@ -101,30 +106,48 @@ def _doubt_step(steps: list[str]) -> str:
     return ". ".join(steps[start : end + 1])
 
 
+def _take_out(string: str, refused: frozenset[str], *, with_value: bool) -> list[str]:
+    """The lines of ``string`` left once each line that may set the directory is out, with, as
+    the step says where ``with_value``, each line below one up to the next that holds an equals
+    sign or is a refused variable's name alone."""
+    kept: list[str] = []
+    dropping = False
+    for line in _LINE_BREAK.split(string):
+        if _may_name_directory(line):
+            dropping = True
+            continue
+        if dropping and with_value and "=" not in line and not _names_refused(line, refused):
+            continue
+        dropping = False
+        kept.append(line)
+    return kept
+
+
 def _apply_doubt_step(text: str, registry: _Registry, refused: frozenset[str]) -> None:
     """Take each line that may set the directory out of every list, as the step says, and pass
     back what its pass-back clause says to pass back."""
-    keep_run_on = "keep whole each string a refused variable's value runs on into" in text
+    leave = "leave as it is each string that holds a refused variable or that a refused" in text
+    with_value = "up to the next that holds an equals sign" in text
     if "pass back every entry, with only those lines taken out" in text:
         also_removed = False
     elif "the strings and lines this step and the steps above say to remove or take out" in text:
-        # Where the doubt step sits below the removal and run-on steps, its pass-back leaves out
-        # what those say to remove: every refused variable, and the strings a value runs on into.
+        # 6c6b514's wording: the doubt step sat below the removal and run-on steps, and its
+        # pass-back left out what those say to remove, every refused variable and the strings a
+        # value runs on into.
         also_removed = True
     else:
         raise AssertionError(f"no pass-back clause the walk knows: {text!r}")
     kept: list[tuple[str, str]] = []
     for where, string in registry.entries:
-        if string in registry.runs_on_into:
-            if also_removed:
-                continue
-            if keep_run_on:
-                kept.append((where, string))
-                continue
+        if also_removed and string in registry.runs_on_into:
+            continue
+        if leave and (string in registry.runs_on_into or _holds_refused(string, refused)):
+            kept.append((where, string))
+            continue
         lines = [
             line
-            for line in _LINE_BREAK.split(string)
-            if not _may_set_directory(line) and not (also_removed and _sets_refused(line, refused))
+            for line in _take_out(string, refused, with_value=with_value)
+            if not (also_removed and _names_refused(line, refused))
         ]
         if any(line.strip() for line in lines):
             kept.append((where, "\n".join(lines)))
@@ -137,7 +160,7 @@ def _run_installer(registry: _Registry) -> None:
     reading that one as the directory, and adds its own entry at the end."""
     kept: list[tuple[str, str]] = []
     for where, string in registry.entries:
-        if where == _EXTRA and string[: len(_DIR) + 1].upper() == f"{_DIR}=":
+        if where == _EXTRA and _installer_reads(string):
             registry.installer_read.append(string)
             continue
         if where == _EXTRA and not string:
@@ -147,8 +170,34 @@ def _run_installer(registry: _Registry) -> None:
     registry.directory = True
 
 
-#: The create step's clause where a refused value runs on into a string the installer reads.
-_INSTALLER_CLAUSE = "Where a refused variable's value runs on into an AppEnvironmentExtra string"
+def _follow_installer_clause(
+    registry: _Registry, refused: frozenset[str], moves: dict[str, str]
+) -> None:
+    """The create step's clause: read each value a kept AppEnvironmentExtra string the installer
+    reads holds, then remove that string, with each refused variable whose value it holds."""
+    for where, string in list(registry.entries):
+        if where != _EXTRA or not _installer_reads(string):
+            continue
+        holders = {
+            name
+            for name in refused
+            if name not in registry.moved and registry.readable(name, moves[name])
+        }
+        index = registry.entries.index((where, string))
+        registry.entries.remove((where, string))
+        lost = {name for name in holders if not registry.readable(name, moves[name])}
+        registry.read_out |= lost
+        # A refused variable whose value it held goes with it: the string before it, when that
+        # is the refused name set to nothing that ran on into it.
+        if index and registry.entries[index - 1][1].partition("=")[2] == "":
+            before = registry.entries[index - 1]
+            if _names_refused(before[1], refused):
+                registry.entries.remove(before)
+
+
+#: The create step's clause where a string the doubt step leaves as it is may be read by the
+#: installer.
+_INSTALLER_CLAUSE = "Where a string the first step leaves as it is lies in AppEnvironmentExtra"
 
 _PASSIVE = (
     "Take out those lines alone",
@@ -156,6 +205,7 @@ _PASSIVE = (
     "The service's own Environment value",
     "A retired key belongs",
     'See docs/SERVICE.md, "Protect the store encryption key at rest"',
+    _INSTALLER_CLAUSE,
 )
 
 
@@ -177,62 +227,60 @@ def _walk(refusal: str, registry: _Registry, moves: dict[str, str]) -> str:
             if registry.directory:
                 continue
             if "only once the steps below have taken out" in sentence:
-                # The installer may run only after the doubt step below, so that step goes first.
+                # 6c6b514's wording: the installer may run only after the doubt step below, so
+                # that step goes first.
                 _apply_doubt_step(_doubt_step(steps), registry, refused)
             if index + 1 < len(steps) and steps[index + 1].startswith(_INSTALLER_CLAUSE):
-                # Where none exists, the clause says to remove each run-on string the installer
-                # reads before it runs, and to put the value that ran on into it in from where
-                # it came, so the walk no longer looks for that value in the registry.
-                for where, string in list(registry.entries):
-                    if (
-                        string in registry.runs_on_into
-                        and where == _EXTRA
-                        and string[: len(_DIR) + 1].upper() == f"{_DIR}="
-                    ):
-                        registry.entries.remove((where, string))
-                        registry.put_from_source.update(
-                            name
-                            for name in refused
-                            if not registry.readable(name, moves[name])
-                            and name not in registry.moved
-                        )
+                _follow_installer_clause(registry, refused, moves)
             _run_installer(registry)
         elif sentence.startswith("Put "):
             if not registry.directory:
                 return "no secrets directory at the Put step"
             for name, secret in moves.items():
-                if name in KEY_CLASS_NAMES or name in registry.put_from_source:
+                if name in KEY_CLASS_NAMES or name in registry.read_out:
                     continue
                 if not registry.readable(name, secret):
                     return f"{name} lost before the Put step"
             return "ok"
-        elif not sentence.startswith((*_PASSIVE, _INSTALLER_CLAUSE)):
+        elif not sentence.startswith(_PASSIVE):
             raise AssertionError(f"a step the walk does not know: {sentence!r}")
     raise AssertionError("the remedy has no Put step")
 
 
-_CASES = {
+#: Each case: the registry, the strings a refused value runs on into, the refused names with
+#: the secret each holds, and whether a secrets directory already exists.
+_CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], bool]] = {
     # The round-3 example: the directory line shares its string with the password, whose value
     # runs on into the next string, and C:\d does not exist.
     "shared-string-run-on": (
         [(_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD="), (_EXTRA, "abc")],
         frozenset({"abc"}),
         {"MEFOR_STORE_PASSWORD": "abc"},
+        False,
+    ),
+    "shared-string-run-on-directory-exists": (
+        [(_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD="), (_EXTRA, "abc")],
+        frozenset({"abc"}),
+        {"MEFOR_STORE_PASSWORD": "abc"},
+        True,
     ),
     "app-environment-shared-string-run-on": (
         [(_APP, "MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD="), (_APP, "abc")],
         frozenset({"abc"}),
         {"MEFOR_STORE_PASSWORD": "abc"},
+        False,
     ),
     "padded-name": (
         [(_EXTRA, " MEFOR_SECRETS_DIRECTORY=C:\\d"), (_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA")],
         frozenset(),
         {"MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
     ),
     "padded-name-shared-string": (
         [(_EXTRA, "MEFOR_SECRETS_DIRECTORY\u00a0=C:\\d\nMEFOR_AUTH_AD_BIND_PASSWORD=SEKRITbindPw")],
         frozenset(),
         {"MEFOR_AUTH_AD_BIND_PASSWORD": "SEKRITbindPw"},
+        False,
     ),
     "app-environment-later-line": (
         [
@@ -244,6 +292,7 @@ _CASES = {
         ],
         frozenset(),
         {"MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
     ),
     "store-key-in-the-directory-string": (
         [
@@ -252,9 +301,28 @@ _CASES = {
         ],
         frozenset(),
         {_KEY: _KEY_B64, "MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
     ),
-    # The store key runs on into a directory string holding key text: the doubt step keeps that
-    # string whole for the protect-key step, and the create step's installer clause has it
+    # Code review round 1 on this repair: the reader reads a directory line below an empty store
+    # key in the same string as the key's value, so the doubt step leaves that string as it is.
+    "store-key-value-on-a-directory-line": (
+        [
+            (_EXTRA, f"{_KEY}=\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}"),
+            (_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA"),
+        ],
+        frozenset(),
+        {_KEY: _KEY_B64, "MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
+    ),
+    # The same review: a name broken by a line break, whose value sits on the directory line.
+    "broken-name-value-on-a-directory-line": (
+        [(_EXTRA, "MEFOR_VALUE_A\nMEFOR_SECRETS_DIRECTORY=SEKRITvalueA")],
+        frozenset(),
+        {"MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
+    ),
+    # The store key runs on into a directory string holding key text: the doubt step leaves that
+    # string as it is for the protect-key step, and the create step's installer clause has it
     # removed before the installer runs.
     "store-key-runs-on-into-an-installer-string": (
         [
@@ -264,6 +332,15 @@ _CASES = {
         ],
         frozenset({f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"}),
         {_KEY: _KEY_B64, "MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
+    ),
+    # A value bound for the secrets directory runs on into such a string, so the clause has the
+    # operator read it out before removing the string.
+    "password-runs-on-into-an-installer-string": (
+        [(_EXTRA, "MEFOR_STORE_PASSWORD="), (_EXTRA, "mefor_secrets_directory=Summer!x")],
+        frozenset({"mefor_secrets_directory=Summer!x"}),
+        {"MEFOR_STORE_PASSWORD": "Summer!x"},
+        False,
     ),
 }
 
@@ -272,25 +349,28 @@ _CASES = {
 def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves_it(
     case: str,
 ) -> None:
-    entries, runs_on_into, moves = _CASES[case]
+    entries, runs_on_into, moves, exists = _CASES[case]
     posture = read_service_env_posture(probe=_Probe(entries), environ={})
     assert posture.directory_in_doubt
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    registry = _Registry(list(entries), runs_on_into)
+    registry = _Registry(list(entries), runs_on_into, directory=exists)
     assert _walk(refusal, registry, moves) == "ok"
-    # The installer ran with no string left for it to read as the directory: the doubt step
-    # took out every other line that may set it, and the create step's installer clause, where
-    # it prints, the run-on string it keeps (the Lander's ruling (a), comment 7112155891).
+    # Where the installer ran, it found no string to read as the directory: the doubt step took
+    # out each line that may set it, but in a string it left as it is for a refused variable,
+    # and the installer clause had such a string removed first (the Lander's ruling (a),
+    # comment 7112155891).
     assert registry.installer_read == []
-    assert (_INSTALLER_CLAUSE in refusal) is posture.installer_run_on
+    # Only a value the clause had read out before its string went is not read at the Put step.
+    assert registry.read_out <= {"MEFOR_STORE_PASSWORD"}
+    assert (case == "password-runs-on-into-an-installer-string") is bool(registry.read_out)
 
 
 def test_the_installer_model_matches_install_service_ps1() -> None:
-    """``_installer_reads`` and the walk's installer both restate how install-service.ps1 picks
-    the strings that set the directory, so tie them to the script's own text: an
-    AppEnvironmentExtra entry that starts with the name and an equals sign, ignoring case, which
-    Get-MergedEnvironmentList drops with every empty entry before it adds its own."""
+    """``_installer_reads`` restates how install-service.ps1 picks the strings that set the
+    directory, so tie it to the script's own text: an AppEnvironmentExtra entry that starts with
+    the name and an equals sign, ignoring case, which Get-MergedEnvironmentList drops with every
+    empty entry before it adds its own."""
     script = (
         Path(__file__).resolve().parent.parent / "scripts" / "service" / "install-service.ps1"
     ).read_text(encoding="utf-8")

@@ -91,7 +91,9 @@ DOUBT_STEP = (
     "At least one entry that may set MEFOR_SECRETS_DIRECTORY is not one line setting it plainly "
     "to a path under that name, in ASCII with no blank around it, so first take each line that "
     "may set it out of every list, whatever its letter case, a blank around its name, or a letter "
-    "outside ASCII that upper-cases to one of its letters. Take out those lines alone, and keep "
+    "outside ASCII that upper-cases to one of its letters, with each line below it in its string "
+    "up to the next that holds an equals sign or is a refused variable's name alone, which the "
+    "engine reads as part of its value. Take out those lines alone, and keep "
     "every refused variable and every other line where it is, for the steps below to move each "
     "value before its entry goes: where such a line shares a registry string with other lines, "
     "write that string back with its other lines as they were, in their order, and leave out "
@@ -102,16 +104,20 @@ DOUBT_STEP = (
     'above: see docs/SERVICE.md, "Start / stop / status"'
 )
 
-#: DOUBT_STEP's clause where a refused value runs on: a string the value runs on into stays whole
-#: until the run-on step, since it may hold that value, a store key among them.
-DOUBT_KEEP_RUN_ON = (
-    ", but keep whole each string a refused variable's value runs on into, which a step below "
-    "removes with that value"
+#: DOUBT_STEP's clause where a refused variable holds a line that may set the directory past its
+#: own first line (``ServiceEnvPosture.directory_in_refused``): the strings holding a refused
+#: variable or its run-on stay as they are until the step that removes it, since such a line may
+#: be part of its value, a store key among them (code review round 1 on the repair of PR 3142's
+#: round-3 open findings 1 and 2).
+DOUBT_LEAVE = (
+    ", but leave as it is each string that holds a refused variable or that a refused variable's "
+    "value runs on into, since such a line may be part of that value, until a step below removes "
+    "that variable, then take those lines out with it"
 )
 
-#: DOUBT_STEP as printed where a refused value runs on.
-DOUBT_STEP_RUN_ON = DOUBT_STEP.replace(
-    "one of its letters. Take out", f"one of its letters{DOUBT_KEEP_RUN_ON}. Take out", 1
+#: DOUBT_STEP as printed where DOUBT_LEAVE applies.
+DOUBT_STEP_LEAVING = DOUBT_STEP.replace(
+    "part of its value. Take out", f"part of its value{DOUBT_LEAVE}. Take out", 1
 )
 
 #: The add-back step's pass-back exclusion where a directory entry is in doubt, so no line the
@@ -172,18 +178,27 @@ CREATE = (
 #: ruling (a) on PR 3142's repair handback, comment 7112155891).
 DOUBT_CREATE = f"{DOUBT_STEP}. {CREATE}"
 
-#: DOUBT_CREATE where a refused value runs on.
-DOUBT_CREATE_RUN_ON = f"{DOUBT_STEP_RUN_ON}. {CREATE}"
+#: DOUBT_CREATE where DOUBT_LEAVE applies.
+DOUBT_CREATE_LEAVING = f"{DOUBT_STEP_LEAVING}. {CREATE}"
 
-#: CREATE's clause where a directory entry is in doubt and a refused value runs on, in
-#: AppEnvironmentExtra, into a string install-service.ps1 reads as setting the directory, which
-#: DOUBT_STEP_RUN_ON keeps for that value (``ServiceEnvPosture.installer_run_on``).
+#: CREATE's clause where a directory entry is in doubt, DOUBT_LEAVE applies and an
+#: AppEnvironmentExtra string is one install-service.ps1 reads as setting the directory
+#: (``ServiceEnvPosture.installer_reads_extra``). It states its own condition, and has the
+#: operator read each value out before removing the string, since the registry may hold its
+#: only copy (code review round 1 on the repair of PR 3142's round-3 open findings 1 and 2).
 CREATE_INSTALLER = (
-    ". Where a refused variable's value runs on into an AppEnvironmentExtra string that starts "
-    "with MEFOR_SECRETS_DIRECTORY= in any letter case, which the first step keeps, "
-    "install-service.ps1, which `messagefoundry service install` also runs, may read that string "
-    "as the directory the service names and print it, so run the installer only once that string "
-    "is out: where a secrets directory already exists, put that value in it first, and where none "
-    "does, remove that string as a step below says, then run the installer, and put the value in "
-    "the new directory from where it came"
+    ". Where a string the first step leaves as it is lies in AppEnvironmentExtra and starts with "
+    "MEFOR_SECRETS_DIRECTORY= in any letter case, install-service.ps1, which `messagefoundry "
+    "service install` also runs, may read that string as the directory the service names and "
+    "print it, and drops it whole, so before you run the installer read out of that string each "
+    "value the next step puts in the secrets directory, remove the string with each refused "
+    "variable whose value it holds, and put each value you read in the new directory at the next "
+    "step"
 )
+
+#: CREATE_INSTALLER's tail where a store key moves to its key file in the step above it.
+CREATE_INSTALLER_KEY = "; a store key in it went to its key file in the step above"
+
+#: How the Put step names the directory wherever a directory entry is in doubt, since the doubt
+#: step has taken every directory line out (code review round 1 on that repair).
+PUT_DOUBT = "in the secrets directory, the one the installer made or the one already there, as"

@@ -25,10 +25,12 @@ from tests._serviceenv_remedy import (
     ADD_BACK_CREATE,
     ADD_BACK_DOUBT,
     CREATE,
-    DOUBT_CREATE_RUN_ON,
+    DOUBT_CREATE,
     DOUBT_PASS_BACK,
-    DOUBT_STEP_RUN_ON,
+    DOUBT_STEP,
+    DOUBT_STEP_LEAVING,
     KEEP,
+    PUT_DOUBT,
     REMOVE,
     REMOVE_SPARING,
     RUNS_ON,
@@ -225,7 +227,7 @@ def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directo
     # key file, and the removal last (fourth hold, H1; the Lander's ruling (a) on PR 3142's
     # repair handback, comment 7112155891).
     assert remedy.startswith(
-        f"{DOUBT_STEP_RUN_ON}. Keep the store key in a DPAPI-protected key file instead"
+        f"{DOUBT_STEP_LEAVING}. Keep the store key in a DPAPI-protected key file instead"
     )
     assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{_END}")
     # The directory item may still be read as its own variable, so no "set no" opener, and the
@@ -455,14 +457,14 @@ def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -
     assert refusal is not None
     assert REMOVE in refusal and RUNS_ON in refusal
     remedy = refusal.split("each value refused here. ", 1)[1]
-    assert remedy.startswith(
-        f"{DOUBT_CREATE_RUN_ON}. Put MEFOR_STORE_PASSWORD in the secrets directory"
-    )
+    assert remedy.startswith(f"{DOUBT_CREATE}. Put MEFOR_STORE_PASSWORD {PUT_DOUBT}")
     # The password moves to the secrets directory, so the step carries its create clause.
     assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{ADD_BACK_CREATE}{_END}")
     # The third hold's H1: no step between the doubt step and the add-back step names a string.
-    # Those two read and pass back a list, so they name the strings they keep or leave out.
-    assert "string" not in remedy.split(DOUBT_STEP_RUN_ON, 1)[1].split(ADD_BACK_DOUBT, 1)[0]
+    # Those two read and pass back a list, so they name the strings they keep or leave out. The
+    # create step's installer clause (CREATE_INSTALLER) names one too, but it prints only where
+    # the doubt step leaves a string as it is, which it does not here.
+    assert "string" not in remedy.split(DOUBT_STEP, 1)[1].split(ADD_BACK_DOUBT, 1)[0]
 
 
 def test_a_store_key_alone_beside_a_directory_entry_in_doubt_gets_the_add_back_step() -> None:

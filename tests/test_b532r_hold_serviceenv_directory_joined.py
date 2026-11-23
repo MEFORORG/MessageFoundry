@@ -36,7 +36,7 @@ from tests._serviceenv_remedy import (
     CREATE_INSTALLER,
     DOUBT_PASS_BACK,
     DOUBT_STEP,
-    DOUBT_STEP_RUN_ON,
+    DOUBT_STEP_LEAVING,
     KEEP,
     REMOVE,
     REMOVE_SPARING,
@@ -503,7 +503,7 @@ def test_a_string_that_sets_the_directory_and_more_has_its_directory_line_taken_
     )
     assert refusal is not None
     assert SET_NO not in refusal
-    assert refusal.count(DOUBT_STEP_RUN_ON) == 1 and refusal.count(DOUBT_PASS_BACK) == 1
+    assert refusal.count(DOUBT_STEP_LEAVING) == 1 and refusal.count(DOUBT_PASS_BACK) == 1
     step = ADD_BACK_DOUBT + ADD_BACK_CREATE
     assert refusal.count(step) == 1
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(step)
@@ -523,9 +523,9 @@ def test_a_string_a_value_runs_on_into_is_left_to_the_run_on_step() -> None:
         _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"])
     )
     assert refusal is not None
-    assert refusal.count(RUNS_ON) == 1 and refusal.count(DOUBT_STEP_RUN_ON) == 1
+    assert refusal.count(RUNS_ON) == 1 and refusal.count(DOUBT_STEP_LEAVING) == 1
     assert refusal.count(DOUBT_PASS_BACK) == 1 and WIDER not in refusal
-    assert refusal.index(DOUBT_STEP_RUN_ON) < refusal.index("Put ") < refusal.index(RUNS_ON)
+    assert refusal.index(DOUBT_STEP_LEAVING) < refusal.index("Put ") < refusal.index(RUNS_ON)
 
 
 @pytest.mark.parametrize("where", [_PLAIN, "Environment"], ids=["AppEnvironment", "Environment"])
