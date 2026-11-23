@@ -663,9 +663,9 @@ def test_a_text_field_at_the_cap_still_parses() -> None:
 
 # --- BACKLOG #5787: a body with no closing delimiter is refused -----------------------------------
 #
-# The first half refuses a body with no closing delimiter. The second half counts a delimiter only
-# at a line start: at the start of the body or after a CR or an LF. The differential arm below pins
-# what both halves leave alone: every body in the corpus that carries a close marker must parse
+# The first half refuses a body with no closing delimiter. The second half counts a delimiter after
+# the first only at a line start (multipart._LineStartDelimiters). The differential arm below pins
+# what both halves leave alone: every body in the corpus that carries close-marker text must parse
 # exactly as origin/main parsed it, outcome for outcome, except the rows _ANCHORED_OUTCOMES names.
 # The outcomes were recorded by running origin/main's parser (at ec75a5f61bf) over this same corpus,
 # so a change that moves any other row, accept or refuse, shows here. The record says what main did,
@@ -677,7 +677,8 @@ _FP = b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\n'
 
 
 def _corpus() -> list[tuple[str, str, bytes]]:
-    """(id, Content-Type, body). Shapes the narrow fix must not move, then the test_multipart bodies."""
+    """(id, Content-Type, body). Edge shapes, then the test_multipart bodies. Only the rows
+    _ANCHORED_OUTCOMES names may move from origin/main's outcome."""
     cap = multipart._MAX_FIELD_BYTES
     return [
         ("plain", _CT_B, b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"),
@@ -741,8 +742,8 @@ def _digest(value: bytes) -> bytes | tuple[int, str]:
     return value if len(value) <= 64 else (len(value), hashlib.sha256(value).hexdigest())
 
 
-#: origin/main's outcome for each corpus body, recorded at ec75a5f61bf. Every body here carries a close
-#: marker, so the #5787 fix must leave each one exactly as it was.
+#: origin/main's outcome for each corpus body, recorded at ec75a5f61bf. Every body here carries
+#: close-marker text; #5787 leaves each one as it was, except the rows _ANCHORED_OUTCOMES names.
 _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "plain": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
     "delim-cr-run": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
@@ -837,13 +838,6 @@ _ANCHORED_OUTCOMES: dict[str, tuple[Any, ...]] = {
         "MultipartError",
         "multipart body has no closing boundary delimiter; the upload may be truncated",
     ),
-    # Nothing in it starts a line, so it holds no delimiter at all.
-    "close-in-preamble": (
-        "refused",
-        "MultipartError",
-        "multipart body holds no delimiter for the boundary its Content-Type names "
-        "(a delimiter counts only at the start of a line)",
-    ),
 }
 
 
@@ -857,13 +851,13 @@ def _close_marker(content_type: str) -> bytes:
 
 
 @pytest.mark.parametrize(("case", "content_type", "body"), _CORPUS, ids=[c[0] for c in _CORPUS])
-def test_a_body_with_a_close_marker_parses_exactly_as_main_did(
+def test_a_body_with_a_close_marker_parses_as_main_did_unless_listed(
     case: str, content_type: str, body: bytes
 ) -> None:
-    """#5787 differential arm: neither half moves a body that carries a line-start close marker,
-    whatever its shape (a CR run after a delimiter, a close marker after a bare CR, anything after
-    the close marker). Only the rows with delimiter text mid-line move, to _ANCHORED_OUTCOMES, and
-    each of those differs from main. It pins ``parse_multipart_form``; ``parse_single_file_upload``
+    """#5787 differential arm: neither half moves a corpus body, whatever its shape (a CR run after a
+    delimiter, a close marker after a bare CR, anything after the close marker, a preamble ending
+    mid-line), except the rows holding delimiter text mid-line after the first delimiter. Those
+    move to _ANCHORED_OUTCOMES, and each of those differs from main. It pins ``parse_multipart_form``; ``parse_single_file_upload``
     shares the same walk and terminator check."""
     # Close-marker text, not a line-start close: the rows _ANCHORED_OUTCOMES names hold it mid-line.
     assert _close_marker(content_type) in body, "every corpus body holds close-marker text"
@@ -877,6 +871,7 @@ def test_a_body_with_a_close_marker_parses_exactly_as_main_did(
 def test_the_recorded_outcomes_cover_the_whole_corpus() -> None:
     """The record and the corpus must name the same bodies, or a body could go uncompared."""
     assert [case for case, _, _ in _CORPUS] == list(_MAIN_OUTCOMES)
+    assert set(_ANCHORED_OUTCOMES) <= set(_MAIN_OUTCOMES)
 
 
 @pytest.mark.parametrize(
@@ -992,13 +987,39 @@ def test_delimiter_text_mid_line_stays_inside_the_file() -> None:
 
 @pytest.mark.parametrize(
     "prefix",
-    [b"", b"pre\r\n", b"pre\n", b"pre\r"],
-    ids=["at-start", "after-crlf", "after-lf", "after-bare-cr"],
+    [b"", b"pre\r\n", b"pre\n", b"pre\r", b"\n", b"\r", b" ", b"\xef\xbb\xbf", b"pre"],
+    ids=["start", "crlf", "lf", "bare-cr", "lone-lf", "lone-cr", "space", "bom", "mid-line"],
 )
-def test_a_delimiter_after_any_line_end_counts(prefix: bytes) -> None:
-    """The first delimiter is found at the start of the body or after a CRLF, an LF or a bare CR."""
+def test_the_first_delimiter_counts_wherever_it_sits(prefix: bytes) -> None:
+    """The first delimiter is the first ``--<boundary>`` anywhere, as on origin/main, so a stray
+    byte or a preamble ending mid-line before it does not turn the first part into preamble."""
     body = prefix + b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"
     assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
+
+
+def test_a_preamble_ending_mid_line_keeps_both_file_parts() -> None:
+    """origin/main refused this body for its two file parts; it still does, rather than dropping
+    the first one as preamble."""
+    body = b"pre--B\r\n" + _FP + b"A\r\n--B\r\n" + _FP + b"B\r\n--B--"
+    with pytest.raises(MultipartError, match="2 file parts"):
+        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+
+
+@pytest.mark.parametrize(("body", "at", "expected"), [(b"x\n--B", 2, 2), (b"x\r--B", 2, 2)])
+def test_a_later_delimiter_right_at_the_search_offset_is_found(
+    body: bytes, at: int, expected: int
+) -> None:
+    """The cursor search starts one byte before ``at``, where the line end of a delimiter at ``at``
+    sits."""
+    assert multipart._LineStartDelimiters(body, b"--B").find(at) == expected
+
+
+def test_the_delimiter_search_refuses_to_go_back() -> None:
+    """The cursors keep state, so a smaller offset than the last one would skip delimiters."""
+    delims = multipart._LineStartDelimiters(b"--B\r\nx\r\n--B\r\ny\r\n--B--", b"--B")
+    assert delims.find(5) == 8
+    with pytest.raises(RuntimeError):
+        delims.find(4)
 
 
 def test_delimiters_after_mixed_line_ends_are_each_found_in_order() -> None:
@@ -1027,12 +1048,16 @@ def _python_lines(run: Callable[[], object]) -> int:
             count += 1
         return trace
 
+    # A collection during the run would trace any Python finalizer it calls; keep it out.
+    gc.collect()
+    gc.disable()
     previous = sys.gettrace()
     sys.settrace(trace)
     try:
         run()
     finally:
         sys.settrace(previous)
+        gc.enable()
     return count
 
 

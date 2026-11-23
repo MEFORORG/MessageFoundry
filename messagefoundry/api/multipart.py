@@ -12,7 +12,7 @@ delimiter, and each part's ``Content-Disposition`` gives its field name + (for a
 What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block over
 ``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
 ``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body with no
-closing delimiter ``--<boundary>--`` at a line start (BACKLOG #5787), and, in
+closing delimiter ``--<boundary>--`` where a delimiter counts (BACKLOG #5787), and, in
 :func:`parse_single_file_upload`, a body with no file part or with more than one.
 
 Scope: exactly what an upload form needs — one file part + optional small text fields. It is not a
@@ -145,17 +145,26 @@ _NOT_CRLF = re.compile(rb"[^\r\n]")
 
 
 class _LineStartDelimiters:
-    """Finds each ``--<boundary>`` that starts a line: at the start of the body, or right after a CR
-    or an LF (BACKLOG #5787). One at any other offset is part content. A bare CR counts as a line
-    end, so a close marker after one (``MSH|x\r--B--``) is still found.
+    """Finds the delimiters ``--<boundary>`` of a body (BACKLOG #5787). This is the one statement of
+    which offsets count.
 
-    Two ``find`` cursors, one for ``\n--B`` and one for ``\r--B``, each only ever moving forward,
-    so a body holding the delimiter text mid-line many times is skipped in C and the walk stays
-    linear. One at offset 0 is found by a ``startswith`` check; each later one is found by exactly
-    one cursor, because its previous byte is one of the two.
+    The first delimiter is the first ``--<boundary>`` anywhere, as on origin/main, so a preamble
+    that ends mid-line, or a stray byte before the first delimiter, parses as it did. Each later
+    delimiter must start a line: it must come right after a CR or an LF. Delimiter text elsewhere
+    after the first delimiter is not a delimiter, so inside a part it is content. A bare CR counts as
+    a line end, so a close marker after one (``MSH|x\r--B--``) is still found.
 
-    The cursors hold state between calls, so :meth:`find` is correct only for a caller whose ``at``
-    never decreases; the walk in :func:`_locate_parts` is that caller."""
+    So the boundary is trusted not to start a line inside a part body. That trust goes past RFC
+    2046, which keeps only ``CRLF--<boundary>`` out of content: a content line after a bare CR or a
+    bare LF that starts with ``--<boundary>`` is taken as a delimiter here, though a conforming
+    sender may write one. Nothing here reads what follows the boundary, so a content line starting
+    with ``--<boundary>--`` and then other text is taken as the close.
+
+    After the first, two ``find`` cursors, one for ``\n--B`` and one for ``\r--B``, each only ever
+    moving forward, so a body holding the delimiter text mid-line many times is skipped in C and the
+    walk stays linear. Each later delimiter is found by exactly one cursor, because its previous
+    byte is one of the two. The cursors hold state between calls, so :meth:`find` refuses an ``at``
+    smaller than the previous call's."""
 
     def __init__(self, body: bytes, delim: bytes) -> None:
         self._body = body
@@ -165,18 +174,22 @@ class _LineStartDelimiters:
         # Offsets of the line-end byte before a delimiter; -2 until first searched, -1 for none left.
         self._lf = -2
         self._cr = -2
+        self._last_at = -1
 
     def _advance(self, cursor: int, needle: bytes, at: int) -> int:
         if cursor == -1 or cursor + 1 >= at:
             return cursor
         return self._body.find(needle, at - 1)
 
+    def first(self) -> int:
+        """The offset of the first delimiter, at any offset, or -1."""
+        return self._body.find(self._delim)
+
     def find(self, at: int) -> int:
-        """The offset of the first line-start delimiter at or after ``at``, or -1. ``at`` must not
-        be less than on the previous call."""
-        if at == 0 and self._body.startswith(self._delim):
-            return 0
-        at = max(at, 1)
+        """The offset of the first line-start delimiter at or after ``at`` (at least 1), or -1."""
+        if at < self._last_at or at < 1:
+            raise RuntimeError(f"delimiter search went back to {at} from {self._last_at}")
+        self._last_at = at
         self._lf = self._advance(self._lf, self._after_lf, at)
         self._cr = self._advance(self._cr, self._after_cr, at)
         found = [c for c in (self._lf, self._cr) if c != -1]
@@ -221,9 +234,9 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     closed = False
     # Anything before the first delimiter is the ignorable preamble; the closing "--boundary--" is
     # the first later delimiter followed by b"--", and anything after it is the ignorable epilogue.
-    # A delimiter is one that starts a line (BACKLOG #5787); see _LineStartDelimiters.
+    # Which offsets count as a delimiter is stated once, on _LineStartDelimiters.
     delims = _LineStartDelimiters(body, delim)
-    pos = delims.find(0)
+    pos = delims.first()
     seen = pos != -1
     while pos != -1:
         start = pos + len(delim)
@@ -297,18 +310,16 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     # its close marker (for example one built from a file still being written) is one, and its last
     # part would otherwise run to the end of the body and be taken as complete. Checked last, so a
     # body that fails a check above gets that refusal. A close marker counts only where a delimiter
-    # does, at a line start, so close-marker text in the middle of a content line no longer makes a
-    # cut-short body pass as complete. A content line that itself starts with the close marker still
-    # does: the walk stops there and the part ends at that line.
+    # does (_LineStartDelimiters), so close-marker text in the middle of a content line no longer
+    # makes a cut-short body pass as complete; the cases it still misses are stated there.
     if not closed:
         if not seen:
-            # No line-start delimiter at all. At least an empty body, one built with another
-            # boundary than the Content-Type names, and one cut inside its first delimiter line land
-            # here. A body built with a boundary the declared one is a prefix of (declared B, body
-            # uses BX) does not: it has delimiters, so it gets the missing-terminator refusal below.
+            # No delimiter at all. At least an empty body, one built with another boundary than the
+            # Content-Type names, and one cut before its first ``--<boundary>`` is whole land here.
+            # A body built with a boundary the declared one is a prefix of (declared B, body uses
+            # BX) does not: it has delimiters, so it gets the missing-terminator refusal below.
             raise MultipartError(
-                "multipart body holds no delimiter for the boundary its Content-Type names "
-                "(a delimiter counts only at the start of a line)"
+                "multipart body holds no delimiter for the boundary its Content-Type names"
             )
         raise MultipartError(
             "multipart body has no closing boundary delimiter; the upload may be truncated"
@@ -325,11 +336,9 @@ def parse_multipart_form(
     closing delimiter is missing, or it holds more than ``_MAX_PARTS`` parts, or a part
     with no header block exceeds ``_MAX_FIELD_BYTES`` (all HTTP 400 at the route), and
     :class:`MultipartTooLargeError` if a file part exceeds ``max_file_bytes`` or a non-file part with
-    a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413 at the route). A delimiter counts only at
-    a line start (after a CR, an LF, or at the start of the body), and the boundary is trusted not to
-    start a line inside a part body. That trust goes past RFC 2046, which keeps only
-    ``CRLF--<boundary>`` out of content: a content line after a bare CR or a bare LF that starts with
-    ``--<boundary>`` is taken as a delimiter here, though a conforming sender may write one.
+    a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413 at the route). Which offsets count as a
+    delimiter, and what the parser trusts about the boundary, is stated on
+    :class:`_LineStartDelimiters`.
 
     The function is synchronous and walks the whole body. The upload route keeps one file and no
     field, so it calls :func:`parse_upload_off_loop`, which runs :func:`parse_single_file_upload`
