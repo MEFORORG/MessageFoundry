@@ -386,9 +386,15 @@ _ANSWER_SEND_SECONDS = 1.0
 
 #: The least rate, in data set bytes a second, at which one DIMSE message has to arrive once its
 #: first fragment has (vault BACKLOG #5080); :class:`_ReceiptTally` says how the deadline is built
-#: from it, and docs/DICOM.md section 3 states the bound it gives. A constant, not a setting, chosen
-#: far under any real link: 64 KiB a second is a quarter of a 2 Mbit/s line.
+#: from it, and docs/DICOM.md section 3 states the bound it gives. The default of the SCP's
+#: ``min_message_bytes_per_second``, chosen far under most links: 64 KiB a second is a quarter of a
+#: 2 Mbit/s line. A slower link needs the setting (vault BACKLOG #6637).
 _MIN_MESSAGE_BYTES_PER_SECOND = 64 * 1024
+
+#: The least ``min_message_bytes_per_second`` the SCP takes. The deadline is the slow-sender defence,
+#: so no value may switch it off or make it unbounded. At this rate the longest message the SCP
+#: holds, twice its 16 MiB ceiling, has about 68 minutes plus ``timeout_seconds``.
+_LEAST_MESSAGE_BYTES_PER_SECOND = 8 * 1024
 
 #: The least and the most ``max_pdu_size`` the SCP takes. pynetdicom fragments an object into PDVs
 #: of six bytes less than the size a peer offers, so a size of six or less breaks its senders, and
@@ -1055,8 +1061,8 @@ class _ReceiptTally:
     fragments are read through a ``memoryview``, so counting one copies nothing.
 
     A message also has a deadline, from the PDU that brings its first fragment (vault BACKLOG #5080):
-    ``timeout_seconds`` plus its data set bytes so far at :data:`_MIN_MESSAGE_BYTES_PER_SECOND`. It
-    is checked as each P-DATA-TF is counted, so a message that is past it ends the association when
+    ``timeout_seconds`` plus its data set bytes so far at ``min_bytes_per_second``, the SCP's
+    ``min_message_bytes_per_second``. It is checked as each P-DATA-TF is counted, so a message that is past it ends the association when
     its next PDU lands. A peer that sends nothing more is ended by pynetdicom's idle timer, and one
     that stops part way through a PDU by the read deadline. A
     message that completes is never ended by it, and the clock starts again with the next one."""
@@ -1066,12 +1072,15 @@ class _ReceiptTally:
         *,
         max_data_set_bytes: int,
         timeout_seconds: float,
+        min_bytes_per_second: int = _MIN_MESSAGE_BYTES_PER_SECOND,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         #: Past this the association is ended: twice the SCP's effective ``max_object_bytes``.
         self.max_data_set_bytes = max_data_set_bytes
         #: The fixed part of a message's deadline: the SCP's ``timeout_seconds``.
         self.timeout_seconds = timeout_seconds
+        #: The rate part of a message's deadline, in data set bytes a second.
+        self.min_bytes_per_second = min_bytes_per_second
         self._clock = clock
         #: When the message in progress began, on ``clock``, or ``None`` between messages.
         self.began: float | None = None
@@ -1115,12 +1124,12 @@ class _ReceiptTally:
         names the bound, never a byte count or a time the peer's sending made."""
         if self.began is None:  # the PDU completed its message
             return None
-        allowed = self.timeout_seconds + self.data_set_bytes / _MIN_MESSAGE_BYTES_PER_SECOND
+        allowed = self.timeout_seconds + self.data_set_bytes / self.min_bytes_per_second
         if self._clock() - self.began <= allowed:
             return None
         return _ABORT_OVER_LIMIT, (
             "a message did not arrive within timeout_seconds plus its data set at "
-            f"{_MIN_MESSAGE_BYTES_PER_SECOND} bytes a second"
+            f"{self.min_bytes_per_second} bytes a second (min_message_bytes_per_second)"
         )
 
     def _take_command(
@@ -1290,6 +1299,7 @@ def _admitting_server_class() -> type[Any]:
             stopping: threading.Event,
             max_pdu_size: int,
             max_object_bytes: int,
+            min_message_bytes_per_second: int,
             **kwargs: Any,
         ) -> None:
             #: The longest P-DATA-TF variable field the SCP offers to take, and so takes.
@@ -1297,6 +1307,8 @@ def _admitting_server_class() -> type[Any]:
             #: The SCP's effective object cap. An association whose object passes twice this is
             #: ended (owner ruling B462-R3).
             self.max_object_bytes = max_object_bytes
+            #: The rate part of each message's deadline; see :class:`_ReceiptTally`.
+            self.min_message_bytes_per_second = min_message_bytes_per_second
             self._admit = admit
             self._refused = refused
             #: Called besides ``refused`` for a connection refused at a connection cap, which the
@@ -1957,6 +1969,7 @@ def _admitting_server_class() -> type[Any]:
             sock.tally = _ReceiptTally(
                 max_data_set_bytes=2 * server.max_object_bytes,
                 timeout_seconds=cast(float, server.ae.network_timeout),
+                min_bytes_per_second=server.min_message_bytes_per_second,
             )
             assoc.start()
 
@@ -2024,6 +2037,27 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
 #: shared default tells the operator to "use None or 0 to disable it", which is false on the SCP:
 #: either value resolves to the ingress ceiling. Following that advice would leave the SCP at 16 MiB
 #: while the operator believed it uncapped.
+def _message_rate_setting(s: Mapping[str, Any]) -> int:
+    """The SCP's ``min_message_bytes_per_second``. Unset is the shipped rate; a value that is set
+    has to be a whole number at or over :data:`_LEAST_MESSAGE_BYTES_PER_SECOND`, so ``None``, zero
+    and every other spelling of "off" are refused rather than read as no deadline. The refusal
+    withholds the value, by the rule in :func:`~messagefoundry.transports.base.count_setting`."""
+    if "min_message_bytes_per_second" not in s:
+        return _MIN_MESSAGE_BYTES_PER_SECOND
+    rate = count_setting(
+        s["min_message_bytes_per_second"],
+        knob="min_message_bytes_per_second",
+        transport="DICOM-SCP source",
+    )
+    if rate < _LEAST_MESSAGE_BYTES_PER_SECOND:
+        raise ValueError(
+            "DICOM-SCP source: min_message_bytes_per_second must be at least "
+            f"{_LEAST_MESSAGE_BYTES_PER_SECOND} (value withheld); it bounds how long a slow sender "
+            "can hold an association, and it cannot be turned off"
+        )
+    return rate
+
+
 _SCP_OBJECT_CAP_OFF_HINT = (
     "None or 0 does not disable the SCP's object cap: either one resolves to the engine's binary "
     f"ingress ceiling of {_ENGINE_INGRESS_CEILING_BYTES} bytes, and no setting raises the cap above it"
@@ -2091,6 +2125,7 @@ class DicomScpSource(SourceConnector):
                 "second; it is a deadline on every read and send, so a smaller one would end "
                 "nearly every peer"
             )
+        self._min_message_bytes_per_second = _message_rate_setting(s)
         # Association-rate pacing (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). The keys are NOT
         # max_messages_per_second/message_burst and are not read through mllp._pacing_settings, because
         # the UNIT here is an association, not a message — see _pace_association for why a message-rate
@@ -2308,6 +2343,7 @@ class DicomScpSource(SourceConnector):
             stopping=self._stopping,
             max_pdu_size=self._max_pdu_size,
             max_object_bytes=self._max_object_bytes,
+            min_message_bytes_per_second=self._min_message_bytes_per_second,
         )
         server.start_serving()
         self._ae = ae

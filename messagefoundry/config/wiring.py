@@ -4779,10 +4779,10 @@ class _RoleDefault:
         return "<each role's default>"
 
 
-#: ``DICOM(max_object_bytes=...)`` left unset. One factory builds both roles and each has its own
-#: default (``transports/dicom.py``; vault BACKLOG #4908), so the factory writes no value it was not
-#: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, which is what an
-#: author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
+#: ``DICOM(max_object_bytes=...)`` or ``min_message_bytes_per_second`` left unset. One factory builds
+#: both roles and the transport holds each default (``transports/dicom.py``; vault BACKLOG #4908,
+#: #6637), so the factory writes no value it was not given. Typed ``Any`` so that the parameter's
+#: annotation stays what an author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
 #: Not ``_UNSET``, which is ``env()``'s.
 _ROLE_DEFAULT: Any = _RoleDefault()
 
@@ -4833,6 +4833,8 @@ def DICOM(
     max_pdu_size: int = 16384,  # largest PDU offered; the SCP aborts a longer one (SCP: 4096 to 1 MiB)
     timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: deadline per read and send, >= 1 s
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
+    min_message_bytes_per_second: int = _ROLE_DEFAULT,  # SCP: the rate in each message's deadline;
+    # unset = 64 KiB a second. Lower it for a slower link. At least 8 KiB a second: it cannot be off.
 ) -> ConnectionSpec:
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
     with ``content_type="dicom"`` on ``inbound(...)`` so a received object is base64-carried (ADR 0028)
@@ -4920,6 +4922,8 @@ def DICOM(
     }
     if max_object_bytes is not _ROLE_DEFAULT:
         settings["max_object_bytes"] = max_object_bytes
+    if min_message_bytes_per_second is not _ROLE_DEFAULT:
+        settings["min_message_bytes_per_second"] = min_message_bytes_per_second
     return ConnectionSpec(ConnectorType.DIMSE, settings)
 
 

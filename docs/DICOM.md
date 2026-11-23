@@ -106,7 +106,8 @@ a PDU is ended there. This is a deadline per read, not per object, so at the def
 sender sending PDUs of the shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second
 within each PDU. Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. The
 deadline for each message, below, sets a far higher one for a whole object: it has
-`timeout_seconds` plus its size at 64 KiB a second, so a large object has to arrive at nearly that.
+`timeout_seconds` plus its size at `min_message_bytes_per_second`, 64 KiB a second unless that is
+set, so a large object has to arrive at nearly that rate.
 A peer that keeps finishing PDUs is not ended by the per-read deadline, and pynetdicom's idle timer
 restarts on each PDU; the deadline for each message is what ends one that never finishes its
 message. Each send has a `timeout_seconds` deadline for the whole send too, so a peer that stops
@@ -141,27 +142,45 @@ it. So is any command but a C-STORE or C-ECHO request, the two the SCP serves, s
 serves some others on a thread of their own, outside the hold below.
 
 **Each DIMSE message has a deadline too** (BACKLOG #5080). From the PDU that brings a message's first
-fragment, the SCP allows `timeout_seconds` plus the message's data set bytes so far at 64 KiB a
-second. A message still incomplete past that ends the association with an A-ABORT. The check runs
+fragment, the SCP allows `timeout_seconds` plus the message's data set bytes so far at
+`min_message_bytes_per_second`, which is 64 KiB a second unless it is set. A message still incomplete past that ends the association with an A-ABORT. The check runs
 as each P-DATA-TF lands, so the end can come as late as the next PDU's header and body reads, each
 of which has `timeout_seconds`. A peer that sends nothing more is ended by pynetdicom's idle timer,
 after `timeout_seconds`, and one that stops part way through a PDU by the read deadline. A
 message whose last fragment arrives is served however long it took, and the next message's clock
-starts at its own first fragment. The 64 KiB a second is a constant, not a setting. The bound is
-per message, not per association. At least these limits apply:
+starts at its own first fragment. The bound is per message, not per association. At least these
+limits apply:
 
 - The SCP counts at most twice the effective `max_object_bytes` of one object, and the effective
   cap is at most 16 MiB, so one message lasts at most
-  `timeout_seconds + 2 * min(max_object_bytes, 16 MiB) / (64 KiB a second)` from the end of its
-  first PDU's reads to the start of the next PDU's: 30 + 512 seconds, about 9 minutes, at the
-  defaults. Those two PDUs' header and body reads, each up to `timeout_seconds`, come on top.
-- A link slower than 64 KiB a second has its larger objects cut. At a link rate of `r` bytes a
-  second, an object is cut once its data set is over `timeout_seconds * r * 64 KiB / (64 KiB - r)`.
-  At the default 30 seconds that is objects over about 2 MiB at 32 KiB a second, and over about
-  640 KiB at 16 KiB a second. The cut falls at the same point on every attempt, so such an object
-  is never delivered over that link. This engine's own C-STORE client reads the failed association
-  as transient and retries the object at the head of its lane, so the lane stops there until the
-  object is moved aside. Raising `timeout_seconds` on the SCP raises the size that is cut.
+  `timeout_seconds + 2 * min(max_object_bytes, 16 MiB) / min_message_bytes_per_second` from the
+  end of its first PDU's reads to the start of the next PDU's: 30 + 512 seconds, about 9 minutes, at
+  the defaults. Those two PDUs' header and body reads, each up to `timeout_seconds`, come on top.
+- A link slower than that rate has its larger objects cut. At a link rate of `r` bytes a second and
+  a setting of `f`, an object is cut once its data set is over `timeout_seconds * r * f / (f - r)`.
+  At the defaults that is roughly 1.9 MiB at 32 KiB a second and 640 KiB at 16 KiB a second. Those
+  two figures are computed from the formula. What was measured is the cut and the remedy below, on
+  a throttled loopback link at 32 KiB a second and a `timeout_seconds` of 2, for a 200 KiB object
+  (`tests/test_dicom_scp_message_deadline.py`). So at 32 KiB a second the band is objects of roughly
+  2 to 32 MiB: a smaller one arrives in time, and one past 32 MiB, twice the effective cap, is
+  aborted over any link. The cut falls at the same point on every attempt, so an object in the band
+  is never delivered over that link as configured. This engine's own C-STORE client reads the
+  failed association as transient and retries the object at the head of its lane, so the lane stops
+  there until the object dead-letters at the retry cap, or for as long as it is sent with
+  `max_attempts=None`.
+- **The remedy for that band is `min_message_bytes_per_second` on the SCP** (BACKLOG #6637). Set it
+  at or under the link's real rate and the object arrives inside its deadline on its first attempt.
+  It moves only this rate. Raising `timeout_seconds` instead would also loosen every read and send
+  deadline above. It takes a whole number of at least 8192, which is 8 KiB a second. A smaller
+  value, zero and `None` are refused when the connection is built, so the deadline cannot be turned
+  off. At that least rate one message can hold a `max_associations` slot for `timeout_seconds` plus
+  about 68 minutes, so set it no lower than the link needs.
+- **A sender's own timer can cut the object first.** This engine's C-STORE client applies its
+  `timeout_seconds` from the start of a store to the response, with nothing coming back in between,
+  so at the default 30 seconds it ends a store that takes longer than that on the link, about
+  960 KiB at 32 KiB a second, whatever the SCP allows (measured at a 3 second client timeout on the
+  same throttled link). Over a slow link, raise the client's `timeout_seconds` past the object's
+  time on the link as well as setting the SCP's rate.
 - A peer that sends small complete messages one after another, such as a C-ECHO every few seconds,
   still holds a `max_associations` slot for as long as it keeps sending. Each of its messages
   completes, so no deadline ends it, and this bound does not close that case.
