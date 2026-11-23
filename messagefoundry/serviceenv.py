@@ -111,12 +111,6 @@ SCM_ENVIRONMENT_VALUE = "Environment"
 #: What the Windows probe puts before each NSSM value's name in the label of an entry it reads.
 _NSSM_LABEL_PREFIX = "Parameters\\"
 
-#: Where an entry read from NSSM's ``AppEnvironmentExtra`` sits, the list the refusal's add-back
-#: step says to read with ``nssm get`` and pass back whole. Its removal clauses read this list
-#: only, so they never name an entry the rest of that step does not cover (the Lander's hold
-#: on PR 3142, comment 7090314503).
-_EXTRA_LIST = f"{_NSSM_LABEL_PREFIX}{NSSM_EXTRA_VALUE}"
-
 _NSSM_IMAGE = "nssm.exe"
 
 
@@ -179,13 +173,17 @@ class ServiceEnvPosture:
     #: plainly a path (:func:`_directory_entry_value`). The remedy alone reads this, never the
     #: refusal itself.
     nothing_to_move_names: tuple[str, ...] = field(default=(), repr=False)
-    #: Whether such an entry, run on into, sets the directory to a path, every refused value that
-    #: runs on takes only blank or plain-path directory entries (``directory_only``), and no later
-    #: line of a refused value sets the directory to anything else. Any of those may be key
-    #: material, so where this is False the remedy prints no keep-one step and no clause sparing
-    #: directory lines from its removal steps; where it is True, it prints both and no add-back
-    #: step. The remedy alone reads this, never the refusal itself.
-    directory_path_joined: bool = False
+    #: Whether any registry string in the lists is a directory entry in doubt
+    #: (:func:`_directory_entry_in_doubt`): one of its lines, or its whole-string name, may name
+    #: ``MEFOR_SECRETS_DIRECTORY``, and the string alone is not plainly a path. Where this is
+    #: True the remedy prints no keep-one step and no clause sparing directory lines from its
+    #: removal steps, and it prints the add-back step, which says to take every other line that
+    #: may name the directory out of every list and to add one entry naming the path. Where it
+    #: is False, every directory entry is plainly a path on its own, so the keep-one step prints
+    #: where a refused value runs on into one (``directory_run_on``), and no step removes one
+    #: otherwise. The remedy alone reads this, never the refusal itself (the Lander's ruling B on
+    #: PR 3142's repair handback, comment 7106776128).
+    directory_in_doubt: bool = False
     #: Whether a refused value runs on into a string whose first non-blank line sets
     #: ``MEFOR_SECRETS_DIRECTORY``, so the run-on step removes it. The remedy alone reads this.
     directory_run_on: bool = False
@@ -200,18 +198,6 @@ class ServiceEnvPosture:
     #: remedy alone reads this, and then never says the lists set no secrets directory (the
     #: Lander's holds on PR 3142, comments 7088663896 and 7089064404, B).
     directory_in_lists: bool = False
-    #: Whether a string in AppEnvironmentExtra (:data:`_EXTRA_LIST`) sets
-    #: ``MEFOR_SECRETS_DIRECTORY`` and nothing else (:func:`_sets_only_directory`). The remedy
-    #: alone reads this: where its add-back step prints, it then says to remove every other
-    #: such string and not to pass one back (the Lander's holds on PR 3142, comments
-    #: 7089064404, 7089400537 and 7090314503).
-    directory_only_in_extra: bool = False
-    #: Whether a string in AppEnvironmentExtra sets ``MEFOR_SECRETS_DIRECTORY`` on one line and
-    #: something else on another (:func:`_sets_directory_beside_more`). The remedy alone reads
-    #: this: where its add-back step prints, it then says to take each directory line out of
-    #: such a string and keep each other line no step above removes, never to remove the string
-    #: whole (the Lander's hold on PR 3142, comment 7090314503).
-    directory_mixed_in_extra: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -671,8 +657,6 @@ class _Variable:
     #: Whether it runs on, and every non-blank string it takes is a directory entry that is blank
     #: or plainly a path (:func:`_directory_entry_value`). Read by the remedy only.
     directory_only: bool = False
-    #: Whether it runs on into such an entry that sets the directory to a path. Remedy only.
-    keeps_directory: bool = False
     #: Whether it runs on, and a string after its own in the joined group sets
     #: ``MEFOR_SECRETS_DIRECTORY`` on its first non-blank line (:func:`_sets_directory`).
     #: Remedy only.
@@ -931,25 +915,18 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         joined, _ends = _read_string(where, "\r\n".join(strings), own_lines=starts[1] - 1)
         # For the remedy only, from the last string back: whether the non-blank strings from
         # each index on are all directory entries that are blank or plainly a path
-        # (:func:`_directory_entry_value`), whether there is one, and
-        # whether one sets the directory to a path. Nothing here feeds ``_names``, so it changes
-        # no refusal (the Lander's fifth hold on PR 3142, H2).
+        # (:func:`_directory_entry_value`), whether there is one, and whether one sets the
+        # directory. Nothing here feeds ``_names``, so it changes no refusal (the Lander's fifth
+        # hold on PR 3142, H2).
         only_after = [True] * (len(strings) + 1)
         any_after = [False] * (len(strings) + 1)
-        path_after = [False] * (len(strings) + 1)
         set_after = [False] * (len(strings) + 1)
         for i in range(len(strings) - 1, -1, -1):
-            only_after[i], any_after[i], path_after[i] = (
-                only_after[i + 1],
-                any_after[i + 1],
-                path_after[i + 1],
-            )
+            only_after[i], any_after[i] = only_after[i + 1], any_after[i + 1]
             set_after[i] = set_after[i + 1] or _sets_directory(strings[i])
             if not _still_blank(strings[i]):
-                path = _directory_entry_value(strings[i])
-                only_after[i] = only_after[i] and path is not None
+                only_after[i] = only_after[i] and _directory_entry_value(strings[i]) is not None
                 any_after[i] = True
-                path_after[i] = path_after[i] or (path is not None and not _still_blank(path))
         for variable in joined:
             index = bisect.bisect_right(starts, variable.line or 1) - 1
             local = (variable.line or 1) - starts[index] + 1
@@ -977,7 +954,6 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     broken=variable.broken and not joined_break,
                     runs_on=ran_on,
                     directory_only=ran_on and any_after[index + 1] and only_after[index + 1],
-                    keeps_directory=ran_on and path_after[index + 1],
                     takes_directory=ran_on and set_after[index + 1],
                     holds_directory=holds,
                 )
@@ -994,24 +970,6 @@ def _sets_directory(entry: str) -> bool:
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
     written, equals, _rest = first.partition("=")
     return bool(equals) and written.isascii() and written.strip().upper() == _DIRECTORY_VARIABLE
-
-
-def _sets_only_directory(entry: str) -> bool:
-    """Whether ``entry`` has a non-blank line and every non-blank line of it sets
-    ``MEFOR_SECRETS_DIRECTORY``, each read as :func:`_sets_directory` reads one, so removing the
-    whole string removes nothing but the directory, however NSSM reads its lines."""
-    lines = [line for line in _LINE_BREAK.split(entry) if line.strip()]
-    return bool(lines) and all(_sets_directory(line) for line in lines)
-
-
-def _sets_directory_beside_more(entry: str) -> bool:
-    """Whether a non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, each read as
-    :func:`_sets_directory` reads one, and another non-blank line does not, so removing the
-    whole string would remove more than the directory (the Lander's hold on PR 3142, comment
-    7090314503)."""
-    lines = [line for line in _LINE_BREAK.split(entry) if line.strip()]
-    sets = [_sets_directory(line) for line in lines]
-    return any(sets) and not all(sets)
 
 
 def _directory_entry_value(entry: str) -> str | None:
@@ -1033,6 +991,32 @@ def _directory_entry_value(entry: str) -> str | None:
     if not _PLAIN_PATH.fullmatch(path) or _EITHER_KEY_RUN.search(path):
         return None
     return value
+
+
+def _may_name_directory(text: str) -> bool:
+    """Whether the text before the first equals sign of ``text``, or all of it where it has none,
+    is ``MEFOR_SECRETS_DIRECTORY`` once blanks around it are stripped and it is upper-cased. That
+    is broader than :func:`_sets_directory` on purpose: it takes a padded name, a name written
+    alone, and a non-ASCII letter ``str.upper`` maps onto an ASCII one, such as U+017F or U+0131,
+    since Python's ``os.environ`` on Windows upper-cases each name it reads (the Lander's hold on
+    PR 3142, comment 7104660861)."""
+    return text.partition("=")[0].strip().upper() == _DIRECTORY_VARIABLE
+
+
+def _directory_entry_in_doubt(entry: str) -> bool:
+    """Whether the registry string ``entry`` is a directory entry the remedy may not keep: a line
+    of it, or its whole-string name, may name the directory (:func:`_may_name_directory`), and
+    the string alone is not plainly a path, that is, :func:`_directory_entry_value` reads no
+    value from it or a blank one. So a directory line beside other lines of its string, one in a
+    broken whole-string name, one whose value is key text, blank or ``=``, and one whose name is
+    padded or not ASCII are each in doubt. A string with one such line plainly a path is not,
+    whether or not a refused value runs on into it. The remedy alone reads it, through
+    ``ServiceEnvPosture.directory_in_doubt`` (the Lander's ruling B on PR 3142's repair
+    handback, comment 7106776128)."""
+    if not any(_may_name_directory(text) for text in (entry, *_LINE_BREAK.split(entry))):
+        return False
+    value = _directory_entry_value(entry)
+    return value is None or _still_blank(value)
 
 
 def _kept_empty(variable: _Variable) -> bool:
@@ -1155,16 +1139,9 @@ def read_service_env_posture(
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
         nothing_to_move_names=_every_kept(variables, found, _nothing_to_move),
-        # Fail closed, as the field's doc says (sixth hold, H1; the Lander's hold on PR 3142,
-        # comment 7104660861, item 1).
-        directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
-        and all(v.directory_only for v in variables if v.runs_on and _names([v]))
-        and not any(
-            _sets_directory(line) and _directory_entry_value(line) is None
-            for v in variables
-            if _names([v])
-            for line in _LINE_BREAK.split(v.value)[1:]
-        ),
+        # Every registry string as written, never the variables read from them, so a line
+        # absorbed into a broken name or an uncounted twin is still judged.
+        directory_in_doubt=any(_directory_entry_in_doubt(entry) for _where, entry in entries),
         directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
@@ -1172,14 +1149,6 @@ def read_service_env_posture(
         # Every line, since NSSM may read a later line of a string as its own variable.
         directory_in_lists=any(
             _sets_directory(line) for _where, entry in entries for line in _LINE_BREAK.split(entry)
-        ),
-        # AppEnvironmentExtra only: the add-back step's clauses act inside that list, which it
-        # says to read first and pass back whole.
-        directory_only_in_extra=any(
-            _sets_only_directory(entry) for where, entry in entries if where == _EXTRA_LIST
-        ),
-        directory_mixed_in_extra=any(
-            _sets_directory_beside_more(entry) for where, entry in entries if where == _EXTRA_LIST
         ),
     )
 
@@ -1398,17 +1367,24 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             cite += ' and "[environments]"'
         if parts:
             steps.append(". ".join([*parts, cite]))
-    add_back_due = (
-        bool(others or values or posture.directory_run_on)
-        and _DIRECTORY_VARIABLE not in posture.listed
-        and not posture.directory_path_joined
+    # The per-entry rule, as ``directory_in_doubt``'s doc states it (the Lander's ruling B on PR
+    # 3142's repair handback, comment 7106776128). Where no directory entry is in doubt and a
+    # refused value runs on into one, one entry is kept, written as the path, and every other
+    # directory line goes, as origin/main's joined-directory step said; the removal steps then
+    # spare each directory line, so no step removes an entry a later one keeps (code review on
+    # PR 3142). directory_run_on needs a refused value that runs on, so the run-on step prints
+    # too. Where any entry is in doubt, nothing is spared or kept, and the add-back step says to
+    # take every directory line out and name the path again, so no step changes the directory
+    # the engine reads without naming it.
+    doubt = posture.directory_in_doubt
+    keep_one = posture.directory_run_on and not doubt
+    add_back_due = not keep_one and (
+        doubt
+        or (
+            bool(others or values or posture.directory_run_on)
+            and _DIRECTORY_VARIABLE not in posture.listed
+        )
     )
-    # One directory entry is kept, the one the engine reads, and every other removed, as
-    # origin/main's joined-directory step said; the removal steps then spare each directory
-    # line, so no step removes an entry a later one keeps (code review on PR 3142). When, as at
-    # b1d44693cae, is ``directory_path_joined``'s to say (the Lander's hold on PR 3142, comment
-    # 7104660861, item 1). It needs a refused value that runs on, so the run-on step prints too.
-    keep_one = posture.directory_path_joined
     spare = f", but for each line that sets {_DIRECTORY_VARIABLE}, which a step below covers"
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
     # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).
@@ -1428,9 +1404,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     if add_back_due:
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
-        # the value it is joined to unless it is plainly a path, which the keep-one step below
-        # keeps instead, so only that makes "add it back" false (the Lander's ruling on handback
-        # 7085947392, F1). A refused
+        # the value it is joined to unless no directory entry is in doubt, when the keep-one
+        # step below keeps one instead, so only that makes "add it back" false (the Lander's
+        # ruling on handback 7085947392, F1). A refused
         # name outside the key class may need the directory, and the run-on step may remove
         # a directory string even for a store key alone (the Lander's ruling on comment
         # 7087145957, F1 on H3's terms).
@@ -1438,41 +1414,41 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
         # The step says the lists set no directory only where no line of any string in them
-        # sets one (directory_in_lists). Its clauses read AppEnvironmentExtra only, the list it
-        # says to pass back. Where a string there sets the directory and nothing else, it says
-        # to remove every other such string, in origin/main's words narrowed to "and nothing
-        # else". Where a string there holds a directory line and other lines, it says to take
-        # each directory line out of every such string, keeping each other line no step above
-        # removes, and to leave the lines it takes out of what it passes back; it removes no
-        # such string whole. Where a value runs on, or a string there sets only the directory,
-        # the entries it says to pass back also leave out the strings this step and the steps
-        # above say to remove, which may hold the refused value or set the directory (the
-        # Lander's holds on PR 3142, comments 7088102723, 7088663896, 7089064404, 7089400537
-        # and 7090314503).
-        none_set = (others or values) and not posture.directory_in_lists
+        # sets one (directory_in_lists) and no directory entry is in doubt. Where one is in
+        # doubt, it says to take every other line that may name the directory
+        # (:func:`_may_name_directory`) out of every list, removing a string that holds nothing
+        # else and keeping each other line no step above removes, so no entry in doubt is left
+        # to override the one added or to keep key text, and to leave the strings and lines it
+        # and the steps above take out of what it passes back. That clause replaces the two
+        # AppEnvironmentExtra clauses of the Lander's holds on PR 3142, comments 7089064404,
+        # 7089400537 and 7090314503: a string that sets the directory and nothing else, or
+        # beside other lines, is now either plainly a path, and so kept or listed, or in doubt
+        # (the Lander's ruling B on PR 3142's repair handback, comment 7106776128). Where a value
+        # runs on, the entries it says to pass back also leave out the strings the steps above
+        # say to remove, which may hold the refused value or set the directory (the Lander's
+        # holds on PR 3142, comments 7088102723 and 7088663896).
+        none_set = (others or values) and not posture.directory_in_lists and not doubt
         add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if none_set else "") + (
             f"Where install-service.ps1 already made the secrets directory, add "
             f"{_DIRECTORY_VARIABLE} naming that existing path back to the service's "
             "AppEnvironmentExtra, beside its other entries, "
         )
-        if posture.directory_only_in_extra:
+        if doubt:
             add_back += (
-                f"and remove any other entry that sets {_DIRECTORY_VARIABLE} and nothing else, "
-            )
-        if posture.directory_mixed_in_extra:
-            add_back += (
-                f"and take each line that sets {_DIRECTORY_VARIABLE} out of any other entry that "
-                "holds other lines too, keeping each other line no step above says to remove, "
+                f"and take each other line that may set {_DIRECTORY_VARIABLE} out of every "
+                "list, whatever its letter case, a blank around its name, or a letter outside "
+                "ASCII that upper-cases to one of its letters, removing an entry that holds "
+                "nothing else and keeping each other line no step above says to remove, "
             )
         add_back += (
             "before any re-run of the installer, which refuses an existing directory the "
-            "service does not name. `nssm set` replaces that whole list, so read it first with "
-            "`nssm get`, running the service's own nssm.exe by its full path, and pass back "
-            "every entry but those refused above"
+            f"service does not name. `nssm set` replaces {'a' if doubt else 'that'} whole list, "
+            "so read it first with `nssm get`, running the service's own nssm.exe by its full "
+            "path, and pass back every entry but those refused above"
         )
-        if posture.value_runs_on or posture.directory_joined or posture.directory_only_in_extra:
+        if doubt or posture.value_runs_on or posture.directory_joined:
             add_back += " and the strings this step and any step above say to remove"
-        if posture.directory_mixed_in_extra:
+        if doubt:
             add_back += ", leaving out the lines this step says to take out"
         add_back += ': see docs/SERVICE.md, "Start / stop / status"'
         # Only where a setting moves, as the create step reads: a store key alone goes to a

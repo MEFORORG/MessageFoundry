@@ -55,7 +55,7 @@ from tests._serviceenv_remedy import (
     ADD_BACK,
     ADD_BACK_ANY,
     ADD_BACK_CREATE,
-    ADD_BACK_JOINED,
+    ADD_BACK_DOUBT,
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
     CREATE,
@@ -641,17 +641,19 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
             None,
             id="directory-listed",
         ),
-        # A joined directory string that no step keeps goes with the run-on (the Lander's
-        # ruling on handback 7085947392, F1), in either spelling, and so does a path the
-        # fail-closed rule does not keep.
+        # A joined directory string in doubt goes with the run-on (the Lander's ruling on
+        # handback 7085947392, F1), in either spelling, and the step says to take every other
+        # directory line out (the Lander's ruling B on PR 3142's repair handback, comment
+        # 7106776128). A joined plain path beside a run-on into other text is in no doubt, so
+        # the keep-one step names it instead.
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1"],
-            "joined",
+            "doubt",
             id="directory-joined",
         ),
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory ==", "MEFOR_VALUE_B=1"],
-            "joined",
+            "doubt",
             id="directory-joined-spaced",
         ),
         pytest.param(
@@ -661,8 +663,8 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
                 "MEFOR_VALUE_A=",
                 "synthetic-run-on",
             ],
-            "joined",
-            id="directory-path-not-kept",
+            None,
+            id="directory-path-kept-beside-a-run-on",
         ),
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory=C:\\d", "MEFOR_VALUE_B=1"],
@@ -678,10 +680,11 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
     """The add-back step, printed once after the Put step and the removal where no listed variable
     is MEFOR_SECRETS_DIRECTORY and the remedy keeps no joined path entry: as origin/main prints it
     where main prints it (the Lander's hold on PR 3142, comment 7085002242), and where a joined
-    string sets the directory with no opener and main's wider pass-back exclusion (comment
-    7088102723). Where a value runs on, the step keeps the opener but leaves out the strings
-    the steps above say to remove (comment 7088663896). A store key alone with no run-on goes
-    to a key file and gets none."""
+    directory string is in doubt with no opener, the clause taking every other directory line
+    out, and main's wider pass-back exclusion (comment 7088102723; the Lander's ruling B on the
+    repair handback, comment 7106776128). Where a value runs on, the step keeps the opener but
+    leaves out the strings the steps above say to remove (comment 7088663896). A store key alone
+    with no run-on goes to a key file and gets none."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     if form is None:
@@ -691,7 +694,7 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
         step = {
             "main": ADD_BACK,
             "run-on": ADD_BACK_RUN_ON + ADD_BACK_CREATE,
-            "joined": ADD_BACK_JOINED + ADD_BACK_CREATE,
+            "doubt": ADD_BACK_DOUBT + ADD_BACK_CREATE,
         }[form]
         assert refusal.count(step) == 1
         assert (SET_NO in refusal) is (form in ("main", "run-on"))
