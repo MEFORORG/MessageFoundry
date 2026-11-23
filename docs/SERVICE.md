@@ -279,9 +279,14 @@ the service's account rather than yours (vault BACKLOG #3411).
 The host key provider keeps two files, `handoff.key`, which `provision-admin --service-account`
 writes, and `master.key`, which the service's first start writes from it and then reads at every
 start. The service must be able to add a file where they live, and a service that may add a file
-to the secrets directory may supply a secret-class setting (ADR 0214's 2026-11-22 amendment); the
-install script's own grant there is read, though it keeps a wider grant the service account
-already holds. So when the install script reads
+to the secrets directory may supply a secret-class setting (ADR 0214's 2026-11-22 amendment). The
+install script's own grant to the service there is read, and the engine refuses no grant to one
+account, so the service is not thereby left at read only there: a rerun keeps an explicit grant to
+the service account itself, such as the write the Vault Agent sink route
+([CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)) gives it.
+Only an explicit grant survives: the script turns inheritance off (`/inheritance:r`), which drops
+every inherited entry, and removes every other account's entry, a group's included. So when the
+install script reads
 `[store].key_provider = 'host'` it also makes a **custody directory** of its own for those two
 files, `-CustodyDir`, else the one the service already names, else `<DataDir>-custody`, and names
 it to the service as `MEFOR_CUSTODY_DIRECTORY`. It is judged before anything acts by the secrets
@@ -354,9 +359,11 @@ tell whose key a file holds, and either file may be the only copy of a store's k
 4. **If the file is another store's, or you cannot tell**, this store needs places that hold
    neither file. Let the install script make each one new and restricted, rather than making or
    filling a folder by hand. Re-run it with the option for where the file is:
-   - beside the store's database: `-DataDir` naming a new folder that does not exist yet, and no
-     `-DbPath`, so the store is `<DataDir>\messagefoundry.db` in a directory the script creates and
-     restricts. A `-DbPath` outside `-DataDir` names a folder the script grants nothing on.
+   - beside the store's database: `-DataDir` naming a new folder that does not exist yet, so the
+     store is `<DataDir>\messagefoundry.db` in a directory the script creates and restricts. Pass
+     no `-DbPath`, or a `-DbPath` naming that same path, as the engine's refusal asks; keep both on
+     every later reinstall. A `-DbPath` outside `-DataDir` names a folder the script grants nothing
+     on.
    - in the directory `MEFOR_SECRETS_DIRECTORY` names: `-SecretsDir` naming a new folder that does
      not exist yet. Then add this service's secret files to it as
      [the secrets directory](#protect-the-store-encryption-key-at-rest-wp-11d) says.
@@ -407,23 +414,26 @@ tell whose key a file holds, and either file may be the only copy of a store's k
      into `master.key` and deletes the copy it read. It is machine-scope DPAPI: on this host, any
      process that can read the file can unwrap the store key from it, though it does not unwrap
      on another host.
-   - **An `api-generated-key.pem` original:** delete it with its `api-generated-cert.pem`. It is
-     the private key of a certificate the service still presents.
+   - **The `api-generated-cert.pem` and `api-generated-key.pem` originals:** delete both once the
+     service presents the copied pair. The key original is a second copy of the private key the
+     service presents, readable by whoever its own access list names.
    - **The database originals** may hold PHI; dispose of them as [PHI.md](PHI.md) describes.
 6. **Start the service**, and read its log for a refusal ([Verify it's running](#verify-its-running)).
 
 **Without the install scripts**, as on Linux or in a container, the same steps hold with the
-engine stopped in place of the service: leave every key file and delete nothing; for a file that
+engine stopped in place of the service: leave every key file, and delete none except as the end
+of this paragraph says; for a file that
 is this store's, make the settings change and put the file where the host provider reads it; for
 one that is not, run the store from a new, empty data directory for a file beside it, or set the
 variable that names the file's directory, `MEFOR_SECRETS_DIRECTORY` or `MEFOR_CUSTODY_DIRECTORY`,
 to a new directory owned by the account the engine runs as, mode 0700, in a folder only that
 account or root may write, and add the engine's other secret files to a new secrets directory. A move
 within one file system keeps the file's owner and mode; across file systems, copy it keeping them
-(`cp -p`, as root). Once the engine has opened its store from the copy, move the original, within
-its file system, into a folder only root can read, and keep it there; never delete it. On
-Windows, set a kept original's owner and list as step 5 says rather than only moving it, and
-delete a `handoff.key` original once the service has started from the copy, as step 5 says.
+(`cp -p`, as root). Once the engine has opened its store from the copy, move a `master.key`
+original, within its file system, into a folder only root can read, and keep it there. On
+Windows, set a kept `master.key` original's owner and list as step 5 says rather than only moving
+it, and delete a `handoff.key` original once the service has started from the copy, as step 5
+says; keep every other key file original.
 
 ## Update to a new build (restart vs reinstall)
 

@@ -3158,10 +3158,10 @@ if ($HostCustody) {
 # --- the custody directory (vault BACKLOG #3411, ADR 0214's 2026-11-22 amendment) --------------------
 # Under the host provider the service's first start writes its own key file, master.key, beside the
 # handoff provision-admin leaves, so it must add a file where those two live. A service that may add
-# a file to the secrets directory may supply a secret-class setting (ADR 0214's amendment), and
-# Set-SecretsDirAcl adds the service's read grant there and keeps a wider grant the service account
-# itself already holds, nor does the engine refuse one, so the key files do not rest on the service
-# lacking that right. They get a directory of their own, named to the service as
+# a file to the secrets directory may supply a secret-class setting (ADR 0214's amendment), and the
+# service is not left at read only there (docs/SERVICE.md 'The custody directory under the host key
+# provider' says which grants survive), so the key files do not rest on the service lacking that
+# right. They get a directory of their own, named to the service as
 # MEFOR_CUSTODY_DIRECTORY, which the engine reads in place of MEFOR_SECRETS_DIRECTORY for them.
 # Judged here, before anything acts, by the secrets directory's rules; made, restricted
 # (Set-CustodyDirAcl) and named once the account resolves, after the service is registered.

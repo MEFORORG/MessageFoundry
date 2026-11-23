@@ -203,9 +203,9 @@ def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
     is not read as that path, so it is not caught. The
     service may add files to its custody directory, and a service that may add a file to the
     secrets directory may supply a secret-class setting (ADR 0214's 2026-11-22 amendment), so the
-    two must stay apart. The installer adds the service's read grant on the secrets directory and
-    keeps a wider grant the service account itself already holds there, and the engine refuses
-    none, so neither leaves the service at read only there."""
+    two must stay apart. Neither the installer nor the engine leaves the service at read only on
+    the secrets directory: docs/SERVICE.md, 'The custody directory under the host key provider',
+    says which grants survive."""
     raw = environ.get(CUSTODY_DIRECTORY_VARIABLE, "").strip()
     secrets = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
     if (
@@ -220,9 +220,12 @@ def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
         return (
             "the custody directory MEFOR_CUSTODY_DIRECTORY names is, holds or sits inside the "
             "secrets directory MEFOR_SECRETS_DIRECTORY names. The service may add files to its "
-            "custody directory, and must not be able to add one to the secrets directory, so do "
-            "not give it that right there: set MEFOR_CUSTODY_DIRECTORY, here and in the service's "
-            "environment, to a directory of its own outside it"
+            "custody directory, and a service that may add a file to the secrets directory may "
+            "supply a secret-class setting, so the two are kept apart. A right to add a file there "
+            "that a documented route gives the service, at least the Vault Agent sink route "
+            "docs/CONFIGURATION.md describes, may stay, but the key files go elsewhere: set "
+            "MEFOR_CUSTODY_DIRECTORY, here and in the service's environment, to a directory of its "
+            "own outside it"
         )
     if not raw or not os.path.lexists(raw):
         # Nothing there: a read finds no file, and a mint refuses the missing directory itself.
@@ -1191,7 +1194,9 @@ def _refuse_an_unusable_directory(
             )
         # A directory behind a parent this account cannot search reads as absent here too. None
         # is offered for making by hand: the install script makes and restricts each one
-        # (docs/SERVICE.md's procedure, step 4), and it refuses a custody directory it did not make.
+        # (docs/SERVICE.md's procedure, step 4). Its Get-CustodyDirProblem refuses an existing
+        # custody directory the service does not name, and one it names whose owner is neither
+        # Administrators nor SYSTEM; one made by hand in an elevated shell can pass that.
         raise HostCustodyRefused(
             f"the custody directory {directory} is missing, or a directory above it is one this "
             f"account cannot search, {none_shown}. To go on, {move_on()}, "
