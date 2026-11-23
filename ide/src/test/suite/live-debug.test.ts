@@ -326,13 +326,15 @@ suite("liveDebug invocationsForFile", () => {
             inv({ file: "D:\\b622-ws\\Config\\A.py" }),
             inv({ file: "D:/B622-WS/config/a.py" }),
             inv({ file: "D:\\b622-ws\\config\\B.py" }),
+            // Both limbs at once: relative to the base, and differing in case from the editor path.
+            inv({ file: "Config\\a.PY" }),
           ],
         }),
       ];
       const only = forFile(entries, "d:\\b622-ws\\config\\A.py", "d:\\b622-ws");
       assert.deepStrictEqual(
         only.map((i) => i.file),
-        ["D:\\b622-ws\\Config\\A.py", "D:/B622-WS/config/a.py"],
+        ["D:\\b622-ws\\Config\\A.py", "D:/B622-WS/config/a.py", "Config\\a.PY"],
       );
     },
   );

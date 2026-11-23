@@ -66,8 +66,13 @@ const vscodeStub = {
 const cliStub = {
   configDir: (): string => stubConfigDir,
   workspaceDir: (): string | undefined => stubWorkspace,
-  runJson: (): Promise<Wire[]> => Promise.resolve(stubDiags),
+  runJson: (args: string[], cwd?: string): Promise<Wire[]> => {
+    calls.push({ args, cwd });
+    return Promise.resolve(stubDiags);
+  },
 };
+/** Every runJson(args, cwd) the validator made, in order. */
+let calls: { args: string[]; cwd?: string }[] = [];
 
 interface Loader {
   _load(request: string, parent: unknown, isMain: boolean): unknown;
@@ -136,6 +141,7 @@ validatorSuite("b622 #5847 createValidator places each diagnostic", () => {
     stubConfigDir = configDir;
     stubDiags = diags;
     sets = [];
+    calls = [];
     const context = { subscriptions: [] as unknown[] };
     await createValidator(context as never).run();
     return sets;
@@ -147,11 +153,18 @@ validatorSuite("b622 #5847 createValidator places each diagnostic", () => {
 
   teardown(() => {
     stubWorkspace = undefined;
+    stubConfigDir = "config";
+    stubDiags = [];
+    sets = [];
+    calls = [];
   });
 
   test("the stubs are wired: an absolute file with no line lands as given, on line 0", async () => {
     const abs = path.join(ws, "config", "a.py");
     const out = await validate([{ message: "boom", file: abs, severity: "error" }]);
+    // The CLI runs in the workspace with the configDir the fallback uses, which is what lets a relative
+    // path it prints be resolved against the workspace.
+    assert.deepStrictEqual(calls, [{ args: ["validate", "--config", "config"], cwd: ws }]);
     assert.deepStrictEqual(
       out.map((s) => [s.fsPath, s.list.map((d) => [d.range.startLine, d.message, d.source])]),
       [[abs, [[0, "boom", "messagefoundry"]]]],
