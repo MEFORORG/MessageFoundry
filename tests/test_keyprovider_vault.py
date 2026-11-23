@@ -346,7 +346,8 @@ def test_the_name_refusal_says_ascii_and_scopes_its_redirect_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #6010 item 5: the shape is ASCII, as Go's ``\\w`` is, so the text says so; and only
-    a slash can move the request path, so the text does not say every refused name could."""
+    a slash or a name of dots alone, such as ``..``, can move the request path, so the text does
+    not say every refused name could."""
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "kék")
     with pytest.raises(KeyProviderError) as excinfo:
         keyprovider_vault.kek_required_capabilities()
@@ -371,6 +372,31 @@ def test_the_key_type_check_refuses_a_malformed_name_before_reading_it(name: str
     assert transit.read_calls == []
 
 
+def _no_client_built(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A test whose refusal must come before any client fails here, not by dialling Vault."""
+
+    def _refuse(addr: str, token: str, **_: Any) -> _FakeClient:
+        raise AssertionError("a Vault client was built")
+
+    monkeypatch.setattr(keyprovider_vault, "_build_client", _refuse)
+
+
+def test_an_unset_kek_setting_keeps_its_text_at_the_key_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal of an unset KEK name or wrapped DEK is built from the variables' names alone,
+    so it is recorded too, and the key seam keeps it (BACKLOG #6010 item 3)."""
+    from messagefoundry.store.base import resolve_active_key
+
+    _no_client_built(monkeypatch)
+    monkeypatch.delenv("MEFOR_STORE_VAULT_TRANSIT_KEY", raising=False)
+    monkeypatch.delenv("MEFOR_STORE_VAULT_WRAPPED_DEK", raising=False)
+    with pytest.raises(KeyProviderError) as excinfo:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    text = str(excinfo.value)
+    assert "MEFOR_STORE_VAULT_TRANSIT_KEY, MEFOR_STORE_VAULT_WRAPPED_DEK is not set" in text
+
+
 def test_a_malformed_kek_name_keeps_its_text_at_the_key_seam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -380,6 +406,7 @@ def test_a_malformed_kek_name_keeps_its_text_at_the_key_seam(
     from messagefoundry.store.base import resolve_active_key
 
     _configure_env(monkeypatch)
+    _no_client_built(monkeypatch)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "a/../../../sys/x")
     with pytest.raises(KeyProviderError) as excinfo:
         resolve_active_key(StoreSettings(key_provider="vault"))

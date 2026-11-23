@@ -591,7 +591,8 @@ class VaultKeyProvider:
                 )
                 if not value
             ]
-            raise KeyProviderError(
+            # Built from variable names alone, so recorded: the key seam keeps it (BACKLOG #6010).
+            raise _recorded_refusal(
                 f"[store].key_provider={_EXTRA!r} is selected but {', '.join(missing)} is not set — "
                 f"supply the Transit KEK name and the wrapped DEK via the environment."
             )
@@ -751,9 +752,9 @@ def checked_transit_key_name(name: str, *, selector: str) -> str:
     if _TRANSIT_KEY_NAME.fullmatch(name) is None:
         raise _recorded_refusal(
             f"{selector} is not a Vault transit key name: use ASCII letters, digits and "
-            f"underscores, with dots or hyphens only between them. A slash could change which "
-            f"Vault path a request reaches, and a name outside the shape Vault gives its key "
-            f"names is refused with it."
+            f"underscores, with dots or hyphens only between them. A slash, or a name of dots "
+            f"alone, could change which Vault path a request reaches, and a name outside the "
+            f"shape Vault gives its key names is refused with it."
         )
     return name
 

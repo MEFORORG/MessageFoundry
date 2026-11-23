@@ -1384,7 +1384,20 @@ class TransitCipher(_UnmarkedPolicy):
         checks its shape. An HTTP 400 or 403 raises
         :class:`~messagefoundry.store.crypto.TransitSealRefused` with that status, raised outside the
         handler so no chain carries Vault's reply; anything else raises :class:`CipherError`.
-        Blocking."""
+        Blocking.
+
+        ``key_name`` goes into the request path, so a name that is not a Transit key name raises
+        :class:`CipherError` before any request (BACKLOG #6010 item 9)."""
+        try:
+            checked_transit_key_name(key_name, selector="the row seal's key name")
+        except KeyProviderError:
+            refused_name = True
+        else:
+            refused_name = False
+        if refused_name:
+            raise CipherError(
+                "Transit row seal verify was given a key name that is not a Transit key name"
+            )
         refused = 0
         try:
             return self._transit_verify(key_name, digest, mac)
@@ -1422,6 +1435,15 @@ class _TransitAuditMac:
         return self._cipher.verify_audit_hmac(data, stored)
 
 
+def _refusal_text(exc: KeyProviderError, selector: str) -> str:
+    """The text the engine recorded for ``exc`` when it built it, else a fixed text naming
+    ``selector``. The instance's own text is never read, so a refusal raised by code this module
+    did not vet cannot pass its text through the store's fixed-text seams."""
+    from messagefoundry.store.base import _recorded_text
+
+    return _recorded_text(exc) or f"{selector} could not be read as a Vault transit key name."
+
+
 def _key_names() -> tuple[str, str]:
     """The Transit data key and audit key from the environment, read in one place for the cipher
     and for :func:`transit_cipher_required_capabilities`. Raises :class:`KeyProviderError` when the
@@ -1436,7 +1458,7 @@ def _key_names() -> tuple[str, str]:
     try:
         key_name = transit_key_name_setting(_ENV_TRANSIT_KEY)
     except KeyProviderError as exc:
-        refusals.append(str(exc))
+        refusals.append(_refusal_text(exc, _ENV_TRANSIT_KEY))
     else:
         if key_name is None:
             refusals.append(
@@ -1448,10 +1470,10 @@ def _key_names() -> tuple[str, str]:
     try:
         audit_key = transit_key_name_setting(_ENV_AUDIT_KEY)
     except KeyProviderError as exc:
-        refusals.append(str(exc))
+        refusals.append(_refusal_text(exc, _ENV_AUDIT_KEY))
     # Raised outside the handlers, so nothing a read held rides along on the chain (BACKLOG #2307).
-    # Each text is one this module or `checked_transit_key_name` built from a variable name alone,
-    # so it is recorded and the store's fixed-text seams keep it (BACKLOG #6010 item 3).
+    # Each text is one the engine built from a variable name alone, read from its record, so the
+    # joined text is recorded and the store's fixed-text seams keep it (BACKLOG #6010 item 3).
     if refusals or key_name is None:
         raise _recorded_refusal(" ".join(refusals))
     return key_name, audit_key or key_name

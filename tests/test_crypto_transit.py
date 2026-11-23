@@ -359,8 +359,9 @@ def test_unreachable_transit_fails_closed_type_only(monkeypatch: pytest.MonkeyPa
 
 # --- both key names are checked before they reach a Transit path (BACKLOG #6010) ------------------
 
-#: The KEK test's cases (BACKLOG #6010 item 12): every Transit key name goes through one check, so
-#: one list covers both modules, plus the two path-shaped names this module's tests began with.
+#: The KEK test's cases (BACKLOG #6010 item 12): the KEK and both Transit key names go through
+#: one check, so one list covers both modules, plus the two path-shaped names this module's tests
+#: began with.
 _BAD_KEY_NAMES = [*_MALFORMED_KEK_NAMES, "mefor/store", "mefor-store/"]
 
 
@@ -428,6 +429,23 @@ def test_the_cipher_itself_refuses_a_malformed_key_name(which: str, bad: str) ->
     names = ("mefor-store", bad) if which == "audit" else (bad, None)
     with pytest.raises(KeyProviderError, match="is not a Vault transit key name"):
         TransitCipher(_FakeClient(_FakeTransit()), names[0], audit_key=names[1])
+
+
+@pytest.mark.parametrize("bad", _BAD_KEY_NAMES)
+def test_a_row_seal_verify_refuses_a_malformed_key_name_before_any_request(bad: str) -> None:
+    """BACKLOG #6010 item 9: the row seal verify takes its key name from the sealer, not the
+    environment read, so it checks the name itself before it reaches ``transit/verify/<name>``."""
+    calls: list[str] = []
+
+    class _Recording(_FakeTransit):
+        def verify_signed_data(self, *, name: str, **kwargs: Any) -> dict[str, Any]:
+            calls.append(name)
+            return super().verify_signed_data(name=name, **kwargs)
+
+    cipher = TransitCipher(_FakeClient(_Recording()), _KEY_NAME)
+    with pytest.raises(CipherError, match="not a Transit key name"):
+        cipher.verify_seal_hmac(bad, b"digest", "vault:v1:AAAA")
+    assert calls == []
 
 
 @pytest.mark.parametrize("selector", ["MEFOR_STORE_TRANSIT_KEY", "MEFOR_STORE_TRANSIT_AUDIT_KEY"])
