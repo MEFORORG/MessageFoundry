@@ -26,6 +26,7 @@ import asyncio
 import base64
 import inspect
 import io
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -384,6 +385,14 @@ async def test_a_rotation_burst_is_charged_PER_BATCH_not_only_at_close(
         await rotated.close()
 
 
+#: ``cipher_call(<cipher>, <encrypt callable>, ...)``: the callable is passed, not called, so the
+#: ``name(`` tokens below cannot see it (BACKLOG #3929).
+_ENCRYPT_VIA_CIPHER_CALL = re.compile(
+    r"cipher_call\(\s*[^,()]+,\s*(?:[\w.]*\.)?"
+    r"(?:encrypt|encrypt_many|_enc|_reencrypt_value|reseal_unless_tag_failure)\s*[,)]"
+)
+
+
 def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> None:
     """OMISSION GUARD — the class of defect, not one instance of it.
 
@@ -405,6 +414,8 @@ def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> Non
                 continue
             # encrypt_many (vault BACKLOG #6706) seals a batch through the same single-value encrypt.
             # reseal_unless_tag_failure (BACKLOG #5610) is the tagged-cell loops' decrypt-then-encrypt.
+            # BACKLOG #3929 runs the cipher off the loop: an encrypt is then a call to the store's
+            # async wrappers, or the encrypt callable handed to cipher_call uncalled, so read both.
             encrypts = any(
                 tok in src
                 for tok in (
@@ -412,8 +423,10 @@ def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> Non
                     "encrypt_many(",
                     "_reencrypt_value(",
                     "reseal_unless_tag_failure(",
+                    "._aencrypt(",
+                    "._aenc(",
                 )
-            )
+            ) or bool(_ENCRYPT_VIA_CIPHER_CALL.search(src))
             if "while True" not in src or not encrypts:
                 continue
             checked.append(f"{cls.__name__}.{name}")
