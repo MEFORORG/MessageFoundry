@@ -31,6 +31,9 @@ _PINNED: Counter[tuple[str, str, str]] = Counter(
         # The first load's start: Engine._first_load runs build_check_off_loop on this graph
         # first, whose build_check logs the line (engine PR 2815 moved it out of reload_detail).
         ("messagefoundry/pipeline/engine.py", "Engine._first_load", "False"): 1,
+        # The same first load on a cluster (BACKLOG #5743): this branch runs only while
+        # _first_load holds _first_start_refused, which it sets after that build check.
+        ("messagefoundry/pipeline/engine.py", "Engine._start_graph", "False"): 1,
         (
             "messagefoundry/pipeline/wiring_runner.py",
             "RegistryRunner._build_fhir_lookup_executor.build",

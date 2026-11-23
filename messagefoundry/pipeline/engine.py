@@ -942,6 +942,9 @@ class Engine:
         # Set as stop() begins. A first load reads it under _first_load_lock once its build check
         # returns, so a stop that found no runner to stop is not followed by one starting.
         self._stopping = False
+        # What a clustered first load's CA check refused, for the one start it may make (BACKLOG
+        # #5743). Cleared when that load's reconcile returns, so a later promotion checks afresh.
+        self._first_start_refused: dict[str, Exception] | None = None
         self._graph_reconcile_interval = 1.0
         # The config writes started and not finished: today the connection flag's store write
         # (BACKLOG #2623), the one write this engine tracks. A caller that is cancelled stops
@@ -1701,21 +1704,51 @@ class Engine:
         if self._stopping:
             raise RuntimeError("the engine is stopping, so the first load started no runner")
         previous_env_values, self._env_values = self._env_values, env_values
+        clustered = self._coordinator.is_clustered()
         try:
             runner = self.add_registry(registry)
             # That check warned for this graph, so this start does not (vault BACKLOG #2910),
             # except for a lookup it left out, which the start warns for (vault BACKLOG #3582).
-            await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
+            if clustered:
+                # BACKLOG #5743: only the leader runs the graph, with its epoch pushed first, so
+                # the start goes through the reconcile. The supervisor comes after it: spawned
+                # first, it would swallow a leader's start failure and this reload would report
+                # success with no graph.
+                self._first_start_refused = refused
+                try:
+                    await self._reconcile_graph()
+                finally:
+                    self._first_start_refused = None
+                if self._stopping and not runner.running:
+                    raise RuntimeError(
+                        "the engine is stopping, so the first load started no runner"
+                    )
+                self._ensure_graph_supervisor()
+            else:
+                await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
         except asyncio.CancelledError:
             # BACKLOG #5705: cleared only when the cancelled start finished its own teardown.
             # Otherwise the runner may still hold live state, so it stays, with the values it was
-            # built from, where engine.stop() can reach it.
+            # built from, where engine.stop() can reach it. On a cluster the supervisor then owns
+            # it, since nothing else would start it or converge what is left.
             installed = self._registry_runner
             if installed is not None and installed.start_cancel_unwound:
                 self._registry_runner = None
                 self._env_values = previous_env_values
+            elif clustered:
+                self._ensure_graph_supervisor()
             raise
         except Exception:
+            installed = self._registry_runner
+            if (
+                clustered
+                and installed is not None
+                and (installed.running or installed.has_residual_state)
+            ):
+                # A demotion's stop failed after the start, or a failed start's teardown did:
+                # clearing would orphan live listeners, so the supervisor converges them.
+                self._ensure_graph_supervisor()
+                raise
             # Don't leave a half-started runner: a later reload would take the "runner exists"
             # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
             self._registry_runner = None
@@ -2659,33 +2692,43 @@ class Engine:
         # row is independently prevented by the store's per-row leases (see __init__). Single-node
         # never spawns it (the graph is already running, brought up directly above).
         if self._coordinator.is_clustered() and self._registry_runner is not None:
-            ttl = self._cluster_settings.leader_lease_ttl_seconds
-            fence = self._cluster_settings.leader_fence_timeout_seconds
-            # Stay comfortably inside the (ttl - fence) margin and never slower than ~1s.
-            self._graph_reconcile_interval = max(0.1, min(1.0, (ttl - fence) / 3.0))
-            self._graph_stop.clear()
-            self._graph_wake.clear()
-            # ADR 0157 Inc 5: register the demotion edge-trigger if this coordinator supports it.
-            # An isinstance gate rather than hasattr, and a test pins that BOTH shipped coordinators
-            # satisfy the Protocol — otherwise the capability degrades to the poll path SILENTLY,
-            # which is the defect class the ADR itself criticises elsewhere.
-            if isinstance(self._coordinator, _SupportsDemoteHook):
-                self._coordinator.set_on_demote(self._on_demote_edge)
-            else:
-                log.info(
-                    "engine: coordinator has no demotion edge-trigger; graph teardown follows the "
-                    "%.2fs poll instead",
-                    self._graph_reconcile_interval,
-                )
             # Reconcile ONCE synchronously before the loop: if this node is already the leader (it
             # acquired the lease on coordinator.start()'s first tick, or in tests a stand-in reports
             # leader immediately), the graph comes up during start() rather than a poll-interval later.
             # A real DbCoordinator is usually not-yet-leader here (the lease is acquired asynchronously),
             # so this is a no-op and the supervisor brings the graph up on promotion.
             await self._reconcile_graph()
-            self._graph_supervisor = asyncio.create_task(self._graph_supervisor_loop())
+            self._ensure_graph_supervisor()
 
     # --- active-passive graph gating (Workstream A1/A3/A4) -------------------
+
+    def _ensure_graph_supervisor(self) -> None:
+        """Spawn the graph supervisor unless one exists or the engine is stopping, for
+        :meth:`start` and a clustered first load (BACKLOG #5743). A stop that has begun has
+        already passed its supervisor step, so a task spawned now would outlive it. The demotion
+        hook is registered here, after the caller's first reconcile: the loop's first pass
+        reconciles again, so an edge in that window is not lost."""
+        if self._graph_supervisor is not None or self._stopping:
+            return
+        ttl = self._cluster_settings.leader_lease_ttl_seconds
+        fence = self._cluster_settings.leader_fence_timeout_seconds
+        # Stay comfortably inside the (ttl - fence) margin and never slower than ~1s.
+        self._graph_reconcile_interval = max(0.1, min(1.0, (ttl - fence) / 3.0))
+        self._graph_stop.clear()
+        self._graph_wake.clear()
+        # ADR 0157 Inc 5: register the demotion edge-trigger if this coordinator supports it.
+        # An isinstance gate rather than hasattr, and a test pins that BOTH shipped coordinators
+        # satisfy the Protocol — otherwise the capability degrades to the poll path SILENTLY,
+        # which is the defect class the ADR itself criticises elsewhere.
+        if isinstance(self._coordinator, _SupportsDemoteHook):
+            self._coordinator.set_on_demote(self._on_demote_edge)
+        else:
+            log.info(
+                "engine: coordinator has no demotion edge-trigger; graph teardown follows the "
+                "%.2fs poll instead",
+                self._graph_reconcile_interval,
+            )
+        self._graph_supervisor = asyncio.create_task(self._graph_supervisor_loop())
 
     def _check_pt_backend_supported(self) -> None:
         """Gate the start-time graph through the SINGLE source of truth for the PT-backend allow-list
@@ -2826,7 +2869,17 @@ class Engine:
         # before the workers start — the delivery burst it actually targets. Fire-and-forget so it never
         # blocks bring-up; a no-op on SQLite or when [store].warm_pool is off.
         await self._fire_pool_warm()
-        await self._registry_runner.start()
+        # BACKLOG #5743: a clustered first load reaches here with no supervisor for stop() to
+        # quiesce, so a stop may have passed this runner during the awaits above. Nothing yields
+        # from this read to the start taking the runner's reload lock.
+        if self._stopping:
+            return
+        if self._first_start_refused is None:
+            await self._registry_runner.start()
+        else:
+            await self._registry_runner.start(
+                warn_query_credentials=False, fhir_lookup_refused=self._first_start_refused
+            )
         log.info("engine graph started — this node is processing")
 
     async def _fire_pool_warm(self) -> None:
