@@ -415,16 +415,17 @@ def _run_one(
                     pass
                 else:
                     result = list(names)
-        if phase == "accepts":
-            # HandlerAccepts is contractually ``(msg) -> bool`` and the PARENT coerces the verdict with
-            # ``bool(...)`` (dryrun._accepted). Coerce HERE too, BEFORE the result is described back: a
-            # predicate that returns a truthy NON-bool (a natural shape the parent's ``bool()`` sanctions,
-            # e.g. ``re.search(...)`` -> re.Match) would otherwise be rejected by the codec's strict
-            # JSON-bool slot — content-dependent, since a non-match returns None. Coercing to the
-            # contract type here is what lets the parent demand a strict bool, and makes
-            # ``[sandbox].mode`` never change the routing decision (ADR 0087). An awaitable or an
-            # iterator is refused first, as at mode=off (BACKLOG #5514).
-            result = accepts_verdict(name, result)
+            elif phase == "accepts":
+                # HandlerAccepts is contractually ``(msg) -> bool``, and at mode=off the parent reads
+                # the verdict through ``accepts_verdict`` (dryrun._accepted). Apply the same rule HERE,
+                # BEFORE the result is described back: a predicate that returns a truthy NON-bool
+                # (e.g. ``re.search(...)`` -> re.Match) would otherwise be rejected by the codec's
+                # strict JSON-bool slot, content-dependently, since a non-match returns None, and an
+                # awaitable or iterator verdict is refused as at mode=off (BACKLOG #5514). It runs
+                # inside the run context, as at mode=off, because a verdict's ``__bool__`` or a
+                # generator's ``finally`` is user code. One rule in both places is what keeps
+                # ``[sandbox].mode`` from changing the routing decision (ADR 0087).
+                result = accepts_verdict(name, result)
     except (DbLookupError, FhirLookupError) as exc:
         if broker is not None:
             # mode=isolated: the lookup ran, or was refused, through the parent, so its error is the

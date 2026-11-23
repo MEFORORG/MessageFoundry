@@ -6163,6 +6163,11 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     return found
 
 
+# The verdict types :func:`accepts_verdict` refuses: each reads as True without being awaited or
+# iterated. A tuple rather than a PEP-604 union, which isinstance would rebuild on every call.
+_ALWAYS_TRUE_VERDICT_TYPES: Final = (Awaitable, Iterator, AsyncIterator)
+
+
 def accepts_verdict(hname: str, verdict: object) -> bool:
     """The truth value of ``verdict``, the value an ``accepts=`` predicate returned, or
     :class:`TypeError` when it is an awaitable, an iterator or an async iterator (BACKLOG #5514).
@@ -6174,15 +6179,34 @@ def accepts_verdict(hname: str, verdict: object) -> bool:
     out of ``route_only`` like any predicate raise, into the router-stage error path. A coroutine or
     generator is closed first, so no "never awaited" warning follows. The text names the handler and
     the verdict's type, never its value. Every mode applies this one rule, so ``[sandbox].mode`` does
-    not change the verdict (ADR 0087)."""
-    if type(verdict) is bool:  # the contract's shape: one compare on the routing hot path
-        return verdict
-    if isinstance(verdict, Awaitable | Iterator | AsyncIterator):
+    not change the verdict (ADR 0087).
+
+    An object whose class defines ``__bool__`` or ``__len__`` has a truth value of its own, so it is
+    read by that value as before, iterator or not."""
+    if verdict is None or type(verdict) is bool:  # the contract's shapes: the routing hot path
+        return bool(verdict)
+    cls = type(verdict)
+    if (
+        isinstance(verdict, _ALWAYS_TRUE_VERDICT_TYPES)
+        and not hasattr(cls, "__bool__")
+        and not hasattr(cls, "__len__")
+    ):
         if inspect.iscoroutine(verdict) or inspect.isgenerator(verdict):
-            # close() runs the body's finally on a started one; whatever that raises must not
-            # replace the TypeError below, which is the fault the author has to read.
-            with suppress(Exception):
+            # close() runs the body's finally on a started one. An Exception from it must not
+            # replace the TypeError below, which is the fault the author has to read, so it is
+            # logged by type only (its text may quote message content). MemoryError and any
+            # BaseException still propagate, so the sandbox child can recycle its worker.
+            try:
                 verdict.close()
+            except MemoryError:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- author code; logged, then the TypeError
+                _logger.debug(
+                    "closing the %s that accepts= predicate for handler %r returned raised %s",
+                    cls.__name__,
+                    hname,
+                    type(exc).__name__,
+                )
         raise TypeError(
             f"accepts= predicate for handler {hname!r} returned an object of type "
             f"{type(verdict).__name__}, which the router stage cannot await or iterate and would "

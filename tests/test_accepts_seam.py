@@ -1082,6 +1082,7 @@ def test_an_awaitable_or_iterator_verdict_raises_on_the_traced_path(
     assert out["disposition"] == MessageStatus.ERROR.value
     assert out["handlers"] == []
     assert "returned an object" in (out["error"] or "")
+    assert out["accepts_declined"] == []  # a refused verdict records no decline
 
 
 @pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
@@ -1106,7 +1107,7 @@ async def test_an_awaitable_or_iterator_verdict_dead_letters(
     assert ran == []
 
 
-@pytest.mark.parametrize("pred", [_returns_coroutine, _returns_generator])
+@pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
 async def test_an_awaitable_or_iterator_verdict_is_a_content_error_on_the_fused_twin(
     store: MessageStore, tmp_path: Path, pred: Any
 ) -> None:
@@ -1144,6 +1145,30 @@ def test_a_plain_verdict_is_unchanged(tmp_path: Path, verdict: object, expected:
     assert trace_dry_run(reg, ADT, inbound="IB")["handlers"] == expected
 
 
+class _SizedIterator:
+    """An iterator whose class defines ``__len__``: it has a truth value of its own."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def __iter__(self) -> _SizedIterator:
+        return self
+
+    def __next__(self) -> int:
+        raise StopIteration
+
+    def __len__(self) -> int:
+        return self.n
+
+
+@pytest.mark.parametrize(("n", "expected"), [(0, []), (1, ["h"])])
+def test_an_iterator_with_its_own_truth_value_is_read_by_it(
+    tmp_path: Path, n: int, expected: list[str]
+) -> None:
+    reg = _reg(tmp_path, accepts={"h": lambda m: _SizedIterator(n)})
+    assert route_only(reg, reg.inbound["IB"], ADT) == expected
+
+
 _SANDBOX_AWAITABLE_GRAPH = """
 from messagefoundry import inbound, outbound, router, handler, MLLP, Send
 
@@ -1156,12 +1181,8 @@ def _gen():
     yield False
 
 
-def _returns_coroutine(msg):
-    return _coro()
-
-
-def _returns_generator(msg):
-    return _gen()
+async def _agen():
+    yield False
 
 
 inbound("IB_T", MLLP(port=19513), router="r")
@@ -1170,16 +1191,26 @@ outbound("OB_T", MLLP(host="127.0.0.1", port=19514))
 
 @router("r")
 def r(msg):
-    return ["h_gen"] if msg["MSH-3"] == "ESC" else ["h_coro"]
+    return ["h_" + msg["MSH-3"]]
 
 
-@handler("h_coro", accepts=_returns_coroutine)
+@handler("h_coro", accepts=lambda m: _coro())
 def h_coro(msg):
     return Send("OB_T", str(msg))
 
 
-@handler("h_gen", accepts=_returns_generator)
+@handler("h_gen", accepts=lambda m: _gen())
 def h_gen(msg):
+    return Send("OB_T", str(msg))
+
+
+@handler("h_agen", accepts=lambda m: _agen())
+def h_agen(msg):
+    return Send("OB_T", str(msg))
+
+
+@handler("h_filter", accepts=lambda m: filter(None, []))
+def h_filter(msg):
     return Send("OB_T", str(msg))
 """
 
@@ -1196,7 +1227,9 @@ def test_an_awaitable_or_iterator_verdict_raises_in_the_sandbox_child(tmp_path: 
         graph=None,
     )
     try:
-        for raw, hname in ((ADT, "h_coro"), (ESC, "h_gen")):
+        for kind in ("coro", "gen", "agen", "filter"):
+            raw = ADT.replace("|S|F|", f"|{kind}|F|")
+            hname = f"h_{kind}"
             # "sandbox failed accepts" is the parent's text for an error the CHILD reported, so the
             # refusal ran across the process boundary rather than in the parent.
             with pytest.raises(
