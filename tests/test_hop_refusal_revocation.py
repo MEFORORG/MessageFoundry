@@ -1582,8 +1582,11 @@ async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> 
     ).model_copy(update={"oidc_jwks_uri": None})
     store = await MessageStore.open(":memory:")
     try:
-        with pytest.raises(InsecureHopRefused, match="OIDC jwks_uri endpoint"):
-            AuthService(store, settings, ldap=_FakeLdap(), hop_posture=PROD_PHI)  # type: ignore[arg-type]
+        for posture in (PROD_PHI, STAGING_PHI):
+            with pytest.raises(
+                InsecureHopRefused, match="OIDC jwks_uri endpoint: the URL names no host"
+            ):
+                AuthService(store, settings, ldap=_FakeLdap(), hop_posture=posture)  # type: ignore[arg-type]
     finally:
         await store.close()
 

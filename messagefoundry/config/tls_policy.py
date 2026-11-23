@@ -3607,9 +3607,9 @@ def vault_client_verify_kwargs(
         # A malformed bracketed host, or an address that names no host (BACKLOG #2207). Not
         # raised here: the client build refuses a given address it cannot read as one URL, with
         # fixed text and the provider's own error type (BACKLOG #2317). An unset address does
-        # not reach here from a provider, which refuses it first (BACKLOG #2851). A host this
-        # function cannot read must not count as on-box, so it gets a name that never does.
-        host = "(unreadable host)"
+        # not reach here from a provider, which refuses it first (BACKLOG #2851). The empty host
+        # is not on-box (BACKLOG #5512), so the anchor keeps what an off-box hop gets.
+        host = ""
     anchor = resolve_trust_anchor(connection_ca_file=ca_file, host=host, policy=TrustAnchorPolicy())
     verify = requests_verify_from_anchor(anchor, cell=cell)
     return {} if verify is None else {"verify": verify}
