@@ -883,9 +883,8 @@ def test_the_refined_view_adds_no_deny_main_did_not_have(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
-def _nested_subshell_substitutions(depth: int) -> str:
+def _nested_subshell_substitutions(depth: int, inner: str = "$((find /proc) )") -> str:
     """`echo "$(( $(( ... $((find /proc) ) ... ) ) )"`, DEPTH sites deep, every one a subshell."""
-    inner = "$((find /proc) )"
     for _ in range(depth - 1):
         inner = "$(( " + inner + " ) )"
     return 'echo "' + inner + '"'
@@ -906,9 +905,30 @@ SITE_TEXT_DENY = [
     ),
     pytest.param(
         'echo "' + "$(( ${a:-$(" * 20 + "echo a" + ")} ) )" * 20 + '"; echo "$((find /proc) )"',
-        id="walk-after-nested-sites-under-unclosed-parameter-expansions",
+        id="walk-after-nested-sites-inside-parameter-expansions",
     ),
     pytest.param('echo "$(( $((find /proc) ) + 1 ))"', id="subshell-substitution-in-arithmetic"),
+    # A shift in arithmetic inside a subshell site's own text, which Hide-HeredocBodies would read
+    # as an opener there too; at depth 50 the refined view has also given up.
+    pytest.param(
+        'echo "$(( $((y=$(( 1 << n ))\nfind /proc) ) + 1 ))"',
+        id="shift-in-arithmetic-inside-a-subshell-site",
+    ),
+    pytest.param(
+        _nested_subshell_substitutions(50, "$((y=$(( 1 << n ))\nfind /proc) )"),
+        id="shift-in-arithmetic-inside-fifty-nested-subshell-sites",
+    ),
+    # Single quotes are literal in arithmetic, and the substitution in them runs.
+    pytest.param("x=$(( '$((find /proc) )' ))", id="subshell-site-in-single-quotes-in-arithmetic"),
+    pytest.param(
+        "echo \"$(( '$((find /proc) )' ))\"",
+        id="subshell-site-in-single-quotes-in-quoted-arithmetic",
+    ),
+    pytest.param("x=$[ '$((find /proc) )' ]", id="subshell-site-in-single-quotes-in-old-style"),
+    # Two arithmetic sites whose shift lines end inside them.
+    pytest.param(
+        "x=$(( a << b\n ))\ny=$(( c << d\n ))\nfind /proc", id="two-multi-line-shift-sites"
+    ),
     pytest.param("(( a << b ))\nfind /proc", id="spaced-shift-in-an-arithmetic-command-no-quote"),
     pytest.param("x=$(( 1 << n ))\nfind /proc", id="spaced-shift-in-arithmetic-no-quote"),
     pytest.param(
@@ -924,8 +944,10 @@ def test_a_walk_a_per_site_text_exposes_is_denied(command: str) -> None:
 
 # THE CONTROLS FOR THE PER-SITE TEXTS, each allowed on origin/main: a site that closes with `))` is
 # arithmetic and adds no subshell text, a site in single quotes or in a quoted heredoc body is data,
-# `((` inside double quotes is no site, a blanked shift leaves the quote after it intact, and prose
-# after a subshell site stays inside its quotes.
+# `((` inside double quotes is no site, a blanked shift leaves the quote after it intact, prose
+# after a subshell site stays inside its quotes, and a heredoc opened inside a `$((cmd) )` subshell
+# site is a heredoc, whose body is data, not a shift's operand. An earlier cut of this change
+# denied the last four.
 SITE_TEXT_ALLOW = [
     pytest.param("x=$(( 1 << n )); echo done", id="shift-in-arithmetic-before-a-bounded-command"),
     pytest.param('(( x << y )); echo "x; find /proc"', id="blanked-shift-keeps-the-quote"),
@@ -935,6 +957,20 @@ SITE_TEXT_ALLOW = [
     pytest.param('echo "$((echo a) ) x; find /proc"', id="prose-after-a-subshell-site"),
     pytest.param(
         'echo "find"; x=' + "$(( " * 300 + "1" + " ))" * 300, id="deep-arithmetic-adds-no-text"
+    ),
+    pytest.param("x=$(( 'a' ))\necho \"find /proc\"", id="single-quotes-in-arithmetic"),
+    pytest.param(
+        "x=$((cat <<'EOF'\n$((find /proc) )\nEOF\n) )", id="site-in-a-heredoc-in-a-subshell-site"
+    ),
+    pytest.param(
+        "x=$((cat <<'EOF'\nfind /proc\nEOF\n) | wc -l)", id="walk-in-a-heredoc-in-a-subshell-site"
+    ),
+    pytest.param(
+        "x=$((cat <<EOF\ngrep -r foo /\nEOF\n) )", id="walk-in-a-bare-heredoc-in-a-subshell-site"
+    ),
+    pytest.param(
+        "echo \"$((cat <<'EOF'\nnote: never run $((find /proc) ) here\nEOF\n) )\"",
+        id="site-in-a-heredoc-in-a-quoted-subshell-site",
     ),
 ]
 
@@ -980,6 +1016,18 @@ def test_nested_subshell_substitutions_are_read_in_linear_time() -> None:
     started = time.monotonic()
     assert_denied(run_guard(bash(_nested_subshell_substitutions(4000))))
     full = time.monotonic() - started
+    assert full < 3 * half + 3
+
+
+def test_nested_subshell_sites_that_allow_are_read_in_linear_time() -> None:
+    """The allow path reads nested texts until its cap, so its time must grow linearly too."""
+    command = 'echo "{}"; grep x f'
+    half = _guard_seconds(
+        command.format(_nested_subshell_substitutions(1000, "$((echo a) )")[6:-1])
+    )
+    full = _guard_seconds(
+        command.format(_nested_subshell_substitutions(2000, "$((echo a) )")[6:-1])
+    )
     assert full < 3 * half + 3
 
 
@@ -1125,8 +1173,8 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FLOOR_DENY": 3,
     "REFINED_CONTROL_ALLOW": 2,
     "REFINED_FALSE_DENY_ALLOW": 14,
-    "SITE_TEXT_DENY": 8,
-    "SITE_TEXT_ALLOW": 7,
+    "SITE_TEXT_DENY": 14,
+    "SITE_TEXT_ALLOW": 12,
 }
 
 
