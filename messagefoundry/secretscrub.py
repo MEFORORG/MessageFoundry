@@ -1129,7 +1129,9 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # text where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``,
 # and an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
 # reading, so in such a text none of them runs. The fallback covers the whole text, not one line,
-# so a member-key label on one line leaves a PEM body on a later line unmasked.
+# so through :func:`scrub_credentials` a member-key label on one line leaves at least a PEM body on
+# another line of that text unmasked, before the label or after it. That is :func:`scrub_credentials`
+# alone; a surface that also runs :func:`mask_private_key_blocks_then` is not described here.
 
 #: The label words a padded token68 may not end in: every family's, and the query keys
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.

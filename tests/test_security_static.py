@@ -320,20 +320,47 @@ _IMPORTED_CONSTANT_MODULES = frozenset({"messagefoundry.secretscrub"})
 
 
 def _imported_constants(tree: ast.Module) -> dict[str, str]:
-    """``{local name: value}`` for each ``str`` a file imports from :data:`_IMPORTED_CONSTANT_MODULES`."""
+    """``{local name: value}`` for each ``str`` a file imports from :data:`_IMPORTED_CONSTANT_MODULES`.
+
+    A name is left out, so a pattern built on it stays unresolved and pinned, when the file also
+    binds it as a store, augmented-assign or ``del`` target, a parameter, a ``def`` or ``class``
+    name, an ``except ... as`` name or another import, and when any attribute in the file shares its
+    name, since :func:`_static_str` reads ``obj.NAME`` loosely as ``NAME``. Without that, a
+    rebinding the constant pass does not read (``NAME += ...``, a computed local) would be scanned
+    as the imported text and drop out of the pin. Other dynamic bindings, such as ``globals()``
+    writes, are not seen.
+    """
     names: dict[str, str] = {}
+    dropped: set[str] = set()
+    other_bindings: set[str] = set()
     for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.ImportFrom)
-            and node.level == 0
-            and node.module in _IMPORTED_CONSTANT_MODULES
-        ):
-            continue
-        module = importlib.import_module(node.module)
-        for alias in node.names:
-            value = getattr(module, alias.name, None)
-            if isinstance(value, str):
-                names[alias.asname or alias.name] = value
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            other_bindings.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            other_bindings.add(node.attr)
+        elif isinstance(node, ast.arg):
+            other_bindings.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            other_bindings.add(node.name)
+        elif isinstance(node, ast.ExceptHandler):
+            other_bindings.update([node.name] if node.name else [])
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            imported = (
+                importlib.import_module(node.module)
+                if isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and node.module in _IMPORTED_CONSTANT_MODULES
+                else None
+            )
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                value = None if imported is None else getattr(imported, alias.name, None)
+                if not isinstance(value, str) or names.get(local, value) != value:
+                    dropped.add(local)
+                else:
+                    names[local] = value
+    for name in dropped | other_bindings:
+        names.pop(name, None)
     return names
 
 
@@ -344,9 +371,8 @@ def _string_constants(tree: ast.Module) -> dict[str, str]:
     exactly as invisible to an inline-literal scanner as a module-level one, and dropping it silently
     is how a catastrophic pattern would pass. A name bound to two different literals in the same file
     is discarded as ambiguous rather than resolved to whichever won — reporting the wrong literal
-    would be a fabricated finding. The map starts from :func:`_imported_constants`, so a name the
-    file imports from a module that list names resolves, and a local binding of the same name to
-    other text makes it ambiguous like any other.
+    would be a fabricated finding. The map starts from :func:`_imported_constants`, whose docstring
+    says which imported names it leaves out.
     """
     names: dict[str, str] = _imported_constants(tree)
     ambiguous: set[str] = set()
@@ -602,7 +628,11 @@ def find_nested_quantifiers(source: str) -> list[str]:
 
 @functools.cache
 def _scanned(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """:func:`_regex_scan` of ``path``, read once per run, since the tree walks below share it."""
+    """:func:`_regex_scan` of ``path``, read once per run, since the tree walks below share it.
+
+    The result depends on the modules :data:`_IMPORTED_CONSTANT_MODULES` names, so a test that
+    patches one of them calls :func:`_regex_scan` instead, or it would cache the patched reading.
+    """
     resolved, unresolved = _regex_scan(path.read_text(encoding="utf-8"))
     return tuple(resolved), tuple(unresolved)
 
@@ -701,9 +731,12 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``_GUARDED_BRACED_VALUE``. That is why ``_AUTH_SCHEME`` joins this list. Every repetition they
     # add is possessive (``++``, ``*+``, ``\s*+``) or bounded (``{1,6}``), and none sits under an
     # unbounded greedy quantifier. ``support/redact.py`` spells the same fragments with literal
-    # keywords, and takes the masked tails and the bytes probe from ``secretscrub`` by import, which
-    # :data:`_IMPORTED_CONSTANT_MODULES` lets this scanner read. So ITS copies stay resolvable, and
-    # this scanner reads them there; that is the scanned twin of every expression below. ``_KV_QUOTED_VALUE`` (``_CREDENTIAL_KV``'s quoted value, which
+    # keywords, so ITS copies stay resolvable, and this scanner reads them there. That is the
+    # scanned twin of the expressions below that redact.py also compiles: ``_AUTH_SCHEME``, and the
+    # four tailed patterns the BACKLOG #5546 paragraph below names. It is no twin of the key-block,
+    # DSN, ``_CAMEL_PROBE`` or ``source`` entries, which redact.py imports compiled or does not hold,
+    # nor of the camelCase fragments, which redact.py's copies leave out, so those are held by
+    # inspection only. ``_KV_QUOTED_VALUE`` (``_CREDENTIAL_KV``'s quoted value, which
     # runs on past a later label's opening quote) is written as plain concatenation in both files for
     # that reason: built by a helper, the bundle copy fell out of this scan.
     #
@@ -723,8 +756,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # with a separator after the label word, which holds no repetition outside a lookaround and the
     # possessive ``\s*+``. ``_pre_camel`` compiles each shipped pattern with its
     # camelCase fragments swapped back for what ``origin/main`` held there before #5545, with the
-    # masked tails and the bytes probe stripped, and ``_PRIVATE_KEY_BLOCK`` compiled as a pattern
-    # that never matches. Apart from the tails and the key block, that is the
+    # masked tails and the bytes probe stripped, ``_MARKED_SCHEME_WORDS`` swapped back for
+    # ``_SCHEME_WORDS`` (``secretscrub._TAIL_FRAGMENTS`` lists the swaps), and ``_PRIVATE_KEY_BLOCK``
+    # compiled as a pattern that never matches. Apart from those, that is the
     # shipped pattern with each fragment replaced by text this file scanned then, not the whole of a
     # pattern scanned then: a pattern changed since #5545 comes back with its later change, and one
     # added since, such as ``_WIDE_DSN_PASSWORD``, holds no fragment and comes back as it ships.
@@ -764,13 +798,12 @@ _UNSCANNABLE_RE_PATTERNS = {
     # fragment, and ``_BEARER`` also ``_MARKED_SCHEME_WORDS``; the query filter in ``logging_setup``
     # splices the probe and ``_KV_TAILS``. ``support/redact.py`` imports the probe and the tails from
     # ``messagefoundry/secretscrub.py`` rather than spelling them, so that the tails' contract is
-    # stated once there. This scanner reads those imported values from ``secretscrub`` itself
-    # (:data:`_IMPORTED_CONSTANT_MODULES`), so redact.py's copies of the four patterns resolve, with
-    # the tails in them, and are scanned there. ``secretscrub.py``'s own copies stay unresolved,
-    # below: at least ``_alternation(...)``, ``re.escape(...)`` and the join that builds
-    # ``_NO_LABEL_BEFORE`` are runtime composition, which a reading of that file does not resolve. By inspection every
-    # repetition the tails add is possessive or bounded, the label stops in ``_NO_LABEL_BEFORE`` are fixed-width
-    # lookbehinds with no repetition, and each tail group is optional and possessive after the whole
+    # stated once there; :data:`_IMPORTED_CONSTANT_MODULES` says how redact.py's copies still
+    # resolve. ``secretscrub.py``'s own copies stay unresolved, below: at least
+    # ``_alternation(...)``, ``re.escape(...)`` and the join that builds ``_NO_LABEL_BEFORE`` are
+    # runtime composition, which a reading of that file does not resolve. By inspection every
+    # repetition the tails add is possessive or bounded, the label stops in ``_NO_LABEL_BEFORE`` are
+    # fixed-width lookbehinds with no repetition, and each tail group is optional and possessive after the whole
     # old match. BACKLOG #5550's ``_PRIVATE_KEY_BLOCK`` splices ``_KEY_LINE``, which holds those label
     # stops; why it is linear is on the pattern. The two ``source`` entries are ``_pre_camel``'s and
     # ``_without_tails``' compiles of a shipped pattern rewritten at runtime.
@@ -900,16 +933,48 @@ def test_a_nested_quantifier_in_an_imported_tail_is_caught_in_redact(
     tail is spliced, not pass because the import hid it (BACKLOG #5546 to #5548).
     """
     import messagefoundry.secretscrub as secretscrub
+    from messagefoundry.support import redact
 
     source = (_REPO / "messagefoundry" / "support" / "redact.py").read_text(encoding="utf-8")
     resolved, unresolved = _regex_scan(source)
-    assert len(resolved) == 9
+    tailed = [redact._BEARER, redact._MEFOR_SECRET, redact._CREDENTIAL_KV, redact._KEY_MATERIAL]
+    # The scanned text is the text redact.py compiled, tails included.
+    assert [pattern.pattern in resolved for pattern in tailed] == [True] * 4
     assert len(unresolved) == 0
     assert find_nested_quantifiers(source) == []
     monkeypatch.setattr(secretscrub, name, getattr(secretscrub, name) + r"(?:x+)*")
     offenders = find_nested_quantifiers(source)
     assert offenders
     assert all(r"(?:x+)*" in pattern for pattern in offenders)
+
+
+_TAILS_IMPORT = "import re\nfrom messagefoundry.secretscrub import _KV_TAILS\n"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "_KV_TAILS += r'(?:x+)*'\nre.compile('a' + _KV_TAILS)\n",
+        "def f():\n    _KV_TAILS = build()\n    return re.compile('a' + _KV_TAILS)\n",
+        "re.compile(obj._KV_TAILS)\n",
+        "def f(_KV_TAILS):\n    return re.compile('a' + _KV_TAILS)\n",
+        "from messagefoundry.secretscrub import _MEFOR_TAILS as _KV_TAILS\nre.compile('a' + _KV_TAILS)\n",
+    ],
+)
+def test_an_imported_constant_the_file_also_binds_stays_unresolved(body: str) -> None:
+    """A name the file rebinds is not read as the imported text, so the pattern stays pinned."""
+    resolved, unresolved = _regex_scan(_TAILS_IMPORT + body)
+    assert len(unresolved) == 1
+    assert resolved == []
+
+
+def test_an_imported_constant_the_file_does_not_rebind_resolves() -> None:
+    """The control for the test above: the same import, used without a rebinding, resolves."""
+    import messagefoundry.secretscrub as secretscrub
+
+    resolved, unresolved = _regex_scan(_TAILS_IMPORT + "re.compile('a' + _KV_TAILS)\n")
+    assert resolved == ["a" + secretscrub._KV_TAILS]
+    assert len(unresolved) == 0
 
 
 # The MANY-STARTS shape (BACKLOG #4036): an unanchored pattern that opens with a literal prefix,
