@@ -664,7 +664,8 @@ def test_a_text_field_at_the_cap_still_parses() -> None:
 # --- BACKLOG #5787: a body with no closing delimiter is refused -----------------------------------
 #
 # The first half refuses a body with no closing delimiter. The second half counts a delimiter only
-# at a line start and reads what follows a close (multipart._LineStartDelimiters states both). The
+# at a line start and reads what follows each delimiter the walk reaches, the close included
+# (multipart._LineStartDelimiters states both). The
 # differential arm below pins what both halves leave alone: every body in the corpus that carries
 # close-marker text must parse exactly as origin/main parsed it, outcome for outcome, except the rows
 # _ANCHORED_OUTCOMES names.
