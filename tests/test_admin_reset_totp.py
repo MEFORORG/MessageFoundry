@@ -1227,14 +1227,17 @@ def test_a_refusal_at_the_second_open_names_the_earlier_open(
     code = main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"])
     error = _error(capsys)
     assert code == exit_code, error
-    assert _EARLIER_OPEN in error, error
-    # No bare "the open": each open the text describes is named.
+    assert _EARLIER_OPEN.lower() in error.lower(), error
+    # Each sentence saying what an open may have changed names which open.
     assert "the open may" not in error.lower() and "the open's" not in error.lower(), error
     assert "this command makes did not land" in error and "delete it" in error, error
     assert "nothing was written" not in error.lower(), error
-    assert "the replacement's own open may" in error.lower(), error
-    # A busy store's text is printed as its class only; the other two print their own text.
-    assert ("at the second open" in error) is (refusal != "busy"), error
+    # A busy store's class says nothing of the replacement's open, which may not have touched
+    # the database, so only the earlier open is named. Its text is printed as its class only;
+    # the other two print their own text and describe the replacement's own open.
+    named = refusal != "busy"
+    assert ("the replacement's own open may" in error.lower()) is named, error
+    assert ("at the second open" in error) is named, error
 
 
 def test_an_unnamed_os_user_after_the_first_open_says_what_it_may_have_changed(

@@ -11850,29 +11850,31 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         refusal say what the open may have changed before them (BACKLOG #5067). So does any refusal
         raised once an open returned (``store_returned``), never "nothing was written".
         ``after_check`` says the refusal came from the swap's open or a read after it, so check()'s
-        open had returned before it: the text names each open, never a bare "the open", which
-        would read as the one just refused."""
+        open had returned before it: the sentence that says what an open may have changed names
+        which open, the earlier one or the replacement's own, since "the open" would read as the
+        one just refused. A refusal the class says nothing about names the earlier open alone:
+        it may have come before the replacement's open touched the database, and that open finds
+        the one-time steps already done."""
         keyed = _open_is_keyed(settings)
         if after_check:
-            swap_open = "the replacement's own open"
-            this_open = _open_refusal_left_behind(
-                exc, settings.store, keyed=keyed, opener=swap_open
+            earlier_open = (
+                "this command's earlier open, which checked the account before the key was shown,"
             )
-            listed = _keyed_open_changes(settings.store, keyed=keyed)
-            earlier = (
-                "This command's earlier open, which checked the account before the key was shown, "
-                + (
+            this_open = _open_refusal_left_behind(
+                exc, settings.store, keyed=keyed, opener="the replacement's own open"
+            )
+            if this_open is None:
+                left = _open_steps_left_behind(
+                    settings.store, keyed=keyed, returned=True, opener=earlier_open
+                )
+            else:
+                listed = _keyed_open_changes(settings.store, keyed=keyed)
+                earlier = (
                     f"may already have changed the database: at least {listed}"
                     if listed
                     else "may already have written to the database"
                 )
-            )
-            left = (
-                f"The change this command makes did not land. {earlier}. "
-                f"{_capitalized(swap_open)} may also have written to it before this refusal"
-                if this_open is None
-                else f"{_sentence(this_open)} {earlier}"
-            )
+                left = f"{_sentence(this_open)} {_capitalized(earlier_open)} {earlier}"
         elif store_returned:
             left = _opened_left_behind(exc, settings.store, keyed=keyed)
         else:
