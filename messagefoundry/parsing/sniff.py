@@ -34,6 +34,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ntpath
+import re
 
 from messagefoundry.content_type import ContentType
 from messagefoundry.controlchars import has_control_char
@@ -65,11 +66,25 @@ def _looks_like_hl7(raw: bytes) -> bool:
 _LEADING_WS = b" \t\r\n\x0b\x0c"
 
 
+#: The first byte that is not :data:`_LEADING_WS`, found in C without copying the body.
+_PAST_LEADING_WS = re.compile(b"[^" + re.escape(_LEADING_WS) + b"]")
+
+#: How much of the body past the leading noise :func:`_lstrip_bom_ws` returns: more than the
+#: longest signature any caller compares (the 8-byte PNG magic).
+_SNIFF_HEAD_BYTES = 16
+
+
 def _lstrip_bom_ws(raw: bytes) -> bytes:
-    head = raw.lstrip(_LEADING_WS)
-    if head.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
-        head = head[3:].lstrip(_LEADING_WS)
-    return head
+    """The first :data:`_SNIFF_HEAD_BYTES` of ``raw`` past leading :data:`_LEADING_WS` and one
+    UTF-8 BOM (with white space either side of it). Only that head is copied, so a large body with
+    leading noise is not copied whole (BACKLOG #5520, filing review finding 3); every caller compares
+    a signature at its start."""
+    found = _PAST_LEADING_WS.search(raw)
+    at = len(raw) if found is None else found.start()
+    if raw.startswith(b"\xef\xbb\xbf", at):  # UTF-8 BOM
+        found = _PAST_LEADING_WS.search(raw, at + 3)
+        at = len(raw) if found is None else found.start()
+    return raw[at : at + _SNIFF_HEAD_BYTES]
 
 
 #: The str-domain twin of :data:`_LEADING_WS`, plus U+FEFF (what a UTF-8/UTF-16 BOM decodes to). Derived
