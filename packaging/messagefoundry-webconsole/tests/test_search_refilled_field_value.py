@@ -25,10 +25,7 @@ from test_uploaded_logs_ui import _service as _uploads_service
 from messagefoundry.auth import Role
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.content_search import sends_a_needle as engine_sends_a_needle
-from messagefoundry_webconsole.routes._common import (
-    DROPPED_CONTENT,
-    DROPPED_FIELD_VALUE,
-)
+from messagefoundry_webconsole.routes._common import DROPPED_FIELD_VALUE
 from messagefoundry_webconsole.routes._common import sends_a_needle as console_sends_a_needle
 
 _REFUSAL = "field_value applies only to an HL7 field path, not to content"
@@ -183,66 +180,41 @@ async def test_an_uploaded_log_substring_filter_from_a_refilled_page_succeeds(
         assert _refilled(fourth.text, action)["field_value"] == ""
 
 
-# --- BACKLOG #6700 items 2, 7, 8, 9 and 24 ----------------------------------------------------------
+# --- BACKLOG #6700 items 2, 8, 9 and 24 -------------------------------------------------------------
 
 _BOTH = "provide exactly one of a content substring or an HL7 field path"
 
 
-async def test_a_refilled_substring_beside_a_typed_field_path_is_dropped_with_a_notice(
-    engine: Engine,
-) -> None:
-    """Item 7: an operator who ran a substring search and then types a Field path posted the old
-    Substring beside it and was refused. Item 8: the page now says the leftover was not sent."""
-    service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR)
-    mid = await _seed(engine)  # PID-3 = 100, body carries DOE^JANE
-    async with _client(engine, service) as c:
-        await _cookie_login(c, "op")
-        first = await c.post("/ui/messages/search/run", data={"content": "DOE^JANE"})
-        assert first.status_code == 200, first.text
-        assert DROPPED_CONTENT not in first.text  # control: nothing was dropped on the first run
-        form = _refilled(first.text, "/ui/messages/search/run")
-        assert form["content"] == "DOE^JANE"  # control: the page did refill the box
-
-        form.update(field_path="PID-3", field_value="100")
-        second = await c.post("/ui/messages/search/run", data=form)
-        assert second.status_code == 200, second.text
-        assert _BOTH not in second.text
-        assert f"/ui/messages/{mid}" in second.text
-        assert DROPPED_CONTENT in second.text
-        assert _refilled(second.text, "/ui/messages/search/run")["content"] == ""
-
-        # Changed on the refilled page: the operator's own value, so it is sent and refused.
-        form = _refilled(first.text, "/ui/messages/search/run")
-        form.update(field_path="PID-3", content="SMITH")
-        third = await c.post("/ui/messages/search/run", data=form)
-        assert third.status_code == 400, third.text
-        assert _BOTH in third.text and DROPPED_CONTENT not in third.text
-
-
 async def test_a_dropped_field_value_leftover_is_named_on_the_page(engine: Engine) -> None:
-    """Item 8, the Field value side."""
+    """Item 8: the page says the leftover was not sent. A leftover of only spaces, which the engine
+    would not have read, raises no notice."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     await _seed(engine)
+    action = "/ui/messages/search/run"
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        first = await c.post(
-            "/ui/messages/search/run", data={"field_path": "PID-3", "field_value": "100"}
-        )
-        assert DROPPED_FIELD_VALUE not in first.text
-        form = _refilled(first.text, "/ui/messages/search/run")
+        first = await c.post(action, data={"field_path": "PID-3", "field_value": "100"})
+        assert DROPPED_FIELD_VALUE not in first.text  # control: nothing dropped on the first run
+        form = _refilled(first.text, action)
         form.update(field_path="", content="DOE^JANE")
-        second = await c.post("/ui/messages/search/run", data=form)
+        second = await c.post(action, data=form)
         assert second.status_code == 200, second.text
         assert DROPPED_FIELD_VALUE in second.text
 
+        blank = await c.post(action, data={"field_path": "PID-3", "field_value": "  "})
+        form = _refilled(blank.text, action)
+        assert form["field_value_refilled"] == "  "  # control: the blank value has its marker
+        form.update(field_path="", content="DOE^JANE")
+        third = await c.post(action, data=form)
+        assert third.status_code == 200, third.text
+        assert DROPPED_FIELD_VALUE not in third.text
+
 
 async def test_resubmitting_a_refusal_page_that_carried_a_path(engine: Engine) -> None:
-    """Item 24: a refusal page rendered with a Field path holds the Field value marker and no
-    Substring marker. Resubmitted unchanged, both terms are the operator's and are refused again;
-    with Field path cleared the Field value is the leftover; with Substring cleared the field
-    search runs on the value."""
+    """Item 24: a refusal page rendered with a Field path holds the Field value marker. Resubmitted
+    unchanged, both terms are sent and refused again; with Field path cleared the Field value is the
+    leftover and the substring search runs; with Substring cleared the field search runs on it."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)
@@ -254,7 +226,7 @@ async def test_resubmitting_a_refusal_page_that_carried_a_path(engine: Engine) -
         )
         assert refused.status_code == 400, refused.text
         form = _refilled(refused.text, action)
-        assert form["field_value_refilled"] == "999" and form["content_refilled"] == ""
+        assert form["field_value_refilled"] == "999"
 
         again = await c.post(action, data=form)
         assert again.status_code == 400, again.text
@@ -287,7 +259,7 @@ async def test_a_field_value_of_only_spaces_alone_is_no_criterion(engine: Engine
 
 
 def test_console_needle_rule_matches_the_engine() -> None:
-    """The console's copy of the optional-needle rule agrees with the engine's on every case."""
+    """The console's copy of the optional-needle rule agrees with the engine's on every case here."""
     texts = [None, "", " ", "　", "DOE", " DOE "]
     # A stored preset can hand the rule a non-text Field value; the engine ignores one.
     values: list[Any] = [*texts, 5, 0]
@@ -318,65 +290,3 @@ async def test_an_uploaded_log_refusal_echoes_no_control_character_and_applies_n
         r = await c.post(action, data={"content": "M" * 600, "message_type": "ADT^A04"})
         assert r.status_code == 400, r.text
         assert "1 of 2 message(s)" in r.text, "a valid filter beside a refused one was dropped"
-
-
-async def test_a_refilled_substring_beside_a_path_with_no_value_is_still_refused(
-    engine: Engine,
-) -> None:
-    """Review round 1: dropping the Substring beside a Field path alone would run a presence test
-    the operator may not have meant, which decrypts bodies, where origin/main refused the pair."""
-    service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR)
-    await _seed(engine)
-    action = "/ui/messages/search/run"
-    async with _client(engine, service) as c:
-        await _cookie_login(c, "op")
-        first = await c.post(action, data={"content": "DOE^JANE"})
-        form = _refilled(first.text, action)
-        form.update(field_path="PID-3")
-        r = await c.post(action, data=form)
-        assert r.status_code == 400, r.text
-        assert _BOTH in r.text and DROPPED_CONTENT not in r.text
-
-
-async def test_a_refusal_after_a_dropped_substring_puts_it_back_with_its_marker(
-    engine: Engine,
-) -> None:
-    """Review round 1: a typo in the new Field path made the refusal page come back with the
-    Substring box empty. It is put back with its marker, so the corrected resubmit drops it again."""
-    service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR)
-    mid = await _seed(engine)
-    action = "/ui/messages/search/run"
-    async with _client(engine, service) as c:
-        await _cookie_login(c, "op")
-        first = await c.post(action, data={"content": "DOE^JANE"})
-        form = _refilled(first.text, action)
-        form.update(field_path="P", field_value="100")
-        typo = await c.post(action, data=form)
-        assert typo.status_code == 400, typo.text
-        again = _refilled(typo.text, action)
-        assert again["content"] == "DOE^JANE" and again["content_refilled"] == "DOE^JANE"
-        again.update(field_path="PID-3")
-        fixed = await c.post(action, data=again)
-        assert fixed.status_code == 200, fixed.text
-        assert f"/ui/messages/{mid}" in fixed.text and DROPPED_CONTENT in fixed.text
-
-
-async def test_an_uploaded_log_refusal_puts_a_dropped_substring_back(
-    engine: Engine, tmp_path: Path
-) -> None:
-    """The same on the uploaded-log filter's model-refusal arm."""
-    service = await _uploads_service(engine, ("op", Role.OPERATOR))
-    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        await _login(c, "op")
-        fid = await _upload(c)
-        action = f"/ui/uploaded-logs/file/{fid}/filter"
-        first = await c.post(action, data={"content": "MRN123"})
-        form = _refilled(first.text, action)
-        form.update(field_path="PID-3", field_value="MRN999", control_id="C" * 300)
-        r = await c.post(action, data=form)
-        assert r.status_code == 400, r.text
-        back = _refilled(r.text, action)
-        assert back["content"] == "MRN123" and back["content_refilled"] == "MRN123"

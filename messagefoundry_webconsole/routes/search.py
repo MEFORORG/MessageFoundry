@@ -126,7 +126,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         control_id: str | None,
         limit: int,
         notice: str = "",
-        dropped_content: str | None = None,
     ) -> HTMLResponse:
         """Render the search page for one set of criteria — shared by the GET form render and by the
         POST that runs a needle-bearing search (BACKLOG #1184). Everything below this line is identical
@@ -157,12 +156,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             control_id=for_echo(control_id),
             notice=notice,
         )
-        # A refusal page puts a Substring the POST did not send back in its box, with its marker,
-        # so the operator need not retype it after correcting the other criterion (#6700).
-        refused = shared
-        if dropped_content:
-            echo = for_echo(dropped_content)
-            refused = {**shared, "content": echo, "content_refilled": echo}
         # BACKLOG #1740: the four metadata filters, against the rules GET /messages/search declares.
         # Checked HERE rather than in the GET route so both arms are covered by one call; on the POST
         # arm SearchPresetCriteria has already applied the same four rules, so this never fires
@@ -174,7 +167,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # core.search_messages, which charges the per-actor read budget in its own body.
             enforce_phi_read_pacing(request, identity)
             return HTMLResponse(
-                pages.message_search(None, error=refusal, presets=preset_list, **refused),
+                pages.message_search(None, error=refusal, presets=preset_list, **shared),
                 status_code=400,
             )
         if not has_criteria:
@@ -214,7 +207,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         None,
                         error=for_echo(str(exc.detail)),
                         presets=preset_list,
-                        **refused,
+                        **shared,
                     ),
                     status_code=400,
                 )
@@ -336,7 +329,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             control_id=criteria.control_id,
             limit=criteria.limit,
             notice=needle.notice,
-            dropped_content=needle.dropped_content,
         )
 
     @app.post("/ui/messages/search/presets")

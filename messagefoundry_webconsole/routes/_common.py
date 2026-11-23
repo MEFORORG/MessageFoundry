@@ -29,7 +29,7 @@ from messagefoundry.api.validation import (
     StatusFilter,
 )
 
-from ..pages._common import REFILLED_CONTENT, REFILLED_FIELD_VALUE
+from ..pages._common import REFILLED_FIELD_VALUE
 
 _log = logging.getLogger(__name__)
 
@@ -215,24 +215,18 @@ def blank_to_none(value: str | None) -> str | None:
 
 
 class PostedNeedle(NamedTuple):
-    """The needle terms a form POST carries as criteria (BACKLOG #6700). ``notice`` says which
-    refilled leftover was not sent, or is empty when none was. ``dropped_content`` is the Substring
-    that was not sent, so a refusal page can put it back in its box with its marker rather than
-    make the operator retype it."""
+    """The needle terms a form POST carries as criteria (BACKLOG #6700). ``notice`` says that a
+    refilled leftover was not sent, or is empty when none was."""
 
     content: str | None
     field_path: str | None
     field_value: str | None
     notice: str
-    dropped_content: str | None = None
 
 
-#: The on-page notices for a dropped leftover. Fixed text, so nothing the operator typed is echoed.
+#: The on-page notice for a dropped leftover. Fixed text, so nothing the operator typed is echoed.
 DROPPED_FIELD_VALUE = (
     "The Field value left from the last search was not sent, because Field path is now blank."
-)
-DROPPED_CONTENT = (
-    "The Substring left from the last search was not sent, because a Field path is now given."
 )
 
 
@@ -240,33 +234,28 @@ def posted_needle(form: Mapping[str, str]) -> PostedNeedle:
     """The Substring, Field path and Field value a needle form POST carries as criteria (BACKLOG
     #6700).
 
-    The search and uploaded-log filter pages refill their boxes after a run, so an operator who
-    switches from one kind of needle to the other posts the old term beside the new one, and the
-    engine refuses that pair. A leftover is not sent in two cases: Field path is blank, a Substring
-    is given, and the Field value is unchanged from the one the page rendered beside a Field path;
-    or a Field path and a Field value are given and the Substring is unchanged from the one the page
-    rendered with no Field path. A Field path with no Field value keeps the Substring, so the pair
-    is refused as before rather than run as a presence test the operator may not have meant. A page
-    that refills the boxes writes the markers, a refusal page included. A value the operator typed
-    or changed, or one a page echoed back without its marker, is sent as posted, so the engine's
-    refusal of it reaches the page rather than the value being dropped."""
+    The search and uploaded-log filter pages refill their boxes after a run, so an operator who ran
+    a field-path search and then clears Field path to search on a substring posts the old Field
+    value beside the new substring. The engine refuses that pair, so that leftover is not sent: it
+    is the case where Field path is blank, a substring is given, and the Field value is unchanged
+    from the one the page rendered beside a Field path, whether that page showed results or a
+    refusal. The notice names the drop, unless the value held only whitespace, which the engine
+    would not have read either. A value the operator typed or changed, or one a refusal page echoed
+    back with no Field path, is sent as posted, so the engine's refusal of it reaches the page
+    rather than the value being dropped."""
     content = form.get("content") or None
     field_path = form.get("field_path") or None
     field_value = form.get("field_value") or None
-    has_path = bool((field_path or "").strip())
     notice = ""
-    has_value = bool(field_value and not field_value.isspace())
-    dropped_content = None
-    if content is not None and has_path and has_value and content == form.get(REFILLED_CONTENT):
-        content, dropped_content, notice = None, content, DROPPED_CONTENT
-    elif (
+    if (
         field_value is not None
-        and not has_path
-        and (content or "").strip()
         and field_value == form.get(REFILLED_FIELD_VALUE)
+        and not (field_path or "").strip()
+        and (content or "").strip()
     ):
-        field_value, notice = None, DROPPED_FIELD_VALUE
-    return PostedNeedle(content, field_path, field_value, notice, dropped_content)
+        notice = "" if field_value.isspace() else DROPPED_FIELD_VALUE
+        field_value = None
+    return PostedNeedle(content, field_path, field_value, notice)
 
 
 def sends_a_needle(content: str | None, field_path: str | None, field_value: str | None) -> bool:

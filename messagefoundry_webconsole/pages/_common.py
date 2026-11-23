@@ -44,22 +44,6 @@ def _refilled_field_value(field_path: str, field_value: str) -> Markup:
     return el("input", type="hidden", name=REFILLED_FIELD_VALUE, value=value or None)
 
 
-REFILLED_CONTENT = "content_refilled"
-"""The hidden input that carries the Substring a needle form was refilled with (BACKLOG #6700).
-:func:`messagefoundry_webconsole.routes._common.posted_needle` reads it back."""
-
-
-def _refilled_content(field_path: str, content: str, marker: str | None = None) -> Markup:
-    """A needle form's record of the Substring it was rendered with while Field path was blank, the
-    mirror of :func:`_refilled_field_value`: an operator who ran a substring search and then types a
-    Field path would otherwise post the old Substring beside it, which the engine refuses (BACKLOG
-    #6700). Written only with no path, so a page that already showed both holds no marker and
-    resubmitting it sends the Substring again. ``marker`` overrides that, for a refusal page that
-    puts back a Substring the POST did not send."""
-    value = marker if marker is not None else (content if not field_path.strip() else "")
-    return el("input", type="hidden", name=REFILLED_CONTENT, value=value or None)
-
-
 def _reveal_cell(value: str | None, href: str | None, *, revealed: bool) -> object:
     """A masked cell: the value as the engine sent it, plus a "Reveal" link to ``href`` while it is
     masked (BACKLOG #2346, #2436, #2443; ASVS 14.2.6). Shared by the message pages and the event

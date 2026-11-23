@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 from messagefoundry.api.models import UploadedFileList, UploadedMessagesResult
 
 from .._html import Markup, el, page, register_nav, rows_table, text
-from ._common import _pager, _refilled_content, _refilled_field_value
+from ._common import _pager, _refilled_field_value
 
 __all__ = [
     "uploaded_log_delete_confirm",
@@ -183,7 +183,6 @@ def _browse_filters(
     field_value: str,
     message_type: str,
     control_id: str,
-    content_refilled: str | None = None,
 ) -> Markup:
     """A POST filter form over an uploaded file's split messages (metadata + optional content needle)."""
     return el(
@@ -196,7 +195,6 @@ def _browse_filters(
         el("label", "Field value", el("input", name="field_value", value=field_value or None)),
         _refilled_field_value(field_path, field_value),
         el("label", "Substring", el("input", name="content", value=content or None)),
-        _refilled_content(field_path, content, content_refilled),
         el("input", name="message_type", value=message_type or None, placeholder="type (optional)"),
         el(
             "input",
@@ -223,7 +221,6 @@ def uploaded_log_detail(
     control_id: str = "",
     error: str = "",
     notice: str = "",
-    content_refilled: str | None = None,
     can_resend: bool = True,
 ) -> Markup:
     """Browse one uploaded file's split messages (metadata only), with a per-file resend form (inject a
@@ -232,8 +229,7 @@ def uploaded_log_detail(
     ``can_resend`` is False for a viewer without ``messages:edit``, which a resend needs beside
     ``files:browse`` (vault BACKLOG #2625). The form is replaced by a sentence saying so, rather
     than offered and then refused at its confirm page. ``notice`` says that a refilled leftover was
-    not sent (BACKLOG #6700); ``content_refilled`` overrides the Substring marker, for a refusal page
-    that puts back a Substring the POST did not send."""
+    not sent (BACKLOG #6700)."""
     file_id = result.file_id
     rows = [[m.index, m.message_type, m.control_id, _human_size(m.size)] for m in result.messages]
     note = f"{result.matched} of {result.total_messages} message(s)" + (
@@ -293,7 +289,6 @@ def uploaded_log_detail(
                 field_value=field_value,
                 message_type=message_type,
                 control_id=control_id,
-                content_refilled=content_refilled,
             ),
             el("p", text(note), class_="pager"),
             rows_table(["#", "Type", "Control ID", "Size"], rows),

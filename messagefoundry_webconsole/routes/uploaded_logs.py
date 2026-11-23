@@ -619,7 +619,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         error: str = "",
         notice: str = "",
         refused: frozenset[str] = frozenset(),
-        dropped_content: str | None = None,
         status_code: int = 200,
     ) -> Response:
         """Render one uploaded file's browse page for a given filter — shared by the GET page render
@@ -639,12 +638,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             control_id=for_echo(control_id),
             notice=notice,
         )
-        # A refusal page puts a Substring the POST did not send back in its box, with its marker,
-        # so the operator need not retype it after correcting the other criterion (#6700).
-        on_refusal = shared
-        if dropped_content:
-            echo = for_echo(dropped_content)
-            on_refusal = {**shared, "content": echo, "content_refilled": echo}
 
         async def _browse(c: str | None, fp: str | None, fv: str | None) -> Any:
             return await core.browse_uploaded_file(
@@ -704,15 +697,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         # built from the values the caller sent.
                         error=for_echo(str(exc.detail)),
                         can_resend=can_resend,
-                        **on_refusal,
+                        **shared,
                     ),
                     status_code=400,
                 )
             raise
         return HTMLResponse(
-            pages.uploaded_log_detail(
-                result, error=error, can_resend=can_resend, **(on_refusal if error else shared)
-            ),
+            pages.uploaded_log_detail(result, error=error, can_resend=can_resend, **shared),
             status_code=status_code,
         )
 
@@ -800,7 +791,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 error="a filter criterion is not a value that field accepts",
                 notice=needle.notice,
                 refused=frozenset(str(e["loc"][0]) for e in exc.errors() if e["loc"]),
-                dropped_content=needle.dropped_content,
                 status_code=400,
             )
         return await _render_browse(
@@ -815,7 +805,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             control_id=criteria.control_id,
             limit=criteria.limit,
             notice=needle.notice,
-            dropped_content=needle.dropped_content,
         )
 
     @app.post("/ui/uploaded-logs/file/{file_id}/resend")
