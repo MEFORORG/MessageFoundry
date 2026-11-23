@@ -641,27 +641,105 @@ def test_the_way_on_names_the_custody_directory_of_its_own(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES])
-@pytest.mark.parametrize("named", ["custody", "secrets", "neither"])
+@pytest.mark.parametrize(
+    "named", ["custody", "secrets", "neither", "custody is the data directory"]
+)
 def test_the_way_on_moves_off_every_directory_the_left_behind_check_reads(
     tmp_path: Path, backend: StoreBackend, named: str
 ) -> None:
     """PR 3168 hold, items 1 and 9: once MEFOR_CUSTODY_DIRECTORY is set, a key file in the secrets
     directory or beside a SQLite store refuses a mint, so the step names a new one of each that
-    holds the key file it leaves in place, even where its caller keeps the store location."""
+    holds the key file it leaves in place, even where its caller keeps the store location; where
+    the variable names the store's own directory, that is beside the store too."""
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
     environ = {
         "custody": {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")},
         "secrets": {"MEFOR_SECRETS_DIRECTORY": str(tmp_path / "secrets")},
         "neither": {},
+        "custody is the data directory": {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path)},
     }[named]
     step = custody_host.keep_the_key_step(settings, new_store=False, environ=environ)
     assert "named by MEFOR_CUSTODY_DIRECTORY here" in step, step
     assert ("a new secrets directory, named by MEFOR_SECRETS_DIRECTORY" in step) is (
         named == "secrets"
     ), step
-    beside = named == "neither" and backend is StoreBackend.SQLITE
-    assert ("a new SQLite path in a directory of its own" in step) is beside, step
+    beside = named in ("neither", "custody is the data directory") and (
+        backend is StoreBackend.SQLITE
+    )
+    assert ("a new SQLite path in a directory with no master.key" in step) is beside, step
     assert ("Point [store]" in step) is beside, step
+    # PR 3168 review round-ddf319bc80: with no key file left in place, as provision-admin's
+    # missing-key refusal has, nothing but a new custody directory and the caller's own ask.
+    none_left = custody_host.keep_the_key_step(
+        settings, new_store=False, environ=environ, key_file_left=False
+    )
+    assert "MEFOR_SECRETS_DIRECTORY" not in none_left and "Point [store]" not in none_left
+
+
+@host_file_platforms
+@pytest.mark.parametrize("named", ["neither", "custody is the data directory"])
+def test_the_way_on_from_a_key_file_beside_the_store_reaches_a_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: str
+) -> None:
+    """PR 3168 review round-ddf319bc80: mint_target's refusal of a key file beside the store keeps
+    the store location by its caller, so the step moves it; following the step's text reaches a
+    mint, through mint_target, with the key file left in place."""
+    store_dir = tmp_path / "old"
+    store_dir.mkdir()
+    if named == "neither":
+        environ: dict[str, str] = {}
+    else:
+        environ = {"MEFOR_CUSTODY_DIRECTORY": str(_own_custody_directory(store_dir / "c"))}
+        store_dir = Path(environ["MEFOR_CUSTODY_DIRECTORY"])
+    settings = _settings(store_dir)
+    kept = store_dir / custody_host.HOST_FILE_NAME
+    kept.write_bytes(b"not read")
+    with pytest.raises(FileExistsError) as refused:
+        mint_target(settings, service_account=None, enforcing=True, environ=environ)
+    text = " ".join(str(refused.value).split())
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in text, text
+    assert "a new SQLite path in a directory with no master.key" in text, text
+    followed = {"MEFOR_CUSTODY_DIRECTORY": str(_own_custody_directory(tmp_path / "custody"))}
+    (tmp_path / "new").mkdir()
+    moved = settings.model_copy(update={"path": str(tmp_path / "new" / "store.db")})
+    target = mint_target(moved, service_account=None, enforcing=True, environ=followed)
+    assert target == tmp_path / "custody" / custody_host.HOST_FILE_NAME
+    assert kept.read_bytes() == b"not read"
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "win32"), reason="mints on Linux and Windows")
+@pytest.mark.parametrize("named", ["MEFOR_CUSTODY_DIRECTORY", "MEFOR_SECRETS_DIRECTORY", None])
+def test_the_unusable_directory_refusals_name_their_own_way_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: str | None
+) -> None:
+    """PR 3168 hold items 12 and 13: a missing custody directory may be created with its access
+    list, and nothing else is offered for making by hand; the --db alternative keeps "on a local
+    file system" where the volume is refused; the secrets directory is not offered for writing."""
+    from messagefoundry import restricted_file
+
+    missing = tmp_path / "missing"
+    with pytest.raises(HostCustodyRefused) as refused:
+        custody_host._refuse_an_unusable_directory(missing, service_account=None, named=named)
+    text = " ".join(str(refused.value).split())
+    created = "create it with the access list docs/SERVICE.md, 'The custody directory under"
+    assert (created in text) is (named == "MEFOR_CUSTODY_DIRECTORY"), text
+    assert "create it," not in text, text
+    monkeypatch.setattr(restricted_file, "can_add_a_file", lambda _d: True)
+    monkeypatch.setattr(
+        restricted_file, "key_directory_volume_problem", lambda _d: "a network share"
+    )
+    with pytest.raises(HostCustodyRefused) as volume:
+        custody_host._refuse_an_unusable_directory(tmp_path, service_account=None, named=named)
+    text = " ".join(str(volume.value).split())
+    assert "can add a file to, on a local file system" in text, text
+    assert ("in a new data directory, on a local file system" in text) is (named is None), text
+    monkeypatch.setattr(restricted_file, "can_add_a_file", lambda _d: False)
+    with pytest.raises(HostCustodyRefused) as no_add:
+        custody_host._refuse_an_unusable_directory(tmp_path, service_account=None, named=named)
+    text = str(no_add.value)
+    assert ("Let this account add files there" in text) is (named != "MEFOR_SECRETS_DIRECTORY"), (
+        text
+    )
 
 
 @windows_only
@@ -2717,7 +2795,7 @@ def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
     assert _run_provision_admin(tmp_path, monkeypatch, store_path) == 2
     err = " ".join(capsys.readouterr().err.split())
     assert "named by MEFOR_CUSTODY_DIRECTORY here" in err, err
-    assert "a new SQLite path in a directory of its own" in err, err
+    assert "a new SQLite path in a directory with no master.key" in err, err
     new_secrets = "a new secrets directory, named by MEFOR_SECRETS_DIRECTORY"
     assert (new_secrets in err) is (kept_in == "the secrets directory"), err
     left = {path: path.read_bytes() for path in (kept, store_path)}

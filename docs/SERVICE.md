@@ -402,7 +402,10 @@ tell whose key a file holds, and either file may be the only copy of a store's k
    certificate pair the same way, both files. Once the service has opened its store from the
    copies:
    - **A `master.key` original:** keep it as a second copy of the store's key, but take the
-     service's access to it away first. Moving a file into another folder does not do that: the
+     service's access to it away first. Record its owner and list before you change them
+     (`(Get-Acl -LiteralPath <file>).Sddl`), and keep that record with it: the engine reads it as
+     a key file again only once that owner and list are back, and only as the account it was
+     written for. Moving a file into another folder does not do that: the
      file keeps its own owner and access list, and an account that list names can still open it
      by its path. Set the original's owner and list, then check both
      (`icacls <file> /setowner *S-1-5-32-544`, then
@@ -431,7 +434,9 @@ to a new directory owned by the account the engine runs as, mode 0700, in a fold
 account or root may write, and add the engine's other secret files to a new secrets directory. A move
 within one file system keeps the file's owner and mode; across file systems, copy it keeping them
 (`cp -p`, as root). Once the engine has opened its store from the copy, move the original, within
-its file system, into a folder only root can read, and keep it there; never delete it.
+its file system, into a folder only root can read, and keep it there; never delete it. On
+Windows, set a kept original's owner and list as step 5 says rather than only moving it, and
+delete a `handoff.key` original once the service has started from the copy, as step 5 says.
 
 ## Update to a new build (restart vs reinstall)
 

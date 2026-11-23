@@ -157,8 +157,8 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   BACKLOG #3411).** Under `[store].key_provider = 'host'` the service's first start writes its own
   key file, `master.key`, beside the `handoff.key` an administrator's `provision-admin
   --service-account` left. The installer adds the service's read grant on this directory and
-  takes no wider grant away, so a write grant the service already holds, such as one the Vault
-  Agent sink route gives it, survives a rerun; the engine does not refuse one either, since
+  keeps a grant the service account itself already holds there, so a write grant given to that
+  account, such as one the Vault Agent sink route gives it, survives a rerun; the engine does not refuse one either, since
   decision 4's check passes a directory one named account may write. A service right to add a
   file here would let it supply a secret-class setting. So those two files move to a directory of their own when
   `MEFOR_CUSTODY_DIRECTORY` names one, an absolute path, which wins over `MEFOR_SECRETS_DIRECTORY`

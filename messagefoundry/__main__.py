@@ -10592,7 +10592,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # On a server the probe refused only a store with a genesis record or with data.
                 held = "exists" if settings.store.backend is StoreBackend.SQLITE else "holds data"
                 step = keep_the_key_step(
-                    settings.store, new_store=True, service_account=args.service_account
+                    settings.store,
+                    new_store=True,
+                    service_account=args.service_account,
+                    key_file_left=False,
                 )
                 raise HostCustodyRefused(
                     f"the store already {held}, and {missing}. A new key cannot open a store "
