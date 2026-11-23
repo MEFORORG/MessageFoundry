@@ -284,17 +284,22 @@ def rename_code_set(
         try:
             rewritten = len(impact.write_rename(prepared))
         except impact.RenameWriteError as exc:
-            if exc.unrestored:
+            # A file the write could not restore, read again: one that holds the bytes the plan
+            # read names the old table after all, and one that cannot be read counts as left,
+            # as after an interrupt.
+            unrestored = set(exc.unrestored)
+            still_new = [f for f in impact.rewritten_files(prepared) if f in unrestored]
+            if still_new:
                 # A reference that may be left naming the new table would lose it to a move back,
-                # so the code set stays, as after an interrupt that leaves a file it cannot read.
-                # The message names the files config-relative, and the error by its type only.
-                left, others = _reference_split(config_dir, prepared, exc.unrestored)
+                # so the code set stays. The message names the files config-relative, and the
+                # error by its type only.
+                left, others = _reference_split(config_dir, prepared, still_new)
                 raise WiringError(
                     f"cannot rename code set {old!r} to {new!r}: a reference write failed "
                     f"({_cause_name(exc)}), and these could not be restored and may still name "
                     f"{new!r}: {left}. The code set stays as {_pair(dest, had_sidecar)}; these "
                     f"name {old!r}: {others}. Rewrite the references to one name by hand, and "
-                    "move the code set to match"
+                    f"move the code set to match: to keep {old!r}, put it back as {home}"
                 ) from exc
             # A write failed and the files written were restored, so the table moves back to the
             # name they read. The move back is never undone: a half that fails leaves what moved

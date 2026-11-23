@@ -970,23 +970,78 @@ def test_rename_move_back_with_a_refused_sidecar_keeps_the_pair_together(
     )
 
 
+def _referrer_module(n: str) -> str:
+    """A config module whose handler names code set ``diets``, with its own connection names."""
+    return (
+        "from messagefoundry import MLLP, Send, code_set, handler, inbound, outbound, router\n"
+        "\n"
+        f'inbound("IB_{n}", MLLP(port={2700 + ord(n)}), router="r_{n}")\n'
+        f'outbound("OB_{n}", MLLP(host="127.0.0.1", port={6300 + ord(n)}))\n'
+        "\n"
+        "\n"
+        f'@router("r_{n}")\n'
+        f"def r_{n}(msg):\n"
+        f'    return ["h_{n}"]\n'
+        "\n"
+        "\n"
+        f'@handler("h_{n}")\n'
+        f"def h_{n}(msg):\n"
+        '    label = code_set("diets").get("A")\n'
+        f'    return Send("OB_{n}", msg)\n'
+    )
+
+
+def _unrestored_write(monkeypatch: pytest.MonkeyPatch, *, rewrite: bool) -> None:
+    """A referent write that leaves ``mod_a.py`` unrestored: rewritten to the new name with
+    ``rewrite``, else still holding what the plan read."""
+    from messagefoundry.config import impact
+
+    def fail(prepared: impact.PreparedRename) -> list[object]:
+        (file,) = [f for f, _raw, _new in prepared.files if f.endswith("mod_a.py")]
+        if rewrite:
+            Path(file).write_bytes(next(new for f, _raw, new in prepared.files if f == file))
+        raise impact.RenameWriteError(f"writing {file} failed", [file])
+
+    monkeypatch.setattr(impact, "write_rename", fail)
+
+
+def _with_referrers(tmp_path: Path) -> Path:
+    _with_policy(tmp_path, "diets")
+    for n in ("a", "b"):
+        (tmp_path / f"mod_{n}.py").write_text(_referrer_module(n), encoding="utf-8", newline="")
+    return _codesets(tmp_path)
+
+
 def test_rename_write_with_an_unrestored_reference_keeps_the_code_set_under_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A reference the failed write could not restore still names the new table, so moving the
     pair back would take the table from under it: it stays, and the error says which reference
-    reads which name, config-relative."""
-    _with_policy(tmp_path, "diets")
-    left = tmp_path / "routers" / "route_diets.py"
-    _fail_referent_write(monkeypatch, unrestored=[str(left)])
+    reads which name, and where the pair belongs under the old name, config-relative."""
+    cs_dir = _with_referrers(tmp_path)
+    _unrestored_write(monkeypatch, rewrite=True)
     with pytest.raises(WiringError) as err:
         codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
-    cs_dir = _codesets(tmp_path)
     assert sorted(os.listdir(cs_dir)) == ["meals.csv", "meals.policy.toml"]
+    assert 'code_set("meals")' in (tmp_path / "mod_a.py").read_text(encoding="utf-8")
     message = str(err.value)
-    assert "may still name 'meals': routers/route_diets.py" in message
+    assert "may still name 'meals': mod_a.py." in message
+    assert "these name 'diets': mod_b.py." in message
     assert "stays as codesets/meals.csv and codesets/meals.policy.toml" in message
+    assert "put it back as codesets/diets.csv and codesets/diets.policy.toml" in message
     assert str(tmp_path) not in message
+
+
+def test_rename_write_with_an_unrestored_but_unchanged_reference_moves_the_code_set_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file the write reports unrestored that still reads as the plan read it, such as one whose
+    own write failed before it changed, names the old table: the pair moves back to it."""
+    cs_dir = _with_referrers(tmp_path)
+    _unrestored_write(monkeypatch, rewrite=False)
+    with pytest.raises(WiringError, match="moved back to codesets/diets.csv"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(os.listdir(cs_dir)) == ["diets.csv", "diets.policy.toml"]
 
 
 def test_rename_move_back_names_the_sidecar_too(
