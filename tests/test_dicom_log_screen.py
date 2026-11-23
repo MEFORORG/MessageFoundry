@@ -299,6 +299,37 @@ def test_a_message_whose_str_raises_is_withheld() -> None:
     assert _PLANTED not in written and _WITHHELD in written
 
 
+def test_traceback_text_already_on_a_record_is_not_written() -> None:
+    # A record that a formatter has seen, or one rebuilt from a queue, carries exc_text, which a
+    # formatter writes in preference to exc_info.
+    exc = RuntimeError("Unable to decode the received PDU data")
+    info = (RuntimeError, exc, None)
+    for exc_info in (info, None):
+        record = logging.LogRecord(
+            "pynetdicom.dul", logging.ERROR, __file__, 1, "Network timeout reached", (), exc_info
+        )
+        record.exc_text = f"Traceback naming {_PLANTED}"
+        assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+        assert _PLANTED not in logging.Formatter("%(message)s").format(record)
+
+
+@pytest.mark.parametrize(
+    "exc_info", [(), (None, None, None), (ValueError, "not an exception", None)]
+)
+def test_a_malformed_exc_info_does_not_raise(exc_info: tuple[object, ...]) -> None:
+    record = logging.LogRecord(
+        "pynetdicom.dul",
+        logging.ERROR,
+        __file__,
+        1,
+        f"value {_PLANTED}",
+        (),
+        exc_info,  # type: ignore[arg-type]
+    )
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    assert _PLANTED not in record.getMessage()
+
+
 def test_a_line_break_in_a_value_cannot_forge_a_second_line() -> None:
     # `.` stops at a line break, so the value slot does not span it and no template matches.
     forged = f"Calling Application Name:    A\nAssociation Accepted {_PLANTED}"
@@ -543,6 +574,7 @@ def test_every_template_compiles_and_matches_its_own_shape() -> None:
         "assoc_reason": "Reserved",
         "context_result": "Accepted",
         "identity_type": "SAML",
+        "dataset_encoding": "Little Endian Implicit",
     }
     for text in _iter_templates():
         filled = re.sub(

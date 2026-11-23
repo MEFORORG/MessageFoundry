@@ -45,7 +45,7 @@ _SLOT_PATTERNS = {
     "tag": r"[0-9A-F]{4},[0-9A-F]{4}",
     "name": r"[A-Za-z][A-Za-z /-]{0,63}",
     "keyword": r"[A-Za-z0-9]{1,64}",
-    "message_type": r"[A-Za-z][A-Za-z -]{0,31}",
+    "message_type": r"[CN][-_][A-Z_-]{2,24}",
     "role": r"SCU|SCP",
     "roles": r"SCP/SCU|SCP|SCU|Default|",
     "codecs": r"[A-Za-z0-9_, -]{1,64}",
@@ -85,6 +85,7 @@ _SLOT_PATTERNS = {
         r"|Rejected - Transfer Syntax Not Supported|\(no value available\)"
     ),
     "identity_type": r"Username/Password|Username|Kerberos|SAML|JSON Web Token",
+    "dataset_encoding": r"(?:Deflated )?(?:Little|Big) Endian (?:Implicit|Explicit)",
 }
 
 #: The slots whose text is never kept.
@@ -131,6 +132,7 @@ TEMPLATES: tuple[str, ...] = (
     "Invalid 'User Identity Type' {int}",
     "Non-conformant VM {int} for '{keyword}', taking the first value",
     "maximum_pdu_size set to {int}",
+    'pydicom.read_dataset() TransferSyntax="{dataset_encoding}"',
     # --- A SOP class or transfer syntax the peer named ---
     "No presentation context for '{quoted_uid}' has been accepted by the peer for the {role} role",
     "No presentation context for '{quoted_uid}' has been accepted by the peer with "

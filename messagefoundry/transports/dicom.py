@@ -696,7 +696,7 @@ def _screen_record(record: logging.LogRecord) -> None:
         return
     record.__dict__[_SCREENED] = True
     info = record.exc_info
-    exc = info[1] if isinstance(info, tuple) else None
+    exc = info[1] if isinstance(info, tuple) and len(info) > 1 else None
     try:
         line = _screened_line(record.getMessage())
     except Exception as failed:  # noqa: BLE001 - bad %-args, or a msg whose str() raises
@@ -720,8 +720,10 @@ def _screen_record(record: logging.LogRecord) -> None:
         record.exc_text = f"{type(exc).__name__} (traceback withheld: it did not render)"
         logger.debug("A DICOM traceback was withheld: %s", type(failed).__name__)
         return
+    # Cleared when nothing changed too: a formatter prefers exc_text, which has not been read.
+    record.exc_text = rendered
     if rendered is not None:
-        record.exc_info, record.exc_text = None, rendered
+        record.exc_info = None
 
 
 class _PeerValueFilter(logging.Filter):

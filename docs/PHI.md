@@ -365,11 +365,11 @@ path** (no separate at-rest tier):
   (SOPClassUID / Modality / UIDs / AE title), never the dataset or element values. That rule covers
   third-party library loggers too, such as pynetdicom's and pydicom's, and a peer-sent value either
   library refuses or flags as non-conformant must never be logged verbatim (owner ruling 2026-11-03,
-  BACKLOG #5081). The DICOM transport applies that rule through a log filter that redacts the value
-  from at least a list of known pynetdicom and pydicom line shapes, so it meets the rule only for
-  those shapes. A line of a new shape, such as a library upgrade could add, passes whole until it is
-  added. The pin tests fail when either library's version changes in the environment they run in,
-  which is not a site's own install. The list, and what it does not cover, is in
+  BACKLOG #5081). The DICOM transport applies that rule by default-deny on those libraries' loggers
+  (BACKLOG #6637): a line that matches no pinned template is withheld, and names only its logger,
+  level and exception class. A line a library upgrade adds is therefore withheld until it is pinned.
+  The pin tests fail when either library's version changes in the environment they run in,
+  which is not a site's own install. What stays, what an operator loses and the limits are in
   [DICOM.md](DICOM.md) section 5. (Pixel data can carry
   *burned-in* PHI, but **pixel-data handling is out of scope.**)
 - **Base64-carried binary bodies `[BUILT]` (ADR 0028).** A base64-encoded body is **still PHI** —
