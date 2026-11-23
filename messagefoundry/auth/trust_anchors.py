@@ -252,11 +252,12 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     device at the path among them, or an ACL or path that could not be read, since whoever
     swapped the file can make its ACL unreadable. Some file read faults set nothing
     (:func:`_transient_read_fault`, which lists at least which): a file not there, as between the
-    steps of some renewals, any ``PermissionError``, as while a scanner holds the file, and a
-    network or I/O fault under the read, such as a share whose network name went away. Since every
+    steps of some renewals, any ``PermissionError``, as while a scanner holds the file, and some
+    network or I/O faults, such as a share whose network name went away. Since every
     ``PermissionError`` counts, a sharing violation among them, a party who can deny the engine
-    reads of the pin file can keep the hold from being set; that is a known residual. Any other
-    ``OSError`` sets the hold. What it refuses: at least the new connects the
+    reads of the pin file can keep the hold from being set, as can one who can make the read fail
+    with one of those network faults; these are known residuals, which that function names. Any
+    other ``OSError`` sets the hold. What it refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -2915,34 +2916,46 @@ async def _preflight_one(
         raise
 
 
-#: Windows error codes for a network path or connection lost under a read (module item 11):
-#: ERROR_BAD_NETPATH, ERROR_UNEXP_NET_ERR, ERROR_NETNAME_DELETED, ERROR_BAD_NET_NAME,
-#: ERROR_NETWORK_UNREACHABLE and ERROR_CONNECTION_ABORTED. Python maps 53 and 67 to
+#: Windows error codes for a network path, host or connection lost under a read (module item
+#: 11): ERROR_BAD_NETPATH, ERROR_DEV_NOT_EXIST, ERROR_UNEXP_NET_ERR, ERROR_NETNAME_DELETED,
+#: ERROR_BAD_NET_NAME, ERROR_SEM_TIMEOUT (the usual timeout on a share), ERROR_NETWORK_UNREACHABLE,
+#: ERROR_HOST_UNREACHABLE and ERROR_CONNECTION_ABORTED. Python maps 53 and 67 to
 #: ``FileNotFoundError`` already; they are listed so the rule does not rest on that mapping.
-_TRANSIENT_WINERRORS: frozenset[int] = frozenset({53, 59, 64, 67, 1231, 1236})
+_TRANSIENT_WINERRORS: frozenset[int] = frozenset({53, 55, 59, 64, 67, 121, 1231, 1232, 1236})
 
 
 def _transient_read_fault(exc: OSError | ValueError) -> bool:
     """Whether reading an anchor failed in a way that sets no store pin hold (module item 11),
-    since the next check may not repeat it. At least these: a file not there, as between the two
-    steps of some renewals; any ``PermissionError``; a network or I/O fault under the read, which
-    is a ``ConnectionError`` or ``TimeoutError``, ``EIO``, or on Windows one of
-    :data:`_TRANSIENT_WINERRORS`, such as a share whose network name went away.
+    since the next check may not repeat it. At least these: a ``FileNotFoundError``, as between
+    the two steps of some renewals; any ``PermissionError``; and a network or I/O fault, which is
+    a ``ConnectionError`` other than ``BrokenPipeError``, a ``TimeoutError``, ``EIO``, or an
+    ``OSError`` whose Windows error code is one of :data:`_TRANSIENT_WINERRORS`. On Windows at
+    least ``os.stat`` and ``os.fstat`` carry that code; at least some failures of the open and
+    of the read itself carry none, so a share lost at those steps can still set the hold.
 
-    **Every** ``PermissionError`` counts, a Windows sharing or lock violation among them, since
-    that is what a scanner holding the file arrives as and the read cannot tell it from a denied
-    read. **That is a known residual**: a party who can deny the engine reads of the pin file,
-    or hold it open without sharing, can keep a refusal at ``enforce`` from setting the hold, so
-    new store connects go on while the file stays unreadable. Each such check still refuses the
+    **Known residuals.** Every ``PermissionError`` counts, a Windows sharing or lock violation
+    among them, since that is what a scanner holding the file arrives as and the read cannot tell
+    it from a denied read. So a party who can deny the engine reads of the pin file, or hold it
+    open without sharing, can keep a refusal at ``enforce`` from setting the hold, and new store
+    connects go on while the file stays unreadable. The same holds for a party who can make the
+    read fail with one of the network or I/O faults above, such as one who controls the share or
+    the network path to it. Windows also reports at least some malformed paths as
+    ``FileNotFoundError``, which then sets no hold either. Each such check still refuses the
     reload.
 
-    Verdicts about the file still set the hold: at least a pipe or device refused as not a
-    regular file, a path the OS cannot take, and any other ``OSError``."""
+    What still sets the hold: at least a pipe or device refused as not a regular file, a
+    ``BrokenPipeError``, which is how a pipe at the path can fail on Windows, a ``ValueError``
+    for a path Python will not pass to the OS, and any other ``OSError``."""
+    if isinstance(exc, BrokenPipeError):
+        return False
     if isinstance(exc, (FileNotFoundError, PermissionError, ConnectionError, TimeoutError)):
         return True
     if not isinstance(exc, OSError):
         return False
-    return exc.errno == errno.EIO or getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS
+    winerror = getattr(exc, "winerror", None)
+    return exc.errno == errno.EIO or (
+        isinstance(winerror, int) and winerror in _TRANSIENT_WINERRORS
+    )
 
 
 async def _preflight_checks(

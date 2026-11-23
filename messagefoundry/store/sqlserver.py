@@ -3480,12 +3480,16 @@ class _PinGatedExecutor(ThreadPoolExecutor):
     other call runs as before.
 
     **The gate depends on that shape.** It refuses a call only when :func:`_is_odbc_connect`
-    reads it as ``pyodbc.connect``, bare or as a ``functools.partial``. An aioodbc that dialled
-    off this executor, or wrapped the connect in another callable, would dial with no refusal.
+    reads it as ``pyodbc.connect``, bare or as a ``functools.partial``, as it reaches ``submit``
+    through the event loop's ``run_in_executor``. An aioodbc whose pool stopped handing this
+    executor to its connects, that dialled off it, or that wrapped the connect in another
+    callable, would dial with no refusal.
     ``test_the_installed_aioodbc_submits_its_connect_in_the_shape_the_gate_reads`` in
-    ``tests/test_store_pin_connect_refusal.py`` drives the installed aioodbc's own ``connect``
-    over a stub ``pyodbc.connect`` and fails if the shape changes; it runs where the
-    ``sqlserver`` extra is installed, so re-read it on any change to the aioodbc pin."""
+    ``tests/test_store_pin_connect_refusal.py`` drives the installed aioodbc's own
+    ``create_pool``, at its fill and at a grow, over a stub ``pyodbc.connect``, and fails if
+    the shape changes. It runs only where the ``sqlserver`` extra is installed, at least in CI's
+    path-gated ``sqlserver-store`` leg, which a change to the aioodbc pin or the lock files alone
+    may not start, so run it by hand with the extra installed on any such change."""
 
     def __init__(self, spec: AnchorSpec, **kwargs: Any) -> None:
         super().__init__(**kwargs)

@@ -9,9 +9,9 @@ Step 11, re-scoped: after a settings check at ``enforce`` refuses the SQL Server
 store refuses new connects. Item 11 of the trust anchors module docstring states the hold.
 
 ``aioodbc`` and ``pyodbc`` are the optional ``sqlserver`` extra, so recording modules stand in for
-them through ``sys.modules``, as ``tests/test_sqlserver_login_timeout.py`` does. The one test that
-needs the real ``aioodbc`` skips without it: it pins that aioodbc 0.5.0's pool connect reaches the
-executor as ``pyodbc.connect``, which is what the executor gate keys on.
+them through ``sys.modules``, as ``tests/test_sqlserver_login_timeout.py`` does. At least the two
+tests that need the real ``aioodbc`` skip without it: they pin that aioodbc 0.5.0's connect, and
+its pool's, reach the executor as ``pyodbc.connect``, which is what the executor gate keys on.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def _fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
 
 
-def _winerror(code: int, message: str) -> OSError:
+def _winerror(code: object, message: str) -> OSError:
     """An ``OSError`` carrying a Windows error code on any platform. CPython sets ``winerror``
     only on Windows, so elsewhere it is set by hand, as the read would see it there."""
     exc = OSError(errno.EINVAL, message)
@@ -452,19 +452,23 @@ async def test_aioodbc_dials_through_the_pool_executor_as_pyodbc_connect(
         executor.shutdown(wait=True)
 
 
+@pytest.mark.parametrize("minsize", [1, 0], ids=["pool-fill", "pool-grow"])
 async def test_the_installed_aioodbc_submits_its_connect_in_the_shape_the_gate_reads(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, minsize: int
 ) -> None:
     """The canary for the gate's dependency on aioodbc: ``_PinGatedExecutor`` refuses a call only
     when :func:`~messagefoundry.store.sqlserver._is_odbc_connect` reads it as ``pyodbc.connect``,
-    bare or as a ``functools.partial``. This drives the installed aioodbc's real ``connect`` into
-    an executor with no gate that records each call, over a stub ``pyodbc.connect``, and fails if
-    the dial reached the stub without one recorded call in that shape, as it would if aioodbc
-    dialled off the executor or wrapped the connect in another callable. No server is reached.
-    Skipped without the ``sqlserver`` extra; it runs where that extra is installed."""
+    bare or as a ``functools.partial``. This drives the installed aioodbc's own ``create_pool``,
+    as the store opens its pool, into an executor with no gate that records each call, over a
+    stub ``pyodbc.connect``: once as the pool fills to its minimum at creation, and once as a pool
+    with none grows at an acquire. It fails if the dial reached the stub without one recorded
+    call in that shape, as it would if the pool stopped handing the executor to its connects,
+    aioodbc dialled off the executor, or it wrapped the connect in another callable. No server is
+    reached. Skipped without the ``sqlserver`` extra; it runs where that extra is installed."""
     aioodbc = pytest.importorskip("aioodbc")
     pytest.importorskip("pyodbc")
     submitted: list[Any] = []
+    dialled: list[str] = []
 
     class _Recording(ThreadPoolExecutor):
         def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
@@ -475,13 +479,50 @@ async def test_the_installed_aioodbc_submits_its_connect_in_the_shape_the_gate_r
         pass
 
     def connect(dsn: str, **_kwargs: Any) -> object:
+        dialled.append(dsn)
         raise _Stop(dsn)
 
     monkeypatch.setattr(sys.modules["pyodbc"], "connect", connect)
     executor = _Recording(max_workers=1)
     try:
         with pytest.raises(_Stop):
-            await aioodbc.connect(dsn="DRIVER=x", executor=executor)
+            pool = await aioodbc.create_pool(
+                dsn="DRIVER=x", minsize=minsize, maxsize=1, executor=executor
+            )
+            try:
+                await pool.acquire()
+            finally:
+                pool.close()
+                await pool.wait_closed()
     finally:
         executor.shutdown(wait=True)
+    assert dialled == ["DRIVER=x"]
     assert [fn for fn in submitted if _is_odbc_connect(fn)], submitted
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        BrokenPipeError(errno.EPIPE, "The pipe has been ended"),  # a pipe at the path, on Windows
+        _winerror(87, "The parameter is incorrect"),  # a code outside the network set
+        _winerror(["64"], "a winerror that is not an int"),
+    ],
+    ids=["broken-pipe", "winerror-87", "winerror-not-int"],
+)
+async def test_a_read_fault_outside_the_transient_set_sets_the_hold(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: OSError
+) -> None:
+    """The negative controls for the transient set: a pipe fault, a Windows code outside the
+    network set, and a ``winerror`` that is not an int each set the hold. Red under: every
+    ``ConnectionError`` counted transient, any ``winerror`` counted transient, or a membership
+    test that raises on a value it cannot hash."""
+    settings = _settings(_pin(tmp_path))
+
+    def unreadable(_spec: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(ta, "evaluate_anchor", unreadable)
+    with pytest.raises(TrustAnchorError, match="could not read the trust anchor"):
+        await run_anchor_preflight(_specs(settings), store, enforcing=True)
+    with pytest.raises(StorePinConnectRefused):
+        refuse_connect_after_pin_refusal(settings)
