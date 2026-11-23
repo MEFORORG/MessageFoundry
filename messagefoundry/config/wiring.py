@@ -4834,7 +4834,8 @@ def DICOM(
     timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: deadline per read and send, >= 1 s
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
     min_message_bytes_per_second: int = _ROLE_DEFAULT,  # SCP: the rate in each message's deadline;
-    # unset = 64 KiB a second. Lower it for a slower link. At least 8 KiB a second: it cannot be off.
+    # unset = 64 KiB a second. Lower it for a slower link. At least 8 KiB a second: it cannot be
+    # off. Refused on an outbound.
 ) -> ConnectionSpec:
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
     with ``content_type="dicom"`` on ``inbound(...)`` so a received object is base64-carried (ADR 0028)

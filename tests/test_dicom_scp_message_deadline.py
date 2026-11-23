@@ -314,6 +314,12 @@ def test_no_value_can_switch_the_per_message_deadline_off(value: object) -> None
         _build_scp([], min_message_bytes_per_second=value)
 
 
+@pytest.mark.parametrize("value", [0, 16 * 1024])
+def test_the_setting_on_an_outbound_is_refused_rather_than_ignored(value: int) -> None:
+    with pytest.raises(ValueError, match="min_message_bytes_per_second"):
+        _scu(1, min_message_bytes_per_second=value)
+
+
 def test_the_factory_passes_the_setting_and_writes_none_it_was_not_given() -> None:
     from messagefoundry.config.wiring import DICOM
 

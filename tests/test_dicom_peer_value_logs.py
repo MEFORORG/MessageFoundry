@@ -1859,6 +1859,49 @@ def test_a_tag_and_quote_on_any_other_line_stay_as_they_are() -> None:
     assert _filtered("pydicom", line) == line
 
 
+def test_a_private_creator_holding_a_double_quote_is_redacted() -> None:
+    # repr() of the KeyError's line then escapes each single quote, which moves the shape's head.
+    creator = f"['{_PLANTED}\"X', 'B']"
+    error = KeyError(f"(0009,0010) '{creator}' is not a valid private creator")
+    assert _PLANTED in str(error)  # CONTROL
+    assert _PLANTED not in dicom_module._safe_library_exc(error)
+
+
+@pytest.mark.parametrize(
+    "convert",
+    ["DS", "IS", "DSfloat"],
+)
+def test_pythons_number_error_on_a_peers_text_loses_the_value(convert: str) -> None:
+    from pydicom import valuerep
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(ValueError) as raised:
+            getattr(valuerep, convert)("DOE^JANE")
+    assert "DOE^JANE" in str(raised.value)  # CONTROL
+    assert "DOE^JANE" not in dicom_module._safe_library_exc(raised.value)
+    assert "DOE^JANE" not in _filtered("pynetdicom.events", str(raised.value))
+
+
+def test_pydicoms_wrong_length_warning_copy_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydicom import config
+    from pydicom.dataelem import RawDataElement, convert_raw_data_element
+    from pydicom.tag import Tag
+
+    monkeypatch.setattr(config, "convert_wrong_length_to_UN", True)
+    element = RawDataElement(Tag(0x0028, 0x0010), "US", 3, b"SEC", 0, False, True)
+
+    with warnings.catch_warnings(record=True) as caught:  # CONTROL: unignored, it quotes the bytes
+        warnings.simplefilter("always")
+        convert_raw_data_element(element)
+    assert [w for w in caught if "b'SEC'" in str(w.message)]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dicom_module._redact_flagged_peer_values()
+        convert_raw_data_element(element)
+    assert not [w for w in caught if "b'SEC'" in str(w.message)]
+
+
 def test_the_private_creator_line_is_still_pydicoms() -> None:
     import inspect
 
@@ -1909,19 +1952,76 @@ def _object_whose_instance_uid_will_not_read() -> bytes:
     return broken
 
 
+def _object_with_instance(value: Any) -> bytes:
+    """A synthetic object whose SOP Instance UID is ``value``, or absent where that is ``None``."""
+    from pydicom import dcmread
+
+    from tests._dicom_sample import make_sr_part10
+
+    dataset = dcmread(io.BytesIO(make_sr_part10()))
+    if value is None:
+        del dataset.SOPInstanceUID
+    else:
+        dataset.SOPInstanceUID = value
+    buffer = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dataset.save_as(buffer)
+    return buffer.getvalue()
+
+
+def _object_with_two_transfer_syntaxes() -> bytes:
+    """A synthetic object whose file meta names two transfer syntaxes, by editing its bytes, since
+    pydicom will not write one. The group length moves with it."""
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    found = data.find(b"\x02\x00\x10\x00UI")
+    assert found > 0
+    length = int.from_bytes(data[found + 6 : found + 8], "little")
+    first = data[found + 8 : found + 8 + length].rstrip(b"\x00")
+    value = first + b"\\1.2.840.10008.1.2"
+    value += b"\x00" * (len(value) % 2)
+    grown = len(value) - length
+    broken = (
+        data[: found + 6] + len(value).to_bytes(2, "little") + value + data[found + 8 + length :]
+    )
+    meta_length_at = broken.find(b"\x02\x00\x00\x00UL") + 8
+    meta_length = int.from_bytes(broken[meta_length_at : meta_length_at + 4], "little")
+    return (
+        broken[:meta_length_at]
+        + (meta_length + grown).to_bytes(4, "little")
+        + broken[meta_length_at + 4 :]
+    )
+
+
 @pytest.mark.parametrize(
     "build",
-    [lambda: _object_with_class(_PLANTED_REFUSED), _object_whose_instance_uid_will_not_read],
-    ids=["refused-sop-class", "instance-uid-does-not-read"],
+    [
+        lambda: _object_with_class(_PLANTED_REFUSED),
+        _object_whose_instance_uid_will_not_read,
+        lambda: _object_with_instance(None),
+        lambda: _object_with_instance(""),
+        lambda: _object_with_instance(["1.2.3", "1.2.4"]),
+        _object_with_two_transfer_syntaxes,
+    ],
+    ids=[
+        "refused-sop-class",
+        "instance-uid-does-not-read",
+        "no-instance-uid",
+        "empty-instance-uid",
+        "two-instance-uids",
+        "two-transfer-syntaxes",
+    ],
 )
 async def test_an_object_the_scu_cannot_propose_is_a_bad_object(
     build: Callable[[], bytes],
 ) -> None:
     from messagefoundry.transports.base import NegativeAckError
-    from tests.test_dicom_scu import _carry, _scu
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
 
-    with pytest.raises(NegativeAckError) as raised:
-        await _scu(1).send(_carry(build()))
+    with _storage_scp() as port, pytest.raises(NegativeAckError) as raised:
+        await _scu(port).send(_carry(build()))
     assert raised.value.code == "bad-object"
     assert raised.value.permanent is True
     assert _PLANTED_REFUSED not in str(raised.value)

@@ -597,11 +597,16 @@ _REFUSALS: tuple[_Shape, ...] = (
             r"\d+\."
         ),
         anywhere=True,
+        warning=r"Expected total bytes to be an even multiple of bytes per value\. Instead received ",
     ),
+    # Python's own refusal of a DS or IS that is no number, which quotes the text whole.
+    _Shape(re.compile(r"could not convert string to float: "), anywhere=True),
+    _Shape(re.compile(r"invalid literal for int\(\) with base \d+: "), anywhere=True),
     # A private element's creator with more than one value, which pydicom prints whole, as a line
-    # and in the KeyError it raises, whose str() is the repr of the line and so ends in a quote.
+    # and in the KeyError it raises, whose str() is the repr of the line: it ends in a quote, and
+    # escapes each single quote where the value holds a double one.
     _Shape(
-        re.compile(r"\([0-9A-F]{4},[0-9A-F]{4}\) '"),
+        re.compile(r"\([0-9A-F]{4},[0-9A-F]{4}\) \\?'"),
         _NOT_A_PRIVATE_CREATOR,
         re.compile(_NOT_A_PRIVATE_CREATOR + "[\"']?"),
         anywhere=True,
@@ -2984,6 +2989,12 @@ class DicomScuDestination(DestinationConnector):
             )
         self._host = str(host)
         self._port = port_setting(s.get("port", 104), transport="DICOM-SCU destination")
+        if "min_message_bytes_per_second" in s:
+            # Refused rather than ignored: on a slow link the sender's limit is timeout_seconds.
+            raise ValueError(
+                "DICOM-SCU destination: min_message_bytes_per_second is a setting of the receiving "
+                "SCP; on the sending side, raise timeout_seconds past the object's time on the link"
+            )
         self._calling_ae_title = str(s["ae_title"])
         called = s.get("called_ae_title")
         # pynetdicom's accept-any token when the peer AE title is left unset.
@@ -3140,6 +3151,8 @@ class DicomScuDestination(DestinationConnector):
         re-sends the identical bad object)."""
         _ignore_pydicom_value_warnings()  # ahead of the reads below, which can flag a value
         dcmread = load_dcmread()
+        from pydicom.multival import MultiValue
+
         # Also outside the try, for the same reason: a pydicom without the readers the guard replays is
         # a deploy error, and the broad except below must not turn it into a per-message bad-object.
         load_header_readers()
@@ -3164,7 +3177,16 @@ class DicomScuDestination(DestinationConnector):
             sop_class = str(dataset.SOPClassUID)
             # For the log lines and errors alone; the raw class is what the association proposes.
             # The read is lazy, so an instance UID that does not convert raises here.
-            sop_instance = _loggable_uid(getattr(dataset, "SOPInstanceUID", ""))
+            instance = getattr(dataset, "SOPInstanceUID", "")
+            # Each fails the same way inside send_c_store on every attempt, as an error that reads
+            # as transient there. An absent UID is caught at that call, below.
+            if (
+                isinstance(transfer_syntax, MultiValue)
+                or isinstance(instance, MultiValue)
+                or ("SOPInstanceUID" in dataset and not instance)
+            ):
+                raise ValueError("a transfer syntax or SOP instance UID is not one value")
+            sop_instance = _loggable_uid(instance)
         except Exception as exc:  # noqa: BLE001 - untrusted/forwarded object; never escape as internal
             raise NegativeAckError(
                 "DICOM C-STORE client (SCU): outgoing object is not a parseable DICOM Part-10 object (no retry)",
@@ -3218,6 +3240,13 @@ class DicomScuDestination(DestinationConnector):
                 permanent=True,
             ) from exc
         except Exception as exc:  # noqa: BLE001 - a genuine DIMSE/transport error mid-store is transient
+            if isinstance(exc, AttributeError) and "SOPInstanceUID" not in dataset:
+                # pynetdicom reads the UID before it sends anything; a retry repeats this.
+                raise NegativeAckError(
+                    "DICOM C-STORE client (SCU): outgoing object has no SOP Instance UID (no retry)",
+                    code="bad-object",
+                    permanent=True,
+                ) from exc
             # No response either, so it counts toward the same bound as an empty status below.
             final = self._count_unanswered(_unanswered_key(object_bytes), len(object_bytes))
             if final is not None:

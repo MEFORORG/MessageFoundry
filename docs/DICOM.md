@@ -169,8 +169,11 @@ limits apply:
   there until the object dead-letters at the retry cap, or for as long as it is sent with
   `max_attempts=None`.
 - **The remedy for that band is `min_message_bytes_per_second` on the SCP** (BACKLOG #6637). Set it
-  at or under the link's real rate and the object arrives inside its deadline on its first attempt.
-  It moves only this rate. Raising `timeout_seconds` instead would also loosen every read and send
+  at or under the link's real rate and an object up to the effective `max_object_bytes` arrives
+  inside its deadline on its first attempt. One over that cap, up to twice it, then gets the final
+  `0xC010` once it has arrived, so it dead-letters on its first attempt instead of being cut and
+  retried. The link also has to carry each whole PDU inside the read deadline above, which is
+  `max_pdu_size / timeout_seconds` and which this setting does not move. It moves only this rate. Raising `timeout_seconds` instead would also loosen every read and send
   deadline above. It takes a whole number of at least 8192, which is 8 KiB a second. A smaller
   value, zero and `None` are refused when the connection is built, so the deadline cannot be turned
   off. At that least rate one message can hold a `max_associations` slot for `timeout_seconds` plus
