@@ -469,8 +469,8 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     for fact in (
         "`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`",
-        "only the first refusal of an account in each report interval",
-        "adds no row and no alert",
+        "only the first refusal under a report key in each report interval",
+        "writes no `integrity.authority_seal_failed` row and raises no alert",
         "one absent on a re-read reads as gone",
         "A row still there after every check raced fails closed",
         "One that keeps changing the row's own `id` still can",
@@ -512,14 +512,27 @@ _CONSOLE_SENTENCES = {
         r"stated in the docstring of `_shown_name`"
     ),
     # Lander hold 7091484059: the confirmation catches the 423 and answers 200, so the two
-    # sentences that said every refusal answers 423 or is listed as failed now say only that it
-    # is answered as a failing record is, and the page's own-account case is stated.
+    # sentences that said every refusal answers 423 or is listed as failed were narrowed, and the
+    # page's own-account case is stated. Lander hold 7095706239: the interval sentence names the
+    # confirmation beside its deferral, the Vault transit one says the record is refused at its
+    # first check, and the report key is the part and the id.
     "the interval sentence defers to the per-route answers": (
-        r"in that process, is answered as a failing record is and adds no row and no alert"
+        r"gets the answer its reader gives a failing record, which is not a 423 at least for "
+        r"`GET /ui/users/\{user_id\}/delete-confirm`"
     ),
-    "the Vault transit sentence defers to the per-route answers": (
-        r"a record Vault transit cannot verify is answered as a failing record is, but reported "
-        r"under `integrity\.authority_seal_unverifiable`"
+    "the Vault transit sentence says the record is refused at its first check": (
+        r"a record Vault transit cannot verify is refused at the first check that cannot verify "
+        r"it, with no re-read, rather than after two failing reads, and then gets the answer its "
+        r"reader gives a failing record\. It is reported under "
+        r"`integrity\.authority_seal_unverifiable`"
+    ),
+    "the report key is the part and the id": (
+        r"The key is the record's part and the account's id, `\{part\}:\{user_id\}` in "
+        r"`AuthService\._user_seal_failed`"
+    ),
+    "the single-check refusals are a floor": (
+        r"At least these are refused on the first check, with no re-read: a record Vault transit "
+        r"cannot verify"
     ),
     "the confirmation for the caller's own account has no form": (
         r"Where the id in its path is the caller's own, that page shows a note that the caller "
@@ -539,6 +552,31 @@ _UNSCOPED = {
     r"answered the same way, a 423 or listed as failed": (
         "a record Vault transit cannot verify is answered the same way, a 423 or listed as "
         "failed, but reported under `integrity.authority_seal_unverifiable`"
+    ),
+}
+
+#: Overclaims Lander hold 7095706239 asked to keep out of the statement, restored from this
+#: branch's earlier bans and widened to the wording the hold found: each regex with the earlier
+#: sentences it was written against, every one of which it must match, as its positive controls.
+#: The throttle keys on the record's part and the account's id (``AuthService._user_seal_failed``),
+#: not on the account; a record Vault transit cannot verify is refused at its first check, not
+#: after the two failing reads a failing record takes; and that is not the only single-check case.
+_REMOVED: dict[str, tuple[str, tuple[str, ...]]] = {
+    "any reader of the same account": (
+        r"other reader of the same account",
+        ("from any of these routes or any other reader of the same account in that process",),
+    ),
+    "an unverifiable record answered as a failing one": (
+        r"cannot verify[^.;]*answered as a (failing record|record that fails its seal)",
+        (
+            "a record Vault transit cannot verify is answered as a failing record is, but reported",
+            "a record Vault transit cannot verify is refused at the first check that cannot verify "
+            "it, with no further read, and then answered as a record that fails its seal is",
+        ),
+    ),
+    "a counted exception": (
+        r"(?<!at least )\bone exception\b",
+        ("One exception: a `users` row with a timestamp or counter cell that does not parse",),
     ),
 }
 
@@ -564,3 +602,13 @@ def test_the_security_doc_does_not_state_the_423_without_the_confirmation(overcl
     text = _SECURITY_MD.read_text("utf-8")
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     assert not re.search(overclaim, body, re.IGNORECASE), overclaim
+
+
+@pytest.mark.parametrize("name", sorted(_REMOVED))
+def test_the_security_doc_drops_the_overclaim(name: str) -> None:
+    shape, controls = _REMOVED[name]
+    for control in controls:
+        assert re.search(shape, control, re.IGNORECASE), (name, control)
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert not re.search(shape, body, re.IGNORECASE), name

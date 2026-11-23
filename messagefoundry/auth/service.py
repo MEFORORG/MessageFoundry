@@ -2283,11 +2283,17 @@ class UserSealRefused(RuntimeError):
     seal (BACKLOG #5520). :meth:`AuthService.change_password` raises it too, from that read or
     from the store write's own seal refusal, each reported the same way, and ``POST /me/password``
     answers it 423 (BACKLOG #5902). The failure was handed to the seal-failure report, which
-    writes the audit row and raises the alert only for the first failure of the account in each report interval
+    writes the ``integrity.authority_seal_failed`` audit row and raises the alert only for the
+    first failure under its report key, the record's part and the account's id
+    (:meth:`AuthService._user_seal_failed`), in each report interval
     (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
-    service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
-    may still delete it. The admin routes answer it 423. A record Vault transit cannot verify is
-    refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
+    service's process, so a refusal under that key inside that interval adds no such row. Not "no
+    such user": the row is there, and an administrator may still delete it.
+    ``auth_routes._checked_user``, and so the JSON admin routes that read an account through it,
+    answer it 423; docs/SECURITY.md, *What an admin user read reports*, states what at least some
+    web console pages answer. A record Vault transit cannot verify raises it too, at the first
+    check that cannot verify it, reported by :meth:`AuthService._user_seal_unverifiable` under
+    ``integrity.authority_seal_unverifiable`` on a report key of its own (ADR 0217)."""
 
 
 async def read_user_or_unreadable(read: Awaitable[UserRecord | None]) -> UserRecord | None:
