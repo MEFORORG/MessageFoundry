@@ -932,11 +932,11 @@ def test_a_backticked_git_inside_a_DOUBLE_quoted_commit_message_is_denied(
     assert "SHARED PRIMARY" in reason, reason
 
 
-@pytest.mark.parametrize("quote", ["'"])
 def test_a_backticked_git_inside_a_QUOTED_commit_message_is_still_allowed(
-    repo: SimpleNamespace, quote: str
+    repo: SimpleNamespace,
 ) -> None:
-    """The false deny this fix would most plausibly cause, pinned in both quote styles.
+    """The false deny this fix would most plausibly cause, pinned in single quotes (the double-quoted
+    half is the DENY test above, since bash runs a backtick there).
 
     Prose that NAMES a dangerous command in backticks is written constantly in this repository -- this
     very change did it -- and it must not refuse. It survives because ``Remove-QuotedSpans`` blanks the
@@ -944,7 +944,7 @@ def test_a_backticked_git_inside_a_QUOTED_commit_message_is_still_allowed(
     different mechanism from the one being changed, which is exactly why it is worth a row: if the
     blanking ever moves, this reds rather than the gap reopening silently.
     """
-    command = f"git commit -m {quote}never run {_backticked('git reset --hard')} here{quote}"
+    command = f"git commit -m 'never run {_backticked('git reset --hard')} here'"
     assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
 
 

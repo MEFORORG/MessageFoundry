@@ -3,16 +3,19 @@
 """Rules 3c, 3d, 3 and 3b also judge rewritten readings of the whole command (BACKLOG #5655 step 3).
 
 The hook's Get-AddedCommandReadings returns the command as given, then at most these rewrites: a git
-word the owning-word search skips (``\\git``, ``/usr/bin/git``, on Windows ``GIT``) spelled ``git``,
-a posix backtick substitution spelled ``$( )``, each git-bearing inner invocation hoisted to where the
+word the owning-word search skips (``\\git``, ``/usr/bin/git``, on Windows and macOS ``GIT``) spelled
+``git``, a posix backtick substitution spelled ``$( )``, a judged inner invocation hoisted to where the
 shell runs it, and the outer invocation with its closed ``$( )`` replaced by ``_``. Each is judged by
 the same rules after the command as given, so a rewrite can only add a deny.
 
-Each ``_is_denied`` row was measured ALLOW at ``BASELINE`` (origin/main when this was built). The
-differential test runs every row of this file, and the shapes of the earlier quoted-path file,
-through both the shipped hook and the hook as it stood at ``BASELINE``, and fails on any input the
-baseline denies and the shipped hook allows. It also checks that each ``_is_denied`` row really was
-an ALLOW there, so a row that pinned nothing new would be seen.
+Each ``DENIED`` row was measured ALLOW at ``BASELINE`` (origin/main when this was built). The
+differential test runs this file's rows, and the rows it can harvest from the parametrize marks of
+the earlier quoted-path file, through both the shipped hook and the hook as it stood at ``BASELINE``,
+and fails on any of those inputs the baseline denies and the shipped hook allows. A harvested row runs
+from the cwd it names, or from outside where it names none, so it can differ from the context its own
+test uses; rows with other placeholders, and tests with no parametrize mark, are not harvested. It also
+checks that each ``DENIED`` row really was an ALLOW there, so a row that pinned nothing new would be
+seen. The differential is skipped in a clone that does not hold ``BASELINE``.
 """
 
 from __future__ import annotations
@@ -108,6 +111,41 @@ DENIED: list[tuple[str, str, str, str]] = [
     ("git -C {o} log $(git -C '{wt}' checkout {b})", "outside", "Bash", "LINKED WORKTREE"),
     ("git -C {o} log {bt}git -C '{wt}' checkout {b}{bt}", "outside", "Bash", "LINKED WORKTREE"),
     ("x={bt}git -C {p} worktree remove {wt}{bt}", "outside", "Bash", "worktree remove"),
+    ("cd {p} && cd sub && git -C {o} log $(git reset --hard)", "outside", "Bash", "SHARED PRIMARY"),
+    # Review round c8390202ab: an apostrophe the walk took as a quote, an escaped backtick that
+    # swallowed the real opener, and eight harmless decoys that used up the hoist budget.
+    (
+        "cat > notes.md <<EOF\ndon't\nEOF\ncd {p} && git -C {o} log {bt}git reset --hard{bt}",
+        "outside",
+        "Bash",
+        "SHARED PRIMARY",
+    ),
+    (
+        "echo $'it\\'s' && cd {p} && git -C {o} log {bt}git reset --hard{bt}",
+        "outside",
+        "Bash",
+        "SHARED PRIMARY",
+    ),
+    (
+        "echo hi # it's\ncd {p} && git -C {o} log {bt}git reset --hard{bt}",
+        "outside",
+        "Bash",
+        "SHARED PRIMARY",
+    ),
+    (
+        "cd {p} && echo \\{bt} && git -C {o} log {bt}git reset --hard{bt}",
+        "outside",
+        "Bash",
+        "SHARED PRIMARY",
+    ),
+    (
+        "cd {p} && echo $(date)"
+        + " $(git status)" * 8
+        + " $(git log -1) $(git log -2); git -C {o} log $(git reset --hard)",
+        "outside",
+        "Bash",
+        "SHARED PRIMARY",
+    ),
     # Inside DOUBLE quotes bash runs a backtick and a `$( )`, so the reset really runs.
     (
         'git commit -m "never run {bt}git reset --hard{bt} here"',
@@ -118,7 +156,7 @@ DENIED: list[tuple[str, str, str, str]] = [
     ('git commit -m "never run $(git reset --hard) here"', "primary", "Bash", "SHARED PRIMARY"),
 ]
 
-#: Rows that hold only on Windows, where `GIT` runs git.exe.
+#: Rows that hold only where `GIT` runs git: Windows here; macOS is rewritten too but not run in CI.
 DENIED_WINDOWS: list[tuple[str, str, str, str]] = [
     ("GIT reset --hard", "primary", "PowerShell", "SHARED PRIMARY"),
     ("GIT config {k}", "primary", "PowerShell", "SHARED git"),
@@ -137,6 +175,14 @@ ALLOWED: list[tuple[str, str, str]] = [
         "Bash",
     ),
     ("Write-Output '$(git reset --hard)'", "primary", "PowerShell"),
+    # Review round c8390202ab: a hoisted inner read keeps its closing `)`, so a verb-named argument
+    # at its end is not read as the verb, and a separator inside quotes does not cut it.
+    ("echo $(git log --grep reset)", "primary", "Bash"),
+    ("n=$(git rev-list --count HEAD --grep merge)", "primary", "Bash"),
+    ("git log --oneline {bt}git rev-parse --verify checkout{bt}", "primary", "Bash"),
+    ("Write-Output $(git log --grep reset)", "primary", "PowerShell"),
+    ("git -C {wt} log $(git -C {wt} log --format=%H --grep reset)", "primary", "Bash"),
+    ('git commit -m "fix; see $(git log -1)"', "wt", "Bash"),
     ("git -C '{o}' -c user.name=$(git config user.name) config {k}", "outside", "Bash"),
     ("git -C '{o}' -c user.name=$(git config user.name) config {k}", "outside", "PowerShell"),
     ("\\git -C '{o}' -c user.name=$(git log -1) config {k}", "outside", "Bash"),
@@ -211,7 +257,7 @@ def test_a_rewritten_reading_is_denied(
     assert row[3] in reason, reason
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="`GIT` runs git.exe only on a Windows volume")
+@pytest.mark.skipif(sys.platform != "win32", reason="these rows are measured on Windows only")
 @pytest.mark.parametrize("row", DENIED_WINDOWS, ids=lambda r: f"{r[2]}-{r[1]}-{r[0]}")
 def test_an_upper_case_git_word_is_denied_on_windows(
     rig: SimpleNamespace, row: tuple[str, str, str, str]

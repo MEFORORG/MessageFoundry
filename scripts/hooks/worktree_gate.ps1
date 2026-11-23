@@ -962,9 +962,10 @@ function Get-ScanRawIndexMap($Seg) {
 # Rules 3 and 3c do not reliably read a git word that rules 3 and 3c's case-sensitive match of
 # `$gitInvocation` misses, such as `GIT` (an unquoted `.exe` suffix is read in any case since BACKLOG
 # #5655 step 3; a quoted program path ending `git.EXE` is still not, Remove-QuotedSpans says why).
-# On Windows, Get-AddedCommandReadings spells an unquoted `GIT` at command position `git`, so `GIT
-# reset --hard` and `GIT config core.hooksPath /nope` from the primary, ALLOWED under the PowerShell
-# tool on 2026-11-18, are refused; on Linux `GIT` is not git and is not rewritten. Also, at least: any line
+# On Windows and macOS, Get-AddedCommandReadings spells an unquoted `GIT` at command position `git`,
+# so `GIT reset --hard` and `GIT config core.hooksPath /nope` from the primary, ALLOWED under the
+# PowerShell tool on Windows on 2026-11-18, are refused; on Linux it is not rewritten (a macOS volume
+# formatted case-sensitive gets the rewrite all the same, which costs only a false deny). Also, at least: any line
 # after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
 # dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell
@@ -1205,26 +1206,37 @@ function Test-TrueSeparatorIn([string]$Text) {
 # blocks the command rather than letting it through (install-gate.ps1 installs `onFailure = block`).
 #
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
-# quotes, an escaped character, a quoted-delimiter posix heredoc body, a PowerShell `@' '@` here-string
-# -- and no rewrite starts there, so a backticked command NAMED in a single-quoted message or a data
-# heredoc is not read as run. Inside DOUBLE quotes a posix backtick and a `$( )` do run, so they are
-# rewritten there: `git commit -m "see `git reset --hard`"` in the primary is refused, because bash runs
-# that reset. A backtick span holding an unpaired quote or a line break is not rewritten, since whether
-# and where it runs then depends on parsing this walk does not do. The walk can still misread, and `_` can stand where a path
-# was; each misreading can only cost a false deny, never an allow, because the command as given has
-# already been judged and allowed.
+# quotes, posix `$'...'`, an escaped character, a posix `#` comment, a quoted-delimiter posix heredoc
+# body, a PowerShell `@' '@` here-string -- and no rewrite starts there, so a backticked command NAMED
+# in a single-quoted message or a data heredoc is not read as run. Inside DOUBLE quotes, and in an
+# unquoted posix heredoc body, a posix backtick and a `$( )` do run, so they are rewritten there: `git
+# commit -m "see `git reset --hard`"` in the primary is refused, because bash runs that reset. A
+# backtick span holding an unpaired quote or a line break is not rewritten, since whether and where it
+# runs then depends on parsing this walk does not do.
+#
+# WHAT A MISREADING COSTS. The walk is a second, smaller quoting model beside Remove-QuotedSpans', and
+# it can disagree with the shell. Where it calls code literal, a rewrite is skipped and that reading is
+# lost, so a shape the rewrites would refuse is allowed as it was before them; where it calls literal
+# text code, or `_` stands where a path was, the cost is a false deny. Neither can remove a deny, because
+# the command as given is judged first, by the readings that ran before this existed. At least these
+# are not rewritten: a single-quoted interpreter payload (`bash -c '... `git reset --hard` ...'`, which
+# the scan recurses into as code), a nested `$( )`, and a command longer than $maxRewrite characters.
 function Get-QuoteStateMap([string]$Text, [string]$Convention) {
-    # One character per input character: N outside quotes, D in double quotes, S literal, E escaped.
+    # One character per input character: N code, D double-quoted or heredoc text that still expands,
+    # S literal, E a character an escape makes literal.
+    $posix = $Convention -eq 'posix'
     $esc = $(if ($Convention -eq 'pwsh') { [char]'`' } else { [char]'\' })
     $map = [char[]]::new($Text.Length)
-    $heredoc = [regex]::new('\G(?<!<)<<(-?)[ \t]*(?:''(\w+)''|"(\w+)"|\\(\w+))')
+    $heredoc = [regex]::new('\G(?<!<)<<(-?)[ \t]*(?:''(\w+)''|"(\w+)"|\\(\w+)|(\w+))')
     $pending = [System.Collections.Generic.List[object]]::new()
     $state = 'N'
     $i = 0
     while ($i -lt $Text.Length) {
         $c = $Text[$i]
-        if ($state -eq 'S') {
+        if ($state -eq 'S' -or $state -eq 'A') {
             $map[$i] = 'S'
+            # Inside posix $'...' a backslash escapes, a quote included.
+            if ($state -eq 'A' -and $c -eq [char]'\' -and $i + 1 -lt $Text.Length) { $map[$i + 1] = 'S'; $i += 2; continue }
             if ($c -eq [char]"'") {
                 if ($Convention -eq 'pwsh' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]"'") {
                     $map[$i + 1] = 'S'; $i += 2; continue
@@ -1242,23 +1254,34 @@ function Get-QuoteStateMap([string]$Text, [string]$Convention) {
             $i++; continue
         }
         $map[$i] = 'N'
+        if ($posix -and $c -eq [char]'$' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]"'") {
+            $map[$i + 1] = 'S'; $state = 'A'; $i += 2; continue
+        }
         if ($c -eq [char]"'") { $map[$i] = 'S'; $state = 'S'; $i++; continue }
         if ($c -eq [char]'"') { $map[$i] = 'D'; $state = 'D'; $i++; continue }
-        if ($c -eq [char]'<' -and $Convention -eq 'posix') {
+        if ($posix -and $c -eq [char]'#' -and ($i -eq 0 -or " `t`r`n;&|(".Contains([string]$Text[$i - 1]))) {
+            # A comment runs to the end of its line; the line break stays code, for a pending heredoc.
+            while ($i -lt $Text.Length -and $Text[$i] -ne [char]"`n") { $map[$i] = 'S'; $i++ }
+            continue
+        }
+        if ($posix -and $c -eq [char]'<') {
             $h = $heredoc.Match($Text, $i)
             if ($h.Success) {
-                $delim = @($h.Groups[2].Value, $h.Groups[3].Value, $h.Groups[4].Value) | Where-Object { $_ } | Select-Object -First 1
-                $pending.Add([pscustomobject]@{ Delim = $delim; Dash = ($h.Groups[1].Value -eq '-') })
+                $quoted = -not $h.Groups[5].Success
+                $delim = @($h.Groups[2].Value, $h.Groups[3].Value, $h.Groups[4].Value, $h.Groups[5].Value) |
+                    Where-Object { $_ } | Select-Object -First 1
+                $pending.Add([pscustomobject]@{ Delim = $delim; Dash = ($h.Groups[1].Value -eq '-'); Body = $(if ($quoted) { 'S' } else { 'D' }) })
             }
         }
-        if ($c -eq [char]'@' -and $Convention -eq 'pwsh' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]"'") {
+        if ($Convention -eq 'pwsh' -and $c -eq [char]'@' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]"'") {
             $close = [regex]::new("\n'@").Match($Text, $i)
             $stop = $(if ($close.Success) { $close.Index + $close.Length } else { $Text.Length })
             for ($j = $i; $j -lt $stop; $j++) { $map[$j] = 'S' }
             $i = $stop; continue
         }
         if ($c -eq [char]"`n" -and $pending.Count -gt 0) {
-            # The quoted-delimiter heredoc bodies that start on the next line, each up to its delimiter.
+            # The heredoc bodies that start on the next line, each up to its delimiter: literal where the
+            # delimiter was quoted, expanding (a quote there opens nothing) where it was not.
             $j = $i + 1
             foreach ($hd in $pending) {
                 while ($j -lt $Text.Length) {
@@ -1266,9 +1289,18 @@ function Get-QuoteStateMap([string]$Text, [string]$Convention) {
                     $lineEnd = $(if ($eol -lt 0) { $Text.Length } else { $eol + 1 })
                     $line = $Text.Substring($j, $lineEnd - $j).TrimEnd("`r", "`n")
                     if ($hd.Dash) { $line = $line.TrimStart("`t") }
-                    for ($k = $j; $k -lt $lineEnd; $k++) { $map[$k] = 'S' }
+                    $isEnd = $line -ceq $hd.Delim
+                    $k = $j
+                    while ($k -lt $lineEnd) {
+                        $map[$k] = $(if ($isEnd) { [char]'S' } else { [char]$hd.Body })
+                        # In an expanding body a backslash still escapes the next character.
+                        if (-not $isEnd -and $hd.Body -eq 'D' -and $Text[$k] -eq [char]'\' -and $k + 1 -lt $lineEnd) {
+                            $map[$k + 1] = 'E'; $k += 2; continue
+                        }
+                        $k++
+                    }
                     $j = $lineEnd
-                    if ($line -ceq $hd.Delim) { break }
+                    if ($isEnd) { break }
                 }
             }
             $pending.Clear()
@@ -1280,17 +1312,23 @@ function Get-QuoteStateMap([string]$Text, [string]$Convention) {
 }
 
 # Get-AddedCommandReadings' rewrite of each match of $Pattern that starts where $Map says the shell
-# reads code (N, or D under -InDouble), to $With; any other match is kept as written.
+# reads code (N, or D under -InDouble), to $With. A match starting anywhere else is not taken, and the
+# search resumes one character after its start, so it cannot swallow a real opener after it.
 function Edit-UnquotedMatches([string]$Text, [char[]]$Map, [string]$Pattern, [string]$With,
                               [System.Text.RegularExpressions.RegexOptions]$Options, [switch]$InDouble) {
+    $re = [regex]::new($Pattern, $Options)
     $out = [System.Text.StringBuilder]::new()
     $from = 0
-    foreach ($m in [regex]::Matches($Text, $Pattern, $Options)) {
-        $st = $Map[$m.Index]
-        if (-not ($st -eq [char]'N' -or ($InDouble -and $st -eq [char]'D'))) { continue }
+    $pos = 0
+    while ($pos -le $Text.Length) {
+        $m = $re.Match($Text, $pos)
+        if (-not $m.Success) { break }
+        $st = $(if ($m.Index -lt $Map.Length) { $Map[$m.Index] } else { [char]'S' })
+        if (-not ($st -eq [char]'N' -or ($InDouble -and $st -eq [char]'D'))) { $pos = $m.Index + 1; continue }
         [void]$out.Append($Text, $from, $m.Index - $from)
         [void]$out.Append($m.Result($With))
         $from = $m.Index + $m.Length
+        $pos = [Math]::Max($from, $m.Index + 1)
     }
     [void]$out.Append($Text, $from, $Text.Length - $from)
     $out.ToString()
@@ -1298,15 +1336,19 @@ function Edit-UnquotedMatches([string]$Text, [char[]]$Map, [string]$Pattern, [st
 
 function Get-AddedCommandReadings([string]$Cmd, [string]$Convention) {
     $Cmd
-    $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
+    # The walks below are character loops inside the hook's timeout, so a longer command is judged as
+    # given only (measured: a 78 KB heredoc took 18 s through an earlier draft of these readings).
+    $maxRewrite = 32768
+    if ($Cmd.Length -gt $maxRewrite) { return }
+    # Where `GIT` runs git: a Windows volume, and macOS's default case-insensitive one.
+    $opts = $(if ($IsWindows -or $IsMacOS) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
             [System.Text.RegularExpressions.RegexOptions]::None })
     $plain = [System.Text.RegularExpressions.RegexOptions]::None
     # At command position: the line start, a separator or opener, `$(` or a backtick, then blanks and
     # any `NAME=value` assignments. A word ending `/git` elsewhere, such as a `cd` target, is left alone.
     $at = '(?<=(?:^|[;&|({\r\n`]|\$\()[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|()=]*[ \t]+)*)'
     $qualifier = $(if ($Convention -eq 'posix') { '(?:\\|[^\s;&|(){}''"`$<>=]*[\\/])?' } else { '(?:[^\s;&|(){}''"`$<>=]*[\\/])?' })
-    # Each step walks the quoting only where its pattern can change something, since the walk is a
-    # character loop and runs inside the hook's timeout.
+    # Each step walks the quoting only where its pattern can change something.
     $gitWord = "$at$qualifier(?<![\w.-])git(?i:\.exe)?(?=[\s;&|)}``]|$)"
     $named = $Cmd
     if (@([regex]::Matches($Cmd, $gitWord, $opts) | Where-Object { $_.Value -cne 'git' }).Count -gt 0) {
@@ -1319,29 +1361,43 @@ function Get-AddedCommandReadings([string]$Cmd, [string]$Convention) {
             '`((?:[^`''"\r\n]|''[^''\r\n]*''|"[^"`\r\n]*")*)`' '$$($1)' $plain -InDouble
     }
     if ($named -cne $Cmd) { $named }
-    if (-not $named.Contains('$(')) { return }
+    $subst = '\$\(([^()\r\n]*)\)'
+    if ($named -notmatch $subst) { return }
     $namedMap = Get-QuoteStateMap $named $Convention
-    # A HOISTED INNER INVOCATION, one string per closed one-line `$( )` holding a git word, at most
-    # eight: the text before the `$(`, cut after its last true separator or line break, then the inner
-    # command, so it is read where the shell runs it (`echo $(git -C <wt> checkout <b>)`; `cd <p> && echo
-    # $(date); git -C <o> log $(git reset --hard)`, where the chdir follower stops at the `$(date)`).
-    $hoisted = 0
-    foreach ($sub in [regex]::Matches($named, '\$\(([^()\r\n]*)\)')) {
-        if ($hoisted -ge 8) { break }
+    # A HOISTED INNER INVOCATION: the text before a closed one-line `$(`, cut after its last true
+    # separator or line break outside quotes, then the inner command, so it is read where the shell
+    # runs it (`echo
+    # $(git -C <wt> checkout <b>)`; `cd <p> && echo $(date); git -C <o> log $(git reset --hard)`,
+    # where the chdir follower stops at the `$(date)`). Only an inner command holding a word some rule
+    # judges is hoisted -- rule 3's verbs, rule 3c's `config` and `-c`, rule 3d's `worktree` -- each
+    # distinct string once, at most eight.
+    $judged = '(?:^|\s)(?:cherry-pick|checkout|switch|reset|restore|stash|clean|rebase|merge|revert|am|apply|config|worktree|-c|--config-env\S*)(?=\s|$)'
+    $hoists = [System.Collections.Generic.List[string]]::new()
+    foreach ($sub in [regex]::Matches($named, $subst)) {
+        if ($hoists.Count -ge 8) { break }
         if ($namedMap[$sub.Index] -ne [char]'N' -and $namedMap[$sub.Index] -ne [char]'D') { continue }
         $inner = $sub.Groups[1].Value
-        if ($inner -cnotmatch $gitInvocation) { continue }
+        if ($inner -cnotmatch $gitInvocation -or $inner -notmatch $judged) { continue }
         $before = $named.Substring(0, $sub.Index)
-        $cuts = [regex]::Matches($before, '(?:;|\|\|?|&&|(?<![<>&])&(?![>&])|\r?\n)')
-        $keep = $(if ($cuts.Count -gt 0) { $before.Substring(0, $cuts[$cuts.Count - 1].Index + $cuts[$cuts.Count - 1].Length) } else { "" })
-        $hoist = "$keep $inner"
-        if ($hoist -cne $Cmd -and $hoist -cne $named) { $hoist; $hoisted++ }
+        $cutAt = 0
+        foreach ($cut in [regex]::Matches($before, '(?:;|\|\|?|&&|(?<![<>&])&(?![>&])|\r?\n)')) {
+            if ($namedMap[$cut.Index] -eq [char]'N') { $cutAt = $cut.Index + $cut.Length }
+        }
+        # The `)` is kept only after a judged word, where it stops that word reading as a verb as it
+        # did inside the `$( )`; elsewhere it would end a branch name rule 3b reads.
+        $close = $(if ($inner -match "$judged\s*\z") { ')' } else { '' })
+        $hoist = "$($before.Substring(0, $cutAt)) $inner$close"
+        if ($hoist -cne $Cmd -and $hoist -cne $named -and -not $hoists.Contains($hoist)) { $hoists.Add($hoist) }
     }
+    $hoists
     $outer = $named
+    $map = $namedMap
     for ($i = 0; $i -lt 32; $i++) {
-        $next = Edit-UnquotedMatches $outer (Get-QuoteStateMap $outer $Convention) '\$\([^()\r\n]*\)' '_' $plain -InDouble
+        $next = Edit-UnquotedMatches $outer $map '\$\([^()\r\n]*\)' '_' $plain -InDouble
         if ($next -ceq $outer) { break }
         $outer = $next
+        if ($outer -notmatch $subst) { break }
+        $map = Get-QuoteStateMap $outer $Convention
     }
     if ($outer -cne $named -and $outer -cne $Cmd) { $outer }
 }

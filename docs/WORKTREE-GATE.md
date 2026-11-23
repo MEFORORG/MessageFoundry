@@ -149,18 +149,20 @@ added reading misses and some of its false refusals.
 
 **Rules 3c, 3d, 3 and 3b also judge a few rewritten spellings of the command.** Under BACKLOG #5655
 step 3 the hook judges the command as given first, then, where they differ, the same command with an
-unquoted `\git` or path-qualified git word at command position spelled `git` (and `GIT` on Windows),
-with a one-line Bash backtick substitution spelled `$( )`, with up to eight git-bearing one-line
-`$( )` hoisted to where the shell runs them, and with closed one-line `$( )` replaced by a placeholder
-word. A rewrite can only add a
-refusal, because the command as given has already been judged. Each refused shape is a row in
-[`tests/test_worktree_gate_added_command_readings.py`](../tests/test_worktree_gate_added_command_readings.py),
-whose differential test also checks that every input of that file and the quoted-path file that the
-hook at the baseline commit refused is still refused. No rewrite starts in text the hook reads as
+unquoted `\git` or path-qualified git word at command position spelled `git` (and `GIT` on Windows
+and macOS), with a one-line Bash backtick substitution spelled `$( )`, with up to eight one-line
+`$( )` whose inner git command names a word some rule judges hoisted to where the shell runs them,
+and with closed one-line `$( )` replaced by a placeholder word. A rewrite can only add a refusal,
+because the command as given has already been judged. The measured shapes it refuses are rows in
+[`tests/test_worktree_gate_added_command_readings.py`](../tests/test_worktree_gate_added_command_readings.py).
+Its differential test runs that file's rows and the rows it harvests from the quoted-path test file
+through this hook and the hook at a fixed baseline commit, and fails on any of them the baseline
+refused and this hook allows; the test file says which rows it harvests. No rewrite starts in text the hook reads as
 literal, such as single quotes or a quoted-delimiter heredoc body, so a command named there is not
 read as run. Inside double quotes Bash runs a backtick or `$( )`, so `git commit -m "... `` `git reset
 --hard` `` ..."` in the primary is now refused. A rewrite is text, not a parse, so it can cost a false
-refusal; the `Get-AddedCommandReadings` note in the hook is the source of record for what it reads.
+refusal or miss a shape the shell runs, and a long command gets none; the `Get-AddedCommandReadings`
+note in the hook is the source of record for what it reads and what it misses.
 
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
