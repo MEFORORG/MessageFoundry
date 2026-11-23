@@ -128,7 +128,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 #: The address a listener with a missing or blank ``host`` binds. The runner's peer-control gate
-#: (``check_http_intake_auth``) reads this too, so it judges the address that is really bound.
+#: (``check_http_intake_auth``) reads it for a missing or blank host too.
 DEFAULT_BIND_HOST = "127.0.0.1"
 
 # Resource caps (DoS guards), HTTP analogs of the MLLP frame/connection/idle caps. All overridable per

@@ -25,17 +25,21 @@ or allowed everything, would fail too. Nothing here touches the network.
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from messagefoundry.__main__ import _warn_on_an_unrevoked_store_hop
 from messagefoundry.auth.trust_anchors import smtp_hop_anchor_spec
 from messagefoundry.config.models import Destination
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    AiSettings,
     AlertsSettings,
     AuthSettings,
     LoggingSettings,
+    SecurityEnforcement,
     StoreSettings,
     TlsSettings,
     _names_this_host,
@@ -136,6 +140,23 @@ def test_a_store_on_loopback_is_still_on_box() -> None:
     assert _build_ssl(_store_with_server(LOOPBACK), posture=ENFORCING) is not None
 
 
+@pytest.mark.parametrize(
+    ("server", "warned"), [("", True), (None, True), (LOOPBACK, False)], ids=str
+)
+def test_a_cli_store_open_at_warn_warns_on_a_store_with_no_server(
+    server: str | None, warned: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The CLI's own run of the store guard, at ``warn``, where a refusal becomes a WARNING."""
+    settings = SimpleNamespace(
+        ai=AiSettings(),
+        security=SimpleNamespace(enforcement=SecurityEnforcement.WARN),
+        store=_store_with_server(server),
+    )
+    with caplog.at_level("WARNING"):
+        _warn_on_an_unrevoked_store_hop(settings)  # type: ignore[arg-type]
+    assert ("(no [store].server)" in caplog.text) is warned
+
+
 # --- an unknown destination: a generic ODBC server -----------------------------------------------
 
 
@@ -145,7 +166,7 @@ def test_a_blank_generic_server_is_not_judged_on_box(
 ) -> None:
     """A ``server`` of spaces passes the required-setting check and splits to an empty host. The
     driver is handed that text, so where it dials is not known here. CONTROL: real loopback."""
-    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused):
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="no server"):
         connector(config(server="  "))
     with active_hop_posture(ENFORCING):
         assert connector(config(server=LOOPBACK))

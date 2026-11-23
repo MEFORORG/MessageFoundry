@@ -2218,7 +2218,9 @@ def generic_cleartext_hop_guard(
         reads_comma_port=family in COMMA_PORT_FAMILIES,
     )
     return InsecureHopGuard.capture(
-        host=host,
+        # A blank server names no host, so the guard judges it off-box (BACKLOG #5512). The stand-in
+        # names the setting in the refusal.
+        host=host or "(no server)",
         port=port,
         cell=cell,
         # The classifier's reason rides in the description so the refusal names WHAT is unset, not just
