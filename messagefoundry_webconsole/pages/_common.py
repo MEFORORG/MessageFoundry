@@ -49,13 +49,14 @@ REFILLED_CONTENT = "content_refilled"
 :func:`messagefoundry_webconsole.routes._common.posted_needle` reads it back."""
 
 
-def _refilled_content(content: str, field_path: str) -> Markup:
+def _refilled_content(field_path: str, content: str, marker: str | None = None) -> Markup:
     """A needle form's record of the Substring it was rendered with while Field path was blank, the
     mirror of :func:`_refilled_field_value`: an operator who ran a substring search and then types a
     Field path would otherwise post the old Substring beside it, which the engine refuses (BACKLOG
     #6700). Written only with no path, so a page that already showed both holds no marker and
-    resubmitting it sends the Substring again."""
-    value = content if not field_path.strip() else ""
+    resubmitting it sends the Substring again. ``marker`` overrides that, for a refusal page that
+    puts back a Substring the POST did not send."""
+    value = marker if marker is not None else (content if not field_path.strip() else "")
     return el("input", type="hidden", name=REFILLED_CONTENT, value=value or None)
 
 

@@ -15,6 +15,7 @@ import itertools
 import re
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 
 import httpx
 from _webui_support import _add, _client, _cookie_login, _seed, _service
@@ -287,8 +288,10 @@ async def test_a_field_value_of_only_spaces_alone_is_no_criterion(engine: Engine
 
 def test_console_needle_rule_matches_the_engine() -> None:
     """The console's copy of the optional-needle rule agrees with the engine's on every case."""
-    values = [None, "", " ", "　", "DOE", " DOE "]
-    for content, path, value in itertools.product(values, values, values):
+    texts = [None, "", " ", "　", "DOE", " DOE "]
+    # A stored preset can hand the rule a non-text Field value; the engine ignores one.
+    values: list[Any] = [*texts, 5, 0]
+    for content, path, value in itertools.product(texts, texts, values):
         assert console_sends_a_needle(content, path, value) == engine_sends_a_needle(
             content, path, value
         ), (content, path, value)
@@ -315,3 +318,65 @@ async def test_an_uploaded_log_refusal_echoes_no_control_character_and_applies_n
         r = await c.post(action, data={"content": "M" * 600, "message_type": "ADT^A04"})
         assert r.status_code == 400, r.text
         assert "1 of 2 message(s)" in r.text, "a valid filter beside a refused one was dropped"
+
+
+async def test_a_refilled_substring_beside_a_path_with_no_value_is_still_refused(
+    engine: Engine,
+) -> None:
+    """Review round 1: dropping the Substring beside a Field path alone would run a presence test
+    the operator may not have meant, which decrypts bodies, where origin/main refused the pair."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _seed(engine)
+    action = "/ui/messages/search/run"
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        first = await c.post(action, data={"content": "DOE^JANE"})
+        form = _refilled(first.text, action)
+        form.update(field_path="PID-3")
+        r = await c.post(action, data=form)
+        assert r.status_code == 400, r.text
+        assert _BOTH in r.text and DROPPED_CONTENT not in r.text
+
+
+async def test_a_refusal_after_a_dropped_substring_puts_it_back_with_its_marker(
+    engine: Engine,
+) -> None:
+    """Review round 1: a typo in the new Field path made the refusal page come back with the
+    Substring box empty. It is put back with its marker, so the corrected resubmit drops it again."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    action = "/ui/messages/search/run"
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        first = await c.post(action, data={"content": "DOE^JANE"})
+        form = _refilled(first.text, action)
+        form.update(field_path="P", field_value="100")
+        typo = await c.post(action, data=form)
+        assert typo.status_code == 400, typo.text
+        again = _refilled(typo.text, action)
+        assert again["content"] == "DOE^JANE" and again["content_refilled"] == "DOE^JANE"
+        again.update(field_path="PID-3")
+        fixed = await c.post(action, data=again)
+        assert fixed.status_code == 200, fixed.text
+        assert f"/ui/messages/{mid}" in fixed.text and DROPPED_CONTENT in fixed.text
+
+
+async def test_an_uploaded_log_refusal_puts_a_dropped_substring_back(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The same on the uploaded-log filter's model-refusal arm."""
+    service = await _uploads_service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+        action = f"/ui/uploaded-logs/file/{fid}/filter"
+        first = await c.post(action, data={"content": "MRN123"})
+        form = _refilled(first.text, action)
+        form.update(field_path="PID-3", field_value="MRN999", control_id="C" * 300)
+        r = await c.post(action, data=form)
+        assert r.status_code == 400, r.text
+        back = _refilled(r.text, action)
+        assert back["content"] == "MRN123" and back["content_refilled"] == "MRN123"

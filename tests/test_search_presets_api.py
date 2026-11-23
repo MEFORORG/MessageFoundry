@@ -1053,8 +1053,6 @@ async def _store_criteria(engine: Engine, pid: str, criteria: dict[str, Any]) ->
     """Replace a preset's stored criteria THROUGH the store, so the cell is sealed by the cipher as
     every real write is. A raw ``UPDATE`` of plaintext works only on an engine with no key, so a
     test that planted it would pass for a reason a keyed store does not share (BACKLOG #6700)."""
-    import json
-
     assert isinstance(engine.store, MessageStore)  # a SQLite engine: the owner read needs _db
     cur = await engine.store._db.execute(
         "SELECT owner_user_id, name FROM search_presets WHERE id=?", (pid,)

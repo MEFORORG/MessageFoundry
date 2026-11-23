@@ -77,9 +77,9 @@ group mapping, and a counter-reset request, may carry at most 1000 entries.
 In the JSON body of `POST /messages/search`, `POST /messages/export`,
 `POST /uploads/{file_id}/messages/search` and the criteria on `POST /search/presets`, a `limit`,
 `offset` or `scan_limit` the model takes must be a JSON integer when sent, and `scan_limit` may also
-be `null`. A string such as `"7"`, a boolean, or a number written with a fraction, `7.0` included,
-gets a 422 (vault BACKLOG #6700). The same names on
-a query string are read from text, as every query value is.
+be `null`. Anything else gets a 422, at least a string such as `"7"`, a boolean, and a number
+written with a fraction, `7.0` included (vault BACKLOG #6700). The same names on a query string are
+read from text, as every query value is.
 
 **Which words and codes exist is not decided here.** The role names, the permission catalog and the
 status vocabulary belong to the engine. These rules decide only the shape a value may take, so a
@@ -285,8 +285,9 @@ Where each rule lives:
   spaces, with no Substring or Field path, counts as no criterion there. The search form and the
   uploaded-log filter refill their boxes after a run. A refilled term the operator left in place
   is not sent beside a term of the other kind: a Field value once Field path is blank and a
-  Substring is given, or a Substring once a Field path is given. The page then says which one was
-  not sent. `posted_needle`, in
+  Substring is given, or a Substring once a Field path and a Field value are given. A page that
+  echoes the criteria back then says which one was not sent; the search form's refusal for a
+  criterion its model does not accept echoes none. `posted_needle`, in
   [`messagefoundry_webconsole/routes/_common.py`](../messagefoundry_webconsole/routes/_common.py),
   holds that rule.
 - Layered search: `_compose_preset_layers`, in

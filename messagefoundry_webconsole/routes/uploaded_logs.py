@@ -619,6 +619,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         error: str = "",
         notice: str = "",
         refused: frozenset[str] = frozenset(),
+        dropped_content: str | None = None,
         status_code: int = 200,
     ) -> Response:
         """Render one uploaded file's browse page for a given filter — shared by the GET page render
@@ -638,6 +639,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             control_id=for_echo(control_id),
             notice=notice,
         )
+        # A refusal page puts a Substring the POST did not send back in its box, with its marker,
+        # so the operator need not retype it after correcting the other criterion (#6700).
+        on_refusal = shared
+        if dropped_content:
+            echo = for_echo(dropped_content)
+            on_refusal = {**shared, "content": echo, "content_refilled": echo}
 
         async def _browse(c: str | None, fp: str | None, fv: str | None) -> Any:
             return await core.browse_uploaded_file(
@@ -649,7 +656,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 field_path=fp,
                 field_value=fv,
                 target="both",
-                # A refused filter is echoed for correction, never applied (BACKLOG #6700).
+                # A filter the POST arm's model refused is echoed for correction, not applied
+                # (BACKLOG #6700). The GET arm checks no alphabet, so `refused` is empty there.
                 message_type=None if "message_type" in refused else message_type,
                 control_id=None if "control_id" in refused else control_id,
                 limit=limit,
@@ -691,13 +699,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     raise
                 return HTMLResponse(
                     pages.uploaded_log_detail(
-                        result, error=str(exc.detail), can_resend=can_resend, **shared
+                        result,
+                        # for_echo on the DETAIL too, as on the search page: it is engine text
+                        # built from the values the caller sent.
+                        error=for_echo(str(exc.detail)),
+                        can_resend=can_resend,
+                        **on_refusal,
                     ),
                     status_code=400,
                 )
             raise
         return HTMLResponse(
-            pages.uploaded_log_detail(result, error=error, can_resend=can_resend, **shared),
+            pages.uploaded_log_detail(
+                result, error=error, can_resend=can_resend, **(on_refusal if error else shared)
+            ),
             status_code=status_code,
         )
 
@@ -785,6 +800,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 error="a filter criterion is not a value that field accepts",
                 notice=needle.notice,
                 refused=frozenset(str(e["loc"][0]) for e in exc.errors() if e["loc"]),
+                dropped_content=needle.dropped_content,
                 status_code=400,
             )
         return await _render_browse(
@@ -799,6 +815,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             control_id=criteria.control_id,
             limit=criteria.limit,
             notice=needle.notice,
+            dropped_content=needle.dropped_content,
         )
 
     @app.post("/ui/uploaded-logs/file/{file_id}/resend")

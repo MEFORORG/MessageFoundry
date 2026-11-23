@@ -216,12 +216,15 @@ def blank_to_none(value: str | None) -> str | None:
 
 class PostedNeedle(NamedTuple):
     """The needle terms a form POST carries as criteria (BACKLOG #6700). ``notice`` says which
-    refilled leftover was not sent, or is empty when none was."""
+    refilled leftover was not sent, or is empty when none was. ``dropped_content`` is the Substring
+    that was not sent, so a refusal page can put it back in its box with its marker rather than
+    make the operator retype it."""
 
     content: str | None
     field_path: str | None
     field_value: str | None
     notice: str
+    dropped_content: str | None = None
 
 
 #: The on-page notices for a dropped leftover. Fixed text, so nothing the operator typed is echoed.
@@ -241,17 +244,21 @@ def posted_needle(form: Mapping[str, str]) -> PostedNeedle:
     switches from one kind of needle to the other posts the old term beside the new one, and the
     engine refuses that pair. A leftover is not sent in two cases: Field path is blank, a Substring
     is given, and the Field value is unchanged from the one the page rendered beside a Field path;
-    or a Field path is given and the Substring is unchanged from the one the page rendered with no
-    Field path. Either page, results or refusal, writes the markers. A value the operator typed or
-    changed, or one a page echoed back without its marker, is sent as posted, so the engine's
+    or a Field path and a Field value are given and the Substring is unchanged from the one the page
+    rendered with no Field path. A Field path with no Field value keeps the Substring, so the pair
+    is refused as before rather than run as a presence test the operator may not have meant. A page
+    that refills the boxes writes the markers, a refusal page included. A value the operator typed
+    or changed, or one a page echoed back without its marker, is sent as posted, so the engine's
     refusal of it reaches the page rather than the value being dropped."""
     content = form.get("content") or None
     field_path = form.get("field_path") or None
     field_value = form.get("field_value") or None
     has_path = bool((field_path or "").strip())
     notice = ""
-    if content is not None and has_path and content == form.get(REFILLED_CONTENT):
-        content, notice = None, DROPPED_CONTENT
+    has_value = bool(field_value and not field_value.isspace())
+    dropped_content = None
+    if content is not None and has_path and has_value and content == form.get(REFILLED_CONTENT):
+        content, dropped_content, notice = None, content, DROPPED_CONTENT
     elif (
         field_value is not None
         and not has_path
@@ -259,7 +266,7 @@ def posted_needle(form: Mapping[str, str]) -> PostedNeedle:
         and field_value == form.get(REFILLED_FIELD_VALUE)
     ):
         field_value, notice = None, DROPPED_FIELD_VALUE
-    return PostedNeedle(content, field_path, field_value, notice)
+    return PostedNeedle(content, field_path, field_value, notice, dropped_content)
 
 
 def sends_a_needle(content: str | None, field_path: str | None, field_value: str | None) -> bool:
@@ -268,7 +275,8 @@ def sends_a_needle(content: str | None, field_path: str | None, field_value: str
     something besides whitespace (BACKLOG #6700). A copy, because the console may not import
     ``messagefoundry.store``; ``test_console_needle_rule_matches_the_engine`` pins it to the
     engine's ``content_search.sends_a_needle``."""
-    return bool(content or field_path) or bool(field_value and not field_value.isspace())
+    has_value = isinstance(field_value, str) and bool(field_value) and not field_value.isspace()
+    return bool(content or field_path) or has_value
 
 
 async def _form_pairs(request: Request) -> list[tuple[str, str]]:
