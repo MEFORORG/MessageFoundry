@@ -1250,6 +1250,7 @@ function pageHtml(
     /* A multi-line Comment (BACKLOG #5841) edits in a textarea whose row count is its line count. */
     .params .field:has(> textarea) { flex: 1 1 100%; min-width: 0; }
     .params .field textarea { resize: none; width: 100%; box-sizing: border-box; overflow-x: auto; }
+    .params .field textarea.invalid { outline: 1px solid var(--vscode-inputValidation-errorBorder, red); }
     /* ADR 0104 §2.3 field picker: the ⋮ button sits beside its input (the input keeps flexing, so free-text
        stays first-class). Only a pickable path/segment slot gets the .edit-row wrapper. */
     .params .field .edit-row { display: flex; align-items: stretch; gap: 3px; }

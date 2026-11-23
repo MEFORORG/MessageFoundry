@@ -209,6 +209,21 @@
       const n = Number(meta ? meta.getAttribute('content') : NaN);
       return Number.isSafeInteger(n) ? n : undefined;
     }
+    // A multi-line Comment's textarea (BACKLOG #5841) keeps its line count, so a line break is never a
+    // valid keystroke there: plain Enter commits the field (blur fires its change), as it does in a
+    // one-line input.
+    for (const ta of document.querySelectorAll('textarea.edit')) {
+      ta.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' && !ev.shiftKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+          ev.preventDefault();
+          ta.blur();
+        }
+      });
+      ta.addEventListener('input', () => {
+        ta.classList.remove('invalid');
+        ta.removeAttribute('aria-invalid');
+      });
+    }
     for (const inp of document.querySelectorAll('input.edit, select.edit, textarea.edit')) {
       inp.addEventListener('change', () => {
         // A route's handlers field (data-list) posts its comma-separated names as a list, empties
@@ -226,6 +241,9 @@
           // fix the count without retyping, and a toast says why.
           const want = Number(inp.dataset.lineEnd) - Number(inp.dataset.lineStart) + 1;
           if (inp.value.split('\n').length !== want) {
+            // Marked invalid until the next keystroke, so the field does not pass for saved text.
+            inp.classList.add('invalid');
+            inp.setAttribute('aria-invalid', 'true');
             vscode.postMessage({ command: 'noteLineCount', lines: want });
             return;
           }
@@ -612,6 +630,11 @@
     const INDENT_PX = 20;
     let dragSrc = null;
     let bar = null, pill = null;
+    // A step dropped on a Comment's textarea (BACKLOG #5841) is not a reorder target, and the native drop
+    // would type the drag payload into the comment, an edit the line-count guard lets through.
+    for (const ta of document.querySelectorAll('textarea.edit')) {
+      ta.addEventListener('drop', (ev) => { if (dragSrc) { ev.preventDefault(); } });
+    }
     function ensureIndicators() {
       if (!bar) { bar = document.createElement('div'); bar.className = 'insertion-bar'; document.body.appendChild(bar); }
       if (!pill) { pill = document.createElement('div'); pill.className = 'scope-pill'; document.body.appendChild(pill); }

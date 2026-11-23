@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
 
 import { buildRowViewModel, renderRowHtml, type LensRow } from "../../stepsModel";
 import { loadPage, type DomNode } from "./b622-g09-steps-page";
@@ -58,7 +60,7 @@ suite("b622 #5841 — Comment and Pragma rows render their text", () => {
     const html = renderRowHtml(buildRowViewModel(comment, 0, lines));
     assert.match(html, /readonly disabled value=" check the MRN"/);
     const ro = renderRowHtml(buildRowViewModel(multi, 0, multiLines));
-    assert.match(ro, /<textarea readonly rows="2" wrap="off">\n a\n b<\/textarea>/);
+    assert.match(ro, /<textarea readonly disabled rows="2" wrap="off">\n a\n b<\/textarea>/);
   });
 
   // The page side: the shipped stepsWebview.js run against the real renderer under jsdom.
@@ -114,8 +116,42 @@ suite("b622 #5841 — Comment and Pragma rows render their text", () => {
       assert.strictEqual(page.posted.find((m) => m.command === "edit"), undefined);
       assert.strictEqual(area.value, typed, "the typed text stays in the field");
       assert.strictEqual(page.posted.find((m) => m.command === "noteLineCount")?.lines, 2);
+      assert.strictEqual(area.getAttribute("aria-invalid"), "true", "the field is marked unsaved");
+      area.dispatchEvent(new page.window.Event("input"));
+      assert.strictEqual(area.hasAttribute("aria-invalid"), false, "typing clears the mark");
     });
   }
+
+  test("webview: plain Enter in the Comment textarea commits rather than adding a line", () => {
+    const { area, page } = notePage();
+    const KeyboardEvent = page.window.KeyboardEvent as new (type: string, init: object) => DomNode;
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    area.dispatchEvent(enter);
+    assert.strictEqual(enter.defaultPrevented, true);
+  });
+
+  test("webview: a step dropped on the Comment textarea mid-drag is not typed into it", () => {
+    const { area, page } = notePage();
+    page.row(4).dispatchEvent(new page.window.Event("dragstart", { bubbles: true }));
+    const drop = new page.window.Event("drop", { bubbles: true, cancelable: true }) as DomNode;
+    area.dispatchEvent(drop);
+    assert.strictEqual(drop.defaultPrevented, true);
+  });
+
+  // stepsView.ts imports vscode, so the provider cannot be loaded node-side; pin its wiring by scan.
+  test("provider: noteLineCount shows its own error text from a validated count only", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "..", "..", "src", "stepsView.ts"),
+      "utf8",
+    );
+    const at = src.indexOf('m?.command === "noteLineCount"');
+    assert.ok(at >= 0, "stepsView.ts handles noteLineCount");
+    const body = src.slice(at, src.indexOf("} else if", at));
+    assert.match(body, /typeof m\.lines === "number"/);
+    assert.match(body, /Number\.isSafeInteger\(m\.lines\)/);
+    assert.match(body, /showErrorMessage\(\s*`MessageFoundry: /);
+    assert.doesNotMatch(body, /m\.text/, "no webview text reaches the toast");
+  });
 
   test("webview: a click in the Comment textarea does not move the row selection", () => {
     const { area, page } = notePage();

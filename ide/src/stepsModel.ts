@@ -3384,9 +3384,9 @@ function isMultilineNoteText(row: RowViewModel, p: ParamField): boolean {
 
 /**
  * A multi-line Comment's text as a textarea (BACKLOG #5841), editable when `attrs` carries edit
- * coordinates, otherwise read-only (still selectable, so not disabled). `wrap="off"` keeps one visual
- * row per physical line, since the engine counts physical lines. The page reads the note's span from
- * the edit coordinates, the same span the engine's set_note checks a new text against. Pure.
+ * coordinates, otherwise read-only and disabled like every other read-only field. `wrap="off"` keeps
+ * one visual row per physical line, since the engine counts physical lines. The page reads the note's
+ * span from the edit coordinates, the same span the engine's set_note checks a new text against. Pure.
  */
 function noteTextareaHtml(value: string, attrs: string): string {
   const lines = value.split("\n").length;
@@ -3395,7 +3395,7 @@ function noteTextareaHtml(value: string, attrs: string): string {
   const body = `\n${escapeHtml(value)}`;
   return attrs
     ? `<textarea class="edit" ${attrs} rows="${lines}" wrap="off">${body}</textarea>`
-    : `<textarea readonly rows="${lines}" wrap="off">${body}</textarea>`;
+    : `<textarea readonly disabled rows="${lines}" wrap="off">${body}</textarea>`;
 }
 
 /** The edit coordinates every editable control of one param carries, echoed back on edit (F7). */
