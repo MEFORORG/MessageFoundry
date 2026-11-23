@@ -28,6 +28,22 @@
 # reinstates either one, the gate reds on it as a NEW ADVISORY. Triage it again, starting from PR
 # 2112's reasoning.
 #
+# THREE MORE ENTRIES WERE REMOVED ON 2026-11-23: lodash GHSA-f23m-r3pf-42rh, minimatch
+# GHSA-g3hv-75wg-m249 and deepmerge GHSA-gcqx-w48m-w2h4. Scheduled Security runs reported each as a
+# STALE BASELINE ENTRY daily from at least run 45030900670 (2026-11-20). Claude, an AI agent
+# working as a Builder subagent, read `gh api advisories/<id>` for each on 2026-11-23. GitHub
+# withdrew GHSA-gcqx-w48m-w2h4 at 2026-11-16T18:55:38Z. It has not withdrawn the other two; it
+# narrowed their affected ranges so they no longer cover the locked versions. GHSA-f23m-r3pf-42rh's
+# lodash range now reads "= 4.17.23" (updated 2026-11-03), and the lockfile holds lodash 4.17.21.
+# GHSA-g3hv-75wg-m249's range now reads ">= 7.0.0, < 11.0.1" (updated 2026-11-04), and the lockfile
+# holds minimatch 3.1.2. THE AUDIT STILL SEES BOTH PACKAGES: a live `npm audit` the same day, with
+# npm 11.19.0, counted 561 dependencies against the lockfile's 561 entries and still reported
+# lodash GHSA-r5fr-rjxr-66jc and GHSA-xxjr-mmjv-4gpg and minimatch's three other entries. Its
+# report is tests/fixtures/cla_action_audit/npm-audit-2026-11-23.json. The deepmerge and minimatch
+# triage comments at the end of this file are kept, because other comments here cite their bundle
+# readings. If GitHub reinstates or widens any of the three, the gate reds on it as a NEW ADVISORY;
+# triage it again from its comment, or for lodash from scratch, since it had none.
+#
 # A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT. It bears on the js-yaml entries and on braces
 # GHSA-grv7-fg5c-xmjg. That advisory sits on braces 3.0.2, the node the withdrawn GHSA-vfj7-8cjw-p6xm
 # was also reported against. NONE OF THOSE ENTRIES WAS TRIAGED ON THIS MEASUREMENT ALONE. The
@@ -303,12 +319,9 @@ package = "js-yaml"
 id = "GHSA-mh29-5h37-fv8m"
 package = "js-yaml"
 
-# NOT TRIAGED. The three lodash entries and the lodash.set entry below are recorded as found. The
-# 2026-11-05 triage did not cover them (BACKLOG #2492).
-
-[[advisory]]
-id = "GHSA-f23m-r3pf-42rh"
-package = "lodash"
+# NOT TRIAGED. The two lodash entries and the lodash.set entry below are recorded as found. The
+# 2026-11-05 triage did not cover them (BACKLOG #2492). A third lodash entry, GHSA-f23m-r3pf-42rh,
+# was removed on 2026-11-23; the header says why.
 
 [[advisory]]
 id = "GHSA-r5fr-rjxr-66jc"
@@ -429,6 +442,9 @@ package = "brace-expansion"
 id = "GHSA-qhr7-859c-m2p7"
 package = "brace-expansion"
 
+# ENTRY REMOVED 2026-11-23: GitHub withdrew GHSA-gcqx-w48m-w2h4 at 2026-11-16T18:55:38Z; the
+# header says more. This comment is kept as the record of the deepmerge bundle reading, which
+# tests/test_cla_action_advisory_gate.py still re-runs. It reads as written on 2026-10-28.
 # TRIAGED 2026-10-28 by Claude, an AI agent in the Manager seat, on issue 2618 (scheduled
 # Security run 40685626928, job cla-action-audit). deepmerge GHSA-gcqx-w48m-w2h4, GitHub
 # severity low (its CVSS 3.1 vector scores 5.3, which CVSS rates medium): mergeObject() allows
@@ -446,10 +462,11 @@ package = "brace-expansion"
 # deepmerge defines, so a re-vendored bundle that carries unminified deepmerge 4.x reds there. It
 # does NOT see deepmerge code arriving minified or renamed inside another package's pre-built file.
 
-[[advisory]]
-id = "GHSA-gcqx-w48m-w2h4"
-package = "deepmerge"
-
+# ENTRY REMOVED 2026-11-23: GitHub narrowed GHSA-g3hv-75wg-m249's range to ">= 7.0.0, < 11.0.1",
+# which no longer covers the locked minimatch 3.1.2; the header says more. This comment is kept as
+# the record of the minimatch, glob, rimraf and actions-toolkit bundle readings, which other
+# comments here and tests/test_cla_action_advisory_gate.py cite. It reads as written on 2026-10-31,
+# when GitHub's range covered 3.1.2.
 # TRIAGED 2026-10-31 by Claude, an AI agent working as a Builder subagent of the Lander, on issue
 # 2695 (scheduled Security run 41198026900, job cla-action-audit). minimatch GHSA-g3hv-75wg-m249,
 # GitHub severity medium, npm moderate, no CVSS score: a glob pattern an attacker supplies can
@@ -486,7 +503,3 @@ package = "deepmerge"
 # Lander's chat, as the Lander relayed
 # it to the Builder writing this. Asked: "Accept minimatch in the CLA action's baseline (PR 2697)".
 # Answer: "accept".
-
-[[advisory]]
-id = "GHSA-g3hv-75wg-m249"
-package = "minimatch"

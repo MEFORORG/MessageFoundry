@@ -8,9 +8,15 @@ thing to avoid here.* So most tests below are controls: each plants one failure 
 catch and requires the gate to name it.
 
 NO NETWORK. The report the gate judges is npm's verbatim stdout from ``npm audit --json``. It was
-taken on 2026-10-31 with npm 11.19.0, through this gate's own runner, against the vendored lockfile.
-It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-28 reading, also npm
-11.19.0, after GitHub published minimatch GHSA-g3hv-75wg-m249. The findings the gate compares differ
+taken on 2026-11-23 with npm 11.19.0, through this gate's own runner, against the vendored lockfile.
+It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-31 reading, also npm
+11.19.0, after GitHub withdrew deepmerge GHSA-gcqx-w48m-w2h4 and narrowed the ranges of lodash
+GHSA-f23m-r3pf-42rh and minimatch GHSA-g3hv-75wg-m249 so they no longer cover the locked versions.
+The findings the gate compares differ by exactly those three. The dependency counts are unchanged.
+Seven ``vulnerabilities`` entries left, deepmerge and the six packages that reached it, with the
+low and total counts down by seven, and two changed, lodash and minimatch, whose ``via`` lost the
+advisory and whose ``range`` narrowed. The 2026-10-31 reading had replaced the 2026-10-28 one, also
+npm 11.19.0, after GitHub published minimatch GHSA-g3hv-75wg-m249. The findings the gate compares differ
 by exactly that one. The ``vulnerabilities`` entries and the counts are unchanged in number, and the
 only entry that moved is minimatch, whose ``via`` gains the advisory and whose ``range`` widens.
 The 2026-10-28 reading had replaced the 2026-10-24 one, also npm 11.19.0, after GitHub published
@@ -47,7 +53,7 @@ from tests._workflow_contexts import jobs_of
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = REPO_ROOT / "scripts" / "security"
-_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-10-31.json"
+_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-11-23.json"
 
 
 def _load(name: str) -> ModuleType:
@@ -619,14 +625,14 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #:
 #: - Packages on the braces and js-yaml chains: what that reading settles is stated in the header
 #:   paragraph "A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT".
-#: - deepmerge, read 2026-10-28: what that reading settles is stated in the triage comment above
-#:   deepmerge's entry. Only names deepmerge alone defines are re-run here, two of the six it
-#:   measured. The other four are left out because other code uses them too: the
+#: - deepmerge, read 2026-10-28: what that reading settles is stated in the deepmerge triage
+#:   comment, kept after its entry was removed on 2026-11-23. Only names deepmerge alone defines
+#:   are re-run here, two of the six it measured. The other four are left out because other code uses them too: the
 #:   is-mergeable-object package exports ``isMergeableObject``, ``arrayMerge`` and ``mergeObject``
 #:   are common helper names, and "deepmerge" is in other packages' names, such as deepmerge-ts.
-#: - minimatch, read 2026-10-31: what that reading settles is stated in the triage comment above
-#:   minimatch's GHSA-g3hv-75wg-m249 entry. These three cover minimatch by name, an identifier of
-#:   its own, and glob, its runtime parent. "Toolkit" above covers actions-toolkit, the top of that
+#: - minimatch, read 2026-10-31: what that reading settles is stated in the minimatch
+#:   GHSA-g3hv-75wg-m249 triage comment, kept after its entry was removed on 2026-11-23. These
+#:   three cover minimatch by name, an identifier of its own, and glob, its runtime parent. "Toolkit" above covers actions-toolkit, the top of that
 #:   chain. The bare name is kept although other packages' names can hold it, such as
 #:   @types/minimatch: a false red only sends someone to redo the reading. The other two still fire
 #:   if that name is gone from the file but these identifiers survive.
