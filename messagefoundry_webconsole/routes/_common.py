@@ -29,7 +29,7 @@ from messagefoundry.api.validation import (
     StatusFilter,
 )
 
-from ..pages._common import REFILLED_FIELD_VALUE
+from ..pages._common import REFILLED_CONTENT, REFILLED_FIELD_VALUE
 
 _log = logging.getLogger(__name__)
 
@@ -214,26 +214,61 @@ def blank_to_none(value: str | None) -> str | None:
     return value or None
 
 
-def posted_field_value(form: Mapping[str, str]) -> str | None:
-    """The Field value a needle form POST carries as a criterion, or ``None`` (BACKLOG #6700).
+class PostedNeedle(NamedTuple):
+    """The needle terms a form POST carries as criteria (BACKLOG #6700). ``notice`` says which
+    refilled leftover was not sent, or is empty when none was."""
 
-    The search and uploaded-log filter pages refill their boxes after a run, so an operator who ran a
-    field-path search and then clears Field path to search on a substring posts the old Field value
-    beside the new substring. The engine refuses that pair, so that leftover is not sent: it is the
-    case where Field path is blank, a substring is given, and the Field value is unchanged from the
-    one the page rendered beside a Field path, whether that page showed results or a refusal. A
-    value the operator typed or changed, or one a refusal page echoed back with no Field path, is
-    sent as posted, so the engine's refusal of it reaches the page rather than the value being
-    dropped."""
-    value = form.get("field_value") or None
-    if (
-        value is not None
-        and value == form.get(REFILLED_FIELD_VALUE)
-        and not form.get("field_path", "").strip()
-        and form.get("content", "").strip()
+    content: str | None
+    field_path: str | None
+    field_value: str | None
+    notice: str
+
+
+#: The on-page notices for a dropped leftover. Fixed text, so nothing the operator typed is echoed.
+DROPPED_FIELD_VALUE = (
+    "The Field value left from the last search was not sent, because Field path is now blank."
+)
+DROPPED_CONTENT = (
+    "The Substring left from the last search was not sent, because a Field path is now given."
+)
+
+
+def posted_needle(form: Mapping[str, str]) -> PostedNeedle:
+    """The Substring, Field path and Field value a needle form POST carries as criteria (BACKLOG
+    #6700).
+
+    The search and uploaded-log filter pages refill their boxes after a run, so an operator who
+    switches from one kind of needle to the other posts the old term beside the new one, and the
+    engine refuses that pair. A leftover is not sent in two cases: Field path is blank, a Substring
+    is given, and the Field value is unchanged from the one the page rendered beside a Field path;
+    or a Field path is given and the Substring is unchanged from the one the page rendered with no
+    Field path. Either page, results or refusal, writes the markers. A value the operator typed or
+    changed, or one a page echoed back without its marker, is sent as posted, so the engine's
+    refusal of it reaches the page rather than the value being dropped."""
+    content = form.get("content") or None
+    field_path = form.get("field_path") or None
+    field_value = form.get("field_value") or None
+    has_path = bool((field_path or "").strip())
+    notice = ""
+    if content is not None and has_path and content == form.get(REFILLED_CONTENT):
+        content, notice = None, DROPPED_CONTENT
+    elif (
+        field_value is not None
+        and not has_path
+        and (content or "").strip()
+        and field_value == form.get(REFILLED_FIELD_VALUE)
     ):
-        return None
-    return value
+        field_value, notice = None, DROPPED_FIELD_VALUE
+    return PostedNeedle(content, field_path, field_value, notice)
+
+
+def sends_a_needle(content: str | None, field_path: str | None, field_value: str | None) -> bool:
+    """Whether a form sent any needle term, by the engine's rule for a route where a needle is
+    optional: any non-empty Substring or Field path, spaces only included, or a Field value with
+    something besides whitespace (BACKLOG #6700). A copy, because the console may not import
+    ``messagefoundry.store``; ``test_console_needle_rule_matches_the_engine`` pins it to the
+    engine's ``content_search.sends_a_needle``."""
+    return bool(content or field_path) or bool(field_value and not field_value.isspace())
 
 
 async def _form_pairs(request: Request) -> list[tuple[str, str]]:

@@ -74,6 +74,13 @@ Some lists have a length of their own. A message export may name at most 100000 
 same ceiling as its `limit`. An events request may filter on at most 32 event kinds. A directory
 group mapping, and a counter-reset request, may carry at most 1000 entries.
 
+In the JSON body of `POST /messages/search`, `POST /messages/export`,
+`POST /uploads/{file_id}/messages/search` and the criteria on `POST /search/presets`, a `limit`,
+`offset` or `scan_limit` the model takes must be a JSON integer when sent, and `scan_limit` may also
+be `null`. A string such as `"7"`, a boolean, or a number written with a fraction, `7.0` included,
+gets a 422 (vault BACKLOG #6700). The same names on
+a query string are read from text, as every query value is.
+
 **Which words and codes exist is not decided here.** The role names, the permission catalog and the
 status vocabulary belong to the engine. These rules decide only the shape a value may take, so a
 value that could not be a member is refused early and one that merely does not exist gets a 404.
@@ -274,12 +281,20 @@ Where each rule lives:
   with anything besides whitespace, gets a 400 where the model has not refused it first. A blank one beside a real term counts as not sent,
   so that request is accepted.
 - The console search form: it calls the API's search handler, so a clash gets the same answer.
-  With no criteria at all it shows the empty form and does not search.
+  With no criteria at all it shows the empty form and does not search. A Field value of only
+  spaces, with no Substring or Field path, counts as no criterion there. The search form and the
+  uploaded-log filter refill their boxes after a run. A refilled term the operator left in place
+  is not sent beside a term of the other kind: a Field value once Field path is blank and a
+  Substring is given, or a Substring once a Field path is given. The page then says which one was
+  not sent. `posted_needle`, in
+  [`messagefoundry_webconsole/routes/_common.py`](../messagefoundry_webconsole/routes/_common.py),
+  holds that rule.
 - Layered search: `_compose_preset_layers`, in
   [`messagefoundry/api/app.py`](../messagefoundry/api/app.py). A content term is a `content` value,
   a `field_path` or a `field_value` saved in a preset. A preset holding a `field_value` with no
   `field_path` counts as one, and the search refuses it with a 400. A `field_value` that is empty or
-  only whitespace does not count.
+  only whitespace does not count, nor does a stored one that is not text, so on a preset with no
+  other content term it is ignored.
 - Edit and resubmit, and the statistics reset: each route itself, in the same file.
 - Password change: the API rule is in the route, in
   [`messagefoundry/api/auth_routes.py`](../messagefoundry/api/auth_routes.py). The API takes no

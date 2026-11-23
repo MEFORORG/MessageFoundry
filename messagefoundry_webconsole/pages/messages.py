@@ -26,7 +26,7 @@ from messagefoundry.parsing.peek import starts_with_msh
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
-from ._common import _pager, _refilled_field_value, _reveal_cell, _seg
+from ._common import _pager, _refilled_content, _refilled_field_value, _reveal_cell, _seg
 from .approvals import approvals_link
 
 __all__ = [
@@ -354,12 +354,14 @@ def message_search(
     message_type: str = "",
     control_id: str = "",
     error: str = "",
+    notice: str = "",
     presets: list[Any] | None = None,
 ) -> Markup:
     """The content-search page (a step-up-unlock GET, ADR 0046 #51): search by an HL7 field path
     (``PID-3``) or a raw/summary substring, over the caller's channels. ``results is None`` = the bare
     form (no search yet). Every matched row is a metadata-only summary (server-redacted) linking to the
-    audited detail view — no decrypted body is ever rendered here."""
+    audited detail view — no decrypted body is ever rendered here. ``notice`` says that a refilled
+    leftover was not sent (BACKLOG #6700)."""
     target_options = [
         el("option", label, value=value, selected=value == target or None)
         for value, label in (
@@ -384,6 +386,7 @@ def message_search(
         el("label", "Field value", el("input", name="field_value", value=field_value or None)),
         _refilled_field_value(field_path, field_value),
         el("label", "Substring", el("input", name="content", value=content or None)),
+        _refilled_content(content, field_path),
         el("label", "Target", el("select", *target_options, name="target")),
         el("input", name="channel_id", value=channel_id or None, placeholder="channel (optional)"),
         el("input", name="status", value=status or None, placeholder="status (optional)"),
@@ -409,6 +412,8 @@ def message_search(
     ]
     if error:
         parts.append(el("p", error, class_="banner"))
+    if notice:
+        parts.append(el("p", notice, class_="muted"))
     if results is not None:
         rows = [
             [

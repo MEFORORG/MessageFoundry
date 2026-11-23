@@ -30,7 +30,7 @@ from .._html import Markup, el, text
 
 REFILLED_FIELD_VALUE = "field_value_refilled"
 """The hidden input that carries the Field value a needle form was refilled with (BACKLOG #6700).
-:func:`messagefoundry_webconsole.routes._common.posted_field_value` reads it back."""
+:func:`messagefoundry_webconsole.routes._common.posted_needle` reads it back."""
 
 
 def _refilled_field_value(field_path: str, field_value: str) -> Markup:
@@ -39,9 +39,24 @@ def _refilled_field_value(field_path: str, field_value: str) -> Markup:
     only with a path: a page re-rendered from a refused value-without-path holds no marker, so
     resubmitting that refusal sends the value again rather than dropping it. It holds the same value
     as the visible box beside it and travels in the POST body, as the box does."""
-    # Blank as posted_field_value and the engine read it: a path of only spaces is no path.
+    # Blank as posted_needle and the engine read it: a path of only spaces is no path.
     value = field_value if field_path.strip() else ""
     return el("input", type="hidden", name=REFILLED_FIELD_VALUE, value=value or None)
+
+
+REFILLED_CONTENT = "content_refilled"
+"""The hidden input that carries the Substring a needle form was refilled with (BACKLOG #6700).
+:func:`messagefoundry_webconsole.routes._common.posted_needle` reads it back."""
+
+
+def _refilled_content(content: str, field_path: str) -> Markup:
+    """A needle form's record of the Substring it was rendered with while Field path was blank, the
+    mirror of :func:`_refilled_field_value`: an operator who ran a substring search and then types a
+    Field path would otherwise post the old Substring beside it, which the engine refuses (BACKLOG
+    #6700). Written only with no path, so a page that already showed both holds no marker and
+    resubmitting it sends the Substring again."""
+    value = content if not field_path.strip() else ""
+    return el("input", type="hidden", name=REFILLED_CONTENT, value=value or None)
 
 
 def _reveal_cell(value: str | None, href: str | None, *, revealed: bool) -> object:

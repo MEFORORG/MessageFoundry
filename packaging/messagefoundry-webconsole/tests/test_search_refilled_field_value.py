@@ -11,6 +11,7 @@ sides: the leftover is not sent, and a value the operator typed still reaches th
 
 from __future__ import annotations
 
+import itertools
 import re
 from html.parser import HTMLParser
 from pathlib import Path
@@ -22,6 +23,12 @@ from test_uploaded_logs_ui import _service as _uploads_service
 
 from messagefoundry.auth import Role
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.content_search import sends_a_needle as engine_sends_a_needle
+from messagefoundry_webconsole.routes._common import (
+    DROPPED_CONTENT,
+    DROPPED_FIELD_VALUE,
+)
+from messagefoundry_webconsole.routes._common import sends_a_needle as console_sends_a_needle
 
 _REFUSAL = "field_value applies only to an HL7 field path, not to content"
 #: The result note for no match, anchored so "10 match(es)" does not satisfy it.
@@ -173,3 +180,138 @@ async def test_an_uploaded_log_substring_filter_from_a_refilled_page_succeeds(
         fourth = await c.post(action, data=form)
         assert fourth.status_code == 400, fourth.text
         assert _refilled(fourth.text, action)["field_value"] == ""
+
+
+# --- BACKLOG #6700 items 2, 7, 8, 9 and 24 ----------------------------------------------------------
+
+_BOTH = "provide exactly one of a content substring or an HL7 field path"
+
+
+async def test_a_refilled_substring_beside_a_typed_field_path_is_dropped_with_a_notice(
+    engine: Engine,
+) -> None:
+    """Item 7: an operator who ran a substring search and then types a Field path posted the old
+    Substring beside it and was refused. Item 8: the page now says the leftover was not sent."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)  # PID-3 = 100, body carries DOE^JANE
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        first = await c.post("/ui/messages/search/run", data={"content": "DOE^JANE"})
+        assert first.status_code == 200, first.text
+        assert DROPPED_CONTENT not in first.text  # control: nothing was dropped on the first run
+        form = _refilled(first.text, "/ui/messages/search/run")
+        assert form["content"] == "DOE^JANE"  # control: the page did refill the box
+
+        form.update(field_path="PID-3", field_value="100")
+        second = await c.post("/ui/messages/search/run", data=form)
+        assert second.status_code == 200, second.text
+        assert _BOTH not in second.text
+        assert f"/ui/messages/{mid}" in second.text
+        assert DROPPED_CONTENT in second.text
+        assert _refilled(second.text, "/ui/messages/search/run")["content"] == ""
+
+        # Changed on the refilled page: the operator's own value, so it is sent and refused.
+        form = _refilled(first.text, "/ui/messages/search/run")
+        form.update(field_path="PID-3", content="SMITH")
+        third = await c.post("/ui/messages/search/run", data=form)
+        assert third.status_code == 400, third.text
+        assert _BOTH in third.text and DROPPED_CONTENT not in third.text
+
+
+async def test_a_dropped_field_value_leftover_is_named_on_the_page(engine: Engine) -> None:
+    """Item 8, the Field value side."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        first = await c.post(
+            "/ui/messages/search/run", data={"field_path": "PID-3", "field_value": "100"}
+        )
+        assert DROPPED_FIELD_VALUE not in first.text
+        form = _refilled(first.text, "/ui/messages/search/run")
+        form.update(field_path="", content="DOE^JANE")
+        second = await c.post("/ui/messages/search/run", data=form)
+        assert second.status_code == 200, second.text
+        assert DROPPED_FIELD_VALUE in second.text
+
+
+async def test_resubmitting_a_refusal_page_that_carried_a_path(engine: Engine) -> None:
+    """Item 24: a refusal page rendered with a Field path holds the Field value marker and no
+    Substring marker. Resubmitted unchanged, both terms are the operator's and are refused again;
+    with Field path cleared the Field value is the leftover; with Substring cleared the field
+    search runs on the value."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    action = "/ui/messages/search/run"
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        refused = await c.post(
+            action, data={"field_path": "PID-3", "field_value": "999", "content": "DOE^JANE"}
+        )
+        assert refused.status_code == 400, refused.text
+        form = _refilled(refused.text, action)
+        assert form["field_value_refilled"] == "999" and form["content_refilled"] == ""
+
+        again = await c.post(action, data=form)
+        assert again.status_code == 400, again.text
+        assert _BOTH in again.text
+
+        form = _refilled(refused.text, action)
+        form.update(field_path="")
+        sub = await c.post(action, data=form)
+        assert sub.status_code == 200, sub.text
+        assert f"/ui/messages/{mid}" in sub.text and DROPPED_FIELD_VALUE in sub.text
+
+        form = _refilled(refused.text, action)
+        form.update(content="")
+        field = await c.post(action, data=form)
+        assert field.status_code == 200, field.text
+        assert _NO_MATCH.search(field.text), "the refilled Field value was not applied"
+
+
+async def test_a_field_value_of_only_spaces_alone_is_no_criterion(engine: Engine) -> None:
+    """Item 2: the console counted a Field value of only spaces as a criterion, where the engine's
+    rule for an optional needle does not, so it searched and was refused. It is the bare form now."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/messages/search/run", data={"field_value": "   "})
+        assert r.status_code == 200, r.text
+        assert "match(es)" not in r.text and _BOTH not in r.text
+
+
+def test_console_needle_rule_matches_the_engine() -> None:
+    """The console's copy of the optional-needle rule agrees with the engine's on every case."""
+    values = [None, "", " ", "　", "DOE", " DOE "]
+    for content, path, value in itertools.product(values, values, values):
+        assert console_sends_a_needle(content, path, value) == engine_sends_a_needle(
+            content, path, value
+        ), (content, path, value)
+
+
+async def test_an_uploaded_log_refusal_echoes_no_control_character_and_applies_no_refused_filter(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Item 9: the refusal arm echoed control_id raw, control characters included, and still
+    applied it, so the listing was filtered by the refused value. Control: a valid message_type
+    beside a refused criterion is still applied."""
+    service = await _uploads_service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+        action = f"/ui/uploaded-logs/file/{fid}/filter"
+        r = await c.post(action, data={"control_id": "MSG1\x01", "message_type": "ADT\x02"})
+        assert r.status_code == 400, r.text
+        assert "\x01" not in r.text and "\x02" not in r.text
+        assert "2 of 2 message(s)" in r.text, "a refused filter was applied"
+        assert 'value="MSG1"' in r.text  # the echo, with the control character dropped
+
+        r = await c.post(action, data={"content": "M" * 600, "message_type": "ADT^A04"})
+        assert r.status_code == 400, r.text
+        assert "1 of 2 message(s)" in r.text, "a valid filter beside a refused one was dropped"
