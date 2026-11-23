@@ -40,7 +40,12 @@ import logging
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-__all__ = ["RequestTimeoutMiddleware", "DEFAULT_REQUEST_TIMEOUT_SECONDS", "TIMEOUT_STATE_ATTR"]
+__all__ = [
+    "BODY_REFUSED_KEY",
+    "DEFAULT_REQUEST_TIMEOUT_SECONDS",
+    "RequestTimeoutMiddleware",
+    "TIMEOUT_STATE_ATTR",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -56,6 +61,10 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 #: state, so a bare ASGI scope with no app degrades to the shipped default rather than crashing.
 #: This is the seam a ``[api]`` knob would set; it is not wired to config today.
 TIMEOUT_STATE_ATTR = "request_timeout_seconds"
+
+#: Scope key the body limit sets just before its counted 413: that 413 is this request's response,
+#: and the route it interrupted has not returned. Anything the route sends from here on is dropped.
+BODY_REFUSED_KEY = "messagefoundry.body_refused"
 
 #: Set directly because this middleware sits OUTSIDE the app's ``_security_headers``, so a refusal
 #: short-circuits it. Mirrors ``client_networks._DENIAL_HEADERS`` minus its denial marker.

@@ -245,7 +245,7 @@ from messagefoundry.api.outlive import (
 )
 from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS as OUTLIVING_DRAIN_SECONDS
 from messagefoundry.api.paging import page_total
-from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
+from messagefoundry.api.request_timeout import BODY_REFUSED_KEY, RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     DIRECTORY_GRANTED_BY,
@@ -5125,8 +5125,10 @@ def create_app(
 
             async def send_with_headers(message: Message) -> None:
                 # The response start is where the router has run, so the matched route the
-                # no-store arm reads is in the scope by now.
-                if message["type"] == "http.response.start":
+                # no-store arm reads is in the scope by now. After a counted 413 the body limit
+                # drops this response, and building its headers reads request.url, which raises on
+                # a query string that is not UTF-8.
+                if message["type"] == "http.response.start" and not scope.get(BODY_REFUSED_KEY):
                     _apply_security_headers(request, MutableHeaders(scope=message))
                 await send(message)
 
@@ -5229,6 +5231,8 @@ def create_app(
                     scrub_log_argument(client_ip(request) or "unknown"),
                 )
             else:
+                # Before the 413's start, so the layers it passes through can read it.
+                request.scope[BODY_REFUSED_KEY] = True
                 refusal = _refuse_body(
                     request, 413, "request body too large", "oversized request body"
                 )

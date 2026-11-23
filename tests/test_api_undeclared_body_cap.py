@@ -264,6 +264,32 @@ async def test_a_non_utf8_query_string_does_not_stop_the_413(
     )
 
 
+@pytest.mark.parametrize(
+    ("chunks", "headers"),
+    [
+        (_chunks(_CHUNKS_AT_CAP + 1, fill=b"{"), ()),
+        ([b"{"], ((b"content-length", str(_MAX_REQUEST_BODY_BYTES + 1).encode()),)),
+    ],
+    ids=["counted", "declared"],
+)
+async def test_a_non_utf8_query_cannot_raise_past_the_413_on_a_real_route(
+    chunks: list[bytes], headers: tuple[tuple[bytes, bytes], ...]
+) -> None:
+    """FastAPI answers the disconnect with its own 400. That response is dropped, so nothing may
+    build its headers: they read ``request.url``, which raises on this query."""
+    run = await _drive(
+        create_app(allow_no_auth=True),
+        chunks,
+        path="/auth/login",
+        headers=headers,
+        query_string=b"a=\xff",
+    )
+    assert run.status == 413
+    assert run.closes
+    bodies = [m["body"] for m in run.sent if m["type"] == "http.response.body"]
+    assert bodies == [b'{"detail":"request body too large"}']
+
+
 async def test_a_refusal_is_logged(caplog: pytest.LogCaptureFixture) -> None:
     app, _ = _app_with_probe()
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
