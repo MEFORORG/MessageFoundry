@@ -453,6 +453,24 @@ def test_an_asyncpg_sqlstate_attribute_is_still_read() -> None:
     assert "[23505] [driver message withheld]" in safe_traceback((type(exc), exc, None))
 
 
+class _AgreeingText(str):
+    """Text whose ``==`` says yes to anything."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
+def test_a_sqlstate_text_subclass_cannot_name_an_asyncpg_message() -> None:
+    """Red on a03971a7569, whose ``attribute == state`` let a ``str`` subclass's ``__eq__`` name
+    ``MRN42``, asyncpg's message, as the state."""
+    exc = _AsyncpgMessage(_VALUE)
+    exc.sqlstate = _AgreeingText("")
+    assert database._shown_state(_VALUE, exc) is None
+    assert _VALUE not in database._safe_db_error(exc)
+
+
 async def test_an_asyncpg_message_in_a_send_is_dead_lettered_naming_no_state(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

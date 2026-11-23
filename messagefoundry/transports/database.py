@@ -2850,7 +2850,8 @@ def _shown_state(state: str | None, exc: BaseException) -> str | None:
     if args_hold_a_message(exc):
         try:
             attribute = getattr(exc, "sqlstate", None)
-            if not (isinstance(attribute, str) and attribute == state):
+            # Exactly str, compared by str's own method: a subclass's __eq__ could say yes.
+            if not (type(attribute) is str and str.__eq__(attribute, state) is True):
                 return None
         except Exception:  # noqa: BLE001 - an unreadable attribute names nothing, as the docstring says
             return None
