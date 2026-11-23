@@ -388,13 +388,14 @@ _PG_SWEEP_LANES = {
 
 
 class _PgSweepConn:
-    """An asyncpg connection stand-in: answers the orphan SELECT with two unregistered rows and
+    """An asyncpg connection stand-in: answers the orphan SELECT with three unregistered rows and
     models the queue rows' status for the DEAD ``UPDATE ... WHERE id=$5 [AND status IN ($6, $7)]``,
-    returning the command tag asyncpg would."""
+    returning the command tag asyncpg would. q-1 is the row a test moves; q-2 (in flight) and q-3
+    (pending) are the controls, one for each status the read selects."""
 
     def __init__(self, lane: str) -> None:
         self.lane = lane
-        self.status: dict[str, str] = {"q-1": "pending", "q-2": "inflight"}
+        self.status: dict[str, str] = {"q-1": "pending", "q-2": "inflight", "q-3": "pending"}
 
     @asynccontextmanager
     async def transaction(self, **_kw: Any) -> AsyncIterator[None]:
@@ -405,6 +406,7 @@ class _PgSweepConn:
         return [
             {"id": "q-1", "message_id": "m-1", self.lane: "GONE_A"},
             {"id": "q-2", "message_id": "m-2", self.lane: "GONE_B"},
+            {"id": "q-3", "message_id": "m-3", self.lane: "GONE_C"},
         ]
 
     async def execute(self, sql: str, *args: Any) -> str:
@@ -421,11 +423,12 @@ class _PgSweepConn:
 @pytest.mark.parametrize("moved", sorted(_MOVES))
 @pytest.mark.parametrize("sweep", sorted(_PG_SWEEP_LANES))
 async def test_a_postgres_sweep_leaves_a_row_that_moved_after_its_read(
-    sweep: str, moved: str
+    sweep: str, moved: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The Postgres sweeps read with no row lock too, so a row cancelled, purged or completed
     before the DEAD update keeps its new state, gets no ``dead`` event and no finalize, and is not
-    counted. The in-flight control row is still dead-lettered."""
+    counted or named in the warning. The in-flight and pending control rows are still
+    dead-lettered."""
     move, keeps = _MOVES[moved]
     conn = _PgSweepConn(_PG_SWEEP_LANES[sweep])
     events: list[str] = []
@@ -455,10 +458,15 @@ async def test_a_postgres_sweep_leaves_a_row_that_moved_after_its_read(
     store._event = event  # type: ignore[method-assign,assignment]
     store._maybe_finalize_message = maybe_finalize  # type: ignore[method-assign,assignment]
 
-    dead = await getattr(store, sweep)(set(), now=200.0)
+    with caplog.at_level("WARNING", logger="messagefoundry.store.postgres"):
+        dead = await getattr(store, sweep)(set(), now=200.0)
 
     assert conn.status.get("q-1") == keeps, conn.status
     assert conn.status["q-2"] == "dead", "the in-flight control row was not dead-lettered"
-    assert dead == 1
-    assert events == ["m-2"], "a dead event was written for a row the sweep did not dead-letter"
-    assert finalized == ["m-2"], "the moved row's message was finalized"
+    assert conn.status["q-3"] == "dead", "the pending control row was not dead-lettered"
+    assert dead == 2
+    assert events == ["m-2", "m-3"], "a dead event was written for a row not dead-lettered"
+    assert finalized == ["m-2", "m-3"], "the moved row's message was finalized"
+    (message,) = [r.getMessage() for r in caplog.records if "dead-lettered" in r.getMessage()]
+    assert message.startswith("dead-lettered 2 "), message
+    assert message.endswith(": GONE_B, GONE_C") and "GONE_A" not in message, message
