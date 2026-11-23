@@ -80,8 +80,10 @@ from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 from messagefoundry.pipeline.dr import (
     DrCoordinator,
     DrProfileNotLeading,
+    alert_resume_refused,
     note_passive_start,
-    resume_prior_activation,
+    record_resume,
+    resumable_activation,
     warn_unset_pass_environment,
 )
 from messagefoundry.pipeline.dr_backup import BackupRunner
@@ -2220,6 +2222,44 @@ class Engine:
         if disarm is not None:
             disarm()
 
+    async def _resume_or_start_passive(self) -> None:
+        """BACKLOG #5965: on a DR box, resume an earlier activation under ``[dr].activate = true``,
+        or record that a passive start ended one.
+
+        ``[dr].activate = true`` keeps a box promoted by ``POST /dr/activate`` active across a
+        restart. It resumes only an activation the store records on this host with nothing ending
+        it since, so a boot latches the run-profile only behind a ``dr.activate`` row that endpoint
+        wrote; what that check cannot see is in ``resumable_activation``'s docstring. With none,
+        the box starts passive rather than refusing the start, which would crash-loop a service
+        restarted after a proper release with the key still set: it logs an ERROR and alerts.
+
+        Whether sibling engine processes share the store decides an engine shard, not the
+        ``--shard`` flag: ``supervise`` passes it for its one engine shard of a config with no
+        ``shard=`` too, whose filter attaches no shard id, and that box is a lone engine. A filter
+        with no graph yet cannot say, so it counts as an engine shard."""
+        dr = self._dr_settings
+        if not dr.enabled or self._dr_active:
+            return
+        engine_shard = self._shares_transform_state() or (
+            self.filters_its_graph and self._registry_runner is None
+        )
+        if dr.activate:
+            found = await resumable_activation(self.store, dr, engine_shard=engine_shard)
+            if found[0] is not None:
+                await record_resume(self.store, dr, found[0], now=time.time())
+                self._set_dr_active(True)
+                self._dr_profile_applied = True
+                if self._dr_coordinator is not None:
+                    # Built before start, it read the latch as off; a repeated POST /dr/activate
+                    # must find the box active rather than seed it again.
+                    self._dr_coordinator.note_resumed()
+                return
+            alert_resume_refused(self._alert_sink, found[1])
+        if not engine_shard:
+            # A passive start ends any activation the store still shows, so a later start under
+            # [dr].activate = true cannot resume one this box stopped serving here.
+            await note_passive_start(self.store, now=time.time())
+
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
         outbounds, then start the wired graph."""
@@ -2295,27 +2335,6 @@ class Engine:
                 "set audit_verify_on_start = true to arm it",
                 self._audit_anchor_file,
             )
-        # BACKLOG #5965: [dr].activate = true keeps a box promoted by POST /dr/activate active across
-        # a restart. It resumes only an activation the store records on this host with nothing
-        # ending it since, and refuses the start otherwise, before any listener binds, so a boot
-        # latches the run-profile only behind a dr.activate row that endpoint wrote. What that
-        # check cannot see is in resume_prior_activation's docstring. The latch goes to the runner
-        # before the graph comes up below.
-        engine_shard = self.filters_its_graph or self.instance_identity is not None
-        if self._dr_settings.enabled and self._dr_settings.activate and not self._dr_active:
-            await resume_prior_activation(
-                self.store, self._dr_settings, now=time.time(), engine_shard=engine_shard
-            )
-            self._set_dr_active(True)
-            self._dr_profile_applied = True
-            if self._dr_coordinator is not None:
-                # Built before start, it read the latch as off; a repeated POST /dr/activate must
-                # find the box active rather than seed it again.
-                self._dr_coordinator.note_resumed()
-        elif self._dr_settings.enabled and not self._dr_active and not engine_shard:
-            # A passive start ends any activation the store still shows, so a later start under
-            # [dr].activate = true cannot resume one this box stopped serving here (BACKLOG #5965).
-            await note_passive_start(self.store, now=time.time())
         # Bring cluster membership + leader election up BEFORE the workers run, so the node's heartbeat
         # is registered and leadership is contended the moment it starts processing (Track B Step 3/4).
         # NullCoordinator (the single-node default) is a no-op here, so this line is free for SQLite /
@@ -2394,6 +2413,10 @@ class Engine:
             # refused here, before any sync, rather than surfacing later as a failed sync, and so
             # is a non-bool literal on a boolean source setting (vault BACKLOG #3234).
             refuse_reference_hop_flags(self._registry_runner.registry)
+        # After the refusals above, so a start they refuse writes no dr.resume or dr.lapsed row,
+        # and before the graph comes up below, which takes the latch.
+        await self._resume_or_start_passive()
+        if self._registry_runner is not None:
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener

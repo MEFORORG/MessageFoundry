@@ -301,8 +301,10 @@ class AlertSink(Protocol):
         the bare connection name, whichever direction stopped. Some raises are not about a
         connection and carry a prefixed stand-in instead, which no connection name can hold (the
         name grammar has no colon): at least ``reference:<set>`` for a reference set that failed to
-        sync, ``fhir_lookup:<name>`` for a lookup that failed to build, and
-        ``cluster:transform-state`` for a state-convergence failure. ``detail`` says what stopped."""
+        sync, ``fhir_lookup:<name>`` for a lookup that failed to build,
+        ``cluster:transform-state`` for a state-convergence failure, and ``dr:resume`` for a DR box
+        that started passive because ``[dr].activate = true`` found no activation to resume
+        (BACKLOG #5965). ``detail`` says what stopped."""
         ...
 
     def connection_started(self, name: str) -> None:

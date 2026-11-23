@@ -79,9 +79,11 @@ __all__ = [
     "DrCoordinator",
     "DrProfileNotLeading",
     "DrResult",
-    "DrResumeRefused",
+    "RESUME_ALERT_SUBJECT",
+    "alert_resume_refused",
     "note_passive_start",
-    "resume_prior_activation",
+    "record_resume",
+    "resumable_activation",
 ]
 
 log = logging.getLogger(__name__)
@@ -162,12 +164,6 @@ class DrProfileNotLeading(RuntimeError):
     coordinator no longer reads it as leader, before the reload changed any lane (BACKLOG #5906).
     The engine raises it from the runner's own refusal, so this module does not import the
     runner."""
-
-
-class DrResumeRefused(RuntimeError):
-    """A boot under ``[dr].activate = true`` found no activation of this box to resume, so the
-    engine refuses to start rather than latch the DR run-profile unaudited (BACKLOG #5965). The
-    message names no configured value."""
 
 
 class DrActivationError(RuntimeError):
@@ -299,7 +295,7 @@ class DrCoordinator:
         self._owned_lanes = owned_lanes
         # Whether the DR run-profile is currently on (mirrors the engine's _dr_active; this
         # coordinator flips it on activate/release). The engine passes its own latch, which a boot
-        # sets only by resuming an audited activation (resume_prior_activation, BACKLOG #5965).
+        # sets only by resuming an audited activation (resumable_activation, BACKLOG #5965).
         # Never read from [dr].activate, which alone proves no activation.
         self._active = active
         # An activation whose run-profile is applied but whose dr.activate row is not yet known to be
@@ -1703,7 +1699,7 @@ _ENDS_AN_ACTIVATION: dict[str, str] = {
 }
 
 
-async def _live_activation(store: Store) -> tuple[dict[str, Any] | None, str | None]:
+async def _live_activation(store: Store) -> tuple[dict[str, Any], None] | tuple[None, str]:
     """The newest ``dr.activate`` row when it is live, else ``None`` and why not. One read: the
     newest row among ``dr.activate`` and the actions that end one."""
     rows = await store.recent_audit_of([_ACTION_ACTIVATE, *_ENDS_AN_ACTIVATION], limit=1)
@@ -1750,56 +1746,82 @@ async def note_passive_start(store: Store, *, now: float) -> None:
     )
 
 
-async def resume_prior_activation(
-    store: Store, settings: DrSettings, *, now: float, engine_shard: bool = False
-) -> int:
-    """Resume, at start, an activation this box already made through ``POST /dr/activate``.
+#: The stand-in name a refused resume raises ``connection_stopped`` under (BACKLOG #5965). The
+#: colon keeps it outside the connection-name grammar, so no alert rule's restart reaches a real
+#: connection, as for ``reference:<name>`` and ``cluster:transform-state``.
+RESUME_ALERT_SUBJECT = "dr:resume"
 
-    ``[dr].activate = true`` keeps a promoted box active across a restart (BACKLOG #5965). It
-    re-latches the run-profile without seeding again and without the takeover hook: the store is
-    the one that activation verified and has served since, and a second seed check could refuse
-    it, because on a server-DB box the box's own ``dr_backup`` rows are by then the latest anchor a
-    restore token is compared with. It never stands in for the activation itself, which alone runs
-    the seed verify and the takeover hook and writes the ``dr.activate`` row.
+
+def alert_resume_refused(sink: AlertSink | None, reason: str) -> None:
+    """Log at ERROR and raise ``connection_stopped`` under :data:`RESUME_ALERT_SUBJECT` for a start
+    under ``[dr].activate = true`` that resumed nothing (BACKLOG #5965), on ``sink`` or the
+    logging sink. Fixed words, naming no configured value. Never raises: an alert failure must not
+    stop the passive start. Nothing resolves the instance on its own; an operator does, once the
+    box is promoted or ``[dr].activate`` is set false."""
+    text = (
+        f"[dr].activate = true found no activation of this box to resume: {reason}. The box "
+        "started PASSIVE and binds no priority feed. A DR box is promoted by POST /dr/activate "
+        "(dr:operate), which verifies the cold seed, runs the takeover hook and writes the "
+        "dr.activate audit row; [dr].activate = true only keeps such a box active across a restart"
+    )
+    log.error("DR: %s", text)
+    try:
+        (sink or LoggingAlertSink()).connection_stopped(RESUME_ALERT_SUBJECT, detail=text)
+    except Exception:  # a sink must never break the start
+        log.warning("DR: the refused-resume alert failed", exc_info=True)
+
+
+async def resumable_activation(
+    store: Store, settings: DrSettings, *, engine_shard: bool = False
+) -> tuple[int, None] | tuple[None, str]:
+    """The audit row id of an activation a start under ``[dr].activate = true`` may resume, else
+    ``None`` and why not. It writes nothing.
+
+    ``[dr].activate = true`` keeps a box promoted by ``POST /dr/activate`` active across a restart
+    (BACKLOG #5965). A resume re-latches the run-profile without seeding again and without the
+    takeover hook: the store is the one that activation verified and has served since, and a second
+    seed check could refuse it, because on a server-DB box the box's own ``dr_backup`` rows are by
+    then the latest anchor a restore token is compared with. It never stands in for the activation
+    itself, which alone runs the seed verify and the takeover hook and writes the ``dr.activate``
+    row.
 
     So the store must show that activation: the newest row among ``dr.activate`` and
     :data:`_ENDS_AN_ACTIVATION` is a ``dr.activate`` written on this host at the configured
-    ``priority_threshold``. An engine shard never resumes, since the rows name the host and not
-    the engine shard. A start that finds none raises :class:`DrResumeRefused`, which refuses the
-    start, and binds nothing. One that finds it writes a ``dr.resume`` row naming that activation,
-    before the rest of the start, and returns its row id. A store error propagates, so a store that
-    cannot be read refuses the start too.
+    ``priority_threshold``. ``engine_shard`` is true where sibling engine processes share the
+    store; such an engine never resumes, since the rows name the host and not the engine shard. A
+    store error propagates.
 
     The checks read what the store records, and at least these cases pass them: an activation
     this host made in an earlier incident, carried in a restored store, when no passive start or
     attempt has followed it there; and a completed release whose ``dr.release`` row could not be
     written."""
-    node = socket.gethostname()
-    activation, reason = await _live_activation(store)
     if engine_shard:
-        reason = "an engine shard cannot tell its own activation from a sibling engine shard's"
-    elif activation is not None:
-        detail = _detail(activation)
-        if detail.get("node") != node:
-            reason = "the last activation was not recorded on this host"
-        elif detail.get("threshold") != settings.priority_threshold.value:
-            reason = "the last activation ran at a different [dr].priority_threshold"
-    if activation is None or reason is not None:
-        raise DrResumeRefused(
-            f"[dr].activate = true found no activation of this box to resume: {reason}. A DR box "
-            "is promoted by POST /dr/activate (dr:operate), which verifies the cold seed, runs the "
-            "takeover hook and writes the dr.activate audit row; [dr].activate = true only keeps "
-            "such a box active across a restart. Set [dr].activate = false, start the box passive, "
-            "and promote it with POST /dr/activate"
-        )
-    activation_id = int(activation["id"])
+        return None, "an engine shard cannot tell its own activation from a sibling engine shard's"
+    live = await _live_activation(store)
+    if live[0] is None:
+        return live
+    activation = live[0]
+    detail = _detail(activation)
+    if detail.get("node") != socket.gethostname():
+        return None, "the last activation was not recorded on this host"
+    if detail.get("threshold") != settings.priority_threshold.value:
+        return None, "the last activation ran at a different [dr].priority_threshold"
+    return int(activation["id"]), None
+
+
+async def record_resume(
+    store: Store, settings: DrSettings, activation_id: int, *, now: float
+) -> None:
+    """Write the ``dr.resume`` row naming ``activation_id``, which :func:`resumable_activation`
+    found, and log the re-latch. The engine calls it once the start's own refusals have passed,
+    so a start refused later leaves no row (BACKLOG #5965)."""
     await store.record_audit(
         _ACTION_RESUME,
         actor="system",
         detail=json.dumps(
             {
                 "activation_id": activation_id,
-                "node": node,
+                "node": socket.gethostname(),
                 "threshold": settings.priority_threshold.value,
             },
             sort_keys=True,
@@ -1812,4 +1834,3 @@ async def resume_prior_activation(
         settings.priority_threshold.value,
         activation_id,
     )
-    return activation_id

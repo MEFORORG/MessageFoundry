@@ -8,11 +8,13 @@ alone, so a boot bound the priority feeds with no seed verification, takeover ho
 come back passive after a restart, and on a server-DB box with a restore token its own
 ``dr_backup`` rows then refused the activation again. Now a boot resumes only the newest
 ``dr.activate`` row written on this host with no ``dr.release`` or later ``dr_seed`` after it,
-records a ``dr.resume`` row, and refuses to start otherwise."""
+and records a ``dr.resume`` row. Otherwise it starts passive, logs an ERROR and alerts: refusing
+the start would crash-loop a box restarted after a proper release with the key still set."""
 
 from __future__ import annotations
 
 import json
+import logging
 import socket
 from pathlib import Path
 
@@ -25,16 +27,21 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StoreSettings,
 )
+from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dr import (
+    RESUME_ALERT_SUBJECT,
     DrActivationError,
     DrCoordinator,
-    DrResumeRefused,
-    resume_prior_activation,
+    record_resume,
+    resumable_activation,
 )
 from messagefoundry.pipeline.dr_backup import BackupRunner
+from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
+from tests.test_shard_recovery_engine import _only, _write_cfg
 
 
 async def _seed(tmp_path: Path) -> tuple[str, StoreSettings, str]:
@@ -65,14 +72,48 @@ async def _seed(tmp_path: Path) -> tuple[str, StoreSettings, str]:
     return res.archive_path, ss, key
 
 
-async def _engine(ss: StoreSettings, key: str, dr: DrSettings) -> Engine:
+class _StopSpy(LoggingAlertSink):
+    """Records each ``connection_stopped`` it is sent."""
+
+    def __init__(self) -> None:
+        self.stopped: list[tuple[str, str]] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append((name, detail))
+
+
+async def _engine(
+    ss: StoreSettings,
+    key: str,
+    dr: DrSettings,
+    *,
+    alert_sink: _StopSpy | None = None,
+    shard: str | None = None,
+) -> Engine:
     return Engine(
         await MessageStore.open(ss.path, cipher=make_cipher(key)),
         poll_interval=0.05,
         store_settings=ss,
         dr_settings=dr,
         egress_settings=EgressSettings(deny_by_default=False),
+        alert_sink=alert_sink,
+        registry_filter=None if shard is None else _only(shard),
     )
+
+
+async def _activate_once(ss: StoreSettings, key: str, archive: str) -> int:
+    """Promote the box through ``POST /dr/activate``'s coordinator, then stop it. Returns the
+    ``dr.activate`` row id."""
+    first = await _engine(ss, key, DrSettings(enabled=True, seed_archive=archive))
+    try:
+        await first.start()
+        coord = first.dr_coordinator
+        assert coord is not None
+        await coord.activate(actor="alice")
+        rows = await first.store.list_audit(action="dr.activate", limit=1)
+        return int(rows[0]["id"])
+    finally:
+        await first.stop()
 
 
 async def _actions(engine: Engine) -> list[str]:
@@ -121,14 +162,92 @@ async def test_a_restart_after_an_api_activation_resumes_it(tmp_path: Path) -> N
             await engine.stop()
 
 
-async def test_activate_true_with_no_prior_activation_refuses_the_start(tmp_path: Path) -> None:
+async def test_activate_true_with_no_prior_activation_starts_passive_and_alerts(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No refusal of the start, which would crash-loop the service: the box comes up passive, an
+    ERROR names the reason and POST /dr/activate, and the alert path raises ``dr:resume``."""
     archive, ss, key = await _seed(tmp_path)
-    engine = await _engine(ss, key, DrSettings(enabled=True, activate=True, seed_archive=archive))
+    spy = _StopSpy()
+    dr = DrSettings(enabled=True, activate=True, seed_archive=archive)
+    engine = await _engine(ss, key, dr, alert_sink=spy)
     try:
-        with pytest.raises(DrResumeRefused, match=r"POST /dr/activate") as info:
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.dr"):
             await engine.start()
-        assert "records no POST /dr/activate" in str(info.value)
         assert not engine.dr_active
+        assert "dr.resume" not in await _actions(engine)
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "records no POST /dr/activate" in errors[0] and "started PASSIVE" in errors[0]
+        assert "POST /dr/activate (dr:operate)" in errors[0]
+        assert [name for name, _ in spy.stopped] == [RESUME_ALERT_SUBJECT]
+        assert "records no POST /dr/activate" in spy.stopped[0][1]
+        # The control: POST /dr/activate still promotes the passive box.
+        coord = engine.dr_coordinator
+        assert coord is not None
+        await coord.activate(actor="alice")
+        assert engine.dr_active
+    finally:
+        await engine.stop()
+
+
+async def test_a_single_shard_supervise_start_resumes(tmp_path: Path) -> None:
+    """``supervise`` passes ``--shard`` for its one engine shard of a config with no ``shard=``
+    too. That engine shares the store with no sibling, so it resumes as a lone engine does."""
+    archive, ss, key = await _seed(tmp_path)
+    activation_id = await _activate_once(ss, key, archive)
+    full = load_config(_write_cfg(tmp_path / "cfg", tmp_path, [None]))
+    spy = _StopSpy()
+    dr = DrSettings(enabled=True, activate=True, seed_archive=archive)
+    engine = await _engine(ss, key, dr, alert_sink=spy, shard="default")
+    try:
+        engine.add_registry(filter_registry_for_shard(full, "default"))
+        assert engine.filters_its_graph and engine.instance_identity is None
+        await engine.start()
+        assert engine.dr_active
+        resumed = await engine.store.list_audit(action="dr.resume", limit=1)
+        assert json.loads(resumed[0]["detail"])["activation_id"] == activation_id
+        assert spy.stopped == []
+    finally:
+        await engine.stop()
+
+
+async def test_an_engine_shard_of_a_multi_shard_config_starts_passive(tmp_path: Path) -> None:
+    """The rows name the host, not the engine shard, so a sibling's live activation would read as
+    this engine shard's own. It starts passive, alerts, and writes no dr.lapsed row, which would
+    end a sibling's activation."""
+    archive, ss, key = await _seed(tmp_path)
+    await _activate_once(ss, key, archive)
+    full = load_config(_write_cfg(tmp_path / "cfg", tmp_path, ["a", "b"]))
+    spy = _StopSpy()
+    dr = DrSettings(enabled=True, activate=True, seed_archive=archive)
+    engine = await _engine(ss, key, dr, alert_sink=spy, shard="a")
+    try:
+        engine.add_registry(filter_registry_for_shard(full, "a"))
+        assert engine.instance_identity == "shard:a"
+        await engine.start()
+        assert not engine.dr_active
+        actions = await _actions(engine)
+        assert "dr.resume" not in actions and "dr.lapsed" not in actions
+        assert [name for name, _ in spy.stopped] == [RESUME_ALERT_SUBJECT]
+        assert "engine shard cannot tell" in spy.stopped[0][1]
+    finally:
+        await engine.stop()
+
+
+async def test_a_start_refused_later_writes_no_resume_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dr.resume row is written only once the start's own refusals have passed."""
+    archive, ss, key = await _seed(tmp_path)
+    await _activate_once(ss, key, archive)
+    dr = DrSettings(enabled=True, activate=True, seed_archive=archive)
+    engine = await _engine(ss, key, dr)
+    try:
+        engine.add_registry(load_config(_write_cfg(tmp_path / "cfg", tmp_path, [None])))
+        monkeypatch.setattr(engine.store, "supports_ingest_stage", False, raising=False)
+        with pytest.raises(RuntimeError, match=r"staged ingress pipeline"):
+            await engine.start()
         assert "dr.resume" not in await _actions(engine)
     finally:
         await engine.stop()
@@ -162,10 +281,13 @@ async def test_a_passive_start_ends_the_activation_it_starts_over(tmp_path: Path
         assert (await _actions(again)).count("dr.lapsed") == 1
     finally:
         await again.stop()
-    kept = await _engine(ss, key, DrSettings(enabled=True, activate=True, seed_archive=archive))
+    spy = _StopSpy()
+    dr = DrSettings(enabled=True, activate=True, seed_archive=archive)
+    kept = await _engine(ss, key, dr, alert_sink=spy)
     try:
-        with pytest.raises(DrResumeRefused, match=r"started passive since the last activation"):
-            await kept.start()
+        await kept.start()
+        assert not kept.dr_active
+        assert "started passive since the last activation" in spy.stopped[0][1]
     finally:
         await kept.stop()
 
@@ -182,11 +304,13 @@ async def test_a_released_activation_is_not_resumed(tmp_path: Path) -> None:
         assert not first.dr_active
     finally:
         await first.stop()
-    engine = await _engine(ss, key, DrSettings(enabled=True, activate=True, seed_archive=archive))
+    spy = _StopSpy()
+    dr = DrSettings(enabled=True, activate=True, seed_archive=archive)
+    engine = await _engine(ss, key, dr, alert_sink=spy)
     try:
-        with pytest.raises(DrResumeRefused, match=r"released by POST /dr/release"):
-            await engine.start()
+        await engine.start()  # a restart after a proper release starts, passive
         assert not engine.dr_active
+        assert "released by POST /dr/release" in spy.stopped[0][1]
     finally:
         await engine.stop()
 
@@ -221,8 +345,8 @@ async def test_an_activation_that_is_not_this_boxes_live_one_is_refused(
             if detail.get("node") == "HERE":
                 detail = {"threshold": "critical", **detail, "node": socket.gethostname()}
             await _record(store, action, detail)
-        with pytest.raises(DrResumeRefused, match=reason):
-            await resume_prior_activation(store, DrSettings(), now=2.0)
+        activation, why = await resumable_activation(store, DrSettings())
+        assert activation is None and why is not None and reason in why
         assert not await store.list_audit(action="dr.resume", limit=1)
     finally:
         await store.close()
@@ -255,8 +379,11 @@ async def test_a_server_db_box_resumes_where_activating_again_is_refused(tmp_pat
         # The activated box backs itself up, which writes the newer anchor.
         await _record(store, "dr_backup", {"archive": "dr-box-own.mfbak"})
 
-        activation = await resume_prior_activation(store, dr, now=3.0)
+        activation, _ = await resumable_activation(store, dr)
+        assert activation is not None
         assert activation == (await store.list_audit(action="dr.activate", limit=1))[0]["id"]
+        await record_resume(store, dr, activation, now=3.0)
+        assert await store.list_audit(action="dr.resume", limit=1)
 
         # The control: activating again after the restart is what the resume avoids.
         with pytest.raises(DrActivationError) as exc:
@@ -272,8 +399,9 @@ async def test_an_engine_shard_never_resumes(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "s.db")
     try:
         await _record(store, "dr.activate", {"node": socket.gethostname(), "threshold": "critical"})
-        with pytest.raises(DrResumeRefused, match=r"engine shard cannot tell"):
-            await resume_prior_activation(store, DrSettings(), now=2.0, engine_shard=True)
-        assert await resume_prior_activation(store, DrSettings(), now=2.0) > 0
+        activation, why = await resumable_activation(store, DrSettings(), engine_shard=True)
+        assert activation is None and why is not None and "engine shard cannot tell" in why
+        activation, why = await resumable_activation(store, DrSettings())
+        assert activation is not None and activation > 0 and why is None
     finally:
         await store.close()

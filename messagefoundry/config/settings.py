@@ -6066,8 +6066,9 @@ _ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})
 #: real connection. The notifier checks the same set at dispatch (``NotifierAlertSink._emit``).
 #:
 #: This set checks the event TYPE only, and an allowed type can still carry a stand-in:
-#: ``reference:<name>`` (pipeline/reference_sync.py) and ``cluster:transform-state``
-#: (pipeline/state_convergence.py) both raise ``connection_stopped``. So the notifier also skips the
+#: ``reference:<name>`` (pipeline/reference_sync.py), ``cluster:transform-state``
+#: (pipeline/state_convergence.py) and ``dr:resume`` (pipeline/dr.py) all raise
+#: ``connection_stopped``. So the notifier also skips the
 #: action for an event whose ``connection`` key is not a connection name, even at an explicit
 #: control_target (BACKLOG #2527). A stand-in raised under one of these types must keep a colon.
 #:
@@ -7709,8 +7710,9 @@ class DrSettings(_Section):
     (``enabled = true``) or it is not. ``POST /dr/activate`` is the only way to promote a box.
     ``activate = true`` keeps a box that endpoint promoted active across a restart: the engine
     resumes that activation only when the store shows it was made on this host and not released,
-    and refuses to start otherwise, so a boot never binds the priority feeds without the seed
-    verification, takeover hook and ``dr.activate`` audit row the endpoint runs (BACKLOG #5965).
+    and otherwise starts passive, logging an ERROR and raising an alert, so a boot never binds the
+    priority feeds without the seed verification, takeover hook and ``dr.activate`` audit row the
+    endpoint runs (BACKLOG #5965).
     Without ``enabled`` it is refused at load, where it was silently ignored.
     """
 
@@ -7719,8 +7721,8 @@ class DrSettings(_Section):
     enabled: bool = False
     # Whether this DR box comes back UNDER the DR run-profile after a restart (BACKLOG #5965). It
     # resumes only an activation POST /dr/activate made on this host and did not release, as the
-    # store's audit rows show; with none, the engine refuses to start. It never promotes a box by
-    # itself. false = the box always boots provisioned-but-passive: it does NOT bind the priority
+    # store's audit rows show; with none, the box starts passive, with an ERROR and an alert. It
+    # never promotes a box by itself. false = the box always boots provisioned-but-passive: it does NOT bind the priority
     # feeds until an operator activates it. Refused at load unless enabled.
     activate: bool = False
     activation_mode: DrActivationMode = DrActivationMode.MANUAL
@@ -7865,7 +7867,7 @@ class DrSettings(_Section):
     def _activate_needs_enabled(self) -> DrSettings:
         # BACKLOG #5965: without enabled the engine never read activate, so a box an operator
         # meant to keep active came up as an ordinary engine with nothing said. What activate does
-        # with enabled is checked at start (pipeline.dr.resume_prior_activation), against the store.
+        # with enabled is checked at start (pipeline.dr.resumable_activation), against the store.
         if self.activate and not self.enabled:
             raise ValueError(
                 "[dr].activate = true needs [dr].enabled = true: it keeps a DR box that POST "
