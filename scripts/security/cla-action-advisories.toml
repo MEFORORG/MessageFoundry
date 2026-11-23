@@ -10,8 +10,8 @@
 # The script prints what to check first.
 #
 # AN ENTRY WITH NO TRIAGE COMMENT ABOVE IT HAS NOT BEEN TRIAGED. The first audit, run 2026-09-29
-# with npm 11.5.2, recorded 35 entries as found; 34 of them are the first 34 here, since lodash
-# GHSA-f23m-r3pf-42rh was removed on 2026-11-23. Listing an entry here is
+# with npm 11.5.2, recorded 35 entries as found; commit 1dabae7123b holds that list. Lodash
+# GHSA-f23m-r3pf-42rh, one of them, was removed on 2026-11-23. Listing an entry here is
 # not a judgement of whether it is reachable in the bundle's runtime path; only a triage comment
 # above it is. Some affect packages the lockfile marks `dev` only (the @babel packages, for
 # example). Others do not: lodash, lodash.set and js-yaml are among the packages the lockfile does
@@ -32,26 +32,28 @@
 # THREE MORE ENTRIES WERE REMOVED ON 2026-11-23: lodash GHSA-f23m-r3pf-42rh, minimatch
 # GHSA-g3hv-75wg-m249 and deepmerge GHSA-gcqx-w48m-w2h4. Scheduled Security runs reported
 # GHSA-f23m-r3pf-42rh as a STALE BASELINE ENTRY from run 41841556576 (2026-11-04),
-# GHSA-g3hv-75wg-m249 from run 42040981435 (2026-11-05), and all three by run 45030900670
-# (2026-11-22). Claude, an AI agent working as a Builder subagent, read `gh api advisories/<id>`
-# for each on 2026-11-23. GitHub withdrew GHSA-gcqx-w48m-w2h4 at 2026-11-16T18:55:38Z. It has not
-# withdrawn the other two; it narrowed their affected ranges so they no longer cover the locked
-# versions. GHSA-f23m-r3pf-42rh's lodash range now reads "= 4.17.23" (updated 2026-11-03), and the
-# lockfile holds lodash 4.17.21. GHSA-g3hv-75wg-m249's range now reads ">= 7.0.0, < 11.0.1"
-# (updated 2026-11-04), and the lockfile holds minimatch 3.1.2. THE NARROWING DOES NOT MEAN THE
-# LOCKED LODASH LOST THAT FLAW: the same audit reports GHSA-xxjr-mmjv-4gpg, still baselined below,
-# under a new npm source id (1244531, was 1120370), with `_.pullAt` added to its title beside
-# `_.unset` and `_.omit`, over ">=4.0.0 <=4.17.22", which covers 4.17.21. Read it as GitHub
-# moving the array-path pollution for 4.17.21 into that advisory. THE AUDIT STILL SEES BOTH
-# PACKAGES: a live `npm audit` on 2026-11-23, with npm 11.19.0, counted 561 dependencies against
-# the lockfile's 561 entries and still reported lodash GHSA-r5fr-rjxr-66jc and GHSA-xxjr-mmjv-4gpg
-# and minimatch's three other entries. Its report is
-# tests/fixtures/cla_action_audit/npm-audit-2026-11-23.json. The minimatch triage comment at the
-# end of this file is kept because other comments here cite its bundle readings; the deepmerge
-# one is kept because the gate test still re-runs two of its probes. NEITHER NOW SITS ABOVE AN
-# ENTRY, AND NEITHER ACCEPTANCE CARRIES OVER: if GitHub reinstates or widens any of the three, the
-# gate reds on it as a NEW ADVISORY, and a re-added entry needs a fresh triage and acceptance in a
-# new comment of its own, on the advisory as it then reads.
+# GHSA-g3hv-75wg-m249 from run 42040981435 (2026-11-05), and GHSA-gcqx-w48m-w2h4 from run
+# 44115255276 (2026-11-17). Claude, an AI agent working as a Builder subagent, read `gh api
+# advisories/<id>` for each on 2026-11-23. GitHub withdrew GHSA-gcqx-w48m-w2h4 at
+# 2026-11-16T18:55:38Z. It has not withdrawn the other two; it narrowed their affected ranges so
+# they no longer cover the locked versions. GHSA-f23m-r3pf-42rh's lodash range now reads "= 4.17.23"
+# (updated 2026-11-03), and the lockfile holds lodash 4.17.21. GHSA-g3hv-75wg-m249's range now reads
+# ">= 7.0.0, < 11.0.1" (updated 2026-11-04), and the lockfile holds minimatch 3.1.2. THE LOCKED
+# LODASH IS STILL COVERED BY A PROTOTYPE POLLUTION ADVISORY IN THE SAME FUNCTIONS:
+# GHSA-xxjr-mmjv-4gpg, still baselined below, names `_.unset`, `_.omit` and now `_.pullAt`, and its
+# range, ">=4.0.0 <=4.17.22", covers 4.17.21. The same audit reports it under a new npm source id
+# (1244531, was 1120370). GitHub added `_.pullAt` to GHSA-f23m-r3pf-42rh's summary too. THE AUDIT
+# STILL SEES BOTH PACKAGES: a live `npm audit` on 2026-11-23, with npm 11.19.0, counted 561
+# dependencies against the lockfile's 561 entries and still reported lodash GHSA-r5fr-rjxr-66jc and
+# GHSA-xxjr-mmjv-4gpg and minimatch's three other entries. Its report is
+# tests/fixtures/cla_action_audit/npm-audit-2026-11-23.json. The minimatch triage comment at the end
+# of this file is kept because other comments here cite its bundle readings; the deepmerge one is
+# kept as the starting point for a fresh triage if GitHub reinstates the advisory, as the 2026-10-24
+# paragraph above does with PR 2112's reasoning, and the gate test re-runs two of its probes so that
+# starting point stays true of the bundle. NEITHER NOW SITS ABOVE AN ENTRY, AND NEITHER ACCEPTANCE
+# CARRIES OVER: if GitHub reinstates or widens any of the three, the gate reds on it as a NEW
+# ADVISORY, and a re-added entry needs a fresh triage and acceptance in a new comment of its own, on
+# the advisory as it then reads.
 #
 # A BUNDLE MEASUREMENT FROM PR 2112'S TRIAGE IS KEPT. It bears on the js-yaml entries and on braces
 # GHSA-grv7-fg5c-xmjg. That advisory sits on braces 3.0.2, the node the withdrawn GHSA-vfj7-8cjw-p6xm
@@ -514,3 +516,8 @@ package = "brace-expansion"
 # Lander's chat, as the Lander relayed
 # it to the Builder writing this. Asked: "Accept minimatch in the CLA action's baseline (PR 2697)".
 # Answer: "accept".
+#
+# NO ENTRY FOLLOWS. The two comments above, deepmerge's and minimatch's GHSA-g3hv-75wg-m249,
+# cover no [[advisory]] entry since 2026-11-23, and their acknowledgement and acceptance do not
+# carry to one. Put a new or re-added entry above the "ENTRY REMOVED 2026-11-23" deepmerge
+# comment, with a triage comment of its own, never below this line.

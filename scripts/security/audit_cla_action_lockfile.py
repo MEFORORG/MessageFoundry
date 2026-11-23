@@ -26,10 +26,10 @@ run's real output:
    in the vendored action's declared LOCKFILE, which does not bound what the bundle holds. Its
    triage comments say, for the entries they cover, whether the package's identifiers were found
    in the bundle itself, on a reading whose limits are stated in the baseline's header, and in the
-   deepmerge and minimatch GHSA-g3hv-75wg-m249 triage comments, which state their own. The lockfile
-   is frozen, so an audit that stops reporting one has either stopped looking or met a withdrawn
-   advisory. Either way a person has to find out which. For each stale GHSA id the run prints
-   the ``withdrawn_at`` GitHub's advisory database gives, read live, or why it could not be read.
+   triage comments that state their own. The lockfile is frozen, so the causes of an advisory no
+   longer being reported include at least a withdrawn advisory, an affected range narrowed off the
+   locked version, and an audit that stopped looking. A person has to find out which. For each
+   stale GHSA id the run prints the ``withdrawn_at`` GitHub's advisory database gives, read live, or why it could not be read.
    That line is a hint for the person and never changes the verdict: a stale entry is a red
    whether GitHub says it was withdrawn, says it was not, or cannot be reached.
 
@@ -255,7 +255,8 @@ def evaluate(
     for ident, package in stale_entries(reported, baseline):
         problems.append(
             f"STALE BASELINE ENTRY: {ident} in {package} is acknowledged but no longer reported. "
-            "The tree is frozen, so either the advisory was withdrawn or the audit stopped seeing "
+            "The tree is frozen, so at least these could explain it: the advisory was withdrawn, "
+            "its affected range no longer covers the locked version, or the audit stopped seeing "
             "the package. Find out which before removing the entry."
         )
     return problems
@@ -474,7 +475,9 @@ bundle, which needs a Node toolchain this repository does not carry.
 What to do about a STALE BASELINE ENTRY. Read its WITHDRAWN_AT line above where the run printed
 one with a timestamp or NOT withdrawn; otherwise open the advisory's GitHub page. If it was
 withdrawn or its affected range no longer covers the locked version, remove the entry. If neither,
-the audit stopped seeing the package, and the audit is what needs fixing.""",
+look for a NEW ADVISORY on the same package in this run, which may be the same flaw re-keyed, and
+then check whether the audit stopped seeing the package; if it did, the audit is what needs
+fixing.""",
     "COVERAGE": """\
 What to do about COVERAGE. The audit did not read the whole lockfile, so none of its other results
 mean anything yet. Check what npm printed, and whether a new npm counts dependencies differently.""",

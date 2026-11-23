@@ -13,23 +13,23 @@ It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-31 
 11.19.0, after GitHub withdrew deepmerge GHSA-gcqx-w48m-w2h4 and narrowed the ranges of lodash
 GHSA-f23m-r3pf-42rh and minimatch GHSA-g3hv-75wg-m249 so they no longer cover the locked versions.
 The findings the gate compares differ by exactly those three. The dependency counts are unchanged.
-Seven ``vulnerabilities`` entries left, deepmerge and the six packages that reached it, with the
-low and total counts down by seven. Two entries changed, lodash and minimatch, in their ``via``
+Seven ``vulnerabilities`` entries were removed, deepmerge and the six packages that reached it, with
+the low and total counts down by seven. Two entries changed, lodash and minimatch, in their ``via``
 and ``range`` fields only. Each ``via`` lost the removed advisory. lodash's also re-issued
 GHSA-xxjr-mmjv-4gpg under a new npm source id with ``_.pullAt`` added to its title; the baseline's
 header says what that means. The 2026-10-31 reading had replaced the 2026-10-28 one, also npm
-11.19.0, after GitHub published minimatch GHSA-g3hv-75wg-m249. The findings the gate compares
-differ by exactly that one. The ``vulnerabilities`` entries and the counts are unchanged in number, and the
-only entry that moved is minimatch, whose ``via`` gains the advisory and whose ``range`` widens.
-The 2026-10-28 reading had replaced the 2026-10-24 one, also npm 11.19.0, after GitHub published
+11.19.0, after GitHub published minimatch GHSA-g3hv-75wg-m249. The findings the gate compares differ
+by exactly that one. The ``vulnerabilities`` entries and the counts are unchanged in number, and the
+only entry that moved is minimatch, whose ``via`` gains the advisory and whose ``range`` widens. The
+2026-10-28 reading had replaced the 2026-10-24 one, also npm 11.19.0, after GitHub published
 deepmerge GHSA-gcqx-w48m-w2h4. Those two differ by exactly that one finding, plus seven
 ``vulnerabilities`` entries, deepmerge and six packages that reach it, with the low and total counts
-up by seven; every entry the 2026-10-24 reading held is unchanged. The 2026-10-24 reading had
-itself replaced the 2026-10-07 one, taken with npm 11.5.2, after GitHub withdrew two advisories.
-Those two readings' findings differed by exactly the two withdrawn ids. Other fields differed too: some followed from the withdrawals, such as the braces and js-yaml
-ranges and js-yaml's ``via``, and the rest, such as some ``effects`` and ``fixAvailable`` values,
-were not traced to a cause. The live call is replaced by an injected runner, so nothing here needs
-npm.
+up by seven; every entry the 2026-10-24 reading held is unchanged. The 2026-10-24 reading had itself
+replaced the 2026-10-07 one, taken with npm 11.5.2, after GitHub withdrew two advisories. Those two
+readings' findings differed by exactly the two withdrawn ids. Other fields differed too: some
+followed from the withdrawals, such as the braces and js-yaml ranges and js-yaml's ``via``, and the
+rest, such as some ``effects`` and ``fixAvailable`` values, were not traced to a cause. The live
+call is replaced by an injected runner, so nothing here needs npm.
 
 THE FALSE CLEAN IS A RECORDED READING, NOT A GUESS. :data:`_NO_MANIFEST_REPORT` is npm's verbatim
 output with the lockfile and no ``package.json``. The gate must fail it even with an EMPTY baseline,
@@ -222,6 +222,20 @@ def test_an_acknowledged_advisory_no_longer_reported_fails() -> None:
 
     assert len(problems) == 1, problems
     assert problems[0].startswith("STALE BASELINE ENTRY") and "left-pad" in problems[0]
+
+
+def test_a_stale_entry_does_not_offer_a_closed_list_of_causes() -> None:
+    """The red line must not send a reader to only two causes.
+
+    On 2026-11-23 two of three stale entries were neither withdrawn nor unseen: GitHub had narrowed
+    their ranges off the locked versions. A line saying "either withdrawn or unseen" sent a reader
+    to suspect the audit had gone blind. It names the narrowed range and says "at least" instead.
+    """
+    problems = _evaluate(_REPORT, _FOUND | {("GHSA-2222-3333-4444", "left-pad")})
+
+    assert "either" not in problems[0]
+    assert "at least" in problems[0]
+    assert "range" in problems[0] and "withdrawn" in problems[0]
 
 
 # --- The false clean: success must be distinguishable from absence ---------------------------
@@ -628,16 +642,18 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #: - Packages on the braces and js-yaml chains: what that reading settles is stated in the header
 #:   paragraph "A BUNDLE MEASUREMENT FROM PR 2112'S TRIAGE IS KEPT".
 #: - deepmerge, read 2026-10-28: what that reading settles is stated in the deepmerge triage
-#:   comment, kept after its entry was removed on 2026-11-23. Only names deepmerge alone defines
-#:   are re-run here, two of the six it measured. The other four are left out because other code uses them too: the
-#:   is-mergeable-object package exports ``isMergeableObject``, ``arrayMerge`` and ``mergeObject``
-#:   are common helper names, and "deepmerge" is in other packages' names, such as deepmerge-ts.
+#:   comment, kept after its entry was removed on 2026-11-23. Only names deepmerge alone defines are
+#:   re-run here, two of the six it measured. The other four are left out because other code uses
+#:   them too: the is-mergeable-object package exports ``isMergeableObject``, ``arrayMerge`` and
+#:   ``mergeObject`` are common helper names, and "deepmerge" is in other packages' names, such as
+#:   deepmerge-ts.
 #: - minimatch, read 2026-10-31: what that reading settles is stated in the minimatch
-#:   GHSA-g3hv-75wg-m249 triage comment, kept after its entry was removed on 2026-11-23. These
-#:   three cover minimatch by name, an identifier of its own, and glob, its runtime parent. "Toolkit" above covers actions-toolkit, the top of that
-#:   chain. The bare name is kept although other packages' names can hold it, such as
-#:   @types/minimatch: a false red only sends someone to redo the reading. The other two still fire
-#:   if that name is gone from the file but these identifiers survive.
+#:   GHSA-g3hv-75wg-m249 triage comment, kept after its entry was removed on 2026-11-23. These three
+#:   cover minimatch by name, an identifier of its own, and glob, its runtime parent. "Toolkit"
+#:   above covers actions-toolkit, the top of that chain. The bare name is kept although other
+#:   packages' names can hold it, such as @types/minimatch: a false red only sends someone to redo
+#:   the reading. The other two still fire if that name is gone from the file but these identifiers
+#:   survive.
 #: - The 2026-11-05 triage (BACKLOG #2492): what it settles is stated in the header paragraph "THE
 #:   2026-11-05 TRIAGE" and in each triaged entry's comment. Re-run here are the probes those
 #:   comments name as re-run. Generic names they measured, such as @babel/helpers'
