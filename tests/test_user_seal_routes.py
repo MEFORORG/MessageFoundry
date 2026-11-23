@@ -494,7 +494,9 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
 #: confirmation page, which shows a page in place of the 423 its checked read answers for that
 #: record, inside the report interval or not and for a record Vault transit cannot verify too; and
 #: the post-action pages' fallback is stated once, in ``_shown_name``'s docstring, which this
-#: statement points at. Case-insensitive regexes over the whitespace-normalised statement.
+#: statement points at. Lander hold 7091484059 added the two answer sentences the confirmation
+#: made false, which are not console sentences, and the page's own-account case.
+#: Case-insensitive regexes over the whitespace-normalised statement.
 _CONSOLE_SENTENCES = {
     "the list's delete is the confirmation's, for users:manage": (
         r"to a caller holding `users:manage` it links that account's delete to "
@@ -510,15 +512,14 @@ _CONSOLE_SENTENCES = {
         r"stated in the docstring of `_shown_name`"
     ),
     # Lander hold 7091484059: the confirmation catches the 423 and answers 200, so the two
-    # sentences that said every refusal answers 423 or is listed as failed now defer to the
-    # paragraph's per-route answers, and the page's own-account case is stated.
+    # sentences that said every refusal answers 423 or is listed as failed now say only that it
+    # is answered as a failing record is, and the page's own-account case is stated.
     "the interval sentence defers to the per-route answers": (
-        r"in that process, is answered as this paragraph answers a failing record and adds no "
-        r"row and no alert"
+        r"in that process, is answered as a failing record is and adds no row and no alert"
     ),
     "the Vault transit sentence defers to the per-route answers": (
-        r"a record Vault transit cannot verify is answered as this paragraph answers a failing "
-        r"record, but reported under `integrity\.authority_seal_unverifiable`"
+        r"a record Vault transit cannot verify is answered as a failing record is, but reported "
+        r"under `integrity\.authority_seal_unverifiable`"
     ),
     "the confirmation for the caller's own account has no form": (
         r"Where the id in its path is the caller's own, that page shows a note that the caller "

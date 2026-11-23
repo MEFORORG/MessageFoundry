@@ -1710,7 +1710,7 @@ per account and rate-limited, in each engine process: only the first refusal of 
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
 inside that interval, from any of these routes or any other reader of the same account in that
-process, is answered as this paragraph answers a failing record and adds no row and no alert.
+process, is answered as a failing record is and adds no row and no alert.
 Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
@@ -1741,7 +1741,7 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-answered as this paragraph answers a failing record, but reported under
+answered as a failing record is, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
 lists nothing, pages `authority-seal-transit` and writes no audit row.
