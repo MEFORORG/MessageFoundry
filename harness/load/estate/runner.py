@@ -576,6 +576,13 @@ def _reconcile(
         )
     if drain_seconds is None:
         unproven.append("the drain timed out — the final counts are an unsettled snapshot")
+    # `out_dead` counts rows dead NOW, so a replay or purge lowers it, and `_counter_reset` does not
+    # watch it. A fall can hide new dead-letters behind the removed ones (BACKLOG #5436).
+    if engine_judged and out_dead < 0:
+        unproven.append(
+            f"the outbound dead count fell by {-out_dead} during the step (a replay or a purge) — "
+            f"new dead-letters cannot be told from the removed rows"
+        )
     ok = not lost and drained and not unproven
     parts: list[str] = []
     if engine_judged and read_short > 0:

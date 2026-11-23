@@ -961,13 +961,13 @@ def test_estate_reconcile_dead_letters_from_before_the_baseline_do_not_count() -
     assert result.ok, result.detail
 
 
-def test_estate_reconcile_dead_count_that_fell_is_not_loss() -> None:
-    # A purge or replay lowers the gauge. The delta is negative, so the arm does not fire.
+def test_estate_reconcile_dead_count_that_fell_is_inconclusive() -> None:
+    # A purge or replay lowers the count, and could hide new dead-letters: 7 removed, 2 new.
     base = replace(_BASE, out_dead=7)
     final = replace(_RIG_FINAL, out_dead=2)
     result = estate_reconcile(_RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET)
-    assert result.ok, result.detail
-    assert "dead-lettered" not in result.detail
+    assert not result.ok and result.inconclusive, result.detail
+    assert "outbound dead count fell by 5" in result.detail
 
 
 def test_estate_reconcile_dead_delta_across_a_counter_reset_is_not_judged() -> None:
