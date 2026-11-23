@@ -160,6 +160,7 @@ from messagefoundry.transports.db_endpoint import (
     generic_driver_family,
     generic_hop_endpoint,
     is_remote_spelling,
+    names_no_host,
     odbc_keyword_name,
     odbc_param,
     sqlserver_preset_refusal,
@@ -1994,7 +1995,9 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
     they refuse at least ``;``, ``{``, ``}``, ``=``, a quote, an empty or blank value and a leading
-    or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, an
+    or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, a ``server``
+    that :func:`~messagefoundry.transports.db_endpoint.names_no_host` reads is refused whatever the
+    posture or declaration (BACKLOG #5512), an
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
     refuses ``;``, ``{`` and ``}``, and must be on the generic driver allowlist. ``password`` is
@@ -2030,6 +2033,10 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a quote, a control "
             "character or a non-ASCII character (ODBC injection risk)"
         )
+    # BACKLOG #5512: here and not in the cleartext guard, which stands down on a TLS mode. Neither
+    # tls_hop_attested nor cleartext_accepted can speak for a hop with no named destination.
+    if names_no_host(server):
+        raise ValueError(f"{where}DATABASE server names no host; name the host to connect to")
     # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
     # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
     _refuse_unsafe_text(driver, what="odbc_driver", connection=connection, refused=";{}")
@@ -2218,9 +2225,7 @@ def generic_cleartext_hop_guard(
         reads_comma_port=family in COMMA_PORT_FAMILIES,
     )
     return InsecureHopGuard.capture(
-        # A blank server names no host, so the guard judges it off-box (BACKLOG #5512). The stand-in
-        # names the setting in the refusal.
-        host=host or "(no server)",
+        host=host,
         port=port,
         cell=cell,
         # The classifier's reason rides in the description so the refusal names WHAT is unset, not just

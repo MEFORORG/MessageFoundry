@@ -9,8 +9,10 @@ Each caller here says what empty means where it stands:
 
 * an unconfigured feature: no log forwarder is built, so there is no hop to judge;
 * a gate where "remote" is the permissive answer: empty still counts as this host;
-* an unknown destination: the store, a generic ODBC ``server``, and every shared guard and trust
-  anchor. It is judged off-box, so it fails closed.
+* an unknown destination: a Postgres store, and every shared guard and trust anchor. It is judged
+  off-box, so the caller's gate applies as it does to any remote hop;
+* no destination at all: a generic ODBC ``server`` naming no host and a blank SQL Server store are
+  refused whatever the posture or declaration.
 
 The fourth meaning, a default that really is local, is the HTTP listener's: a blank host binds
 loopback. ``test_offloopback_without_effective_peer_control_refused_by_posture`` in
@@ -25,10 +27,12 @@ or allowed everything, would fail too. Nothing here touches the network.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.__main__ import _warn_on_an_unrevoked_store_hop
 from messagefoundry.auth.trust_anchors import smtp_hop_anchor_spec
@@ -40,6 +44,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
     LoggingSettings,
     SecurityEnforcement,
+    StoreBackend,
     StoreSettings,
     TlsSettings,
     _names_this_host,
@@ -58,10 +63,11 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.restricted_file import _loopback_share_problem
 from messagefoundry.store.postgres import _build_ssl
+from messagefoundry.transports.database import DatabaseDestination, DatabaseSource
 from messagefoundry.transports.mllp import InsecureHopGuard
 from messagefoundry.transports.strict_requests import _stays_on_the_box
 from messagefoundry.transports.tcp import TcpDestination
-from tests.test_hop_refusal_db_inbound import _GENERIC_CONNECTORS
+from tests.test_hop_refusal_db_inbound import _GENERIC_CONNECTORS, _generic_dest, _generic_source
 from tests.test_hop_refusal_rawtcp import tcp_cfg
 from tests.test_hop_refusal_revocation import _guard, _pg
 
@@ -160,16 +166,111 @@ def test_a_cli_store_open_at_warn_warns_on_a_store_with_no_server(
 # --- an unknown destination: a generic ODBC server -----------------------------------------------
 
 
+#: Each passes the required-setting check, and none names a host in front of its first comma.
+_GENERIC_SERVERS_NAMING_NO_HOST = ["  ", ":5432", "[]", "[ ]:5432", ",1433", " ,db.example"]
+
+
+@pytest.mark.parametrize("server", _GENERIC_SERVERS_NAMING_NO_HOST)
+@pytest.mark.parametrize("posture", [ENFORCING, HopPosture(enforcing=False), None], ids=str)
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
-def test_a_blank_generic_server_is_not_judged_on_box(
-    connector: Callable[[Any], object], config: Callable[..., Any]
+def test_a_generic_server_naming_no_host_is_refused_at_every_posture(
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+    posture: HopPosture | None,
+    server: str,
 ) -> None:
-    """A ``server`` of spaces passes the required-setting check and splits to an empty host. The
-    driver is handed that text, so where it dials is not known here. CONTROL: real loopback."""
-    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="no server"):
-        connector(config(server="  "))
-    with active_hop_posture(ENFORCING):
+    """The driver is handed that text, so where it dials is not known here. CONTROL: real loopback
+    builds at the same posture."""
+    with (
+        active_hop_posture(posture) if posture else nullcontext(),
+        pytest.raises(ValueError, match="names no host"),
+    ):
+        connector(config(server=server))
+    with active_hop_posture(posture) if posture else nullcontext():
         assert connector(config(server=LOOPBACK))
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {"tls_hop_attested": True, "tls_hop_attested_reason": "a segment the engine cannot see"},
+        {"cleartext_accepted": True, "cleartext_reason": "a hop accepted as cleartext"},
+    ],
+    ids=["attested", "accepted"],
+)
+def test_no_declaration_covers_a_generic_hop_with_no_named_host(declared: dict[str, Any]) -> None:
+    """Either declaration is about a hop, and this one has no destination to be about. CONTROL: the
+    same declaration still crosses on a named remote host."""
+    with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="names no host"):
+        DatabaseDestination(_generic_dest(server="  ", **declared))
+    with active_hop_posture(ENFORCING):
+        assert DatabaseDestination(_generic_dest(server=REMOTE, **declared))
+
+
+def test_an_attested_inbound_poll_with_no_named_host_is_refused() -> None:
+    declared: dict[str, Any] = {
+        "tls_hop_attested": True,
+        "tls_hop_attested_reason": "a segment the engine cannot see",
+    }
+    with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="names no host"):
+        DatabaseSource(_generic_source(server="  ", **declared))
+    with active_hop_posture(ENFORCING):
+        assert DatabaseSource(_generic_source(server=REMOTE, **declared))
+
+
+def test_a_tls_mode_does_not_stand_in_for_a_named_host() -> None:
+    """The cleartext guard stands down on a TLS mode, so the refusal has to sit in front of it."""
+    params = {"odbc_params": {"sslmode": "verify-full"}}
+    with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="names no host"):
+        DatabaseDestination(_generic_dest(server="  ", **params))
+    with active_hop_posture(ENFORCING):
+        assert DatabaseDestination(_generic_dest(server=REMOTE, **params))
+
+
+# --- what a blank [store].server means on each backend ------------------------------------------
+
+
+def _store_on(backend: StoreBackend, server: str) -> StoreSettings:
+    return StoreSettings(backend=backend, server=server, database="d", username="u")
+
+
+@pytest.mark.parametrize("server", ["", " ", "\t"])
+def test_a_sql_server_store_refuses_a_blank_server_and_names_the_setting(server: str) -> None:
+    """It would send ``SERVER=,1433``, and no hop guard reads the SQL Server store's host."""
+    with pytest.raises(ValidationError, match=r"\[store\]\.server is blank"):
+        _store_on(StoreBackend.SQLSERVER, server)
+    assert _store_on(StoreBackend.SQLSERVER, "db.example").server == "db.example"
+
+
+@pytest.mark.parametrize("server", [" ", "\t"])
+def test_a_postgres_store_refuses_a_server_of_spaces_and_names_the_setting(server: str) -> None:
+    """Spaces are not empty to asyncpg: it would try them as a host name."""
+    with pytest.raises(ValidationError, match=r"\[store\]\.server is blank"):
+        _store_on(StoreBackend.POSTGRES, server)
+
+
+def test_a_postgres_store_keeps_an_empty_server() -> None:
+    """Empty has a meaning here: asyncpg reads ``PGHOST``, then its local default. The hop is still
+    judged off-box (``test_a_store_with_no_server_is_not_judged_on_box``)."""
+    assert _store_on(StoreBackend.POSTGRES, "").server == ""
+
+
+@pytest.mark.parametrize("server", ["", " "])
+def test_a_sqlite_store_has_no_server_to_refuse(server: str) -> None:
+    assert StoreSettings(backend=StoreBackend.SQLITE, server=server).server == server
+
+
+def test_the_store_guard_names_the_setting_for_a_server_of_spaces() -> None:
+    """Built past the load refusal, so the guard's own text is what is read."""
+    with pytest.raises(InsecureHopRefused, match=r"to \(no \[store\]\.server\):"):
+        _build_ssl(_store_with_server("  "), posture=ENFORCING)
+
+
+def test_the_store_guard_does_not_trim_a_padded_host_onto_loopback() -> None:
+    """The stand-in is for a value with nothing in it. A padded address is not loopback as written,
+    and trimming it here would open the on-box carve-out."""
+    with pytest.raises(InsecureHopRefused, match="127"):
+        _build_ssl(_store_with_server(f" {LOOPBACK} "), posture=ENFORCING)
 
 
 # --- an unknown destination: the shared guards and the trust anchor -----------------------------
@@ -230,7 +331,7 @@ def test_an_smtp_relay_with_no_host_reads_no_internal_ca() -> None:
     assert smtp_hop_anchor_spec(relay, AuthSettings(), tls) is not None
 
 
-# --- row item 1: a bracketed literal reads as remote, which fails closed -------------------------
+# --- row item 1: a bracketed literal reads as remote ---------------------------------------------
 
 
 def test_a_bracketed_loopback_literal_reads_as_remote() -> None:
@@ -242,7 +343,7 @@ def test_a_bracketed_loopback_literal_reads_as_remote() -> None:
 
 
 @pytest.mark.parametrize(("host", "refused"), [("[::1]", True), ("::1", False)])
-def test_a_bracketed_loopback_tcp_hop_fails_closed(host: str, refused: bool) -> None:
+def test_a_bracketed_loopback_tcp_hop_is_refused_when_enforcing(host: str, refused: bool) -> None:
     config: Destination = tcp_cfg(host)
     with active_hop_posture(ENFORCING):
         if refused:

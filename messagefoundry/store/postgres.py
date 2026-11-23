@@ -2056,9 +2056,10 @@ def _refuse_store_revocation(
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
     RevocationHopGuard.capture(
-        # The load refuses only a None server. A blank one names no host, so the guard cannot place
-        # the hop and judges it off-box (BACKLOG #5512); the stand-in names the setting in its text.
-        host=host or "(no [store].server)",
+        # Empty is PGHOST or asyncpg's local default, and the guard cannot tell which, so it judges
+        # the hop off-box (BACKLOG #5512). The stand-in names the setting. A padded address keeps
+        # its padding: trimmed, it could read as loopback, which the driver is not handed.
+        host=host if host and host.strip() else "(no [store].server)",
         cell="[store] Postgres TLS (verified TLS, no revocation check)",
         description=(
             "carries the PHI message store over verified TLS but performs no certificate revocation "

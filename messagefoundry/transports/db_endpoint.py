@@ -89,6 +89,13 @@ def split_generic_server(server: str) -> tuple[str, str]:
     return host.strip(), in_server.strip()
 
 
+def names_no_host(server: str) -> bool:
+    """Whether a generic-dialect ``server`` leaves its first host unnamed: blank, a bare port, empty
+    brackets, or nothing in front of its first comma (BACKLOG #5512). A driver has to pick such a
+    destination itself, so no reading here can place the hop."""
+    return not split_generic_server(server.partition(",")[0])[0]
+
+
 def _exact_split(text: str) -> tuple[str, str] | None:
     """:func:`split_generic_server` of ``text``, or ``None`` unless ``text`` is a host,
     ``host:port`` or ``[v6]:port`` written exactly, with a usable port where it carries one.

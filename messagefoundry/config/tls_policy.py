@@ -2427,16 +2427,18 @@ def is_loopback_hop_host(host: str) -> bool:
 
     Covers all of ``127.0.0.0/8`` and ``::1`` via :mod:`ipaddress` (not just the literal
     ``127.0.0.1``), plus the ``localhost`` name. It **never resolves DNS**: any other
-    name cannot be *proven* loopback, so it is treated as remote, which fails closed at the cleartext
-    guards — a name that happens to resolve to a loopback address is still refused, because
+    name cannot be *proven* loopback, so it is treated as remote and gets no on-box carve-out. A
+    name that happens to resolve to a loopback address is judged as any off-box hop is, because
     resolution is attacker-influenceable and would let a hostname smuggle an off-box hop past the
-    on-box carve-out.
+    carve-out. Judged off-box means the caller's gate applies: an enforcing instance refuses unless
+    a per-hop declaration covers the hop, and some transports only warn at
+    ``[security].enforcement = warn``. It does not mean always refused.
 
     **An empty host is not loopback (BACKLOG #5512).** It names no destination, so this predicate
     cannot place it, and what it means belongs to the caller. A listener whose blank host binds a
     local default reads that default before it asks. A feature with no host has no hop and returns
     before it asks. A caller that cannot say where the hop goes lets this answer stand, so the hop
-    is judged as remote and fails closed.
+    is judged off-box, as above.
 
     **A limit (vault BACKLOG #2706): apart from case, a name is read as written, and a host is an
     address only where :mod:`ipaddress` reads it as one.** So at least ``localhost.``, ``127.0.0.1.``,

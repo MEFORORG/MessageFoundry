@@ -1233,6 +1233,16 @@ class StoreSettings(_Section):
                 missing.append("username")  # SQL login needs a user (+ MEFOR_STORE_PASSWORD)
             if missing:
                 raise ValueError(f"{label} backend requires: " + ", ".join(missing))
+            # BACKLOG #5512. SQL Server would be sent `SERVER=,1433` with no hop guard reading it,
+            # and asyncpg would try spaces as a host name. An empty Postgres server stays: asyncpg
+            # reads it as PGHOST, then its local default, and the revocation guard judges that hop
+            # off-box because it cannot tell which one the driver picked.
+            if (
+                self.server is not None
+                and not self.server.strip()
+                and (self.server or self.backend is StoreBackend.SQLSERVER)
+            ):
+                raise ValueError(f"[store].server is blank: name the {label} host")
         return self
 
     @field_validator("ssl_root_cert")
@@ -5432,7 +5442,8 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     the SAME authority the transports consume — so the forwarder decides identically to every other
     egress cell. A hop is treated as **secure** (and never gated) only when it is TLS *with
     verification on*; plaintext ``udp``/``tcp`` and the ``forward_tls_verify=false`` opt-out are both
-    MITM-able and go to the gradient:
+    MITM-able and go to the gradient. A forwarder with no host returns ALLOW before any of this:
+    ``serve`` builds none without a host, so there is no hop to judge (BACKLOG #5512).
 
     #. loopback collector → ALLOW — the ADR 0080 "point ``tcp``/``udp`` at ``127.0.0.1`` and let a
        local rsyslog/Vector agent add TLS" deployment is explicitly preserved, byte-identical.

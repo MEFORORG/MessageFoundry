@@ -2441,7 +2441,7 @@ built, and the error names the setting and never the value:
 | `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`, `"`, `'`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An `odbc_params` value of `true` or `false` is refused, never sent as the text `True` or `False`; write the driver's own spelling as a string. An unset `database` or `username` is left out of the string |
 | `SSLmode`, in any case of the keyword | plain | for MySQL Connector/ODBC under its registered name, exactly one of `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case; refused on Microsoft's `ODBC Driver <n> for SQL Server`, which reads `Encrypt` instead; for psqlODBC, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
 | `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
-| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused |
+| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused, and so is a value that names no host in front of its first comma (blank, a bare `:port`, `[]`), whatever the posture, `tls_hop_attested` or `cleartext_accepted` |
 | `password` | braced, with the `}}` escape | printable ASCII. See below |
 
 Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
