@@ -32,10 +32,22 @@ class X12FrameError(X12Error):
 
 class X12ValidationError(X12Error):
     """The opt-in strict validator (``pyx12``, ADR 0012) could not finish a structural validation
-    pass over this interchange: at least when the bytes are not a parseable X12 data file, when it
-    names a version pyx12 has no map for, and when pyx12 raises partway through a walk, as a
-    non-numeric GE01 makes it do. A damaged pyx12 install raises :class:`RuntimeError` instead, so
-    ``except ValueError`` does not dead-letter a good message over it. The X12 analog of
+    pass over this interchange: at least when the bytes are not a parseable X12 data file, when
+    pyx12 has no map that selects it, which a conformant interchange under a guide pyx12 does not
+    bundle also meets, and when pyx12 raises partway through a walk, as a non-numeric GE01 makes it
+    do. So this does not always mean the interchange is bad.
+
+    A walk failure of a type a sender's bytes cannot raise
+    (:func:`~messagefoundry.parsing.x12._deps.is_x12_install_fault`) is a :class:`RuntimeError`
+    instead. A Handler's ``except ValueError`` does not catch that, but left uncaught it takes the
+    ``internal_error`` policy, whose default, ``CONTINUE``, also dead-letters the row.
+
+    **A damaged install can land here too.** A map or table that still parses but is wrong raises
+    an ordinary error, and an index that lost a map's entry reads as having no map, so each is this
+    error, which a Handler's ``except ValueError`` would dead-letter. Each refusal logs its exception
+    class at WARNING, rate-limited, so a run of one class shows an operator the damage.
+
+    The X12 analog of
     :class:`~messagefoundry.parsing.fhir.errors.FhirValidationError`. A *failed validation* (a pass
     that finishes with violations of the implementation guide) is **not** this — it is reported as
     data on :class:`~messagefoundry.parsing.x12.validate.X12ValidationResult` (``valid=False`` +

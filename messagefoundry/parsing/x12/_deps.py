@@ -39,15 +39,28 @@ _MAP_IDS_RETRY_SECONDS = 60.0
 _map_ids: frozenset[str] = frozenset()
 _map_ids_retry_at = 0.0
 
-#: What a pyx12 walk raises when the install, not the interchange, is at fault. The walk's source and
-#: outputs are in-memory streams, so its only file reads are pyx12's bundled maps, and only those
-#: maps reach an XML parser.
-X12_INSTALL_FAULTS: tuple[type[Exception], ...] = (OSError, ImportError, ParseError)
-
 
 def _missing_extra(feature: str) -> RuntimeError:
     return RuntimeError(
         f"{feature} requires the optional 'x12' extra: pip install 'messagefoundry[x12]'"
+    )
+
+
+def is_x12_install_fault(exc: Exception) -> bool:
+    """Whether a failed pyx12 walk raised a type that a sender's bytes cannot raise there.
+
+    The walk gets in-memory streams, so it opens only pyx12's map directory and config file, under
+    names from pyx12's code and index, and only those files reach an XML parser. So ``OSError``,
+    ``ImportError``, XML ``ParseError`` and a defusedxml refusal each mean the install or its config
+    is at fault. That is read from pyx12 4.1.0's source. A refusal is matched by class name because
+    pyx12 raises the upstream package's class, which is not the engine's vendored one, and an import
+    here could raise and chain the exception being classified.
+
+    It is a statement about types only, so it does not catch every damaged install:
+    :class:`~messagefoundry.parsing.x12.errors.X12ValidationError` says what the rest do."""
+    return isinstance(exc, (OSError, ImportError, ParseError)) or any(
+        cls.__name__ == "DefusedXmlException" and cls.__module__.endswith("defusedxml.common")
+        for cls in type(exc).__mro__
     )
 
 
@@ -73,29 +86,6 @@ def _log_maps_unreadable(exc: Exception) -> None:
         "pyx12's maps could not be read (%s); X12 errors will carry no segment id",
         type(exc).__name__,
     )
-
-
-def x12_install_loads() -> bool:
-    """Whether pyx12 can still load what every walk loads: its map index, a control map, and the
-    code and data-element tables that building a map reads. Called only after a walk has raised, to
-    tell a damaged install from a bad interchange, and through pyx12's own loaders so it reads those
-    files the way the walk does. Not cached, so it sees damage done since the last pass. It adds at
-    most the setup that failed pass already ran. A damaged transaction map that still parses is out
-    of its reach. It never raises, and logs only the class name."""
-    try:
-        import pyx12.map_if
-        import pyx12.map_index
-        import pyx12.params
-
-        if not pyx12.map_index.map_index().maps:
-            _log.warning("pyx12's map index lists no map")
-            return False
-        pyx12.map_if.load_map_file("x12.control.00501.xml", pyx12.params.params())
-    # Broad on purpose: a damaged table can raise at least ValueError or TypeError.
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("pyx12's maps could not be loaded (%s)", type(exc).__name__)
-        return False
-    return True
 
 
 def _parse_map_xml(source: IO[bytes]) -> Any:
