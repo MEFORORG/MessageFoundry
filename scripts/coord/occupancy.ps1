@@ -45,8 +45,10 @@
 
     IT IS A NARROW SHAPE ON PURPOSE. Most records on this host name OTHER repositories, and faulting
     those would leave the fence permanently unavailable -- which disarms every caller as thoroughly as
-    never refusing at all. Get-UnplaceableCwdReason below holds the whole boundary and says what
-    evidence each side of it rests on.
+    never refusing at all. Two functions below hold the boundary and say what evidence each side
+    of it rests on: Get-UnplaceableCwdReason for a record that matched no worktree, and
+    Get-NestedUnplaceableReason for one that matched a listed worktree only by path prefix
+    (BACKLOG #5599).
 
     RecordsExamined and RecordsUnplaceable deliberately OVERLAP: the first counts what parsed, the
     second counts what cannot be placed, and a cwd-less record is both.
@@ -198,7 +200,8 @@ function Get-OwningGitCommonDir([string]$Path) {
 # Why a record that matched no worktree is a FAULT rather than simply somebody else's session. Returns
 # '' when it is not this fence's business.
 #
-# THE BOUNDARY IS THE WHOLE OF THIS FUNCTION, and it cuts both ways. Under-flagging is the defect this
+# THIS FUNCTION HOLDS THE BOUNDARY FOR A RECORD THAT MATCHED NO WORKTREE (Get-NestedUnplaceableReason
+# holds it for one that matched by prefix only), and it cuts both ways. Under-flagging is the defect this
 # was written for: a session in a deregistered checkout vanished, so the fence cleared worktrees it had
 # never accounted for. Over-flagging costs exactly as much in the other direction -- most records on
 # this host name other repositories, and faulting those leaves the fence permanently unavailable, which

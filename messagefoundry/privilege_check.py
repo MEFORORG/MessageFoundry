@@ -267,7 +267,7 @@ def vault_admin_paths(
 #: made with ``-no-default-policy`` needs them granted to read clean.
 _SELF_READ_GRANT = (
     "read on auth/token/lookup-self and update on sys/capabilities-self, for the privilege probe "
-    "serve and this check run"
+    "serve and this check run; the Transit cipher's token renewal also reads lookup-self"
 )
 
 #: A token's own endpoints, which a provider calls on the token it holds (BACKLOG #5609). One token
@@ -398,9 +398,10 @@ def vault_hop(
 
     Over-granted: a ``root`` policy; any capability beyond the one a configured path needs; any
     capability but ``deny`` on an administrative path the engine never calls; or, when ``shared``
-    names other hops that hold the SAME token, any grant on a path only those hops need. One token
-    serving two hops holds the union of both grants, so each hop holds more than its own least
-    grant. A capability the engine needs and the token lacks is reported but is not an over-grant:
+    names other hops that hold the SAME token, any grant on a path only those hops need, except
+    the token's own ``auth/token/lookup-self`` and ``auth/token/renew-self`` (BACKLOG #5609),
+    which are not read as an over-grant. One token serving two hops holds the union of both
+    grants, so each hop holds more than its own least grant. A capability the engine needs and the token lacks is reported but is not an over-grant:
     the engine's own call would fail. Unobservable: any part of the reading could not be made, and
     no over-grant was seen. Over-grant wins, as it does in the exit code.
 
