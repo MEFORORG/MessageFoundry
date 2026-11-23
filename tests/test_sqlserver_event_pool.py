@@ -420,17 +420,10 @@ class _PgSweepConn:
         return f"UPDATE {int(hit)}"
 
 
-@pytest.mark.parametrize("moved", sorted(_MOVES))
-@pytest.mark.parametrize("sweep", sorted(_PG_SWEEP_LANES))
-async def test_a_postgres_sweep_leaves_a_row_that_moved_after_its_read(
-    sweep: str, moved: str, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The Postgres sweeps read with no row lock too, so a row cancelled, purged or completed
-    before the DEAD update keeps its new state, gets no ``dead`` event and no finalize, and is not
-    counted or named in the warning. The in-flight and pending control rows are still
-    dead-lettered."""
-    move, keeps = _MOVES[moved]
-    conn = _PgSweepConn(_PG_SWEEP_LANES[sweep])
+def _pg_sweep_store(conn: _PgSweepConn, move: Any) -> tuple[PostgresStore, list[str], list[str]]:
+    """A bare PostgresStore over ``conn``, recording the message ids it writes a ``dead`` event for
+    and finalizes. ``move`` runs when the finalize locks are taken: after the read, before the
+    writes, which is where another writer can move a row."""
     events: list[str] = []
     finalized: list[str] = []
     store = object.__new__(PostgresStore)
@@ -443,7 +436,6 @@ async def test_a_postgres_sweep_leaves_a_row_that_moved_after_its_read(
         return value
 
     async def lock_finalize_batch(_conn: Any, _ids: Any) -> None:
-        # After the read, before the writes: where another writer can move a row.
         move(conn.status)
 
     async def event(_conn: Any, message_id: str, *_rest: Any) -> None:
@@ -457,6 +449,21 @@ async def test_a_postgres_sweep_leaves_a_row_that_moved_after_its_read(
     store._lock_finalize_batch = lock_finalize_batch  # type: ignore[method-assign,assignment]
     store._event = event  # type: ignore[method-assign,assignment]
     store._maybe_finalize_message = maybe_finalize  # type: ignore[method-assign,assignment]
+    return store, events, finalized
+
+
+@pytest.mark.parametrize("moved", sorted(_MOVES))
+@pytest.mark.parametrize("sweep", sorted(_PG_SWEEP_LANES))
+async def test_a_postgres_sweep_leaves_a_row_that_moved_after_its_read(
+    sweep: str, moved: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Postgres sweeps read with no row lock too, so a row cancelled, purged or completed
+    before the DEAD update keeps its new state, gets no ``dead`` event and no finalize, and is not
+    counted or named in the warning. The in-flight and pending control rows are still
+    dead-lettered."""
+    move, keeps = _MOVES[moved]
+    conn = _PgSweepConn(_PG_SWEEP_LANES[sweep])
+    store, events, finalized = _pg_sweep_store(conn, move)
 
     with caplog.at_level("WARNING", logger="messagefoundry.store.postgres"):
         dead = await getattr(store, sweep)(set(), now=200.0)
@@ -470,3 +477,25 @@ async def test_a_postgres_sweep_leaves_a_row_that_moved_after_its_read(
     (message,) = [r.getMessage() for r in caplog.records if "dead-lettered" in r.getMessage()]
     assert message.startswith("dead-lettered 2 "), message
     assert message.endswith(": GONE_B, GONE_C") and "GONE_A" not in message, message
+
+
+def _pg_move_all(status: dict[str, str]) -> None:
+    status["q-1"] = "cancelled"
+    del status["q-2"]
+    status["q-3"] = "done"
+
+
+@pytest.mark.parametrize("sweep", sorted(_PG_SWEEP_LANES))
+async def test_a_postgres_sweep_whose_every_row_moved_writes_and_counts_nothing(
+    sweep: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every orphan moved before the writes: nothing is dead-lettered, the sweep returns 0, and it
+    logs no warning."""
+    conn = _PgSweepConn(_PG_SWEEP_LANES[sweep])
+    store, events, finalized = _pg_sweep_store(conn, _pg_move_all)
+    with caplog.at_level("WARNING", logger="messagefoundry.store.postgres"):
+        dead = await getattr(store, sweep)(set(), now=200.0)
+    assert dead == 0
+    assert conn.status == {"q-1": "cancelled", "q-3": "done"}
+    assert events == [] and finalized == []
+    assert not [r for r in caplog.records if "dead-lettered" in r.getMessage()]

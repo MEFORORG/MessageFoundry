@@ -8463,8 +8463,9 @@ class PostgresStore:
             dead: list[Any] = []
             for row in orphans:
                 # The read took no row lock, so a row may have left the read's statuses before this
-                # write (cancelled, completed, purged). The status term leaves such a row as it is,
-                # and its zero rowcount skips the row's event, finalize and count.
+                # write (at least cancelled, completed, dead-lettered or purged). The status term
+                # leaves such a row as it is, and its zero rowcount skips the row's event, finalize
+                # and count.
                 result = await conn.execute(
                     "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
                     " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status IN ($6, $7)",
