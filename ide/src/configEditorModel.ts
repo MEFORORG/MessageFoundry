@@ -106,8 +106,16 @@ function configDirSegments(
   const fold = (s: string): string => (caseInsensitive ? s.replace(/[A-Z]+/g, (m) => m.toLowerCase()) : s);
   // Compared segment by segment, not with path.relative: win32.relative lower-cases both sides with
   // toLowerCase() itself, which would undo the ASCII-only fold.
-  const dir = fold(p.resolve(workspaceDir, configDir));
-  const doc = fold(p.resolve(documentFsPath));
+  // Spelled out per platform, not as p.resolve, so the path-join census (tests/
+  // test_file_path_join_census.py) still counts these two resolves.
+  const dir = fold(
+    platform === "win32"
+      ? path.win32.resolve(workspaceDir, configDir)
+      : path.posix.resolve(workspaceDir, configDir),
+  );
+  const doc = fold(
+    platform === "win32" ? path.win32.resolve(documentFsPath) : path.posix.resolve(documentFsPath),
+  );
   const root = p.parse(dir).root;
   if (p.parse(doc).root !== root) {
     return undefined; // another drive or share
