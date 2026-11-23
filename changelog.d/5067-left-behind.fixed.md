@@ -8,8 +8,8 @@
   to keep that entry until a later run of the command completes. A SQLite store refusal after
   the store opened no longer reads as "cannot open the store". A `StoreKeylessError` or `CipherError` raised once the
   write has started still reaches the command's last-resort exit 1, which names no entry.
-- **A refusal that follows a store open no longer says "nothing was written" where the open may
-  already have run its own writing steps**, in at least `provision-admin`, `admin-reset-totp`,
+- **These store refusals that follow a store open no longer say "nothing was written" where the
+  open may already have run its own writing steps**, in `provision-admin`, `admin-reset-totp`,
   `admin-unlock` and `admin-set-notify-email`: a `StoreKeylessError`, `CipherError`,
   keyless-chain or unauditable-write refusal, `admin-unlock`'s refused account read,
   `admin-set-notify-email`'s refused audit append, in `admin-reset-totp` a store failure raised
@@ -20,6 +20,7 @@
   Server under `[store].schema_management = auto`, the snapshot options. Where the command
   cannot tell whether the open reached its writing steps, as for a cipher refusal that can come
   before the open connects, it says the open may or may not have reached them and names those
-  changes only as possible. At least a store pin refusal under the
-  host key provider, and a refusal about the account itself, such as a disabled Administrator,
-  still say nothing was written. (`BACKLOG #5067`)
+  changes only as possible. Other refusals after an open still say nothing was written, at least a store pin
+  refusal under the host key provider, a refusal about the account itself such as a disabled
+  Administrator, an OS user the command cannot name, an authenticator code that did not match,
+  and `admin-unlock`'s refused row seal. (`BACKLOG #5067`)
