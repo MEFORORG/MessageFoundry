@@ -169,15 +169,23 @@ limits apply:
   there until the object dead-letters at the retry cap, or for as long as it is sent with
   `max_attempts=None`.
 - **The remedy for that band is `min_message_bytes_per_second` on the SCP** (BACKLOG #6637). Set it
-  at or under the link's real rate and an object up to the effective `max_object_bytes` arrives
+  at or under the link's real rate, down to the least below, and an object up to the effective `max_object_bytes` arrives
   inside its deadline on its first attempt. One over that cap, up to twice it, then gets the final
   `0xC010` once it has arrived, so it dead-letters on its first attempt instead of being cut and
   retried. The link also has to carry each whole PDU inside the read deadline above, which is
   `max_pdu_size / timeout_seconds` and which this setting does not move. It moves only this rate. Raising `timeout_seconds` instead would also loosen every read and send
   deadline above. It takes a whole number of at least 16384, which is 16 KiB a second. A smaller
   value, zero and `None` are refused when the connection is built, so the deadline cannot be turned
-  off. At that least rate one message can hold a `max_associations` slot for `timeout_seconds` plus
-  about 34 minutes, so set it no lower than the link needs.
+  off. At that least rate one message can hold a `max_associations` slot for about 34 minutes plus
+  `timeout_seconds`, and the two PDU reads above, each up to `timeout_seconds`, come on top of that,
+  so set it no lower than the link needs.
+- **A link slower than that least rate is not cured by this setting alone.** The setting cannot go
+  below 16384, so such a site also raises `timeout_seconds`, which loosens every read and send
+  deadline above, as that bullet says. The data set arrives at less than the raw link rate, because
+  PDU and TLS framing take part of it, so a link rated near 16 KiB a second may still be under the
+  least. Computed from the cut formula above, not measured: at a link rate of 10 KiB a second, the
+  setting at 16384 and the default `timeout_seconds` of 30, an object is cut once its data set is
+  over 30 * 10 * 16 / 6 = 800 KiB.
 - **A sender's own timer can cut the object first.** This engine's C-STORE client applies its
   `timeout_seconds` from the start of a store to the response, with nothing coming back in between,
   so at the default 30 seconds it ends a store that takes longer than that on the link, about

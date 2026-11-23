@@ -393,8 +393,10 @@ _DEFAULT_MESSAGE_BYTES_PER_SECOND = 64 * 1024
 
 #: The least ``min_message_bytes_per_second`` the SCP takes. The deadline is the slow-sender defence,
 #: so no value may switch it off or make it unbounded. At this rate the longest message the SCP
-#: holds, twice its 16 MiB ceiling, has about 34 minutes plus ``timeout_seconds``. It is the rate
-#: at which the band's object was measured delivering over a throttled link (vault BACKLOG #6637).
+#: holds, twice its 16 MiB ceiling, has about 34 minutes plus ``timeout_seconds``. That halves the
+#: longest slot hold against the 8 KiB a second first proposed, which the Lander's ruling decided
+#: (vault BACKLOG #6637). The row's test delivered its object with this rate set over a 32 KiB a
+#: second link, so it shows that a setting at the minimum delivers; it sets no lower bound.
 _LEAST_MESSAGE_BYTES_PER_SECOND = 16 * 1024
 
 #: The least and the most ``max_pdu_size`` the SCP takes. pynetdicom fragments an object into PDVs
