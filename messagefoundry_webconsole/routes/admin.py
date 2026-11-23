@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
+import traceback
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -67,6 +68,7 @@ from .._auth import (
     session_token,
 )
 from .._service import _service
+from ..pages._common import _seg
 from ..pages.admin import (
     CONFIRM_MANUAL_SCOPE_FIELD,
     CONFIRM_MANUAL_SCOPE_VALUE,
@@ -141,6 +143,16 @@ register_ui_action(
     label="Sign out all of a user's sessions",
 )
 register_ui_action(r"^/ui/users/[^/?#]+/delete$", Permission.USERS_MANAGE, label="Delete a user")
+# BACKLOG #5559: the confirmation the users list leads to before that delete, for an account whose
+# record fails its seal. A GET continuation like the federated unlink confirmation, untagged like
+# the delete it leads to.
+register_ui_action(
+    r"^/ui/users/[^/?#]+/delete-confirm$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    label="Open a user's delete confirmation",
+)
 # BACKLOG #1143 / #295 (ADR 0184 slice B): the federated-identity screen. Its two POSTs are
 # action-bound to admin_federated_identity, like their JSON twins, and NEITHER is registered: the link
 # POST carries a body, and an unlink is never auto-re-POSTed across a re-auth. Each stale POST maps
@@ -244,6 +256,43 @@ def _group_keys(pairs: list[tuple[str, str]]) -> list[str]:
     return [v.strip(" \t\r\n") for k, v in pairs if k == "ad_group"]
 
 
+def _frames(exc: BaseException) -> str:
+    """Where ``exc`` was raised from, its own frames then each ``__cause__``'s, as code-object
+    names and line numbers alone, outermost call first. ``walk_tb`` reads no source line, so no
+    file is opened on the event loop, and nothing of the exception's message is included
+    (BACKLOG #5559)."""
+    chain: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(
+            " -> ".join(
+                f"{frame.f_code.co_qualname}:{lineno}"
+                for frame, lineno in traceback.walk_tb(current.__traceback__)
+            )
+            or "(no frames)"
+        )
+        current = current.__cause__
+    return " | caused by ".join(chain)
+
+
+def _fallback_refused(user_id: str, reason: str, exc: BaseException) -> None:
+    """The log lines ``_shown_name`` writes for a refused read; its docstring says which."""
+    _log.warning(
+        "the name of account %s for a page after a landed action was not shown: its checked "
+        "read %s; the page names the account by id",
+        scrub_log_argument(user_id),
+        reason,
+    )
+    if _log.isEnabledFor(logging.DEBUG):
+        _log.debug(
+            "the checked read of account %s raised from (message withheld): %s",
+            scrub_log_argument(user_id),
+            _frames(exc),
+        )
+
+
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L4a admin surface (ADR 0065; #75 phase 4): user, role, and AD-group-mapping /ui pages + actions. Clients of the injected JSON handlers (called directly, re-asserting each gate via require_ui*)."""
     admin = deps.admin
@@ -262,28 +311,38 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     async def _shown_name(user_id: str, service: AuthService) -> str:
         """The username a page shows after an action already landed, read as :func:`_checked`
-        reads it, or the id when that read raises ``HTTPException`` or one of
-        ``account_read_errors()`` other than ``AUDIT_WRITE_DEFECTS`` (BACKLOG #5559). The
-        action's one-time output was already issued and must still be rendered. Each fallback logs
-        a WARNING naming the account; a seal failure is also reported by the read itself. Any other
-        exception raises."""
+        reads it (BACKLOG #5559). This docstring states the fallback's rule; the console
+        CHANGELOG and docs/SECURITY.md point here.
+
+        The action's one-time output was already issued and is shown nowhere else, so no
+        ``Exception`` from a read made only to label it replaces the page that hands it over: the
+        page names the account by its id. A refusal, ``HTTPException`` or one of
+        ``account_read_errors()`` other than ``AUDIT_WRITE_DEFECTS``, logs a WARNING naming the
+        account and the status or the exception's type, then a DEBUG line with the traceback's
+        frames. Any other exception, a listed defect included, logs one ERROR naming the account,
+        the exception's type and the frames. Frames are code-object names and line numbers alone,
+        read without opening a source file, and no line carries the exception's message, which
+        can hold the record's values (docs/PHI.md). None of these lines is rate-limited."""
         try:
             user = await _checked(user_id, service)
         except HTTPException as exc:
-            # 404 gone since the action, 423 a record that fails its seal, 503 a Vault Outage.
-            reason = f"answered {exc.status_code}"
-        except account_read_errors() as exc:
-            if isinstance(exc, AUDIT_WRITE_DEFECTS):
-                raise
-            reason = f"failed ({type(exc).__name__})"
+            # 404 gone since the action, 423 a record refused for its seal, 503 a Vault Outage.
+            _fallback_refused(user_id, f"answered {exc.status_code}", exc)
+        except Exception as exc:
+            # Broad on purpose: the credential was issued, and the docstring says why.
+            if isinstance(exc, account_read_errors()) and not isinstance(exc, AUDIT_WRITE_DEFECTS):
+                _fallback_refused(user_id, f"failed ({type(exc).__name__})", exc)
+            elif _log.isEnabledFor(logging.ERROR):
+                _log.error(
+                    "the name of account %s for a page after a landed action was not shown: its "
+                    "checked read raised a defect (%s, message withheld) from %s; the page names "
+                    "the account by id",
+                    scrub_log_argument(user_id),
+                    type(exc).__name__,
+                    _frames(exc),
+                )
         else:
             return str(user.username)
-        _log.warning(
-            "the name of account %s for a page after a landed action was not shown: its checked "
-            "read %s; the page names the account by id",
-            scrub_log_argument(user_id),
-            reason,
-        )
         return user_id
 
     async def _user_detail(
@@ -294,8 +353,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         error: str | None = None,
         status_code: int = 200,
         scope_draft: list[str] | None = None,
+        checked: Any = None,
     ) -> HTMLResponse:
-        user = await _checked(user_id, service)
+        # ``checked``: a record this request already read through :func:`_checked` and has not
+        # changed since, so a refusal decided from it does not read the account a second time.
+        user = checked if checked is not None else await _checked(user_id, service)
         all_roles = await admin.list_roles(service=service, _=identity)
         return HTMLResponse(
             pages.user_detail_page(
@@ -330,8 +392,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.USERS_READ)),
     ) -> HTMLResponse:
         users = await admin.list_users(service=service, identity=identity)
-        # Each summary says whether its scope was withheld from this caller (BACKLOG #3189).
-        return HTMLResponse(pages.users_page(users))
+        # Each summary says whether its scope was withheld from this caller (BACKLOG #3189). The
+        # delete a failing row offers is shown only to a caller its route would let through
+        # (BACKLOG #5559), as the cluster page gates its controls.
+        return HTMLResponse(
+            pages.users_page(users, can_delete=identity.has(Permission.USERS_MANAGE))
+        )
 
     # Declared BEFORE /ui/users/{user_id} so the literal segment wins the route match.
     @app.get("/ui/users/new", response_class=HTMLResponse)
@@ -544,7 +610,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # No draft: a mode the form does not offer has no option to select, and the stored
             # scope is the only honest thing to show for a hand-crafted post.
             return await _user_detail(
-                user_id, service, identity, error="unknown scope mode", status_code=400
+                user_id,
+                service,
+                identity,
+                error="unknown scope mode",
+                status_code=400,
+                checked=user,
             )
         if mode == "list" and not names:
             # No draft: there are no names to keep, and an empty draft would render as the
@@ -558,6 +629,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     "no-channels scope instead"
                 ),
                 status_code=400,
+                checked=user,
             )
         # The token never rides in through the textarea. `set_channel_scope` stores the list as
         # typed, but `auth.service._allowed_channels` returns None -- every channel -- for any
@@ -583,6 +655,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 status_code=400,
                 scope_draft=kept or None,
+                checked=user,
             )
         # BACKLOG #1152: all-channels is now the explicit ALL_CHANNELS grant, not a null scope. Null
         # and [] both deny, so posting null for "all" would have silently inverted this form.
@@ -611,6 +684,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 status_code=400,
                 scope_draft=channels,
+                checked=user,
             )
         try:
             body = ChannelScope(
@@ -995,6 +1069,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
 
+    @app.get("/ui/users/{user_id}/delete-confirm", response_class=HTMLResponse)
+    async def ui_user_delete_confirm(
+        user_id: str,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
+    ) -> Response:
+        # BACKLOG #5559: the confirmation the users list leads to for an account whose record
+        # fails its seal, behind the delete's own gate. The account is read through the checked
+        # read first, so the page is shown only for a record that read refused for its seal: an intact
+        # account goes to its own detail page, and a missing one, or any other refusal, is that
+        # read's answer. The page names the id alone, and the POST it carries makes every check
+        # the delete makes.
+        try:
+            await _checked(user_id, service)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_423_LOCKED:
+                raise
+        else:
+            # Encoded as the list's link to this page is, so the path spelling is not put back raw.
+            return RedirectResponse(f"/ui/users/{_seg(user_id)}", status_code=303)
+        return HTMLResponse(
+            pages.user_delete_confirm_page(user_id, is_self=user_id == identity.user_id)
+        )
+
     @app.post("/ui/users/{user_id}/delete")
     async def ui_user_delete(
         user_id: str,
@@ -1013,8 +1111,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     user_id, service, identity, error=str(exc.detail), status_code=400
                 )
             except HTTPException as page_exc:
-                # BACKLOG #5559: the users list offers the delete for a record that fails its
-                # seal, whose detail page answers 423. The delete's own refusal is the answer, and
+                # BACKLOG #5559: the delete confirmation offers the delete for a record that fails
+                # its seal, whose detail page answers 423. The delete's own refusal is the answer, and
                 # it stays the answer when the page's read is refused on an HTTP refusal from the
                 # re-render (a 503 Vault Outage, say), which would replace it. An account gone
                 # since answers 404.

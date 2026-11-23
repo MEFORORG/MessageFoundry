@@ -37,6 +37,7 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
 from tests._admin_account import create_local_user_chosen
+from tests._fake_dbapi_driver import DriverError
 from tests._store_audit import no_operator_audit
 
 
@@ -553,7 +554,7 @@ async def test_database_capture_propagates_a_fetch_driver_error() -> None:
 
     class _FailingFetch(_Cur):
         async def fetchall(self) -> list[tuple[Any, ...]]:
-            raise Exception("08S01", "[08S01] communication link failure (10054) (SQLFetch)")
+            raise DriverError("08S01", "[08S01] communication link failure (10054) (SQLFetch)")
 
     d = _db(True)
     with pytest.raises(Exception, match="08S01"):

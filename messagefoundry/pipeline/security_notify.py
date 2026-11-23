@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from typing import Final, Protocol
 
 from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
@@ -794,9 +795,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # Each one swallows its own failure, so this only waits.
             await asyncio.gather(*self._recording, return_exceptions=True)
 
-    async def _handle(self, event: SecurityEvent) -> None:
+    async def _handle(self, event: SecurityEvent, delivered: Callable[[], None]) -> None:
         try:
-            await asyncio.to_thread(self._send, event)
+            if await asyncio.to_thread(self._send, event):
+                delivered()
         except Exception:
             # Best-effort: a failed send must never propagate. The event is usually also in the audit
             # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
@@ -845,9 +847,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                     type(exc).__name__,
                 )
 
-    def _send(self, event: SecurityEvent) -> None:
+    def _send(self, event: SecurityEvent) -> bool:
+        """Mail the notice, returning whether it was sent."""
         if not event.email:  # narrowed for mypy; notify() already filtered these out
-            return
+            return False
         send_plain_email(
             host=self._host,
             port=self._port,
@@ -864,6 +867,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             tls_ca_file=self._tls_ca_file,
             trust_anchor_policy=self._trust_anchor_policy,
         )
+        return True
 
 
 def security_notifier_from_settings(

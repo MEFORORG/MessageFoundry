@@ -477,7 +477,7 @@ def warn_url_query_credentials(
     escape, and accept a false refusal because the peer is unverified (vault BACKLOG #3230, #3533).
     Elsewhere
     the warning is all there is, and the reason is the difference from the userinfo precedent.
-    ``transports.rest.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
+    ``urlscreen.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
     authenticated anything: urllib reads it as part of the host, and the error text carried the
     password into ``queue.last_error``. A query credential does authenticate, and some partner APIs
     take it nowhere else (a shared-access ``sig``, an API ``key``), so a refusal would remove the hop

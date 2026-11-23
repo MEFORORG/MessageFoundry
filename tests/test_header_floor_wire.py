@@ -524,12 +524,17 @@ async def _fed_and_still_open(
     ],
 )
 async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
-    request_bytes: bytes, status: int, bare_answers: bool
+    request_bytes: bytes, status: int, bare_answers: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """What uvicorn's Server.shutdown does to each connection still in its set: call
     ``shutdown()``. On the bare sans-I/O class that sends a 500 on a conn that has already ended
     its stream, and websockets asserts, which is the control. On the floored class the connection
-    was answered and marked so, nothing more is written, and the call returns."""
+    was answered and marked so, nothing more is written, and the call returns.
+
+    On a parser rejection it also checks that uvicorn's handle_connect never ran, that a later
+    ``data_received`` does not call the floor's step again, and that clearing ``close_sent`` makes
+    the closing ``shutdown`` raise. That closing call is what ``protocol_headers`` cites as the
+    coverage of uvicorn's ``shutdown`` reading ``close_sent``: keep it last and unguarded."""
     bare, bare_transport = await _fed_and_still_open(WebSocketsSansIOProtocol, request_bytes)
     assert bool(bare_transport.written) is bare_answers
     with pytest.raises(AssertionError) as stopped:
@@ -538,18 +543,52 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
 
     floored_class = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
     assert floored_class is not None
+    calls: list[Any] = []
+    step = protocol_headers._answer_a_parser_rejection
+
+    def _counted(protocol: Any) -> None:
+        calls.append(protocol)
+        step(protocol)
+
+    monkeypatch.setattr(protocol_headers, "_answer_a_parser_rejection", _counted)
     floored, transport = await _fed_and_still_open(floored_class, request_bytes)
+    # The spy's positive control: the first data_received reaches the step on both paths.
+    assert calls == [floored]
     written = bytes(transport.written)
     assert written.startswith(f"HTTP/1.1 {status} ".encode()), written[:40]
     assert b"nosniff" in written and transport.closing
-    if not bare_answers:
-        # The parser-rejection step set these itself; uvicorn never ran handle_connect.
+    # handle_connect's first act is to set ``request``, which uvicorn's __init__ does not.
+    ran_handle_connect = {"request" in vars(p) for p in (bare, floored)}
+    if bare_answers:
+        # Here uvicorn did run handle_connect, on both instances.
+        assert ran_handle_connect == {True} and bare.handshake_initiated
+    else:
+        # uvicorn never ran handle_connect on either instance, so the parser-rejection step set
+        # these three itself.
+        assert ran_handle_connect == {False} and not bare.handshake_initiated
         assert (floored.handshake_initiated, floored.handshake_complete, floored.close_sent) == (
             True,
             True,
             True,
         )
-        floored.data_received(b"more bytes after the rejection")  # no second pass, no raise
+        floored.data_received(b"more bytes after the rejection")  # no raise
+        assert calls == [floored], "the parser-rejection step was called again"
+        assert bytes(transport.written) == written
+        # Controls in this same case. A valid upgrade on a fresh floored instance does run
+        # handle_connect, so the ``request`` check above can see it.
+        accepted, _ = await _fed_and_still_open(
+            floored_class, _HANDSHAKE.format(path="/ws/stats").encode()
+        )
+        assert "request" in vars(accepted)
+        # What the protocol_headers docstring cites: with close_sent cleared, which is what a
+        # shutdown that dropped its close_sent check sees, shutdown raises inside websockets.
+        from websockets.exceptions import InvalidState
+
+        cleared, _ = await _fed_and_still_open(floored_class, request_bytes)
+        cleared.close_sent = False
+        with pytest.raises(InvalidState) as unread:
+            cleared.shutdown()
+        _assert_raised_in_websockets(unread.value)
     floored.shutdown()
     assert bytes(transport.written) == written
 

@@ -684,8 +684,15 @@ becomes the bottleneck.
   database. A config-only pass with no config file to archive, such as one over an empty config dir, fails instead of writing an archive, so that pass does not take the retention slot of a good one; on a PostgreSQL or SQL Server store, `[backup].enabled = true` with `[backup].config_only_on_server_db = true` and `[backup].include_config = false` is refused when the settings load ([`CONFIGURATION.md`](CONFIGURATION.md) `[backup]` lists at least what each refuses).
 
 **Restore an archive.** `messagefoundry restore <archive> --to <new store path>` verifies the archive,
-decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal` /
-`-shm` sidecar) — point `--to` at a clean path and move the old store aside yourself. Add
+decrypts it, and writes the store. It **refuses to overwrite** an existing store. Before it decrypts
+anything, it refuses a `--to` whose name, or whose `-wal`, `-shm` or `-journal` name beside it, is
+already taken by a file, a directory or a link, a dangling link included, and it reads those three
+sidecar names again just before it writes the store. A stale `-wal` or hot `-journal` matters because
+SQLite replays it over the verified pages on first open. A sidecar created after that last read is not
+caught. It also refuses at least a `--to` whose file name holds a `:`, and on Windows one ending in a
+dot or a space, because on Windows those spellings make the check read names SQLite never uses; spell
+`--to` as the plain file name. Point `--to` at a clean path. To reuse the old store's path, stop the engine,
+then move the old store aside together with its `-wal`, `-shm` and `-journal`, as one set. Add
 `--config-to <dir>` to restore the config bundle alongside it. A config-only archive carries no store,
 so restore its config bundle with `messagefoundry restore <archive> --config-to <dir>` and no `--to`;
 an archive that carries a store is refused that way. Check the archive without writing anything

@@ -20,7 +20,11 @@ export function resolveAgainst(base: string, p: string, win32: boolean = IS_WIN3
 /**
  * A comparison key for the file `p` names, resolved against `base` first. On Windows (by default, when
  * running there) it is lower-cased, because the file system ignores case and the two sides spell the
- * drive letter differently. Two paths name the same file when their keys are equal.
+ * drive letter differently. Two paths name the same file when their keys are equal. It folds with
+ * toLowerCase(), as VS Code's own resource comparison does on a case-insensitive file system, so the
+ * keys group diagnostics the way a DiagnosticCollection does; it is not a containment check, which
+ * folds ASCII only (pathFold.ts, BACKLOG #5832). Open limit: Live Debug keys its trace by it too, so
+ * a module whose name differs only by such a fold (U+212A KELVIN SIGN for "k") shares a key.
  */
 export function fileKey(base: string, p: string, win32: boolean = IS_WIN32): string {
   const resolved = resolveAgainst(base, p, win32);
