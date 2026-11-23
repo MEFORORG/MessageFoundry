@@ -90,13 +90,12 @@ against the server class it is handed. So is every attribute the two sans-I/O st
 or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
 error. That check sees a name that is no longer assigned. It cannot see a name the server still
 assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
-another object. Some reads have a test of their own. For ``close_sent``,
-``test_shutdown_of_an_answered_still_open_connection_does_not_raise`` fails when uvicorn's
-``shutdown`` drops its ``close_sent`` check and sends a close frame on a parser-rejected
-connection; a ``shutdown`` that stops reading it and returns early some other way passes it. The
-other-object case is an open note on BACKLOG #1120. The checked hooks are: the HTTP protocol's
-``send_400_response``, its
-``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
+another object, and no test covers the second case. For the first, at least ``close_sent`` has a
+wire test: the shutdown test in ``tests/test_header_floor_wire.py`` shows that ``shutdown`` on a
+parser-rejected connection raises with the flag cleared, so it fails if uvicorn's ``shutdown``
+drops its ``close_sent`` check. A ``shutdown`` that stops reading the flag some other way need not
+fail it. The checked hooks are: the HTTP protocol's ``send_400_response``, its ``cycle`` and
+``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response``, ``default_headers``, ``send``, and the ``disconnected``, ``message_event``
 and ``response_complete`` it reads, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O

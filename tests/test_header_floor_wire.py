@@ -569,39 +569,23 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
         floored.data_received(b"more bytes after the rejection")  # no raise
         assert calls == [floored], "the parser-rejection step was called again"
         assert bytes(transport.written) == written
+        # Controls in this same case. A valid upgrade on a fresh floored instance does run
+        # handle_connect, so the ``request`` check above can see it.
+        accepted, _ = await _fed_and_still_open(
+            floored_class, _HANDSHAKE.format(path="/ws/stats").encode()
+        )
+        assert "request" in vars(accepted)
+        # What the protocol_headers docstring cites: with close_sent cleared, which is what a
+        # shutdown that dropped its close_sent check sees, shutdown raises inside websockets.
+        from websockets.exceptions import InvalidState
+
+        cleared, _ = await _fed_and_still_open(floored_class, request_bytes)
+        cleared.close_sent = False
+        with pytest.raises(InvalidState) as unread:
+            cleared.shutdown()
+        _assert_raised_in_websockets(unread.value)
     floored.shutdown()
     assert bytes(transport.written) == written
-
-
-class _ShutdownSkipsCloseSent(WebSocketsSansIOProtocol):
-    """uvicorn 0.54.0's sans-I/O ``shutdown`` with its ``close_sent`` check removed, so a
-    connection marked closed falls through to the close frame."""
-
-    def shutdown(self) -> None:
-        self.stop_keepalive()
-        if self.handshake_complete:
-            self.queue.put_nowait({"type": "websocket.disconnect", "code": 1012})
-            self.conn.send_close(1012)
-            self.transport.write(b"".join(self.conn.data_to_send()))
-        else:
-            self.send_500_response()
-        self.transport.close()
-
-
-async def test_the_shutdown_test_sees_shutdown_drop_its_close_sent_check() -> None:
-    """The control behind what ``protocol_headers`` says the shutdown test above covers: on a
-    parser-rejected connection the floor marked, a ``shutdown`` that no longer checks
-    ``close_sent`` sends a close frame on a conn that never opened, and websockets raises. It does
-    not cover a ``shutdown`` that stops reading ``close_sent`` and returns early some other way."""
-    from websockets.exceptions import InvalidState
-
-    floored_class = floored_ws_protocol_class(base=_ShutdownSkipsCloseSent)
-    assert floored_class is not None
-    floored, _ = await _fed_and_still_open(floored_class, _LONG_LINE_UPGRADE)
-    assert floored.close_sent
-    with pytest.raises(InvalidState) as stopped:
-        floored.shutdown()
-    _assert_raised_in_websockets(stopped.value)
 
 
 async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() -> None:
