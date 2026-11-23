@@ -156,6 +156,33 @@ async def test_the_sweep_removes_both_leftover_shapes_and_counts_them(tmp_path: 
     assert await store.prune_expired() == PruneResult()
 
 
+def test_the_removal_warning_is_true_for_each_kind(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A temp is removed with no sidecar check, so its message must not claim one read as absent."""
+    store = _store(tmp_path)
+    root = tmp_path / "uploads"
+    root.mkdir(mode=0o700, parents=True)
+    tmp_name = f".{secrets.token_hex(16)}{_BLOB_SUFFIX}.{secrets.token_hex(4)}.tmp"
+    body_name = f"{secrets.token_hex(16)}{_BLOB_SUFFIX}"
+    for leftover in (root / tmp_name, root / body_name):
+        leftover.write_text("x", encoding="utf-8")
+        _backdate(leftover, seconds=2 * _ORPHAN_MIN_AGE_SECONDS)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert store._sweep_orphans_sync(now=time.time()) == 2
+
+    messages = {r.getMessage() for r in caplog.records if "orphan sweep removed" in r.getMessage()}
+    assert (
+        f"uploaded-logs orphan sweep removed temp file {tmp_name}: past the age floor" in messages
+    )
+    assert (
+        f"uploaded-logs orphan sweep removed body with no sidecar {body_name}: "
+        "past the age floor, and its sidecar read as absent"
+    ) in messages
+    assert not any("sidecar" in m for m in messages if tmp_name in m)
+
+
 def test_an_aborted_sweep_stops_before_its_next_entry(tmp_path: Path) -> None:
     """BACKLOG #2264, code review. A pass writes its audit rows only once the orphan sweep returns,
     so a slow sweep over a large dir must stop on the pass's abort rather than hold those rows past

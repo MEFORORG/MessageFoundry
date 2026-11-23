@@ -4369,10 +4369,12 @@ class UploadStore:
             removed += 1
             # ASCII only in the message itself: a stock Windows cp1252 console raises
             # UnicodeEncodeError on the em dashes this module's prose uses freely.
+            # A temp is removed with no sidecar check, so only a body's text says one read as absent.
             _log.warning(
-                "uploaded-logs orphan sweep removed %s %s: past the age floor, and its sidecar read as absent",
+                "uploaded-logs orphan sweep removed %s %s: past the age floor%s",
                 kind,
                 name,
+                "" if sidecar is None else ", and its sidecar read as absent",
             )
         return removed
 
