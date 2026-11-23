@@ -967,7 +967,8 @@ _UNREAD_CA_ON_TLS_OFF: Final = MappingProxyType(
 def _tls_off_reason(tls: object) -> str | None:
     """Why a CA beside this ``tls`` is never read, or ``None``: the one predicate the factories and
     :func:`refuse_resolved_verify_off` share (``unread_ca_reason``'s ``tls`` arm). An ``env()``
-    ``tls`` is truthy, so it reads as on until it resolves."""
+    ``tls`` reads as on until it resolves, by ``unread_ca_reason``'s own rule, since
+    ``bool_setting`` refuses one."""
     from messagefoundry.auth.trust_anchors import unread_ca_reason
 
     return unread_ca_reason({"tls": tls})
@@ -975,8 +976,9 @@ def _tls_off_reason(tls: object) -> str | None:
 
 def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: object) -> None:
     """The ``tls_ca_file`` and ``tls_ca_pin`` checks of a factory in :data:`_UNREAD_CA_ON_TLS_OFF`
-    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, since the unread
-    reason reads it by truthiness."""
+    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, so the refusal names
+    the factory: the unread reason reads ``tls`` strictly and would raise a bare ``ValueError``
+    that does not (vault BACKLOG #3234)."""
     factory = _UNREAD_CA_ON_TLS_OFF[type_]
     if ca is not None:
         refuse_bool_literals({"tls": tls}, factory)
@@ -7173,7 +7175,11 @@ class Registry:
         ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems` judges every
         ``env()`` reference but an inbound encoding's: an ``env()`` value reads as unknown, and the
         check after resolution refuses it then."""
-        from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
+        from messagefoundry.auth.trust_anchors import (
+            unread_ca_flags_refused,
+            unread_ca_reason,
+            unread_pin_message,
+        )
 
         dialling = [
             ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
@@ -7187,6 +7193,11 @@ class Registry:
         problems: list[str] = []
         for kind, name, settings in dialling:
             if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
+                continue
+            if unread_ca_flags_refused(settings):
+                # The strict read in unread_ca_reason may raise on it, ending validate_config's
+                # collection; bool_literal_problems names the literal. The skip covers all four
+                # flags, read or not, so an unread-CA problem here shows once the literal is fixed.
                 continue
             if (unread := unread_ca_reason(settings)) is not None:
                 problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
@@ -7844,10 +7855,16 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
-    if isinstance(settings.get("tls_check_hostname"), EnvRef):
+    # An explicit None or an empty string is the default, on, as bool_setting reads it (vault
+    # BACKLOG #3230). Any other value counts when bool() reads it as false, without raising, as
+    # before bool_setting turned strict (vault BACKLOG #3234), so this lists at least the hops that
+    # read listed. That is a deliberate second reading beside bool_setting's: the connectors refuse
+    # a non-bool where they read the key, and a Registry build refuses one, but the settings dict
+    # stays mutable after the build, so this reader can still meet one and must not raise on it.
+    value = settings.get("tls_check_hostname")
+    if isinstance(value, EnvRef):
         return True
-    return not bool_setting(settings, "tls_check_hostname", default=True)
+    return value is not None and not (isinstance(value, str) and value == "") and not bool(value)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
