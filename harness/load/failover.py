@@ -14,7 +14,7 @@ the current primary mid-load**, and measures what a failover actually costs:
   lease TTL`` (relative, so it stays valid whatever timings a profile sets);
 * **no loss (acknowledged)** — every message the engine accept-ACKed reached the sink (``acked ⊆
   delivered``, via :class:`~harness.load.failover_track.FailoverTracker`), with nothing stranded
-  (``in_pipeline == 0``) and no dead-letters;
+  (``in_pipeline == 0``) and the outbound dead count unchanged from the run's opening read;
 * **bounded duplicates** — at-least-once re-deliveries (``sink_received − engine done``) under a rate cap;
 * **per-lane FIFO** — first arrivals per engine outbound DESTINATION (the lane, recovered from MSH-6 —
   the MLLP connector opens a fresh connection per delivery, so the lane is the destination, not the
@@ -73,6 +73,8 @@ REMOTE_DEBUG_OFF = ("-X", "disable-remote-debug")
 
 _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let the final ACKs/arrivals settle before the truly-final engine sample
+_OPENING_STATS_ATTEMPTS = 5
+_OPENING_STATS_RETRY_S = 0.5
 
 #: The most bytes the rig reads of one ``/health``, ``/cluster/status`` or ``/stats`` answer, the
 #: only API routes it polls over ``httpx`` (ASVS 5.1.1, BACKLOG #1127). Each is a role or a few
@@ -679,8 +681,7 @@ async def run_failover_load(
             leader = await _await_single_leader(nodes, client, timeout=election_timeout)
             notes.append(f"elected {leader.node_id} as the initial primary")
             await _await_port("127.0.0.1", ports.inbound_adt, timeout=15.0)
-            done_baseline = await _live_stats(nodes, client)
-            done_at_start = done_baseline.done if done_baseline else 0
+            opening = await _opening_stats(nodes, client)
 
             dispatcher.start()
             stop = asyncio.Event()
@@ -732,7 +733,7 @@ async def run_failover_load(
                 tracker,
                 outcome,
                 final,
-                done_at_start,
+                opening,
                 fo,
                 notes,
             )
@@ -859,17 +860,33 @@ def _build_report(
     tracker: FailoverTracker,
     outcome: _KillOutcome,
     final: NodeStats,
-    done_at_start: int,
+    opening: NodeStats,
     fo: Failover,
     notes: list[str],
 ) -> FailoverReport:
     c = counters.snapshot()
-    engine_delivered = max(0, final.done - done_at_start)
+    engine_delivered = max(0, final.done - opening.done)
     duplicates = max(0, c.sink_received - engine_delivered)
     dup_rate = duplicates / engine_delivered if engine_delivered else 0.0
     acked_not_delivered = tracker.acked_not_delivered()
     intake_gap = max(0, c.sent - c.acked)
-    no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and final.dead == 0
+    # Nonzero either way fails. A fall means rows were purged during the run, so the count can no
+    # longer show whether a row also went dead; a plain "> 0" would pass that. A purge exactly equal
+    # to the new dead rows still reads as zero: these two counters cannot show it (BACKLOG #5572).
+    dead_new = final.dead - opening.dead
+    no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and dead_new == 0
+    if dead_new > 0:
+        notes.append(f"{dead_new} row(s) went dead this run ({opening.dead} -> {final.dead})")
+    elif dead_new < 0:
+        notes.append(
+            f"the dead count fell during the run ({opening.dead} -> {final.dead}), so new dead "
+            "rows cannot be ruled out; failing the no-loss check"
+        )
+    elif opening.dead:
+        notes.append(
+            f"{opening.dead} dead row(s) carried over from before this run; the count did not "
+            "change (an equal purge and new dead rows would not show)"
+        )
     recovery_bound = fo.recovery_ttl_multiple * fo.leader_lease_ttl_seconds
 
     slos = [
@@ -1058,6 +1075,21 @@ async def _live_stats(nodes: list[EngineNode], client: httpx.AsyncClient) -> Nod
         if s is not None:
             return s
     return None
+
+
+async def _opening_stats(nodes: list[EngineNode], client: httpx.AsyncClient) -> NodeStats:
+    """The run's baseline, read before any load. With none, the report would count a reused store's
+    prior ``done`` rows as this run's deliveries and hide duplicates, so the run refuses instead."""
+    for attempt in range(_OPENING_STATS_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(_OPENING_STATS_RETRY_S)
+        stats = await _live_stats(nodes, client)
+        if stats is not None:
+            return stats
+    raise FailoverError(
+        f"could not read the opening /stats baseline in {_OPENING_STATS_ATTEMPTS} attempts; "
+        "no load was offered"
+    )
 
 
 async def _await_drain(node: EngineNode, client: httpx.AsyncClient, *, timeout: float) -> None:
