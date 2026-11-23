@@ -98,11 +98,13 @@ from messagefoundry.pipeline.remote_debug_watch import (
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
+    PendingRotationStamp,
     SecretRotationRunner,
     SecretStamp,
     enforce_secret_expiry,
     enforce_store_key_expiry,
     held_env_secret_values,
+    persist_rotation_meta,
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
 )
@@ -2332,6 +2334,8 @@ class Engine:
             # clear, which resolves a pause alert an earlier run left open (slice 3).
             await self._intake_monitor.check_once()
             self._intake_monitor.start()
+        # Set on the single-node path, which reconciles early and saves the rows further down.
+        pending_rotation: list[PendingRotationStamp] | None = None
         if self._registry_runner is not None:
             # Fail loud (not at the first received message) if the configured store can't run the
             # staged ingress pipeline: the inbound path unconditionally calls store.enqueue_ingress,
@@ -2368,6 +2372,12 @@ class Engine:
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener
                 # bring-up live in _start_graph (shared with the clustered leader path).
+                # BACKLOG #5615: refuse an expired key or secret before any listener binds. The
+                # stamps are saved further down, at the [secret_rotation] block, because a stamp says
+                # a secret was rotated: saved by a start that then failed, a candidate value would
+                # make the old value read as a new rotation and lift its refusal.
+                pending_rotation = []
+                await self._reconcile_rotation_and_refuse(defer_writes=pending_rotation)
                 await self._start_graph()
             else:
                 # CLUSTERED (active-passive, Workstream A1): the graph runs ONLY on the leader, so do
@@ -2504,75 +2514,12 @@ class Engine:
         # no-op when warn_days=0 or nothing is tracked. NOT leader-gated: it reads node-local config +
         # fingerprints and the per-secret realert throttle bounds any alert spam, so each node may run it.
         if self._secret_rotation_settings is not None:
-            # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
-            # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
-            # Vault/OIDC secret is fingerprinted with a keyed MAC sealed as a store-cipher cell
-            # (BACKLOG #3472) so a change auto-detects a rotation; and the ENFORCE escalation fires
-            # here (at restart) for a DEK past max_age + grace.
-            # The upserts are idempotent (keyed-MAC + dates only, never a value). All three shipped
-            # backends (SQLite, SQL Server, Postgres) implement the narrow SecretRotationMetaStore
-            # (#1186), so this isinstance gate engages on each and the reconcile + ENFORCE escalation
-            # runs; a backend that did NOT would degrade to the operator-configured dates without
-            # persistence — never an error.
-            if isinstance(self.store, SecretRotationMetaStore):
-                try:
-                    self._secret_rotation_stamps = await reconcile_rotation_meta(
-                        self.store,
-                        self._secret_rotation_settings,
-                        dek_key_id=self.store.cipher_info().active_key_id,
-                        enforcement=self._security_enforcement,
-                        alert_sink=self._alert_sink,
-                        # Per-Connection env() connector credentials resolved from the live graph, so
-                        # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
-                        # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
-                        extra_values=self._connector_secret_env_values(),
-                        # BACKLOG #4942: a changed key the keyed audit chain has not rolled to is
-                        # held, not stamped. The open already settled the chain; no I/O here.
-                        audit_rolled=audit_chain_rolled(self.store),
-                    )
-                except SecretsDirectoryError:
-                    # Vault BACKLOG #2595: not a reconcile fault but a secrets directory or file the
-                    # engine must not use. Refused as what it is, naming the file: logged and stepped
-                    # over by the arm below, it would leave the stamps empty and resurface as an
-                    # undetermined DEK age under ENFORCE, pointing the operator at the wrong key.
-                    raise
-                except Exception:
-                    # A reconcile failure must never take the engine down — the runner still works off the
-                    # operator-configured dates (empty stamps). Logged, not raised.
-                    log.exception(
-                        "secret-rotation stamp reconcile failed; continuing with config dates"
-                    )
-                # ASVS 13.3.4 / BACKLOG #1004 — the DEK's CALENDAR expiry refusal, and its placement is
-                # the control. It sits OUTSIDE the `except Exception` directly above ON PURPOSE: that
-                # handler's entire body is a log call, so a refusal raised beneath it would be logged
-                # and stepped over, and the engine would start normally on an expired key. A gate a
-                # handler swallows is a traceback, not a control. From here it propagates out of
-                # Engine.start() and aborts the ASGI lifespan.
-                #
-                # It also covers the SECOND-ORDER swallow: when the reconcile above fails, the stamps
-                # stay empty, so a gate written to read them would silently not fire. An undetermined
-                # age REFUSES rather than reading as a young one (the item's ruling). `cipher_info()`
-                # is re-read rather than hoisted so the reconcile's own guarded call keeps its
-                # behaviour; if it were to fail here the engine refuses to start, which is the
-                # fail-closed direction.
-                enforce_store_key_expiry(
-                    self._secret_rotation_settings,
-                    self._secret_rotation_stamps,
-                    enforcement=self._security_enforcement,
-                    dek_key_id=self.store.cipher_info().active_key_id,
-                    alert_sink=self._alert_sink,
-                )
-                # BACKLOG #1932 — the same refusal for the NON-DEK classes the operator opted into
-                # [secret_rotation].enforce_secret_expiry_classes, sited here for the same reason. It is a
-                # no-op on the shipped default (an empty opt-in), and `_expiry_enforced_held_ids`
-                # computes nothing in that case, so a default config's start is unchanged.
-                enforce_secret_expiry(
-                    self._secret_rotation_settings,
-                    self._secret_rotation_stamps,
-                    enforcement=self._security_enforcement,
-                    held=await self._expiry_enforced_held_ids(),
-                    alert_sink=self._alert_sink,
-                )
+            # Saved here and not straight after the graph: each runner above can still fail this
+            # start, and one that does must leave no stamp (BACKLOG #5615).
+            if pending_rotation is None:
+                await self._reconcile_rotation_and_refuse()
+            else:
+                await self._persist_pending_rotation(pending_rotation)
             self._secret_rotation_runner = SecretRotationRunner(
                 self._tracked_secrets,
                 self._secret_rotation_settings,
@@ -2678,6 +2625,99 @@ class Engine:
             # so this is a no-op and the supervisor brings the graph up on promotion.
             await self._reconcile_graph()
             self._graph_supervisor = asyncio.create_task(self._graph_supervisor_loop())
+
+    async def _reconcile_rotation_and_refuse(
+        self, *, defer_writes: list[PendingRotationStamp] | None = None
+    ) -> None:
+        """Reconcile the rotation stamps and run both expiry refusals against them. With
+        ``defer_writes`` the stamps are computed but not saved, so a start that goes on to fail
+        records no rotation (BACKLOG #5615)."""
+        if self._secret_rotation_settings is None:
+            return
+        # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
+        # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
+        # Vault/OIDC secret is fingerprinted with a keyed MAC sealed as a store-cipher cell
+        # (BACKLOG #3472) so a change auto-detects a rotation; and the ENFORCE escalation fires
+        # here (at restart) for a DEK past max_age + grace.
+        # The upserts are idempotent (keyed-MAC + dates only, never a value). All three shipped
+        # backends (SQLite, SQL Server, Postgres) implement the narrow SecretRotationMetaStore
+        # (#1186), so this isinstance gate engages on each and the reconcile + ENFORCE escalation
+        # runs; a backend that did NOT would degrade to the operator-configured dates without
+        # persistence — never an error.
+        if isinstance(self.store, SecretRotationMetaStore):
+            try:
+                self._secret_rotation_stamps = await reconcile_rotation_meta(
+                    self.store,
+                    self._secret_rotation_settings,
+                    dek_key_id=self.store.cipher_info().active_key_id,
+                    enforcement=self._security_enforcement,
+                    alert_sink=self._alert_sink,
+                    # Per-Connection env() connector credentials resolved from the live graph, so
+                    # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
+                    # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
+                    extra_values=self._connector_secret_env_values(),
+                    # BACKLOG #4942: a changed key the keyed audit chain has not rolled to is
+                    # held, not stamped. The open already settled the chain; no I/O here.
+                    audit_rolled=audit_chain_rolled(self.store),
+                    defer_writes=defer_writes,
+                )
+            except SecretsDirectoryError:
+                # Vault BACKLOG #2595: not a reconcile fault but a secrets directory or file the
+                # engine must not use. Refused as what it is, naming the file: logged and stepped
+                # over by the arm below, it would leave the stamps empty and resurface as an
+                # undetermined DEK age under ENFORCE, pointing the operator at the wrong key.
+                raise
+            except Exception:
+                # A reconcile failure must never take the engine down — the runner still works off the
+                # operator-configured dates (empty stamps). Logged, not raised.
+                log.exception(
+                    "secret-rotation stamp reconcile failed; continuing with config dates"
+                )
+            # ASVS 13.3.4 / BACKLOG #1004 — the DEK's CALENDAR expiry refusal, and its placement is
+            # the control. It sits OUTSIDE the `except Exception` directly above ON PURPOSE: that
+            # handler's entire body is a log call, so a refusal raised beneath it would be logged
+            # and stepped over, and the engine would start normally on an expired key. A gate a
+            # handler swallows is a traceback, not a control. From here it propagates out of
+            # Engine.start() and aborts the ASGI lifespan.
+            #
+            # It also covers the SECOND-ORDER swallow: when the reconcile above fails, the stamps
+            # stay empty, so a gate written to read them would silently not fire. An undetermined
+            # age REFUSES rather than reading as a young one (the item's ruling). `cipher_info()`
+            # is re-read rather than hoisted so the reconcile's own guarded call keeps its
+            # behaviour; if it were to fail here the engine refuses to start, which is the
+            # fail-closed direction.
+            enforce_store_key_expiry(
+                self._secret_rotation_settings,
+                self._secret_rotation_stamps,
+                enforcement=self._security_enforcement,
+                dek_key_id=self.store.cipher_info().active_key_id,
+                alert_sink=self._alert_sink,
+            )
+            # BACKLOG #1932 — the same refusal for the NON-DEK classes the operator opted into
+            # [secret_rotation].enforce_secret_expiry_classes, sited here for the same reason. It is a
+            # no-op on the shipped default (an empty opt-in), and `_expiry_enforced_held_ids`
+            # computes nothing in that case, so a default config's start is unchanged.
+            enforce_secret_expiry(
+                self._secret_rotation_settings,
+                self._secret_rotation_stamps,
+                enforcement=self._security_enforcement,
+                held=await self._expiry_enforced_held_ids(),
+                alert_sink=self._alert_sink,
+            )
+
+    async def _persist_pending_rotation(self, pending: list[PendingRotationStamp]) -> None:
+        """Save the stamps a start deferred. A failure must not refuse a start that is already up,
+        and loses nothing: the stored stamp still differs from the value held, so the next start
+        detects the same change. Logged by type only, as an error here could quote a stored cell."""
+        if not isinstance(self.store, SecretRotationMetaStore):
+            return
+        try:
+            await persist_rotation_meta(self.store, pending)
+        except Exception as exc:
+            log.error(
+                "secret-rotation stamps were not saved (%s); the next start detects them again",
+                type(exc).__name__,
+            )
 
     # --- active-passive graph gating (Workstream A1/A3/A4) -------------------
 

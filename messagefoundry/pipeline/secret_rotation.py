@@ -55,7 +55,7 @@ import secrets
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeGuard
+from typing import TYPE_CHECKING, NamedTuple, TypeGuard
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import CONNECTOR_SECRET_EXPIRY_CLASS
@@ -92,6 +92,8 @@ __all__ = [
     "fingerprint_changed",
     "fingerprints_equal",
     "open_rotation_record",
+    "PendingRotationStamp",
+    "persist_rotation_meta",
     "reconcile_rotation_meta",
     "secrets_from_settings",
     "secrets_from_settings_and_stamps",
@@ -555,6 +557,28 @@ def secrets_from_settings_and_stamps(
     return watched
 
 
+class PendingRotationStamp(NamedTuple):
+    """A stamp row held back by ``defer_writes``, its dates in ISO form (BACKLOG #5615)."""
+
+    class_id: str
+    sealed_fingerprint: str
+    tracked_since: str
+    last_rotated: str
+
+
+async def persist_rotation_meta(
+    meta_store: SecretRotationMetaStore, pending: Sequence[PendingRotationStamp]
+) -> None:
+    """Save stamp rows exactly as :func:`reconcile_rotation_meta` computed them, never re-sealing."""
+    for row in pending:
+        await meta_store.upsert_secret_rotation_meta(
+            row.class_id,
+            fingerprint=row.sealed_fingerprint,
+            tracked_since=row.tracked_since,
+            last_rotated=row.last_rotated,
+        )
+
+
 async def reconcile_rotation_meta(
     meta_store: SecretRotationMetaStore,
     settings: SecretRotationSettings,
@@ -566,6 +590,7 @@ async def reconcile_rotation_meta(
     extra_values: Mapping[str, str] | None = None,
     env_values: Mapping[str, str] | None = None,
     audit_rolled: bool | None = None,
+    defer_writes: list[PendingRotationStamp] | None = None,
 ) -> dict[str, SecretStamp]:
     """Reconcile the persisted secret-rotation stamps against what the engine holds RIGHT NOW, at engine
     start (ASVS 13.3.4, BACKLOG #282). For each tracked class — the store DEK (by its one-way key-id) and
@@ -608,6 +633,11 @@ async def reconcile_rotation_meta(
     ``store_key_max_age_days + enforce_grace_days`` emits its ``secret_rotation_due`` alert with
     ``enforced=True`` at restart. Returns the reconciled stamps for the runner's live secret source.
 
+    **``defer_writes`` holds the stamp rows back (BACKLOG #5615).** Given a list, each row this call
+    would upsert is appended to it instead, already sealed, for :func:`persist_rotation_meta` to save
+    once the start has succeeded. The rotation record is still opened here, because it only holds a
+    key and never lifts a refusal, so a write that outlives a failed start fails closed.
+
     PHI/secret-safe: a secret value is read only to compute its keyed MAC; only the sealed MAC + dates
     are ever persisted, and only dates and counts are alerted or logged, never the value."""
     ts = time.time() if now is None else now
@@ -626,12 +656,13 @@ async def reconcile_rotation_meta(
         write: bool,
     ) -> None:
         if write:
-            await meta_store.upsert_secret_rotation_meta(
-                class_id,
-                fingerprint=fingerprint,
-                tracked_since=tracked_since.isoformat(),
-                last_rotated=last_rotated.isoformat(),
+            row = PendingRotationStamp(
+                class_id, fingerprint, tracked_since.isoformat(), last_rotated.isoformat()
             )
+            if defer_writes is None:
+                await persist_rotation_meta(meta_store, [row])
+            else:
+                defer_writes.append(row)
         stamps[class_id] = SecretStamp(
             class_id=class_id,
             label=label,
@@ -664,7 +695,8 @@ async def reconcile_rotation_meta(
             # completes finds it and closes it, and a later start reads the same dates. A record
             # open for another key is kept, and this key is held all the same. Re-read for those
             # dates, which `dated` below takes when there is no stamp, and to see that it wrote: a
-            # writer between the two reads can have stamped the key first.
+            # writer between the two reads can have stamped the key first. Eager even under
+            # defer_writes: it only opens a hold and cannot lift a refusal, so it fails closed.
             opened = await open_rotation_record(
                 meta_store, dek_key_id, today.isoformat(), keep_another=True
             )
