@@ -23,6 +23,7 @@ import importlib.machinery
 import importlib.util
 import marshal
 import os
+import posixpath
 import re
 import runpy
 import subprocess
@@ -460,10 +461,16 @@ def test_the_snapshot_selects_code_sets_by_the_loader_s_own_rule(
     held = read_config_snapshot(tmp_path, strict=True).files
     assert set(asked) >= set(names)
     assert [rel for rel in held if rel.startswith("codesets/")] == ["codesets/keep.txt"]
+    monkeypatch.undo()
+    # The rule asks no platform: with normcase case-preserving, as on POSIX, it still folds.
+    monkeypatch.setattr(os.path, "normcase", posixpath.normcase)
     assert [n for n in names if is_code_set_name(n)] == ["X.CSV", "x.Toml"]
 
 
-def test_a_file_the_loader_does_not_read_as_a_code_set_is_not_in_the_digest(tmp_path: Path) -> None:
+@pytest.mark.parametrize("strict", [False, True], ids=["observational", "strict"])
+def test_a_file_the_loader_does_not_read_as_a_code_set_is_not_in_the_digest(
+    tmp_path: Path, strict: bool
+) -> None:
     """The control for the tests above: the rule is the loader's, not "everything in the folder"."""
     (tmp_path / "graph.py").write_text(_graph("V1"), encoding="utf-8")
     (tmp_path / "codesets").mkdir()
@@ -471,10 +478,10 @@ def test_a_file_the_loader_does_not_read_as_a_code_set_is_not_in_the_digest(tmp_
     for path in skipped:
         path.write_text("k,v\na,b\n", encoding="utf-8")
     assert not load_config(tmp_path).code_sets
-    before = config_fingerprint(tmp_path, strict=True)
+    before = config_fingerprint(tmp_path, strict=strict)
     for path in skipped:
         path.write_text("k,v\na,c\n", encoding="utf-8")
-    assert config_fingerprint(tmp_path, strict=True) == before
+    assert config_fingerprint(tmp_path, strict=strict) == before
 
 
 def test_a_module_linked_in_beside_another_changes_the_digest(tmp_path: Path) -> None:
