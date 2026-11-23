@@ -2751,9 +2751,10 @@ class _Reading:
         return all("builtins.staticmethod" in self.decorators.get(n, ()) for n in (m, s))
 
     classes: dict[ast.ClassDef, _ScopeState] = field(default_factory=dict)
-    #: Names whose origin at a def may not be the one this reading resolves: those the loops
-    #: enclosing the statement being read may bind (:func:`_loop_bound`), and those any function
-    #: declares ``global``, which a call may rebind at any point.
+    #: At least some of the names whose origin at a def may not be the one this reading resolves:
+    #: those the loops enclosing the statement being read may bind (:func:`_loop_bound`), and those
+    #: any function declares ``global``, which a call may rebind at any point. A name rebound
+    #: through ``globals()``, ``exec`` or any other route this reading does not see is not here.
     loop_bound: frozenset[str] = frozenset()
 
 
@@ -3226,9 +3227,14 @@ def _signature_clause(
 _OUTER_BINDS: Final = {
     "builtins.property": "a property, which is not callable and runs its getter on every read",
     "builtins.staticmethod": "a staticmethod, whose callers pass every parameter",
-    "builtins.classmethod": "a classmethod, which a call through its class passes the class first",
+    "builtins.classmethod": (
+        "a classmethod, which a call through a class passes the class first, and which outside "
+        "a class is not callable"
+    ),
     "functools.cache": "a cache wrapper, whose call results are cached",
-    "functools.lru_cache": "a cache wrapper, whose call results are cached",
+    "functools.lru_cache": (
+        "a cache wrapper, which caches call results up to its maxsize, and none at maxsize=0"
+    ),
     "functools.cached_property": (
         "a cached_property, which is not callable and runs its function once per instance"
     ),
@@ -3416,11 +3422,13 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
     if mismatch is not None:
         findings.problems.append(
             f"{cell_id}: absence claim PROVE-ERROR — the mutation {mismatch}. "
-            "Applied, that breaks every call site -- a TypeError, or a coroutine, generator or "
-            "other object where a value was expected -- so the observable would go red for the "
-            "call shape and not for the reintroduction — a wrecking ball wearing the shape of a "
-            "surgical proof. Copy the live signature; the mutation lives in a different repository "
-            "from the symbol it shadows, so nothing else keeps the two in step"
+            "Applied, that changes what a call of the name gets -- a TypeError, a coroutine, "
+            "generator or other object where a value was expected, or, where only the shape "
+            "decorators differ, a different binding, such as results no longer cached -- so the "
+            "observable may go red for that change and not for the reintroduction — a wrecking "
+            "ball wearing the shape of a surgical proof. Copy the live signature and decorators; "
+            "the mutation lives in a different repository from the symbol it shadows, so nothing "
+            "else keeps the two in step"
         )
         return False
     return True

@@ -3188,7 +3188,7 @@ def test_prove_absences_screen_outer_rule_reads_only_a_shape_that_is_fixed_and_l
     assert any("functools.cache" in p for p in _screen(plain, cached, tmp_path))
 
 
-# The four tests below are red on b1ce5d29f47, the head before the outer rule read call forms, loop
+# The five tests below are red on 18f06c570af, the head before the outer rule read call forms, loop
 # bodies and its own refusal text.
 
 _OUTER_HEAD: Final = (
@@ -3276,22 +3276,22 @@ def test_prove_absences_screen_outer_rule_reads_a_module_level_staticmethod_as_n
 
 def test_prove_absences_screen_outer_refusal_says_what_the_change_does(tmp_path: Path) -> None:
     """A dropped cache beside an unnamed decorator leaves every call working, so the refusal says
-    the results stop being cached, and not that the change breaks every call site."""
+    the results stop being cached, and not the signature refusal's text."""
     plain = _decorated((), method=False)
     cached = _OUTER_HEAD + _decorated(("functools.cache", "w"), method=False)
     (problem,) = _screen(plain, cached, tmp_path)
-    assert "breaks every call site" not in problem
+    assert "where a value was expected" not in problem
     assert "the function the def itself makes" in problem
     assert "a cache wrapper, whose call results are cached" in problem
-    # Control: a signature refusal keeps its own text.
     # A property swapped for a cached_property: the text names what differs.
     prop = _OUTER_HEAD + _decorated(("property", "w"), method=True)
     (swapped,) = _screen(_decorated(("functools.cached_property",), method=True), prop, tmp_path)
     assert "runs its function once per instance" in swapped
     assert "runs its getter on every read" in swapped
+    # Control: a signature refusal keeps its own text.
     bare = _OUTER_HEAD + plain
     (renamed,) = _screen("def f(b):\n    return 1\n", bare, tmp_path)
-    assert "breaks every call site" in renamed
+    assert "where a value was expected" in renamed
 
 
 def test_signature_fields_name_every_signature_value() -> None:
