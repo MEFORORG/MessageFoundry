@@ -139,8 +139,9 @@ class CipherCell:
         A value is read from the store, and a planted row is one thing a cipher read hunts for, so
         each is shown at most :data:`_LOCATOR_LIMIT` characters and an elision mark. It is escaped,
         whole escape by whole escape, only when the shown head of that many characters holds a
-        non-printable character (:func:`_shown`), so a locator cannot forge a line of the report or
-        carry a long value out whole."""
+        non-printable character (:func:`_shown`), so a locator cannot start a new line of the
+        report or carry a long value out whole. A printable head is shown unquoted, so it can still
+        read as report text within its line."""
         return " ".join(f"{c}={_shown(v)}" for c, v in zip(self.locator, values, strict=True))
 
 

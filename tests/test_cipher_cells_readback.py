@@ -2198,7 +2198,8 @@ def test_a_real_outage_and_a_real_cell_finding_carry_their_kind(
     tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End to end through the real walk: an outage gets no misread framing under an incompatible
-    open, and a ``cell`` finding (a misspelled at-rest marker) does."""
+    open, and a ``cell`` finding (an overwritten at-rest marker, read as an unmarked value on a
+    sealed surface) does."""
     from messagefoundry.store.crypto import CipherUnavailableError
 
     db, settings = _copy(_template, tmp_path)

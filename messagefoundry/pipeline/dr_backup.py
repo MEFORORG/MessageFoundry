@@ -4967,13 +4967,13 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
 
 
 #: What decided a :func:`_decrypt_check` verdict. ``cell`` is, under a key, at least a sealed value
-#: that did not open; a value that opened but its reader refuses (a ``QueueTagError``); a value
-#: whose AAD was refused (an ``AADComponentError`` at the open, or a ``CipherError`` its builder
-#: raised); a marker in another ASCII case; and, on a surface the keyed store sealed and without
-#: ``allow_unmarked_ciphertext``, a value with no marker. ``damaged`` is a BLOB, or a TEXT value
-#: that is not UTF-8, for which Python's sqlite3 module raises a decode error; at least this
-#: build's own writer stores neither. ``sqlite_schema`` is a statement the snapshot's schema could
-#: not answer, by :func:`is_schema_step_error`, other than a virtual table's missing module;
+#: that did not open, other than one the key service gave no verdict on (``outage``); a value that
+#: opened but its reader refuses (a ``QueueTagError``); a value whose AAD the open refused (an
+#: ``AADComponentError``); a marker in another ASCII case; and, on a surface the keyed store sealed
+#: and without ``allow_unmarked_ciphertext``, a value with no marker. ``damaged`` is a BLOB, or a
+#: TEXT value that is not UTF-8, for which Python's sqlite3 module raises a decode error; at least
+#: this build's own writer stores neither. ``sqlite_schema`` is a statement the snapshot's schema
+#: could not answer, by :func:`is_schema_step_error`, other than a virtual table's missing module;
 #: ``sqlite`` any other SQLite fault; ``interrupted`` a schema change mid-walk; ``outage`` a key
 #: service that gave no verdict; ``key_mismatch`` a keyed snapshot read with no key; ``pass`` none.
 WalkKind = Literal[
@@ -4989,10 +4989,11 @@ WalkKind = Literal[
 
 #: The kinds, by this set exactly, for which the incompatible-snapshot refusal offers the reading
 #: that a walk under this build read another version's cells or schema differently, as well as
-#: real damage. They are not every kind a fault of that shape can reach: at least a keyed walk of
-#: a cipher column with an unregistered collation ("no such collation sequence"), which no engine
-#: SQLite schema declares, yields kind ``sqlite`` with no misread framing. The reading is a
-#: possible cause there, never a finding that the cells are sound.
+#: real damage. The reading is a possible cause there, never a finding that the cells are sound.
+#: A fault of any other kind gets no such framing. At least a keyed walk of a cipher column with an
+#: unregistered collation ("no such collation sequence") is one: it yields kind ``sqlite``, and
+#: since no engine SQLite schema declares a collation, it is read, like a virtual table's missing
+#: module (:func:`_sqlite_kind`), as an object another tool left.
 _MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
 
 
