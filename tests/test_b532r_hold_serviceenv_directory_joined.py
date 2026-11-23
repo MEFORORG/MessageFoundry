@@ -86,7 +86,8 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     assert ADD_BACK_STEP not in refusal
     assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
     # The create clause only where a setting moves (the Lander's ruling on handback
-    # 7087574833, R1).
+    # 7087574833, R1), and next to the step it qualifies.
+    assert (ADD_BACK_JOINED + ADD_BACK_CREATE in refusal) is moved
     assert (ADD_BACK_CREATE in refusal) is moved
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
         refused.startswith("MEFOR_VALUE_") and " " not in directory
