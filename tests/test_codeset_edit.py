@@ -970,11 +970,14 @@ def test_rename_move_back_with_a_refused_sidecar_keeps_the_pair_together(
 
 def _referrer_module(n: str) -> str:
     """A config module whose handler names code set ``diets``, with its own connection names."""
+    # The names are built first so this source holds no literal factory call that the shipped
+    # connection-name census in test_api_input_validation.py would read as a real name.
+    ib, ob = f"IB_{n}", f"OB_{n}"
     return (
         "from messagefoundry import MLLP, Send, code_set, handler, inbound, outbound, router\n"
         "\n"
-        f'inbound("IB_{n}", MLLP(port={2700 + ord(n)}), router="r_{n}")\n'
-        f'outbound("OB_{n}", MLLP(host="127.0.0.1", port={6300 + ord(n)}))\n'
+        f'inbound({ib!r}, MLLP(port={2700 + ord(n)}), router="r_{n}")\n'
+        f'outbound({ob!r}, MLLP(host="127.0.0.1", port={6300 + ord(n)}))\n'
         "\n"
         "\n"
         f'@router("r_{n}")\n'
@@ -985,7 +988,7 @@ def _referrer_module(n: str) -> str:
         f'@handler("h_{n}")\n'
         f"def h_{n}(msg):\n"
         '    label = code_set("diets").get("A")\n'
-        f'    return Send("OB_{n}", msg)\n'
+        f"    return Send({ob!r}, msg)\n"
     )
 
 
