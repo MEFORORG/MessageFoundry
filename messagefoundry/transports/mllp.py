@@ -31,6 +31,7 @@ import re
 import socket
 import ssl
 import time
+import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -136,6 +137,7 @@ from messagefoundry.transports.framing import (
     frame_for_delivery,
     frame_reply_reporting,
 )
+from messagefoundry.transports.intake import IntakeAuth, IntakeContext, deliver
 
 __all__ = [
     "SB",
@@ -1682,6 +1684,16 @@ class MLLPDestination(DestinationConnector):
 # --- source ------------------------------------------------------------------
 
 
+#: What ``MLLPSource._intake`` re-raises from the certificate subject read rather than log and
+#: drop: a cancellation, which stop() relies on, and an interpreter exit (vault BACKLOG #2607).
+_RERAISED_FROM_INTAKE: tuple[type[BaseException], ...] = (
+    asyncio.CancelledError,
+    KeyboardInterrupt,
+    SystemExit,
+    GeneratorExit,
+)
+
+
 def _peer_host(writer: PeerInfo) -> str | None:
     """The peer IP from the socket for a connection-event row (#46) — socket metadata, never payload.
     ``None`` for a UNIX/unresolved peer."""
@@ -2873,7 +2885,57 @@ class MLLPSource(SourceConnector):
         except Exception as exc:  # fail-soft; an audit bug cannot drop an MLLP client
             logger.warning("MLLP intake audit emit failed: %s", safe_exc(exc))
 
-    async def _handle_bounded(self, message: bytes, handler: InboundHandler) -> str | None:
+    def _intake(self, writer: asyncio.StreamWriter) -> IntakeContext:
+        """The intake context of an admitted connection (vault BACKLOG #2607): how its sender was
+        admitted, with no IP address (owner ruling 2026-11-22). A client certificate is required
+        only where ``tls_ca_file`` set ``CERT_REQUIRED``, so only then is its subject
+        read; with ``tls_client_subjects`` on, reaching here means it was listed."""
+        subject: str | None = None
+        if self._ssl is None:
+            mode = IntakeAuth.NONE
+        elif self._ssl.verify_mode is not ssl.CERT_REQUIRED:
+            mode = IntakeAuth.TLS
+        else:
+            mode = IntakeAuth.MTLS if self._client_subjects is None else IntakeAuth.MTLS_SUBJECTS
+            try:
+                # Lazy, as _sender_listed's: pki pulls in cryptography.
+                from messagefoundry.pki import peer_subject
+
+                subject = peer_subject(writer.get_extra_info("ssl_object"))
+            except BaseException as exc:  # noqa: BLE001 -- the record is optional; the sender is not
+                # peer_subject already turns an unreadable certificate into None, so what lands
+                # here is a defect, a pyo3 PanicException (a BaseException) among them. It is
+                # logged, and the sender is still served, as it was before this record existed.
+                # A cancellation or an interpreter exit is not a defect of the read, so
+                # :data:`_RERAISED_FROM_INTAKE` is re-raised before anything is logged. The log line names
+                # the type and frames, never the message, which could quote the certificate, and
+                # a subject can name a person.
+                if isinstance(exc, _RERAISED_FROM_INTAKE):
+                    raise
+                frames = "; ".join(
+                    f"{frame.filename}:{frame.lineno} in {frame.name}"
+                    for frame in traceback.extract_tb(exc.__traceback__)
+                )
+                logger.error(
+                    "MLLP listener %s: reading the sender certificate's subject for the intake "
+                    "context failed with %s at %s; the connection's messages are stored without "
+                    "a subject",
+                    self._pacing_name,
+                    type(exc).__name__,
+                    frames,
+                )
+                subject = None
+        return IntakeContext(
+            transport="mllp",
+            auth_mode=mode,
+            cert_subject=subject,
+            # Reaching here means the address passed source_ip_allowlist, when one is set.
+            address_listed=True if self.source_ip_allowlist is not None else None,
+        )
+
+    async def _handle_bounded(
+        self, message: bytes, handler: InboundHandler, intake: IntakeContext | None = None
+    ) -> str | None:
         """Run the inbound handler inside one of this listener's in-flight slots, if the bound is on
         (BACKLOG #1725 act 3).
 
@@ -2888,12 +2950,15 @@ class MLLPSource(SourceConnector):
         ``handler`` is the inbound handler, or for a refused sender the runner's
         ``refuse_unlisted_sender``, which records the frame as ``ERROR`` and returns the ``AR``
         reply, if any (BACKLOG #4907). That takes a slot too, as it writes to the store.
+
+        ``intake`` is the connection's intake context, which :func:`deliver` hands to a handler
+        that takes one (vault BACKLOG #2607).
         """
         slots = self._inflight
         if slots is None:
-            return await handler(message)
+            return await deliver(handler, message, intake)
         async with slots:
-            return await handler(message)
+            return await deliver(handler, message, intake)
 
     @property
     def sockport(self) -> int:
@@ -3227,6 +3292,9 @@ class MLLPSource(SourceConnector):
                 if admitted is None:
                     return  # closed unread: the sender keeps whatever it had not had read
                 handle, unlisted = admitted
+                # Vault BACKLOG #2607: who sent this connection's messages, read once. A refused
+                # sender's frames go to the refusal, which records no intake context.
+                intake = None if unlisted else self._intake(writer)
                 if not unlisted:
                     established = True
                     await self._emit_event("established", peer_host=peer_host)
@@ -3275,7 +3343,7 @@ class MLLPSource(SourceConnector):
                             fault: str | None = None
                             try:
                                 # BACKLOG #1725 act 3: bounded per listener; see the method.
-                                reply = await self._handle_bounded(message, handle)
+                                reply = await self._handle_bounded(message, handle, intake)
                             except Exception as exc:  # noqa: BLE001 -- see _answer_handler_failure
                                 # BACKLOG #1619: the handler faulted on a frame the decoder read
                                 # cleanly, which is not a framing fault. A store outage at the
@@ -3306,7 +3374,7 @@ class MLLPSource(SourceConnector):
                                     # Each retry runs through _handle_bounded, so it takes an
                                     # in-flight slot and gives it back before the next pause.
                                     reply = await hold_and_retry(
-                                        lambda raw: self._handle_bounded(raw, handle),
+                                        lambda raw: self._handle_bounded(raw, handle, intake),
                                         message,
                                         fault,
                                         transport="MLLP",

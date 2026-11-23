@@ -724,6 +724,33 @@ def peer_othernames_intact(ssl_object: Any) -> bool:
         return False
 
 
+def peer_subject(ssl_object: Any) -> str | None:
+    """The RFC 4514 subject of a TLS connection's peer certificate, read from its DER, or ``None``
+    when there is none or it cannot be read (vault BACKLOG #2607, the intake context).
+
+    It runs after the listener admitted the peer, and the subject only names the peer, it decides
+    nothing, so a certificate that cannot be read stores the message without it rather than drop
+    it: ``ssl.SSLError``, and what ``cryptography`` raises for a certificate it cannot read, the
+    :data:`_UNREADABLE_CA` tuple, which holds ``ValueError`` (a handshake not done is one too).
+    An ``ssl_object`` with no ``getpeercert`` reads as no certificate. Any other exception is a
+    defect and raises. A fault is logged by its type alone, since a subject can name a person."""
+    getpeercert = getattr(ssl_object, "getpeercert", None)
+    if getpeercert is None:
+        return None
+    try:
+        der = getpeercert(binary_form=True)
+        if not der:
+            return None
+        # A SAN-only leaf has an empty subject, which names nobody, so it reads as none.
+        return x509.load_der_x509_certificate(der).subject.rfc4514_string() or None
+    except (*_UNREADABLE_CA, ssl.SSLError) as exc:  # the tuple is defined below; read at call
+        _log.warning(
+            "could not read a peer certificate's subject; the message is stored without it: %s",
+            type(exc).__name__,
+        )
+        return None
+
+
 #: What ``cryptography`` raises, at least, for CRL extensions it cannot read, beside a duplicate
 #: extension, which :func:`_crl_extensions` refuses itself: a general name it does not support,
 #: such as an x400Address, and, where warnings are errors, a deprecation it warns of. Neither is a
