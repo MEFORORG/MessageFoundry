@@ -5347,7 +5347,7 @@ flowchart TB
   `refuse_unless_step_up_window_live`, which a route body makes after its gate has passed,
   `_record_route_refusal` in `messagefoundry/api/security.py` says what it records. The
   monitoring-read 429 that `require_monitoring_read` holds on a `GET /connections` reveal is raised
-  by the route body after its scope check; its gate wrote no grant row, and
+  by the route body after its scope and permission checks; its gate wrote no grant row, and
   `raise_deferred_monitoring_refusal` writes the `auth.gate_refused` row the gate would have. Other
   refusals a route body makes after its gate has passed write no `auth.gate_refused` row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
@@ -7695,12 +7695,15 @@ them cost work per call: `/graph/edges` rebuilds the wiring graph, and `/status`
 copies the in-memory metrics ring and reads no store; it was put in the set because the console's
 Flow and trends page reads it beside `/graph/edges`, but the console is not charged (below), so
 its pace bounds only JSON clients. The gate charges a per-actor sliding window at
-admission, before the route's own work. On `GET /connections?reveal=` the read is still charged
-at admission, but a 429 is held until the route has run its channel-scope check, so a reveal naming
-a connection outside the caller's scope is still denied and audited as `auth.channel_denied` when
-the budget is spent. A held 429 the route never raises, because the scope check or query
-validation refused first, is answered by that refusal and writes no throttled row or log line. The
-six routes share ONE budget per account: a read of any of them spends it. The budget is in-process, per API process, so N engine shards multiply it by N
+admission, before the route's own work. On `GET /connections` with a valid `reveal` value, a
+429 is held until the route has run its channel-scope check and the reveal's
+`messages:view_summary` check, so with the budget spent those refusals still answer 403 and write
+their `auth.channel_denied` or `auth.permission_denied` row, as on main. A held 429 the route never
+raises, at least because one of those checks refused first, writes no throttled row or log line. A
+reveal value that will fail validation is charged and refused at the gate like any other read.
+The limiter records no refused attempt, so once the budget is spent a reveal those checks refuse
+spends nothing more. The six routes share ONE budget per account: a read of any of them spends
+it. The budget is in-process, per API process, so N engine shards multiply it by N
 (*Business-logic limits* above).
 
 **Key.** `identity.user_id` of the bearer session the request presents. A Prometheus-style scraper

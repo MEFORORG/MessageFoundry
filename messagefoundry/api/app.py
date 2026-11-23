@@ -67,7 +67,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
-from pydantic import PrivateAttr
+from pydantic import PrivateAttr, TypeAdapter, ValidationError
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -620,6 +620,22 @@ _MAX_PRESET_LAYERS = 8
 _CONNECTION_TEST_TIMEOUT = 35.0  # overall cap for a POST /connections/{name}/test probe (seconds)
 _MAX_WS_CONNECTIONS = 64  # cap concurrent /ws/stats sockets (API-WS)
 _WS_FRAME_SECONDS = 1.0  # one /ws/stats frame this often; the caller is re-resolved before each
+
+
+_CONNECTION_NAME_ADAPTER: TypeAdapter[str] = TypeAdapter(ConnectionName)
+
+
+def _valid_connection_name(value: str) -> bool:
+    """Whether ``value`` passes the ``ConnectionName`` rule the ``reveal`` query is validated by.
+    ``GET /connections`` defers its monitoring-read 429 only for a valid reveal, so a request that
+    will fail validation is refused, and recorded, at the gate (vault BACKLOG #1191)."""
+    try:
+        _CONNECTION_NAME_ADAPTER.validate_python(value)
+    except ValidationError:
+        return False
+    return True
+
+
 #: Path prefixes whose JSON responses are served ``Cache-Control: no-store`` (ASVS 14.2.2). These are
 #: the PHI-read route families — every route gated by ``require_phi_read`` and every step-up GET that
 #: charges the PHI-read hop/pacing budget lives under one of them, so a browser, a proxy or any other
@@ -5683,7 +5699,11 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(
-            require_monitoring_read(Permission.MONITORING_READ, defer_when_query="reveal")
+            require_monitoring_read(
+                Permission.MONITORING_READ,
+                defer_when_query="reveal",
+                defer_value_valid=_valid_connection_name,
+            )
         ),
         # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
         # calls this handler in-process, and a call that leaves it out must get None.
@@ -5702,11 +5722,13 @@ def create_app(
         # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
         # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
         # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
-        # behind a 429. For that reason the gate holds its monitoring-read 429 on a reveal, and it
-        # is raised here, after this check; the read was charged at admission either way (vault
-        # BACKLOG #1191). A scoped caller's dashboard carries no outbound rows at all.
+        # behind a 429. For that reason the gate holds a monitoring-read 429 on a valid reveal, and
+        # it is raised here, after this check and the reveal's permission check, so both refusals
+        # are recorded as on main (vault BACKLOG #1191). A scoped caller's dashboard carries no
+        # outbound rows at all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
+            await _refuse_reveal_without_view_summary(request, identity)
         await raise_deferred_monitoring_refusal(request)
         await _admit_reveal(request, identity, reveal)
         out = await _dashboard_rows(engine, identity, reveal=reveal)
@@ -6745,6 +6767,20 @@ def create_app(
             reason=e.reason,
         )
 
+    async def _refuse_reveal_without_view_summary(request: Request, identity: Identity) -> None:
+        """Refuse a reveal from a caller without ``messages:view_summary``, audited as
+        ``auth.permission_denied`` (the permission half of :func:`_admit_reveal`)."""
+        if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
+            auth = get_auth(request)
+            if auth is not None:
+                await auth.audit_permission_denied(
+                    identity,
+                    Permission.MESSAGES_VIEW_SUMMARY,
+                    request.url.path,
+                    client=client_ip(request),
+                )
+            raise HTTPException(403, "a reveal needs messages:view_summary")
+
     async def _admit_reveal(request: Request, identity: Identity, reveal: int | str | None) -> None:
         """The gate a ``reveal`` request adds on top of its list route's ``monitoring:*`` gate.
 
@@ -6762,16 +6798,7 @@ def create_app(
         route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
         if reveal is None:
             return
-        if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
-            auth = get_auth(request)
-            if auth is not None:
-                await auth.audit_permission_denied(
-                    identity,
-                    Permission.MESSAGES_VIEW_SUMMARY,
-                    request.url.path,
-                    client=client_ip(request),
-                )
-            raise HTTPException(403, "a reveal needs messages:view_summary")
+        await _refuse_reveal_without_view_summary(request, identity)
         if not (_matched_route_path(request) or "").startswith("/ui/"):
             enforce_phi_read_hop(request)
             # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read

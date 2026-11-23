@@ -326,8 +326,10 @@ def _names_called(node: ast.AST) -> list[str]:
 def test_every_gate_that_runs_admit_decides_inside_its_decision_block() -> None:
     """RED when: a gate factory calls ``_admit`` with no ``_recorded_decision`` block, so it writes
     no grant row for the requests it admits, or makes one of its own checks outside that block, so
-    the grant row is written before that check decides. ``require`` is the one factory that writes
-    its grant directly. The counts are the positive control: the walk found the seven gates, and a
+    the grant row is written before that check decides. ``require`` writes its grant directly, and
+    so does ``require_monitoring_read`` on its deferred-``reveal`` branch, whose charge
+    (``_charge_monitoring_read``) is not in ``_GATE_CHECKS``, so this walk does not check that
+    branch's order. The counts are the positive control: the walk found the seven gates, and a
     check in each."""
     from messagefoundry.api import security
 

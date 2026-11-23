@@ -1993,7 +1993,9 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
 
 
 def require_monitoring_read(
-    *permissions: Permission, defer_when_query: str | None = None
+    *permissions: Permission,
+    defer_when_query: str | None = None,
+    defer_value_valid: Callable[[str], bool] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus a **per-actor pace** on six ``monitoring:read`` GETs (vault BACKLOG
     #1191, ASVS 15.2.2). Five of them cost store or parse work per call: ``/graph/edges`` rebuilds
@@ -2016,16 +2018,23 @@ def require_monitoring_read(
     ``defer_when_query`` names a query parameter that delays the REFUSAL, not the charge: when the
     request carries it, the gate still charges the budget at admission, but a 429 it would answer
     is held on the request, with no decision row yet, until the route body calls
-    :func:`raise_deferred_monitoring_refusal` after its own scope check. A held 429 the route
-    never raises, because the scope check or query validation refused the request first, is
-    answered by that refusal and writes no throttled row or line. ``GET /connections`` defers on
+    :func:`raise_deferred_monitoring_refusal` after its own checks. ``defer_value_valid``, when
+    given, defers only a value that will pass the route's validation, so an invalid one is charged
+    and refused here as any other read. A held 429 the route never raises, at least because one of
+    its own checks refused the request first, is answered by that refusal and writes no throttled
+    row or line. ``GET /connections`` defers on
     ``reveal`` (vault BACKLOG #1191); docs/SECURITY.md, *Monitoring-read pacing*, says why."""
 
     async def dependency(request: Request) -> Identity:
         auth, identity = await _admit(request, permissions, mfa_gate=True)
         if auth is None:
             return identity
-        if defer_when_query is not None and defer_when_query in request.query_params:
+        deferred_value = (
+            request.query_params.get(defer_when_query) if defer_when_query is not None else None
+        )
+        if deferred_value is not None and (
+            defer_value_valid is None or defer_value_valid(deferred_value)
+        ):
             refusal = _charge_monitoring_read(request, auth, identity)
             if refusal is None:
                 await _record_grant(request, auth, identity, permissions)

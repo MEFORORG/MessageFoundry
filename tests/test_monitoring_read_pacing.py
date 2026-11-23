@@ -213,23 +213,44 @@ def _decisions_on(rows: Sequence[Row], path: str) -> list[tuple[str, dict[str, o
 
 
 async def _scoped_service(engine: Engine, **overrides: object) -> AuthService:
+    """``vw`` (Viewer) and ``op`` (Operator, so it holds ``messages:view_summary``), each scoped
+    to ``IB_MINE``."""
     service = await _service(engine, **overrides)
-    scoped = await service.store.get_user_by_username("vw")
-    assert scoped is not None
-    await service.set_channel_scope(scoped.id, ["IB_MINE"], actor="test")
+    op_id = await create_local_user_chosen(
+        service,
+        username="op",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    op = await service.store.get_user(op_id)
+    assert op is not None and op.password_hash is not None
+    await service.store.set_password(
+        op_id, password_hash=op.password_hash, must_change_password=False, password_generated=False
+    )
+    for name in ("vw", "op"):
+        user = await service.store.get_user_by_username(name)
+        assert user is not None
+        await service.set_channel_scope(user.id, ["IB_MINE"], actor="test")
     return service
+
+
+def _actions(rows: Sequence[Row], action: str) -> list[dict[str, object]]:
+    return [json.loads(str(row["detail"] or "{}")) for row in rows if row["action"] == action]
 
 
 async def test_an_out_of_scope_reveal_is_denied_and_audited_with_the_budget_spent(
     engine: Engine,
 ) -> None:
-    """As on main, the scope check and its ``auth.channel_denied`` row come before the monitoring
-    pace: an account whose budget is spent still gets the channel denial for an out-of-scope
-    reveal, not a 429 that hides the probe. An in-scope reveal past the budget is still refused,
-    with one ``auth.gate_refused`` row and no grant row (BACKLOG #1197)."""
+    """The scope check's 403 and ``auth.channel_denied`` row come before the monitoring 429, as
+    main's 403 and row came with no pace at all: an account whose budget is spent still gets the
+    channel denial, not a 429 that hides the probe. An in-scope reveal past the budget is refused
+    429, with one ``auth.gate_refused`` row and no grant row (BACKLOG #1197)."""
     service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
     async with _client(engine, service) as c:
-        h = await _bearer(c, "vw")
+        h = await _bearer(c, "op")
         assert (await c.get("/status", headers=h)).status_code == 200
         assert (await c.get("/status", headers=h)).status_code == 429  # the budget is spent
         denied = await c.get("/connections", params={"reveal": "IB_THEIRS"}, headers=h)
@@ -238,38 +259,61 @@ async def test_an_out_of_scope_reveal_is_denied_and_audited_with_the_budget_spen
         assert paced.status_code == 429
         assert int(paced.headers["Retry-After"]) >= 1
     rows = await engine.store.list_audit(limit=1000)
-    denials = [
-        json.loads(str(row["detail"] or "{}"))
-        for row in rows
-        if row["action"] == "auth.channel_denied"
-    ]
-    assert any("IB_THEIRS" in json.dumps(d) for d in denials), denials
+    assert any("IB_THEIRS" in json.dumps(d) for d in _actions(rows, "auth.channel_denied"))
     on_path = _decisions_on(rows, "/connections")
-    # Only the in-scope reveal's refusal is written: the out-of-scope one was answered, and
-    # recorded, as a channel denial, and its held 429 was never raised.
+    # The out-of-scope reveal was answered, and recorded, as a channel denial; its held 429 was
+    # never raised.
     assert [a for a, _ in on_path] == ["auth.gate_refused"], on_path
     assert {d["reason"] for _, d in on_path} == {"throttled"}
 
 
-async def test_a_refused_reveal_still_spends_the_budget(engine: Engine) -> None:
-    """The reveal's charge is taken at admission: a reveal the scope check denies, and one whose
-    value fails validation, each spend a read, so neither is an unpaced probe."""
+async def test_a_reveal_without_view_summary_is_denied_with_the_budget_spent(
+    engine: Engine,
+) -> None:
+    """As on main, a reveal by a caller without ``messages:view_summary`` gets the 403 and its
+    ``auth.permission_denied`` row, not a monitoring 429, even with the budget spent."""
+    service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
+    async with _client(engine, service) as c:
+        h = await _bearer(c, "vw")
+        assert (await c.get("/status", headers=h)).status_code == 200
+        refused = await c.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["detail"] == "a reveal needs messages:view_summary"
+    rows = await engine.store.list_audit(limit=1000)
+    assert any(
+        d.get("permission") == "messages:view_summary"
+        for d in _actions(rows, "auth.permission_denied")
+    )
+
+
+async def test_an_invalid_reveal_over_the_budget_writes_a_decision_row(engine: Engine) -> None:
+    """A reveal value that will fail validation is not deferred: over the budget it is refused 429
+    at the gate with its ``auth.gate_refused`` row, so the request leaves a decision row, as main's
+    grant row did."""
+    service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
+    async with _client(engine, service) as c:
+        h = await _bearer(c, "vw")
+        invalid = await c.get("/connections", params={"reveal": ""}, headers=h)
+        assert invalid.status_code == 422  # under the budget: charged, granted, then invalid
+        again = await c.get("/connections", params={"reveal": ""}, headers=h)
+        assert again.status_code == 429
+    rows = await engine.store.list_audit(limit=1000)
+    assert [a for a, _ in _decisions_on(rows, "/connections")] == [
+        "auth.permission_granted",
+        "auth.gate_refused",
+    ]
+
+
+async def test_an_out_of_scope_reveal_under_the_budget_spends_a_read(engine: Engine) -> None:
+    """While the budget has room, a reveal the scope check denies spends a read like any other.
+    Once it is spent, the limiter records no refused attempt, so such a reveal is answered by the
+    scope check's 403 with no further charge."""
     service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
     async with _client(engine, service) as c:
         h = await _bearer(c, "vw")
         denied = await c.get("/connections", params={"reveal": "IB_THEIRS"}, headers=h)
         assert denied.status_code == 403
         assert (await c.get("/status", headers=h)).status_code == 429
-        h_other = await _bearer(c, "other")
-        invalid = await c.get("/connections", params={"reveal": ""}, headers=h_other)
-        assert invalid.status_code == 422
-        assert (await c.get("/status", headers=h_other)).status_code == 429
-        # Over the budget, an invalid reveal is still answered by its validation 422: the held 429
-        # is never raised, so it writes no throttled row on the path.
-        again = await c.get("/connections", params={"reveal": ""}, headers=h_other)
-        assert again.status_code == 422
-    rows = await engine.store.list_audit(limit=1000)
-    assert [a for a, _ in _decisions_on(rows, "/connections") if a == "auth.gate_refused"] == []
 
 
 async def test_an_in_scope_reveal_under_the_budget_is_charged_once(engine: Engine) -> None:
@@ -277,7 +321,7 @@ async def test_an_in_scope_reveal_under_the_budget_is_charged_once(engine: Engin
     async with _client(engine, service) as c:
         h = await _bearer(c, "vw")
         # A Viewer passes the scope check and the pace, and is then refused by the reveal's own
-        # permission check, which runs after both.
+        # permission check.
         passed = await c.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
         assert passed.status_code == 403
         assert passed.json()["detail"] == "a reveal needs messages:view_summary"
