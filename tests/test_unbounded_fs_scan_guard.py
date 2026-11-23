@@ -891,7 +891,7 @@ def _nested_subshell_substitutions(depth: int, inner: str = "$((find /proc) )") 
 
 
 # THE PER-SITE TEXTS (BACKLOG #5607). Each row was allowed on origin/main at 3cf5d973237. The refined
-# view gave up on its budget past about 45 nested sites, never read a `$((cmd) )` nested inside
+# view gave up on its budget past some nesting depth, never read a `$((cmd) )` nested inside
 # arithmetic as a site, and is not built for a command with no quote, where Hide-HeredocBodies read
 # a spaced shift in arithmetic as a heredoc opener and blanked the walk on the lines after it.
 SITE_TEXT_DENY = [
@@ -929,6 +929,13 @@ SITE_TEXT_DENY = [
     pytest.param(
         "x=$(( a << b\n ))\ny=$(( c << d\n ))\nfind /proc", id="two-multi-line-shift-sites"
     ),
+    # A shift after a heredoc whose body a subshell site already read, and a grouping `((` in
+    # arithmetic, which is no site of its own.
+    pytest.param(
+        "x=$((cat << EOF\nhi\nEOF\n) )\ny=$(( 1 << n ))\nfind /proc",
+        id="shift-after-a-heredoc-read-inside-a-subshell-site",
+    ),
+    pytest.param("x=$(( ((a) << b) ))\nfind /proc", id="shift-after-grouping-parens-in-arithmetic"),
     pytest.param("(( a << b ))\nfind /proc", id="spaced-shift-in-an-arithmetic-command-no-quote"),
     pytest.param("x=$(( 1 << n ))\nfind /proc", id="spaced-shift-in-arithmetic-no-quote"),
     pytest.param(
@@ -971,6 +978,25 @@ SITE_TEXT_ALLOW = [
     pytest.param(
         "echo \"$((cat <<'EOF'\nnote: never run $((find /proc) ) here\nEOF\n) )\"",
         id="site-in-a-heredoc-in-a-quoted-subshell-site",
+    ),
+    # Each denied by the second cut of this change. Single quotes in a word-start `((` site that
+    # bash reads as a subshell are quotes; a comment in a substitution in `${...}` is a comment; a
+    # double quote inside a substitution in single-quoted arithmetic nests; and an apostrophe
+    # followed by a combining mark still opens single quotes.
+    pytest.param("((echo '$(find /proc)') )", id="single-quotes-in-a-subshell-site"),
+    pytest.param("if true; then ((echo '$(find /proc)') ); fi", id="single-quotes-after-then"),
+    pytest.param("while ((echo '$(grep -r x /)') ); do :; done", id="single-quotes-after-while"),
+    pytest.param(
+        "((cat <<'EOF'\nsay '$(find /proc)'\nEOF\n) )", id="single-quotes-in-a-heredoc-in-a-site"
+    ),
+    pytest.param(
+        'v="${HOME:-$(true # see $((find /proc) ) docs\n)}"', id="comment-in-a-default-value"
+    ),
+    pytest.param('echo "${a:-$(echo # $((find /proc) )\n)}"', id="comment-in-a-quoted-default"),
+    pytest.param("x=$(( '$(echo \"a;find /proc\")' ))", id="quoted-separator-in-quoted-arithmetic"),
+    pytest.param("x=$[ '$(echo \"a;find /proc\")' ]", id="quoted-separator-in-quoted-old-style"),
+    pytest.param(
+        "echo 'x'\u0301 'y $((find /proc) ) z'; x=$(( 1 ))", id="combining-mark-after-a-quote"
     ),
 ]
 
@@ -1173,8 +1199,8 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FLOOR_DENY": 3,
     "REFINED_CONTROL_ALLOW": 2,
     "REFINED_FALSE_DENY_ALLOW": 14,
-    "SITE_TEXT_DENY": 14,
-    "SITE_TEXT_ALLOW": 12,
+    "SITE_TEXT_DENY": 16,
+    "SITE_TEXT_ALLOW": 21,
 }
 
 

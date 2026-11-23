@@ -710,13 +710,15 @@ function Hide-PowerShellSpans([string]$Text) {
 #   - in arithmetic, single quotes are literal and a substitution in them still runs, so the quoted
 #     text gives a text of its own, read as if double-quoted.
 # Where a `#`, or a line end after a `<<`, falls inside a subshell site before its decision, or the
-# site never closes, a command reads the site differently from this pass. Its end is then found again
-# by a command's reading, and the sites this pass found inside it give no text of their own; the
-# site's own text, read by the views above, stands for them. Single-quoted text outside arithmetic,
-# `$'...'` and heredoc bodies hold no site. It still does not read at least these: a case pattern's
-# `)`, a `((` glued to a keyword, and a substitution in a heredoc body. Past its step budget it
-# returns $null, and the caller then adds nothing. With -From, it reads a command from that offset
-# inside an open `(` and returns where that `(` closes.
+# site never closes, this pass finds the site's end again by a command's reading, and the sites it
+# found inside give no text of their own; the site's own text, read by the views above, stands for
+# them. That matches bash for a `$((` site holding a heredoc, whose body bash reads as data. Bash
+# reads at least a word-start `((` site holding a heredoc otherwise, and runs the body's lines;
+# such a walk stays allowed, as on main. Single-quoted text outside arithmetic, `$'...'` and heredoc
+# bodies hold no site. It still does not read at least these: a case pattern's `)`, a `((` glued to
+# a keyword, and a substitution in a heredoc body. Past its step budget it returns $null, and the
+# caller then adds nothing. With -From, it reads a command from that offset inside an open `(` and
+# returns where that `(` closes.
 function Get-SiteTexts([string]$Text, [int]$From = -1) {
     $len = $Text.Length
     $steps = 0
@@ -726,9 +728,7 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
     $n = 0
     if ($From -ge 0) { $frames.Add(@{ K = 'par'; U = $false; Site = $null; D = 0 }); $n = $From }
     $sites = [System.Collections.Generic.List[object]]::new()
-    $quotedArith = [System.Collections.Generic.List[object]]::new()
     $pending = [System.Collections.Generic.List[string]]::new()
-    $braceDepth = 0
     $wordStart = $true
     $delimRe = [regex]::new('\G-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
     $readDelim = {
@@ -752,7 +752,7 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
         }
         if ($ch -ceq '$' -and $next -ceq '(' -and $n + 2 -lt $len -and $Text[$n + 2] -ceq '(') {
             $s = @{ Brk = $false; S = $n; ILo = $n + 2; IHi = $len; Dec = $null; Unc = $false; NoText = $false
-                Sh = [System.Collections.Generic.List[int]]::new() }
+                Sh = [System.Collections.Generic.List[int]]::new(); Q = [System.Collections.Generic.List[object]]::new() }
             $sites.Add($s)
             $frames.Add(@{ K = 'A'; U = $f.U; Site = $s; D = 0 })
             $frames.Add(@{ K = 'B'; U = $true; Site = $s; D = 0 })
@@ -762,12 +762,13 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
             $frames.Add(@{ K = 'sub'; U = $false; Site = $null; D = 0 }); $wordStart = $true; $n += 2; continue
         }
         if ($ch -ceq '$' -and $next -ceq '[') {
-            $s = @{ Brk = $true; Sh = [System.Collections.Generic.List[int]]::new() }
+            $s = @{ Brk = $true; NoText = $false; Sh = [System.Collections.Generic.List[int]]::new()
+                Q = [System.Collections.Generic.List[object]]::new() }
             $sites.Add($s)
             $frames.Add(@{ K = 'brk'; U = $true; Site = $s; D = 0 }); $wordStart = $true; $n += 2; continue
         }
         if ($ch -ceq '$' -and $next -ceq '{') {
-            $frames.Add(@{ K = 'brace'; U = $f.U; Site = $null; D = 0 }); $braceDepth++; $wordStart = $false
+            $frames.Add(@{ K = 'brace'; U = $f.U; Site = $null; D = 0 }); $wordStart = $false
             $n += 2; continue
         }
         if ($ch -ceq '`') {
@@ -781,7 +782,7 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
             $n++
             foreach ($term in $pending) {
                 while ($n -lt $len) {
-                    $end = $Text.IndexOf("`n", $n)
+                    $end = $Text.IndexOf([char]10, $n)
                     if ($end -lt 0) { $end = $len }
                     $steps++
                     $hit = $Text.Substring($n, $end - $n).Trim() -ceq $term
@@ -805,11 +806,18 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
         }
         if ($ch -ceq '\') { $wordStart = $false; $n += 2; continue }
         if ($ch -ceq "'") {
-            $close = $Text.IndexOf("'", $n + 1)
+            $close = $Text.IndexOf([char]39, $n + 1)
             $end = if ($close -lt 0) { $len } else { $close + 1 }
-            if ($f.U -and $Text.IndexOf('$(', $n, $end - $n, [StringComparison]::Ordinal) -ge 0 -or
-                ($f.U -and $Text.IndexOf([char]96, $n, $end - $n) -ge 0)) {
-                $quotedArith.Add(@{ Cost = $end - $n; Lo = $n; Hi = $end; Dq = $true; Whole = $false })
+            if ($f.U -and ($Text.IndexOf('$(', $n, $end - $n, [StringComparison]::Ordinal) -ge 0 -or
+                $Text.IndexOf([char]96, $n, $end - $n) -ge 0)) {
+                # Kept with the innermost site, and read only if that site is arithmetic.
+                for ($i = $frames.Count - 1; $i -ge 0 -and $frames[$i].U; $i--) {
+                    $steps++
+                    if ($frames[$i].K -ceq 'B' -or $frames[$i].K -ceq 'brk') {
+                        $frames[$i].Site.Q.Add(@{ Cost = $end - $n; Lo = $n; Hi = $end; Dq = $true; Whole = $false })
+                        break
+                    }
+                }
             }
             $n = $end; $wordStart = $false; continue
         }
@@ -819,11 +827,11 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
             $n++; $wordStart = $false; continue
         }
         if ($ch -ceq '"') { $frames.Add(@{ K = 'dq'; U = $f.U; Site = $null; D = 0 }); $wordStart = $false; $n++; continue }
-        if ($ch -ceq '#' -and $wordStart -and $braceDepth -eq 0) {
-            $end = $Text.IndexOf("`n", $n)
+        if ($ch -ceq '#' -and $wordStart -and $k -cne 'brace') {
+            $end = $Text.IndexOf([char]10, $n)
             if ($end -lt 0) { $end = $len }
             if ($k -ceq 'bt') {
-                $tick = $Text.IndexOf('`', $n)
+                $tick = $Text.IndexOf([char]96, $n)
                 if ($tick -ge 0 -and $tick -lt $end) { $end = $tick }
             }
             $n = $end; continue
@@ -840,9 +848,9 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
             $wordStart = $false; $n += 2; continue
         }
         if ($ch -ceq '(') {
-            if ($next -ceq '(' -and $wordStart -and $braceDepth -eq 0 -and $k -cne 'brk') {
+            if ($next -ceq '(' -and $wordStart -and $k -cne 'brace' -and -not $f.U) {
                 $s = @{ Brk = $false; S = $n; ILo = $n + 1; IHi = $len; Dec = $null; Unc = $false; NoText = $false
-                    Sh = [System.Collections.Generic.List[int]]::new() }
+                    Sh = [System.Collections.Generic.List[int]]::new(); Q = [System.Collections.Generic.List[object]]::new() }
                 $sites.Add($s)
                 $frames.Add(@{ K = 'A'; U = $f.U; Site = $s; D = 0 })
                 $frames.Add(@{ K = 'B'; U = $true; Site = $s; D = 0 })
@@ -857,11 +865,13 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
                 $s = $f.Site
                 if ($next -ceq ')') { $s.Dec = 'arith' }
                 else {
-                    # A subshell: the rest of it is a command, and each `<<` read so far opens a heredoc.
+                    # A subshell: the rest of it is a command. Each `<<` read so far opens a heredoc
+                    # whose body starts at the next line end, unless one already passed inside the
+                    # site, which then has its end found again below.
                     $s.Dec = 'sub'
                     $frames[$frames.Count - 1].U = $false
-                    foreach ($p in $s.Sh) { & $readDelim ($p + 2) }
-                    $s.Sh.Clear()
+                    if (-not $s.Unc) { foreach ($p in $s.Sh) { & $readDelim ($p + 2) } }
+                    $s.Sh.Clear(); $s.Q.Clear()
                 }
             }
             elseif ($k -ceq 'A') { $f.Site.IHi = $n }
@@ -871,7 +881,7 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
         elseif ($k -ceq 'brk' -and $ch -ceq ']') {
             if ($f.D -gt 0) { $f.D-- } else { $frames.RemoveAt($frames.Count - 1) }
         }
-        elseif ($k -ceq 'brace' -and $ch -ceq '}') { $frames.RemoveAt($frames.Count - 1); $braceDepth-- }
+        elseif ($k -ceq 'brace' -and $ch -ceq '}') { $frames.RemoveAt($frames.Count - 1) }
         $wordStart = [char]::IsWhiteSpace($ch) -or ';&|('.IndexOf($ch) -ge 0
         $n++
     }
@@ -887,6 +897,7 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
         $s.IHi = [int]$end
         foreach ($t in $sites) {
             if (-not $t.Brk -and $t.S -gt $s.ILo -and $t.S -lt $s.IHi) { $t.NoText = $true }
+            foreach ($q in $t.Q) { if ($q.Lo -gt $s.ILo -and $q.Lo -lt $s.IHi) { $q.Cost = -1 } }
         }
     }
     $shifts = [System.Collections.Generic.List[int]]::new()
@@ -895,8 +906,11 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
     # Each entry names a text without building it, so a deep nesting costs nothing it does not read.
     $texts = [System.Collections.Generic.List[object]]::new()
     if ($shifts.Count -gt 0) { $texts.Add(@{ Cost = $len; Lo = 0; Hi = $len; Dq = $false; Whole = $true }) }
-    $local = [System.Collections.Generic.List[object]]::new($quotedArith)
+    $local = [System.Collections.Generic.List[object]]::new()
     foreach ($s in $sites) {
+        if (($s.Brk -or $s.Dec -ceq 'arith') -and -not $s.NoText) {
+            foreach ($q in $s.Q) { if ($q.Cost -ge 0) { $local.Add($q) } }
+        }
         if ($s.Brk -or $s.NoText -or $s.Dec -ceq 'arith') { continue }
         $local.Add(@{ Cost = $s.IHi - $s.ILo; Lo = $s.ILo; Hi = $s.IHi; Dq = $false; Whole = $false })
     }
@@ -916,7 +930,14 @@ function Get-SiteText([string]$Text, $Entry, $Shifts) {
         $chars[$Shifts[$i] - $Entry.Lo] = ' '; $chars[$Shifts[$i] - $Entry.Lo + 1] = ' '
     }
     if ($Entry.Dq) {
-        for ($c = 0; $c -lt $chars.Length; $c++) { if ($chars[$c] -ceq '"') { $chars[$c] = ' ' } }
+        # A `"` outside any substitution would end the double quotes; inside one it nests.
+        $depth = 0
+        for ($c = 1; $c -lt $chars.Length - 1; $c++) {
+            if ($chars[$c] -ceq '$' -and $chars[$c + 1] -ceq '(') { $depth++; $c++ }
+            elseif ($depth -gt 0 -and $chars[$c] -ceq '(') { $depth++ }
+            elseif ($depth -gt 0 -and $chars[$c] -ceq ')') { $depth-- }
+            elseif ($depth -eq 0 -and $chars[$c] -ceq '"') { $chars[$c] = ' ' }
+        }
         $chars[0] = '"'
         if ($chars.Length -gt 1 -and $chars[$chars.Length - 1] -ceq "'") { $chars[$chars.Length - 1] = '"' }
     }
@@ -1091,8 +1112,9 @@ try {
     # THE PER-SITE TEXTS (BACKLOG #5607) COME AFTER EVERY VIEW ABOVE, under the same rule, so they can
     # only add denies to the verdict those views reach: they are read only once every earlier bound
     # has been judged and allowed, their bounds are appended, and a throw or a budget giving up
-    # returns that allow. The budgets bound the time they add to an allow, and that time counts
-    # against the timeout this guard shares with the hooks run after it in the same dispatch. Each
+    # returns that allow. The budgets bound how much text they read, not the time it takes to judge
+    # it, and that time counts against the timeout this guard shares with the hooks run after it in
+    # the same dispatch. Each
     # text is read under the plain, bash and refined views, one text per call, so the loop judges it
     # before the next is read. Built only for a command holding `((` or `$[`.
     $sitePending = @{ Value = ($tool -cne 'PowerShell' -and
