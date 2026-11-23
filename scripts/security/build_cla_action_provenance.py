@@ -250,10 +250,11 @@ VENDORING_HEADER = (
 #:    and never followed ``pageInfo.hasNextPage``, so an author first seen past page one was not in
 #:    the list a sign comment is recorded against. The patch loops on ``endCursor``, and raises when
 #:    a further page is claimed with a cursor that is missing or already seen, which the action
-#:    reports as a failed step. It does NOT compare the commits read with ``totalCount``: this
-#:    change's review measured GitHub's connection stopping at 250 commits while ``totalCount``
-#:    reported the full number (2026-11-23), so that comparison would red every larger pull request
-#:    with no way to clear it.
+#:    reports as a failed step. It does NOT compare the commits read with ``totalCount``: GitHub's
+#:    connection stops at 250 commits while ``totalCount`` reports the full number (the reading is
+#:    recorded once, in ``scripts/security/cla_precheck.py``), so that comparison would red every
+#:    larger pull request with no way to clear it. An author first seen past commit 250 is
+#:    therefore not checked.
 #:
 #: Every patched span carries a ``MessageFoundry patch`` comment, so a grep of the bundle finds all
 #: of them.
@@ -304,26 +305,43 @@ def revert_bundle_patches(body: bytes) -> bytes:
     a body carrying the patched text at the OTHER site would revert to the same upstream bytes, and
     the derivation would sign off on a patch applied somewhere it was never reviewed.
 
-    Raises :class:`ValueError` naming the patch, so a moved or edited hunk reads as that rather than
-    as a bare digest mismatch.
+    Raises :class:`ValueError` naming every bad patch, so a moved or edited hunk reads as that rather
+    than as a bare digest mismatch. :func:`verify_derivation` uses
+    :func:`revert_bundle_patches_reporting` instead, so the digest is still compared when a patch
+    is bad.
     """
-    for number, (_, patched) in enumerate(BUNDLE_PATCHES, start=1):
+    reverted, problems = revert_bundle_patches_reporting(body)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return reverted
+
+
+def revert_bundle_patches_reporting(body: bytes) -> tuple[bytes, list[str]]:
+    """Revert what can be reverted, and return it with EVERY problem found, not the first.
+
+    A patch whose patched span does not occur exactly once is left as it is, and the others are
+    still reverted. Stopping at the first bad patch would skip the digest comparison, so a second
+    change made beside the bad patch, anywhere else in the bundle, would go unreported until the
+    first was fixed: the hidden-second-change shape :func:`verify_derivation` accumulates against.
+    """
+    problems: list[str] = []
+    for number, (upstream, patched) in enumerate(BUNDLE_PATCHES, start=1):
         found = body.count(patched)
         if found != 1:
-            raise ValueError(
+            problems.append(
                 f"bundle patch {number} occurs {found} times in the vendored bundle, not once, so "
                 "the bundle is not the upstream blob with the recorded patches applied"
             )
-    for upstream, patched in BUNDLE_PATCHES:
+            continue
         body = body.replace(patched, upstream)
     for number, (upstream, _) in enumerate(BUNDLE_PATCHES, start=1):
         found = body.count(upstream)
         if found != 1:
-            raise ValueError(
+            problems.append(
                 f"bundle patch {number}'s upstream text occurs {found} times once the patches are "
                 "reverted, not once, so which site it patched is ambiguous"
             )
-    return body
+    return body, problems
 
 
 def unrecorded_files(root: Path) -> list[str]:
@@ -552,7 +570,8 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
             "dist/index.js is NOT the upstream bundle; it is a patched fork (owner ruling "
             "2026-11-23). BACKLOG #5644 item 2 anchors checkAllowList's wildcard pattern to the "
             "whole name. BACKLOG #5645 item 2 makes getCommitters follow GraphQL pagination past "
-            "the first 100 commits. The component's hashes entry is the patched file; the "
+            "the first 100 commits, up to GitHub's 250-commit stop; an author first seen past "
+            "commit 250 is not checked. The component's hashes entry is the patched file; the "
             "upstream bundle-sha256 property is the unpatched body. The component's pedigree "
             "names the upstream ancestor and lists the patches as unofficial.",
         ),
@@ -710,10 +729,14 @@ def verify_derivation(contents: dict[str, bytes]) -> list[str]:
     problems: list[str] = []
 
     try:
-        body = revert_bundle_patches(split_vendoring_header(contents[BUNDLE_PATH]))
+        patched_body = split_vendoring_header(contents[BUNDLE_PATH])
     except ValueError as exc:
         problems.append(str(exc))
     else:
+        # Every bad patch is reported, and the digest is compared whatever they found: any bad
+        # patch already fails the gate, and the digest is what names a change outside the patches.
+        body, patch_problems = revert_bundle_patches_reporting(patched_body)
+        problems += patch_problems
         body_sha = hashlib.sha256(body).hexdigest()
         if body_sha != UPSTREAM_BUNDLE_SHA256:
             problems.append(

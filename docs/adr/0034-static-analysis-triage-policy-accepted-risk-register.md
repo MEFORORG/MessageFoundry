@@ -482,7 +482,9 @@ one is an accepted residual.
 > It also carried one judgment the Contingency bullet does not: on a step holding a write token that
 > any GitHub user can trigger by comment, **trading a frozen vendored bundle for a less-reviewed fork
 > is not self-evidently a security win.** That weighs against the replacement candidate below and is
-> preserved here for the session that acts on it.
+> preserved here for the session that acts on it. *(Note 2026-11-23: the bundle is now a patched fork
+> of this same tag, made in this repository under the owner ruling of that date, not a third-party
+> fork; see the amendment of 2026-11-23 at the foot of this ADR.)*
 >
 > **THE NODE20 DEADLINE IS NOT PART OF THAT RETRACTION, and must not be read as carried away with it.**
 > Vendoring froze the bytes; it did not change what they declare. Re-verified in-tree 2026-09-21:
@@ -505,7 +507,9 @@ one is an accepted residual.
   SHA-pinned, not archived, and never what this finding was about.) **The fact the bullet reports is
   still true and is why the revisit bullet below bites:** upstream is archived (API `archived: true`,
   `archived_at: null`; last push 2026-03-23), v2.6.1 is the final release, and the vendored
-  `dist/index.js` is that tag's bundle — so there is no later patch to move to.
+  `dist/index.js` is that tag's bundle — so there is no later patch to move to. *(Since 2026-11-23
+  the vendored bundle is that tag's bundle with local patches applied here; see the amendment of
+  that date.)*
 * **Compensating control, and its limit. THE CONTROL IS RETRACTED 2026-09-21; ITS LIMIT IS NOT.** As
   written: the full-SHA pin closes tampering, because a bundled JS action's SHA fully determines the
   bytes that run and a vanished namespace fails the step rather than running someone else's code.
@@ -829,7 +833,9 @@ Node 24. Read the first post-merge `cla` run, and keep a revert ready.
 This deadline no longer needs the fork named in the 2026-08-01 Contingency. Vendoring made the
 runtime line ours to change. GitHub's own shim showed the bundle runs on Node 24. The Contingency's
 gates still apply if the action is ever replaced for another reason. The judgment recorded above
-also stands: a less-reviewed fork is not a security win over a frozen bundle.
+also stands: a less-reviewed fork is not a security win over a frozen bundle. *(Note 2026-11-23:
+the bundle is no longer frozen at the upstream bytes; it is patched in this repository. See the
+amendment of 2026-11-23.)*
 
 ## Amendment — 2026-09-27: accepted risk #5 is retired, because nothing writes the file any more (BACKLOG #1136)
 
@@ -904,3 +910,20 @@ start red.
 A name match is the false case only while the logged value carries no secret: a fixed sentence, a
 verdict literal, or an address list. A value read from a real credential reaching a log sink is
 real, whatever the source is called.
+
+## Amendment — 2026-11-23: the vendored CLA bundle is a patched fork (BACKLOG #5644, #5645)
+
+The owner ruled on 2026-11-23, choosing "Fork, patch, re-provenance", to patch the vendored
+`cla-assistant-lite` bundle in this repository rather than leave two defects in it. The entries
+above that call `dist/index.js` "that tag's bundle" or "a frozen bundle" describe it before this
+date, and are kept as the record of the earlier judgment: a less-reviewed THIRD-PARTY fork was not
+a security win. This is not that case. The patches are four small hand edits, reviewed in this
+repository, to the same v2.6.1 bundle:
+
+* `checkAllowList` anchors a wildcard allowlist entry to the whole name (BACKLOG #5644 item 2).
+* `getCommitters` follows GraphQL pagination past the first 100 commits (BACKLOG #5645 item 2).
+
+The bundle was not rebuilt. `scripts/security/build_cla_action_provenance.py` records the edits as
+`BUNDLE_PATCHES` and still derives the upstream digest offline by reverting them, so a change
+outside a recorded patch fails its gate. The action's README states what each patch does and its
+limits, including GitHub's 250-commit stop on a pull request's commit list.

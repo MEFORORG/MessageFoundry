@@ -116,7 +116,7 @@
         },
         {
           "name": "messagefoundry:vendored:bundle-local-change",
-          "value": "dist/index.js is NOT the upstream bundle; it is a patched fork (owner ruling 2026-11-23). BACKLOG #5644 item 2 anchors checkAllowList's wildcard pattern to the whole name. BACKLOG #5645 item 2 makes getCommitters follow GraphQL pagination past the first 100 commits. The component's hashes entry is the patched file; the upstream bundle-sha256 property is the unpatched body. The component's pedigree names the upstream ancestor and lists the patches as unofficial."
+          "value": "dist/index.js is NOT the upstream bundle; it is a patched fork (owner ruling 2026-11-23). BACKLOG #5644 item 2 anchors checkAllowList's wildcard pattern to the whole name. BACKLOG #5645 item 2 makes getCommitters follow GraphQL pagination past the first 100 commits, up to GitHub's 250-commit stop; an author first seen past commit 250 is not checked. The component's hashes entry is the patched file; the upstream bundle-sha256 property is the unpatched body. The component's pedigree names the upstream ancestor and lists the patches as unofficial."
         },
         {
           "name": "messagefoundry:vendored:action-yml-local-change",

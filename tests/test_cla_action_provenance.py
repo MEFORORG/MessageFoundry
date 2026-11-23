@@ -390,6 +390,25 @@ def test_the_gate_sees_a_reverted_patch(tree: Path, index: int) -> None:
     assert any(f"bundle patch {index + 1} occurs 0 times" in p for p in problems), problems
 
 
+def test_a_bad_patch_does_not_hide_a_second_change(tree: Path) -> None:
+    """Two bad patches AND an edit outside every patch are all reported in one run.
+
+    Before, the first bad patch raised, the digest comparison was skipped, and both the second bad
+    patch and the injected line went unreported until the first was fixed.
+    """
+    bundle = tree / provenance.BUNDLE_PATH
+    data = bundle.read_bytes()
+    for index in (0, 2):
+        upstream, patched = provenance.BUNDLE_PATCHES[index]
+        data = data.replace(patched, upstream)
+    bundle.write_bytes(data + b"\n// injected\n")
+
+    problems = provenance.check(tree)
+    assert any("bundle patch 1 occurs 0 times" in p for p in problems), problems
+    assert any("bundle patch 3 occurs 0 times" in p for p in problems), problems
+    assert any("does not reproduce the recorded upstream digest" in p for p in problems), problems
+
+
 def test_a_patch_moved_to_another_site_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     """The post-revert uniqueness check, which is what refuses a patch applied at a second site.
 
