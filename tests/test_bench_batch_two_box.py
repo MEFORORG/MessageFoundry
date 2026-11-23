@@ -764,7 +764,7 @@ async def test_a_stop_failure_after_a_failed_start_does_not_read_as_a_fault_bug_
     assert all((c.error or "").startswith("engine did not start") for c in report.cells)
     stop_notes = [n for n in report.notes if "stop" in n and "RuntimeError" in n]
     assert stop_notes
-    assert all("not a fault" in n and "STILL RUNNING" not in n for n in stop_notes)
+    assert all("not a cell fault" in n and "RUNNING" not in n for n in stop_notes)
     _assert_logged_by_type_only(report, caplog)
 
 
@@ -782,7 +782,7 @@ async def test_a_failed_start_that_left_a_live_process_says_so_bug_5857(
 
     stop_notes = [n for n in report.notes if "stop" in n and "RuntimeError" in n]
     assert stop_notes
-    assert all("STILL RUNNING" in n and "not a fault" not in n for n in stop_notes)
+    assert all("RUNNING" in n and "not a cell fault" not in n for n in stop_notes)
     _assert_logged_by_type_only(report, caplog)
 
 

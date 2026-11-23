@@ -967,8 +967,8 @@ class FuseModeComparison:
 
     @property
     def ok(self) -> bool:
-        """The correctness fold for the run's exit code: every present B1 arm held zero-loss and none
-        is missing. The GO/NO-GO throughput decision is reported separately and does NOT fail the run
+        """The correctness fold for the run's exit code: every present B1 arm held zero-loss, none
+        is missing, and no cell went unrun in both arms. The GO/NO-GO throughput decision is reported separately and does NOT fail the run
         (a null/negative fusion result banks nothing but is not an error, ADR 0071 §6.4b)."""
         return (
             bool(self.rows)
@@ -1128,7 +1128,7 @@ def build_fuse_comparison(
     ``(claim_mode, sweep_mode, count, arm)`` so >= 2 trials per arm feed the mean + spread, then pairs
     each B0 cell against its B1 arm and applies the ADR 0071 §6.4(b) guards. ``missing_detail`` maps a
     ``(claim_mode, sweep_mode, count)`` whose B1 arm never ran to a loud reason (surfaced on the missing
-    row).
+    row); a key with no record in either arm is reported in ``unrun_cells``.
 
     ``arm_of`` selects the boolean A/B discriminator (default the ``fuse_thread_hops`` tag); the
     statement-batching A/B (ADR 0075) passes ``batch_handoff_statements`` + the batch labels through

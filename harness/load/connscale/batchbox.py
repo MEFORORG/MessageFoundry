@@ -1059,17 +1059,19 @@ async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineRep
     a cell error: the cell's result is already decided by the time teardown runs (BACKLOG #5857).
 
     The note reads the process, not the code path: a cell that failed its health or port wait did
-    spawn an engine, which may still be running beside the next cell."""
+    spawn an engine. ``alive`` sees only the root process's last known state, so neither note
+    claims the whole process tree is gone."""
     try:
         await node.stop()
     except Exception as exc:
         kind = type(exc).__name__
         log.warning("batch cell %s: engine stop raised %s", cell_id, kind)
         report.notes.append(
-            f"CELL {cell_id}: engine stop raised {kind} and its process is STILL RUNNING"
+            f"CELL {cell_id}: engine stop raised {kind} and its root process still reads as "
+            "RUNNING; check that it exited"
             if node.alive
-            else f"CELL {cell_id}: cleanup stop raised {kind}; no engine process is running, "
-            "so this is not a fault"
+            else f"CELL {cell_id}: cleanup stop raised {kind}; its root process is not running, "
+            "so this is not a cell fault (child processes were not checked)"
         )
 
 
