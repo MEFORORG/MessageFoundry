@@ -2554,8 +2554,8 @@ def _is_generator(fn: _FunctionNode) -> bool:
 #: permission check written as a decorator), and a decorator the reading cannot name turns off the
 #: decorator comparison for that def, unless the other side's decorators it cannot name are the same
 #: ones (:meth:`_Reading.pair`). Two defs are still told apart by their outermost shape decorator
-#: where neither side has another decorator above it, except a passthrough one
-#: (:meth:`_Reading.outer_mismatch`).
+#: where neither side has another decorator above it, except a passthrough one, and that shape
+#: decorator fixes what the name is bound to (:func:`_outer_decorator`, :meth:`_Reading.outer_mismatch`).
 #: The class decorators here (a generated constructor)
 #: are resolved too, but no check compares a class's decorators (:func:`_scope_mismatch`).
 _SHAPE_DECORATORS: Final = frozenset(
@@ -2596,13 +2596,47 @@ _SHAPE_BUILTINS: Final = frozenset({"property", "staticmethod", "classmethod"})
 _ACCESSORS: Final = frozenset({"setter", "getter", "deleter"})
 #: The prefix of a binding's origin that names a MODULE rather than an object in one.
 _MODULE: Final = "module:"
-#: :attr:`_Reading.outer` for a decorator that resolved to nothing this screen can name, or to
-#: something that is neither a shape decorator nor in :data:`_PASSTHROUGH_DECORATORS`.
+#: :attr:`_Reading.outer` for a decorator :func:`_outer_decorator` cannot read a shape from.
 _UNNAMED: Final = "?"
-#: Decorators that hand back the object they are given, so :attr:`_Reading.outer` passes over them.
+#: Decorators that hand back the object they are given where they do not raise, so
+#: :attr:`_Reading.outer` passes over them. ``functools.wraps`` does so only once it is called.
 _PASSTHROUGH_DECORATORS: Final = frozenset(
-    {"functools.wraps", "abc.abstractmethod", "typing.final", "typing.override"}
+    {
+        "functools.wraps",
+        "abc.abstractmethod",
+        "typing.final",
+        "typing.override",
+        "typing_extensions.final",
+        "typing_extensions.override",
+    }
 )
+#: Decorators that may be called first, the call returning the decorator itself.
+_CALLED_DECORATORS: Final = frozenset({"functools.wraps", "functools.lru_cache", "pytest.fixture"})
+#: Shape decorators whose result hands each call on to what they wrap, so what is applied under
+#: them can decide what a call returns; :attr:`_Reading.outer` reads them as :data:`_UNNAMED`.
+_DELEGATING_DECORATORS: Final = frozenset(
+    {"functools.singledispatch", "functools.singledispatchmethod"}
+)
+
+
+def _outer_decorator(decorators: list[ast.expr], origins: list[str | None]) -> str | None:
+    """The outermost of `decorators` that is not a passthrough one (:data:`_PASSTHROUGH_DECORATORS`):
+    its origin if it is a shape decorator that fixes what the name is bound to, else
+    :data:`_UNNAMED`; ``None`` if there is none. A decorator called where it is not one of
+    :data:`_CALLED_DECORATORS`, or such a one left uncalled where only its call decorates
+    (``functools.wraps``), is read as :data:`_UNNAMED`."""
+    for decorator, origin in zip(decorators, origins, strict=True):
+        called = isinstance(decorator, ast.Call)
+        if origin is None or (called and origin not in _CALLED_DECORATORS):
+            return _UNNAMED
+        if origin == "functools.wraps" and not called:
+            return _UNNAMED
+        if origin in _PASSTHROUGH_DECORATORS:
+            continue
+        if origin in _SHAPE_DECORATORS and origin not in _DELEGATING_DECORATORS:
+            return origin
+        return _UNNAMED
+    return None
 
 
 @dataclass
@@ -2644,23 +2678,23 @@ class _Reading:
     decorators: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
     #: Each def's decorators that resolved to nothing, by :func:`_unknown_key`, sorted.
     unknown: dict[_DefNode, tuple[str, ...]] = field(default_factory=dict)
-    #: Each function def's outermost decorator that is not in :data:`_PASSTHROUGH_DECORATORS`: a
-    #: shape decorator, after :data:`_SAME_SHAPE`, or :data:`_UNNAMED`; ``None`` if it has none.
+    #: Each function def's outermost decorator that is not a passthrough one, by
+    #: :func:`_outer_decorator`.
     outer: dict[_DefNode, str | None] = field(default_factory=dict)
 
     def outer_mismatch(self, m: _DefNode, s: _DefNode) -> tuple[str | None, str | None] | None:
         """`m`'s and `s`'s :attr:`outer` decorators where they tell the two shapes apart, else
         ``None``.
 
-        They do where they are two different shape decorators, or a shape decorator and none: with
-        only passthrough decorators above it, the shape decorator applied last is what the name is
-        bound to the result of, whatever is applied under it. Any other decorator may make that
-        binding anything, so where one is outermost on either side this tells nothing, and
-        :meth:`pair` decides (BACKLOG #5590)."""
+        They do where they are two different shape decorators, after :data:`_SAME_SHAPE`, or a
+        shape decorator and none: with only passthrough decorators above it, the shape decorator
+        applied last is what the name is bound to the result of, whatever is applied under it. Any
+        other decorator may make that binding anything, so where one is outermost on either side
+        this tells nothing, and :meth:`pair` decides (BACKLOG #5590)."""
         if m not in self.outer or s not in self.outer:
             return None
         mo, so = self.outer[m], self.outer[s]
-        if mo == so or _UNNAMED in (mo, so):
+        if _SAME_SHAPE.get(mo or "", mo) == _SAME_SHAPE.get(so or "", so) or _UNNAMED in (mo, so):
             return None
         return mo, so
 
@@ -2899,14 +2933,7 @@ def _run_stmt(
             _SAME_SHAPE.get(origin, origin) for origin in origins if origin in _SHAPE_DECORATORS
         )
         if not isinstance(node, ast.ClassDef):
-            reading.outer[node] = next(
-                (
-                    _SAME_SHAPE.get(o, o) if o in _SHAPE_DECORATORS else _UNNAMED
-                    for o in origins
-                    if o not in _PASSTHROUGH_DECORATORS
-                ),
-                None,
-            )
+            reading.outer[node] = _outer_decorator(node.decorator_list, origins)
         if outer is None:  # a `global` anywhere inside binds a MODULE name, never a class member
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Global):
@@ -3251,8 +3278,13 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         real = src_sigs.get(name)
         if real is None:
             continue  # shadows no module-level function of that name; nothing to compare
-        mismatch = _node_mismatch(margs, real, name, a.mutation_path, reading, method=False)
-        if mismatch is not None:
+        # No outer rule here: the target's last def of a name may not be its live binding, and the
+        # second check, which knows, applies it.
+        mdecs, sdecs = reading.pair(margs, real)
+        mine = _signature(margs, mdecs)
+        theirs = _signature(real, sdecs)
+        if mine != theirs:
+            mismatch = _signature_clause(name, a.mutation_path, mine, theirs)
             break
     if mismatch is None and walked is not None:
         mismatch = _scope_mismatch(
