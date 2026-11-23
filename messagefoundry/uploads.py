@@ -60,7 +60,7 @@ from messagefoundry.controlchars import (
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
-from messagefoundry.path_reach import is_absent, is_unreachable
+from messagefoundry.path_reach import is_absent, is_name_absent, is_unreachable
 from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import (
@@ -306,25 +306,23 @@ def _not_a_plain_file(path: Path) -> str | None:
     return None
 
 
-_WINERROR_FILE_NOT_FOUND = 2
-
-
 def _sidecar_is_absent(sidecar: Path) -> bool:
     """Whether the file system says ``sidecar`` is not there; ``False`` when it is, in any form,
     since an ``lstat`` follows no link. Any failure to find out raises ``OSError`` (BACKLOG #6575).
-
-    ``FileNotFoundError`` alone does not say so on Windows, which also maps at least an unreachable
-    share (``ERROR_BAD_NETPATH``, ``ERROR_BAD_NET_NAME``) and a missing parent to it. Only
-    ``ERROR_FILE_NOT_FOUND`` (2) is the directory answering that it holds no such name. That is
-    why this is not :func:`~messagefoundry.path_reach.is_absent`, which counts a missing parent as
-    absence: here the answer authorises an unlink."""
+    The answer authorises an unlink, so it is :func:`~messagefoundry.path_reach.is_name_absent`'s."""
     try:
         os.lstat(sidecar)
     except FileNotFoundError as exc:
-        if getattr(exc, "winerror", None) in (None, _WINERROR_FILE_NOT_FOUND):
+        if is_name_absent(exc):
             return True
         raise
     return False
+
+
+def _root_out_of_reach(exc: OSError) -> bool:
+    """Whether a fault on one entry says the whole uploads root cannot be reached, so the sweep
+    should stop rather than go on to the next entry."""
+    return is_unreachable(exc) or (isinstance(exc, FileNotFoundError) and not is_name_absent(exc))
 
 
 def _names_a_link(info: os.stat_result) -> bool:
@@ -4238,9 +4236,12 @@ class UploadStore:
         **A read fault is never read as a missing sidecar (BACKLOG #6575).** The root is listed
         once, whole, before anything is removed. A root that is not there is an empty pass, and any
         other listing failure raises with nothing removed. A body the listing shows with no sidecar
-        goes only once :func:`_sidecar_is_absent`
-        confirms it, so a sidecar that landed after the listing keeps its body. Any other answer
-        from that check stops the pass where it is, logged at ERROR, and returns what it removed.
+        goes only once it is past the floor and :func:`_sidecar_is_absent`, asked right before the
+        unlink, says the sidecar is not there. That narrows the race with a sidecar landing after
+        the listing and does not close it: one can land between that check and the unlink, and a
+        network client's cache could answer the check from the listing's stale view. A fault on
+        one entry leaves that entry for the next pass. A fault saying the root is out of reach
+        stops the pass at ERROR, and it returns what it removed.
 
         **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
         in this process currently holds, and a held name is skipped outright, so the threshold never
@@ -4279,40 +4280,50 @@ class UploadStore:
             if stop.is_set():
                 break
             name = entry.name
-            if _is_inflight(name):
-                continue  # a write in this process is holding it right now
             stem = name[: -len(_BLOB_SUFFIX)] if name.endswith(_BLOB_SUFFIX) else ""
+            sidecar: Path | None = None
             if _ORPHAN_TMP_RE.match(name):
                 kind = "temp file"
             elif _FILE_ID_RE.match(stem):
-                sidecar = f"{stem}{_META_SUFFIX}"
-                if sidecar in names:
+                if f"{stem}{_META_SUFFIX}" in names:
                     continue
-                # The listing is a snapshot and a share can return a short one with no error, so
-                # only a direct answer that the sidecar is not there lets its body go.
-                try:
-                    if not _sidecar_is_absent(root / sidecar):
-                        continue
-                except OSError as exc:
-                    _log.error(
-                        "uploaded-logs orphan sweep stopped: could not check the sidecar of %s "
-                        "(%s); no further file was removed and the next pass retries",
-                        stem,
-                        exc.strerror or type(exc).__name__,
-                    )
-                    break
+                sidecar = root / f"{stem}{_META_SUFFIX}"
                 kind = "body with no sidecar"
             else:
                 continue  # not one of ours — never touched
+            if _is_inflight(name):
+                continue  # a write in this process is holding it right now
             try:
                 if entry.stat().st_mtime > cutoff:
                     continue  # too young to be certain it is abandoned
+                # The listing is a snapshot and a share can return a short one with no error, so
+                # ask again, last, before the unlink.
+                if sidecar is not None and not _sidecar_is_absent(sidecar):
+                    continue
                 entry.unlink()
             except OSError as exc:
+                if _root_out_of_reach(exc):
+                    if self._link_logged.first("orphan sweep stopped"):
+                        _log.error(
+                            "uploaded-logs orphan sweep stopped at %s: the uploads root could not "
+                            "be reached (%s); no further file was removed and the next pass retries",
+                            name,
+                            exc.strerror or type(exc).__name__,
+                        )
+                    break
                 # Already gone (a sibling shard's sweep), held open by another process, or not a file
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
-                # a random tag, never a body.
-                _log.debug("uploaded-logs orphan sweep left %s alone: %s", name, exc)
+                # a random tag, never a body. Anything but "already gone" is named once an interval,
+                # since a body whose sidecar cannot be checked stays until someone looks.
+                quiet = isinstance(exc, FileNotFoundError) or not self._link_logged.first(
+                    f"orphan sweep {name}"
+                )
+                _log.log(
+                    logging.DEBUG if quiet else logging.WARNING,
+                    "uploaded-logs orphan sweep left %s alone: %s",
+                    name,
+                    exc.strerror or type(exc).__name__,
+                )
                 continue
             removed += 1
             # ASCII only in the message itself: a stock Windows cp1252 console raises

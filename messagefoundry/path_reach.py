@@ -47,3 +47,11 @@ def is_unreachable(exc: OSError) -> bool:
 def is_absent(exc: OSError) -> bool:
     """Whether ``exc`` says nothing is at the path, as against saying the path cannot be reached."""
     return isinstance(exc, FileNotFoundError) and not is_unreachable(exc)
+
+
+def is_name_absent(exc: OSError) -> bool:
+    """:func:`is_absent`, narrowed for a caller that deletes on the answer: the parent directory
+    answered and holds no such name. On Windows only ERROR_FILE_NOT_FOUND (2) says that, so a
+    missing parent (3) or drive (15) is not absence here. POSIX has one ENOENT for both, so there
+    this cannot tell a missing name from a missing parent."""
+    return isinstance(exc, FileNotFoundError) and getattr(exc, "winerror", None) in (None, 2)

@@ -15,6 +15,7 @@ the one that matters — a write that is happening right now all have to survive
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import secrets
@@ -216,8 +217,8 @@ async def test_the_sweep_never_unlinks_a_file_that_is_not_ours(tmp_path: Path, n
 
 
 async def test_a_body_whose_sidecar_will_not_decrypt_is_kept(tmp_path: Path) -> None:
-    """A rotated-away key must not let this pass destroy a live pair. ``_iter_sidecars`` yields a
-    sidecar WITHOUT opening it, so an undecryptable one still makes its body reachable."""
+    """A rotated-away key must not let this pass destroy a live pair. The sweep checks a sidecar's
+    NAME without opening it, so an undecryptable one still makes its body reachable."""
     store = _store(tmp_path)
     root = tmp_path / "uploads"
     meta = await store.save(data=_TXT, filename="a.txt", uploader="op", uploader_id="u1")
@@ -389,6 +390,8 @@ async def test_a_transient_stat_failure_does_not_read_as_no_sidecars(
     assert store._sweep_orphans_sync(now=time.time()) == 1
     assert live.exists(), "a body with a sidecar was removed"
     assert not orphan.exists(), "the real orphan was not removed"
+    if flaky:
+        assert checks == 0, "the sweep asked a check that swallows a read fault"
 
 
 @pytest.mark.parametrize("partway", [False, True], ids=["at-the-call", "partway-through"])
@@ -494,17 +497,84 @@ async def test_a_sidecar_the_listing_did_not_show_keeps_its_body(
     assert body.exists()
 
 
+async def test_a_sidecar_landing_during_the_age_check_keeps_its_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar check is the last read before the unlink, so the age check is not a gap."""
+    store = _store(tmp_path)
+    body = _aged_orphan(store)
+    sidecar = body.with_suffix(_META_SUFFIX)
+    real = Path.stat
+
+    def _lands_during_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        result = real(self, follow_symlinks=follow_symlinks)
+        if self == body:
+            sidecar.write_text("landed", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "stat", _lands_during_stat)
+    assert store._sweep_orphans_sync(now=time.time()) == 0
+    assert body.exists()
+
+
+async def test_a_fault_on_one_sidecar_leaves_only_that_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lasting fault on one name must not stop the sweep at that name on every pass, or nothing
+    listed after it would ever be reclaimed. Its body stays, and it is named once an interval."""
+    store = _store(tmp_path)
+    bodies = [_aged_orphan(store) for _ in range(3)]
+    denied = bodies[0].with_suffix(_META_SUFFIX).name
+    real = os.lstat
+
+    def _one_sidecar_denied(path: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path).name == denied:
+            raise PermissionError(13, "Permission denied")
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _one_sidecar_denied)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert store._sweep_orphans_sync(now=time.time()) == 2
+        assert store._sweep_orphans_sync(now=time.time()) == 0
+
+    assert [body.exists() for body in bodies] == [True, False, False]
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+    named = [r for r in caplog.records if "left" in r.getMessage()]
+    assert len(named) == 1 and bodies[0].name in named[0].getMessage()
+    assert _ORPHAN_TEXT not in caplog.text
+
+
+async def test_a_young_body_with_a_faulting_sidecar_costs_the_pass_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body under the floor is not a removal candidate, so its sidecar is never asked about."""
+    store = _store(tmp_path)
+    aged = _aged_orphan(store)
+    young = _aged_orphan(store)
+    _backdate(young, seconds=_ORPHAN_MIN_AGE_SECONDS / 2)
+    young_sidecar = young.with_suffix(_META_SUFFIX).name
+    real = os.lstat
+
+    def _young_sidecar_faults(path: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path).name == young_sidecar:
+            raise OSError(errno.ESTALE, "Stale file handle")
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _young_sidecar_faults)
+    assert store._sweep_orphans_sync(now=time.time()) == 1
+    assert young.exists() and not aged.exists()
+
+
 @pytest.mark.parametrize(
     "fault",
     [
-        lambda: PermissionError(13, "Permission denied"),
-        lambda: OSError(116, "Stale file handle"),
+        lambda: OSError(errno.ESTALE, "Stale file handle"),
         lambda: _win_not_found(53),
         lambda: _win_not_found(3),
     ],
-    ids=["denied", "stale-handle", "unreachable-share", "missing-parent"],
+    ids=["stale-handle", "unreachable-share", "missing-parent"],
 )
-async def test_a_sidecar_stat_fault_stops_the_sweep(
+async def test_a_root_out_of_reach_stops_the_sweep(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
