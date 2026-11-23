@@ -125,7 +125,16 @@ def run_contexts(context: RunContext, *, phase: str) -> Iterator[None]:
     Replaces the hand-written ``with (activated(...), …)`` tuples the router worker, transform worker,
     and dry-run path each used. Enters via one :class:`~contextlib.ExitStack`, so providers nest in
     registration order and unwind cleanly (each accessor's prior view restored) on exit — including on
-    an exception raised inside the body."""
+    an exception raised inside the body.
+
+    An unknown ``phase`` raises :class:`ValueError` (BACKLOG #5780): every provider is tagged with
+    phases from ``_PHASES``, so any other string would silently activate none of them, and a run would
+    read every accessor as unset. A dispatch-level phase such as ``"accepts"`` is not a run phase; the
+    caller maps it first, as the sandbox worker maps it to ``"router"``."""
+    if phase not in _PHASES:
+        raise ValueError(
+            f"run_contexts: unknown phase {phase!r}; expected one of {sorted(_PHASES)}"
+        )
     with ExitStack() as stack:
         for _name, provider, phases in _providers:
             if phase in phases:

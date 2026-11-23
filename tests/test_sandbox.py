@@ -1183,14 +1183,24 @@ def test_code_sets_reach_the_child_without_travelling_per_dispatch() -> None:
 
 def _codeset_graph(tmp_path: Path, mapped: str) -> Registry:
     (tmp_path / "codesets").mkdir(exist_ok=True)
-    (tmp_path / "codesets" / "cs.csv").write_text(f"key,value\nA,{mapped}\n", encoding="utf-8")
+    (tmp_path / "codesets" / "cs.csv").write_text(f"key,value\nA,{mapped}\nR,h\n", encoding="utf-8")
     (tmp_path / "graph.py").write_text(
         "from messagefoundry import inbound, outbound, router, handler, MLLP, Send, code_set\n"
         'inbound("IB_C", MLLP(port=19331), router="r")\n'
+        'inbound("IB_C_GEN", MLLP(port=19333), router="r_gen_cs")\n'
+        'inbound("IB_C_MISS", MLLP(port=19334), router="r_gen_missing")\n'
         'outbound("OB_C", MLLP(host="127.0.0.1", port=19332))\n'
         '@router("r")\n'
         "def r(msg):\n"
         '    return "h"\n'
+        '@router("r_gen_cs")\n'
+        "def r_gen_cs(msg):\n"
+        "    # A GENERATOR Router whose body reads a run-scoped provider (BACKLOG #5780).\n"
+        '    yield code_set("cs")["R"]\n'
+        '@router("r_gen_missing")\n'
+        "def r_gen_missing(msg):\n"
+        "    # A GENERATOR Router whose body raises a code_set error (BACKLOG #5780).\n"
+        '    yield code_set("no_such_set")["R"]\n'
         '@handler("h")\n'
         "def h(msg):\n"
         '    return Send("OB_C", code_set("cs")["A"])\n'
@@ -1243,6 +1253,41 @@ def test_a_generator_handlers_body_runs_inside_the_childs_run_context(tmp_path: 
     with run_contexts(rc, phase="transform"):
         off, _, _, _ = transform_one(registry, "h_gen_cs", RAW, run_context=rc)
     assert [(d.to, d.payload) for d in ds] == [(d.to, d.payload) for d in off]
+
+
+def test_a_generator_routers_body_runs_inside_the_childs_run_context(tmp_path: Path) -> None:
+    """BACKLOG #5780: a generator Router's body runs when something iterates it. The child must do
+    that inside ``with run_contexts(...)`` and inside its exception arms, as ``mode=off`` does.
+
+    Outside the context, a ``code_set(...)`` read in the body resolves nothing under
+    ``mode=subprocess`` while it works under ``mode=off``. Outside the arms, a code_set error raised
+    in the body escapes and ends the worker, so the message reads as a crash and the next dispatch
+    pays a respawn. Both halves run against one worker."""
+    registry = _codeset_graph(tmp_path, "MAPPED")
+    gen_ic = registry.inbound["IB_C_GEN"]
+    miss_ic = registry.inbound["IB_C_MISS"]
+    rc = RunContext(code_sets=registry.code_sets)
+    with run_contexts(rc, phase="router"):
+        off = route_only(registry, gen_ic, RAW, run_context=rc)
+        with pytest.raises(Exception, match="no_such_set"):
+            route_only(registry, miss_ic, RAW, run_context=rc)
+    assert off == ["h"]
+    session = _session(str(tmp_path), inbound="IB_C_GEN", code_sets=registry.code_sets)
+    try:
+        assert route_only(registry, gen_ic, RAW, sandbox=session, run_context=rc) == off
+        proc = session._proc
+        assert proc is not None and proc.poll() is None
+        pid = proc.pid
+        with pytest.raises(
+            SandboxError, match=r"sandbox failed router 'r_gen_missing'.*no_such_set"
+        ):
+            route_only(registry, miss_ic, RAW, sandbox=session, run_context=rc)
+        # The worker answered with the Router's error; it did not die, and it serves the next one.
+        assert session._proc is proc and proc.poll() is None
+        assert route_only(registry, gen_ic, RAW, sandbox=session, run_context=rc) == off
+        assert session._proc is not None and session._proc.pid == pid
+    finally:
+        session.close()
 
 
 def test_an_unreloaded_codeset_edit_does_not_brick_the_inbound(tmp_path: Path) -> None:
