@@ -2242,16 +2242,15 @@ class FhirLookupExecutor:
             knob="timeout_seconds",
             transport=f"FhirLookup {cname!r}",
         )
+        # ASVS 4.2.5: the lookup's static url and headers are bounded at construction, as the
+        # destination's are. Before this gate was added here, they were unbounded on both sides.
+        _bounded_lookup_request(url, headers, label)
         # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
         # Validated like the DB lookups': a flag written into this mutable dict without its
         # reason is refused here rather than crossing unexplained.
         # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
         # arrives in these settings, mirrored from the spec's typed fields by
         # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
-        # ASVS 4.2.5: this executor never called the construction gate at all -- fhir.py's only
-        # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
-        # headers were unbounded on both sides.
-        _bounded_lookup_request(url, headers, label)
         # Vault BACKLOG #3139: a refusal from either reader names the lookup, as the url checks do.
         try:
             attested = hop_attestation_from_settings(s)

@@ -259,3 +259,6 @@ def test_a_lookup_refusal_survives_the_credential_scrubber(over: dict[str, Any],
     text = str(ei.value)
     assert text.startswith(f"connection 'fhir_lookup:{name}'; ")
     assert scrub_credentials(text) == text
+    # The control: the scrubber does redact the shape these refusals used before.
+    old = f"FhirLookup '{name}': basic_user and basic_password must be set together"
+    assert scrub_credentials(old) != old
