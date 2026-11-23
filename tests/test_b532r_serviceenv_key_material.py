@@ -561,23 +561,6 @@ _PLAIN = "Parameters\\AppEnvironment"
             ],
             id="joined-lower-case-path",
         ),
-        pytest.param(
-            [
-                (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\real"),
-                (_EXTRA, "MEFOR_VALUE_A="),
-                (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
-            ],
-            id="joined-equals-beside-a-listed-one",
-        ),
-        pytest.param(
-            [
-                (_PLAIN, "MEFOR_VALUE_A=synthetic"),
-                (_PLAIN, "MEFOR_VALUE_A="),
-                (_PLAIN, " MEFOR_SECRETS_DIRECTORY=="),
-                ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\real"),
-            ],
-            id="joined-padded-beside-the-scm-one",
-        ),
         # Review round 2 on the repair: the only directory entry is in AppEnvironment, so the
         # step says to add the one it keeps to AppEnvironmentExtra.
         pytest.param(
@@ -607,3 +590,67 @@ def test_a_joined_directory_entry_keeps_one_entry_and_spares_it_from_removal(
     assert "Keep any of them that sets" not in refusal
     assert refusal.index(REMOVE_SPARING) < refusal.index(RUNS_ON_SPARING) < refusal.index(KEEP)
     assert "synthetic" not in refusal and "C:\\other" not in refusal
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # The hold's scenario: the joined entry's value is key-shaped, not a path.
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\x"),
+                (_EXTRA, f"{_KEY}="),
+                (_EXTRA, f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"),
+            ],
+            id="joined-key-text-beside-a-listed-path",
+        ),
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+                (_EXTRA, "MEFOR_VALUE_A="),
+                (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
+            ],
+            id="joined-equals-beside-a-listed-one",
+        ),
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_VALUE_A=synthetic"),
+                (_PLAIN, "MEFOR_VALUE_A="),
+                (_PLAIN, " MEFOR_SECRETS_DIRECTORY=="),
+                ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+            ],
+            id="joined-padded-beside-the-scm-one",
+        ),
+    ],
+)
+def test_a_joined_directory_entry_that_is_not_plainly_a_path_is_removed_with_the_value(
+    entries: list[tuple[str, str]],
+) -> None:
+    """The Lander's hold on PR 3142, comment 7104660861, item 1. A joined directory entry whose
+    value is not plainly a path may hold key material, so, as at b1d44693cae, no step spares or
+    keeps it: the removal and run-on steps take it out with the value, and the directory entry
+    the service lists elsewhere stays the one the engine reads. The control, the same lists with
+    a joined path, still keeps one entry."""
+    posture = read_service_env_posture(probe=_Probe(entries), environ={})
+    assert not posture.directory_path_joined and posture.directory_joined
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert KEEP not in refusal and "a step below covers" not in refusal
+    assert REMOVE in refusal and RUNS_ON in refusal
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
+    assert ADD_BACK_JOINED not in refusal and SET_NO not in refusal
+    assert _KEY_B64 not in refusal and "C:\\x" not in refusal
+    control = service_env_refusal(
+        read_service_env_posture(
+            probe=_Probe(
+                [
+                    (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\x"),
+                    (_EXTRA, f"{_KEY}="),
+                    (_EXTRA, "mefor_secrets_directory=C:\\y"),
+                ]
+            ),
+            environ={},
+        )
+    )
+    assert control is not None and control.endswith(f"{KEEP}{_END}"), control
+    assert REMOVE_SPARING in control

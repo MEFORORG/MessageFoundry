@@ -618,10 +618,10 @@ def test_an_empty_value_beside_a_listed_directory_path_is_told_to_go_and_not_to_
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
-    """A joined ``==`` directory entry in AppEnvironmentExtra overrides the AppEnvironment one,
-    so the remedy keeps one entry, rewritten to the path, and the removal steps spare the
-    directory lines it covers (the Lander's hold on PR 3142, comment 7100710066, items 5 and
-    8)."""
+    """A joined ``==`` directory entry in AppEnvironmentExtra would override the AppEnvironment
+    one. It is not plainly a path, so no step keeps or spares it: the removal and run-on steps
+    take it out with the value, and the AppEnvironment entry stays the one the engine reads (the
+    Lander's hold on PR 3142, comment 7104660861, item 1)."""
     posture = _read_pairs(
         [
             (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\synthetic-secrets"),
@@ -632,8 +632,8 @@ def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE_SPARING in refusal and RUNS_ON_SPARING in refusal and CREATE not in refusal
-    assert refusal.endswith(f'{KEEP}. [security].enforcement = "warn" does not change this refusal')
+    assert REMOVE in refusal and RUNS_ON in refusal and CREATE not in refusal
+    assert KEEP not in refusal and "naming that existing path back" not in refusal
 
 
 def test_a_directory_joined_to_an_empty_pem_key_is_removed_with_it() -> None:
