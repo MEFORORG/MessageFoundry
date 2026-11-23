@@ -93,6 +93,7 @@ from messagefoundry.config.models import (
     Source,
     bool_setting,
     check_db_connect_timeout,
+    flag_from_settings,
     hop_attestation_from_settings,
     whole_seconds,
 )
@@ -308,7 +309,8 @@ def _build_dsn(
             f"{where}DATABASE server names no host; name the host to connect to"
         )
     encrypt = bool_setting(s, "encrypt", default=True)
-    trust = bool(s.get("trust_server_certificate", False))
+    # Strict: bool("false") is True, which sent TrustServerCertificate=yes (vault BACKLOG #3234).
+    trust = flag_from_settings(s, "trust_server_certificate")
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
             f"{where}DATABASE connection TLS is weakened "
@@ -2286,7 +2288,7 @@ def _build_connection(
     only, since the SQL Server preset refuses rather than warns."""
     dialect = str(s.get("dialect", "sqlserver")).lower()
     if dialect == "sqlserver":
-        weakened = bool(s.get("trust_server_certificate", False)) or not bool_setting(
+        weakened = flag_from_settings(s, "trust_server_certificate") or not bool_setting(
             s, "encrypt", default=True
         )
         return (

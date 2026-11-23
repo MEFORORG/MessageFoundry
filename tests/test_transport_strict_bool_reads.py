@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The DICOM connectors read ``tls`` strictly, and the DICOM, FHIR, SOAP and FTPS reads of
-``tls_allow_expired`` are strict too (vault BACKLOG #3234 added step 8).
+"""The DICOM and MLLP connectors read ``tls`` strictly, the DICOM, FHIR, SOAP, FTPS, MLLP and REST
+reads of ``tls_allow_expired`` are strict too, and so are the DATABASE reads of
+``trust_server_certificate`` (vault BACKLOG #3234, added step 8 and the remainder after it).
 
 The load and the runner's builds (``_source_config``, ``_dest_config``) refuse a non-bool literal
 on a boolean setting. A connector constructed directly from a ``Source`` or ``Destination``, as
@@ -18,11 +19,15 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import skips_validity_period
+from messagefoundry.transports import database as database_module
 from messagefoundry.transports import dicom as dicom_module
 from messagefoundry.transports import fhir as fhir_module
+from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports import remotefile as remotefile_module
+from messagefoundry.transports import rest as rest_module
 from messagefoundry.transports import soap as soap_module
 from messagefoundry.transports.fhir import FhirDestination
+from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.soap import SoapDestination
 
 _REFUSED = "tls_allow_expired must be true or false, not str"
@@ -263,3 +268,149 @@ def test_ftps_revocation_guard_reads_a_real_bool_tls_allow_expired(
         connection="OB_FTPS",
     )
     assert seen == [value]
+
+
+# Vault BACKLOG #3234's remainder after engine PRs 3169 and 3176: MLLP ``tls`` and
+# ``tls_allow_expired``, REST ``tls_allow_expired`` and DATABASE ``trust_server_certificate``. Each
+# was read with ``bool(...)`` or by truthiness, so ``"false"`` switched MLLP TLS on, relaxed an MLLP
+# or REST expiry check, or sent ``TrustServerCertificate=yes``. A real ``bool`` reads as before.
+
+
+@pytest.mark.parametrize("value", _NON_BOOLS)
+@pytest.mark.parametrize("server", [True, False])
+def test_mllp_context_refuses_a_non_bool_tls(value: Any, server: bool) -> None:
+    with pytest.raises(ValueError, match=_refusal(value, "tls")):
+        mllp_module._mllp_ssl_context({"host": "127.0.0.1", "tls": value}, server=server)
+
+
+@pytest.mark.parametrize("value", [0, ""])
+@pytest.mark.parametrize("server", [True, False])
+def test_mllp_context_refuses_a_falsy_non_bool_tls_before_the_pin_check(
+    value: Any, server: bool
+) -> None:
+    # The pin check reads tls by truthiness, and would name an unread pin instead.
+    pinned = {"host": "127.0.0.1", "tls": value, "tls_ca_file": "x.pem", "tls_ca_pin": "a" * 64}
+    with pytest.raises(ValueError, match=_refusal(value, "tls")):
+        mllp_module._mllp_ssl_context(pinned, server=server)
+
+
+def test_mllp_context_reads_a_real_bool_tls() -> None:
+    assert mllp_module._mllp_ssl_context({"host": "127.0.0.1", "tls": False}, server=False) is None
+    assert mllp_module._mllp_ssl_context({"tls": False}, server=True) is None
+    assert mllp_module._mllp_ssl_context({"host": "127.0.0.1"}, server=False) is None
+    assert mllp_module._mllp_ssl_context({"host": "127.0.0.1", "tls": True}, server=False)
+    with pytest.raises(ValueError, match="requires tls_cert_file"):
+        mllp_module._mllp_ssl_context({"tls": True}, server=True)
+
+
+@pytest.mark.parametrize("value", _NON_BOOLS)
+def test_mllp_destination_refuses_a_non_bool_tls_allow_expired(value: Any) -> None:
+    with pytest.raises(ValueError, match=_refusal(value)):
+        mllp_module._mllp_ssl_context(
+            {"host": "127.0.0.1", "tls": True, "tls_allow_expired": value}, server=False
+        )
+
+
+def test_mllp_destination_refuses_a_non_bool_tls_allow_expired_with_tls_off() -> None:
+    # The tls-off return never read the setting, so it passed unseen there.
+    with pytest.raises(ValueError, match=_REFUSED):
+        mllp_module._mllp_ssl_context(
+            {"host": "127.0.0.1", "tls": False, "tls_allow_expired": "false"}, server=False
+        )
+
+
+@pytest.mark.parametrize(("value", "relaxed"), [(True, True), (False, False), (None, False)])
+def test_mllp_destination_reads_a_real_bool_tls_allow_expired(
+    value: bool | None, relaxed: bool
+) -> None:
+    ctx = mllp_module._mllp_ssl_context(
+        {"host": "127.0.0.1", "tls": True, "tls_allow_expired": value}, server=False
+    )
+    assert ctx is not None
+    assert skips_validity_period(ctx) is relaxed
+
+
+def _rest(**settings: Any) -> RestDestination:
+    return RestDestination(
+        Destination(
+            name="OB_REST",
+            type=ConnectorType.REST,
+            settings={"url": "https://127.0.0.1/api", **settings},
+        )
+    )
+
+
+@pytest.mark.parametrize("value", _NON_BOOLS)
+def test_rest_refuses_a_non_bool_tls_allow_expired(value: Any) -> None:
+    with pytest.raises(ValueError, match=_refusal(value)):
+        _rest(tls_allow_expired=value)
+
+
+def test_rest_refuses_a_non_bool_tls_allow_expired_with_verify_off() -> None:
+    # The verify-off branch never read the setting, so it passed unseen there.
+    with pytest.raises(ValueError, match=_REFUSED):
+        _rest(tls_allow_expired="false", verify_tls=False)
+
+
+def test_rest_refuses_a_non_bool_tls_allow_expired_before_its_url_check() -> None:
+    # Read first, so a build it refuses reaches no hop guard that could log a crossing.
+    with pytest.raises(ValueError, match=_REFUSED):
+        RestDestination(
+            Destination(
+                name="OB_REST", type=ConnectorType.REST, settings={"tls_allow_expired": "false"}
+            )
+        )
+
+
+@pytest.mark.parametrize(("value", "relaxed"), [(True, True), (False, False), (None, False)])
+def test_rest_reads_a_real_bool_tls_allow_expired(
+    monkeypatch: pytest.MonkeyPatch, value: bool | None, relaxed: bool
+) -> None:
+    seen = _spy_expiry_relaxed(monkeypatch, rest_module)
+    built: list[bool] = []
+    real = rest_module._expiry_relaxed_opener
+
+    def spy_opener(*args: Any, **kwargs: Any) -> Any:
+        built.append(True)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rest_module, "_expiry_relaxed_opener", spy_opener)
+    _rest(tls_allow_expired=value)
+    assert seen == [relaxed]
+    assert built == ([True] if relaxed else [])
+
+
+_SQLSERVER: dict[str, Any] = {"server": "db.example.org", "database": "d"}
+
+
+@pytest.mark.parametrize("value", _NON_BOOLS)
+@pytest.mark.parametrize("attested", [True, False])
+def test_database_dsn_refuses_a_non_bool_trust_server_certificate(
+    value: Any, attested: bool
+) -> None:
+    # Attested, "false" built TrustServerCertificate=yes; unattested, it was refused as a weakened
+    # hop, which names the wrong fault.
+    with pytest.raises(ValueError, match=_refusal(value, "trust_server_certificate")):
+        database_module._build_dsn(
+            {**_SQLSERVER, "trust_server_certificate": value}, attested=attested
+        )
+
+
+@pytest.mark.parametrize("value", _NON_BOOLS)
+def test_database_connection_refuses_a_non_bool_trust_server_certificate(value: Any) -> None:
+    # _build_connection reads the flag for its weakened report before _build_dsn reads it.
+    with pytest.raises(ValueError, match=_refusal(value, "trust_server_certificate")):
+        database_module._build_connection(
+            {**_SQLSERVER, "trust_server_certificate": value}, attested=True
+        )
+
+
+@pytest.mark.parametrize(("value", "trusted"), [(True, True), (False, False), (None, False)])
+def test_database_reads_a_real_bool_trust_server_certificate(
+    value: bool | None, trusted: bool
+) -> None:
+    dsn, weakened = database_module._build_connection(
+        {**_SQLSERVER, "trust_server_certificate": value}, attested=True
+    )
+    assert weakened is trusted
+    assert f"TrustServerCertificate={'yes' if trusted else 'no'}" in dsn
