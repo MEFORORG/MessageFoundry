@@ -15,6 +15,7 @@ required, non-optional reference for the same reason."""
 
 from __future__ import annotations
 
+import copy
 import functools
 import os
 import re
@@ -111,12 +112,28 @@ def test_a_gated_engine_requires_the_operators_attestation(service: str) -> None
 # --- a value the engine reads as false (BACKLOG #5400 item 3) ------------------------------------
 
 _CHECK = "revocation-attestation-check"
+_CHECK_HA = "revocation-attestation-check-ha"
 
 
 def _check_argv() -> list[str]:
     """The check service's argv after the image's interpreter, to run with this interpreter."""
     entry = [str(a) for a in _all_services()[_CHECK]["entrypoint"]]
     return entry[entry.index("/opt/venv/bin/python") + 1 :]
+
+
+def _checks() -> dict[str, dict[str, Any]]:
+    """Every attestation check service: the default one and each image's variant of it."""
+    return {n: s for n, s in _all_services().items() if n == _CHECK or n.startswith(_CHECK + "-")}
+
+
+def _gating_checks(svc: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The attestation checks ``svc`` waits on to complete successfully before it starts."""
+    deps = svc.get("depends_on") or {}
+    return {
+        n: c
+        for n, c in _checks().items()
+        if (deps.get(n) or {}).get("condition") == "service_completed_successfully"
+    }
 
 
 @pytest.mark.parametrize("service", sorted(_serving_engines()))
@@ -126,25 +143,126 @@ def test_a_gated_engine_waits_on_the_attestation_check(service: str) -> None:
     svc = _serving_engines()[service]
     if not _gated(svc):
         pytest.skip(f"{service} does not bind in-process TLS off loopback")
-    dep = (svc.get("depends_on") or {}).get(_CHECK)
-    assert dep == {"condition": "service_completed_successfully"}, (
-        f"{service} does not wait on {_CHECK}, so a false attestation restarts it forever"
+    assert _gating_checks(svc), (
+        f"{service} waits on no attestation check, so a false attestation restarts it forever"
     )
 
 
-def test_the_check_reads_the_same_required_value_and_never_restarts() -> None:
-    check = _all_services()[_CHECK]
+def test_the_compose_file_has_both_checks() -> None:
+    # Positive control: the default engine and the ha pair each wait on their own image's check.
+    assert set(_checks()) == {_CHECK, _CHECK_HA}
+    engines = _serving_engines()
+    assert set(_gating_checks(engines["engine"])) == {_CHECK}
+    assert set(_gating_checks(engines["engine-ha"])) == {_CHECK_HA}
+    assert set(_gating_checks(engines["engine-standby"])) == {_CHECK_HA}
+
+
+@pytest.mark.parametrize("name", sorted(_checks()))
+def test_each_check_reads_the_same_required_value_and_never_restarts(name: str) -> None:
+    check = _checks()[name]
     assert _REQUIRED.match(str(_env(check).get(TLS_REVOCATION_ATTESTED_ENV)))
     assert str(check.get("restart")) == "no"
-    assert not check.get("profiles"), "a profiled check would not run for every engine"
+    assert check.get("network_mode") == "none"
+    assert check.get("healthcheck") == {"disable": True}
+    assert check.get("read_only") is True
+    assert check.get("cap_drop") == ["ALL"]
+    assert "no-new-privileges:true" in (check.get("security_opt") or [])
+    # The command test below runs only the default check's text; every variant must run that text.
+    assert check.get("entrypoint") == _all_services()[_CHECK]["entrypoint"], name
 
 
-def test_the_check_runs_the_engines_image() -> None:
+def test_the_default_check_has_no_profile() -> None:
+    assert not _all_services()[_CHECK].get("profiles"), (
+        "a profiled check would not run for the default engine"
+    )
+
+
+@pytest.mark.parametrize("service", sorted(_serving_engines()))
+def test_the_check_runs_the_engines_image(service: str) -> None:
     # A check in another image would read the value with another version's parser, or fail to
-    # pull an image the operator never built.
-    image = _all_services()[_CHECK]["image"]
-    for name, svc in _serving_engines().items():
-        assert svc["image"] == image, f"{name} runs {svc['image']!r}, the check {image!r}"
+    # pull an image the operator never built. So every check an engine waits on runs its image,
+    # and is active whenever the engine is: unprofiled, or under every profile the engine has.
+    svc = _serving_engines()[service]
+    checks = _gating_checks(svc)
+    if not checks:
+        pytest.skip(f"{service} waits on no attestation check")
+    engine_profiles = set(svc.get("profiles") or [])
+    for name, check in checks.items():
+        assert check["image"] == svc["image"], (
+            f"{service} runs {svc['image']!r}, the check {name} {check['image']!r}"
+        )
+        check_profiles = set(check.get("profiles") or [])
+        assert not check_profiles or (engine_profiles and engine_profiles <= check_profiles), (
+            f"{service} is active under {sorted(engine_profiles) or 'every profile'}, "
+            f"{name} only under {sorted(check_profiles)}"
+        )
+
+
+@pytest.mark.parametrize("name", sorted(_checks()))
+def test_each_check_is_active_only_where_an_engine_it_gates_is(name: str) -> None:
+    # A check active more widely than the engines that wait on it pulls their image for nobody:
+    # an unprofiled check in the postgres image would fail a plain `up` for a default-only user.
+    check_profiles = set(_checks()[name].get("profiles") or [])
+    gated = [s for s in _serving_engines().values() if name in _gating_checks(s)]
+    assert gated, f"no engine waits on {name}"
+    if not check_profiles:
+        assert any(not s.get("profiles") for s in gated), (
+            f"{name} has no profile, but every engine waiting on it does"
+        )
+    else:
+        wider = check_profiles - {p for s in gated for p in s.get("profiles") or []}
+        assert not wider, f"{name} runs under {sorted(wider)}, where no engine waits on it"
+
+
+def _mutated(edit: Any) -> dict[str, dict[str, Any]]:
+    services = copy.deepcopy(_all_services())
+    edit(services)
+    return services
+
+
+@pytest.mark.parametrize(
+    ("case", "edit", "guard"),
+    [
+        (
+            "ha engines on the default check",
+            # The two engines alias one depends_on mapping, so each gets a rebuilt copy.
+            lambda s: [
+                s[e].update(
+                    depends_on={
+                        (_CHECK if k == _CHECK_HA else k): v for k, v in s[e]["depends_on"].items()
+                    }
+                )
+                for e in ("engine-ha", "engine-standby")
+            ],
+            "image",
+        ),
+        ("ha check in the default image", lambda s: s[_CHECK_HA].update(image="x:latest"), "image"),
+        ("ha check with no profile", lambda s: s[_CHECK_HA].pop("profiles"), "active"),
+        ("default check profiled", lambda s: s[_CHECK].update(profiles=["ha"]), "image"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_the_image_and_profile_guards_fail_on_a_broken_wiring(
+    monkeypatch: pytest.MonkeyPatch, case: str, edit: Any, guard: str
+) -> None:
+    # Negative controls: each wiring below is one a guard above must refuse. Run the guard on a
+    # mutated copy of the services and require it to fail for at least one service.
+    services = _mutated(edit)
+    monkeypatch.setattr(sys.modules[__name__], "_all_services", lambda: services)
+    failures = 0
+    if guard == "image":
+        for name in sorted(_serving_engines()):
+            try:
+                test_the_check_runs_the_engines_image(name)
+            except AssertionError:
+                failures += 1
+    else:
+        for name in sorted(_checks()):
+            try:
+                test_each_check_is_active_only_where_an_engine_it_gates_is(name)
+            except AssertionError:
+                failures += 1
+    assert failures, f"no guard refused: {case}"
 
 
 @pytest.mark.parametrize(("value", "passes"), [("1", True), ("0", False)])
@@ -162,6 +280,10 @@ def test_the_shipped_check_command_runs(value: str, passes: bool) -> None:
     else:
         assert done.returncode == 1, done.stderr
         assert "API revocation gate" in done.stderr
+        # Each check gates only the containers that depend on it (one check per image in compose,
+        # its own pod in k8s), so the refusal must not claim it stops every engine.
+        assert "refusing to start the containers this check gates" in done.stderr
+        assert "any engine" not in done.stderr
 
 
 # --- the env-file guidance (BACKLOG #5400 item 2) ------------------------------------------------

@@ -192,7 +192,7 @@ backend-limited.
 | `vault_revocation_attested_reason` | str | — | **required** with `vault_revocation_attested = true`: what covers revocation of the store Vault's certificate, for example its short lifetime, and of an `https://` proxy's in front of it. The flag without it, a blank one, one holding a control character or a lone surrogate, or a reason without the flag is refused at load. It is printed in the loosening report and the serve-time warning, so put no secret in it. Env: `MEFOR_STORE_VAULT_REVOCATION_ATTESTED_REASON` |
 | `require_encryption` | bool | `false` | keeps the keyless refusal in force past the audited opt-out. It does not create that refusal, which is the default; [PHI.md](PHI.md#3-encryption-at-rest) §3 states the rule and the opt-out. It encrypts nothing itself, so a key is still needed. |
 | `allow_unencrypted_phi` | | | **→ moved to `[security].allow_unencrypted_phi`** (ADR 0118) — set it there; no longer accepted in `[store]`. |
-| `server`, `port` | str/int | — / 1433 | server DBs (required for `sqlserver`) |
+| `server`, `port` | str/int | — / 1433 | server DBs (required for `sqlserver`, where at least a blank value, a bare `:1433`, `[]`, an empty entry beside a comma, and a host made only of brackets, colons and digits that is neither all digits nor an IPv6 literal (such as `[,]` or `:1433:`) are refused at load, while a plain number such as `1433` or `12:34`, `::` and `[::]` are accepted, and a protocol prefix with no host, such as `tcp:`, is not caught; on `postgres` a value of spaces is refused, and an empty one reads as `PGHOST`, then asyncpg's local default, with the hop judged off-box) |
 | `database` | str | — | server DBs (required for `sqlserver`) |
 | `auth` | enum | `sql` | `sql` · `integrated` · `entra` (SQL Server). `integrated` connects `Trusted_Connection=yes` — the **service account's** Windows identity authenticates (no SQL password); the turnkey **gMSA** walkthrough (grant the gMSA a SQL login + run the service under it) is [`DEPLOY-SERVER-DB.md` §1.1](DEPLOY-SERVER-DB.md). |
 | `username` | str | — | server DBs (required when `auth = sql`) |
@@ -519,8 +519,8 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   Python's own `bool`, which reads any non-empty text as true. A `MEFOR_VALUE_*` of `false` would
   then have turned on a loosening such as `tls_allow_expired` or `trust_server_certificate`.
   Since vault BACKLOG #3234, an `env()` reference on a boolean setting is read this strict way
-  once it resolves, whatever its cast, and so is its `default=`. A `cast=int` there refuses a
-  TOML `true` or `false` before that read, since vault BACKLOG #1650. That covers at least a setting
+  once it resolves, whatever its cast, and so is its `default=`. A `cast=int` or `cast=float` there
+  refuses a TOML `true` or `false` before that read, since vault BACKLOG #1650. That covers at least a setting
   the factory stores under its own name, such as `verify_tls` or `tls_allow_expired`. It covers
   the `enabled` flag of `with_smart_backend`, `with_oauth2_client_credentials` and `with_signing`.
   It covers `Ftp(tls=...)` too, which the factory turns into the protocol, so `false` means plain
