@@ -582,8 +582,8 @@ async def test_a_send_cancelled_on_its_own_in_the_drain_cancels_pass_is_logged_a
 ) -> None:
     """BACKLOG #5907 step 4: a send that raised its own CancelledError in the loop pass the
     drain's cancel was requested in, before _cut_sends ran, was taken for the drain's cancel and
-    re-raised, so its loss was logged nowhere. It is now logged, and the alert stays counted, which
-    is what the startup unwind's ERROR reads."""
+    re-raised, so no line named that transport's loss; only the undelivered count held it. It is
+    now logged by transport, and the alert stays counted."""
     email = _SelfCancelledOnReleaseEmail()
     sink = NotifierAlertSink([email])
     caplog.set_level(logging.WARNING)

@@ -446,8 +446,9 @@ class AlertTransport(Protocol):
     A send returns once its channel took the alert and raises when it did not, since
     :meth:`NotifierAlertSink._handle` counts a send that returned before a drain cancel reached it
     as delivered (BACKLOG #5907 step 4): a send that swallows its own failure reads as delivered.
-    A send that raises ``CancelledError`` without the drain being cancelled loses that transport's
-    alert, logged, and the siblings go on. A send must end promptly once cancelled: on a drain
+    A send that raises ``CancelledError`` before a drain cancel reached it, as
+    :meth:`NotifierAlertSink._handle` decides that, loses that transport's alert, logged, and its
+    cancel goes no further. A send must end promptly once cancelled: on a drain
     cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
     ``aclose()``. A send the drain's cancel reached never counts as delivered, whether it raises
     or returns.
@@ -2714,8 +2715,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
         # The sends the drain's cancel reached while they ran, filled by _cut_sends before it
         # passes the cancel on: none of them counts as delivered, whatever it then does. A cancel
-        # a send meets outside this set is its own (a transport can cancel its child task with
-        # current_task().cancel()), even in the loop pass the drain's cancel is requested in.
+        # a send meets before _cut_sends has put it here is logged as that transport's loss and
+        # goes no further, whoever requested it: at least the transport itself, or another
+        # canceller in the loop pass the drain's cancel is requested in. A cancel delivered to the
+        # send after _cut_sends ran, a current_task().cancel() included, reads as the drain's.
         reached: set[asyncio.Task[None]] = set()
 
         async def deliver(transport: AlertTransport) -> None:
