@@ -29,6 +29,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.transports import database
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import DatabaseDestination
+from tests._fake_dbapi_driver import DriverError
 from tests._odbc_cancel_fakes import RawConn, RawCursor, never
 from tests.test_backlog2394_database_gate import (
     _SQLSERVER,
@@ -40,8 +41,8 @@ from tests.test_backlog2394_database_gate import (
 from tests.test_backlog5010_database_gate_discard import _WakingPool
 
 
-class _DriverError(Exception):
-    """A pyodbc-shaped driver error: the SQLSTATE in ``args[0]``."""
+class _DriverError(DriverError):
+    """A pyodbc-shaped driver error: the SQLSTATE in ``args[0]``, from a driver's module."""
 
 
 class _CursorRefused(RawConn):

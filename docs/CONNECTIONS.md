@@ -164,9 +164,16 @@ transport = "mllp"
   A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
   digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
   #1650). That read sees what a `cast` left. `cast = "int"` is strict too: it refuses a bool and a
-  number that is not whole, where the builtin `int` read `true` as 1 and cut a fraction. A
-  `cast = "float"` is the builtin `float`, so it still reads `true` as 1.0, which the port read
-  takes as port 1. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
+  number that is not whole, where the builtin `int` read `true` as 1 and cut a fraction.
+  `cast = "float"` reads a value by the rule of `float_setting` in `transports/base.py`. It
+  refuses a bool, where the builtin `float` read `true` as 1.0. It also refuses `nan`, an
+  infinity, and text that reads as zero but is not zero in plain digits, such as `"1e-400"` or `"0e0"`. A TOML
+  literal `1e-400` in a value file is parsed to `0.0` first, so it reads as zero. A code-first
+  `env()` with `cast=int`, `cast=float` or `cast=bool` gets the same strict reading as the named
+  cast. Any other code-first cast runs as given, on the value as it arrives. That includes a
+  builtin such as `abs` and a type such as `decimal.Decimal`. So `cast=lambda v: int(v)` still
+  reads `true` as 1, and the port read takes that as port 1. At least `allowed_mllp`, among the
+  host-and-port `[egress]` lists that pin a port,
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin
   of `6661` (BACKLOG #5915). `allowed_db` also compares the SQL Server preset's `port` setting as
   a number when its check runs, but on `dialect="generic"` it refuses a `PORT` keyword with a

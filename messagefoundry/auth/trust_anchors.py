@@ -292,8 +292,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
     build leaves to the driver. A value the build's remote-path check refuses is refused here as a
     setting, in every ``sslmode`` (BACKLOG #2705), for ``sslcapath``, ``sslcert`` and ``sslkey``
-    too, and for each entry of an ``sslcapath`` folder (vault BACKLOG #5197 item 18), though none
-    of those is an anchor; ``docs/CONNECTIONS.md``, Generic ODBC, states that check's limits.
+    too, and on Windows for each entry of an ``sslcapath`` folder (vault BACKLOG #5197 item 18),
+    though none of those is an anchor; ``docs/CONNECTIONS.md``, Generic ODBC, states that check's limits.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
@@ -306,7 +306,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
     ``odbc_params`` has no pin setting. An ``sslcapath`` CA directory, which a driver also reads
     to choose whom to trust, is not an anchor at all: no ACL, path, content or audit check covers
-    it or its entries, only the remote-path check of the folder and of each entry. Nor
+    it or its entries, only the remote-path check of the folder and, on Windows, of each entry. Nor
     is the lane check skipped for a TLS-off keyword other than ``sslmode``, such as ``Encrypt``.
 """
 
@@ -2151,9 +2151,10 @@ def database_ca_anchor_spec(
     answers ``None``, left to the build's refusal, which names the keyword.
 
     The other driver file keywords, ``sslcapath``, ``sslcert`` and ``sslkey``, are judged here
-    again the same way first, and each entry of an ``sslcapath`` folder too, so a path the build
-    cleared that leads off the host later is refused at the lane check (item 18). None of them is
-    read as an anchor: no ACL, path or audit check covers them (module item 12)."""
+    again the same way first, and on Windows each entry of an ``sslcapath`` folder too, so on
+    Windows a path the build cleared that leads off the host later is refused at the lane check
+    (item 18). None of them is read as an anchor: no ACL, path or audit check covers them (module
+    item 12)."""
     files = _lane_driver_files(settings)
     if not files:
         return None
