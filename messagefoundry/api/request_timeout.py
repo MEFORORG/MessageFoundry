@@ -16,11 +16,14 @@ being bounded is the handler's, not the network's.
 a 413 from inside the route's own read, so the route is still running when that start goes out. The
 limit sets :data:`BODY_REFUSED_KEY` first, and the deadline then stays armed until the route returns.
 While the 413 is written the deadline is held off to at least :data:`_REFUSAL_WRITE_GRACE_SECONDS`
-past its start, so a client that keeps reading gets the whole 413 within that grace. Once the host
-has taken the 413, or the write fails, the deadline is back on its own time.
+past its start, so for a write on the route's own task a client that keeps reading gets the whole
+413 within that grace. Once the host has taken the 413, or the write fails, the deadline is back on
+its own time.
 
-A write on the route's own task is cut with the route and can leave a 413 head with no body. A
-write on another task is not necessarily cut by this deadline.
+A 413 write on the route's own task that stalls past the later of the grace and the deadline's own
+time can be cut with the route, leaving the client a 413 head with no body or the host's own 500. A
+413 write on another task is not necessarily cut by this deadline, but once the route returns the
+host may close the connection, so its client can still get a head with no body.
 
 **Pure ASGI, not** ``BaseHTTPMiddleware``: no task hop, and the response-start signal is visible
 directly. It is registered inside :class:`~messagefoundry.api.client_networks.ClientNetworkMiddleware`
