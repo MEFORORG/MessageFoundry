@@ -295,6 +295,29 @@ def test_an_empty_value_name_is_told_to_go_and_not_to_move(
     assert not any(text in refusal for text in _VALUE_TEXT)
 
 
+_COUNTED_ONCE = (
+    "Each MEFOR_VALUE_* name is counted once, without regard to case, under the first registry "
+    "value that sets it, so remove it from every value that sets it"
+)
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        pytest.param([(_PLAIN, "MEFOR_VALUE_A="), (_EXTRA, "MEFOR_VALUE_A=")], id="empty-in-both"),
+        pytest.param([(_PLAIN, "MEFOR_VALUE_A=1"), (_EXTRA, "mefor_value_a=2")], id="moving"),
+    ],
+)
+def test_a_duplicate_value_name_is_told_to_go_from_every_value(
+    pairs: list[tuple[str, str]],
+) -> None:
+    """The Lander's hold on PR 3142, comment 7104660861, item 3: the name is counted once, so
+    the remedy says to remove it from every value that sets it whether it moves or is only told
+    to go, as origin/main does, or the copy left behind refuses the next start."""
+    refusal = service_env_refusal(_read_pairs(pairs))
+    assert refusal is not None and refusal.count(_COUNTED_ONCE) == 1
+
+
 def test_an_oddly_spelled_name_told_only_to_go_gets_no_rename() -> None:
     """Code review on the repair of the Lander's hold on PR 3142, comment 7100710066, item 10:
     the rename sentence is about moving a name, so an empty one, which is only told to go, does

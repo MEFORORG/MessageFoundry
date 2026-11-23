@@ -1346,9 +1346,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             parts.append(
                 "A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
                 "of the environment may go in its value file instead, environments/<env>.toml by "
-                "default, keyed by the name after MEFOR_VALUE_ in lower case. Each MEFOR_VALUE_* "
-                "name is counted once, without regard to case, under the first registry value "
-                "that sets it, so remove it from every value that sets it"
+                "default, keyed by the name after MEFOR_VALUE_ in lower case"
+            )
+        if values:
+            # For a name only told to go as well: a copy left in a second value refuses the
+            # next start (the Lander's hold on PR 3142, comment 7104660861, item 3).
+            parts.append(
+                "Each MEFOR_VALUE_* name is counted once, without regard to case, under the "
+                "first registry value that sets it, so remove it from every value that sets it"
             )
         if _VALUE_PREFIX in values:
             parts.append(
