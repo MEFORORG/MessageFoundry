@@ -31,7 +31,7 @@ import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.code_sets import (
@@ -49,6 +49,9 @@ from messagefoundry.controlchars import has_control_char
 from messagefoundry.path_reach import is_absent
 from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+
+if TYPE_CHECKING:
+    from messagefoundry.config.impact import PreparedRename
 
 _log = logging.getLogger(__name__)
 
@@ -282,14 +285,16 @@ def rename_code_set(
             rewritten = len(impact.write_rename(prepared))
         except impact.RenameWriteError as exc:
             if exc.unrestored:
-                # A reference left naming the new table would lose it to a move back, so the code
-                # set stays; the message names which references read which name, config-relative.
+                # A reference that may be left naming the new table would lose it to a move back,
+                # so the code set stays, as after an interrupt that leaves a file it cannot read.
+                # The message names the files config-relative, and the error by its type only.
                 left, others = _reference_split(config_dir, prepared, exc.unrestored)
                 raise WiringError(
-                    f"cannot rename code set {old!r} to {new!r}: a reference write failed and "
-                    f"{left} could not be restored, so {left} still name {new!r} and the code set "
-                    f"stays as {_pair(dest, had_sidecar)}; these name {old!r}: {others}. Rewrite "
-                    "the references to one name by hand, and move the code set to match"
+                    f"cannot rename code set {old!r} to {new!r}: a reference write failed "
+                    f"({_cause_name(exc)}), and these could not be restored and may still name "
+                    f"{new!r}: {left}. The code set stays as {_pair(dest, had_sidecar)}; these "
+                    f"name {old!r}: {others}. Rewrite the references to one name by hand, and "
+                    "move the code set to match"
                 ) from exc
             # A write failed and the files written were restored, so the table moves back to the
             # name they read. The move back is never undone: a half that fails leaves what moved
@@ -316,7 +321,7 @@ def rename_code_set(
                     "these still name %r: %s",
                     left,
                     new,
-                    _rel(dest),
+                    _pair(dest, had_sidecar),
                     old,
                     others,
                 )
@@ -675,7 +680,9 @@ def _pair(table: Path, has_sidecar: bool) -> str:
     return _rel(table) + (f" and {_rel(_policy_sidecar_path(table))}" if has_sidecar else "")
 
 
-def _reference_split(config_dir: str | Path, prepared: Any, left: list[str]) -> tuple[str, str]:
+def _reference_split(
+    config_dir: str | Path, prepared: PreparedRename, left: list[str]
+) -> tuple[str, str]:
     """The referencing files of a rename ``prepared`` that are ``left`` rewritten, and the rest, each
     joined by config-relative name, so a message or log line carries no host path."""
     return (
@@ -722,10 +729,19 @@ def _case_variant(codesets_dir: Path, name: str, *, besides: Path | None = None)
     (``name.CSV``), which the loader reads too and a case-sensitive file system keeps apart.
 
     ``besides`` is the table being edited, which is never its own variant. A case-insensitive file
-    system opens ``name.CSV`` under the name ``name.csv`` and lists it under its own spelling, so
-    the two are compared as files, never as paths: ``WindowsPath`` equality ignores case."""
+    system opens ``name.CSV`` under the name ``name.csv`` and lists it under its own spelling, so a
+    ``besides`` that is a file the listing does not spell exactly is the entry spelled like it in
+    another case. Compared by listed name, never by path (``WindowsPath`` equality ignores case)
+    or by inode (a link beside the table is a second table to the loader)."""
     with atomic_edit.refused_as(codesets_dir, WiringError, atomic_edit.READ_STEP):
         entries = list(codesets_dir.iterdir())
+    itself = (
+        besides.name.lower()
+        if besides is not None
+        and besides.name not in {p.name for p in entries}
+        and atomic_edit.is_file(besides, refused_error=WiringError)
+        else None
+    )
     return next(
         (
             p
@@ -734,22 +750,10 @@ def _case_variant(codesets_dir: Path, name: str, *, besides: Path | None = None)
             and p.suffix not in _SUPPORTED_EXTS
             and p.suffix.lower() in _SUPPORTED_EXTS
             and atomic_edit.is_file(p, refused_error=WiringError)
-            and not (besides is not None and _same_file(p, besides))
+            and p.name.lower() != itself
         ),
         None,
     )
-
-
-def _same_file(listed: Path, target: Path) -> bool:
-    """Whether ``listed``, a file in a directory listing, is ``target``. A ``target`` that does not
-    exist is not it; a stat that fails otherwise is a refusal, never read as a different file."""
-    with atomic_edit.refused_as(target, WiringError, atomic_edit.READ_STEP):
-        try:
-            return os.path.samefile(listed, target)
-        except FileNotFoundError as exc:
-            if is_absent(exc):
-                return False
-            raise
 
 
 def _cause_name(exc: BaseException) -> str:

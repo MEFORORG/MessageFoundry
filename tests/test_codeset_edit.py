@@ -984,7 +984,7 @@ def test_rename_write_with_an_unrestored_reference_keeps_the_code_set_under_it(
     cs_dir = _codesets(tmp_path)
     assert sorted(os.listdir(cs_dir)) == ["meals.csv", "meals.policy.toml"]
     message = str(err.value)
-    assert "routers/route_diets.py still name 'meals'" in message
+    assert "may still name 'meals': routers/route_diets.py" in message
     assert "stays as codesets/meals.csv and codesets/meals.policy.toml" in message
     assert str(tmp_path) not in message
 
