@@ -373,7 +373,8 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   found leaves a logger outside the named list unscreened until the next SCP start, C-STORE or SCU association puts
   the factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
   `propagate = False` on a logger of its own. A traceback's frames and exception class names are written, since
-  they are code. A failure inside the screen withholds the line. Matching is linear in the line's length.
+  they are code. An `Exception` raised while the screen reads a line withholds that line, and one raised while it
+  renders the traceback withholds the traceback. Matching is linear in the line's length.
 
   A delivery error raised while the SCU stores an object holds, on its chain, at most an engine exception that
   names the library exception's class, with none of its text.
@@ -385,7 +386,8 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   the engine makes no further attempt to end the association.
 
   **The screen assumes a library exception's class behaves as ordinary Python.** A class with hostile attribute,
-  `__str__` or metaclass code is outside it and can still get text past it.
+  `__str__` or metaclass code is outside it and can still get text past it, and an ordinary class's name is
+  written, so a name carrying a value would be written too.
 
   **A library exception the SCU does not wrap keeps its text.** At least one raised while the SCU opens the
   association does. The delivery worker logs only its class, but the text would reach the row's `last_error`
