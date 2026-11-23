@@ -264,16 +264,18 @@ def rename_code_set(
         # Checked against the files before the table moves: a referent file that changed since
         # the plan refuses here, with nothing moved (BACKLOG #5980).
         prepared = impact.prepare_rename(plan)
+        had_sidecar = atomic_edit.is_file(_policy_sidecar_path(src), refused_error=WiringError)
+        # Where table and policy belong if the rename must be undone by hand. Built before the
+        # move, so the move's return leads straight into the try that undoes it.
+        home = _pair(src, had_sidecar)
+        result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
         try:
-            had_sidecar = _move_with_sidecar(src, dest)
+            _move_with_sidecar(src, dest, has_sidecar=had_sidecar)
         except _SplitPairError as exc:
             raise WiringError(
                 f"{exc}. No reference was rewritten, so they still name {old!r}: put the table "
                 f"back as {_rel(src)}, and any policy as {_rel(_policy_sidecar_path(src))}, by hand"
             ) from exc
-        # Where table and policy belong if the rename must be undone by hand.
-        home = _pair(src, had_sidecar)
-        result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
         # The referent rewrite stays under the lock: a second rename planned between the move
         # and the rewrite would read literals naming a table that is already gone.
         try:
@@ -321,7 +323,7 @@ def rename_code_set(
                 _log.error(
                     "code set rename interrupted: moving the code set back failed (%s), so %s; "
                     "its references name %r, so put it back as %s by hand",
-                    type(back.__cause__).__name__,
+                    _cause_name(back),
                     back.layout,
                     old,
                     home,
@@ -499,7 +501,7 @@ def _reject_toml_collision(codesets_dir: Path, name: str) -> None:
     """For an upsert: reject if a ``codesets/<name>.toml`` exists (the ``.csv`` is the overwrite
     target, allowed). Mirrors the loader's duplicate-stem fail-loud."""
     # A folder of that name has always collided too.
-    if _taken(codesets_dir / f"{name}.toml"):
+    if _taken(codesets_dir / f"{name}.toml") or _case_variant(codesets_dir, name):
         raise WiringError(_collision_message(name, codesets_dir))
 
 
@@ -597,9 +599,10 @@ def _move_with_sidecar(
     #5776), returning whether a sidecar moved. ``has_sidecar`` says whether one moves; ``None``
     reads it from the disk.
 
-    With ``roll_back``, a forward move: the table moves first, so a move cut off half way leaves no
-    table under the name the references read, and the config fails to load rather than run with
-    the wrong policy. A failure or an interrupt at any point moves back whatever had moved, read
+    With ``roll_back``, a forward move: the table moves first, so a move cut off half way never
+    leaves a table under the name the references read without its policy. A reference then finds
+    no table (at load for a module-level capture, else at its first lookup) rather than running
+    with the wrong policy. A failure or an interrupt at any point moves back whatever had moved, read
     from the files rather than assumed, since an interrupt can land on either side of a replace.
     A stat that fails is not read as absent: the move back stops there. If the move back fails, a
     failure raises :class:`_SplitPairError` saying where each file is, and an interrupt logs it.
@@ -644,8 +647,9 @@ def _move_with_sidecar(
             raise _SplitPairError(f"{exc}{undo}, so {layout}", layout) from exc
         # Config-relative names and the error's type only: a log line carries no host path.
         _log.error(
-            "code set move interrupted%s, so %s; they belong as %s",
-            f": moving back failed ({type(back).__name__})" if back is not None else "",
+            "code set move cut off by %s%s, so %s; they belong as %s",
+            type(exc).__name__,
+            f": moving back failed ({_cause_name(back)})" if back is not None else "",
             layout,
             _pair(src if roll_back else dest, has_sidecar),
         )
@@ -697,7 +701,7 @@ def _taken(path: Path) -> bool:
 
 
 def _case_variant(codesets_dir: Path, name: str) -> Path | None:
-    """A table of stem ``name`` whose extension differs from ``.csv``/``.toml`` only in case
+    """A table file of stem ``name`` whose extension differs from ``.csv``/``.toml`` only in case
     (``name.CSV``), which the loader reads too and a case-sensitive file system keeps apart."""
     with atomic_edit.refused_as(codesets_dir, WiringError, atomic_edit.READ_STEP):
         entries = list(codesets_dir.iterdir())
@@ -708,9 +712,19 @@ def _case_variant(codesets_dir: Path, name: str) -> Path | None:
             if p.stem == name
             and p.suffix not in _SUPPORTED_EXTS
             and p.suffix.lower() in _SUPPORTED_EXTS
+            and atomic_edit.is_file(p, refused_error=WiringError)
         ),
         None,
     )
+
+
+def _cause_name(exc: BaseException) -> str:
+    """The type of the OS error under ``exc``, else of ``exc``: a refusal wraps the error that
+    says whether a file was held or denied, and a log line gives the type, never the text."""
+    cause: BaseException | None = exc
+    while cause is not None and not isinstance(cause, OSError):
+        cause = cause.__cause__
+    return type(cause or exc).__name__
 
 
 def _where(home: Path, away: Path) -> str:
@@ -773,11 +787,15 @@ def _drop_sidecar_if_table_gone(table: Path, sidecar: Path, dangling: list[dict[
 
 
 def _other_table_exists(path: Path) -> bool:
-    """Whether a second supported table of ``path``'s stem sits beside it."""
-    return any(
-        atomic_edit.is_file(path.with_suffix(ext), refused_error=WiringError)
-        for ext in _SUPPORTED_EXTS
-        if ext != path.suffix
+    """Whether a second table of ``path``'s stem sits beside it, an extension in another case
+    included."""
+    return (
+        any(
+            atomic_edit.is_file(path.with_suffix(ext), refused_error=WiringError)
+            for ext in _SUPPORTED_EXTS
+            if ext != path.suffix
+        )
+        or _case_variant(path.parent, path.stem) is not None
     )
 
 

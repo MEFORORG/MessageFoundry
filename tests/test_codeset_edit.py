@@ -798,6 +798,29 @@ def test_rename_refuses_a_folder_at_a_target_table_name(tmp_path: Path, taken: s
     assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml", taken]
 
 
+def _fake_case_variant(monkeypatch: pytest.MonkeyPatch, cs_dir: Path, variant: str) -> None:
+    """List a table file ``variant`` (``meals.CSV``) in ``cs_dir`` as a case-sensitive file
+    system would beside its lower-case sibling, on any host."""
+    from messagefoundry.config import atomic_edit
+
+    fake = cs_dir / variant
+    real_iterdir = Path.iterdir
+    real_is_file = atomic_edit.is_file
+
+    def iterdir(self: Path) -> object:
+        if self == cs_dir:
+            return iter([*real_iterdir(self), fake])
+        return real_iterdir(self)
+
+    def is_file(path: Path, *, refused_error: object) -> bool:
+        if path == fake:
+            return True
+        return real_is_file(path, refused_error=refused_error)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(atomic_edit, "is_file", is_file)
+
+
 def test_rename_refuses_a_table_whose_extension_differs_only_in_case(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -805,20 +828,40 @@ def test_rename_refuses_a_table_whose_extension_differs_only_in_case(
     apart from ``meals.csv``, so the exact-name probe alone missed it."""
     _with_policy(tmp_path, "diets")
     cs_dir = _codesets(tmp_path)
-    variant = cs_dir / "meals.CSV"
-    real_iterdir = Path.iterdir
-
-    def iterdir(self: Path) -> object:
-        # A case-sensitive listing, on any host.
-        if self == cs_dir:
-            return iter([*real_iterdir(self), variant])
-        return real_iterdir(self)
-
-    monkeypatch.setattr(Path, "iterdir", iterdir)
+    _fake_case_variant(monkeypatch, cs_dir, "meals.CSV")
     with pytest.raises(WiringError, match=r"duplicate code set name 'meals'"):
         codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
     monkeypatch.undo()
     assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_upsert_refuses_a_table_whose_extension_differs_only_in_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upsert beside ``meals.TOML`` would write a duplicate stem the loader refuses."""
+    codeset_edit.upsert_code_set(
+        tmp_path, "other", ["code", "value"], [["A", "Apple"]], validate=_validate
+    )
+    cs_dir = _codesets(tmp_path)
+    _fake_case_variant(monkeypatch, cs_dir, "meals.TOML")
+    with pytest.raises(WiringError, match=r"duplicate code set name 'meals'"):
+        codeset_edit.upsert_code_set(
+            tmp_path, "meals", ["code", "value"], [["A", "Apple"]], validate=_validate
+        )
+    monkeypatch.undo()
+    assert not (cs_dir / "meals.csv").exists()
+
+
+def test_remove_keeps_a_sidecar_a_case_variant_table_still_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing a duplicate stem whose survivor is ``diets.TOML`` keeps its policy."""
+    _with_policy(tmp_path, "diets")
+    cs_dir = _codesets(tmp_path)
+    _fake_case_variant(monkeypatch, cs_dir, "diets.TOML")
+    codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    monkeypatch.undo()
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.policy.toml"]
 
 
 def _refuse_back(
@@ -925,7 +968,7 @@ def test_rename_interrupted_with_a_refused_table_move_back_logs_where_each_file_
     assert "the table is codesets/meals.csv and its policy codesets/diets.policy.toml" in (
         caplog.text
     )
-    assert "moving the code set back failed (WiringError)" in caplog.text
+    assert "moving the code set back failed (PermissionError)" in caplog.text
     assert str(tmp_path) not in caplog.text
 
 
