@@ -7019,6 +7019,63 @@ class RegistryRunner:
         self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
+    # Set by a cancelled start() only when its teardown ran to completion (BACKLOG #5705).
+    _start_cancel_unwound: bool = False
+    # Set once a start() holds the reload lock, so before it can have built anything.
+    _start_entered: bool = False
+
+    @property
+    def start_entered(self) -> bool:
+        """Whether any :meth:`start` got past the reload lock. False means nothing was built."""
+        return self._start_entered
+
+    @property
+    def start_cancel_unwound(self) -> bool:
+        """Whether the last :meth:`start` was cancelled and its teardown ran to completion over
+        everything registered. A source or connector the cancel caught inside its own bring-up
+        is not registered yet, so no teardown reaches it, and True does not cover it.
+        False means a caller must keep this runner so a later stop can reach what is left:
+        ``has_residual_state`` cannot say, since it omits at least the router, transform and
+        response workers, the background tasks, the executors and the sandbox sessions."""
+        return self._start_cancel_unwound
+
+    async def _unwind_cancelled_start(self) -> None:
+        """Tear a cancelled :meth:`start` down, within a bound, and never raise (BACKLOG #5705).
+
+        This runs holding the reload lock, which ``stop()`` needs, so a hung source stop must not
+        hold it for long. The teardown runs in its own task so it can be cut: it gets
+        :data:`_CANCELLED_STOP_GRACE_SECONDS`, or less on a further cancel of this start, and is
+        then cancelled twice, which :meth:`_join_cancelled_source_stops` reads as cut at once.
+        What a cut teardown leaves stays registered for a later stop. A task that outlives even
+        that is held in ``_pending_source_stops``, where a SHUTDOWN stop settles it."""
+        teardown = asyncio.create_task(
+            self._teardown_unsafe(TeardownReason.SHUTDOWN), name="cancelled-start-teardown"
+        )
+        try:  # noqa: SIM105
+            await asyncio.wait({teardown}, timeout=_CANCELLED_STOP_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            pass  # the caller re-raises the cancel it is already handling
+        if not teardown.done():
+            teardown.cancel()
+            teardown.cancel()
+            try:  # noqa: SIM105
+                await asyncio.wait({teardown}, timeout=_CANCELLED_STOP_GRACE_SECONDS)
+            except asyncio.CancelledError:
+                pass
+        if not teardown.done():
+            self._pending_source_stops.append(teardown)
+            teardown.add_done_callback(self._reap_pending_stop)
+            log.error("a cancelled wiring start's teardown did not end; a later stop settles it")
+        elif teardown.cancelled():
+            log.error("a cancelled wiring start's teardown was cut; a later stop finishes it")
+        elif (failure := teardown.exception()) is not None:
+            log.error(
+                "a cancelled wiring start's teardown failed (%s); a later stop finishes it",
+                type(failure).__name__,
+            )
+        else:
+            self._start_cancel_unwound = True
+
     async def start(
         self,
         *,
@@ -7037,6 +7094,9 @@ class RegistryRunner:
         check left them out, so their query-credential WARNING is logged here whatever
         ``warn_query_credentials`` says. ``None`` checks every lookup CA here."""
         async with self._reload_lock:
+            # Inside the lock, so a start queued behind a cancelled one clears that one's True.
+            self._start_cancel_unwound = False
+            self._start_entered = True
             if self._running:
                 return
             if self._sources or self._workers or self._destinations or self._dispatchers:
@@ -7241,6 +7301,10 @@ class RegistryRunner:
                 # gate already (BACKLOG #5704), so nothing here needs the dispatchers.
                 if self._log_write_stopped:
                     await self._unbind_for_log_failure()
+            except asyncio.CancelledError:
+                # BACKLOG #5705: a cancel unwinds the partial start too, and always propagates.
+                await self._unwind_cancelled_start()
+                raise
             except Exception:
                 # A truly fatal startup error (store / DB-lookup executor — NOT a single connection, which
                 # is isolated above) must not leave half the graph wired with _running still False:

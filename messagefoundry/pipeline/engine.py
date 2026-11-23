@@ -1706,12 +1706,20 @@ class Engine:
             # That check warned for this graph, so this start does not (vault BACKLOG #2910),
             # except for a lookup it left out, which the start warns for (vault BACKLOG #3582).
             await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
+        except asyncio.CancelledError:
+            # BACKLOG #5705: cleared when the cancelled start finished its own teardown, or never
+            # began. Otherwise it may still hold live state, so it stays, with the values it was
+            # built from, where engine.stop() can reach it.
+            installed = self._registry_runner
+            if installed is not None and (
+                installed.start_cancel_unwound or not installed.start_entered
+            ):
+                self._registry_runner = None
+                self._env_values = previous_env_values
+            raise
         except Exception:
             # Don't leave a half-started runner: a later reload would take the "runner exists"
             # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
-            # Exception only: RegistryRunner.start() does not tear itself down on a cancellation,
-            # so clearing the reference then would orphan a running runner that engine.stop()
-            # could no longer reach.
             self._registry_runner = None
             self._env_values = previous_env_values
             raise
@@ -3713,7 +3721,8 @@ class Engine:
         committed leaves the new graph live. The API reload routes audit such a fault with reason
         ``reload_fault`` and answer a generic error (BACKLOG #3157). A cancellation is not one of the refusals either,
         and is never audited as a fault: one that lands after the swap committed keeps the new
-        values, and so does one during a first load's runner start.
+        values. One during a first load keeps them only if it keeps the runner, which it does
+        when the start began and its teardown did not complete (BACKLOG #5705).
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()
