@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Batch 532 wave 3 (BACKLOG #5409 item 2): debugpy adds no working directory to the Test Bench Debug
-// launch's import path, on the debugpy builds read (see below). debugpy 1.8.21 and older insert the working directory into
-// `sys.path` when they run a MODULE, whatever `-P` says (debugpy commit 7959635126, first released
-// in 1.8.22, added the `safe_path` check), so the launch hands debugpy a PROGRAM the extension
-// writes into its own storage folder, for which those builds add only that folder. testBench.ts
-// imports vscode, so its wiring is pinned by reading its source; the program itself is run under
-// stand-ins for the runner shapes read at debugpy tags v1.8.0, v1.8.21 and v1.8.22 and at `main` on
-// 2026-11-23: one at v1.8.0 and v1.8.21, and one at v1.8.22 and `main`, which honours `-P`. The
-// releases between those points, and any build before 1.8.0, were not read. The stand-ins are
-// transcriptions, so they show what the launch does under the code read, not under a later debugpy. A PYTHONPATH entry, which `-P` keeps, is out of scope
+// launch's import path, on the debugpy builds TEST_BENCH_DEBUG_PROGRAM names as read. At least
+// v1.8.0 and v1.8.21 insert the working directory into `sys.path` when they run a MODULE, whatever
+// `-P` says (debugpy commit 7959635126, first released in 1.8.22, added the `safe_path` check), so
+// the launch hands debugpy a PROGRAM the extension writes into its own storage folder, for which
+// those builds add only that folder. testBench.ts imports vscode, so its wiring is pinned by reading
+// its source; the program itself is run under a transcription of each runner's sys.path step read.
+// A transcription shows what the program does under the code read, not under the adapter, the
+// launcher or a later debugpy. A PYTHONPATH entry, which `-P` keeps, is out of scope
 // (TEST_BENCH_DEBUG_PROGRAM's open limit). The write itself is vscode-free (testBenchDebugProgram.ts),
 // so it is run against a real temporary folder, with one fs call made to fail where a case needs it.
 import * as assert from "assert";
@@ -55,8 +54,8 @@ function testBench(): string {
 }
 
 /** debugpy 1.8.21's `run_module` (src/debugpy/server/cli.py at tag v1.8.21), reduced to its
- *  sys.path step and the run: it inserts "" with no check of `sys.flags.safe_path`. The sys.path
- *  steps of `run_module` and `run_file` read the same at tag v1.8.0; the tags between were not read. */
+ *  sys.path step and the run: it inserts "" with no check of `sys.flags.safe_path`. Its sys.path
+ *  step and `run_file`'s read the same at tag v1.8.0. */
 const OLD_RUN_MODULE = [
   "import runpy, sys",
   "sys.argv = ['messagefoundry'] + sys.argv[1:]",
@@ -74,8 +73,8 @@ const OLD_RUN_FILE = [
   "runpy.run_path(target, run_name='__main__')",
 ].join("\n");
 
-/** debugpy 1.8.22's `_skip_sys_path_prepend`, which `run_module` and `run_file` consult from that
- *  release on (identical at debugpy `main`, read 2026-11-23): Python's own rule for `-I` and `-P`. */
+/** debugpy 1.8.22's `_skip_sys_path_prepend`, which its `run_module` and `run_file` consult (the
+ *  same at debugpy `main` as read): Python's own rule for `-I` and `-P`. */
 const SKIP_PREPEND = [
   "def _skip_sys_path_prepend():",
   "    return sys.flags.isolated or getattr(sys.flags, 'safe_path', False)",
@@ -101,6 +100,14 @@ const NEW_RUN_FILE = [
   "    if not _skip_sys_path_prepend():",
   "        sys.path.insert(0, os.path.dirname(target))",
   "runpy.run_path(target, run_name='__main__')",
+].join("\n");
+
+/** Not a debugpy runner: puts "" LAST, so the installed package still wins and the probe must say CWD. */
+const CWD_LAST = [
+  "import runpy, sys",
+  "sys.argv = ['messagefoundry'] + sys.argv[1:]",
+  'sys.path.append("")',
+  "runpy.run_module('messagefoundry', run_name='__main__', alter_sys=True)",
 ].join("\n");
 
 /** Runs a runner stand-in as the debuggee's interpreter would, and returns its output lines. */
@@ -175,11 +182,12 @@ suite("b532w3: debugpy adds no working directory to the Test Bench Debug launch 
   /**
    * A temporary launch: a workspace, the working directory, holding a `messagefoundry.py`; the
    * installed package standing in on PYTHONPATH, which `-P` keeps; and the program as
-   * writeDebugProgram writes it. `run` starts the interpreter as the debug adapter's launcher does,
-   * the launch's `python` with its `pythonArgs` first (debugpy's launcher/handlers.py at `main`),
-   * then a script in a folder of its own in place of the debugpy server's folder, so the
-   * interpreter itself adds no working directory and only the runner stand-in can. The
-   * installed `__main__` prints its arguments, then whether the working directory, `""` or the program's folder is on `sys.path`.
+   * writeDebugProgram writes it. `run` puts the launch's `pythonArgs` first, as the launcher's
+   * command line does (debugpy's launcher/handlers.py at `main`), then a runner script in a folder of
+   * its own. The real launcher passes debugpy's package folder and `-X frozen_modules=off` there,
+   * which this does not model; a script leaves the working directory off the path either way, so
+   * only the runner stand-in can add it. The installed `__main__` prints its arguments, then whether
+   * the working directory, `""` included, or the program's folder is on `sys.path`.
    */
   function launch(exe: string, use: (l: { program: string; run: Runner }) => void): void {
     const made = fs.mkdtempSync(path.join(os.tmpdir(), "b532w3-ide-debugpy-"));
@@ -233,6 +241,8 @@ suite("b532w3: debugpy adds no working directory to the Test Bench Debug launch 
     launch(exe!, ({ program, run }) => {
       // THE CONTROL: the module form, which the launch used before, runs the workspace's module.
       assert.deepStrictEqual(run(OLD_RUN_MODULE, ["dryrun"]), ["SHADOWED"]);
+      // The probe's own control: "" placed after the installed package is seen as the working directory.
+      assert.deepStrictEqual(run(CWD_LAST, ["dryrun"]), ["INSTALLED ['dryrun']", "CWD NO-DIR"]);
       // The program runs the installed package, with the launch's arguments. These builds put the
       // program's folder on the import path, never the working directory.
       assert.deepStrictEqual(run(OLD_RUN_FILE, [program, "dryrun", "--show-phi"]), [
@@ -252,10 +262,13 @@ suite("b532w3: debugpy adds no working directory to the Test Bench Debug launch 
       // THE CONTROLS: without -P, these runners put "" first for a module, so the workspace's module
       // wins, and the program's folder first for a program. It is -P from pythonArgs that turns both
       // prepends off.
+      assert.strictEqual(INTERPRETER_OPTIONS.filter((o) => o === "-P").length, 1);
       const noP = INTERPRETER_OPTIONS.filter((o) => o !== "-P");
-      assert.ok(noP.length === INTERPRETER_OPTIONS.length - 1, "INTERPRETER_OPTIONS holds no -P");
       assert.deepStrictEqual(run(NEW_RUN_MODULE, ["dryrun"], noP), ["SHADOWED"]);
-      assert.deepStrictEqual(run(NEW_RUN_FILE, [program, "dryrun"], noP), ["INSTALLED ['dryrun']", "NO-CWD DIR"]);
+      assert.deepStrictEqual(run(NEW_RUN_FILE, [program, "dryrun"], noP), [
+        "INSTALLED ['dryrun']",
+        "NO-CWD DIR",
+      ]);
       // With the launch's options, the module form is not shadowed either.
       assert.deepStrictEqual(run(NEW_RUN_MODULE, ["dryrun"]), ["INSTALLED ['dryrun']", "NO-CWD NO-DIR"]);
       // The program the launch hands debugpy runs the installed package, with nothing added.

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // The cli.ts writers, writerPathSetting and writerConfigTarget, refuse a path setting whose spelling
-// lies inside the workspace folder but whose real path leaves it (BACKLOG #5404). The other suites
+// lies inside the workspace folder but whose real path leaves it (BACKLOG #5404), driven here for at
+// least configDir, serviceConfig and messageSetsDir. The other suites
 // pin their wiring by reading cli.ts's source or drive escapesByLink alone; this one runs the real
 // cli.ts against a stubbed `vscode` and a real temporary folder, so it fails on a writer that checks
 // the spelling only. The refusals have controls on the same folder that the writer accepts, so a
@@ -159,6 +160,17 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
     });
   }
 
+  test("writerPathSetting refuses a linked serviceConfig and messageSetsDir too, beside a plain control", () => {
+    for (const key of ["serviceConfig", "messageSetsDir"] as const) {
+      settings[key] = { workspaceValue: "cfg/x" };
+      assert.strictEqual(cli.writerPathSetting(key), "cfg/x", key);
+      assert.deepStrictEqual(errors, []);
+      settings[key] = { workspaceValue: "escape/x" };
+      assert.strictEqual(cli.writerPathSetting(key), undefined, key);
+      refusedNaming(key, "escape/x");
+    }
+  });
+
   test("writerConfigTarget returns both values for a contained config folder and service config", () => {
     settings.configDir = { workspaceValue: "cfg" };
     settings.serviceConfig = { workspaceValue: "cfg/messagefoundry.toml" };
@@ -206,14 +218,16 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
       for (const value of ["escape.", "escape ", "cfg:stream", "nul", "cfg/CON.toml"]) {
         settings.configDir = { workspaceValue: value };
         assert.strictEqual(cli.writerPathSetting("configDir"), undefined, value);
-        refusedNaming("configDir", value.length > 4 ? value : undefined);
+        // A short device name also appears in the refusal's own text, so only the longer values are
+        // checked for being quoted back.
+        refusedNaming("configDir", ["nul"].includes(value) ? undefined : value);
       }
     },
   );
 
   test("an untrusted window makes no link check: the writer returns the value and the exec gate is on", () => {
-    // isExecGated refuses the writer's CLI call there; the writers that write without the CLI
-    // refuse an untrusted window themselves (cli.ts writerSetting).
+    // isExecGated refuses the writer's CLI call there. A writer that writes without the CLI must
+    // refuse an untrusted window itself, as cli.ts writerSetting's doc says; this test does not show it.
     stubTrusted = false;
     settings.configDir = { globalValue: "escape" };
     assert.strictEqual(cli.writerPathSetting("configDir"), "escape");

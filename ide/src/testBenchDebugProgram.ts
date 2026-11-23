@@ -9,7 +9,7 @@ import * as path from "node:path";
 /**
  * The program the Test Bench's Debug launch hands debugpy in place of `module: "messagefoundry"`:
  * its folder below the extension's global storage, and its source. `-P` alone does not hold for a
- * module: a debugpy older than 1.8.22, which includes the 1.8.21 the Python Debugger extension
+ * module: debugpy before 1.8.22, at least v1.8.0 and the v1.8.21 the Python Debugger extension
  * bundles at the time of writing, inserts the working directory, the workspace, into `sys.path`
  * when it runs a module, whatever `-P` says. For a program it adds at most the program's own
  * folder. That folder holds what {@link writeDebugProgram} puts there: one program per program
@@ -17,21 +17,21 @@ import * as path from "node:path";
  * texts share a file only if their checksums collide (see textChecksum). It also holds `.tmp-`
  * folders, one per write, which a failed removal or a killed extension host can leave behind and
  * no import statement can name. Nothing is ever pruned there, and nothing checks what else is
- * there. It also holds whatever another process running as the same OS user puts there. Under a
- * debugpy before 1.8.22, which puts the folder at `sys.path[0]`, a module placed there shadows any
+ * there. It also holds whatever another process running as the same OS user puts there. Under
+ * those builds, which put the folder at `sys.path[0]`, a module placed there shadows any
  * module of that name the debuggee has not yet imported, the installed `messagefoundry` package
  * and the standard library included. This code does not defend against a writer running as the
  * same OS user: that writer can already change the extension, the interpreter and the workspace.
- * None of the names writeDebugProgram writes is one the launch imports. The program runs the installed
- * package through `runpy`, so no debugpy build read (below) puts the working directory on the import path. The
- * source is written at launch rather than shipped, because the extension package holds no Python
+ * None of the names writeDebugProgram writes is one the launch imports. The program runs the
+ * installed package through `runpy`, so no debugpy build read (below) puts the working directory on
+ * the import path. The source is written at launch rather than shipped, because the extension package holds no Python
  * (the crypto inventory's ide/ arm reads only TypeScript).
  *
  * Builds read: the sys.path steps of debugpy's `run_file` and `run_module` at tags v1.8.0, v1.8.21
  * and v1.8.22 and at `main` (2026-11-23). They take one shape at v1.8.0 and v1.8.21, and another at
  * v1.8.22 and `main`, whose runners skip their prepend under `-P`; b532w3-ide-debugpy.test.ts runs
- * the launch under a stand-in for each. The releases between those points, and any build before
- * 1.8.0, were not read.
+ * the program under a transcription of each runner's sys.path step. The releases between those
+ * points, and any build before 1.8.0, were not read.
  *
  * Open limit: `-P` does not remove a PYTHONPATH entry, and the Python Debugger extension loads an
  * env file into the debuggee, the workspace's `.env` by default. At least a PYTHONPATH that env file
