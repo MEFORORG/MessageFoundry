@@ -887,8 +887,8 @@ class Engine:
         self._intake_monitor: IntakeBoundMonitor | None = None
         # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
         # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
-        # active only when this box is a DR standby that has been activated for THIS boot (dr.enabled
-        # AND dr.activate): then the runner binds only connections whose resolved tier rank >=
+        # active only when this box is a DR standby that POST /dr/activate has promoted (the load
+        # refuses [dr].activate = true, BACKLOG #5965, so no boot starts active): then the runner binds only connections whose resolved tier rank >=
         # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
         # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
         # A DR box that is not activated passes dr_standby instead, and binds no inbound listener
@@ -901,8 +901,8 @@ class Engine:
             # At start, not only when a hook runs, which on a DR box is during the disaster: the
             # coordinator that runs hooks is built only at the first activate or release.
             warn_unset_pass_environment(self._dr_settings.pass_environment)
-        # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
-        # [dr].enabled AND [dr].activate at construction; flipped True by the DR coordinator on a
+        # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Seeded from [dr].enabled
+        # AND [dr].activate, which a loaded config keeps False (BACKLOG #5965); flipped True by the DR coordinator on a
         # successful POST /dr/activate (which then reloads the graph so the run-profile filter applies)
         # and back False on POST /dr/release. A runner takes dr_threshold from _dr_run_threshold() when
         # it is built, and _set_dr_active hands a running one the new value on each flip (#3067).

@@ -1678,10 +1678,10 @@ async def test_hitting_the_step_up_return_audit_backstop_pages_once_a_window(
 
 
 async def test_a_window_of_zero_removes_the_whole_step_up_return_audit_budget() -> None:
-    """BACKLOG #3965. RED when: with a window of 0 a tiny global still refuses rows with no
-    account behind them, and pages on every one, though the docs say that window removes the whole
-    budget. A negative window or global is refused at load (BACKLOG #5318), so a global of 1, the
-    tightest that loads, stands in for the negative one this test first planted."""
+    """BACKLOG #3965: a window of 0 removes the whole budget. This first planted a negative
+    global, which refused every row there; the load now refuses that (BACKLOG #5318), and a window
+    of 0 prunes every hit before it counts, so this pins the behaviour rather than the
+    ``backstop_on`` window term, which no loadable value can still need."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(

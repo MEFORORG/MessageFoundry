@@ -1057,9 +1057,11 @@ class StoreSettings(_Section):
     multi_subnet_failover: bool = False
     # At least one connection; a pool of 0 could serve no borrow (BACKLOG #5769).
     pool_size: int = Field(default=40, ge=1)
-    # Seconds. 0 hands the driver no limit (command_timeout's documented 0 = no limit, STORE-3); a
-    # negative value is refused at load (BACKLOG #5769).
-    connect_timeout: int = Field(default=15, ge=0)
+    # Seconds (BACKLOG #5769). The login timeout is at least 1, as a connection's is
+    # (check_db_connect_timeout): asyncpg reads 0 as a deadline already past, so every connect would
+    # fail, and pyodbc reads it as the driver's default. The statement timeout keeps its
+    # documented 0 = no limit (STORE-3) and refuses only a negative.
+    connect_timeout: int = Field(default=15, ge=1)
     command_timeout: int = Field(default=30, ge=0)
     # Upper bound (seconds) on ONE pooled-connection borrow from the server-DB store pool, and on the
     # throwaway pool a DatabaseRef reference sync opens (BACKLOG #1052, ASVS 13.2.6). Server-DB only —

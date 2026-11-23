@@ -4375,8 +4375,7 @@ class AuthService:
         # silences a named user outright; a source with no account gets no such row, because
         # client addresses are the caller's to multiply and accounts are not. A row it stops pages
         # (_page_step_up_return_audit_backstop). Neither is built for a window of 0, which removes
-        # the whole budget (a small global would otherwise still refuse rows there). The load
-        # refuses a negative window or global (BACKLOG #5318).
+        # the whole budget. The load refuses a negative window or global (BACKLOG #5318).
         backstop_on = (
             settings.login_rate_limit_enabled and settings.login_rate_limit_window_seconds > 0
         )

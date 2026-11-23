@@ -275,8 +275,9 @@ class DrCoordinator:
         # cross-shard clobber the scoped startup reset removes. None/None-returning = global (the
         # unsharded DR box, where "no live siblings" genuinely holds).
         self._owned_lanes = owned_lanes
-        # Whether the DR run-profile is currently on (mirrors the engine's _dr_active; the engine seeds
-        # it from [dr].activate at construction and this coordinator flips it on activate/release).
+        # Whether the DR run-profile is currently on (mirrors the engine's _dr_active, seeded from
+        # [dr].activate, which a loaded config keeps False since BACKLOG #5965; this coordinator
+        # flips it on activate/release).
         self._active = bool(settings.enabled and settings.activate)
         # An activation whose run-profile is applied but whose dr.activate row is not yet known to be
         # written: (detail, actor, now). Set before the write and cleared after it, so a write that a

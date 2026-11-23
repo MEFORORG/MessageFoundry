@@ -158,11 +158,18 @@ def test_store_refuses_a_port_or_pool_out_of_range(field: str, value: int) -> No
     assert field in str(info.value)
 
 
-@pytest.mark.parametrize("field", ["connect_timeout", "command_timeout"])
-def test_store_timeouts_refuse_a_negative_and_keep_zero(field: str) -> None:
+def test_the_store_statement_timeout_refuses_a_negative_and_keeps_zero() -> None:
     with pytest.raises(ValidationError):
-        StoreSettings(**{field: -1})  # type: ignore[arg-type]
-    assert getattr(StoreSettings(**{field: 0}), field) == 0  # type: ignore[arg-type]
+        StoreSettings(command_timeout=-1)
+    assert StoreSettings(command_timeout=0).command_timeout == 0
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_the_store_login_timeout_is_at_least_one_second(value: int) -> None:
+    """asyncpg reads a 0 connect timeout as already expired, so no connection would open."""
+    with pytest.raises(ValidationError, match="connect_timeout"):
+        StoreSettings(connect_timeout=value)
+    assert StoreSettings(connect_timeout=1).connect_timeout == 1
 
 
 @pytest.mark.parametrize("value", [-1, 65536])

@@ -1074,7 +1074,7 @@ count is above `0` (vault BACKLOG #2613).
 > | Value | What loosens |
 > |---|---|
 > | `login_rate_limit_enabled = false` | Both sign-in limits, per address and across all clients, and the per-user limit on credential ceremonies. None is built. |
-> | `login_rate_limit_window_seconds` of `0` or less | The same three are off. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
+> | `login_rate_limit_window_seconds` of `0` | The same three are off. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
 > | `login_rate_limit_window_seconds` below `60` | The same three admit their counts once per that window instead of once per minute. A tiny window, such as `1e-6`, admits nearly every attempt. |
 > | `login_rate_limit_per_ip = 0`, or above `10` | The per-address sign-in limit, and the per-user ceremony limit, which reads the same number. `0` turns both off. |
 > | `login_rate_limit_global = 0`, or above `60` | The all-clients sign-in limit. `0` turns it off. |
@@ -1088,7 +1088,7 @@ count is above `0` (vault BACKLOG #2613).
 > The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
 > second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the
 > limiter off, a count or window changes nothing, so only `login_rate_limit_enabled` is named, and a
-> window of `0` or less likewise stands in for its counts. A short window is not named when every count
+> window of `0` likewise stands in for its counts. A short window is not named when every count
 > it paces is `0`, since it then paces nothing; each zeroed count is named instead. **The cutoff is the shipped default, not a
 > judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
 > reported like an off value, with text that says *looser than the default of* rather than *off*. A
@@ -1152,9 +1152,9 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].phi_read_rate_limit_*` looser than its default — PHI reads go less paced
 > No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.1). Named: `phi_read_rate_limit_enabled
-> = false`; a `phi_read_rate_limit_window_seconds` of `0` or less (off) or below `60` s (looser); a
+> = false`; a `phi_read_rate_limit_window_seconds` of `0` (off) or below `60` s (looser); a
 > `phi_read_rate_limit_per_actor` of `0` (off) or above `120` (looser). The same parts rule applies as for
-> sign-in: with the limiter off, or its window at `0` or less, its count is not named again.
+> sign-in: with the limiter off, or its window at `0`, its count is not named again.
 > `phi_read_rate_limit_global` ships **off** (`0`), so no value of it is looser than the default and it is
 > never named.
 - **What you lose:** the per-account pace on the PHI-read routes and console views
