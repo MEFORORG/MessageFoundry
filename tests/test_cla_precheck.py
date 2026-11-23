@@ -839,7 +839,14 @@ def test_a_commit_list_without_its_head_is_judged_with_a_fault(
     env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
     linked = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
     assert _run(env, _serve([linked])) == EXIT_FAULT
-    assert "do not include CLA_HEAD_SHA" in capsys.readouterr().out
+    assert "the commits this read returned do not include CLA_HEAD_SHA" in capsys.readouterr().out
+    # A complete read short of totalCount may have stopped before the head, so the fault names the
+    # commits it returned, never the pull request's.
+    short = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 5, False)
+    assert _run(env, _serve([short])) == EXIT_FAULT
+    out = capsys.readouterr().out
+    assert "the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "the pull request's commits do not include" not in out
     assert _run(env, _serve([_page([_commit(1, "wshallwshall")], 1, False)])) == EXIT_REFUSED
 
 

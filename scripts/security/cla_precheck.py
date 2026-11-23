@@ -37,9 +37,7 @@ It faults in at least these cases: the pull request's head moved while it read, 
 distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
 not be read.
 
-TWO CASES BACKLOG #5645 item 1 names, where a fault ended the run with nothing judged: any
-``errors`` in a reply faulted its page, and a head other than ``CLA_HEAD_SHA`` faulted the whole
-read at once:
+TWO CASES BACKLOG #5645 item 1 names:
 
   * A GraphQL reply carrying ``errors`` beside its ``data`` (a partial error). An error whose
     ``path`` points inside one commit node leaves that commit unjudged, a fault, because GraphQL
@@ -50,11 +48,12 @@ read at once:
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
     ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
     is judged: a read of another head proves nothing about this one. Only that case is re-read. A
-    read whose ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if its commits do not include that
-    head, or cannot show that they do, a fault is added beside the verdict, so a pass is not
-    silent. A head that moves after the first page is not re-read: the pages before the move,
-    which are of ``CLA_HEAD_SHA``, are judged, with a fault. Without ``CLA_HEAD_SHA`` (a comment
-    event) nothing is re-read.
+    read whose ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if it is complete and its commits do
+    not include that head, or cannot show that they do, a fault is added beside the verdict, so a
+    pass is not silent. A read cut short carries its own fault and is not checked for the head. A
+    head that moves after the first page is not re-read: the pages before the move, which are of
+    ``CLA_HEAD_SHA``, are judged, with a fault. Without ``CLA_HEAD_SHA`` (a comment event) nothing
+    is re-read.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
 the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
@@ -107,13 +106,14 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
   CLA_SIGNATURES_BRANCH the action's ``branch``
 
-EXIT CODES: 0 nothing refused; 1 refused, with a ``CLA pre-check refused`` annotation, whatever
-fault is reported beside it; 3 a fault caught by this script with nothing refused, at least: bad
-input, network, a reply in the wrong shape, a short read, a head still stale after the re-reads, a
-commit list that does not include ``CLA_HEAD_SHA`` or cannot show that it does, a commit GraphQL
-reported an error inside, or an exception raised inside ``run``. At least one other path exits 1
-with no refusal annotation: an error before ``main`` runs, such as at import. The interpreter itself exits 2 when it cannot open the script.
-The workflow tells these apart by the annotation, not the code alone.
+EXIT CODES: 0 nothing refused and no fault; 1 refused, with a ``CLA pre-check refused``
+annotation, whatever fault is reported beside it; 3 a fault caught by this script with nothing
+refused, at least: bad input, network, a reply in the wrong shape, a short read, a head still
+stale after the re-reads, a commit list that does not include ``CLA_HEAD_SHA`` or cannot show that
+it does, a commit GraphQL reported an error inside, or an exception raised inside ``run``. At
+least one other path exits 1 with no refusal annotation: an error before ``main`` runs, such as at
+import. The interpreter itself exits 2 when it cannot open the script. The workflow tells these
+apart by the annotation, not the code alone.
 """
 
 from __future__ import annotations
@@ -551,10 +551,11 @@ def evaluate(
     first_slots = slots[: read.first_page]
     seen_by_action = {slot.name for slot in first_slots if slot is not None}
     # A first-page commit this read could not key (an error inside it, a malformed author or
-    # committer, a null author) has an unknown key. A refusal below still holds, since an unsigned
-    # author owes a signature wherever the action sees them, but its reason must not claim that
-    # commit's key. It names keys, not people: an author may be a first-page committer, or carry
-    # another key there, and still be absent from the action's list under this key.
+    # committer) has an unknown key, and a null-author one, on which the action throws, has
+    # none. A refusal below still holds, since an unsigned author owes a signature wherever the
+    # action sees them, but its reason counts only the commits keyed. It names keys, not people:
+    # an author may be a first-page committer, or carry another key there, and still be absent
+    # under this key.
     keyed = sum(1 for slot in first_slots if slot is not None)
     if keyed == len(first_slots):
         where = "none of them carries"
@@ -737,7 +738,7 @@ def read_judged_head(
             sleep(delay)
             continue
         except PrecheckFault as exc:
-            # A later page failed. The pages already read still prove what they prove.
+            # A page failed after whole pages were kept. Those pages still prove what they prove.
             if exc.partial is None:
                 raise
             return exc.partial, False, str(exc)
@@ -754,7 +755,8 @@ def read_judged_head(
                         "pull request's commits include it is unknown"
                     ),
                 )
-            return read, True, "the pull request's commits do not include CLA_HEAD_SHA"
+            # The read may have stopped short of the head, so this names what it returned.
+            return read, True, "the commits this read returned do not include CLA_HEAD_SHA"
         return read, True, None
 
 
