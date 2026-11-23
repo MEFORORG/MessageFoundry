@@ -288,18 +288,75 @@ def test_secure_file_carries_explicit_denies_first_and_drops_inherited_and_full_
     import messagefoundry.store.store as store_mod
 
     current = (
-        "O:BAD:PAI(A;;FA;;;WD)(D;;FW;;;BG)(A;;FR;;;OW)(A;;0x1f01ff;;;OW)"
-        "(A;;WD;;;OW)(A;ID;FA;;;SY)(D;ID;FA;;;BU)"
+        "O:BAD:PAI(A;;FA;;;WD)(D;;FW;;;BG)(A;;FR;;;OW)(A;;0x1f01ff;;;OW)(A;;WD;;;OW)(A;;KA;;;OW)"
+        "(OA;;FR;00000000-0000-0000-0000-000000000001;;OW)(A;ID;FA;;;SY)(D;ID;FA;;;BU)"
     )
     captured = _capture_dacl_writes(monkeypatch, current=current)
     store_mod._secure_file(Path("store.db"))
-    assert captured == [("store.db", f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})(A;;FR;;;OW)", True)]
+    assert captured == [
+        (
+            "store.db",
+            f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})(A;;FR;;;OW)"
+            "(OA;;FR;00000000-0000-0000-0000-000000000001;;OW)",
+            True,
+        )
+    ]
+
+
+@_windows_only
+def test_secure_file_writes_the_bare_list_over_a_null_dacl(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A null DACL has nothing to carry over, so the one list is written as it is, not icacls.
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    captured = _capture_dacl_writes(monkeypatch, current="D:NO_ACCESS_CONTROL")
+    store_mod._secure_file(Path("store.db"))
+    assert captured == [("store.db", _OWNER_ONLY_SDDL, True)]
+
+
+@_windows_only
+def test_secure_file_takes_the_kept_icacls_rewrite_when_a_list_with_carried_entries_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A carried entry may be what the write refused. Main's icacls rewrite then still restricts the
+    # file, rather than leaving it its inherited list.
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    _capture_dacl_writes(
+        monkeypatch,
+        written=store_mod._SddlWrite(failure="its DACL did not convert"),
+        current="D:P(D;;FW;;;BG)",
+    )
+    runs: list[list[str]] = []
+
+    class _R:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def _run(argv: list[str], **_kw: object) -> _R:
+        runs.append(argv)
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    with caplog.at_level("WARNING"):
+        store_mod._secure_file(Path("store.db"))
+    assert "could not restrict store.db to this account" in caplog.text
+    assert [argv[1:] for argv in runs] == [
+        ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
+    ]
 
 
 @_windows_only
 @pytest.mark.parametrize(
     "current",
-    [pytest.param(None, id="unreadable"), pytest.param("D:NO_ACCESS_CONTROL", id="unparseable")],
+    [
+        pytest.param(None, id="unreadable"),
+        pytest.param('D:P(XA;;FR;;;WD;(@User.Dept=="x"))', id="unparseable"),
+    ],
 )
 def test_secure_file_takes_the_kept_icacls_rewrite_when_the_list_cannot_be_read(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, current: str | None

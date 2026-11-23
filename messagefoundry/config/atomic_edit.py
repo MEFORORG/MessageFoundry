@@ -46,8 +46,10 @@ elevated administrator of a file Administrators owns, makes the owner-only rewri
 the editing account, not SYSTEM, Administrators or another reader. That holds only when this
 process's account can be read from its token and the list can be written. When the token cannot be
 read, no list is written, the edit logs it, and the file keeps what its staging directory gave it.
-When only the write fails, ``store._secure_file`` retries the same one-entry list, so where it
-fails too the file keeps the candidate's or staging directory's list, which can hold more entries.
+When only the write fails, ``store._secure_file`` runs. It writes the same one-entry list, plus
+any explicit deny or restrictive OWNER RIGHTS entry the file carries, or runs the kept icacls
+rewrite where it cannot read the list, which keeps every explicit entry. Where its write fails too,
+the file keeps the candidate's or staging directory's list, which can hold more entries.
 A config file that is itself a link is refused rather than replaced: the rename would put a detached
 regular file where the link was and leave its target unedited.
 
@@ -641,7 +643,8 @@ def _restrict_to_editor(
     The whole list in one write, never an ``icacls /inheritance:r`` rewrite. The private directory
     ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER RIGHTS, and an
     own-account edit whose replaced file went through that icacls rewrite, which
-    ``store._secure_file`` made until it too wrote one whole list, was measured granting all four
+    ``store._secure_file`` made until it too wrote one whole list (it still makes it where it
+    cannot read a file's list), was measured granting all four
     rather than its owner alone; that rewrite does not remove an entry a file carries explicitly.
     :func:`replace_validated` calls this on the candidate before its first
     byte, with the live file's owner when that is another account so it can still read the file

@@ -9151,11 +9151,13 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     and explicit allows (an explicit grant on a moved-in file, or the entries a temp directory hands
     a file). Two kinds of explicit entry are carried into it, because ``icacls /grant:r`` kept them
     and dropping them would widen access: a deny, and an OWNER RIGHTS allow that withholds
-    WRITE_DAC (:func:`_entries_the_one_list_keeps`). When the current list cannot be read or
-    parsed, the kept icacls rewrite runs instead. The owner is not changed, and an owner keeps the
-    access Windows gives it beyond the list, so a file another account owns is left to this
-    process's account, not to its owner. A skipped or failed restriction is **logged** (STORE-2),
-    and leaves the file's access list as it was.
+    WRITE_DAC (:func:`_entries_the_one_list_keeps`). A carried OWNER RIGHTS allow grants the
+    file's owner what it holds, in place of the READ_CONTROL and WRITE_DAC Windows otherwise gives
+    an owner beyond the list. The owner is not changed, so a file another account owns keeps that
+    owner access. Where the current list cannot be read or parsed, or a list with carried entries
+    cannot be written, the kept icacls rewrite below runs instead, and it keeps every explicit
+    entry, other principals' allows included. A skipped or failed restriction is **logged**
+    (STORE-2), and leaves the file's access list as it was.
 
     ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
     and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
@@ -9206,14 +9208,18 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
                     path,
                     result.failure or f"Win32 status {result.dacl_status}",
                 )
+                if denies or owner_rights:
+                    # A carried entry may be what the write refused; main's rewrite still applies.
+                    _icacls_grant_keeping_explicit_entries(path, sid)
         else:
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
 
 
-#: An SDDL right that includes WRITE_DAC: file all, generic all, or WRITE_DAC itself.
-_SDDL_RIGHTS_WITH_WRITE_DAC = frozenset({"FA", "GA", "WD"})
+#: An SDDL right that includes WRITE_DAC: file all, generic all, key all (the renderer may pick
+#: it for a file's mask), or WRITE_DAC itself.
+_SDDL_RIGHTS_WITH_WRITE_DAC = frozenset({"FA", "GA", "KA", "WD"})
 _WRITE_DAC = 0x40000
 _GENERIC_ALL = 0x10000000
 #: OWNER RIGHTS, as an SDDL alias and as a SID.
@@ -9239,14 +9245,18 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
     withholds WRITE_DAC, because without any OWNER RIGHTS entry the owner holds READ_CONTROL and
     WRITE_DAC whatever the list says; one that grants WRITE_DAC is dropped, which leaves the owner
     no more than that. Inherited entries are not kept. The ACE text is copied as written, so an
-    object deny keeps its GUIDs."""
-    dacl = _parse_sddl_dacl(sddl)
-    if dacl is None:
-        return None
-    body = sddl[sddl.find("D:") + 2 :]
+    object entry keeps its GUIDs. A null DACL carries nothing."""
+    start = sddl.find("D:")
+    body = sddl[start + 2 :] if start >= 0 else ""
     end = body.find("S:")
     if end >= 0:
         body = body[:end]
+    first = body.find("(")
+    if start >= 0 and "NO_ACCESS_CONTROL" in (body if first < 0 else body[:first]):
+        return [], []
+    dacl = _parse_sddl_dacl(sddl)
+    if dacl is None:
+        return None
     texts = _SDDL_ACE.findall(body)
     if len(texts) != len(dacl.aces):
         return None
@@ -9257,7 +9267,7 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
             continue
         if kind in _SDDL_DENY_TYPES:
             denies.append(f"({text})")
-        elif kind == "A" and ace_sid in _OWNER_RIGHTS and not _grants_write_dac(rights):
+        elif kind in ("A", "OA") and ace_sid in _OWNER_RIGHTS and not _grants_write_dac(rights):
             owner_rights.append(f"({text})")
     return denies, owner_rights
 
@@ -9333,7 +9343,8 @@ async def _secure_file_async(path: Path) -> None:
     """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
     On Windows the restriction was an ``icacls`` subprocess, measured at 21 to 28 ms per file. It is
-    now one blocking security-descriptor write, unmeasured, still file I/O. Called straight from a
+    now a blocking security-descriptor read and write, unmeasured, still file I/O, and that
+    subprocess again where the list cannot be read or parsed. Called straight from a
     coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
@@ -9429,8 +9440,10 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
     """The owner and ``D:`` section of an SDDL string, or ``None`` when the DACL is absent or not
     plainly parseable.
 
-    ``None`` is the fail-closed answer: every caller treats it as "not hardened", so a shape this does
-    not understand (a callback ACE, a resource attribute, a null DACL) gets the owner-only rewrite."""
+    For the store-trio callers ``None`` is the fail-closed answer: they treat it as "not hardened",
+    so a shape this does not understand (a callback ACE, a resource attribute, a null DACL) gets the
+    owner-only rewrite. :func:`_secure_file` treats it differently: it cannot tell what a whole list
+    would drop, so it runs the kept icacls rewrite, which keeps every explicit entry."""
     owner_match = _SDDL_OWNER.search(sddl)
     owner = _resolve_sid(owner_match.group(1)) if owner_match else None
     start = sddl.find("D:")
@@ -9610,7 +9623,8 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
 
     GetNamedSecurityInfoW asks for the DACL and owner alone, so it needs only READ_CONTROL, and SDDL
     names principals by SID, so the answer does not depend on the display language. A failure is
-    logged with its Win32 status, because the caller then falls back to the owner-only rewrite."""
+    logged with its Win32 status, because the caller then falls back: a store-trio caller to the
+    owner-only rewrite, :func:`_secure_file` to the kept icacls rewrite."""
     if sys.platform != "win32":
         return None
     import ctypes
