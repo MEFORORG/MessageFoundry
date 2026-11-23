@@ -842,7 +842,7 @@ async def _inject_fields(
 
 
 #: Peak traced allocation the inject label read may reach on the bodies below (BACKLOG #5707).
-_INJECT_READ_PEAK_BOUND = 8_000_000
+_INJECT_READ_PEAK_BOUND = 4_000_000
 
 
 async def _peak_of_field_read(engine: Engine, raw: str) -> int:
@@ -962,28 +962,56 @@ async def test_inject_drops_a_summary_escapes_expanded_and_keeps_the_other_label
     assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
 
 
-async def test_inject_does_not_expand_escapes_in_the_control_id(
+async def test_inject_reads_an_escaped_control_id_raw_as_the_listener_does(
     engine: Engine, tmp_path: Path
 ) -> None:
-    # The same expansion in MSH-10: reading the control id would build it, so the header's own
-    # bound must hold it back as well as the summary's.
-    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|\U0001f600{'\\.in512\\' * 8000}|P|2.5.1\rPID|1\r"
+    # A whole-field read unescapes nothing, so escapes here cost no memory and lose no label.
+    control_id = "A\\.in512\\B"
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|{control_id}|P|2.5.1\rPID|1||MRN1\r"
+    assert Peek.parse(body).control_id == control_id
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, body) == (control_id, "ADT^A01", "MRN MRN1")
+
+
+async def test_inject_of_an_expanding_control_id_costs_no_expansion(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # Too wide for its column, so it is dropped; the type and summary do not depend on it.
+    body = (
+        f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|\U0001f600{'\\.in512\\' * 8000}|P|2.5.1\r"
+        "PID|1||MRN1\r"
+    )
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
     assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
-    assert await _inject_fields(engine, body) == (None, None, None)
+    assert await _inject_fields(engine, body) == (None, "ADT^A01", "MRN MRN1")
 
 
-async def test_inject_at_the_largest_summarized_body_stays_within_the_bound(
+async def test_inject_bound_reads_the_messages_own_escape_character(
     engine: Engine, tmp_path: Path
 ) -> None:
-    # The dearest body the gate still admits: at the body limit, every character in one escaped
-    # PID-3 leaf, so unescape walks all of it. Its summary is over the cap and is dropped.
-    head = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||\\H\\\U0001f600"
-    tail = "^^^H^MR\r"
-    limit = RegistryRunner._INJECT_SUMMARY_MAX_BODY_CHARS
-    body = head + "X" * (limit - len(head) - len(tail)) + tail
-    assert len(body) == limit
+    # MSH-2 names # as the escape: a bound that assumed a backslash would see no escape here.
+    body = (
+        "MSH|^~#&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
+        f"PID|1||\U0001f600{'#.in512#' * 2000}^^^H^MR\r"
+    )
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
+@pytest.mark.parametrize("filler", ["X", "中", "\U0001f600"], ids=["latin", "cjk", "astral"])
+async def test_inject_at_the_largest_summarized_source_stays_within_the_bound(
+    engine: Engine, tmp_path: Path, filler: str
+) -> None:
+    # The dearest read the gate admits: one escaped leaf filling the limit. Above Latin-1, unescape
+    # holds a separate string per character. The summary is over the cap and is dropped.
+    limit = RegistryRunner._INJECT_SUMMARY_MAX_SOURCE_CHARS
+    pid3 = "\\H\\" + filler * (limit - len("ADT^A01") - len("\\H\\") - len("^^^H^MR")) + "^^^H^MR"
+    assert len("ADT^A01") + len(pid3) == limit
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||{pid3}\r"
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
     assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
@@ -991,13 +1019,13 @@ async def test_inject_at_the_largest_summarized_body_stays_within_the_bound(
 
 
 @pytest.mark.parametrize(("over", "kept"), [(0, True), (1, False)])
-async def test_inject_summary_body_limit_is_exact(
+async def test_inject_summary_source_limit_is_exact(
     engine: Engine, tmp_path: Path, over: int, kept: bool
 ) -> None:
-    head = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN1\rNTE|1||"
-    limit = RegistryRunner._INJECT_SUMMARY_MAX_BODY_CHARS
-    body = head + "X" * (limit + over - len(head) - 1) + "\r"
-    assert len(body) == limit + over
+    # The padding is a component the summary does not read, so only the limit can drop it.
+    limit = RegistryRunner._INJECT_SUMMARY_MAX_SOURCE_CHARS
+    pid3 = "MRN1^" + "Z" * (limit + over - len("ADT^A01") - len("MRN1^"))
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||{pid3}\r"
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
     expected = "MRN MRN1" if kept else None
@@ -1014,26 +1042,31 @@ async def test_inject_summary_body_limit_is_exact(
 async def test_inject_summary_escape_growth_limit_is_exact(
     engine: Engine, tmp_path: Path, escapes: str, kept: bool
 ) -> None:
-    # The escapes sit outside every field the summary reads: the estimate counts them anyway.
-    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN1\rNTE|1||{escapes}\r"
+    # In a PID-3 component the summary does not read, so the value alone cannot drop it.
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN1^{escapes}\r"
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
     expected = "MRN MRN1" if kept else None
     assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", expected)
 
 
-@pytest.mark.parametrize(("over", "labelled"), [(0, True), (1, False)])
-async def test_inject_header_length_limit_is_exact(
-    engine: Engine, tmp_path: Path, over: int, labelled: bool
+async def test_inject_keeps_the_summary_of_a_large_body_with_escapes_elsewhere(
+    engine: Engine, tmp_path: Path
 ) -> None:
-    rest = "|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1"
-    pad = RegistryRunner._INJECT_SUMMARY_MAX_CHARS + over - len("MSH|^~\\&") - len(rest) - 1
-    header = f"MSH|^~\\&{rest}|{'Z' * pad}"
-    assert len(header) == RegistryRunner._INJECT_SUMMARY_MAX_CHARS + over
+    # An embedded-document ORU: size and escapes outside the summary's fields must not cost it.
+    body = (
+        "MSH|^~\\&|S|F|R|RF|20260101||ORU^R01|MSG1|P|2.5.1\r"
+        "PID|1||MRN1||TESTPATIENT^ALPHA\rORC|RE|ORD1\rOBR|1|ORD1|ACC1\r"
+        f"NTE|1||{'\\.in512\\' * 100}\rOBX|1|ED|DOC||^^^Base64^{'QUJD' * 100_000}\r"
+    )
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
-    expected = ("MSG1", "ADT^A01") if labelled else (None, None)
-    assert await _inject_fields(engine, f"{header}\rPID|1||MRN1\r") == (*expected, "MRN MRN1")
+    assert await _inject_fields(engine, body) == (
+        "MSG1",
+        "ORU^R01",
+        summarize(Peek.parse(body)),
+    )
+    assert summarize(Peek.parse(body)).startswith("MRN MRN1")
 
 
 @pytest.mark.parametrize(("mrn_chars", "kept"), [(4092, True), (4093, False)])

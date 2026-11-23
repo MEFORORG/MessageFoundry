@@ -2882,13 +2882,13 @@ class RegistryRunner:
 
     #: The longest injected summary stored, in characters (BACKLOG #5707). ``\.inN\`` escapes can
     #: expand a summary far past its body, and a longer one is stored as ``None``, never cut. Also
-    #: the most escape growth an inject will read through, and the longest MSH line it labels from.
+    #: the most escape growth an inject will unescape while building a summary.
     _INJECT_SUMMARY_MAX_CHARS = 4096
 
-    #: The longest normalized body an inject reads a summary from (BACKLOG #5707). Unescaping a leaf
-    #: costs several times its length in memory before any cap can see the result, so a longer body
-    #: is stored with no summary.
-    _INJECT_SUMMARY_MAX_BODY_CHARS = 256 * 1024
+    #: The most raw characters, across the fields a summary is built from, that an inject will
+    #: unescape (BACKLOG #5707). Unescaping costs many times a leaf's length in memory before any
+    #: cap can see the result, so a message over this is stored with no summary.
+    _INJECT_SUMMARY_MAX_SOURCE_CHARS = 16 * 1024
 
     async def ingress_fields_for(
         self, channel_id: str, raw: str
@@ -2912,14 +2912,11 @@ class RegistryRunner:
         :attr:`_INJECT_SUMMARY_MAX_CHARS`. The widths apply on every backend, so an inject can store
         ``None`` where a listener on SQLite or Postgres would keep a longer value.
 
-        Those checks see a value only after it is built, so the memory bound is taken first, from
-        the raw text. The summary is not read from a body over
-        :attr:`_INJECT_SUMMARY_MAX_BODY_CHARS`, or one whose counted escapes could add more than
-        :attr:`_INJECT_SUMMARY_MAX_CHARS` characters. The control id and type are not read from an
-        MSH line over that many characters, or whose own escapes could add as many. The estimate
-        counts every opener in the text it is given, so a body can lose its summary to an escape
-        outside the fields the summary reads."""
-        # Local so this row leaves the module's import block alone for the builders sharing it.
+        Those checks see a summary only after it is built, so its memory bound is taken first, from
+        the raw text of the fields it is built from. It is not built when those fields total over
+        :attr:`_INJECT_SUMMARY_MAX_SOURCE_CHARS` characters, or when their counted escapes could
+        add more than :attr:`_INJECT_SUMMARY_MAX_CHARS`. The measure takes whole fields, so an
+        escape in a component the summary does not read can still cost a row its summary."""
         from messagefoundry.parsing._builtin_hl7 import escape_expansion_estimate
 
         cap = self._INJECT_SUMMARY_MAX_CHARS
@@ -2943,24 +2940,24 @@ class RegistryRunner:
 
             def read() -> tuple[str | None, str | None, str | None]:
                 peek = Peek.parse(raw, max_bytes=ceiling)
-                text = peek.raw
-                # Peek.parse accepted this text, so it opens with optional whitespace, then MSH.
-                start = text.find("MSH")
-                line_end = text.find("\r", start)
-                stop = len(text) if line_end == -1 else line_end
-
-                def bounded(begin: int, end: int, max_len: int) -> bool:
-                    # The length first, so an oversized span is refused with no slice or scan.
-                    return (
-                        end - begin <= max_len
-                        and escape_expansion_estimate(text[begin:end], limit=cap) <= cap
-                    )
-
-                read_header = bounded(start, stop, cap)
-                read_summary = bounded(0, len(text), self._INJECT_SUMMARY_MAX_BODY_CHARS)
+                # A whole-field read returns the raw text and unescapes nothing, so measuring the
+                # fields summarize() reads costs no expansion. The control id and type are such
+                # reads too, which is why only the summary needs this bound.
+                sources = [
+                    value
+                    for path in ("MSH-9", "PID-3", "PID-5", "ORC-2", "ORC-3", "OBR-2", "OBR-3")
+                    if (value := peek.field(path))
+                ]
+                read_summary = sum(map(len, sources)) <= self._INJECT_SUMMARY_MAX_SOURCE_CHARS
+                if read_summary:
+                    # The estimate takes the escape character from its text's first line, so the
+                    # probe opens with the message's own MSH encoding characters.
+                    start = peek.raw.find("MSH")
+                    probe = "\r".join([peek.raw[start : start + 8], *sources])
+                    read_summary = escape_expansion_estimate(probe, limit=cap) <= cap
                 return (
-                    storable(peek.control_id, 256, utf16=True) if read_header else None,
-                    storable(peek.message_type, 64, utf16=True) if read_header else None,
+                    storable(peek.control_id, 256, utf16=True),
+                    storable(peek.message_type, 64, utf16=True),
                     storable(summarize(peek) or None, cap) if read_summary else None,
                 )
 
