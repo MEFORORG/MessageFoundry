@@ -134,10 +134,13 @@ def test_unread_ca_reason_reads_an_env_ref_as_unknown(key: str) -> None:
     assert unread_ca_reason({key: EnvRef("MEFOR_X")}) is None
 
 
-def test_hostname_check_report_counts_a_non_bool_as_possibly_off() -> None:
-    # A register of loosenings over-reports rather than raise or miss: "false" used to read as on.
-    assert _declares_hostname_check_off({"tls_check_hostname": "false"})
+def test_hostname_check_report_does_not_raise_on_a_non_bool() -> None:
+    # The register reads a non-bool literal as not off rather than raise: a connector that reads
+    # the key refuses it, so no hop runs with it.
     assert _declares_hostname_check_off({"tls_check_hostname": False})
+    assert _declares_hostname_check_off({"tls_check_hostname": EnvRef("MEFOR_X")})
+    for refused in ("false", "true", 0, 1):
+        assert not _declares_hostname_check_off({"tls_check_hostname": refused})
     assert not _declares_hostname_check_off({"tls_check_hostname": True})
     assert not _declares_hostname_check_off({})
 
@@ -153,6 +156,10 @@ def test_dialling_pin_problems_leaves_a_non_bool_flag_to_the_literal_pass() -> N
         {"url": "https://127.0.0.1/fhir", "tls_ca_file": "ca.pem", "tls_ca_pin": "a" * 64},
     )
     registry.add_outbound(build_outbound_connection("OB_FHIR", spec))
-    registry.outbound["OB_FHIR"].spec.settings["verify_tls"] = "false"
+    settings = registry.outbound["OB_FHIR"].spec.settings
+    # Control: a real False is read, and the pin beside the unread CA is reported.
+    settings["verify_tls"] = False
+    assert len(registry.dialling_pin_problems()) == 1
+    settings["verify_tls"] = "false"
     assert registry.dialling_pin_problems() == []
     assert any("verify_tls" in p for p in registry.bool_literal_problems())
