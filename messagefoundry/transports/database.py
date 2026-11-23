@@ -122,10 +122,14 @@ from messagefoundry.odbc_call_gate import (
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import (
+    is_a_sqlite_error,
+    known_driver_error,
     prints_a_codec_error,
     raised_by_a_driver,
+    reads_as_a_sqlstate,
     safe_exc,
     safe_text,
+    sqlite_errorname_of,
 )
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
@@ -2730,7 +2734,7 @@ def _send_refusal(sqlstate: str | None, exc: BaseException) -> DeliveryError:
     read as a SQLSTATE (vault BACKLOG #1661, added item 2). A ``UnicodeDecodeError``, text the
     driver returned, is not this message's, and the caller raises it as an internal error."""
     if sqlstate is not None:
-        return _classify_db_error(sqlstate, str(exc))
+        return _classify_db_error(sqlstate, str(exc), shown=_shown_state(sqlstate, exc) is not None)
     return NegativeAckError(
         f"database driver could not encode the message's text ({type(exc).__name__})",
         code="db",
@@ -2738,7 +2742,9 @@ def _send_refusal(sqlstate: str | None, exc: BaseException) -> DeliveryError:
     )
 
 
-def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False) -> DeliveryError:
+def _classify_db_error(
+    sqlstate: str, message: str, *, connecting: bool = False, shown: bool = True
+) -> DeliveryError:
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
 
@@ -2757,69 +2763,79 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     (``Key (mrn)=(...) already exists``) — and the returned error is persisted to ``queue.last_error``
     and ``message_events.detail`` and rendered into the ``connection_error`` alert, so interpolating
     it would carry a partner's identifier into all three on a first deployment. The same rule the
-    ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows."""
-    code = _driver_code(message)
-    detail = f"[{sqlstate}]" + (f" driver error {code}" if code else "")
+    ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows.
+
+    ``shown`` false says ``sqlstate`` came from an error that is no driver's
+    (:func:`_shown_state`): the error is classified by it all the same, but the text and ``code``
+    name neither it nor a native number read from ``message``."""
+    code = _driver_code(message) if shown else None
+    detail = (f"[{sqlstate}]" if shown else "[SQLSTATE withheld]") + (
+        f" driver error {code}" if code else ""
+    )
+    sqlstate_code = sqlstate if shown else "db"
     if _is_transient(sqlstate):
         return DeliveryError(f"database transient error {detail}")
     if connecting:
         if sqlstate[:2] in _CREDENTIAL_PREFIXES:
             return NegativeAckError(
                 f"database refused the login {detail}",
-                code=sqlstate,
+                code=sqlstate_code,
                 permanent=True,
                 credential_fault=True,
             )
         if sqlstate[:2] in _CONFIG_PREFIXES or sqlstate in _CONFIG_STATES:
             return NegativeAckError(
                 f"database connection refused by its configuration {detail}",
-                code=sqlstate,
+                code=sqlstate_code,
                 permanent=True,
                 config_fault=True,
             )
         return DeliveryError(f"database connect failed {detail}")
     return NegativeAckError(
         f"database rejected the statement {detail}",
-        code=sqlstate or "db",
+        code=sqlstate_code or "db",
         permanent=True,
     )
 
 
-#: A SQLSTATE as SQL defines one: five characters, each a digit or an uppercase Latin letter.
-#: Lowercase is refused, so a word such as ``OSError('reset')``'s or a codec name such as
-#: ``ascii`` does not read as one (vault BACKLOG #1661, added items 1 and 2).
-_SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
-
-
 def _sqlstate(exc: BaseException) -> str | None:
-    """The 5-character SQLSTATE a DB driver error carries in ``args[0]`` (pyodbc/aioodbc), or ``None``
-    if ``exc`` isn't shaped like a DB error — letting a genuine bug propagate as an internal error
-    rather than being misread as a transport failure.
-
-    Never for a ``UnicodeError``, whose first argument is the codec name. Only text of the SQLSTATE
-    alphabet (:data:`_SQLSTATE_RE`) counts. That is a bound on the misread, not a test of who
-    raised ``exc``: a non-driver error whose ``args[0]`` is five uppercase letters or digits still
-    reads as one."""
-    if isinstance(exc, UnicodeError):
+    """The 5-character SQLSTATE ``exc`` carries in ``args[0]``, the shape pyodbc/aioodbc's error
+    has, or ``None`` if ``exc`` isn't shaped like a DB error, letting a genuine bug propagate as an
+    internal error rather than being misread as a transport failure. It CLASSIFIES the failure, by
+    shape: a non-driver error shaped like one, such as ``KeyError('MRN42')``, is classified the same
+    way, but its state may be a value, so only a driver's own error names it in text
+    (:func:`_shown_state`; vault BACKLOG #1661, engine PR 3150 finding 1). Never for a
+    ``UnicodeError``, whose first argument is the codec name, nor for a SQLite error, whose
+    ``args[0]`` is its message. It reads no attribute but ``args``, with ``getattr`` and a default,
+    so an error arm can call it before its cleanup."""
+    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc):
         return None
-    args = getattr(exc, "args", ())
-    if args and isinstance(args[0], str) and _SQLSTATE_RE.fullmatch(args[0]):
-        return args[0]
-    return None
+    return _shaped_state(getattr(exc, "args", ()))
 
 
 def _log_sqlstate(exc: BaseException) -> str | None:
-    """The SQLSTATE a log line may name for ``exc``, or ``None`` when it is not read as a driver
-    error: asyncpg's ``sqlstate`` attribute, else :func:`_sqlstate`'s ``args[0]``.
-
-    Never for a ``UnicodeError`` or an exception that holds one. ``UnicodeEncodeError``'s first
-    argument is the codec name, which is not a SQLSTATE however it is spelled."""
-    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
+    """:func:`_sqlstate`, read first from asyncpg's ``sqlstate`` attribute when that is a SQLSTATE,
+    for the arms that classify an error a PostgreSQL store's driver may raise. Never for a
+    ``UnicodeError`` or an exception that holds one, whose text a codec name can make read like a
+    SQLSTATE. Like :func:`_sqlstate`, it classifies; :func:`_shown_state` says what text names."""
+    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
     state = getattr(exc, "sqlstate", None)
-    if isinstance(state, str) and _SQLSTATE_RE.fullmatch(state):
-        return state
-    return _sqlstate(exc)
+    return state if reads_as_a_sqlstate(state) else _shaped_state(getattr(exc, "args", ()))
+
+
+def _shaped_state(args: object) -> str | None:
+    """``args[0]`` when ``args`` is a tuple whose first item reads like a SQLSTATE."""
+    first = args[0] if isinstance(args, tuple) and args else None
+    return first if reads_as_a_sqlstate(first) else None
+
+
+def _shown_state(state: str | None, exc: BaseException) -> str | None:
+    """``state`` as text may name it: a driver's own error's SQLSTATE, and ``None`` for any other
+    error's, whose first argument may be a value such as ``KeyError('MRN42')``'s (engine PR 3150,
+    finding 1). The failure is still classified by ``state``; only its text is withheld. A class
+    whose driver test raises names nothing (:func:`~messagefoundry.redaction.known_driver_error`)."""
+    return state if state is not None and known_driver_error(exc) else None
 
 
 def _connection_lost(exc: BaseException | None) -> bool:
@@ -2853,16 +2869,11 @@ def _connection_lost(exc: BaseException | None) -> bool:
 _raised_by_a_driver = raised_by_a_driver
 
 
-#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
-#: such as ``SQLITE_CONSTRAINT_UNIQUE``, never a value.
-_SQLITE_ERRORNAME_RE = re.compile(r"SQLITE_[A-Z_]{1,40}")
-
-
 def _withheld(exc: BaseException) -> str:
     """A driver error with no SQLSTATE: its type, and SQLite's result-code name when it has one,
     since SQLite has no SQLSTATE and that name is its only PHI-free diagnostic."""
-    name = getattr(exc, "sqlite_errorname", None)
-    code = f" {name}" if isinstance(name, str) and _SQLITE_ERRORNAME_RE.fullmatch(name) else ""
+    name = sqlite_errorname_of(exc)
+    code = f" {name}" if name is not None else ""
     return f"{type(exc).__name__} [driver message withheld{code}]"
 
 
@@ -2880,11 +2891,13 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     the argument it could not encode, renders as its type alone (engine PR 2658, finding 4). Anything
     else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful text for a bug or
     an unreachable host, unless ``withhold`` says it is held by a driver error, as a link of its
-    chain (:func:`_redacted_copy`). That is a bound, not a guarantee: an error a driver raises as a
-    builtin type, or wraps in another library's, is printed as ``safe_exc`` prints it.
+    chain (:func:`_redacted_copy`), or it carries a SQLSTATE although it is no driver's
+    (:func:`_shown_state`): either renders as its type alone. That is a bound, not a guarantee:
+    an error a driver raises as a builtin type with any other arguments, or wraps in another
+    library's, is printed as ``safe_exc`` prints it.
 
-    Under ``withhold``, only a driver's own error may name a SQLSTATE: any other link renders as
-    its type alone, since ``args[0]`` of five letters or digits may be a value.
+    Only a driver's own error names a SQLSTATE (:func:`_shown_state`), since ``args[0]`` of five
+    letters or digits on any other error may be a value.
 
     A Unicode error, or a non-driver exception holding one, takes ``safe_exc`` or, under
     ``withhold``, its type alone, so this never prints a codec error's text;
@@ -2899,6 +2912,8 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
         state = _log_sqlstate(exc)
         if state is None:
             return _withheld(exc) if driver else safe_exc(exc)
+        if not known_driver_error(exc):  # its arguments may carry a value: name no state
+            return f"{type(exc).__name__} [message withheld]"
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring
         return (
@@ -2913,6 +2928,12 @@ class RedactedDbError(Exception):
     its name prints on every line it stands in for."""
 
 
+class RedactedDbErrorGroup(ExceptionGroup[RedactedDbError], RedactedDbError):
+    """:class:`RedactedDbError` for an exception group: its members are their own copies, so the
+    traceback prints each member's frames and line, as it prints the original's (vault BACKLOG
+    #1661, added item 6). Never raised."""
+
+
 def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
     """An ``exc_info`` for ``exc`` that keeps every frame and cause but no driver message.
 
@@ -2923,7 +2944,8 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
     The record then takes the logging chain's own path: ``prepare_log_record`` renders it into
     ``exc_text`` with the stdlib's walker, and the control-character scrub keeps its line breaks.
 
-    What the copy loses: an exception group's members, any ``__notes__``, the stdlib's extra hints
+    An exception group is copied as a :class:`RedactedDbErrorGroup` holding its members' copies.
+    What the copy loses: any ``__notes__``, the stdlib's extra hints
     (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and the text of
     every link :func:`_poll_log_line` withholds; ``safe_exc``'s 200-character bound applies to
     every non-driver line it keeps, and :data:`_ENGINE_TEXT_LIMIT` to the engine's fixed text.
@@ -2951,9 +2973,19 @@ def _redacted_copy(
     found = made.get(id(exc))
     if found is not None:
         return found
-    copy = RedactedDbError(_poll_log_line(exc, under=under)).with_traceback(exc.__traceback__)
-    made[id(exc)] = copy
+    line = _poll_log_line(exc, under=under)
     below = under or _raised_by_a_driver(exc)
+    members = exc.exceptions if isinstance(exc, BaseExceptionGroup) else ()
+    if members:
+        # A group's members exist before the group does, so a member whose chain leads back to the
+        # group meets this stand-in, which closes the cycle with the group's line and frames.
+        made[id(exc)] = RedactedDbError(line).with_traceback(exc.__traceback__)
+        copies = [_redacted_copy(member, made, under=below) for member in members]
+        copy: RedactedDbError = RedactedDbErrorGroup(line, copies)
+    else:
+        copy = RedactedDbError(line)
+    copy = copy.with_traceback(exc.__traceback__)
+    made[id(exc)] = copy
     if exc.__cause__ is not None:
         copy.__cause__ = _redacted_copy(exc.__cause__, made, under=below)
     if exc.__context__ is not None:
@@ -2982,7 +3014,7 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     withhold and is named by its type alone. It never raises: a link whose classification raises
     is named by its type and a fixed note."""
     try:
-        if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
+        if under or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)
         if isinstance(exc, _ENGINE_FIXED_TEXT):
             return safe_exc(exc, limit=_ENGINE_TEXT_LIMIT)  # the call-gate remedy is its tail
@@ -3785,13 +3817,16 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float) -> N
     state = _log_sqlstate(failure)
     if state is not None and _is_transient(state):  # _transient_driver_error's test
         await _discard_to_pool(pool, conn)
-        raise _classify_db_error(state, str(failure), connecting=True) from failure
+        raise _classify_db_error(
+            state, str(failure), connecting=True, shown=_shown_state(state, failure) is not None
+        ) from failure
     await _return_to_pool(pool, conn)
+    shown = _shown_state(state, failure)
     raise NegativeAckError(
         "database driver refused statement_timeout"
-        + (f" [{state}]" if state else f" ({type(failure).__name__})")
+        + (f" [{shown}]" if shown else f" ({type(failure).__name__})")
         + "; set statement_timeout = 0 on this connection if it cannot take one",
-        code=state or "db",
+        code=shown or "db",
         permanent=True,
         config_fault=True,
     ) from failure
@@ -3948,7 +3983,8 @@ async def _close_cursor(cur: Any) -> None:
     try:
         await cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
+        if logger.isEnabledFor(logging.DEBUG):  # render only a line kept (vault BACKLOG #1661)
+            logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = False) -> None:
@@ -4097,7 +4133,8 @@ def _close_raw_cursor(raw_cur: Any) -> None:
     try:
         raw_cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
+        if logger.isEnabledFor(logging.DEBUG):  # render only a line kept (vault BACKLOG #1661)
+            logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
@@ -4301,7 +4338,9 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
         if state is None:
             # Type alone, never the text: a connect error can carry DSN attributes (#5348).
             raise DeliveryError(f"DATABASE connect failed: {_credential_free_cause(exc)}") from exc
-        raise _classify_db_error(state, str(exc), connecting=True) from exc
+        raise _classify_db_error(
+            state, str(exc), connecting=True, shown=_shown_state(state, exc) is not None
+        ) from exc
 
 
 #: Cursor-allocation states that are the driver refusing the query timeout ``statement_timeout``
@@ -4323,15 +4362,16 @@ def _cursor_refused(exc: Exception, pool: Any) -> DeliveryError | None:
     if state is None:
         return None
     seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
+    shown = _shown_state(state, exc)
     if state in _QUERY_TIMEOUT_REFUSED_STATES and seconds:
         return NegativeAckError(
-            f"database driver refused a cursor [{state}]; if it cannot take the ODBC query "
-            "timeout, set statement_timeout = 0 on this connection",
-            code=state,
+            f"database driver refused a cursor [{shown or 'SQLSTATE withheld'}]; if it cannot take "
+            "the ODBC query timeout, set statement_timeout = 0 on this connection",
+            code=shown or "db",
             permanent=True,
             config_fault=True,
         )
-    return _classify_db_error(state, str(exc), connecting=True)
+    return _classify_db_error(state, str(exc), connecting=True, shown=shown is not None)
 
 
 def _cursor_refusal_discards(refused: DeliveryError) -> bool:
@@ -4374,7 +4414,7 @@ async def _probe_db(
     except Exception as exc:
         state = _sqlstate(exc)
         raise (
-            _classify_db_error(state, str(exc))
+            _classify_db_error(state, str(exc), shown=_shown_state(state, exc) is not None)
             if state
             else DeliveryError(f"DATABASE probe failed: {_credential_free_cause(exc)}")
         ) from exc
@@ -4418,7 +4458,8 @@ async def _fetch_result_set(cur: Any) -> list[Any] | None:
         if state is None:
             raise _ResultUnreadable(type(exc).__name__) from exc
         if state in _CLIENT_FETCH_STATES:
-            raise _ResultUnreadable(f"{type(exc).__name__} [{state}]") from exc
+            shown = _shown_state(state, exc)
+            raise _ResultUnreadable(type(exc).__name__ + (f" [{shown}]" if shown else "")) from exc
         raise
     return rows
 
@@ -4438,7 +4479,10 @@ async def _next_result_set(advance: Callable[[], Awaitable[Any]]) -> bool:
     except Exception as exc:
         state = _log_sqlstate(exc)
         if state in _NO_NEXTSET_STATES:
-            logger.debug("DATABASE: nextset() ended the capture walk with [%s]", state)
+            logger.debug(
+                "DATABASE: nextset() ended the capture walk with [%s]",
+                _shown_state(state, exc) or "SQLSTATE withheld",
+            )
             return False
         if state is None:
             logger.warning(
@@ -6045,7 +6089,7 @@ class DatabaseLookupExecutor:
         except DbLookupError:
             raise
         except Exception as exc:
-            state = _sqlstate(exc)
+            state = _shown_state(_sqlstate(exc), exc)
             # PHI-free: name the connection + SQLSTATE (if any) only — never the statement/params/rows.
             raise DbLookupError(
                 f"db_lookup query on {connection!r} failed" + (f" [{state}]" if state else "")

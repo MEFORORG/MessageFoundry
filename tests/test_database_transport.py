@@ -59,6 +59,7 @@ from messagefoundry.transports.database import (
     generic_odbc_tls_unenforced,
 )
 from messagefoundry.transports.egress import check_egress_allowed, check_source_allowed
+from tests._fake_dbapi_driver import DriverError
 from tests.test_poll_source_tick_ceilings import _CapturingSink
 
 INSERT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
@@ -133,7 +134,7 @@ _POSTGRES_DUP = (
 def _driver_exc(sqlstate: str, message: str) -> Exception:
     """A pyodbc-shaped error: ``args == (sqlstate, message)``, so ``str(exc)`` is the tuple repr the
     connector's call sites actually hand to :func:`_classify_db_error`."""
-    return Exception(sqlstate, message)
+    return DriverError(sqlstate, message)
 
 
 @pytest.mark.parametrize(
@@ -185,7 +186,7 @@ def test_driver_code_will_not_lift_a_parenthesised_column_value() -> None:
 
 
 def test_sqlstate_extraction() -> None:
-    assert _sqlstate(Exception("08S01", "msg")) == "08S01"
+    assert _sqlstate(DriverError("08S01", "msg")) == "08S01"
     assert (
         _sqlstate(ValueError("some bug")) is None
     )  # not SQLSTATE-shaped → propagates as a code bug
@@ -947,7 +948,7 @@ async def test_send_executes_and_commits() -> None:
 
 
 async def test_send_permanent_db_error_dead_letters() -> None:
-    conn = _FakeConn(_FakeCursor(Exception("23000", "constraint violation")))
+    conn = _FakeConn(_FakeCursor(DriverError("23000", "constraint violation")))
     dest = _dest()
     dest._pool = _FakePool(conn)
     with pytest.raises(NegativeAckError) as ei:
@@ -957,7 +958,7 @@ async def test_send_permanent_db_error_dead_letters() -> None:
 
 
 async def test_send_transient_db_error_retries() -> None:
-    conn = _FakeConn(_FakeCursor(Exception("08S01", "connection lost")))
+    conn = _FakeConn(_FakeCursor(DriverError("08S01", "connection lost")))
     dest = _dest()
     dest._pool = _FakePool(conn)
     with pytest.raises(DeliveryError) as ei:
@@ -1195,7 +1196,7 @@ async def test_probe_runs_select_1() -> None:
 
 async def test_probe_transient_error_is_delivery_error() -> None:
     dest = _dest()
-    dest._pool = _FakePool(_FakeConn(_FakeCursor(Exception("08S01", "connection lost"))))
+    dest._pool = _FakePool(_FakeConn(_FakeCursor(DriverError("08S01", "connection lost"))))
     with pytest.raises(DeliveryError) as ei:
         await dest.test_connection()
     assert not isinstance(ei.value, NegativeAckError)  # transient → reachability fail
@@ -1203,7 +1204,7 @@ async def test_probe_transient_error_is_delivery_error() -> None:
 
 async def test_probe_auth_error_is_permanent() -> None:
     dest = _dest()
-    dest._pool = _FakePool(_FakeConn(_FakeCursor(Exception("28000", "login failed"))))
+    dest._pool = _FakePool(_FakeConn(_FakeCursor(DriverError("28000", "login failed"))))
     with pytest.raises(NegativeAckError):  # bad credentials → permanent (still a test failure)
         await dest.test_connection()
 
@@ -1507,7 +1508,7 @@ async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
     src.on_connection_event = sink
     h = _RecordingHandler()
     cur = await _run_poll(
-        src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=Exception("08S01", "deadlock")
+        src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=DriverError("08S01", "deadlock")
     )
     assert h.bodies == [b"A", b"B"]  # both rows handled despite the first mark erroring
     assert len(cur.marks) == 2  # both marks attempted (the error is logged, not fatal)
@@ -1708,7 +1709,7 @@ async def test_source_poll_failure_log_carries_no_driver_value(
     assert _SYNTHETIC_ID not in caplog.text
     assert "duplicate key" not in caplog.text.lower()
     assert "Conversion failed" not in caplog.text
-    assert f"RedactedDbError: Exception [{state}] driver error {code}" in caplog.text
+    assert f"RedactedDbError: DriverError [{state}] driver error {code}" in caplog.text
     assert "in _select" in caplog.text  # the frames are kept
 
 
@@ -1731,7 +1732,7 @@ async def test_source_poll_failure_traceback_renders_a_chained_driver_error_safe
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(src, wrapped)
     assert "direct cause of the following exception" in caplog.text
-    assert "Exception [23000] driver error 2627" in caplog.text
+    assert "DriverError [23000] driver error 2627" in caplog.text
     # No SQLSTATE and not the engine's own error, so its text is withheld (BACKLOG #5348).
     assert "RedactedDbError: RuntimeError [message withheld]" in caplog.text
     # The frame's source line still shows the literal; the exception line no longer does.
@@ -1913,7 +1914,7 @@ def test_poll_log_line_names_an_error_with_no_arguments_by_type_alone() -> None:
     assert database_module._poll_log_line(TimeoutError(), under=False) == "TimeoutError"
 
 
-class _UnclassifiableError(Exception):
+class _UnclassifiableError(DriverError):
     """An error whose ``sqlstate`` property raises something ``getattr`` does not swallow."""
 
     @property
@@ -1936,7 +1937,7 @@ async def test_source_poll_failure_keeps_the_chain_when_one_link_cannot_be_class
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(_src(body_column="payload"), failure)
     assert "_UnclassifiableError [message withheld: RuntimeError while rendering it]" in caplog.text
-    assert "Exception [23000] driver error 2627" in caplog.text
+    assert "DriverError [23000] driver error 2627" in caplog.text
     assert "traceback withheld" not in caplog.text
 
 
@@ -2136,13 +2137,13 @@ async def test_source_poll_failure_reaches_a_sink_as_a_multiline_traceback(
     assert _SYNTHETIC_ID not in out
     if fmt == "json":
         exception = json.loads(out.splitlines()[-1])["exception"]
-        assert "Exception [22018] driver error 245" in exception
+        assert "DriverError [22018] driver error 245" in exception
     else:
         assert len(out.splitlines()) > 3  # the frames kept their line breaks
-        assert "Exception [22018] driver error 245" in out
+        assert "DriverError [22018] driver error 245" in out
 
 
-class _UnprintableDriverError(Exception):
+class _UnprintableDriverError(DriverError):
     """A driver-shaped error whose ``__str__`` raises."""
 
     def __str__(self) -> str:
@@ -2187,7 +2188,7 @@ async def test_source_poll_failure_log_survives_a_failed_copy(
     src = _src(body_column="payload")
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(src, _driver_exc("22018", _SQLSERVER_CONVERT))
-    assert "traceback withheld: RecursionError while rendering Exception" in caplog.text
+    assert "traceback withheld: RecursionError while rendering DriverError" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
 
 
@@ -2195,6 +2196,7 @@ class _AsyncpgShapedError(Exception):
     """asyncpg's shape: the SQLSTATE in a class attribute, the message in ``args[0]``, and a
     ``DETAIL`` line in ``str()`` that quotes the key."""
 
+    __module__ = "asyncpg.exceptions._base"
     sqlstate = "23505"
 
     def __str__(self) -> str:
