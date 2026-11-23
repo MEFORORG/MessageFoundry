@@ -77,11 +77,13 @@ def alert_sink_for(state: Any) -> AlertSink:
     return sink if sink is not None else _FALLBACK_ALERT_SINK
 
 
-#: ``granted_by`` on the ``administrator_granted`` alert a directory sign-in raises (vault BACKLOG
-#: #2610): no administrator acted, the directory's group membership did. It is a fixed marker, styled
-#: like the ``<kerberos>`` audit actor. ``POST /users`` refuses the name (``auth/usernames.py``), but
-#: provision-admin and the directory create paths do not, so an account literally named
-#: ``<directory>`` could read the same in this field; the alert's ``via`` names the route either way.
+#: ``granted_by`` on the ``administrator_granted`` alert raised when the directory, not an
+#: administrator, grants Administrator: a directory sign-in (vault BACKLOG #2610) and the directory
+#: reconciler (``via=directory_reconcile``). It is a fixed marker, styled like the ``<kerberos>``
+#: audit actor. The new-username rule's ``<...>`` form covers it; which paths apply that rule, and
+#: what the rule still admits, ``auth/usernames.py`` states. An account named so by a path that skips
+#: the rule, or spelled to render the same, could read the same in this field; the alert's ``via``
+#: names the route either way.
 DIRECTORY_GRANTED_BY = "<directory>"
 
 
