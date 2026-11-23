@@ -1988,9 +1988,12 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
 
 
 def require_monitoring_read(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
-    """Like :func:`require`, plus a **per-actor pace** on the cost-bearing ``monitoring:read`` GETs
-    (vault BACKLOG #1191, ASVS 15.2.2): the routes that rebuild the wiring graph or scan the store
-    per call. docs/SECURITY.md, *Monitoring-read pacing*, names the routes and the default's basis.
+    """Like :func:`require`, plus a **per-actor pace** on six ``monitoring:read`` GETs (vault BACKLOG
+    #1191, ASVS 15.2.2). Five of them cost store or parse work per call: ``/graph/edges`` rebuilds
+    the wiring graph, and ``/status``, ``/stats``, ``/metrics`` and ``/connections`` read aggregates
+    whose cost grows with the store. ``/metrics/history`` copies an in-memory ring and reads no
+    store; it is paced by the Manager's ruling, because the console polls it beside
+    ``/graph/edges``. docs/SECURITY.md, *Monitoring-read pacing*, says the default's basis.
 
     Charged at ADMISSION, before the route does its work. A throttled read is logged (not silent),
     answered 429 with the actor's ``Retry-After``, and recorded as an ``auth.gate_refused`` row with
