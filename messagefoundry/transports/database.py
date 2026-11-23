@@ -2036,7 +2036,9 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     # BACKLOG #5512: here and not in the cleartext guard, which stands down on a TLS mode. Neither
     # tls_hop_attested nor cleartext_accepted can speak for a hop with no named destination.
     if names_no_host(server):
-        raise ValueError(f"{where}DATABASE server names no host; name the host to connect to")
+        raise InsecureHopRefused(
+            f"{where}DATABASE server names no host; name the host to connect to"
+        )
     # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
     # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
     _refuse_unsafe_text(driver, what="odbc_driver", connection=connection, refused=";{}")
