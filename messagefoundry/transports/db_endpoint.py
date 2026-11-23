@@ -90,10 +90,10 @@ def split_generic_server(server: str) -> tuple[str, str]:
 
 
 def names_no_host(server: str) -> bool:
-    """Whether a generic-dialect ``server`` leaves its first host unnamed: blank, a bare port, empty
-    brackets, or nothing in front of its first comma (BACKLOG #5512). A driver has to pick such a
-    destination itself, so no reading here can place the hop."""
-    return not split_generic_server(server.partition(",")[0])[0]
+    """Whether ``server`` leaves a host unnamed: blank, a bare port, empty brackets, or an empty
+    entry on either side of a comma (BACKLOG #5512). A driver has to pick such a destination
+    itself, so no reading here can place the hop."""
+    return not all(split_generic_server(entry)[0] for entry in server.split(","))
 
 
 def _exact_split(text: str) -> tuple[str, str] | None:

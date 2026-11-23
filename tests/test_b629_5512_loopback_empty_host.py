@@ -14,7 +14,7 @@ Each caller here says what empty means where it stands:
 * no destination at all: a generic ODBC ``server`` naming no host and a blank SQL Server store are
   refused whatever the posture or declaration.
 
-The fourth meaning, a default that really is local, is the HTTP listener's: a blank host binds
+One more meaning, a default that really is local, is the HTTP listener's: a blank host binds
 loopback. ``test_offloopback_without_effective_peer_control_refused_by_posture`` in
 ``tests/test_inbound_http_intake_auth.py`` pins it. The predicate's own answer is in
 ``tests/test_tls_policy.py``, and ``is_never_proxied_host`` in
@@ -131,7 +131,7 @@ def test_a_key_share_whose_server_trims_to_nothing_is_still_refused() -> None:
 
 
 def _store_with_server(server: str | None) -> StoreSettings:
-    # model_copy: the validator refuses a None server, and a blank one is the case it lets through.
+    # model_copy: the validator refuses a None server, so the None case cannot be built through it.
     return _pg(LOOPBACK).model_copy(update={"server": server})
 
 
@@ -165,8 +165,17 @@ def test_a_cli_store_open_at_warn_warns_on_a_store_with_no_server(
 # --- an unknown destination: a generic ODBC server -----------------------------------------------
 
 
-#: Each passes the required-setting check, and none names a host in front of its first comma.
-_GENERIC_SERVERS_NAMING_NO_HOST = ["  ", ":5432", "[]", "[ ]:5432", ",1433", " ,db.example"]
+#: Each passes the required-setting check, and each leaves a host unnamed.
+_GENERIC_SERVERS_NAMING_NO_HOST = [
+    "  ",
+    ":5432",
+    "[]",
+    "[ ]:5432",
+    ",1433",
+    " ,db.example",
+    "db.example,",
+    "db.example,,other.example",
+]
 
 
 @pytest.mark.parametrize("server", _GENERIC_SERVERS_NAMING_NO_HOST)
@@ -216,24 +225,29 @@ def test_nothing_declared_covers_a_generic_hop_with_no_named_host(
 # --- what a blank [store].server means on each backend ------------------------------------------
 
 
-@pytest.mark.parametrize("server", ["", " ", "\t"])
-def test_a_sql_server_store_refuses_a_blank_server_and_names_the_setting(server: str) -> None:
-    """It would send ``SERVER=,1433``, and no hop guard reads the SQL Server store's host."""
-    with pytest.raises(ValidationError, match=r"\[store\]\.server is blank"):
+@pytest.mark.parametrize("server", ["", " ", "\t", ":1433", "[]", ",1433", "db.example,"])
+def test_a_sql_server_store_refuses_a_server_naming_no_host(server: str) -> None:
+    """It would reach the driver as ``SERVER=,1433`` or the like, and no hop guard reads the SQL
+    Server store's host."""
+    with pytest.raises(ValidationError, match=r"\[store\]\.server names no host"):
         _pg(server, backend=StoreBackend.SQLSERVER)
-    assert _pg("db.example", backend=StoreBackend.SQLSERVER).server == "db.example"
+
+
+@pytest.mark.parametrize("server", ["db.example", "tcp:db.example", r".\SQLEXPRESS", "::1"])
+def test_a_sql_server_store_keeps_a_server_that_names_a_host(server: str) -> None:
+    assert _pg(server, backend=StoreBackend.SQLSERVER).server == server
 
 
 @pytest.mark.parametrize("server", [" ", "\t"])
 def test_a_postgres_store_refuses_a_server_of_spaces_and_names_the_setting(server: str) -> None:
     """Spaces are not empty to asyncpg: it would try them as a host name."""
-    with pytest.raises(ValidationError, match=r"\[store\]\.server is blank"):
+    with pytest.raises(ValidationError, match=r"\[store\]\.server names no host"):
         _pg(server)
 
 
 def test_a_postgres_store_keeps_an_empty_server() -> None:
-    """Empty has a meaning here: asyncpg reads ``PGHOST``, then its local default. The hop is still
-    judged off-box (``test_a_store_with_no_server_is_not_judged_on_box``)."""
+    """Empty is legal here (docs/CONFIGURATION.md, the ``server`` row). The hop is still judged
+    off-box (``test_a_store_with_no_server_is_not_judged_on_box``)."""
     assert _pg("").server == ""
 
 

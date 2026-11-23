@@ -2056,8 +2056,9 @@ def _refuse_store_revocation(
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
     RevocationHopGuard.capture(
-        # Empty is PGHOST or asyncpg's local default, and the guard cannot tell which, so it judges
-        # the hop off-box (BACKLOG #5512). The stand-in names the setting.
+        # An empty server is legal here (docs/CONFIGURATION.md, the `server` row), but the guard
+        # cannot place it, so it judges the hop off-box (BACKLOG #5512). The stand-in names the
+        # setting.
         host=host or "(no [store].server)",
         cell="[store] Postgres TLS (verified TLS, no revocation check)",
         description=(

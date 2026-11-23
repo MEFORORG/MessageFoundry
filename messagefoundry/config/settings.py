@@ -1233,16 +1233,19 @@ class StoreSettings(_Section):
                 missing.append("username")  # SQL login needs a user (+ MEFOR_STORE_PASSWORD)
             if missing:
                 raise ValueError(f"{label} backend requires: " + ", ".join(missing))
-            # BACKLOG #5512. SQL Server would be sent `SERVER=,1433` with no hop guard reading it,
-            # and asyncpg would try spaces as a host name. An empty Postgres server stays: asyncpg
-            # reads it as PGHOST, then its local default, and the revocation guard judges that hop
-            # off-box because it cannot tell which one the driver picked.
-            if (
-                self.server is not None
-                and not self.server.strip()
-                and (self.server or self.backend is StoreBackend.SQLSERVER)
-            ):
-                raise ValueError(f"[store].server is blank: name the {label} host")
+            # BACKLOG #5512. No hop guard reads a SQL Server store's host, so one that names none
+            # would reach the driver as `SERVER=,1433`. On Postgres only spaces are refused: the
+            # `server` row of docs/CONFIGURATION.md says what an empty value means there.
+            server = self.server or ""  # `missing` above already refused None
+            if self.backend is StoreBackend.SQLSERVER:
+                # Here, not at module level: importing the transports package loads this module.
+                from messagefoundry.transports.db_endpoint import names_no_host
+
+                unnamed = names_no_host(server)
+            else:
+                unnamed = bool(server) and not server.strip()
+            if unnamed:
+                raise ValueError(f"[store].server names no host: name the {label} host")
         return self
 
     @field_validator("ssl_root_cert")
