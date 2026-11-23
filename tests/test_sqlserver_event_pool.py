@@ -111,11 +111,37 @@ def _event_aad(aad: bytes | None) -> bool:
 
 
 class _OrphanCursor(h.AsyncRecCursor):
-    """Answers a startup sweep's orphan SELECT with two rows no registry names."""
+    """Answers a startup sweep's orphan SELECT with two rows no registry names, and models the
+    queue rows' status for its ``UPDATE ... OUTPUT inserted.id WHERE id=? [AND status IN (?, ?)]``.
+
+    ``at_lock`` runs once, when the first applock is taken: after the sweep read and sealed its rows,
+    before it writes, which is where another writer can move a row."""
+
+    def __init__(self, at_lock: Any = None) -> None:
+        super().__init__()
+        self.status: dict[str, str] = {"q-1": "pending", "q-2": "pending"}
+        self.at_lock = at_lock
+        self._matched: list[tuple[str]] = []
+
+    async def execute(self, sql: str, params: Any = ()) -> None:
+        await super().execute(sql, params)
+        if "sp_getapplock" in sql and self.at_lock is not None:
+            self.at_lock(self.status)
+            self.at_lock = None
+        if sql.startswith("UPDATE queue SET status=?") and " OUTPUT inserted.id" in sql:
+            row_id = params[4]
+            allowed = params[5:7] if " AND status IN (?, ?)" in sql else None
+            current = self.status.get(row_id)
+            hit = current is not None and (allowed is None or current in allowed)
+            if hit:
+                self.status[row_id] = params[0]
+            self._matched = [(row_id,)] if hit else []
 
     async def fetchall(self) -> Any:
         if self._last.startswith("SELECT id, message_id,"):
             return [("q-1", "m-1", "GONE_A"), ("q-2", "m-2", "GONE_B")]
+        if self._last.startswith("UPDATE queue SET status=?"):
+            return self._matched
         return await super().fetchall()
 
 
@@ -219,3 +245,51 @@ async def test_a_thinned_event_is_built_and_written_nowhere(batched: bool) -> No
     assert ss._SQL_UPDATE_MESSAGE_STATUS in statements
     assert not [aad for _thread, aad, _held in cipher.sealed if _event_aad(aad)]
     assert conn.commits == 1
+
+
+# --- a sweep leaves a row that moved after its unlocked read ------------------------------------
+
+
+def _cancel_q1(status: dict[str, str]) -> None:
+    status["q-1"] = "cancelled"
+
+
+def _purge_q1(status: dict[str, str]) -> None:
+    del status["q-1"]
+
+
+_SWEEPS = (
+    "dead_letter_missing_handlers",
+    "dead_letter_missing_inbounds",
+    "dead_letter_missing_destinations",
+)
+
+
+@pytest.mark.parametrize("move", [_cancel_q1, _purge_q1], ids=["cancelled", "purged"])
+@pytest.mark.parametrize("sweep", _SWEEPS)
+async def test_a_sweep_leaves_a_row_that_moved_after_its_read(sweep: str, move: Any) -> None:
+    """The sweep reads its orphans with no lock, then seals each one on the pool before it locks.
+    A row cancelled or purged in that window keeps its new state: no DEAD update lands on it, no
+    ``dead`` event is written for it, and its message is not finalized. The untouched row is the
+    control, and is still dead-lettered (Lander hold 7091043913)."""
+    store = h.bare_store()
+    store._leader_epoch = None
+    cipher = _BlockingCipher()
+    store._cipher = cipher
+    cur = _OrphanCursor(at_lock=move)
+    cipher.cursor = cur
+    dead = await h.drive_async(store, sweep, cursor=cur, conn=h.RecConn(), **_SWEEP)
+
+    # Its new state stands: still cancelled, or still gone.
+    assert cur.status.get("q-1") == ("cancelled" if move is _cancel_q1 else None), cur.status
+    assert cur.status["q-2"] == "dead", "the control row was not dead-lettered"
+    assert dead == 1
+
+    def for_message(sql: str, mid: str) -> list[tuple[Any, ...]]:
+        return [p for s, p in cur.calls if s == sql and p and p[0] == mid]
+
+    events_m1 = for_message(ss._SQL_INSERT_EVENT, "m-1")
+    assert events_m1 == [], "a dead event was written for a row the sweep did not dead-letter"
+    assert for_message(ss._SQL_FINALIZE_COUNT, "m-1") == [], "the moved row's message was finalized"
+    assert [p[2] for p in for_message(ss._SQL_INSERT_EVENT, "m-2")] == ["dead"]
+    assert for_message(ss._SQL_FINALIZE_COUNT, "m-2") != []

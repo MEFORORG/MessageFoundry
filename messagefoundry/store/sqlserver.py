@@ -10264,12 +10264,29 @@ class SqlServerStore:
                     orphans, error, now, by_destination=False
                 )
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
+                dead: list[Any] = []
                 for row, last_error, built in prepared:
+                    # The rows were read with no lock, and sealing them took a pool hop each, so a
+                    # row may have left the SELECT's statuses since (cancelled, purged, completed).
+                    # The status term leaves such a row as it is, and the OUTPUT rowset says so: never
+                    # cursor.rowcount, for the reason _exec_terminal gives.
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (OutboxStatus.DEAD.value, now, last_error, now, row[0]),  # H4
+                        " owner=NULL, lease_expires_at=NULL" + _RESOLVE_OUTPUT + " WHERE id=?"
+                        " AND status IN (?, ?)",
+                        (
+                            OutboxStatus.DEAD.value,
+                            now,
+                            last_error,  # H4
+                            now,
+                            row[0],
+                            OutboxStatus.PENDING.value,
+                            OutboxStatus.INFLIGHT.value,
+                        ),
                     )
+                    if not await cur.fetchall():
+                        continue
+                    dead.append(row)
                     if built is not None:
                         await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
@@ -10277,12 +10294,13 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        log.warning(
-            "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
-            len(orphans),
-            ", ".join(sorted({r[2] for r in orphans})),
-        )
-        return len(orphans)
+        if dead:
+            log.warning(
+                "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
+                len(dead),
+                ", ".join(sorted({r[2] for r in dead})),
+            )
+        return len(dead)
 
     async def dead_letter_missing_inbounds(
         self, valid_names: set[str], now: float | None = None
@@ -10320,12 +10338,29 @@ class SqlServerStore:
                     orphans, error, now, by_destination=False
                 )
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
+                dead: list[Any] = []
                 for row, last_error, built in prepared:
+                    # The rows were read with no lock, and sealing them took a pool hop each, so a
+                    # row may have left the SELECT's statuses since (cancelled, purged, completed).
+                    # The status term leaves such a row as it is, and the OUTPUT rowset says so: never
+                    # cursor.rowcount, for the reason _exec_terminal gives.
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (OutboxStatus.DEAD.value, now, last_error, now, row[0]),  # H4
+                        " owner=NULL, lease_expires_at=NULL" + _RESOLVE_OUTPUT + " WHERE id=?"
+                        " AND status IN (?, ?)",
+                        (
+                            OutboxStatus.DEAD.value,
+                            now,
+                            last_error,  # H4
+                            now,
+                            row[0],
+                            OutboxStatus.PENDING.value,
+                            OutboxStatus.INFLIGHT.value,
+                        ),
                     )
+                    if not await cur.fetchall():
+                        continue
+                    dead.append(row)
                     if built is not None:
                         await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
@@ -10333,13 +10368,14 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        log.warning(
-            "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
-            " inbound(s): %s",
-            len(orphans),
-            ", ".join(sorted({r[2] for r in orphans})),
-        )
-        return len(orphans)
+        if dead:
+            log.warning(
+                "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+                " inbound(s): %s",
+                len(dead),
+                ", ".join(sorted({r[2] for r in dead})),
+            )
+        return len(dead)
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
     # The RetentionRunner drives these once the staged pipeline is enabled. Bodies are blanked to ''
@@ -13353,12 +13389,29 @@ class SqlServerStore:
                     orphans, error, now, by_destination=True
                 )
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
+                dead: list[Any] = []
                 for row, last_error, built in prepared:
+                    # The rows were read with no lock, and sealing them took a pool hop each, so a
+                    # row may have left the SELECT's statuses since (cancelled, purged, completed).
+                    # The status term leaves such a row as it is, and the OUTPUT rowset says so: never
+                    # cursor.rowcount, for the reason _exec_terminal gives.
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (OutboxStatus.DEAD.value, now, last_error, now, row[0]),  # H4
+                        " owner=NULL, lease_expires_at=NULL" + _RESOLVE_OUTPUT + " WHERE id=?"
+                        " AND status IN (?, ?)",
+                        (
+                            OutboxStatus.DEAD.value,
+                            now,
+                            last_error,  # H4
+                            now,
+                            row[0],
+                            OutboxStatus.PENDING.value,
+                            OutboxStatus.INFLIGHT.value,
+                        ),
                     )
+                    if not await cur.fetchall():
+                        continue
+                    dead.append(row)
                     if built is not None:
                         await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
@@ -13366,12 +13419,13 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        log.warning(
-            "dead-lettered %d orphaned outbound row(s) at startup for missing destination(s): %s",
-            len(orphans),
-            ", ".join(sorted({r[2] for r in orphans})),
-        )
-        return len(orphans)
+        if dead:
+            log.warning(
+                "dead-lettered %d orphaned outbound row(s) at startup for missing destination(s): %s",
+                len(dead),
+                ", ".join(sorted({r[2] for r in dead})),
+            )
+        return len(dead)
 
     async def replay(
         self,
