@@ -524,7 +524,7 @@ async def _fed_and_still_open(
     ],
 )
 async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
-    request_bytes: bytes, status: int, bare_answers: bool
+    request_bytes: bytes, status: int, bare_answers: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """What uvicorn's Server.shutdown does to each connection still in its set: call
     ``shutdown()``. On the bare sans-I/O class that sends a 500 on a conn that has already ended
@@ -543,13 +543,27 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     assert written.startswith(f"HTTP/1.1 {status} ".encode()), written[:40]
     assert b"nosniff" in written and transport.closing
     if not bare_answers:
-        # The parser-rejection step set these itself; uvicorn never ran handle_connect.
+        # uvicorn never ran handle_connect on either instance: its first act is to set
+        # ``request``, which uvicorn's __init__ does not. So the parser-rejection step set these
+        # three itself.
+        assert "request" not in vars(bare) and not bare.handshake_initiated
+        assert "request" not in vars(floored)
         assert (floored.handshake_initiated, floored.handshake_complete, floored.close_sent) == (
             True,
             True,
             True,
         )
-        floored.data_received(b"more bytes after the rejection")  # no second pass, no raise
+        passes: list[Any] = []
+        step = protocol_headers._answer_a_parser_rejection
+
+        def _counted(protocol: Any) -> None:
+            passes.append(protocol)
+            step(protocol)
+
+        monkeypatch.setattr(protocol_headers, "_answer_a_parser_rejection", _counted)
+        floored.data_received(b"more bytes after the rejection")  # no raise
+        assert passes == [], "the parser-rejection step ran a second pass"
+        assert bytes(transport.written) == written
     floored.shutdown()
     assert bytes(transport.written) == written
 
