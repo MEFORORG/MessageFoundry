@@ -9149,22 +9149,38 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     writes one protected DACL whole instead, granting full control to the account read from this
     process's token. Written whole, the list replaces the entries the file carried: inherited ones,
     and explicit allows (an explicit grant on a moved-in file, or the entries a temp directory hands
-    a file). Two kinds of explicit entry are carried into it, because ``icacls /grant:r`` kept them
-    and dropping them would widen access: a deny, and an OWNER RIGHTS entry that leaves the owner
-    less than the READ_CONTROL and WRITE_DAC Windows otherwise gives an owner beyond the list
-    (:func:`_entries_the_one_list_keeps`). The owner is not changed, so a file another account owns
-    keeps that owner access, or what a carried OWNER RIGHTS entry leaves it. Where the current list
-    cannot be read or parsed, or the write fails other than by access denied, the kept icacls
-    rewrite below runs instead, and it keeps every explicit entry, other principals' allows
-    included. For an unreadable list that is a deliberate choice: it is what the code before this
-    one-list write did, and the bare list, the other option, would drop a deny or a narrowing OWNER
-    RIGHTS entry it cannot see, so neither is strictly safer. Each of these is **logged** (STORE-2). A restriction that is skipped, or refused with
-    access denied, leaves the file's access list as it was.
+    a file). The owner is not changed.
+
+    **What the one list carries over** (this is the one statement of the rule; ADR 0163 and the
+    helpers point here). Explicit entries only, never inherited ones, their SDDL text copied as
+    written, and ``icacls /grant:r`` kept each of them:
+
+    - every deny, placed first;
+    - every OWNER RIGHTS object allow (``OA``), whatever its mask: on a file it grants the owner
+      nothing, yet it still turns off the owner's implicit access (measured);
+    - every plain OWNER RIGHTS allow that lacks READ_CONTROL or WRITE_DAC.
+
+    A plain OWNER RIGHTS allow holding both is dropped. Any OWNER RIGHTS entry turns off the
+    READ_CONTROL and WRITE_DAC Windows otherwise gives an owner beyond the list, so the owner ends
+    with what the carried OWNER RIGHTS entries grant, or, when none is carried, with those implicit
+    rights. A narrowing entry is carried because dropping it alone would hand the owner the
+    implicit rights back. Where a carried entry sits beside a dropped full one, the owner ends with
+    less than ``icacls /grant:r`` left it: a narrowing, not a loosening. A null DACL carries
+    nothing.
+
+    Where the current list cannot be read or parsed, or the write fails other than by access
+    denied, the kept icacls rewrite below runs instead, and it keeps every explicit entry, other
+    principals' allows included. For an unreadable list that is a deliberate choice: it is what
+    the code before this one-list write did, and the bare list, the other option, would drop a
+    deny or a narrowing OWNER RIGHTS entry it cannot see, so neither is strictly safer. Each of
+    these is **logged** (STORE-2). A restriction that is skipped, or refused with access denied,
+    leaves the file's access list as it was.
 
     ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
     and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
-    entries and replaces only this account's own grant, so every explicit entry the file carries stays. ADR 0163 relies
-    on that: an existing store file keeps the service account's trio entry when an open falls back.
+    entries and replaces only this account's own grant, so every explicit entry the file carries
+    stays. ADR 0163 relies on that: an existing store file keeps the service account's trio entry
+    when an open falls back.
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
     exists, and only logs when it cannot, so a key written and then passed here would sit under the
@@ -9234,7 +9250,8 @@ _SDDL_RIGHTS_WITH_READ_CONTROL = frozenset(
 _WRITE_DAC = 0x40000
 _READ_CONTROL = 0x20000
 _GENERIC_ALL = 0x10000000
-#: GENERIC_ALL, GENERIC_EXECUTE, GENERIC_WRITE and GENERIC_READ: each maps to READ_CONTROL on a file.
+#: GENERIC_ALL, GENERIC_EXECUTE, GENERIC_WRITE and GENERIC_READ: each maps to READ_CONTROL on a
+#: file.
 _GENERIC_ANY = 0xF0000000
 #: OWNER RIGHTS, as an SDDL alias and as a SID.
 _OWNER_RIGHTS = frozenset({"OW", "S-1-3-4"})
@@ -9263,14 +9280,8 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
     """The explicit entries of ``sddl`` that :func:`_secure_file`'s one list carries over, as SDDL
     ACE text: ``(denies, owner_rights)``. ``None`` when the list is not plainly parseable.
 
-    A deny is kept because ``icacls /grant:r`` kept it; dropping one widens access for a principal
-    the new list allows, this account or the owner. Without any OWNER RIGHTS entry the owner holds
-    READ_CONTROL and WRITE_DAC whatever the list says, so an OWNER RIGHTS entry is kept when it may
-    leave the owner less: a plain allow that lacks READ_CONTROL or WRITE_DAC, and every object allow
-    (``OA``), which on a file grants the owner nothing while still removing that implicit access
-    (measured). A plain allow holding both is dropped, which leaves the owner its implicit rights.
-    Inherited entries are not kept. The ACE text is copied as written, so an object entry keeps its
-    GUIDs. A null DACL carries nothing, so the bare list is written over it."""
+    The rule, and what the owner ends with, is stated once in :func:`_secure_file`'s docstring,
+    under *What the one list carries over*."""
     start = sddl.find("D:")
     body = sddl[start + 2 :] if start >= 0 else ""
     end = body.find("S:")

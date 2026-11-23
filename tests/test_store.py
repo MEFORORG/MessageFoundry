@@ -306,10 +306,12 @@ def test_secure_file_keeps_explicit_denies_and_a_restrictive_owner_rights_entry(
 def test_secure_file_carries_explicit_denies_first_and_drops_inherited_and_full_owner_rights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # What the one write carries over, read from the file's current list: explicit denies (first,
-    # in canonical order), and an explicit OWNER RIGHTS allow that lacks READ_CONTROL or WRITE_DAC.
-    # Dropped: every other allow, every inherited entry, and an OWNER RIGHTS allow holding both,
-    # because without it the owner keeps only READ_CONTROL and WRITE_DAC, which is no wider.
+    # What the one write carries over, read from the file's current list, per the rule in
+    # _secure_file's docstring: explicit denies (first), every OWNER RIGHTS object allow, and each
+    # plain OWNER RIGHTS allow lacking READ_CONTROL or WRITE_DAC. Dropped: every other allow, every
+    # inherited entry, and each plain OWNER RIGHTS allow holding both. With carried OWNER RIGHTS
+    # entries beside the dropped full ones, the owner ends with what the carried ones grant (FR and
+    # WD here), less than its implicit rights: a narrowing, not a loosening.
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod

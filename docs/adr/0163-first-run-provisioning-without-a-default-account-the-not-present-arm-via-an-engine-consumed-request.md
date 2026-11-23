@@ -276,13 +276,15 @@ see its *What it widens* and *Left open*.
   shares one security descriptor, so once the published store is restricted the staged link carries the
   same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** built where the
   write succeeds: for these callers `_secure_file` now writes one protected DACL whole, granting the
-  account the process runs as, and removes explicit allows for other principals, with one kind kept:
-  an OWNER RIGHTS allow that narrows the owner, holding less than the READ_CONTROL and WRITE_DAC Windows
-  otherwise gives an owner. Dropping that entry would hand the owner those implicit rights back, so it
-  is carried, and it is an explicit allow for the file's owner. Explicit denies are carried too, as the
-  icacls rewrite kept them. On some failures it runs the icacls rewrite instead, which keeps every
-  explicit entry, other principals' allows included. The `_secure_file` docstring states which entries
-  and which failures.
+  account the process runs as, and removes inherited entries and explicit allows for other
+  principals. It carries over these explicit entries, each of which the icacls rewrite kept: every deny;
+  every OWNER RIGHTS object allow (`OA`), whatever its mask; and every plain OWNER RIGHTS allow that
+  lacks READ_CONTROL or WRITE_DAC. A carried OWNER RIGHTS allow is an explicit allow for the file's
+  owner. It is carried because any OWNER RIGHTS entry turns off the READ_CONTROL and WRITE_DAC Windows
+  otherwise gives an owner, so dropping a narrowing one alone would hand the owner those rights back.
+  On some failures it runs the icacls rewrite instead, which keeps every explicit entry, other
+  principals' allows included. The `_secure_file` docstring, *What the one list carries over*, is
+  the statement of the rule and of those failures; this list follows it.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 
@@ -319,8 +321,8 @@ replaces only the principals it names (measured while building this); that preda
 another account owns whose list writes all failed. At least the DR and restore staging callers and
 the config editors' fallback for a file the editing account owns now get the one protected DACL
 `_secure_file` writes, as the amendment above states, so where that write succeeds the only
-explicit allows left on those files are this account's and any OWNER RIGHTS entry that narrows the
-owner.
+explicit allows left on those files are this account's and the OWNER RIGHTS entries that amendment
+names as carried.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.
 
