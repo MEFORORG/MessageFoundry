@@ -1447,6 +1447,41 @@ async def test_an_unnameable_class_prints_no_text_in_the_worker_fault_log(
     assert _UID not in written, written
 
 
+@pytest.mark.parametrize("make", _UNNAMEABLE.values(), ids=_UNNAMEABLE.keys())
+def test_an_unnameable_class_on_a_log_record_is_withheld_and_does_not_raise(
+    make: Callable[[], Exception],
+) -> None:
+    library = make()
+    written = _written(
+        logging.getLogger("pynetdicom.dul"),
+        # As a tuple: the stdlib reads an exception's traceback itself when it is given the instance.
+        lambda log: log.error("Patient %s", _PLANTED, exc_info=(type(library), library, None)),
+    )
+    assert _WITHHELD in written and "Named" in written  # CONTROL: the line, by the class's name
+    assert _UID not in written and _PLANTED not in written
+
+
+def test_a_record_whose_screen_raised_is_not_marked_screened() -> None:
+    class Interrupting:
+        calls = 0
+
+        def __str__(self) -> str:
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise SystemExit(_UID)
+            return f"Patient {_PLANTED}"
+
+    record = logging.LogRecord(
+        "pynetdicom.dul", logging.ERROR, __file__, 1, Interrupting(), (), None
+    )
+    with pytest.raises(SystemExit):
+        dicom_module._screen_record(record)
+    assert dicom_module._SCREENED not in record.__dict__
+    dicom_module._screen_record(record)  # the next pass screens it, rather than pass the raw line
+    assert _WITHHELD in record.getMessage() and _PLANTED not in record.getMessage()
+    assert record.__dict__[dicom_module._SCREENED] is True
+
+
 def test_a_delivery_error_with_no_chain_keeps_none() -> None:
     from messagefoundry.transports.base import DeliveryError
 

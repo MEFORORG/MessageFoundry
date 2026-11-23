@@ -688,20 +688,22 @@ def _screened_traceback(info: tuple[type[BaseException], BaseException, Any]) ->
 
 
 def _screen_record(record: logging.LogRecord) -> None:
-    """Make ``record`` safe to write, once, and never raise: this runs on whatever pynetdicom thread
-    logged the line, and a failure here withholds the line rather than crash or pass it."""
+    """Make ``record`` safe to write, once. This runs on whatever pynetdicom thread logged the line,
+    so an ``Exception`` from its message withholds the line, and one from its traceback withholds
+    the traceback, rather than crash or pass them. A ``BaseException`` from a class's own code still
+    propagates. The record is marked only once this is done, so one that raised is screened again
+    rather than written raw."""
     if record.__dict__.get(_SCREENED):
         return
-    record.__dict__[_SCREENED] = True
     info = record.exc_info
     exc = info[1] if isinstance(info, tuple) and len(info) > 1 else None
     try:
         line = _screened_line(record.getMessage())
     except Exception as failed:  # noqa: BLE001 - bad %-args, or a msg whose str() raises
-        logger.debug("A DICOM library log line was withheld: %s", type(failed).__name__)
+        logger.debug("A DICOM library log line was withheld: %s", _type_name(failed))
         line = None
     if line is None:
-        named = f" ({type(exc).__name__})" if exc is not None else ""
+        named = f" ({_type_name(exc)})" if exc is not None else ""
         line = f"{record.name} {record.levelname} {_LINE_WITHHELD}{named}"
     # Always rewritten: a handler's handleError prints a record's msg and args if a format fails.
     record.msg, record.args = line, ()
@@ -710,13 +712,14 @@ def _screen_record(record: logging.LogRecord) -> None:
         if record.exc_text:
             record.exc_text = f"(traceback withheld: {_LINE_WITHHELD})"
         record.exc_info = None if not isinstance(info, tuple) else info
-        return
-    try:
-        record.exc_text = _screened_traceback((type(exc), exc, exc.__traceback__))
-    except Exception as failed:  # noqa: BLE001 - rendering a third-party exception
-        record.exc_text = f"{type(exc).__name__} (traceback withheld: it did not render)"
-        logger.debug("A DICOM traceback was withheld: %s", type(failed).__name__)
-    record.exc_info = None
+    else:
+        try:
+            record.exc_text = _screened_traceback((type(exc), exc, exc.__traceback__))
+        except Exception as failed:  # noqa: BLE001 - rendering a third-party exception
+            record.exc_text = f"{_type_name(exc)} (traceback withheld: it did not render)"
+            logger.debug("A DICOM traceback was withheld: %s", _type_name(failed))
+        record.exc_info = None
+    record.__dict__[_SCREENED] = True
 
 
 class _PeerValueFilter(logging.Filter):
