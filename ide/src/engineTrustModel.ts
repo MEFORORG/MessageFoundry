@@ -453,6 +453,8 @@ export function isFullyQualifiedPath(file: string, flavour: PathFlavour = path):
  *   * a second, DIFFERENT file for a `host:port` an earlier entry already pinned. Anchors are filed by
  *     `host:port` ({@link engineHostKey}), so two files cannot both apply; the first one stays, and
  *     the same file named twice (an engine shard repeating its environment's URL) is not a conflict.
+ *     On Windows only ASCII case is folded, so one file spelled twice with a non-ASCII case
+ *     difference is refused as another file, the fail-safe reading (BACKLOG #5832).
  */
 export function trustPinsFor(
   targets: readonly PinTarget[],

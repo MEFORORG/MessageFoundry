@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// Workspace containment and path identity fold ASCII case only on Windows (BACKLOG #5404, #5832).
+// Workspace containment, the hooks-folder match and the caFile pin match fold ASCII case only on
+// Windows (BACKLOG #5404, #5832). pathIdentity.fileKey keeps VS Code's toLowerCase() fold.
 //
 // path.win32.relative and toLowerCase() fold U+212A KELVIN SIGN onto "k", a name NTFS keeps apart
 // from "k", so a sibling directory spelled with it read as inside the workspace. Every refusal here is
@@ -50,7 +51,7 @@ suite("isPathWithin folds ASCII case only on win32 (BACKLOG #5832)", () => {
   });
 });
 
-suite("the sibling sites use the ASCII-only fold (BACKLOG #5832)", () => {
+suite("the caFile pin match uses the ASCII-only fold (BACKLOG #5832)", () => {
   test("a second caFile differing only by KELVIN SIGN is refused, an ASCII case twin is not", () => {
     const url = "https://prod:8765";
     const kelvin = trustPinsFor(
