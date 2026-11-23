@@ -1805,8 +1805,10 @@ rule and one wording for both). A site that supplies only the issuing intermedia
 at start, naming the root.
 
 **Still leaf only.** At least every outbound hop under `[tls].crl_file`. Such a hop may verify
-against the OS trust store, whose roots no CRL file names, so the start rule would refuse it.
-*(Note 2026-11-23: section 15 amends this paragraph, its reason included.)*
+against the OS trust store, where the start rule cannot be met: section 15 gives the reason.
+*(CORRECTED 2026-11-23: this said the OS store's roots are ones "no CRL file names, so the start
+rule would refuse it". A CRL file can name them; section 15 gives the reason that holds, and makes
+this paragraph hold only while `[tls].crl_check_chain` is unset.)*
 `capath=` loading stays out of scope, for the reason the out-of-scope bullet gives.
 
 Pinned by `tests/test_inbound_listener_crl_chain.py` and `tests/test_api_tls_client_trust.py`.
@@ -1815,7 +1817,7 @@ Pinned by `tests/test_inbound_listener_crl_chain.py` and `tests/test_api_tls_cli
 
 **What changed.** `[tls].crl_check_chain`, default `false`, turns on the chain check of section 14
 on the outbound hops `[tls].crl_file` reaches. Section 14's *Still leaf only* now holds while it is
-unset. It is opt-in, not automatic, for the reason that section gives, and for one measured on
+unset. It is opt-in, not automatic, because the `system` and `augment` arms refuse it (below), and for one measured on
 OpenSSL 3.5.7: `ssl.create_default_context` sets `VERIFY_X509_PARTIAL_CHAIN`, so a CA file holding
 an intermediate ends the chain there, and every handshake is refused with `unable to get
 certificate CRL`.
@@ -1827,9 +1829,9 @@ one whose CA file is a connection's `tls_ca_file`, `[alerts].email_tls_ca_file` 
 self-signed root also in it, and applies section 14's start rule, worded for a server chain. An
 intermediate beside its root is admitted: the chain runs on through it to the root, and the start
 rule then asks for the intermediate's own CRL too. The running-hop reload applies the same start
-rule. On the `system` and `augment` arms it refuses the build, for the reason
-`OS_ROOTS_CHAIN_CHECK_REASON` in `messagefoundry/config/tls_policy.py` states, and the refusal
-names the settings that avoid it. A REST connection's ECH sidecar hop checks no `[tls]` CRL against
+rule. On the `system` and `augment` arms it refuses the build: the start rule would need a CRL in `[tls].crl_file` from every CA the OS trust store loads, dozens of public roots or more, and the CA list it reads leaves out certificates that are not CAs and the CAs of a hashed CA directory (capath) that no handshake has used yet, so the setting is refused rather than honoured unchecked.
+`OS_ROOTS_CHAIN_CHECK_REASON` in `messagefoundry/config/tls_policy.py` is the refusal's own
+statement of it, and the refusal names the settings that avoid it. A REST connection's ECH sidecar hop checks no `[tls]` CRL against
 its partner, leaf or chain, since the sidecar verifies the partner, so its refusal offers no way to
 chain-check it. LDAPS, OIDC, the log forwarder and the Postgres store, which
 have CRL settings of their own, keep the leaf check.

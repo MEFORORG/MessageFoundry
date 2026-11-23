@@ -244,7 +244,7 @@ def test_the_os_trust_store_arms_refuse_the_build(build: _Builder, two_tier: _Tw
         text = str(refused.value)
         assert OS_ROOTS_CHAIN_CHECK_REASON in text
         for setting in (
-            "tls_ca_file",
+            "a connection's own tls_ca_file",
             "[alerts].email_tls_ca_file",
             '[tls].internal_ca_file with [tls].trust_anchor_mode = "pinned"',
             "unset [tls].crl_check_chain",
@@ -294,7 +294,9 @@ def test_an_ech_rest_hop_on_the_os_roots_refuses_without_promising_a_check(
         assert "no CRL in [tls].crl_file is checked against the partner" in text
         assert OS_ROOTS_CHAIN_CHECK_REASON in text
         assert "To clear this refusal, unset [tls].crl_check_chain" in text
-        assert "a connection's own tls_ca_file" in text
+        assert "through its own tls_ca_file or [tls].internal_ca_file" in text
+        assert "token server" not in text and "[alerts]" not in text
+        assert "verifies it" not in text
         assert "None of these makes the engine check the partner's revocation" in text
         assert "To chain-check" not in text
 
@@ -325,7 +327,11 @@ def test_an_ech_rest_hop_pinned_by_its_ca_file_still_meets_the_own_crl_rule(
 def test_the_configuration_row_the_settings_comment_names_exists() -> None:
     """TlsSettings.crl_check_chain's comment points at this row; it must be there to find."""
     doc = Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md"
-    assert "| `crl_check_chain` | bool | `false` |" in doc.read_text(encoding="utf-8")
+    text = doc.read_text(encoding="utf-8")
+    assert "| `crl_check_chain` | bool | `false` |" in text
+    # The symbol the row, ADR 0173 and the settings comment point at; importing it above
+    # proves it exists.
+    assert "`OS_ROOTS_CHAIN_CHECK_REASON`" in text
 
 
 @_BUILDERS
