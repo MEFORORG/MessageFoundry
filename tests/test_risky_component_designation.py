@@ -65,6 +65,11 @@ _CORE_LOCK = _ROOT / "docker" / "locks" / "requirements-core.lock"
 #: The ``sqlserver`` extra's closure and the lock it copies (BACKLOG #1955).
 _SQLSERVER_CLOSURE = _ROOT / "security" / "runtime-closure-sqlserver.txt"
 _SQLSERVER_LOCK = _ROOT / "docker" / "locks" / "requirements-sqlserver.lock"
+#: The ``postgres`` extra's closure and the lock it copies (BACKLOG #5933). The runtime-postgres
+#: image installs that lock. The page records the closure and does not yet assess the extra, so it
+#: is a pair here and not in ``_EXTRAS``.
+_POSTGRES_CLOSURE = _ROOT / "security" / "runtime-closure-postgres.txt"
+_POSTGRES_LOCK = _ROOT / "docker" / "locks" / "requirements-postgres.lock"
 #: The ``harness`` extra's closure and the lock it copies. No image installs that lock.
 _HARNESS_CLOSURE = _ROOT / "security" / "runtime-closure-harness.txt"
 _HARNESS_LOCK = _ROOT / "security" / "locks" / "requirements-harness.lock"
@@ -72,6 +77,7 @@ _HARNESS_LOCK = _ROOT / "security" / "locks" / "requirements-harness.lock"
 _PAIRS = (
     (_CLOSURE, _CORE_LOCK),
     (_SQLSERVER_CLOSURE, _SQLSERVER_LOCK),
+    (_POSTGRES_CLOSURE, _POSTGRES_LOCK),
     (_HARNESS_CLOSURE, _HARNESS_LOCK),
 )
 #: The dated public-metadata snapshot the ASVS-example section is held to (BACKLOG #1189).
@@ -336,6 +342,25 @@ def test_an_extra_closure_is_the_core_closure_plus_the_extra(extra: str) -> None
         f"{path.name} adds no {marker} to the core closure; the extra's own package is missing, "
         "so the file or its parser is wrong"
     )
+
+
+def test_the_postgres_closure_is_the_core_closure_plus_asyncpg() -> None:
+    """RED when: the ``postgres`` closure stops being the core one plus ``asyncpg`` alone.
+
+    The page's scope section says the extra adds one name, ``asyncpg``. A lock move that adds a
+    second name, or drops ``asyncpg``, makes that sentence false, and the extra is not in
+    ``_EXTRAS``, so no section test would see it (BACKLOG #5933).
+    """
+    core = _closure_pins()
+    pins = _closure_pins(_POSTGRES_CLOSURE)
+    assert len(core) >= 20, f"the core closure parsed to {len(core)} names, too few to be real"
+    moved = sorted(n for n in core if pins.get(n) != core[n])
+    assert not moved, (
+        f"core packages missing or at another version in the postgres closure: {moved}"
+    )
+    assert _additions(_POSTGRES_CLOSURE) == {"asyncpg"}
+    scope = " ".join(_region("## Scope, and the denominator", "## The criterion").split())
+    assert "It adds one name to the core closure, `asyncpg`." in scope
 
 
 @pytest.mark.parametrize("extra", sorted(_EXTRAS))

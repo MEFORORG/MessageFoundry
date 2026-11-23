@@ -31,7 +31,8 @@ from ._common import (
     blank_to_none,
     check_filters,
     for_echo,
-    posted_field_value,
+    posted_needle,
+    sends_a_needle,
 )
 
 # content-search (ADR 0046 #51): the search PAGE is step-up-gated (bulk-PHI decrypt), so register
@@ -124,14 +125,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         message_type: str | None,
         control_id: str | None,
         limit: int,
+        notice: str = "",
     ) -> HTMLResponse:
         """Render the search page for one set of criteria — shared by the GET form render and by the
         POST that runs a needle-bearing search (BACKLOG #1184). Everything below this line is identical
         for both; only where the criteria CAME FROM differs, which is the whole point of the split."""
         # A criterion is required to search; with none, render the bare form (no decrypt/audit).
         # A field_path alone is a valid presence-test search (matches make_spec/row_matches),
-        # so it counts as a criterion too — keeping /ui at parity with the JSON API.
-        has_criteria = bool(content) or bool(field_value) or bool(field_path)
+        # so it counts as a criterion too. The rule is the engine's for a route where a needle is
+        # optional, so a Field value of only spaces is no criterion and the page renders the bare
+        # form, where POST /messages/search, which needs a needle, answers it with a 400 (#6700).
+        has_criteria = sends_a_needle(content, field_path, field_value)
         preset_list = await _presets(engine, identity, request)
         # What ARRIVED, for the rules to judge -- see routes/core.py: checking the for_echo'd
         # copy below would hand them a value with its control characters already stripped.
@@ -150,6 +154,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             status=for_echo(status_filter),
             message_type=for_echo(message_type),
             control_id=for_echo(control_id),
+            notice=notice,
         )
         # BACKLOG #1740: the four metadata filters, against the rules GET /messages/search declares.
         # Checked HERE rather than in the GET route so both arms are covered by one call; on the POST
@@ -276,14 +281,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         which also drops the typed term, the same deliberate posture the GET form had."""
         assert_same_origin(request)
         form = dict(await _form_pairs(request))
+        needle = posted_needle(form)
         try:
             # SearchPresetCriteria carries the SAME bounds as the JSON route's Query declarations, so a
             # posted form is validated exactly as a query string was. Reusing a model the console
             # already imports leaves the engine seam untouched.
             criteria = SearchPresetCriteria(
-                content=form.get("content") or None,
-                field_path=form.get("field_path") or None,
-                field_value=posted_field_value(form),
+                content=needle.content,
+                field_path=needle.field_path,
+                field_value=needle.field_value,
                 target=form.get("target")  # type: ignore[arg-type]
                 if form.get("target") in ("raw", "summary", "both")
                 else "both",
@@ -322,6 +328,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             message_type=criteria.message_type,
             control_id=criteria.control_id,
             limit=criteria.limit,
+            notice=needle.notice,
         )
 
     @app.post("/ui/messages/search/presets")

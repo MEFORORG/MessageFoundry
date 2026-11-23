@@ -9,6 +9,8 @@
 // link cases are caught too. It is vscode-free so the node-side unit suite can drive it.
 import * as fs from "node:fs";
 import * as path from "node:path";
+// ASCII-only case fold on Windows, not path.relative's toLowerCase() (pathFold.ts, BACKLOG #5832).
+import { isPathWithin as isWithin, isSamePath, nonAsciiCaseVariant, segmentsBelow } from "./pathFold";
 
 function realpath(p: string): string {
   try {
@@ -20,6 +22,27 @@ function realpath(p: string): string {
       throw e;
     }
     return fs.realpathSync(p);
+  }
+}
+
+/**
+ * The case rule a refusal states when a path is not spelled inside the workspace folder (BACKLOG
+ * #5832): on Windows only A-Z case is ignored, elsewhere none. It names the workspace folder's
+ * spelling as VS Code holds it, which can differ from the case on disk.
+ */
+export const CASE_RULE =
+  "(letter case must match the workspace folder's spelling, except that Windows ignores the case of A-Z)";
+
+/** Whether `a` and `b` are one file by identity (device and file id): true, false when either does
+ *  not exist, or undefined when either cannot be read for another reason. */
+function sameFileIdentity(a: string, b: string): boolean | undefined {
+  try {
+    const x = fs.statSync(a, { bigint: true });
+    const y = fs.statSync(b, { bigint: true });
+    return x.dev === y.dev && x.ino === y.ino;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? false : undefined;
   }
 }
 
@@ -83,12 +106,12 @@ export function resolveInsideWorkspace(ws: string, dir: string): string | undefi
  */
 export function committedRelativePath(ws: string, value: string): string | undefined {
   const root = path.resolve(ws);
-  const target = path.resolve(root, value);
-  if (!isWithin(root, target)) {
+  // The segments the ASCII-fold containment found, not path.relative's toLowerCase() reading.
+  const below = segmentsBelow(root, path.resolve(root, value));
+  if (below === undefined) {
     return undefined;
   }
-  const rel = path.relative(root, target);
-  return rel === "" ? "." : rel.split(path.sep).join("/");
+  return below.length === 0 ? "." : below.join("/");
 }
 
 /** `name` without its trailing spaces, in linear time. A `/ +$/` replace backtracks quadratically on
@@ -183,9 +206,13 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * real path cannot be read. The repository supplies the link whichever scope named the path, so the
  * manifest default and a relative user value are checked too. A value spelled outside the folder can
  * only be the operator's own user value, theirs to point anywhere, so it is not checked, and the
- * spelling test runs first, with no I/O.
+ * spelling test runs first, with no I/O. A value spelled outside only by a case outside A-Z that a
+ * file system may fold is the exception: the file system is asked whether it names the workspace
+ * folder, and if so it is checked (escapesUnderCaseVariant, BACKLOG #5832).
  *
- * At least these spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
+ * For a value spelled inside the folder, at least these spellings are refused outright, before any
+ * I/O; for a variant value the real-path and file-id reads that place it as the workspace come
+ * first, and a value placed as another folder is not checked. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
  * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
  * {@link hasTrailingDotOrSpaceName}, {@link hasColonInName} or {@link hasReservedDeviceName} names,
@@ -204,16 +231,61 @@ export function escapesByLink(ws: string | undefined, value: string, win32: bool
   }
   const rel = committedRelativePath(ws, value);
   if (rel === undefined) {
-    return false;
+    return escapesUnderCaseVariant(ws, value, win32);
   }
-  // A backslash separates components on Windows only; on POSIX it is part of a name.
-  if (value.split(win32 ? /[\\/]/ : /[/]/).includes("..")) {
+  if (climbs(value, win32)) {
     return true;
   }
   if (hasTrailingDotOrSpaceName(rel, win32) || hasColonInName(rel, win32) || hasReservedDeviceName(rel, win32)) {
     return true;
   }
   return resolveInsideWorkspace(ws, value) === undefined;
+}
+
+/** Whether `value` has a `..` component. A backslash separates components on Windows only; on
+ *  POSIX it is part of a name. */
+function climbs(value: string, win32: boolean): boolean {
+  return value.split(win32 ? /[\\/]/ : /[/]/).includes("..");
+}
+
+/**
+ * {@link escapesByLink} for a value spelled outside `ws` only because a folder name on it differs
+ * from the workspace's by a case outside A-Z (BACKLOG #5832). NTFS folds some such differences and
+ * not others, so the file system is asked: the real path of the folder the value names at the
+ * workspace's depth. When that is the workspace folder, by real path or, where the real path keeps
+ * the spelling's case (the fallback realpath() takes on some volumes), by device and file id, the
+ * value is the workspace spelled another way, and it is checked as the same path spelled from the
+ * workspace, links included; before this, the ASCII fold read it as outside and skipped the check.
+ * When it is another folder, the value is the operator's own and is not checked, a `..` in it
+ * included. A path that cannot be read refuses. A value outside under every case fold makes no
+ * file-system call; nor does one when `win32` is false, which reads paths exactly. Open limit:
+ * `win32` selects the variant probe and the name checks only; the real-path compares and the
+ * recursive containment read the host's path module, so the flag pins no Windows reading on a
+ * POSIX host.
+ */
+function escapesUnderCaseVariant(ws: string, value: string, win32: boolean): boolean {
+  const root = path.resolve(ws);
+  const variant = nonAsciiCaseVariant(root, path.resolve(root, value), win32);
+  if (variant === undefined) {
+    return false;
+  }
+  const realRoot = realpathOfNearestExisting(root);
+  const realHead = realpathOfNearestExisting(variant.head);
+  if (realRoot === undefined || realHead === undefined) {
+    return true;
+  }
+  if (!isSamePath(realRoot, realHead)) {
+    const same = sameFileIdentity(root, variant.head);
+    if (same === undefined) {
+      return true;
+    }
+    if (!same) {
+      return false;
+    }
+  }
+  // The workspace, spelled another way. A `..` is checked on the value as written, since the path
+  // rebuilt below has it collapsed.
+  return climbs(value, win32) || escapesByLink(ws, path.join(root, ...variant.rest), win32);
 }
 
 /**
@@ -242,11 +314,6 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
     "also take the target of a link, named with an absolute path in user settings, once any value " +
     "for the setting in workspace settings is removed, since a workspace value wins over a user value."
   );
-}
-
-function isWithin(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
 }
 
 /** The scopes of a setting that {@link containedPathSetting} reads: VS Code's `inspect()` answer.
@@ -323,8 +390,8 @@ export interface ContainedPathSetting {
  *  the scope it was written in, never the value (docs/REVIEW-STANDARDS.md R12). */
 function droppedWhy(key: string, dropped: DroppedScope): string {
   return dropped === "workspace"
-    ? `messagefoundry.${key}, set in workspace settings, is not a path inside the workspace folder, is not ` +
-        "text, or no folder is open"
+    ? `messagefoundry.${key}, set in workspace settings, is not a path inside the workspace folder as ` +
+        `spelled ${CASE_RULE}, is not text, or no folder is open`
     : `messagefoundry.${key}, set in user settings, is not text`;
 }
 

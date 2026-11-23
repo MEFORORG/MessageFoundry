@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     from messagefoundry.pki import IssuerIndex
 
 __all__ = [
+    "DEFAULT_BIND_HOST",
     "DEFAULT_MAX_BODY_BYTES",
     "DEFAULT_MAX_HANDSHAKES_PER_HOST",
     "DEFAULT_MAX_HEADER_BYTES",
@@ -126,6 +127,9 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+#: The address a listener with a missing or blank ``host`` binds. The runner's peer-control gate
+#: (``check_http_intake_auth``) reads it for a missing or blank host too.
+DEFAULT_BIND_HOST = "127.0.0.1"
 
 # Resource caps (DoS guards), HTTP analogs of the MLLP frame/connection/idle caps. All overridable per
 # connection via Http() settings; None/0 (in any spelling) disables a cap explicitly where noted.
@@ -966,7 +970,7 @@ class HttpSource(SourceConnector):
         # host on an inbound). Fall back to loopback for a missing/None value — never bind all
         # interfaces (0.0.0.0) by accident. The runner's exposed-gate refuses a non-loopback bind
         # without TLS (check_http_tls_exposure). See docs/CONNECTIONS.md.
-        self.host: str = s.get("host") or "127.0.0.1"
+        self.host: str = s.get("host") or DEFAULT_BIND_HOST
         self.port: int = port_setting(s["port"], transport="HTTP source")
         #: How this source names itself in a log line.
         self._log_name: str = config.name or f"{self.host}:{self.port}"

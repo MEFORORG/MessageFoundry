@@ -533,7 +533,7 @@ Do not restate it as one. §6 names what would flip it.
   one keyed on a single host: it puts one leg on loopback and the other off-box, both ways round, and
   asserts that the off-box leg's own cell refuses. The WARN arm also sees both legs, one warning
   each. `::test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback` pins that a leg whose
-  host cannot be read is refused, since the guard would otherwise treat an empty host as loopback.
+  host cannot be read is refused, whatever the posture.
 
   **AC-4 WAS PARTIAL UNTIL 2026-09-23, AND THE OIDC LEGS ARE NOW BUILT (BACKLOG #1887).** Under #1498
   it covered two hops of the three, and this notice said the OIDC token and JWKS legs were not built.
