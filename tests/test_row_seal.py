@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import math
 import sqlite3
 from collections.abc import Callable
 from typing import Any
@@ -181,7 +182,9 @@ def _through_sqlite_real(value: float) -> object:
 def test_a_negative_zero_seal_survives_a_sqlite_real_round_trip() -> None:
     # BACKLOG #6717. SQLite's REAL column reads -0.0 back as 0.0, so a seal over -0.0's own
     # encoding failed the next read as if the row had been changed.
-    back = _through_sqlite_real(-0.0)  # 0.0 on SQLite 3.50; the check holds either way
+    back = _through_sqlite_real(-0.0)
+    # The premise: the round trip dropped the sign, so the old encoding would have failed here.
+    assert isinstance(back, float) and math.copysign(1.0, back) == 1.0
     sealer = _sealer()
     stored = sealer.seal("session", (("revoked_at", -0.0),))
     assert sealer.verify("session", (("revoked_at", back),), stored)
@@ -200,6 +203,9 @@ def test_every_float_but_negative_zero_keeps_its_float_hex_encoding(value: float
 
 def test_negative_zero_encodes_as_zero_does() -> None:
     assert seal_bytes("k", [("f", -0.0)]) == seal_bytes("k", [("f", 0.0)])
+    # Controls: the sign of any other float still counts, and so does the smallest step off zero.
+    assert seal_bytes("k", [("f", -1.5)]) != seal_bytes("k", [("f", 1.5)])
+    assert seal_bytes("k", [("f", -5e-324)]) != seal_bytes("k", [("f", 0.0)])
 
 
 @pytest.mark.parametrize("value", _NOT_FINITE)
