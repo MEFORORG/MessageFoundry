@@ -113,7 +113,7 @@ from messagefoundry.domainshape import (
     is_canonical_ipv4,
     upn_suffix_key,
 )
-from messagefoundry.hostlist import allow_entry_problem, parse_allow_entry
+from messagefoundry.hostlist import allow_entry_problem, names_no_host, parse_allow_entry
 from messagefoundry.logging_setup import LOG_LEVELS
 
 # Moved to netaddr, the neutral leaf, so the HTTP listener reads them without importing private
@@ -1233,6 +1233,16 @@ class StoreSettings(_Section):
                 missing.append("username")  # SQL login needs a user (+ MEFOR_STORE_PASSWORD)
             if missing:
                 raise ValueError(f"{label} backend requires: " + ", ".join(missing))
+            # BACKLOG #5512. No hop guard reads a SQL Server store's host, so one that names none
+            # would reach the driver as `SERVER=,1433`. On Postgres only spaces are refused: the
+            # `server` row of docs/CONFIGURATION.md says what an empty value means there.
+            server = self.server or ""  # `missing` above already refused None
+            if self.backend is StoreBackend.SQLSERVER:
+                unnamed = names_no_host(server)
+            else:
+                unnamed = bool(server) and not server.strip()
+            if unnamed:
+                raise ValueError(f"[store].server names no host: name the {label} host")
         return self
 
     @field_validator("ssl_root_cert")
@@ -5150,11 +5160,12 @@ def _names_this_host(host: str) -> bool:
     """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
     :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
     where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
-    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS.
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host, and so must
+    a value that trims to nothing, which names no other system (BACKLOG #5512). No DNS.
 
     The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
     h = _bare_host(host)
-    if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
+    if not h or is_loopback_hop_host(h) or h.endswith(".localhost"):
         return True
     addr = _host_ip_literal(h)
     return addr is not None and (addr.is_loopback or addr.is_unspecified)
@@ -5431,7 +5442,8 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     the SAME authority the transports consume — so the forwarder decides identically to every other
     egress cell. A hop is treated as **secure** (and never gated) only when it is TLS *with
     verification on*; plaintext ``udp``/``tcp`` and the ``forward_tls_verify=false`` opt-out are both
-    MITM-able and go to the gradient:
+    MITM-able and go to the gradient. A forwarder with no host returns ALLOW before any of this:
+    ``serve`` builds none without a host, so there is no hop to judge (BACKLOG #5512).
 
     #. loopback collector → ALLOW — the ADR 0080 "point ``tcp``/``udp`` at ``127.0.0.1`` and let a
        local rsyslog/Vector agent add TLS" deployment is explicitly preserved, byte-identical.
@@ -5451,15 +5463,16 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     instance carrying patient data there is no instance left for it to fire on, so it is gone. A
     ``[logging]`` sibling of ``cleartext_accepted`` remains the recorded follow-up and is now the only
     way this cell could express an acceptance."""
+    if not log.forward_host:
+        # An unconfigured forwarder: `serve` builds none without a host, so there is no hop to
+        # refuse. Said here because the shared predicate no longer reads "" as loopback (#5512).
+        return HopDisposition.ALLOW
     if log.forward_protocol is SyslogProtocol.TLS and log.forward_tls_verify:
         # Verified, CA-anchored TLS (ADR 0080) — an encrypted+authenticated hop, nothing to gate.
         return HopDisposition.ALLOW
     return insecure_hop_disposition(
         enforcing=posture.enforcing,
-        # An unset forward_host cannot happen with forwarding on (the validator requires it), and the
-        # empty string is treated as loopback by the shared predicate — so an unconfigured forwarder
-        # can never be refused.
-        is_loopback_hop=is_loopback_hop_host(log.forward_host or ""),
+        is_loopback_hop=is_loopback_hop_host(log.forward_host),
         hop_attested=log.forward_hop_attested,
         # The global escape keeps its arm HERE (same scope carve-out): it is the only expressible
         # relaxation this non-connection cell has. Clamped upstream to non-enforcing, so under ENFORCE
@@ -5537,7 +5550,7 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     number = int(port)
     # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
     # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
-    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+    if "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
         return None
     try:
         address = ipaddress.ip_address(host)

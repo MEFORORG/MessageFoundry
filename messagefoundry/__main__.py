@@ -14888,7 +14888,7 @@ def _warn_on_an_unrevoked_store_hop(settings: ServiceSettings) -> None:
         context = _verifying_context(store)
     except (ValueError, OSError):
         return
-    _refuse_store_revocation(host=store.server or "", posture=posture, context=context)
+    _refuse_store_revocation(host=store.server, posture=posture, context=context)
 
 
 async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:

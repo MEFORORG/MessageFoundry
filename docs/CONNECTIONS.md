@@ -2193,6 +2193,12 @@ host.
   `DatabasePoll`, which takes only [its allowlist](#the-generic-driver-allowlist).
   `DatabaseLookup` and `DatabaseRef` take only a Microsoft driver.
 - `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
+- `server` must name a host (BACKLOG #5512), at every posture, and neither `tls_hop_attested`
+  nor `cleartext_accepted` crosses the refusal, since the preset would send `SERVER=,<port>` and
+  the driver would pick its own destination. A `server` of `None`, which a `DatabaseRef` can carry,
+  is refused the same way and is never sent as the host `None`. What counts as naming no host is
+  stated once, in the `server` row of the generic dialect's [*Values*](#values-on-the-generic-dialect)
+  table, and the preset reads the same spellings.
 - `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
   the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
   dial a port the check never compared. Set `port` to the instance's port.
@@ -2441,7 +2447,7 @@ built, and the error names the setting and never the value:
 | `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`, `"`, `'`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An `odbc_params` value of `true` or `false` is refused, never sent as the text `True` or `False`; write the driver's own spelling as a string. An unset `database` or `username` is left out of the string |
 | `SSLmode`, in any case of the keyword | plain | for MySQL Connector/ODBC under its registered name, exactly one of `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case; refused on Microsoft's `ODBC Driver <n> for SQL Server`, which reads `Encrypt` instead; for psqlODBC, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
 | `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
-| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused |
+| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused, and so is at least a blank value, a bare `:port`, `[]`, an empty entry on either side of a comma, and a host made only of brackets, colons and digits that is neither all digits nor an IPv6 literal (such as `[,]` or `:1433:`), whatever the posture, `tls_hop_attested` or `cleartext_accepted`. A plain number (`1433`, `[1433]`) or digits-only host with a port (`12:34`), and the IPv6 literals `::` and `[::]`, are accepted. The SQL Server preset (`Database`, `DatabasePoll`, `DatabaseLookup`, `DatabaseRef`) refuses the same spellings the same way, except that a value holding a comma meets the preset's own comma refusal first. A protocol prefix with no host after it, such as `tcp:`, is not caught |
 | `password` | braced, with the `}}` escape | printable ASCII. See below |
 
 Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
@@ -4247,7 +4253,7 @@ that carries no recognized credential crosses in three ways that do not claim th
 
 | | claim | disposition |
 |---|---|---|
-| the hop is **on-box** (loopback / `localhost` / empty host) | not a network exposure | ALLOW |
+| the hop is **on-box** (loopback / `localhost`; an empty host is not on-box) | not a network exposure | ALLOW |
 | `cleartext_accepted = true` + `cleartext_reason` | this hop is **not** secure, and we accept that | **WARN** — crossed, loudly logged **and recorded at every construction** |
 | `[security].enforcement = warn` | the instance-wide refuse/warn dial is at `warn` | WARN — but **only for the raw transports** (`MLLP()`, `Tcp()`, `X12()`, `DICOM()`, `Email()`, `Ftp()`). The HTTP family (`Rest()`, `Soap()`, `FHIR()`, `DICOMweb()`, `FhirLookup()`) shipped these refusals unconditionally, and ADR 0092 decision 5 forbids a cell getting weaker, so a no-loosen floor turns that WARN back into a REFUSE there. The dial is **not** a substitute for the declaration |
 
