@@ -1977,7 +1977,11 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
 
     A generic DATABASE connection's CA is its ``odbc_params`` ``sslca`` (module item 12), which
     its driver does not read under ``sslmode=disable``, or MySQL's ``SSLMODE=DISABLED``, in any
-    case (vault BACKLOG #3090)."""
+    case (vault BACKLOG #3090).
+
+    When it reads a flag that is neither a ``bool``, ``None``, an empty string nor an ``env()``
+    reference, it raises :class:`ValueError`, as ``bool_setting`` refuses it (vault BACKLOG
+    #3234). It reads ``verify_tls`` only when no token hop reads the CA."""
     if _odbc_tls_disabled(settings):
         return "odbc_params sslmode turns TLS off, so the driver reads no CA"
     # Each flag is read as its connector reads it: an explicit None is the default (vault BACKLOG
