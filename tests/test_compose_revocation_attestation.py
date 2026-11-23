@@ -280,6 +280,10 @@ def test_the_shipped_check_command_runs(value: str, passes: bool) -> None:
     else:
         assert done.returncode == 1, done.stderr
         assert "API revocation gate" in done.stderr
+        # Each check gates only the containers that depend on it (one check per image in compose,
+        # its own pod in k8s), so the refusal must not claim it stops every engine.
+        assert "refusing to start the containers this check gates" in done.stderr
+        assert "any engine" not in done.stderr
 
 
 # --- the env-file guidance (BACKLOG #5400 item 2) ------------------------------------------------
