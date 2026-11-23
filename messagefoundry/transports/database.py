@@ -2843,16 +2843,16 @@ def _shown_state(state: str | None, exc: BaseException) -> str | None:
     whose driver test raises names nothing (:func:`~messagefoundry.redaction.known_driver_error`).
     Nor does an asyncpg error whose ``state`` is not its ``sqlstate`` attribute: that state was
     read from ``args[0]``, which is asyncpg's message, such as ``MRN42``
-    (:func:`~messagefoundry.redaction.args_hold_a_message`). An attribute that raises when read
-    names nothing."""
+    (:func:`~messagefoundry.redaction.args_hold_a_message`). An attribute that raises when read or
+    compared names nothing."""
     if state is None or not known_driver_error(exc):
         return None
     if args_hold_a_message(exc):
         try:
             attribute = getattr(exc, "sqlstate", None)
+            if not (isinstance(attribute, str) and attribute == state):
+                return None
         except Exception:  # noqa: BLE001 - an unreadable attribute names nothing, as the docstring says
-            return None
-        if attribute != state:
             return None
     return state
 

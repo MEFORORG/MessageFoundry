@@ -3101,17 +3101,22 @@ def _a_driver_class(kind: type) -> bool:
     )
 
 
-#: Driver packages whose error holds its MESSAGE in ``args[0]``, never a SQLSTATE, so no state is
-#: read from it: at least asyncpg, which names its state in a ``sqlstate`` attribute when it names
-#: one. Not a complete list of such drivers; SQLite is tested apart (:func:`is_a_sqlite_error`).
+#: Driver packages whose error holds its MESSAGE in ``args[0]``, never a SQLSTATE: at least
+#: asyncpg, which names its state in a ``sqlstate`` attribute when it names one. Not a complete
+#: list of such drivers; SQLite is tested apart (:func:`is_a_sqlite_error`). What each reader does
+#: with such an error is in :func:`args_hold_a_message`.
 _MESSAGE_IN_ARGS_DRIVERS = frozenset({"asyncpg"})
 
 
 def args_hold_a_message(exc: BaseException) -> bool:
     """Whether ``exc``'s class, or a class it inherits, is from a package in
-    :data:`_MESSAGE_IN_ARGS_DRIVERS`, so its ``args[0]`` is its message and is never read as a
-    SQLSTATE, whatever its shape. A class that cannot be read answers ``False``, so it is read by
-    shape, as any other error is; that does not raise, so this runs on every link of a traceback."""
+    :data:`_MESSAGE_IN_ARGS_DRIVERS`, so its ``args[0]`` is its message. :func:`driver_sqlstate_of`,
+    the traceback line's reader, reads no state from such an ``args[0]``, and the DATABASE
+    connector's ``_shown_state`` names none read from it. The connector still CLASSIFIES such an
+    error by the shape of ``args[0]``, and the store's ``driver_sqlstate`` does not call this, so
+    it still reads and prints that ``args[0]``. A class that cannot be read answers ``False``, so
+    it is read by shape, as any other error is; that does not raise, so this runs on every link of
+    a traceback."""
     try:
         return any(
             isinstance(kind.__module__, str)
