@@ -389,8 +389,11 @@ class EngineNode:
         data = await self._signed_in_json(client, "/stats")
         if data is None:
             return None
-        by = data.get("outbox_by_status", {})
-        by = by if isinstance(by, dict) else {}
+        by = data.get("outbox_by_status")
+        # The API always sends this map, and a status absent from it is a true zero. With no map at
+        # all this is no reading, and zeros here would pass as a run's opening baseline.
+        if not isinstance(by, dict):
+            return None
         return NodeStats(
             done=int(by.get("done", 0)),
             dead=int(by.get("dead", 0)),
@@ -870,9 +873,10 @@ def _build_report(
     dup_rate = duplicates / engine_delivered if engine_delivered else 0.0
     acked_not_delivered = tracker.acked_not_delivered()
     intake_gap = max(0, c.sent - c.acked)
-    # Nonzero either way fails. A fall means rows were purged during the run, so the count can no
-    # longer show whether a row also went dead; a plain "> 0" would pass that. A purge exactly equal
-    # to the new dead rows still reads as zero: these two counters cannot show it (BACKLOG #5572).
+    # Nonzero either way fails. A fall means dead rows left the count during the run (a replay or a
+    # store reset; a retention purge keeps them), so it can no longer show whether a row also went
+    # dead, and a plain "> 0" would pass that. Rows leaving in exactly the number that newly went
+    # dead still read as zero: these two counters cannot show it (BACKLOG #5572).
     dead_new = final.dead - opening.dead
     no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and dead_new == 0
     if dead_new > 0:
@@ -885,7 +889,7 @@ def _build_report(
     elif opening.dead:
         notes.append(
             f"{opening.dead} dead row(s) carried over from before this run; the count did not "
-            "change (an equal purge and new dead rows would not show)"
+            "change (as many rows replayed out as newly went dead would not show)"
         )
     recovery_bound = fo.recovery_ttl_multiple * fo.leader_lease_ttl_seconds
 

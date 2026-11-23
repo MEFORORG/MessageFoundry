@@ -475,7 +475,7 @@ def test_dead_rows_carried_over_from_a_reused_store_do_not_fail_a_clean_run() ->
     ("final_dead", "note"),
     [
         (4, "went dead"),  # a new dead row on a reused store
-        (1, "fell"),  # three purged and one new: a plain delta reads -2 and would pass
+        (1, "fell"),  # three replayed out and one new: a plain delta reads -2 and would pass
         (0, "fell"),
     ],
 )
@@ -545,6 +545,31 @@ def test_opening_stats_gives_up_after_its_bound(monkeypatch: pytest.MonkeyPatch)
     with pytest.raises(FailoverError, match="opening"):
         asyncio.run(failover._opening_stats([node], object()))  # type: ignore[list-item,arg-type]
     assert node.reads == failover._OPENING_STATS_ATTEMPTS
+
+
+@pytest.mark.parametrize("body", [{}, {"outbox_by_status": None}, {"outbox_by_status": []}])
+def test_a_stats_answer_with_no_status_map_is_no_reading(
+    body: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = failover.EngineNode.__new__(failover.EngineNode)
+
+    async def answer(_client: object, _path: str) -> dict[str, object]:
+        return body
+
+    monkeypatch.setattr(node, "_signed_in_json", answer)
+    assert asyncio.run(node.stats(object())) is None  # type: ignore[arg-type]
+
+
+def test_a_stats_answer_with_an_empty_status_map_reads_as_zeros(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = failover.EngineNode.__new__(failover.EngineNode)
+
+    async def answer(_client: object, _path: str) -> dict[str, object]:
+        return {"outbox_by_status": {}, "in_pipeline": 0}
+
+    monkeypatch.setattr(node, "_signed_in_json", answer)
+    assert asyncio.run(node.stats(object())) == _stats()  # type: ignore[arg-type]
 
 
 def test_a_run_whose_opening_stats_never_read_offers_no_load(
