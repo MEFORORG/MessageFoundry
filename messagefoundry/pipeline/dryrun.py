@@ -146,9 +146,12 @@ class TraceHook(Protocol):
 
     When a ``tracer`` is supplied, :func:`route_only` / :func:`transform_one` invoke the Router/Handler
     **through** the hook instead of calling it directly, so the hook can install ``sys.settrace`` around
-    exactly that call. The hook is a *pure observer* — it returns the callable's result unchanged and
-    re-raises any exception — so the traced path is byte-identical to the default (``tracer=None``). The
-    concrete implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps
+    exactly that call. The hook is a *pure observer* — it re-raises any exception, and
+    ``trace_router``/``trace_handler`` return the callable's result unchanged — so the traced path is
+    byte-identical to the default (``tracer=None``). ``trace_accepts`` returns the verdict as a bool,
+    read through :func:`~messagefoundry.config.wiring.accepts_verdict` as the untraced path reads it,
+    so an awaitable, iterator or async iterator verdict raises ``TypeError`` there too (BACKLOG
+    #5514). The concrete implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps
     ``dryrun`` free of any dependency on it (one-way import)."""
 
     def trace_router(

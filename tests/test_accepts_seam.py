@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import gc
+import logging
 import re
 import warnings
 from collections.abc import AsyncIterator, Iterator
@@ -48,6 +49,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
     WiringError,
+    accepts_verdict,
     load_config,
 )
 from messagefoundry.parsing.message import Message
@@ -1170,6 +1172,8 @@ def test_an_iterator_with_its_own_truth_value_is_read_by_it(
 
 
 _SANDBOX_AWAITABLE_GRAPH = """
+import re
+
 from messagefoundry import inbound, outbound, router, handler, MLLP, Send
 
 
@@ -1212,6 +1216,21 @@ def h_agen(msg):
 @handler("h_filter", accepts=lambda m: filter(None, []))
 def h_filter(msg):
     return Send("OB_T", str(msg))
+
+
+class _Awaitable:
+    def __await__(self):
+        yield None
+
+
+@handler("h_awaitable", accepts=lambda m: _Awaitable())
+def h_awaitable(msg):
+    return Send("OB_T", str(msg))
+
+
+@handler("h_finditer", accepts=lambda m: re.finditer("ESC", str(m)))
+def h_finditer(msg):
+    return Send("OB_T", str(msg))
 """
 
 
@@ -1227,7 +1246,8 @@ def test_an_awaitable_or_iterator_verdict_raises_in_the_sandbox_child(tmp_path: 
         graph=None,
     )
     try:
-        for kind in ("coro", "gen", "agen", "filter"):
+        # The six shapes of _STATIC_PASSING_VERDICTS, each across the process boundary.
+        for kind in ("coro", "gen", "agen", "filter", "awaitable", "finditer"):
             raw = ADT.replace("|S|F|", f"|{kind}|F|")
             hname = f"h_{kind}"
             # "sandbox failed accepts" is the parent's text for an error the CHILD reported, so the
@@ -1239,3 +1259,60 @@ def test_an_awaitable_or_iterator_verdict_raises_in_the_sandbox_child(tmp_path: 
                 route_only(registry, ic, raw, sandbox=session, run_context=RunContext())
     finally:
         session.close()
+
+
+# --- BACKLOG #5514 follow-up: the refusal text carries author-controlled class names ---
+
+
+def _crlf_awaitable() -> object:
+    return type("Evil\r\nINJECTED line", (), {"__await__": lambda self: iter(())})()
+
+
+def _crlf_iterator() -> object:
+    return type(
+        "Evil\r\nINJECTED line", (), {"__iter__": lambda self: self, "__next__": lambda self: 0}
+    )()
+
+
+@pytest.mark.parametrize("make", [_crlf_awaitable, _crlf_iterator], ids=["awaitable", "iterator"])
+def test_a_crafted_class_name_reaches_the_refusal_text_escaped(make: Any) -> None:
+    with pytest.raises(TypeError) as exc:
+        accepts_verdict("h", make())
+    text = str(exc.value)
+    assert "\r" not in text and "\n" not in text
+    assert "Evil" in text and "INJECTED line" in text  # escaped, not dropped
+
+
+def test_a_crafted_exception_name_from_close_reaches_the_debug_log_escaped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    evil = type("Boom\r\nINJECTED line", (ValueError,), {})
+
+    def gen() -> Iterator[bool]:
+        try:
+            yield False
+        finally:
+            raise evil("synthetic")
+
+    g = gen()
+    next(g)
+    with (
+        caplog.at_level(logging.DEBUG, logger="messagefoundry.config.wiring"),
+        pytest.raises(TypeError),
+    ):
+        accepts_verdict("h", g)
+    messages = [r.getMessage() for r in caplog.records if "closing the" in r.getMessage()]
+    assert len(messages) == 1
+    assert "\r" not in messages[0] and "\n" not in messages[0]
+    assert "INJECTED line" in messages[0]
+
+
+def test_the_refusal_text_does_not_demand_a_strict_bool() -> None:
+    # None, an int, a str and re.Match are still read by their truth value, so "it must return a
+    # bool" would be false; the text names the rule the code applies.
+    with pytest.raises(TypeError) as exc:
+        accepts_verdict("h", filter(None, []))
+    assert "must return a bool" not in str(exc.value)
+    assert "truth value is the verdict" in str(exc.value)
+    assert accepts_verdict("h", re.search("x", "x")) is True
+    assert accepts_verdict("h", None) is False

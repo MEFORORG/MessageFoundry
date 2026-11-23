@@ -6203,14 +6203,17 @@ def accepts_verdict(hname: str, verdict: object) -> bool:
             except Exception as exc:  # noqa: BLE001 -- author code; logged, then the TypeError
                 _logger.debug(
                     "closing the %s that accepts= predicate for handler %r returned raised %s",
-                    cls.__name__,
+                    scrub_log_argument(cls.__name__),
                     hname,
-                    type(exc).__name__,
+                    scrub_log_argument(type(exc).__name__),
                 )
+        # A class name is author-controlled and type() accepts one with CR or LF in it, so it is
+        # escaped before it reaches text that is logged. hname goes in through repr, which escapes.
         raise TypeError(
             f"accepts= predicate for handler {hname!r} returned an object of type "
-            f"{type(verdict).__name__}, which the router stage cannot await or iterate and would "
-            "read as True; it must return a bool"
+            f"{scrub_log_argument(cls.__name__)}, which the router stage cannot await or iterate "
+            "and would read as True; it must return a value whose truth value is the verdict, "
+            "such as a bool"
         )
     return bool(verdict)
 
