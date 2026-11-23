@@ -1082,8 +1082,10 @@ async def test_the_alter_schema_probe_quotes_the_default_schema(
 async def test_an_incomplete_read_names_held_schema_ddl_rights_too(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #6714 item 3: the early UNOBSERVABLE path listed held roles, audit-table rights and
-    VIEW DEFINITION as "what DID read as held", but not a held CREATE TABLE or ALTER on the schema."""
+    """BACKLOG #6714 item 3: a held CREATE TABLE or ALTER on the schema beside an unread role is
+    named. Since the owner ruling of 2026-11-23 (#6015 item 1) both are read over-grants under
+    external, so they are named in the excess of an OBSERVED report; this asserts the excess, not
+    the detail's "what DID read as held" list."""
     row = _probe_row(database_roles=("db_datareader", "db_datawriter"), unread=("db_owner",))
     row["create_table"] = 1
     row["alter_schema"] = 1

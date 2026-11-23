@@ -185,9 +185,9 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
   line, and `db_ddladmin` the schema-DDL lines and `ALTER` on `audit_log`. The output can also
   list grants it could not read. Remove each grant it names and run the check again; once nothing
   over-granted is left, a grant it still could not read makes it exit 4.
-- It **exits 4** when the probe could not read the login at all, for example on a failed connection
-  or a permission read that came back NULL, or as a value that is not 0 or 1. That is not a clean
-  result.
+- It **exits 4** when the probe could not read the login, for example on a failed connection, or
+  when a permission read came back NULL, or as a value that is not 0 or 1, and nothing it did read
+  is over-granted. That is not a clean result. A read over-grant beside such a read exits 3.
 - It exits 1 when the service settings do not load.
 
 It also probes each Vault token the engine uses and the AD bind account, when they are

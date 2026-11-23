@@ -5313,8 +5313,10 @@ class SqlServerStore:
                 audit_writes=audit_writes,
                 view_definition=tuple(view_definition),
             )
-            # The catalog enumeration below is skipped deliberately: it is additive only, and widening
-            # a report already saying the read was incomplete buys nothing an operator can act on.
+            # The catalog enumeration below is skipped on this path, so a user-defined role is not
+            # weighed here: with no fixed-role over-grant read, a login whose only over-grant is a
+            # user-defined role reads unobserved, which under enforce warns unless
+            # [store].require_least_privilege is declared.
             return StorePrivilegeReport(
                 backend=self.backend,
                 status=(
