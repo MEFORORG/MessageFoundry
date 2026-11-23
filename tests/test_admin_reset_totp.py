@@ -401,7 +401,9 @@ def test_a_wrong_code_at_the_terminal_writes_nothing_and_the_old_seed_still_work
     monkeypatch.setattr(cli, "_show_on_terminal", terminal.show)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
-    assert "nothing was written" in error
+    # After check()'s open, which may have written (BACKLOG #5067).
+    assert "this command makes did not land" in error
+    assert "nothing was written" not in error.lower(), error
     # The real prompt names this command, not provision-admin, and labels the new entry apart from
     # the old one, which carries the bare username.
     shown = "".join(terminal.shown)
@@ -1055,7 +1057,8 @@ def test_a_seed_that_does_not_open_at_the_write_is_a_refusal_not_a_race(
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
-    assert "Nothing was written" in error and "delete it" in error
+    # What the open may have changed before it (BACKLOG #5067), and no replacement.
+    assert "this command makes did not land" in error and "delete it" in error
     assert "enrolled again" not in error
     monkeypatch.setattr(MessageStore, "open_totp_secret", real_open)
     assert _state(db) == before
@@ -1107,3 +1110,95 @@ def test_a_hop_refusal_at_the_open_is_could_not_start(
     monkeypatch.setattr(store_base, "open_store", refused)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
     assert "Nothing was written" in _error(capsys)
+
+
+def test_a_store_failure_after_the_write_open_says_what_the_open_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: a store failure after the write's open returned, before the swap, follows a
+    full open, which may have written, so it does not say nothing was written.
+
+    Mutation: print "nothing was written" again in ``open_refused``'s last branch."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "busy-after-open.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    prompted: list[bool] = []
+    real_open = MessageStore.open_totp_secret
+    real_enrol = cli._enrol_totp_at_terminal
+
+    def open_or_fail(self: MessageStore, user_id: str, cell: str | None) -> str | None:
+        if prompted:
+            raise RuntimeError("synthetic busy store")
+        return real_open(self, user_id, cell)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(MessageStore, "open_totp_secret", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "the store failed before the replacement (RuntimeError)" in error, error
+    assert "this command makes did not land" in error and "delete it" in error, error
+    assert "nothing was written" not in error.lower(), error
+
+
+def test_a_store_failure_at_the_second_open_says_what_the_first_open_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: the first open returned, and may have written, before the second open
+    fails, so that failure does not say nothing was written.
+
+    Mutation: clear ``store_returned`` before the second open again."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "second-open-fails.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    from messagefoundry.store import base
+
+    prompted: list[bool] = []
+
+    real_open_store = base.open_store
+    real_enrol = cli._enrol_totp_at_terminal
+
+    async def open_or_fail(*a: Any, **k: Any) -> Any:
+        if prompted:
+            raise RuntimeError("synthetic busy store at the second open")
+        return await real_open_store(*a, **k)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(base, "open_store", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "the store failed before the replacement (RuntimeError)" in error, error
+    assert "nothing was written" not in error.lower(), error
+
+
+def test_an_unnamed_os_user_after_the_first_open_says_what_it_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: the OS user is named after check()'s open, which may have written, so the
+    refusal does not say nothing was written.
+
+    Mutation: print "nothing was written" again in that refusal."""
+    import getpass
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "no-user.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+
+    def no_user() -> str:
+        raise OSError("no user name for this shell")
+
+    monkeypatch.setattr(getpass, "getuser", no_user)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    error = _error(capsys)
+    assert "cannot name the OS user" in error and "this command makes did not land" in error
+    assert "nothing was written" not in error.lower(), error

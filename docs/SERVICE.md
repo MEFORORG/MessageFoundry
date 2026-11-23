@@ -594,8 +594,8 @@ What that changes for you:
   install keeps it. It refuses to install when it finds neither. Pass `-PythonExe` then.
 - **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
   leaves the user's site directory out. Install into a virtual environment.
-- **`messagefoundry serve` from a prompt has remote debugging on** unless its environment sets
-  `PYTHON_DISABLE_REMOTE_DEBUG`; give it a non-empty value, such as 1, since some shells delete a
+- **`messagefoundry serve` from a prompt has remote debugging on** unless something turns it
+  off, such as its environment setting `PYTHON_DISABLE_REMOTE_DEBUG`; give it a non-empty value, such as 1, since some shells delete a
   variable set to an empty value. With remote debugging on, under `enforce` the start refusal for it stops the engine
   unless `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). The variable works
   there only because the console script passes neither `-I` nor `-E`: a start by hand that keeps
