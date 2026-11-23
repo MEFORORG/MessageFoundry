@@ -24,12 +24,10 @@ from tests._serviceenv_remedy import (
     ADD_BACK_JOINED,
     CREATE,
     KEEP,
-    LOOKALIKE_ANY,
     REMOVE,
     RUNS_ON,
     SET_NO,
     WIDER,
-    lookalike_step,
 )
 
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
@@ -308,29 +306,19 @@ def test_one_joined_value_that_is_no_plain_path_keeps_nothing() -> None:
     assert KEEP not in refusal and "protect-key" in refusal
 
 
-@pytest.mark.parametrize(
-    ("name", "named"),
-    [
-        ("mefor_secrets_d\u0131rectory", "mefor_secrets_d<U+0131>rectory"),
-        ("mefor_\u017fecrets_directory", "mefor_<U+017F>ecrets_directory"),
-    ],
-    ids=["U+0131", "U+017F"],
-)
-def test_a_lookalike_directory_path_joined_into_an_empty_key_is_never_kept(
-    name: str, named: str
+@pytest.mark.parametrize("name", ["mefor_secrets_d\u0131rectory", "mefor_\u017fecrets_directory"])
+def test_a_name_that_upper_cases_to_the_directory_is_kept_as_os_environ_reads_it(
+    name: str,
 ) -> None:
-    """The Lander's hold on PR 3142, comment 7092584745, findings 1 and 3: ``os.environ`` folds
-    these spellings to the directory (comment 7091598959), but install-service.ps1 does not, so
-    the path entry joined into the empty key is never kept. The remedy names the look-alike by
-    its code point and says to take it out; the ASCII spelling, the control, is still kept."""
+    """The Lander's hold on PR 3142, comment 7091598959: the engine reads its directory through
+    ``os.environ``, which on Windows folds a key with ``str.upper``, so these spellings name the
+    secrets directory and the path entry joined into the empty key stays, as for the ASCII
+    spelling."""
     refusal = service_env_refusal(_read([f"{_KEY}=", f"{name}=C:/d"]))
     assert refusal is not None
-    assert "Keep any of them" not in refusal
-    assert refusal.count(lookalike_step(named)) == 1
-    assert refusal.count(ADD_BACK_JOINED) == 1
+    assert refusal.count(KEEP) == 1
     control = service_env_refusal(_read([f"{_KEY}=", "mefor_secrets_directory=C:/d"]))
-    assert control is not None
-    assert control.count(KEEP) == 1 and LOOKALIKE_ANY not in control
+    assert refusal == control
 
 
 def test_a_secret_joined_to_a_directory_value_that_is_no_path_is_moved() -> None:
