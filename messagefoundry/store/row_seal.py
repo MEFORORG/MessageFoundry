@@ -33,9 +33,11 @@ text ``"None"`` encode differently, and a seal of one kind never verifies as ano
 encoded with :meth:`float.hex`, which is exact, so a value that round-trips through a ``REAL`` /
 ``DOUBLE PRECISION`` / ``FLOAT`` column seals identically on every backend. ``-0.0`` encodes as
 ``0.0`` does, for every caller of the encoder, because a SQLite ``REAL`` column reads ``-0.0`` back
-as ``0.0``; that one change to v1 predates any deployment. Making a seal, under either sealer,
-raises :class:`NonFiniteSealValueError` for a float that is not finite, while checking a seal over
-one fails rather than raises (BACKLOG #6717).
+as ``0.0``; that one change to v1 predates any deployment. :meth:`RowSealer.seal` and
+:meth:`TransitRowSealer.seal_async` raise :class:`NonFiniteSealValueError` when a field is a float
+that is not finite. :func:`seal_bytes` itself encodes one, so a check over a row someone set to such
+a value fails rather than raises, and so does a digest built on the encoder, such as the store's
+``passkey_digest`` (BACKLOG #6717).
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ import functools
 import hashlib
 import hmac
 import logging
+import math
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -118,17 +121,16 @@ _TYPE_BYTES: Final = b"B"
 
 _MAC_HEX_LEN: Final = 64  # HMAC-SHA256, hex
 
-# A float strictly inside (-inf, inf) is finite; a NaN compares false both ways, so it is not.
-_FLOAT_INF: Final = float("inf")
-
 
 class NonFiniteSealValueError(ValueError):
     """Raised when a seal is made over a float that is a NaN or an infinity (BACKLOG #6717).
 
-    SQLite stores a NaN as ``NULL``, so its seal would fail the next read as if the row had been
-    changed. An infinity round-trips, but no sealed field means anything by one, so it is refused
-    with the NaN. Its own type, so a caller can tell it from the ``ValueError`` a malformed field
-    pair raises when it is unpacked."""
+    SQLite stores a NaN as ``NULL``: a ``NOT NULL`` column refuses the write, and a nullable one
+    reads back ``None``, so the seal would fail the next read as if the row had been changed. An
+    infinity round-trips, but no sealed field means anything by one, so it is refused with the NaN.
+    Its own type, so a caller can tell it from the ``ValueError`` a malformed field pair raises
+    when it is unpacked. It is raised before any field is encoded, so a row that also holds a value
+    the encoder cannot read raises this, whatever the field order."""
 
 
 class RowSealError(Exception):
@@ -268,12 +270,14 @@ def seal_bytes(kind: str, fields: Iterable[tuple[str, object]]) -> bytes:
 
 
 def _seal_bytes(kind: str, fields: Iterable[tuple[str, object]], *, finite: bool) -> bytes:
-    # ``finite`` is set only where a seal is MADE. A check encodes a non-finite float as it is, so
-    # a row someone set to one fails its seal rather than raising from the check.
+    # ``finite`` is set only where a seal is made (the module docstring says why). The fields are
+    # read whole first, so the refusal precedes any encoder error, as NonFiniteSealValueError says.
+    if finite:
+        fields = tuple(fields)
+        if any(isinstance(v, float) and not math.isfinite(v) for _, v in fields):
+            raise NonFiniteSealValueError("a row seal refuses a float that is not finite")
     out = [_part(_SCHEME), _part(kind.encode("utf-8"))]
     for name, value in fields:
-        if finite and isinstance(value, float) and not -_FLOAT_INF < value < _FLOAT_INF:
-            raise NonFiniteSealValueError("a row seal refuses a float that is not finite")
         type_byte, encoded = _encode_value(value)
         out.append(_part(name.encode("utf-8")) + type_byte + _part(encoded))
     return b"".join(out)
@@ -713,9 +717,7 @@ class TransitRowSealer:
         self._clock = clock
         self._throttle = SealFailureThrottle()
 
-    def _digest(
-        self, kind: str, fields: Iterable[tuple[str, object]], *, finite: bool = False
-    ) -> bytes:
+    def _digest(self, kind: str, fields: Iterable[tuple[str, object]], *, finite: bool) -> bytes:
         encoded = _seal_bytes(kind, fields, finite=finite)
         return hashlib.sha256(self._prefix + _part(encoded)).digest()
 
@@ -824,7 +826,7 @@ class TransitRowSealer:
         key_name, retired = held
         if retired and not accept_retired:
             return False
-        digest = self._digest(kind, fields)
+        digest = self._digest(kind, fields, finite=False)
         entry = hashlib.sha256(
             _part(digest) + _part(key_id.encode("ascii")) + _part(mac.encode("ascii"))
         ).digest()
@@ -1015,10 +1017,6 @@ async def require_seal_for_write(
     here; a whole token hash in it would reach ``args``."""
     if sealer is None:
         return
-    if stored is not None and not isinstance(stored, str):
-        # A stored seal that is not text (a BLOB a writer put there) is no seal: Forged, as both
-        # sealers' checks read it (BACKLOG #6718).
-        raise RowSealError(kind, subject)
     fields = list(fields)
     if kind != SESSION_KIND:
         # A record holding a value the encoder cannot read fails its seal, as main's record checks

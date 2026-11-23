@@ -27,7 +27,12 @@ from messagefoundry.store.crypto import (
     make_cipher,
     row_seal_key_id,
 )
-from messagefoundry.store.row_seal import SEAL_PREFIX, RowSealer, seal_bytes
+from messagefoundry.store.row_seal import (
+    SEAL_PREFIX,
+    NonFiniteSealValueError,
+    RowSealer,
+    seal_bytes,
+)
 
 _FIELDS = (("token_hash", "a" * 64), ("user_id", "u1"), ("created_at", 1.5), ("revoked_at", None))
 
@@ -212,8 +217,11 @@ def test_negative_zero_encodes_as_zero_does() -> None:
 def test_a_seal_refuses_a_float_that_is_not_finite(value: float) -> None:
     # BACKLOG #6717. SQLite stores a NaN as NULL, so a seal over one could never verify again.
     sealer = _sealer()
-    with pytest.raises(ValueError):
+    with pytest.raises(NonFiniteSealValueError):
         sealer.seal("session", (("expires_at", value),))
+    # The refusal precedes an encoder error in any field order.
+    with pytest.raises(NonFiniteSealValueError):
+        sealer.seal("session", (("a", object()), ("expires_at", value)))
     assert sealer.seal("session", (("expires_at", 1.5),))  # control: a finite value seals
 
 
