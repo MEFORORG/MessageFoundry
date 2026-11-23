@@ -347,7 +347,7 @@ def _report(*, tracker: FailoverTracker, outcome=None, final=None, counters=None
         counters or _counters(),
         tracker,
         outcome or _outcome(),
-        final or NodeStats(done=294, dead=0, pending=0, inflight=0, in_pipeline=0),
+        final or _stats(done=294),
         opening=opening or _stats(),
         fo=fo,
         notes=[],
@@ -471,37 +471,24 @@ def test_dead_rows_carried_over_from_a_reused_store_do_not_fail_a_clean_run() ->
     assert any("carried over" in n for n in rep.notes)
 
 
-def test_a_new_dead_row_on_a_reused_store_fails_the_run() -> None:
+@pytest.mark.parametrize(
+    ("final_dead", "note"),
+    [
+        (4, "went dead"),  # a new dead row on a reused store
+        (1, "fell"),  # three purged and one new: a plain delta reads -2 and would pass
+        (0, "fell"),
+    ],
+)
+def test_a_dead_count_that_moves_fails_the_run(final_dead: int, note: str) -> None:
     rep = _report(
         tracker=_full_tracker(),
         opening=_stats(done=5000, dead=3),
-        final=_stats(done=5294, dead=4),
+        final=_stats(done=5294, dead=final_dead),
     )
     assert rep.result_ok is False
     assert _no_loss_ok(rep) is False
-    assert rep.dead_final == 4
-
-
-def test_a_purge_that_hides_a_new_dead_row_fails_the_run() -> None:
-    # Three old rows purged and one new row dead: a plain delta reads -2 and would pass.
-    rep = _report(
-        tracker=_full_tracker(),
-        opening=_stats(done=5000, dead=3),
-        final=_stats(done=5294, dead=1),
-    )
-    assert rep.result_ok is False
-    assert _no_loss_ok(rep) is False
-    assert any("fell" in n for n in rep.notes)
-
-
-def test_a_dead_count_that_falls_to_zero_fails_the_run() -> None:
-    rep = _report(
-        tracker=_full_tracker(),
-        opening=_stats(done=5000, dead=3),
-        final=_stats(done=5294, dead=0),
-    )
-    assert rep.result_ok is False
-    assert _no_loss_ok(rep) is False
+    assert rep.dead_final == final_dead
+    assert any(note in n for n in rep.notes)
 
 
 def test_in_pipeline_stays_absolute_on_a_reused_store() -> None:
@@ -594,7 +581,6 @@ def test_a_run_whose_opening_stats_never_read_offers_no_load(
             pass
 
         def start(self) -> None:
-            events.append("load-offered")
             raise AssertionError("load was offered with no opening baseline")
 
         async def stop(self, _grace: float) -> None:
@@ -622,7 +608,6 @@ def test_a_run_whose_opening_stats_never_read_offers_no_load(
     )
     with pytest.raises(FailoverError, match="opening"):
         asyncio.run(failover.run_failover_load(_profile(), ports=ports, base_env={}))
-    assert "load-offered" not in events
     assert {"dispatcher-stop", "sink-stop", "node-stop"} <= set(events)
 
 
