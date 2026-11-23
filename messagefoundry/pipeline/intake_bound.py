@@ -496,7 +496,8 @@ class IntakeBoundMonitor:
         """One measurement of each enabled bound. A probe that fails, or hangs past
         :data:`PROBE_TIMEOUT_SECONDS`, leaves its reason as it was: an unmeasured backlog or disk is
         not evidence either way. The timeout is what keeps one hung probe from freezing the loop, and
-        with it every later release.
+        with it the other bound's later releases. A hung disk probe still blocks the disk bound's own
+        decisions until it returns (:meth:`_probe_disk`).
 
         A bound that is OFF is reported clear once, so a pause left open by an earlier run is
         resolved after the operator turns that bound off or moves the store to a server backend."""
@@ -554,9 +555,11 @@ class IntakeBoundMonitor:
 
         Single-flight, because a thread blocked on a hung volume cannot be cancelled: one probe per
         tick would fill the default executor that routing and transforms share. While a probe is
-        unfinished no tick starts another, so a hung volume holds at most one of that executor's
-        workers. Only the tick that started a probe may use its result. One that ends later is
-        dropped, since a stale reading must not release or start a pause."""
+        unfinished no tick starts another, so this monitor's probe holds at most one of that
+        executor's workers. The cost: until a hung probe returns, the disk stays unmeasured, so a
+        held disk pause cannot release and a new one cannot start. Only the tick that started a probe
+        may use its result. One that ends later is dropped, since a stale reading must not release or
+        start a pause."""
         if self._disk_probe is not None:
             return None, TimeoutError("an earlier disk probe has not finished")
         probe = asyncio.create_task(

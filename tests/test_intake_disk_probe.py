@@ -14,9 +14,8 @@ import gc
 import logging
 import threading
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -32,6 +31,7 @@ FLOOR_MIB = 1024
 LOW_MIB = 100
 HIGH_MIB = 4096
 _LOGGER = "messagefoundry.pipeline.intake_bound"
+_HEALTHY_TIMEOUT = 30.0
 
 
 class _Probe:
@@ -89,7 +89,9 @@ class _Store:
 def probe(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Probe]:
     fake = _Probe()
     monkeypatch.setattr(intake_bound, "read_disk_floor", fake)
-    monkeypatch.setattr(intake_bound, "PROBE_TIMEOUT_SECONDS", 0.02)
+    # Long, so a healthy probe on a loaded runner never reads as timed out; _tick_into_hang
+    # shortens it for the one tick that must time out.
+    monkeypatch.setattr(intake_bound, "PROBE_TIMEOUT_SECONDS", _HEALTHY_TIMEOUT)
     yield fake
     fake.release.set()  # a failing test must not leave a thread for the loop's teardown to join
 
@@ -105,23 +107,37 @@ def _disk_monitor(
     )
 
 
-async def test_a_hung_probe_across_many_ticks_runs_one_thread_and_starves_nothing(
-    tmp_path: Path, probe: _Probe
+async def _tick_into_hang(
+    monitor: IntakeBoundMonitor, probe: _Probe, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    executor = ThreadPoolExecutor(max_workers=2)
-    asyncio.get_running_loop().set_default_executor(executor)
-    monitor = _disk_monitor(tmp_path, IntakeGate())
+    """One tick whose probe hangs and times out. Returns only once the probe has entered the fake,
+    so the outcome it fixed at entry is the one the test set before this call."""
+    expected = probe.started + 1
     probe.hang = True
+    monkeypatch.setattr(intake_bound, "PROBE_TIMEOUT_SECONDS", 0.05)
+    await monitor.check_once()
+    monkeypatch.setattr(intake_bound, "PROBE_TIMEOUT_SECONDS", _HEALTHY_TIMEOUT)
+    for _ in range(2000):
+        if probe.started >= expected:
+            break
+        await asyncio.sleep(0.005)
+    assert probe.started == expected, "control: the hung probe really started"
+
+
+async def test_a_hung_probe_across_many_ticks_runs_one_thread(
+    tmp_path: Path, probe: _Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monitor = _disk_monitor(tmp_path, IntakeGate())
+    await _tick_into_hang(monitor, probe, monkeypatch)
     for _ in range(8):
         await monitor.check_once()
+    await asyncio.sleep(0.05)  # a queued extra probe would have entered the fake by now
     assert probe.started == 1, "a tick started a probe while an earlier one was still blocked"
-    # The defect's consequence: with every worker stuck, this unrelated call would never run.
-    assert await asyncio.wait_for(asyncio.to_thread(lambda: "ran"), 2.0) == "ran"
     await probe.finish_hung()
 
 
 async def test_a_late_high_reading_does_not_release_a_held_pause(
-    tmp_path: Path, probe: _Probe
+    tmp_path: Path, probe: _Probe, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     gate = IntakeGate()
     monitor = _disk_monitor(tmp_path, gate)
@@ -129,8 +145,8 @@ async def test_a_late_high_reading_does_not_release_a_held_pause(
     await monitor.check_once()
     assert gate.reasons == {DISK_REASON}, "control: the pause is held"
 
-    probe.free_mib, probe.hang = HIGH_MIB, True
-    await monitor.check_once()  # times out, leaving a probe that will report HIGH
+    probe.free_mib = HIGH_MIB
+    await _tick_into_hang(monitor, probe, monkeypatch)  # leaves a probe that will report HIGH
     probe.free_mib = LOW_MIB
     await probe.finish_hung()
     assert gate.reasons == {DISK_REASON}, "a result nobody was waiting for released the pause"
@@ -140,11 +156,13 @@ async def test_a_late_high_reading_does_not_release_a_held_pause(
     assert gate.reasons == {DISK_REASON}, "the stale HIGH reading was used instead of the new one"
 
 
-async def test_a_late_low_reading_does_not_newly_hold(tmp_path: Path, probe: _Probe) -> None:
+async def test_a_late_low_reading_does_not_newly_hold(
+    tmp_path: Path, probe: _Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
     gate = IntakeGate()
     monitor = _disk_monitor(tmp_path, gate)
-    probe.free_mib, probe.hang = LOW_MIB, True
-    await monitor.check_once()
+    probe.free_mib = LOW_MIB
+    await _tick_into_hang(monitor, probe, monkeypatch)
     probe.free_mib = HIGH_MIB
     await probe.finish_hung()
     assert gate.is_open, "a result nobody was waiting for started a pause"
@@ -153,14 +171,14 @@ async def test_a_late_low_reading_does_not_newly_hold(tmp_path: Path, probe: _Pr
 
 
 async def test_a_result_landing_during_a_later_tick_is_not_consumed(
-    tmp_path: Path, probe: _Probe
+    tmp_path: Path, probe: _Probe, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     gate = IntakeGate()
     monitor = _disk_monitor(tmp_path, gate)
     probe.free_mib = LOW_MIB
     await monitor.check_once()
-    probe.free_mib, probe.hang = HIGH_MIB, True
-    await monitor.check_once()
+    probe.free_mib = HIGH_MIB
+    await _tick_into_hang(monitor, probe, monkeypatch)
     # The thread ends, and the very next tick runs before its completion reaches the loop.
     probe.hang = False
     probe.release.set()
@@ -173,27 +191,39 @@ async def test_a_result_landing_during_a_later_tick_is_not_consumed(
 
 
 async def test_a_late_failure_is_neither_logged_nor_left_unretrieved(
-    tmp_path: Path, probe: _Probe, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    probe: _Probe,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    unhandled: list[dict[str, object]] = []
-    asyncio.get_running_loop().set_exception_handler(lambda _, ctx: unhandled.append(ctx))
-    monitor = _disk_monitor(tmp_path, IntakeGate())
-    probe.error, probe.hang = OSError("late failure"), True
-    with caplog.at_level(logging.DEBUG, logger=_LOGGER):
-        await monitor.check_once()
-        await probe.finish_hung()
-        gc.collect()  # an unretrieved exception is reported when its task is collected
-        await asyncio.sleep(0)
-    assert unhandled == []
-    assert not [r for r in caplog.records if r.exc_info and r.exc_info[0] is OSError]
+    late = OSError("late failure")
+    unhandled: list[dict[str, Any]] = []
+    # The loop is session-scoped, so the handler goes back, and only this test's error counts.
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _, ctx: unhandled.append(ctx))
+    try:
+        monitor = _disk_monitor(tmp_path, IntakeGate())
+        probe.error = late
+        with caplog.at_level(logging.DEBUG, logger=_LOGGER):
+            await _tick_into_hang(monitor, probe, monkeypatch)
+            await probe.finish_hung()
+            gc.collect()  # an unretrieved exception is reported when its task is collected
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous)
+    assert not [ctx for ctx in unhandled if ctx.get("exception") is late]
+    assert not [r for r in caplog.records if r.exc_info and r.exc_info[1] is late]
 
 
-async def test_recovery_once_the_hung_probe_finishes(tmp_path: Path, probe: _Probe) -> None:
+async def test_recovery_once_the_hung_probe_finishes(
+    tmp_path: Path, probe: _Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
     gate = IntakeGate()
     monitor = _disk_monitor(tmp_path, gate)
     probe.free_mib = LOW_MIB
     await monitor.check_once()
-    probe.hang = True
+    await _tick_into_hang(monitor, probe, monkeypatch)
     for _ in range(3):
         await monitor.check_once()
     assert gate.reasons == {DISK_REASON}, "an unmeasured disk is not evidence that it recovered"
@@ -219,14 +249,10 @@ async def test_a_probe_failing_inside_its_own_tick_logs_once_with_its_cause(
     assert gate.reasons == {DISK_REASON}
 
 
-async def test_stop_does_not_wait_for_a_hung_probe(
-    tmp_path: Path, probe: _Probe, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_stop_does_not_wait_for_a_hung_probe(tmp_path: Path, probe: _Probe) -> None:
     gate = IntakeGate()
     monitor = _disk_monitor(tmp_path, gate, check_seconds=0.01)
-    # Long enough that the stop lands inside the tick's wait.
-    monkeypatch.setattr(intake_bound, "PROBE_TIMEOUT_SECONDS", 3600.0)
-    probe.hang = True
+    probe.hang = True  # the fixture's long timeout puts the stop inside the tick's wait
     monitor.start()
     for _ in range(400):
         if probe.started:
