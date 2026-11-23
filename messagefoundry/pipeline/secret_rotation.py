@@ -54,7 +54,7 @@ import logging
 import secrets
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeGuard
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
@@ -92,6 +92,8 @@ __all__ = [
     "fingerprint_changed",
     "fingerprints_equal",
     "open_rotation_record",
+    "PendingRotationWrites",
+    "persist_rotation_meta",
     "reconcile_rotation_meta",
     "secrets_from_settings",
     "secrets_from_settings_and_stamps",
@@ -555,6 +557,34 @@ def secrets_from_settings_and_stamps(
     return watched
 
 
+@dataclass
+class PendingRotationWrites:
+    """What :func:`reconcile_rotation_meta` would have written, held back by ``defer_writes`` so a
+    start that fails or is refused writes nothing (BACKLOG #5615). ``stamps`` are finished rows,
+    already sealed. ``record`` is the ``(key_id, day)`` to open the rotation record for."""
+
+    stamps: list[tuple[str, str, str, str]] = field(default_factory=list)
+    record: tuple[str, str] | None = None
+
+
+async def persist_rotation_meta(
+    meta_store: SecretRotationMetaStore, pending: PendingRotationWrites
+) -> None:
+    """Save what a deferred reconcile computed, never re-sealing. The record goes first and through
+    :func:`open_rotation_record`, so it keeps a record another writer opened meanwhile."""
+    if pending.record is not None:
+        key_id, day = pending.record
+        if await open_rotation_record(meta_store, key_id, day, keep_another=True):
+            log.warning(_OPENED_AT_START)  # only now is it true that a record was opened
+    for class_id, fingerprint, tracked_since, last_rotated in pending.stamps:
+        await meta_store.upsert_secret_rotation_meta(
+            class_id,
+            fingerprint=fingerprint,
+            tracked_since=tracked_since,
+            last_rotated=last_rotated,
+        )
+
+
 async def reconcile_rotation_meta(
     meta_store: SecretRotationMetaStore,
     settings: SecretRotationSettings,
@@ -566,6 +596,7 @@ async def reconcile_rotation_meta(
     extra_values: Mapping[str, str] | None = None,
     env_values: Mapping[str, str] | None = None,
     audit_rolled: bool | None = None,
+    defer_writes: PendingRotationWrites | None = None,
 ) -> dict[str, SecretStamp]:
     """Reconcile the persisted secret-rotation stamps against what the engine holds RIGHT NOW, at engine
     start (ASVS 13.3.4, BACKLOG #282). For each tracked class — the store DEK (by its one-way key-id) and
@@ -608,6 +639,11 @@ async def reconcile_rotation_meta(
     ``store_key_max_age_days + enforce_grace_days`` emits its ``secret_rotation_due`` alert with
     ``enforced=True`` at restart. Returns the reconciled stamps for the runner's live secret source.
 
+    **``defer_writes`` holds every write back (BACKLOG #5615).** The stamps and the rotation record
+    are collected for :func:`persist_rotation_meta`, and a key the record would hold reads as held
+    here, before the record exists. A start that never saves leaves the store as it found it, and
+    the next start detects the same change.
+
     PHI/secret-safe: a secret value is read only to compute its keyed MAC; only the sealed MAC + dates
     are ever persisted, and only dates and counts are alerted or logged, never the value."""
     ts = time.time() if now is None else now
@@ -625,7 +661,11 @@ async def reconcile_rotation_meta(
         *,
         write: bool,
     ) -> None:
-        if write:
+        if write and defer_writes is not None:
+            defer_writes.stamps.append(
+                (class_id, fingerprint, tracked_since.isoformat(), last_rotated.isoformat())
+            )
+        elif write:
             await meta_store.upsert_secret_rotation_meta(
                 class_id,
                 fingerprint=fingerprint,
@@ -650,6 +690,7 @@ async def reconcile_rotation_meta(
         changed_fp = dek_changed(prior, fingerprint)
         record = stored.get(ROTATION_RECORD_ID)
         hold = None if changed_fp is False else _rotation_hold(record, fingerprint)
+        deferred_open = False  # its warning waits for the save, which is what makes it true
         # Not only a key that changed: one whose stamp names an unknown scheme (`None`) cannot say,
         # and re-stamping it with the new fingerprint would hide the change from the run.
         # On a keyed chain a record open for another key holds this key too, even one the chain
@@ -665,15 +706,27 @@ async def reconcile_rotation_meta(
             # open for another key is kept, and this key is held all the same. Re-read for those
             # dates, which `dated` below takes when there is no stamp, and to see that it wrote: a
             # writer between the two reads can have stamped the key first.
-            opened = await open_rotation_record(
-                meta_store, dek_key_id, today.isoformat(), keep_another=True
-            )
-            record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
-            hold = _rotation_hold(record, fingerprint)
-            if hold is None and _record_open(record):
-                hold = _HELD_FOR_ANOTHER_RECORD
-            elif hold is not None and opened:
-                hold = _OPENED_AT_START
+            if defer_writes is not None:
+                # The same outcome in memory. `hold` is None here, so an open record names another
+                # key and is kept. With none, the record this start would open dates from today,
+                # which is what `dated` below reads from None.
+                if _record_open(record):
+                    hold = _HELD_FOR_ANOTHER_RECORD
+                else:
+                    defer_writes.record = (dek_key_id, today.isoformat())
+                    record = None
+                    hold = _OPENED_AT_START
+                    deferred_open = True
+            else:
+                opened = await open_rotation_record(
+                    meta_store, dek_key_id, today.isoformat(), keep_another=True
+                )
+                record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
+                hold = _rotation_hold(record, fingerprint)
+                if hold is None and _record_open(record):
+                    hold = _HELD_FOR_ANOTHER_RECORD
+                elif hold is not None and opened:
+                    hold = _OPENED_AT_START
         # With no stamp yet, a held key's age runs from the record, whose dates a re-run keeps, so
         # it is never younger than the run that opened it. A floor of today would restart at every
         # start, and a key held that way could never go overdue.
@@ -682,7 +735,8 @@ async def reconcile_rotation_meta(
         if hold is not None:
             # BACKLOG #3737. Nothing is written, so the run that completes still sees a change and
             # stamps it.
-            log.warning(hold)
+            if not deferred_open:
+                log.warning(hold)
         elif changed_fp:
             last_rotated = today  # rotation auto-detected, so reset the clock
         elif changed_fp is None:
