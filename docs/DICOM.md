@@ -314,8 +314,9 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   least these lines, which stay with the element's name and the reason while the value reads `[redacted]`:
   pynetdicom's non-conformant and refused value lines; its non-conformant transfer syntax and related SOP
   class lines, and its line naming a transfer syntax under the DICOM root that is no transfer syntax; the
-  exception its DUL logs when a received PDU does not decode, and the one its DIMSE provider logs when a
-  received message does not convert, each with its traceback; pydicom's invalid value
+  refusal in an exception logged by any pynetdicom module that logs one, such as its DUL when a received PDU
+  does not decode or its DIMSE provider when a received message does not convert, in the record's message
+  and in each link of its traceback's chain, and pydicom's invalid value refusal the same way; pydicom's invalid value
   line; the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
   association acceptance and a DIMSE message; and the username and password of a user identity in the
   dump of an association request, received or sent, which are never kept. A dump field otherwise keeps at

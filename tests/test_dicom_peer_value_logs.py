@@ -1035,6 +1035,116 @@ def test_the_credential_lines_the_filter_reads_are_still_pynetdicoms() -> None:
         assert "f\"  Password: [{secondary.decode('utf-8')}]\"" in source
 
 
+# --- A refusal inside an exception, on any logger that logs one (vault BACKLOG #6637, item 5) ------
+
+_REFUSAL = f"Invalid 'Affected SOP Instance UID' value '{_PLANTED}' - must not exceed 64 characters"
+_PYDICOM_REFUSAL = (
+    f"Invalid value for VR UI: '{_PLANTED}'. Please see <https://dicom.nema.org/x> for allowed "
+    "values for each VR."
+)
+
+
+def _raised_from(inner: str) -> BaseException:
+    """A plain error raised from a refusal, so only the traceback's chain names the value."""
+    try:
+        try:
+            raise ValueError(inner)
+        except ValueError as refusal:
+            raise RuntimeError("the handler failed") from refusal
+    except RuntimeError as exc:
+        return exc
+
+
+def _raised_during(inner: str) -> BaseException:
+    try:
+        try:
+            raise ValueError(inner)
+        except ValueError:
+            raise RuntimeError("the handler failed")  # noqa: B904 - the implicit context is the case
+    except RuntimeError as exc:
+        return exc
+
+
+def _raised_through_pydicoms_wrapper(inner: str) -> BaseException:
+    """pydicom's ``tag_in_exception``, which builds a new message around the refusal and a copy of
+    its traceback, the shape an encode failure has when ``pynetdicom.dsutils`` logs it."""
+    from pydicom.tag import Tag, tag_in_exception
+
+    try:
+        with tag_in_exception(Tag(0x0000, 0x1000)):
+            raise ValueError(inner)
+    except ValueError as exc:
+        return exc
+    raise AssertionError("the refusal was not raised")
+
+
+def _logged(name: str, exc: BaseException, caplog: pytest.LogCaptureFixture) -> list[str]:
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        # As pynetdicom's own `LOGGER.exception(exc)`, from inside the except block that caught it.
+        logging.getLogger(name).exception(exc, exc_info=exc)
+    return _formatted(list(caplog.records))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "pynetdicom.acse",
+        "pynetdicom.association",
+        "pynetdicom.dimse",
+        "pynetdicom.dsutils",
+        "pynetdicom.dul",
+        "pynetdicom.events",
+        "pynetdicom.fsm",
+        "pynetdicom.service_class",
+        "pynetdicom.transport",
+        "pynetdicom.utils",
+    ],
+)
+@pytest.mark.parametrize("inner", [_REFUSAL, _PYDICOM_REFUSAL], ids=["pynetdicom", "pydicom"])
+@pytest.mark.parametrize(
+    "raising",
+    [_raised_from, _raised_during, _raised_through_pydicoms_wrapper],
+    ids=["cause", "context", "wrapped"],
+)
+def test_a_refusal_in_a_logged_exception_is_redacted_on_every_logger(
+    name: str,
+    inner: str,
+    raising: Callable[[str], BaseException],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exc = raising(inner)
+    with _filter_removed():  # CONTROL: the handler's output names the value
+        assert [line for line in _logged(name, exc, caplog) if _PLANTED in line]
+    lines = _logged(name, exc, caplog)
+    assert lines
+    assert not [line for line in lines if _PLANTED in line], lines
+    assert [line for line in lines if _REDACTED_MARK in line], lines
+
+
+def test_every_pynetdicom_module_that_logs_an_exception_is_filtered() -> None:
+    """A module that logs one and is not on the filter would write a chained refusal whole."""
+    import pkgutil
+
+    import pynetdicom
+
+    logging_exceptions = {
+        f"pynetdicom.{module.name}"
+        for module in pkgutil.iter_modules(pynetdicom.__path__)
+        if not module.ispkg
+        and "LOGGER.exception("
+        in (Path(pynetdicom.__path__[0]) / f"{module.name}.py").read_text(encoding="utf-8")
+    }
+    assert "pynetdicom.events" in logging_exceptions  # CONTROL: the scan finds a known one
+    assert logging_exceptions <= set(dicom_module._FILTERED_LOGGERS)
+
+
+def test_a_value_ahead_of_another_shape_in_one_message_is_redacted() -> None:
+    # The first head in the text decides, whichever order the shapes are listed in.
+    message = f"Unable to decode '{_PLANTED}' using the ascii codec(s): {_REFUSAL}"
+    assert _PLANTED not in _filtered("pynetdicom.events", message)
+
+
 # --- A peer's DIMSE response that does not convert (vault BACKLOG #6637, item 4) -------------------
 
 _PLANTED_REFUSED = "1.02." + "9" * 70  # over 64 characters, so set_uid raises rather than warns

@@ -498,24 +498,41 @@ class _Shape(NamedTuple):
 #: <reason>`` at ERROR, whose reasons are fixed strings in ``pynetdicom._validators``.
 #: ``pynetdicom.presentation`` and ``pynetdicom.pdu_primitives`` write ``The <name> '<value>' is
 #: non-conformant``, and ``pynetdicom.presentation`` names a proposed or accepted transfer syntax
-#: again when it is under the DICOM root and no transfer syntax. ``pynetdicom.dul`` logs the
-#: exception a PDU it receives raised as it decoded, which is the refusal ``set_uid`` or ``set_ae``
-#: raises with the value in it, or ``decode_bytes``'s ``Unable to decode '<hex>'`` with the value's
-#: bytes. ``pydicom`` writes ``warn_and_log``'s ``Invalid value for VR <VR>: <repr>.``,
-#: with a pointer to PS3.5 after it when a data element is read, and sometimes after its own length
-#: message in the same line. ``pynetdicom._handlers`` writes ``<label> : <value>`` at DEBUG for each
-#: association request and DIMSE message it receives or sends; a head with a ``label`` group keeps a
-#: value that passes :func:`_kept`, since a real UID or AE title may be logged. At least these
+#: again when it is under the DICOM root and no transfer syntax. ``pynetdicom._handlers`` writes
+#: ``<label> : <value>`` at DEBUG for each association request and DIMSE message it receives or
+#: sends; a head with a ``label`` group keeps a value that passes :func:`_kept`, since a real UID or
+#: AE title may be logged. :data:`_REFUSALS` holds the shapes an exception can carry. At least these
 #: shapes, read from pynetdicom 3.0.4 and pydicom 3.0.2; a line of another shape, or on another
 #: logger, passes whole.
 _NON_CONFORMANT_NAME = _Shape(
     re.compile(r"The [A-Za-z ]{1,64} '"), "' is non-conformant", re.compile("' is non-conformant")
 )
-_REFUSED_VALUE = _Shape(re.compile(r"Invalid '[^']*' value '"), "' - ", re.compile(r"' - [^']*"))
+#: What ``set_uid``, ``set_ae``, ``decode_bytes`` and pydicom's ``validate_value`` say as they refuse
+#: a value, read wherever it appears in any record or traceback on a filtered logger, since a
+#: refusal is logged by whichever module caught it and pydicom's ``tag_in_exception`` wraps it in a
+#: longer message. Each tail is one line: text after it is not known to be fixed, so it goes too.
+_REFUSALS: tuple[_Shape, ...] = (
+    _Shape(
+        re.compile(r"Invalid '[^']*' value '"), "' - ", re.compile(r"' - [^'\n]*"), anywhere=True
+    ),
+    _Shape(
+        re.compile(r"Unable to decode '"),
+        "' using the ",
+        re.compile(r"' using the [^'\n]*"),
+        anywhere=True,
+    ),
+    # With a pointer to PS3.5 after it when a data element is read, and sometimes after pydicom's own
+    # length message in the same line.
+    _Shape(
+        re.compile(r"Invalid value for VR [A-Z]{2}: "),
+        ". Please see <",
+        re.compile(r"\. Please see <[^<>\n]*> for allowed values for each VR\."),
+        anywhere=True,
+    ),
+)
 _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
     "pynetdicom.utils": (
         _Shape(re.compile(r"Non-conformant '[^']*' value '"), "'", re.compile("'")),
-        _REFUSED_VALUE,
     ),
     "pynetdicom.presentation": (
         _NON_CONFORMANT_NAME,
@@ -528,21 +545,6 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
         ),
     ),
     "pynetdicom.pdu_primitives": (_NON_CONFORMANT_NAME,),
-    "pynetdicom.dul": (
-        _REFUSED_VALUE,
-        _Shape(re.compile(r"Unable to decode '"), "' using the ", re.compile(r"' using the [^']*")),
-    ),
-    # The refusal a DIMSE message raises as it converts to its primitive, logged with its traceback.
-    # Only the SCU reaches it, from a peer's response: the SCP ends such an association first.
-    "pynetdicom.dimse": (_REFUSED_VALUE,),
-    "pydicom": (
-        _Shape(
-            re.compile(r"Invalid value for VR [A-Z]{2}: "),
-            ". Please see <",
-            re.compile(r"\. Please see <[^<>]*> for allowed values for each VR\."),
-            anywhere=True,
-        ),
-    ),
     "pynetdicom._handlers": (
         _Shape(
             re.compile(
@@ -574,33 +576,54 @@ _TITLE_LABELS = frozenset(
 
 
 def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
-    """``text`` with the peer's value in it redacted, or ``None`` where it keeps its value."""
+    """``text`` with the peer's value in it redacted, or ``None`` where it keeps its value. The head
+    earliest in the text decides, since all after it is the value or a fixed tail, so a second value
+    further on goes with the first."""
+    found: tuple[_Shape, re.Match[str]] | None = None
     for shape in shapes:
         head = shape.head.search(text) if shape.anywhere else shape.head.match(text)
-        if head is None:
-            continue
-        rest = text[head.end() :]
-        label = head.groupdict().get("label")
-        if label is not None and _kept(label, rest):
-            return None
-        tail = ""
-        if shape.anchor is not None and shape.tail is not None:
-            cut = rest.rfind(shape.anchor)
-            if cut >= 0 and shape.tail.fullmatch(rest, cut):
-                tail = rest[cut:]
-        return f"{text[: head.end()]}{_REDACTED}{tail}"
-    return None
+        if head is not None and (found is None or head.start() < found[1].start()):
+            found = (shape, head)
+    if found is None:
+        return None
+    shape, head = found
+    rest = text[head.end() :]
+    label = head.groupdict().get("label")
+    if label is not None and _kept(label, rest):
+        return None
+    tail = ""
+    if shape.anchor is not None and shape.tail is not None:
+        cut = rest.rfind(shape.anchor)
+        if cut >= 0 and shape.tail.fullmatch(rest, cut):
+            tail = rest[cut:]
+    return f"{text[: head.end()]}{_REDACTED}{tail}"
 
 
-#: Every logger the filter is on: those above, and three more a pre-read of a command set writes to
-#: with no peer value in the line, so that the hold covers them: ``message_to_primitive``'s WARNING for an element with more than
-#: one value, the Move Originator setter's ERROR, and ``dsutils.decode``'s DEBUG line.
+#: Every logger the filter is on. Those above; ``pydicom``, for :data:`_REFUSALS`; each pynetdicom
+#: module that logs an exception it caught, which can be a refusal or hold one in its chain; and
+#: three a pre-read of a command set writes to with no peer value in the line, so that the hold
+#: covers them: ``message_to_primitive``'s WARNING for an element with more than one value, the Move
+#: Originator setter's ERROR, and ``dsutils.decode``'s DEBUG line.
 _FILTERED_LOGGERS = (
     *_PEER_VALUE_LINES,
+    "pydicom",
+    "pynetdicom.acse",
+    "pynetdicom.association",
+    "pynetdicom.dimse",
     "pynetdicom.dimse_messages",
     "pynetdicom.dimse_primitives",
     "pynetdicom.dsutils",
+    "pynetdicom.dul",
+    "pynetdicom.events",
+    "pynetdicom.fsm",
+    "pynetdicom.service_class",
+    "pynetdicom.transport",
 )
+
+#: What the filter reads on each logger: its own lines, then the refusals every logger can carry.
+_SHAPES_BY_LOGGER: dict[str, tuple[_Shape, ...]] = {
+    name: (*_PEER_VALUE_LINES.get(name, ()), *_REFUSALS) for name in _FILTERED_LOGGERS
+}
 
 #: The start of the ``UserWarning`` pydicom's ``warn_and_log`` raises beside its log line, with the
 #: same value in it. It is ignored; the log line, redacted, still says what was wrong. Unignored, it
@@ -671,9 +694,7 @@ class _PeerValueFilter(logging.Filter):
         if held is not None:
             held.append(record)
             return False
-        shapes = _PEER_VALUE_LINES.get(record.name, ())
-        if not shapes:
-            return True
+        shapes = _SHAPES_BY_LOGGER.get(record.name, _REFUSALS)
         try:
             text = record.getMessage()
         except Exception as failed:  # noqa: BLE001 - bad %-args, or a msg whose str() raises
