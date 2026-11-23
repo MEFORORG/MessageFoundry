@@ -7188,12 +7188,11 @@ class Registry:
         for kind, name, settings in dialling:
             if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
                 continue
-            try:
-                unread = unread_ca_reason(settings)
-            except ValueError:
-                # A non-bool literal on a flag it reads, which bool_literal_problems reports.
+            if any(_bool_literal_problems_in(settings)):
+                # A non-bool literal, which bool_literal_problems names, and which the strict read
+                # in unread_ca_reason would raise on, ending validate_config's collection.
                 continue
-            if unread is not None:
+            if (unread := unread_ca_reason(settings)) is not None:
                 problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
         return problems
 
