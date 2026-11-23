@@ -1119,11 +1119,11 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/uploads.py::UploadStore._sweep_orphans_sync": Site(
         1,
-        INTERNAL,
-        "A sidecar name built from a 32-hex stem that passed `_FILE_ID_RE` and the fixed `.meta` "
-        "suffix, taken from a listing of the uploads root. It holds no separator and cannot leave "
-        "the root. It is only asked about, by `_sidecar_is_absent`; the unlink acts on the listed "
-        "entry, not on this path.",
+        REVIEWED,
+        "A sidecar name built from the stem of a listed `.blob` name that passed `_FILE_ID_RE`, "
+        "plus the fixed `.meta` suffix. The join is reached only when that sidecar name is not in "
+        "the listing, and the path is passed to the absence check `_sidecar_is_absent` and nowhere "
+        "else. The unlink acts on the listed entry.",
     ),
     "messagefoundry/uploads.py::_atomic_write_text": Site(
         1, INTERNAL, "A random-token temp name beside a path the store built."
