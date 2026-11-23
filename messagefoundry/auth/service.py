@@ -16820,7 +16820,9 @@ class AuthService:
         console's write gate), which refuse on ``True``. Not every caller refuses: the console's
         reauth-only action gate records the signal on a request it is refusing for another reason.
         The JSON plane's base gate (``require``) and its monitoring-read gate
-        (``require_monitoring_read``) never call it, so the JSON monitoring reads are not refused. The console's base gate (``require_ui``) calls it for a PHI read or a write, and,
+        (``require_monitoring_read``) never call it, so the JSON monitoring polls are not refused;
+        a monitoring ``reveal`` read is, through the HTTP reveal path above. The console's base
+        gate (``require_ui``) calls it for a PHI read or a write, and,
         since BACKLOG #5646, on every request a step-up gate serves, GET included, because the
         step-up factories hand it their question; the console's plain monitoring polls ride none
         of those, so they are not refused either.

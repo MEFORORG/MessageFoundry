@@ -4031,7 +4031,7 @@ class AuthSettings(_Section):
 
     # Per-actor pacing on six monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2):
     # /graph/edges, /status, /stats, /metrics, /metrics/history and /connections, charged at
-    # admission by require_monitoring_read. The default's measured basis and multiplier are written
+    # admission by require_monitoring_read. The default's basis and multiplier are written
     # once, in docs/SECURITY.md, "Monitoring-read pacing". In-process only, like the PHI-read
     # throttle. 0 disables that dimension.
     monitoring_read_rate_limit_enabled: bool = True
