@@ -3318,12 +3318,13 @@ class TrustAnchor:
     #: :func:`resolve_trust_anchor`, so a loopback hop carries ``None`` even when the instance
     #: configures one.
     crl_file: str | None = None
-    #: Whether ``crl_file`` is checked against the peer's whole chain (``[tls].crl_check_chain``,
-    #: vault BACKLOG #5511). True only beside a ``crl_file``, which construction checks.
-    crl_check_chain: bool = False
     #: Where ``cafile`` came from, for a refusal to name: ``[tls].internal_ca_file``, or a
     #: connection's ``tls_ca_file`` with its name (vault BACKLOG #2370). Not part of equality.
     cafile_setting: str | None = field(default=None, compare=False)
+    #: Whether ``crl_file`` is checked against the peer's whole chain (``[tls].crl_check_chain``,
+    #: vault BACKLOG #5511) rather than its leaf. True only beside a ``crl_file``, which
+    #: construction checks. Last, so a positional construction binds what it did before.
+    crl_check_chain: bool = False
 
     def __post_init__(self) -> None:
         if self.crl_check_chain and self.crl_file is None:
@@ -3498,7 +3499,8 @@ def _require_self_signed_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
     stats = ctx.cert_store_stats()
     if stats["x509"] != stats["x509_ca"]:
         # get_ca_certs leaves out a certificate that is not a CA, such as a pinned server leaf,
-        # and with the flag cleared no chain could end at it.
+        # so the checks below could not see it, and under the chain check it would need a CRL
+        # of its own that no rule here asks for.
         raise ValueError(
             f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
             f"loads {stats['x509'] - stats['x509_ca']} certificate(s) that are not CAs. The "

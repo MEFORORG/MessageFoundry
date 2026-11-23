@@ -176,7 +176,7 @@ def test_a_missing_root_crl_refuses_the_build_in_outbound_words(
     text = str(caught.value)
     assert text.startswith("[tls].crl_file (")
     assert "the CA(s) 'CN=Client Root'" in text
-    assert "loaded from this hop's CA setting (a connection's tls_ca_file" in text
+    assert "loaded from this hop's CA setting (such as a connection's tls_ca_file" in text
     assert "[tls].crl_check_chain checks the whole server chain" in text
     assert "client CA" not in text and "clients" not in text
 

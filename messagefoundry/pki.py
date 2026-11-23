@@ -1470,7 +1470,8 @@ def cas_not_self_signed(ca_ders: Iterable[bytes]) -> list[str]:
 
 #: The CA setting an outbound whole-chain hop loads its CAs from, as a refusal names it.
 _OUTBOUND_CA_SETTINGS = (
-    "a connection's tls_ca_file, or [tls].internal_ca_file under trust_anchor_mode = 'pinned'"
+    "such as a connection's tls_ca_file, [alerts].email_tls_ca_file, or "
+    "[tls].internal_ca_file under trust_anchor_mode = 'pinned'"
 )
 
 
