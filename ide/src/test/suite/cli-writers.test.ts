@@ -4,13 +4,15 @@
 // lies inside the workspace folder but whose real path leaves it (BACKLOG #5404). The other suites
 // pin their wiring by reading cli.ts's source or drive escapesByLink alone; this one runs the real
 // cli.ts against a stubbed `vscode` and a real temporary folder, so it fails on a writer that checks
-// the spelling only. Every refusal has a control on the same folder that the writer accepts, so a
+// the spelling only. The refusals have controls on the same folder that the writer accepts, so a
 // refusal cannot pass because the stub was not wired. Node-side only, as new-route-containment.test.ts
 // is: the Extension Host resolves the real `vscode`.
 import * as assert from "assert";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+import { unlinkLinks } from "../unlinkLinks";
 
 type Scope = "globalValue" | "workspaceValue";
 
@@ -121,15 +123,21 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
   });
 
   teardown(() => {
+    // The links go first: a recursive rmSync can follow a junction into its target (unlinkLinks.ts).
+    unlinkLinks(root);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  /** The one refusal shown, which must name `key`; clears the shown errors for the next call. */
-  function refusedNaming(key: string): void {
+  /** The one refusal shown, which must name `key` and not quote `value`; clears the shown errors
+   *  for the next call. */
+  function refusedNaming(key: string, value?: string): void {
     assert.strictEqual(errors.length, 1, errors.join("\n"));
     assert.ok(errors[0].includes(`messagefoundry.${key}`), errors[0]);
     // The value and the link's target are not quoted back (docs/REVIEW-STANDARDS.md R12).
     assert.ok(!errors[0].includes(outside), errors[0]);
+    if (value !== undefined) {
+      assert.ok(!errors[0].includes(value), errors[0]);
+    }
     errors = [];
   }
 
@@ -144,9 +152,9 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
       for (const value of ["escape", "escape/deeper"]) {
         settings.configDir = { [scope]: value };
         assert.strictEqual(cli.writerPathSetting("configDir"), undefined, value);
-        refusedNaming("configDir");
+        refusedNaming("configDir", value);
         assert.strictEqual(cli.writerConfigTarget(), undefined, value);
-        refusedNaming("configDir");
+        refusedNaming("configDir", value);
       }
     });
   }
@@ -162,8 +170,7 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
     settings.configDir = { workspaceValue: "cfg" };
     settings.serviceConfig = { workspaceValue: "escape/messagefoundry.toml" };
     assert.strictEqual(cli.writerConfigTarget(), undefined);
-    refusedNaming("serviceConfig");
-    assert.ok(!fs.existsSync(path.join(outside, "messagefoundry.toml")));
+    refusedNaming("serviceConfig", "escape/messagefoundry.toml");
   });
 
   test("a blank serviceConfig checks the file the CLI opens in its place, the workspace's messagefoundry.toml", () => {
@@ -178,6 +185,9 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
   });
 
   test("the manifest default is checked too, since the repository supplies the link", () => {
+    // The control: with nothing set and no link yet, the defaults are accepted.
+    assert.deepStrictEqual(cli.writerConfigTarget(), { configDir: "samples/config", serviceConfig: undefined });
+    assert.deepStrictEqual(errors, []);
     fs.mkdirSync(path.join(ws, "samples"));
     fs.symlinkSync(outside, path.join(ws, "samples", "config"), "junction");
     assert.strictEqual(cli.writerPathSetting("configDir"), undefined);
@@ -187,7 +197,7 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
   test("a `..` component is refused even where its spelling stays inside the folder", () => {
     settings.configDir = { workspaceValue: "escape/../cfg" };
     assert.strictEqual(cli.writerPathSetting("configDir"), undefined);
-    refusedNaming("configDir");
+    refusedNaming("configDir", "escape/../cfg");
   });
 
   (process.platform === "win32" ? test : test.skip)(
@@ -196,7 +206,7 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
       for (const value of ["escape.", "escape ", "cfg:stream", "nul", "cfg/CON.toml"]) {
         settings.configDir = { workspaceValue: value };
         assert.strictEqual(cli.writerPathSetting("configDir"), undefined, value);
-        refusedNaming("configDir");
+        refusedNaming("configDir", value.length > 4 ? value : undefined);
       }
     },
   );
@@ -213,6 +223,6 @@ writerSuite("cli.ts writers refuse a path setting whose real path leaves the wor
   test("a workspace value spelled outside the folder is refused by its spelling", () => {
     settings.configDir = { workspaceValue: "../outside" };
     assert.strictEqual(cli.writerPathSetting("configDir"), undefined);
-    refusedNaming("configDir");
+    refusedNaming("configDir", "../outside");
   });
 });

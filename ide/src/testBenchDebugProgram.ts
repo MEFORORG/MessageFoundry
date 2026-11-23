@@ -23,14 +23,15 @@ import * as path from "node:path";
  * and the standard library included. This code does not defend against a writer running as the
  * same OS user: that writer can already change the extension, the interpreter and the workspace.
  * None of the names writeDebugProgram writes is one the launch imports. The program runs the installed
- * package through `runpy`, so no debugpy build puts the working directory on the import path. The
+ * package through `runpy`, so no debugpy build read (below) puts the working directory on the import path. The
  * source is written at launch rather than shipped, because the extension package holds no Python
  * (the crypto inventory's ide/ arm reads only TypeScript).
  *
- * Builds covered: debugpy 1.8.0 and later. The sys.path steps of debugpy's `run_file` and
- * `run_module` read at tags v1.8.0, v1.8.21 and v1.8.22 and at `main` (2026-11-23) take two shapes,
- * 1.8.0 to 1.8.21, and 1.8.22 on, whose two runners skip their prepend under `-P`; and b532w3-ide-debugpy.test.ts
- * runs the launch under a stand-in for each. No build before 1.8.0 was read.
+ * Builds read: the sys.path steps of debugpy's `run_file` and `run_module` at tags v1.8.0, v1.8.21
+ * and v1.8.22 and at `main` (2026-11-23). They take one shape at v1.8.0 and v1.8.21, and another at
+ * v1.8.22 and `main`, whose runners skip their prepend under `-P`; b532w3-ide-debugpy.test.ts runs
+ * the launch under a stand-in for each. The releases between those points, and any build before
+ * 1.8.0, were not read.
  *
  * Open limit: `-P` does not remove a PYTHONPATH entry, and the Python Debugger extension loads an
  * env file into the debuggee, the workspace's `.env` by default. At least a PYTHONPATH that env file
