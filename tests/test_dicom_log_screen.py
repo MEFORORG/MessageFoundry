@@ -1077,6 +1077,14 @@ async def test_a_failed_release_keeps_any_answer_that_is_not_a_confirmed_store(
     assert _UID not in caplog.text
 
 
+def _assert_stands_for(cause: BaseException | None, name: str) -> None:
+    """``cause`` is the engine's stand-in for a library class ``name``, and holds nothing else."""
+    assert isinstance(cause, dicom_module._LibraryCause)
+    assert cause.library_class == name
+    assert name in type(cause).__qualname__  # what a traceback prints
+    assert not cause.args and not vars(cause)
+
+
 def _bomb_in_the_guard(patch: pytest.MonkeyPatch) -> None:
     patch.setattr(dicom_module, "guard_part10_deflate", _raiser(DicomBombError(_REFUSAL)))
 
@@ -1184,19 +1192,24 @@ async def test_each_refusal_the_scu_raises_carries_no_library_text_on_its_chain(
         seen += 1
         link = link.__cause__ or link.__context__
     assert seen == 2  # CONTROL: the cause is still there, by its class
-    assert type(raised.value.__cause__) is library
     assert _UID not in "".join(traceback.format_exception(raised.value))
+    cause = raised.value.__cause__
+    _assert_stands_for(cause, library.__name__)
 
 
 def _exception_whose_bare_new(gives: Callable[[Any], Any]) -> Exception:
-    """A library-style exception holding the refusal, whose ``__new__`` with no arguments, the call
-    the chain scrub makes, returns what ``gives`` does."""
+    """A library-style exception holding the refusal, whose ``__new__`` with no arguments returns
+    what ``gives`` does, and counts the call: the chain scrub must not make it."""
 
     class Odd(Exception):
         raised: Exception
+        bare_calls = 0
 
         def __new__(cls, *args: Any) -> Any:
-            return super().__new__(cls, *args) if args else gives(cls)
+            if args:
+                return super().__new__(cls, *args)
+            cls.bare_calls += 1
+            return gives(cls)
 
     Odd.raised = Odd(_REFUSAL)
     return Odd.raised
@@ -1241,11 +1254,52 @@ def test_the_chain_scrub_never_raises_and_keeps_no_library_text(
     error.__cause__ = library
     dicom_module._drop_library_text_from_chain(error)
     assert error.__context__ is None
-    assert error.__cause__ is not library
-    assert error.__cause__ is None or not (error.__cause__.args or vars(error.__cause__))
     written = "".join(traceback.format_exception(error))
     assert "the screened line" in written  # CONTROL
     assert _UID not in written, written
+    assert type(library).bare_calls == 0  # type: ignore[attr-defined]  # no library code ran
+    _assert_stands_for(error.__cause__, "Odd")
+
+
+def test_a_slot_on_a_library_exception_cannot_carry_text_onto_the_chain() -> None:
+    from messagefoundry.transports.base import DeliveryError
+
+    class Slotted(Exception):
+        __slots__ = ("detail",)
+
+        def __new__(cls, *args: Any) -> Any:
+            made = super().__new__(cls, *args)
+            made.detail = _REFUSAL
+            return made
+
+        def __str__(self) -> str:
+            return str(self.detail)
+
+    error = DeliveryError("the screened line")
+    error.__cause__ = Slotted()
+    assert _UID in "".join(traceback.format_exception(error))  # CONTROL: the slot prints
+    dicom_module._drop_library_text_from_chain(error)
+    assert _UID not in "".join(traceback.format_exception(error))
+    _assert_stands_for(error.__cause__, "Slotted")
+
+
+def test_the_chain_scrub_reads_the_class_name_with_no_library_code() -> None:
+    from messagefoundry.transports.base import DeliveryError
+
+    meta = type("Meta", (type,), {"__name__": property(_raiser(RuntimeError(_REFUSAL)))})
+    named: Any = meta("Named", (Exception,), {})
+    error = DeliveryError("the screened line")
+    error.__cause__ = named(_REFUSAL)
+    dicom_module._drop_library_text_from_chain(error)
+    _assert_stands_for(error.__cause__, "Named")
+
+
+def test_a_delivery_error_with_no_chain_keeps_none() -> None:
+    from messagefoundry.transports.base import DeliveryError
+
+    error = DeliveryError("the screened line")
+    dicom_module._drop_library_text_from_chain(error)
+    assert error.__cause__ is None and error.__context__ is None
 
 
 async def test_a_library_class_that_cannot_be_rebuilt_still_fails_as_a_delivery_error(

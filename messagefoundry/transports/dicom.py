@@ -819,46 +819,44 @@ def _safe_library_exc(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {safe_text(line)}" if line else type(exc).__name__
 
 
+class _LibraryCause(Exception):
+    """Stands on a delivery error's chain for the library exception it was raised from, holding
+    only that exception's class name, which is code. The name is on a subclass rather than in a
+    message: under a database driver's error a traceback withholds every link's message and still
+    prints its class, so this way the name survives there too."""
+
+    library_class: ClassVar[str] = ""
+
+
+#: Reads a class's name past any ``__name__`` its metaclass defines, so no library code runs.
+_class_name: Callable[[type], str] = type.__dict__["__name__"].__get__
+
+
+@functools.lru_cache(maxsize=64)
+def _library_cause_class(name: str) -> type[_LibraryCause]:
+    """The :class:`_LibraryCause` subclass for a library class ``name``, printed by a traceback as
+    ``_LibraryCause[name]``. Cached and bounded, since one is needed for each failed delivery."""
+    namespace = {"__qualname__": f"_LibraryCause[{name}]", "__module__": __name__}
+    return cast(
+        "type[_LibraryCause]",
+        type("_LibraryCause", (_LibraryCause,), {**namespace, "library_class": name}),
+    )
+
+
 def _drop_library_text_from_chain(exc: BaseException) -> None:
-    """Replace what ``exc`` was raised from with an empty exception of the same class.
+    """Replace what ``exc`` was raised from with a :class:`_LibraryCause` naming its class.
 
     A delivery error's own text is screened, but its chain still held the library's exception. If
     the runner's write of the failure to the store then raises, the worker's fault log prints that
     whole chain, and the engine's redaction does not recognise a refused UID. ``from None`` would
-    leave it on ``__context__``, so both links are set. The class stays, for diagnosis and for the
-    retry classification's tests; ``__new__`` runs none of the library's own initialiser. This never
-    raises: it runs on the way out of a delivery failure, and a raise here would replace that failure
-    with an internal error, which can stop the lane."""
+    leave it on ``__context__``, so both links are set. The stand-in is the engine's own class, so
+    none of the library's code runs here and no attribute of its exception survives. This must not
+    raise: it runs on the way out of a delivery failure, and a raise would replace that failure with
+    an internal error, which can stop the lane."""
     link = exc.__cause__ if exc.__cause__ is not None else exc.__context__
-    bare = None if link is None else _empty_exception_like(link, exc)
     exc.__context__ = None
-    exc.__cause__ = bare  # also sets __suppress_context__
-
-
-def _empty_exception_like(link: BaseException, exc: BaseException) -> BaseException | None:
-    """A new, empty exception of ``link``'s class, or ``None`` when its ``__new__`` gives anything
-    else. That method is the library's code, so what it returns is checked: it could be no exception
-    at all, which ``__cause__`` refuses with a ``TypeError``, or a held instance with text on it.
-
-    ``BaseException`` is caught because a class can raise anything here, and nothing else can arrive:
-    this runs on the SCU's worker thread, where no ``KeyboardInterrupt`` is delivered."""
-    kind = type(link)
-    try:
-        bare = kind.__new__(kind)
-        if (
-            type(bare) is kind
-            and bare is not link
-            and bare is not exc
-            and not bare.args
-            and not vars(bare)
-            and bare.__cause__ is None
-            and bare.__context__ is None
-            and bare.__traceback__ is None
-        ):
-            return bare
-    except BaseException as failed:  # noqa: BLE001 - see the docstring
-        logger.debug("A DICOM exception's class was dropped: %s", type(failed).__name__)
-    return None
+    # Setting __cause__ also sets __suppress_context__.
+    exc.__cause__ = None if link is None else _library_cause_class(_class_name(type(link)))()
 
 
 def _raised_at(exc: BaseException) -> str:
