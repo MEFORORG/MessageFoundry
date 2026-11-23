@@ -475,7 +475,9 @@ def test_the_cli_reports_an_unnamed_integrity_refusal_as_a_refused_write(
     )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 1
-    assert error.startswith("the store refused this command's first account write")
+    assert error.startswith(
+        "the store refused a write before this command's first account write landed"
+    )
     assert "cannot open the store" not in error
 
 
@@ -506,7 +508,9 @@ def test_the_cli_reports_a_server_backends_integrity_refusal_as_a_refused_write(
     )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 1
-    assert error.startswith("the store refused this command's first account write")
+    assert error.startswith(
+        "the store refused a write before this command's first account write landed"
+    )
 
 
 # Driver-shaped text, one per backend family. Each fragment names schema or a key value the CLI must
@@ -567,7 +571,9 @@ def test_the_cli_refused_write_names_the_class_and_never_the_driver_text(
     captured = capsys.readouterr()
     assert rc == 1
     error = json.loads(captured.out)["error"] if as_json else captured.err.rsplit("error: ", 1)[1]
-    assert error.startswith(f"the store refused this command's first account write ({class_name})")
+    assert error.startswith(
+        f"the store refused a write before this command's first account write landed ({class_name})"
+    )
     for fragment in _DRIVER_FRAGMENTS:
         assert fragment not in captured.out, fragment
         assert fragment not in captured.err, fragment

@@ -928,7 +928,7 @@ def test_a_refused_first_insert_says_the_shown_entry_has_no_seed(
     captured = capsys.readouterr()
     out = captured.out + captured.err
     assert code == 1, out
-    assert "the store refused this command's first account write (IntegrityError)" in out, out
+    assert "before this command's first account write landed (IntegrityError)" in out, out
     assert "so no account was written" in out and "partly written account" not in out, out
     assert "delete it: its seed was never stored." in out and _KEEP_ENTRY not in out, out
 
@@ -1014,7 +1014,7 @@ def test_a_locked_store_after_the_write_open_is_no_cannot_open(
 ) -> None:
     """A "database is locked" from the service, after the write's open returned, is no "cannot
     open the store": once the write started it says so and to keep the entry; before it, to delete
-    it. Exit 1, as an integrity refusal exits.
+    it. Exit 2, as main exited on this arm.
 
     Mutation: send that arm to ``_emit_store_open_error`` again; it then says cannot open."""
     _service_raises(monkeypatch, sqlite3.OperationalError("database is locked"), wrote=wrote)

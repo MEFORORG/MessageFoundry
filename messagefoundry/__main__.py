@@ -11045,7 +11045,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         refusal came before any account write (a refused first INSERT), delete it, since no seed
         was stored (BACKLOG #5067)."""
         if not write_started:
-            # The first INSERT itself was refused: no account row and no seed (BACKLOG #5067).
+            # Refused before the first account write landed, the INSERT itself included: no
+            # account row and no seed (BACKLOG #5067).
             entry = (
                 ""
                 if totp_secret is None
@@ -11053,8 +11054,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "it: its seed was never stored."
             )
             return _emit_error(
-                f"the store refused this command's first account write ({type(exc).__name__}), "
-                "so no account was written. Once no other provision-admin run is in progress, run "
+                f"the store refused a write before this command's first account write landed "
+                f"({type(exc).__name__}), so no account was written. Once no other provision-admin run is in progress, run "
                 "the command again. If it is refused the same way again, the store has a fault "
                 f"this command cannot repair.{entry}",
                 as_json=args.json,
@@ -11535,7 +11536,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 return ("write-failed", user.username, f"{exc}; {logged}")
             return ("set", user.username, store.path)
         finally:
-            await store.close()
+            # A close that fails warns and never replaces the result, as admin-unlock closes: after
+            # a commit it would read as a change that did not land (BACKLOG #5067).
+            await _close_store_quietly(store)
 
     try:
         outcome, username, extra = run_guarded(run())
@@ -11746,8 +11749,8 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         *store_driver_errors(),
     )
 
-    # Set once an open below has returned, and cleared before the next one, so open_refused can
-    # tell a refusal from a store that had opened (BACKLOG #5067).
+    # Set once check()'s open has returned, so open_refused can tell a refusal from a store
+    # that had opened, and may have written, at least once (BACKLOG #5067).
     store_returned = False
 
     def open_refused(exc: Exception, *, hint: str = "") -> int:
@@ -11953,10 +11956,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     async def run() -> str | None:
         """The swap, its session sweep and its audit row in one transaction, or why not."""
-        nonlocal store_returned
-        store_returned = False
+        # store_returned stays set from check(): that open returned, and may have written,
+        # before this one (BACKLOG #5067).
         store = await opened()
-        store_returned = True
         try:
             user = await store.get_user_by_username(wanted)
             if user is None or user.id != target.user_id:

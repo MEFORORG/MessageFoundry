@@ -1141,3 +1141,38 @@ def test_a_store_failure_after_the_write_open_says_what_the_open_may_have_change
     assert "the store failed before the replacement (RuntimeError)" in error, error
     assert "this command makes did not land" in error and "delete it" in error, error
     assert "nothing was written" not in error.lower(), error
+
+
+def test_a_store_failure_at_the_second_open_says_what_the_first_open_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: the first open returned, and may have written, before the second open
+    fails, so that failure does not say nothing was written.
+
+    Mutation: clear ``store_returned`` before the second open again."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "second-open-fails.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    from messagefoundry.store import base
+
+    prompted: list[bool] = []
+
+    real_open_store = base.open_store
+    real_enrol = cli._enrol_totp_at_terminal
+
+    async def open_or_fail(*a: Any, **k: Any) -> Any:
+        if prompted:
+            raise RuntimeError("synthetic busy store at the second open")
+        return await real_open_store(*a, **k)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(base, "open_store", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "the store failed before the replacement (RuntimeError)" in error, error
+    assert "nothing was written" not in error.lower(), error

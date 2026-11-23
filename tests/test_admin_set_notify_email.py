@@ -972,3 +972,26 @@ def test_a_locked_read_after_the_open_is_no_cannot_open(
     error = _error(capsys)
     assert "the store failed after it opened (OperationalError)" in error, error
     assert "cannot open the store" not in error and "may already have changed" in error, error
+
+
+def test_a_failed_close_after_a_set_does_not_say_the_change_did_not_land(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: a close that fails after the address and its audit row committed warns and
+    keeps the result, so the command never says the change did not land.
+
+    Mutation: close with a bare ``await store.close()`` again; the run then exits 2."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "close-fails.db"
+    _seed(db)
+    real_close = MessageStore.close
+
+    async def failing_close(self: MessageStore) -> None:
+        await real_close(self)
+        raise sqlite3.OperationalError("synthetic close failure")
+
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 0
+    captured = capsys.readouterr()
+    assert "did not land" not in captured.out + captured.err
+    assert "closing the store failed (OperationalError)" in captured.err
