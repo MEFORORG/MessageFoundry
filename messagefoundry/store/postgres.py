@@ -8460,16 +8460,25 @@ class PostgresStore:
             # Pre-lock all affected messages' finalize locks in canonical order before the loop
             # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
             await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
+            dead: list[Any] = []
             for row in orphans:
-                await conn.execute(
+                # The read took no row lock, so a row may have left the read's statuses before this
+                # write (cancelled, completed, purged). The status term leaves such a row as it is,
+                # and its zero rowcount skips the row's event, finalize and count.
+                result = await conn.execute(
                     "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status IN ($6, $7)",
                     OutboxStatus.DEAD.value,
                     now,
                     await self._aenc(error, aad=cell_aad("queue", "last_error", row["id"])),
                     now,
                     row["id"],
+                    OutboxStatus.PENDING.value,
+                    OutboxStatus.INFLIGHT.value,
                 )
+                if _rowcount(result) == 0:
+                    continue
+                dead.append(row)
                 await self._event(
                     conn,
                     row["message_id"],
@@ -8479,12 +8488,13 @@ class PostgresStore:
                     now,
                 )
                 await self._maybe_finalize_message(conn, row["message_id"], now)
-        log.warning(
-            "dead-lettered %d orphaned outbox row(s) at startup for missing destination(s): %s",
-            len(orphans),
-            ", ".join(sorted({r["destination_name"] for r in orphans})),
-        )
-        return len(orphans)
+        if dead:
+            log.warning(
+                "dead-lettered %d orphaned outbox row(s) at startup for missing destination(s): %s",
+                len(dead),
+                ", ".join(sorted({r["destination_name"] for r in dead})),
+            )
+        return len(dead)
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None
@@ -8506,24 +8516,32 @@ class PostgresStore:
             # Pre-lock all affected messages' finalize locks in canonical order before the loop
             # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
             await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
+            dead: list[Any] = []
             for row in orphans:
-                await conn.execute(
+                # As dead_letter_missing_destinations: only a row still in a status the read selected.
+                result = await conn.execute(
                     "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status IN ($6, $7)",
                     OutboxStatus.DEAD.value,
                     now,
                     await self._aenc(error, aad=cell_aad("queue", "last_error", row["id"])),
                     now,
                     row["id"],
+                    OutboxStatus.PENDING.value,
+                    OutboxStatus.INFLIGHT.value,
                 )
+                if _rowcount(result) == 0:
+                    continue
+                dead.append(row)
                 await self._event(conn, row["message_id"], "dead", None, error, now)
                 await self._maybe_finalize_message(conn, row["message_id"], now)
-        log.warning(
-            "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
-            len(orphans),
-            ", ".join(sorted({r["handler_name"] for r in orphans})),
-        )
-        return len(orphans)
+        if dead:
+            log.warning(
+                "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
+                len(dead),
+                ", ".join(sorted({r["handler_name"] for r in dead})),
+            )
+        return len(dead)
 
     async def dead_letter_missing_inbounds(
         self, valid_names: set[str], now: float | None = None
@@ -8548,25 +8566,33 @@ class PostgresStore:
             # Pre-lock all affected messages' finalize locks in canonical order before the loop
             # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
             await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
+            dead: list[Any] = []
             for row in orphans:
-                await conn.execute(
+                # As dead_letter_missing_destinations: only a row still in a status the read selected.
+                result = await conn.execute(
                     "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status IN ($6, $7)",
                     OutboxStatus.DEAD.value,
                     now,
                     await self._aenc(error, aad=cell_aad("queue", "last_error", row["id"])),
                     now,
                     row["id"],
+                    OutboxStatus.PENDING.value,
+                    OutboxStatus.INFLIGHT.value,
                 )
+                if _rowcount(result) == 0:
+                    continue
+                dead.append(row)
                 await self._event(conn, row["message_id"], "dead", None, error, now)
                 await self._maybe_finalize_message(conn, row["message_id"], now)
-        log.warning(
-            "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
-            " inbound(s): %s",
-            len(orphans),
-            ", ".join(sorted({r["channel_id"] for r in orphans})),
-        )
-        return len(orphans)
+        if dead:
+            log.warning(
+                "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+                " inbound(s): %s",
+                len(dead),
+                ", ".join(sorted({r["channel_id"] for r in dead})),
+            )
+        return len(dead)
 
     async def replay(
         self,

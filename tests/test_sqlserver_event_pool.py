@@ -27,6 +27,8 @@ cipher that says it blocks on I/O.
 from __future__ import annotations
 
 import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -34,6 +36,7 @@ import pytest
 from messagefoundry.store import MessageStatus
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.crypto import IdentityCipher
+from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.row_seal import cipher_call
 from tests import adr0075_batch_harness as h
 
@@ -372,3 +375,90 @@ async def test_a_null_lane_name_beside_a_named_one_does_not_break_the_warning(
     assert dead == 2
     (message,) = [r.getMessage() for r in caplog.records if "dead-lettered" in r.getMessage()]
     assert message.endswith(": GONE_A, None"), message
+
+
+# --- the Postgres twin of the moved-row guard ---------------------------------------------------
+
+#: Each Postgres sweep and the lane column its orphan SELECT returns.
+_PG_SWEEP_LANES = {
+    "dead_letter_missing_handlers": "handler_name",
+    "dead_letter_missing_inbounds": "channel_id",
+    "dead_letter_missing_destinations": "destination_name",
+}
+
+
+class _PgSweepConn:
+    """An asyncpg connection stand-in: answers the orphan SELECT with two unregistered rows and
+    models the queue rows' status for the DEAD ``UPDATE ... WHERE id=$5 [AND status IN ($6, $7)]``,
+    returning the command tag asyncpg would."""
+
+    def __init__(self, lane: str) -> None:
+        self.lane = lane
+        self.status: dict[str, str] = {"q-1": "pending", "q-2": "inflight"}
+
+    @asynccontextmanager
+    async def transaction(self, **_kw: Any) -> AsyncIterator[None]:
+        yield
+
+    async def fetch(self, sql: str, *_args: Any) -> list[dict[str, str]]:
+        assert sql.startswith("SELECT id, message_id,"), sql
+        return [
+            {"id": "q-1", "message_id": "m-1", self.lane: "GONE_A"},
+            {"id": "q-2", "message_id": "m-2", self.lane: "GONE_B"},
+        ]
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        assert sql.startswith("UPDATE queue SET status=$1"), sql
+        row_id = args[4]
+        allowed = args[5:7] if " AND status IN ($6, $7)" in sql else None
+        current = self.status.get(row_id)
+        hit = current is not None and (allowed is None or current in allowed)
+        if hit:
+            self.status[row_id] = args[0]
+        return f"UPDATE {int(hit)}"
+
+
+@pytest.mark.parametrize("moved", sorted(_MOVES))
+@pytest.mark.parametrize("sweep", sorted(_PG_SWEEP_LANES))
+async def test_a_postgres_sweep_leaves_a_row_that_moved_after_its_read(
+    sweep: str, moved: str
+) -> None:
+    """The Postgres sweeps read with no row lock too, so a row cancelled, purged or completed
+    before the DEAD update keeps its new state, gets no ``dead`` event and no finalize, and is not
+    counted. The in-flight control row is still dead-lettered."""
+    move, keeps = _MOVES[moved]
+    conn = _PgSweepConn(_PG_SWEEP_LANES[sweep])
+    events: list[str] = []
+    finalized: list[str] = []
+    store = object.__new__(PostgresStore)
+
+    @asynccontextmanager
+    async def acquire(**_kw: Any) -> AsyncIterator[_PgSweepConn]:
+        yield conn
+
+    async def aenc(value: str | None, *, aad: bytes) -> str | None:
+        return value
+
+    async def lock_finalize_batch(_conn: Any, _ids: Any) -> None:
+        # After the read, before the writes: where another writer can move a row.
+        move(conn.status)
+
+    async def event(_conn: Any, message_id: str, *_rest: Any) -> None:
+        events.append(message_id)
+
+    async def maybe_finalize(_conn: Any, message_id: str, _now: float) -> None:
+        finalized.append(message_id)
+
+    store._timed_acquire = acquire  # type: ignore[method-assign]
+    store._aenc = aenc  # type: ignore[method-assign]
+    store._lock_finalize_batch = lock_finalize_batch  # type: ignore[method-assign,assignment]
+    store._event = event  # type: ignore[method-assign,assignment]
+    store._maybe_finalize_message = maybe_finalize  # type: ignore[method-assign,assignment]
+
+    dead = await getattr(store, sweep)(set(), now=200.0)
+
+    assert conn.status.get("q-1") == keeps, conn.status
+    assert conn.status["q-2"] == "dead", "the in-flight control row was not dead-lettered"
+    assert dead == 1
+    assert events == ["m-2"], "a dead event was written for a row the sweep did not dead-letter"
+    assert finalized == ["m-2"], "the moved row's message was finalized"
