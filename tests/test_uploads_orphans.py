@@ -532,7 +532,7 @@ _ONE_ENTRY_FAULT_IDS = ["denied", "stale-handle", "unreachable-share", "missing-
 async def test_a_body_stat_fault_leaves_only_that_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: Callable[[], OSError]
 ) -> None:
-    """A dangling link named like a body raises the codes a lost share does, from its target. With
+    """A dangling link named like a body can raise the codes a lost share does, from its target. With
     the root still answering, that entry is skipped and the orphans listed after it still go."""
     store = _store(tmp_path)
     bodies = [_aged_orphan(store) for _ in range(3)]
@@ -654,6 +654,16 @@ def test_a_not_found_error_with_no_windows_code(
     authorise an unlink. POSIX has no such code, so there the class is the whole answer."""
     monkeypatch.setattr(path_reach, "sys", SimpleNamespace(platform=platform))
     assert path_reach.is_name_absent(FileNotFoundError(errno.ENOENT, "not found")) is absent
+
+
+def test_a_not_found_error_with_a_network_loss_code_is_not_a_missing_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``is_name_absent`` narrows ``is_absent``, so what that calls unreachable is never absence."""
+    monkeypatch.setattr(path_reach, "sys", SimpleNamespace(platform="linux"))
+    exc = FileNotFoundError(errno.ESTALE, "Stale file handle")
+    assert not path_reach.is_absent(exc)
+    assert not path_reach.is_name_absent(exc)
 
 
 # --- drift guard --------------------------------------------------------------------------------

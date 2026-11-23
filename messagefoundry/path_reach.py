@@ -59,7 +59,7 @@ def is_name_absent(exc: OSError) -> bool:
     this cannot tell them apart. A network client can answer from a stale cache on either platform.
     What a Windows share with Access-Based Enumeration answers for a name it hides from this
     account has not been measured, so a hidden name may read as absent."""
-    if not isinstance(exc, FileNotFoundError):
+    if not is_absent(exc):
         return False
     winerror = getattr(exc, "winerror", None)
     return winerror == 2 if winerror is not None else sys.platform != "win32"

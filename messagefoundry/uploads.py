@@ -322,10 +322,10 @@ def _sidecar_is_absent(sidecar: Path) -> bool:
 
 def _root_fault(root: Path) -> str | None:
     """The reason the uploads root's own ``stat`` failed, or ``None`` when it answers. A failure
-    says the root is lost, which an entry's own error cannot: a dangling link raises the codes a
-    lost share does. An answer proves nothing about the entries under it: a POSIX mount that
-    dropped leaves a mount point that still answers. Text and not the exception, whose traceback
-    would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
+    is read as the root being lost, which an entry's own error cannot show: a dangling link can
+    raise the codes a lost share does. An answer proves nothing about the entries under it: a POSIX
+    mount that dropped leaves a mount point that still answers. Text and not the exception, whose
+    traceback would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
     try:
         root.stat()
     except OSError as exc:
@@ -4257,7 +4257,7 @@ class UploadStore:
 
         A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
         too, the pass stops and returns what it removed, logged at ERROR with the root's own error,
-        repeats damped by :class:`_OncePerInterval`.
+        repeats damped while :class:`_OncePerInterval` still holds the key.
 
         **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
         in this process currently holds, and a held name is skipped outright, so the threshold never
@@ -4287,7 +4287,7 @@ class UploadStore:
             entries = list(root.iterdir())
         except OSError as exc:
             if is_absent(exc):
-                return 0  # no root yet: the first save creates it
+                return 0  # read as no root yet, as a lost drive or parent also is
             raise
         # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
         names = {entry.name for entry in entries}
@@ -4332,8 +4332,9 @@ class UploadStore:
                     break
                 # Already gone (a sibling shard's sweep), held open by another process, or not a file
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
-                # a random tag, never a body. Anything but "already gone" is logged, repeats damped,
-                # since a body whose sidecar cannot be checked stays until someone looks.
+                # a random tag, never a body. What is_name_absent does not read as gone is logged,
+                # repeats damped while the memo holds its key, since a body whose sidecar cannot be
+                # checked stays until someone looks. A dangling link does read as gone.
                 quiet = is_name_absent(exc) or not self._link_logged.first(f"orphan sweep {name}")
                 _log.log(
                     logging.DEBUG if quiet else logging.WARNING,
