@@ -255,14 +255,15 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
 
     ``metadata`` is the message's decrypted metadata JSON, as the store's own read returns it. The
     answer is a refusal only when that metadata records a refused body of which only the head was
-    stored. Such a row's ``raw`` is cut at a byte or character offset, and a cut HL7 body can still
-    parse, so resubmitting it could route a message with its tail missing as if it were whole.
+    stored, or is nested too deeply to decode. A head-only row's ``raw`` is cut at a byte or
+    character offset, and a cut HL7 body can still parse, so resubmitting it could route a message
+    with its tail missing as if it were whole. Metadata nested too deeply to decode cannot show
+    whether it records a head, so it is not let through (BACKLOG #5758).
 
-    A whole-stored refusal, any other row, and metadata that is absent (a retention purge nulls it
-    with the body) or not JSON answer ``None``, as before this check existed. Metadata nested too
-    deep to decode is refused: whether it records a head cannot be read, so it is not let through
-    (BACKLOG #5758). The text names lengths and ``message_id`` only, never a byte of the body or
-    another message's id; the deep-nesting refusal names ``message_id`` alone."""
+    Every other case answers ``None``, as before this check existed: a whole-stored refusal, any
+    other row whose metadata decodes, and metadata that is absent (a retention purge nulls it with
+    the body) or not JSON. The text names lengths and ``message_id`` only, never a byte of the body
+    or another message's id; the deep-nesting refusal names ``message_id`` alone."""
     if not metadata:
         return None
     try:
