@@ -3159,7 +3159,7 @@ if ($HostCustody) {
 # Under the host provider the service's first start writes its own key file, master.key, beside the
 # handoff provision-admin leaves, so it must add a file where those two live. A service that may add
 # a file to the secrets directory may supply a secret-class setting (ADR 0214's amendment), and the
-# service is not left at read only there (docs/SERVICE.md 'The custody directory under the host key
+# neither the installer nor the engine guarantees the service read only there (docs/SERVICE.md 'The custody directory under the host key
 # provider' says which grants survive), so the key files do not rest on the service lacking that
 # right. They get a directory of their own, named to the service as
 # MEFOR_CUSTODY_DIRECTORY, which the engine reads in place of MEFOR_SECRETS_DIRECTORY for them.
@@ -3713,8 +3713,8 @@ if ($HostCustody) {
         throw ("$($_.Exception.Message)$removed Re-run the installer. " +
             "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'its first start cannot write its store key file as the custody directory needs')")
     }
-    # A refusal, not a warning: without the variable the service reads the secrets directory, where
-    # it cannot write its key file, and a mint made as SERVICE.md says lands where it does not look.
+    # A refusal, not a warning: without the variable the service reads the secrets directory for its
+    # key file, so a mint made as SERVICE.md says lands where the service does not look.
     $custodyNamingError = $null
     $replacedCustodyDir = $null
     try {
@@ -3724,7 +3724,7 @@ if ($HostCustody) {
         $removed = Remove-CustodyDirMadeHere -Path $CustodyDir -MadeHere:$CustodyDirMadeHere
         throw ("Could not name the custody directory in the service's environment " +
             "($custodyNamingError), and without MEFOR_CUSTODY_DIRECTORY the service looks for its " +
-            "key file in the secrets directory, where it cannot write one.$removed " +
+            "key file in the secrets directory and would mint where it does not look.$removed " +
             "Re-run the installer. " +
             "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it would not find its custody directory')")
     }

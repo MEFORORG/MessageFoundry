@@ -203,7 +203,7 @@ def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
     is not read as that path, so it is not caught. The
     service may add files to its custody directory, and a service that may add a file to the
     secrets directory may supply a secret-class setting (ADR 0214's 2026-11-22 amendment), so the
-    two must stay apart. Neither the installer nor the engine leaves the service at read only on
+    two must stay apart. Neither the installer nor the engine guarantees the service read only on
     the secrets directory: docs/SERVICE.md, 'The custody directory under the host key provider',
     says which grants survive."""
     raw = environ.get(CUSTODY_DIRECTORY_VARIABLE, "").strip()

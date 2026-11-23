@@ -156,7 +156,7 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 - **2026-11-22, the host key provider's files get a custody directory of their own (vault
   BACKLOG #3411).** Under `[store].key_provider = 'host'` the service's first start writes its own
   key file, `master.key`, beside the `handoff.key` an administrator's `provision-admin
-  --service-account` left. Neither the installer nor the engine leaves the service at read only
+  --service-account` left. Neither the installer nor the engine guarantees the service read only
   on this directory ([SERVICE.md, The custody directory under the host key
   provider](../SERVICE.md#the-custody-directory-under-the-host-key-provider) says which grants
   survive a rerun); decision 4's check passes a directory one named account may write. A service right to add a
