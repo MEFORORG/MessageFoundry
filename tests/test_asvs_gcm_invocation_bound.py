@@ -481,7 +481,9 @@ def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> Non
     # The enumeration itself must not silently go empty (a rename would make the guard vacuous). The
     # floor was 20 until BACKLOG #1169 folded each backend's on-open sealing loops into ONE
     # `_seal_surface` per backend (seven functions became three); every one of the three is required.
-    assert len(checked) >= 16, checked
+    # Raised from 16 to 19, the count enumerated when BACKLOG #3929 replaced the encrypt reader, so
+    # a reader that goes blind to a pass fails here rather than only at the sealers.
+    assert len(checked) >= 19, checked
     sealers = {c for c in checked if c.endswith("._seal_surface")}
     assert sealers == {
         "MessageStore._seal_surface",
@@ -790,9 +792,6 @@ def test_the_bound_is_settled_only_AFTER_the_message_graph_has_quiesced() -> Non
     Asserted on statement order because the fault IS an ordering one: a behavioural test would have to
     stand up a whole engine, drain it, and still would not say why it broke.
     """
-    import ast
-    import textwrap
-
     from messagefoundry.pipeline import engine as engine_mod
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(engine_mod.Engine.stop)))
