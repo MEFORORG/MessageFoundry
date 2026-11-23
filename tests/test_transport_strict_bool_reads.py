@@ -284,14 +284,12 @@ def test_mllp_context_refuses_a_non_bool_tls(value: Any, server: bool) -> None:
 
 
 @pytest.mark.parametrize("value", [0, ""])
-@pytest.mark.parametrize("server", [True, False])
-def test_mllp_context_refuses_a_falsy_non_bool_tls_before_the_pin_check(
-    value: Any, server: bool
-) -> None:
-    # The pin check reads tls by truthiness, and would name an unread pin instead.
-    pinned = {"host": "127.0.0.1", "tls": value, "tls_ca_file": "x.pem", "tls_ca_pin": "a" * 64}
+def test_mllp_listener_refuses_a_falsy_non_bool_tls_before_the_pin_check(value: Any) -> None:
+    # The pin check's inbound arm reads tls by truthiness, and would name an unread pin instead.
+    # Its outbound arm reads tls strictly already, so only the listener is pinned here.
+    pinned = {"tls": value, "tls_ca_file": "x.pem", "tls_ca_pin": "a" * 64}
     with pytest.raises(ValueError, match=_refusal(value, "tls")):
-        mllp_module._mllp_ssl_context(pinned, server=server)
+        mllp_module._mllp_ssl_context(pinned, server=True)
 
 
 def test_mllp_context_reads_a_real_bool_tls() -> None:
@@ -388,8 +386,8 @@ _SQLSERVER: dict[str, Any] = {"server": "db.example.org", "database": "d"}
 def test_database_dsn_refuses_a_non_bool_trust_server_certificate(
     value: Any, attested: bool
 ) -> None:
-    # Attested, "false" built TrustServerCertificate=yes; unattested, it was refused as a weakened
-    # hop, which names the wrong fault.
+    # Attested, a truthy non-bool such as "false" built TrustServerCertificate=yes; unattested, it
+    # was refused as a weakened hop, which names the wrong fault. A falsy one ("" or 0) read as off.
     with pytest.raises(ValueError, match=_refusal(value, "trust_server_certificate")):
         database_module._build_dsn(
             {**_SQLSERVER, "trust_server_certificate": value}, attested=attested
@@ -398,7 +396,7 @@ def test_database_dsn_refuses_a_non_bool_trust_server_certificate(
 
 @pytest.mark.parametrize("value", _NON_BOOLS)
 def test_database_connection_refuses_a_non_bool_trust_server_certificate(value: Any) -> None:
-    # _build_connection reads the flag for its weakened report before _build_dsn reads it.
+    # _build_connection reads the flag again for its weakened report.
     with pytest.raises(ValueError, match=_refusal(value, "trust_server_certificate")):
         database_module._build_connection(
             {**_SQLSERVER, "trust_server_certificate": value}, attested=True
@@ -414,3 +412,15 @@ def test_database_reads_a_real_bool_trust_server_certificate(
     )
     assert weakened is trusted
     assert f"TrustServerCertificate={'yes' if trusted else 'no'}" in dsn
+
+
+def test_database_connection_refuses_the_server_shape_before_the_flag() -> None:
+    # The dispatcher's own flag read comes after _build_dsn, so a server holding a comma keeps the
+    # preset refusal's remedy, as a direct _build_dsn call gives it.
+    settings = {"server": "a,b", "database": "d", "trust_server_certificate": "false"}
+    with pytest.raises(ValueError) as direct:
+        database_module._build_dsn(dict(settings), attested=True)
+    with pytest.raises(ValueError) as dispatched:
+        database_module._build_connection(dict(settings), attested=True)
+    assert "trust_server_certificate" not in str(direct.value)
+    assert str(dispatched.value) == str(direct.value)

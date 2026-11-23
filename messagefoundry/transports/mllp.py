@@ -708,9 +708,9 @@ def _mllp_ssl_context(
     ``tls_client_subjects`` (BACKLOG #4907). Handing over the loaded bytes, rather than the path, is
     the point: a second read of ``tls_ca_file`` could see a swapped file. ``None``, the default,
     changes nothing."""
-    # Read strictly, before the pin check reads tls by truthiness, so a non-bool is refused as
-    # itself rather than as an unread pin: bool("false") is True (vault BACKLOG #3234). The
-    # destination's tls_allow_expired is read here too, so it is refused with tls off as well.
+    # Read strictly, before the pin check, whose inbound arm reads tls by truthiness, so a non-bool
+    # is refused as itself rather than as an unread pin: bool("false") is True (vault BACKLOG
+    # #3234). The destination's tls_allow_expired is read here too, so it is refused with tls off.
     tls = flag_from_settings(s, "tls")
     allow_expired = False if server else flag_from_settings(s, "tls_allow_expired")
     refuse_an_unread_ca_pin(
