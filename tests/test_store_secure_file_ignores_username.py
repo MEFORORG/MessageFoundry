@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Opening a store restricts its files to the process token's account, whatever USERNAME says
-(vault BACKLOG #5612).
+"""Outside a hardened data directory, opening a store leaves each file's access list granting the
+process token's account alone, whatever USERNAME says (vault BACKLOG #5612).
 
-These drive ``MessageStore.open`` with a real icacls, then read each file's access list with
-``Get-Acl`` and the account with ``whoami``, so no instrument goes through the code under test. The
-restriction used to grant ``%USERNAME%``: an inherited value naming another principal was granted
-Full Control, and an empty one, with getpass finding nothing either, skipped the restriction and
-left the file its inherited access list. Windows only.
+These cover the owner-only restriction only: a hardened directory's grants, and the file owner,
+are not read here. They drive ``MessageStore.open`` with a real icacls, then read each file's
+access list with ``Get-Acl`` and the account with ``whoami``, so no instrument goes through the code
+under test. The restriction used to grant ``%USERNAME%``: an inherited value naming another
+principal was granted Full Control, and an empty one, with getpass finding nothing either, skipped
+the restriction and left the file its inherited access list. Windows only.
 
-The folder is made here with an access list granting only the token's account, because pytest's
-``tmp_path`` carries SYSTEM, Administrators and OWNER RIGHTS entries that have survived
-``icacls /inheritance:r`` onto a file on the hosted runners (``tests/_win_acl.py`` says more). So
-any other entry on a store file comes from the code under test.
+The folder is made here granting only the token's account, for the reason ``tests/_win_acl.py``
+gives, so any other entry on a store file comes from the code under test.
 """
 
 from __future__ import annotations
@@ -30,9 +29,25 @@ import pytest
 
 from messagefoundry.store import MessageStore
 
-pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="icacls DACL is Windows-only")
+# Each case starts several cold Windows PowerShell processes, so the default per-test budget is
+# raised; each subprocess still has its own timeout below it.
+pytestmark = [
+    pytest.mark.skipif(sys.platform != "win32", reason="icacls DACL is Windows-only"),
+    pytest.mark.timeout(240),
+]
 
-_SYSTEM32 = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32"
+
+def _system_directory() -> Path:
+    """System32 as the OS reports it, never from an inheritable environment variable."""
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(260)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))  # type: ignore[attr-defined,unused-ignore]
+    assert 0 < length < len(buffer)
+    return Path(buffer.value)
+
+
+_SYSTEM32 = _system_directory() if sys.platform == "win32" else Path()
 _POWERSHELL = _SYSTEM32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
 _EVERYONE = "S-1-1-0"
 _FULL_CONTROL = 0x1F01FF
@@ -53,7 +68,7 @@ def _run(argv: list[str], *, extra_env: dict[str, str] | None = None) -> str:
         encoding="oem",
         errors="replace",
         env=env,
-        timeout=120,
+        timeout=40,
     )
     assert result.returncode == 0 and not result.stderr.strip(), (
         f"{argv[0]} failed ({result.returncode}): {result.stderr}"
@@ -146,7 +161,7 @@ def _clear_user_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     [None, "", "mf-no-such-account-5612", "Everyone"],
     ids=["unset", "empty", "unknown-name", "another-principal"],
 )
-async def test_open_restricts_the_store_files_to_the_token_account(
+async def test_open_grants_only_the_token_account_on_the_store_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, username: str | None
 ) -> None:
     sid = _token_sid()
