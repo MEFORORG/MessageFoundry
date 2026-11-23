@@ -420,8 +420,8 @@ class _Tracer:
         """Trace an ``accepts=`` predicate (ADR 0084) and record a decline. It returns the verdict as
         a bool, read by :func:`accepts_verdict` as the untraced path reads it, so the traced routing
         decision stays the same as the untraced one. A raise propagates. A verdict
-        ``accepts_verdict`` refuses, an awaitable, an iterator or an async iterator, raises its
-        ``TypeError`` here, before any decline is recorded (BACKLOG #5514)."""
+        ``accepts_verdict`` refuses raises its ``TypeError`` here, before any decline is recorded
+        (BACKLOG #5514)."""
         verdict = accepts_verdict(name, self._run("accepts", pred, name, payload))
         if not verdict:
             self.accepts_declined.append(name)

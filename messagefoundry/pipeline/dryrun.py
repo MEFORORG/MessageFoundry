@@ -150,9 +150,9 @@ class TraceHook(Protocol):
     ``trace_router``/``trace_handler`` return the callable's result unchanged — so the traced path is
     byte-identical to the default (``tracer=None``). ``trace_accepts`` returns the verdict as a bool,
     read through :func:`~messagefoundry.config.wiring.accepts_verdict` as the untraced path reads it,
-    so an awaitable, iterator or async iterator verdict raises ``TypeError`` there too (BACKLOG
-    #5514). The concrete implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps
-    ``dryrun`` free of any dependency on it (one-way import)."""
+    so a verdict that function refuses raises ``TypeError`` there too (BACKLOG #5514). The concrete
+    implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps ``dryrun``
+    free of any dependency on it (one-way import)."""
 
     def trace_router(
         self, fn: RouterFn, name: str, payload: Message | RawMessage
@@ -364,7 +364,8 @@ def _accepted(
             )
         else:
             # One refusal for both in-process branches (BACKLOG #5514): an awaitable or iterator
-            # verdict would read as True and accept every message, so it raises here instead. The
+            # verdict with no truth value of its own would read as True and accept every message,
+            # so it raises here instead; :func:`accepts_verdict` states which verdicts. The
             # tracer applies it too, so it records no decline for a refused verdict; on its bool
             # this call is one compare.
             verdict = accepts_verdict(

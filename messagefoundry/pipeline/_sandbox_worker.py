@@ -420,8 +420,8 @@ def _run_one(
                 # the verdict through ``accepts_verdict`` (dryrun._accepted). Apply the same rule HERE,
                 # BEFORE the result is described back: a predicate that returns a truthy NON-bool
                 # (e.g. ``re.search(...)`` -> re.Match) would otherwise be rejected by the codec's
-                # strict JSON-bool slot, content-dependently, since a non-match returns None, and an
-                # awaitable or iterator verdict is refused as at mode=off (BACKLOG #5514). It runs
+                # strict JSON-bool slot, content-dependently, since a non-match returns None, and a
+                # verdict ``accepts_verdict`` refuses raises as at mode=off (BACKLOG #5514). It runs
                 # inside the run context, as at mode=off, because a verdict's ``__bool__`` or a
                 # generator's ``finally`` is user code. One rule in both places is what keeps
                 # ``[sandbox].mode`` from changing the routing decision (ADR 0087).

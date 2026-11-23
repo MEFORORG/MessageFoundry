@@ -6163,8 +6163,8 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     return found
 
 
-# The verdict types :func:`accepts_verdict` refuses: each reads as True without being awaited or
-# iterated. A tuple rather than a PEP-604 union, which isinstance would rebuild on every call.
+# The verdict types :func:`accepts_verdict` refuses unless the class has a truth value of its own:
+# each otherwise reads as True without being awaited or iterated.
 _ALWAYS_TRUE_VERDICT_TYPES: Final = (Awaitable, Iterator, AsyncIterator)
 
 
@@ -6231,7 +6231,8 @@ def _check_accepts_predicate(hname: str, pred: object) -> None:
       runs one (:func:`_accepts_is_async`), returns a coroutine, which the router stage reads as
       truthy, so the handler would accept every message (BACKLOG #5514). A plain function that returns
       an awaitable, an iterator or an async iterator is not seen here; :func:`accepts_verdict`
-      refuses that verdict at run time instead, as a router-stage error.
+      refuses such a verdict at run time instead, as a router-stage error, unless its class has a
+      truth value of its own.
     * **Fail-open run-scoped read** — a predicate that can reach ``state_get``/``response_get`` (ADR
       0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
       suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
