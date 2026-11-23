@@ -445,7 +445,7 @@ async def test_a_second_listing_that_cannot_judge_a_slot_drops_its_sighting(
     monkeypatch.setattr(client, "list_dir", second_differs)
     await src._poll_once()
     assert calls == 2
-    assert _retrieved(client, "/in/z.hl7") == 1, "nothing is read without a current listing"
+    assert _retrieved(client, "/in/z.hl7") == 1, "only the first poll read z; this one did not"
     assert src._stuck["z.hl7"][0].due <= time.monotonic(), "it stays due"
     assert "z.hl7" not in src._settle_seen
     assert ("could not list" in caplog.text) is (failure == "refused")
