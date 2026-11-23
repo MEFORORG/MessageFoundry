@@ -2912,7 +2912,7 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
         state = _log_sqlstate(exc)
         if state is None:
             return _withheld(exc) if driver else safe_exc(exc)
-        if not driver:  # shaped like a driver's error: its arguments may carry a value
+        if not known_driver_error(exc):  # its arguments may carry a value: name no state
             return f"{type(exc).__name__} [message withheld]"
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring

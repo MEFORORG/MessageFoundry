@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Only a database driver's own error NAMES a SQLSTATE in text, through one reading the DATABASE
-connector and the log chain share (engine PR 3150 open findings 1, 5 and 6); an error shaped like
-one is still classified by it. Also two log-path changes in the same module (vault BACKLOG #1661,
-added items 5 and 6).
+"""Only a database driver's own error NAMES a SQLSTATE in text (engine PR 3150 open findings 1,
+5 and 6); an error shaped like one is still classified by it. The connector's reading
+(``_log_sqlstate``, ``_shown_state``) and the traceback line's (``redaction.driver_sqlstate_of``)
+are separate and differ in at least one case, an asyncpg error whose ``sqlstate`` attribute is set
+but unusable. Also two log-path changes in the same module (vault BACKLOG #1661, added items 5
+and 6).
 
 Each test was red on the code before its fix, except at least those whose docstring calls it a
 control or a regression check that is not red on main. All values are synthetic.
@@ -165,6 +167,10 @@ def test_an_error_whose_driver_test_raises_is_classified_by_shape() -> None:
     assert database._log_sqlstate(exc) == "08S01"
     assert database._connection_lost(exc)
     assert database._shown_state("08S01", exc) is None
+    named = _Unclassable(_VALUE, "dup (900123) (SQLExecDirectW)")
+    assert database._safe_db_error(named) == "_Unclassable [message withheld]"
+    assert _VALUE not in database._poll_log_line(named, under=False)
+    assert _VALUE not in database._credential_free_detail(named)
 
 
 async def test_an_unclassable_send_error_is_retried_and_its_text_withheld(
@@ -195,7 +201,7 @@ async def test_a_driver_error_in_a_send_is_still_rejected_by_its_sqlstate() -> N
     assert str(refused.value) == "database rejected the statement [23000]"
 
 
-# --- PR 3150 finding 5: one reading for the connector and the log chain ------------------------
+# --- PR 3150 finding 5: the connector and the log chain agree on these errors ------------------
 
 
 def test_a_sqlite_message_is_not_read_as_a_sqlstate_by_the_connector() -> None:
