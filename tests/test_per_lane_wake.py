@@ -270,7 +270,7 @@ def _delivery_registry(inbox: Path, out_a: Path, out_b: Path) -> Registry:
             "file_in",
             ConnectionSpec(
                 ConnectorType.FILE,
-                {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.02},
+                {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.02, "sort": "name"},
             ),
             router="r",
         )
@@ -352,7 +352,21 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
     store: MessageStore, tmp_path: Path
 ) -> None:
     """Three messages into one inbound, delivered in strict arrival (seq) order under per-lane wake —
-    B12 changes only WHEN a worker wakes, never the FIFO claim (#285 / ADR 0059)."""
+    B12 changes only WHEN a worker wakes, never the FIFO claim (#285 / ADR 0059).
+
+    Cause of the 2026-10-12 windows-2025 failure (BACKLOG #3456), read from job 114991525524's log:
+    most consistent with a slow runner, and not proven. The suite took 33:39, against the 3s this
+    wait then allowed, counted in sleeps. The captured log shows both file destinations creating
+    their directories, so a delivery to each had begun when the wait ran out. This pass found no
+    lost wake in the order ``_wait_for_work`` keeps: a worker clears its event before it claims
+    again, so a row committed before the clear is claimed and one committed after it sets the
+    event again. What a lost wake does to this test is in the ``_UNTIL_CEILING_SECONDS`` comment.
+
+    All three files are written in one step, with no sleep between them, so more than one row may
+    be pending in a lane at once. Nothing here checks that one was. The order checked is delivery
+    against arrival, so it holds whatever order the file source took the files in. The cost: a
+    burst usually reaches a busy worker, so a defect that loses only the wakes after a lane's
+    first is less likely to show here than with the spaced writes this replaced."""
     inbox, out_a, out_b = tmp_path / "in", tmp_path / "a", tmp_path / "b"
     inbox.mkdir()
     reg = _delivery_registry(inbox, out_a, out_b)
@@ -366,9 +380,8 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
     )
     await r.start()
     try:
-        for i in range(3):
+        for i in range(3):  # no sleep between the writes; see the docstring
             (inbox / f"m{i}.hl7").write_bytes(ADT.format(cid=f"MSG{i}").encode("utf-8"))
-            await asyncio.sleep(0.05)  # keep arrival order deterministic
         # Poll the ACTUAL asserted condition — all 3 messages finalized to PROCESSED — not a proxy like
         # "N outbound rows DONE" (each message fans out to 2, so that proxy trips at 1.5 messages; it
         # false-greened on a fast runner and flaked on a slow one — mf-ci-test-flakes).
@@ -381,14 +394,25 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
             raise AssertionError(f"{exc}; statuses: {sorted(m['status'] for m in msgs)}") from exc
     finally:
         await r.stop()
-    # Every message reached PROCESSED under per-lane wake, in arrival (ingest = rowid = seq) order —
-    # B12 leaves the FIFO claim untouched; only the wake timing differs (#285 / ADR 0059).
+    # Every message reached PROCESSED under per-lane wake, and each destination was sent them in
+    # arrival (ingest = rowid = seq) order: B12 leaves the FIFO claim untouched, and only the wake
+    # timing differs (#285 / ADR 0059). The order is read from the "delivered" events rather than
+    # assumed from the file names, so an intake reorder does not fail it. A FIFO-claim fault fails
+    # it only on a run where two or more rows were pending in one lane at a claim.
     msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert len(msgs) == 3 and all(m["status"] == MessageStatus.PROCESSED.value for m in msgs)
     cur = await store._db.execute(
         "SELECT control_id FROM messages WHERE channel_id=? ORDER BY rowid", ("file_in",)
     )
-    assert [row["control_id"] for row in await cur.fetchall()] == ["MSG0", "MSG1", "MSG2"]
+    arrival = [row["control_id"] for row in await cur.fetchall()]
+    assert sorted(arrival) == ["MSG0", "MSG1", "MSG2"]
+    for dest in ("out_a", "out_b"):
+        cur = await store._db.execute(
+            "SELECT m.control_id FROM message_events e JOIN messages m ON m.id = e.message_id"
+            " WHERE e.event = 'delivered' AND e.destination = ? ORDER BY e.id",
+            (dest,),
+        )
+        assert [row["control_id"] for row in await cur.fetchall()] == arrival, dest
 
 
 async def _n_processed(store: MessageStore, n: int) -> bool:

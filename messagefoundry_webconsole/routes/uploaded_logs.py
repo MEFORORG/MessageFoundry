@@ -53,7 +53,7 @@ from .._auth import (
     require_ui_step_up_action,
 )
 from ..pages._common import _seg
-from ._common import _form_pairs, for_echo, posted_field_value
+from ._common import _form_pairs, for_echo, posted_needle
 
 # The browse GET decrypts PHI (step-up), so register it as an UNLOCK form — a stale step-up 303s to
 # /ui/reauth and GET-redirects back to the browse page. The PHI-shaped filter now travels in the POST
@@ -617,6 +617,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         control_id: str | None,
         limit: int,
         error: str = "",
+        notice: str = "",
+        refused: frozenset[str] = frozenset(),
         status_code: int = 200,
     ) -> Response:
         """Render one uploaded file's browse page for a given filter — shared by the GET page render
@@ -626,12 +628,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # A resend also needs messages:edit (vault BACKLOG #2625), so a role without it is not
         # offered a form whose confirm page would refuse it.
         can_resend = identity.has(Permission.MESSAGES_EDIT)
+        # for_echo on every echoed criterion: a refused one may carry a control character, and the
+        # page must not hand that byte back out (BACKLOG #6700).
         shared = dict(  # noqa: C408
-            content=content or "",
-            field_path=field_path or "",
-            field_value=field_value or "",
-            message_type=message_type or "",
-            control_id=control_id or "",
+            content=for_echo(content),
+            field_path=for_echo(field_path),
+            field_value=for_echo(field_value),
+            message_type=for_echo(message_type),
+            control_id=for_echo(control_id),
+            notice=notice,
         )
 
         async def _browse(c: str | None, fp: str | None, fv: str | None) -> Any:
@@ -644,8 +649,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 field_path=fp,
                 field_value=fv,
                 target="both",
-                message_type=message_type,
-                control_id=control_id,
+                # A filter the POST arm's model refused is echoed for correction, not applied
+                # (BACKLOG #6700). The GET arm checks no alphabet, so `refused` is empty there.
+                message_type=None if "message_type" in refused else message_type,
+                control_id=None if "control_id" in refused else control_id,
                 limit=limit,
                 offset=0,
             )
@@ -685,7 +692,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     raise
                 return HTMLResponse(
                     pages.uploaded_log_detail(
-                        result, error=str(exc.detail), can_resend=can_resend, **shared
+                        result,
+                        # for_echo on the DETAIL too, as on the search page: it is engine text
+                        # built from the values the caller sent.
+                        error=for_echo(str(exc.detail)),
+                        can_resend=can_resend,
+                        **shared,
                     ),
                     status_code=400,
                 )
@@ -744,19 +756,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         documented continuation for a body-carrying POST."""
         assert_same_origin(request)
         form = dict(await _form_pairs(request))
+        needle = posted_needle(form)
         try:
             # The engine's own body model for this route, so a posted form is bounded exactly as the
             # JSON API bounds it — no second, drifting copy of the field lengths.
             criteria = UploadedMessageSearchRequest(
-                content=form.get("content") or None,
-                field_path=form.get("field_path") or None,
-                field_value=posted_field_value(form),
+                content=needle.content,
+                field_path=needle.field_path,
+                field_value=needle.field_value,
                 message_type=form.get("message_type") or None,
                 control_id=form.get("control_id") or None,
                 limit=200,  # the form carries no page-size control; same default the GET declares
                 offset=0,
             )
-        except ValueError:  # pydantic: a criterion is longer than its bound
+        except ValidationError as exc:  # pydantic: a criterion breaks its bound or its alphabet
             # REFUSE, do not answer with the whole file. Returning 200 with every criterion dropped
             # and the inputs blanked reads to an operator as "your filter matched everything", which
             # is the opposite of what happened -- and it silently discarded their valid criteria too.
@@ -767,15 +780,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 request,
                 engine,
                 identity,
-                content=form.get("content") or None,
-                field_path=form.get("field_path") or None,
-                # The value the run would have used, so a leftover dropped above is not put back
-                # without its marker; for_echo, as it also fills the hidden marker (BACKLOG #6700).
-                field_value=for_echo(posted_field_value(form)) or None,
+                # The values the run would have used, so a leftover dropped above is not put back
+                # without its marker (BACKLOG #6700). _render_browse echoes them through for_echo.
+                content=needle.content,
+                field_path=needle.field_path,
+                field_value=needle.field_value,
                 message_type=form.get("message_type") or None,
                 control_id=form.get("control_id") or None,
                 limit=200,
-                error="a filter criterion is longer than that field allows",
+                error="a filter criterion is not a value that field accepts",
+                notice=needle.notice,
+                refused=frozenset(str(e["loc"][0]) for e in exc.errors() if e["loc"]),
                 status_code=400,
             )
         return await _render_browse(
@@ -789,6 +804,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             message_type=criteria.message_type,
             control_id=criteria.control_id,
             limit=criteria.limit,
+            notice=needle.notice,
         )
 
     @app.post("/ui/uploaded-logs/file/{file_id}/resend")

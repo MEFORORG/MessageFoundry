@@ -28,8 +28,11 @@
 # owner that is root or itself, and root-owned is the safer of the two. Build an adopter image (COPY
 # writes root-owned files; run chmod -R a+rX,go-w on it in the build context first) and set every image:
 # field below (at least revocation-attestation-check, tls-dir, copy-tls and engine) to it:
-#     FROM messagefoundry:<version>
+#     FROM messagefoundry:postgres
 #     COPY config /config
+# where messagefoundry:postgres is the Dockerfile's runtime-postgres target, built as docker/README.md
+# "Image variants" shows, from the checkout of the one release you deploy; the tag names no version,
+# so tag your build with it. The slim default carries no asyncpg, so the Postgres store cannot open on it.
 # The same baked image deploys to all 3 replicas (ADR 0017 same-commit-everywhere).
 ---
 # Headless governing Service — stable in-cluster DNS for the API control/read plane (up on EVERY node).
@@ -197,7 +200,7 @@ spec:
             - disable-remote-debug
             - "-B"
             - "-c"
-            - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start any engine: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engine serves and accepts.')"
+            - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start the containers this check gates: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engine serves and accepts.')"
           env:
             - name: MEFOR_TLS_REVOCATION_ATTESTED
               valueFrom: { secretKeyRef: { name: mefor-secrets, key: tls-revocation-attested } }
@@ -250,9 +253,12 @@ spec:
             - { name: tls, mountPath: /etc/mefor/tls }
       containers:
         - name: engine
-          # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY config /config).
-          # Use the messagefoundry:sqlserver base ONLY if you switch [store].backend to sqlserver or use
-          # the DATABASE / db_lookup connectors.
+          # REPLACE with your config-baked image (FROM messagefoundry:postgres; COPY config /config).
+          # The Postgres store needs the runtime-postgres variant: the slim default carries no
+          # asyncpg, so this store could not open on it. Use the messagefoundry:sqlserver base instead
+          # only if you switch [store].backend to sqlserver. No variant carries both asyncpg and the
+          # ODBC layer the DATABASE / db_lookup connectors need, so this store with those connectors
+          # needs an image of your own.
           image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE
           args: ["serve", "--config", "/config", "--env", "prod"]
           securityContext:

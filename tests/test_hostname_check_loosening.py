@@ -133,9 +133,11 @@ def test_an_unset_value_takes_the_default_on_mllp_ftps_and_email(unset: str | No
     assert bool_setting({}, "k", default=True) is True
     assert bool_setting({"k": False}, "k", default=True) is False
     assert bool_setting({"k": unset}, "k", default=False) is False
-    # Controls: only None and the empty string are unset; whitespace and 0 read with bool().
-    assert bool_setting({"k": " "}, "k", default=False) is True
-    assert bool_setting({"k": 0}, "k", default=True) is False
+    # Controls: only None and the empty string are unset; whitespace and 0 are refused, not read
+    # with bool() (vault BACKLOG #3234).
+    for other in (" ", 0):
+        with pytest.raises(ValueError, match="k must be true or false"):
+            bool_setting({"k": other}, "k", default=True)
 
     blank = {"tls_verify": unset, "tls_check_hostname": unset}
     mllp = _mllp_ssl_context({"tls": True, **blank}, server=False, name="OB_X")
@@ -642,3 +644,35 @@ def test_reader_labels_the_peer_by_host_and_port() -> None:
         )
     )
     assert hostname_unchecked_hops(reg) == [("OB_M", "a.example.invalid:7")]
+
+
+def test_reader_lists_a_falsy_non_bool_flag_as_the_old_read_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3234: MLLP reads ``tls_check_hostname`` only with ``tls`` and ``tls_verify``
+    on, so a context built directly with ``tls_verify=False`` and ``tls_check_hostname=0`` builds
+    and never refuses the ``0``. The register reads a non-bool as ``bool()`` did, without raising,
+    so it lists at least the hops that read listed."""
+    from messagefoundry.transports import mllp
+
+    monkeypatch.setattr(mllp, "weakened_tls_escape_permitted_here", lambda: True)
+    settings: dict[str, Any] = {
+        "host": "a.example.invalid",
+        "port": 7,
+        "tls": True,
+        "tls_verify": False,
+        "tls_check_hostname": 0,
+    }
+    # The context builds with the 0 in place: the strict read never runs on the verify-off path.
+    mllp._mllp_ssl_context(settings, server=False, name="OB_M")
+    # The Registry build refuses a non-bool literal, but the settings dict stays mutable
+    # afterwards, so a Registry built in code can still hold one when the register reads it.
+    reg = Registry()
+    for name, value in (("OB_M", 0), ("OB_STR", "no"), ("OB_T", True), ("OB_N", None)):
+        spec = ConnectionSpec(
+            type=ConnectorType.MLLP, settings={**settings, "tls_check_hostname": True}
+        )
+        reg.add_outbound(build_outbound_connection(name, spec))
+        spec.settings["tls_check_hostname"] = value
+    # Controls: "no", True and None read as on, as bool() read them, and are not listed.
+    assert [name for name, _ in hostname_unchecked_hops(reg)] == ["OB_M"]

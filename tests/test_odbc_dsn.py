@@ -183,7 +183,7 @@ _DB: dict[str, object] = {
         pytest.param(
             {
                 "auth": "SQL",
-                "encrypt": "yes",
+                "encrypt": True,
                 "trust_server_certificate": True,
                 "password": "}}x}",
                 "odbc_driver": "ODBC Driver 17 for SQL Server",
@@ -200,6 +200,19 @@ def test_the_connector_string_is_unchanged(
 ) -> None:
     settings = {**_DB, **update}
     assert _build_dsn(settings, read_only=read_only, attested=True) == expected
+
+
+@pytest.mark.parametrize("value", [0, "false"])
+def test_a_non_bool_encrypt_is_refused(value: object) -> None:
+    # bool() read 0 as off and "false" as on (vault BACKLOG #3234).
+    with pytest.raises(
+        ValueError, match=f"encrypt must be true or false, not {type(value).__name__}"
+    ):
+        _build_dsn(
+            {**_DB, "auth": "SQL", "password": "p", "encrypt": value},
+            read_only=False,
+            attested=True,
+        )
 
 
 def test_the_harness_string_is_unchanged() -> None:
