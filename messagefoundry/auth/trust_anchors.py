@@ -1999,9 +1999,12 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     its driver does not read under ``sslmode=disable``, or MySQL's ``SSLMODE=DISABLED``, in any
     case (vault BACKLOG #3090).
 
-    When it reads a flag that is neither a ``bool``, ``None``, an empty string nor an ``env()``
-    reference, it raises :class:`ValueError`, as ``bool_setting`` refuses it (vault BACKLOG
-    #3234). It reads ``verify_tls`` only when no token hop reads the CA."""
+    Of the flags it reads, it raises :class:`ValueError` only on the four in ``_UNREAD_CA_FLAGS``
+    (``tls``, ``use_tls``, ``tls_verify`` and ``verify_tls``), when one it reads is neither a
+    ``bool``, ``None``, an empty string nor an ``env()`` reference, as ``bool_setting`` refuses it
+    (vault BACKLOG #3234). It reads ``verify_tls`` only when no token hop reads the CA. It still
+    reads ``smart_enabled`` and ``ech_egress`` by truthiness, and ``oauth2_enabled`` through
+    ``oauth2_auth_configured``, which reads a non-bool as off and does not raise."""
     if _odbc_tls_disabled(settings):
         return "odbc_params sslmode turns TLS off, so the driver reads no CA"
     # Each flag is read as its connector reads it: an explicit None is the default (vault BACKLOG

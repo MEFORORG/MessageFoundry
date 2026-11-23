@@ -644,3 +644,35 @@ def test_reader_labels_the_peer_by_host_and_port() -> None:
         )
     )
     assert hostname_unchecked_hops(reg) == [("OB_M", "a.example.invalid:7")]
+
+
+def test_reader_lists_a_non_bool_flag_that_a_hop_still_builds_with(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3234: MLLP reads ``tls_check_hostname`` only with ``tls`` and ``tls_verify``
+    on, so a directly built hop with ``tls_verify=False`` and ``tls_check_hostname=0`` builds and
+    never refuses the ``0``. The register counts a non-bool as possibly off rather than as on, so it
+    lists at least the hops the old ``bool()`` read listed."""
+    from messagefoundry.transports import mllp
+
+    monkeypatch.setattr(mllp, "weakened_tls_escape_permitted_here", lambda: True)
+    settings: dict[str, Any] = {
+        "host": "a.example.invalid",
+        "port": 7,
+        "tls": True,
+        "tls_verify": False,
+        "tls_check_hostname": 0,
+    }
+    # The hop builds with the 0 in place: the strict read never runs on the verify-off path.
+    mllp._mllp_ssl_context(settings, server=False, name="OB_M")
+    # The build refuses a non-bool literal, but the settings dict stays mutable afterwards, so a
+    # Registry built in code can still hold one when the register reads it.
+    reg = Registry()
+    for name, value in (("OB_M", 0), ("OB_STR", "no"), ("OB_T", True), ("OB_N", None)):
+        spec = ConnectionSpec(
+            type=ConnectorType.MLLP, settings={**settings, "tls_check_hostname": True}
+        )
+        reg.add_outbound(build_outbound_connection(name, spec))
+        spec.settings["tls_check_hostname"] = value
+    # Controls: True and None are on, and not listed.
+    assert [name for name, _ in hostname_unchecked_hops(reg)] == ["OB_M", "OB_STR"]

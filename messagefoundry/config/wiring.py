@@ -7853,13 +7853,13 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230). Any
-    # other non-bool literal is not counted: a connector that reads the key refuses it (vault
-    # BACKLOG #3234), so no hop runs with it, and this register does not raise on it.
+    # An explicit None or an empty string is the default, on, as bool_setting reads it (vault
+    # BACKLOG #3230). Any other value that is not True counts as possibly off, without raising: a
+    # connector refuses a non-bool only where it reads the key, and MLLP reads it only with tls and
+    # tls_verify on, so a directly built hop with tls_verify=False and tls_check_hostname=0 builds
+    # (vault BACKLOG #3234). bool() read 0 as off, so this lists at least what that read listed.
     value = settings.get("tls_check_hostname")
-    if isinstance(value, EnvRef):
-        return True
-    return value is False
+    return not (value is None or value is True or (isinstance(value, str) and value == ""))
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:

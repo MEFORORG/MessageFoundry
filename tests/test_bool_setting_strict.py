@@ -135,13 +135,14 @@ def test_unread_ca_reason_reads_an_env_ref_as_unknown(key: str) -> None:
 
 
 def test_hostname_check_report_does_not_raise_on_a_non_bool() -> None:
-    # The register reads a non-bool literal as not off rather than raise: a connector that reads
-    # the key refuses it, so no hop runs with it.
+    # The register reads a non-bool literal as possibly off rather than raise: a connector refuses
+    # it only where it reads the key, and a hop that never reads it still builds.
     assert _declares_hostname_check_off({"tls_check_hostname": False})
     assert _declares_hostname_check_off({"tls_check_hostname": EnvRef("MEFOR_X")})
     for refused in ("false", "true", 0, 1):
-        assert not _declares_hostname_check_off({"tls_check_hostname": refused})
-    assert not _declares_hostname_check_off({"tls_check_hostname": True})
+        assert _declares_hostname_check_off({"tls_check_hostname": refused})
+    for on in (True, None, ""):
+        assert not _declares_hostname_check_off({"tls_check_hostname": on})
     assert not _declares_hostname_check_off({})
 
 
