@@ -89,7 +89,8 @@ WIDER = "and the strings this step and any step above say to remove"
 #: PR 3142's repair handback, comment 7106776128).
 DOUBT_STEP = (
     "At least one entry that may set MEFOR_SECRETS_DIRECTORY is not one line setting it plainly "
-    "to a path under that name, in ASCII with no blank around it, so first take each line that "
+    "to a path under that name, in ASCII with no blank around it, so first note the path each "
+    "such line names, then take each line that "
     "may set it out of every list, whatever its letter case, a blank around its name, or a letter "
     "outside ASCII that upper-cases to one of its letters, with each line below it in its string "
     "that the engine reads as part of its value, up to the next that names a refused variable, "
@@ -99,20 +100,28 @@ DOUBT_STEP = (
     "every refused variable and every other line where it is, for the steps below to move each "
     "value before its entry goes: where such a line shares a registry string with other lines, "
     "write that string back with its other lines as they were, in their order, and leave out "
-    "only a string that holds nothing else. `nssm set` replaces a whole list, so read "
-    "AppEnvironment and AppEnvironmentExtra first with `nssm get`, running the service's own "
-    "nssm.exe by its full path, and pass back every entry, with only those lines taken out. The "
-    "service's own Environment value is no NSSM list and is edited in the registry key named "
-    'above: see docs/SERVICE.md, "Start / stop / status"'
+    "only a string that holds nothing else. No refused value may be typed on a command line, "
+    "where it reaches the shell's history, a transcript and process-creation audit events, so do "
+    "not pass these lists back with `nssm set`. Read AppEnvironment and AppEnvironmentExtra, "
+    "under Parameters in the registry key named above, with `Get-ItemProperty`, edit those "
+    "strings in that same session, and write each back with `Set-ItemProperty -Type "
+    "MultiString`, every entry kept but those lines. The service's own Environment value is no "
+    "NSSM list, and is read and written the same way on the registry key named above: see "
+    'docs/SERVICE.md, "Start / stop / status"'
 )
 
-#: DOUBT_STEP's clause where a refused variable holds a line that may set the directory past its
-#: own first line (``ServiceEnvPosture.directory_in_refused``): the strings holding a refused
-#: variable or its run-on stay as they are until the step that removes it, since such a line may
-#: be part of its value, a store key among them (code review round 1 on the repair of PR 3142's
-#: round-3 open findings 1 and 2).
+#: DOUBT_STEP's command-line rule: the lists it edits still hold every refused value, so it never
+#: has them passed back on a command line (the Lander's hold on PR 3142, comment 7116005396, F2).
+NO_COMMAND_LINE = "No refused value may be typed on a command line"
+
+#: DOUBT_STEP's sentence where taking out the lines that may set the directory would change how
+#: the reader reads a refused variable (``ServiceEnvPosture.directory_in_refused``): the strings
+#: holding a refused variable or its run-on stay as they are until the step that removes it,
+#: since such a line may be part of its value, a store key among them (code review round 1 on
+#: the repair of PR 3142's round-3 open findings 1 and 2; its own sentence under the Lander's
+#: hold on PR 3142, comment 7116005396, F5).
 DOUBT_LEAVE = (
-    ", but leave as it is each string that holds a refused variable or that a refused variable's "
+    ". Leave as it is each string that holds a refused variable or that a refused variable's "
     "value runs on into, since such a line may be part of that value, until a step below removes "
     "that variable, then take those lines out with it"
 )
@@ -186,20 +195,20 @@ DOUBT_CREATE_LEAVING = f"{DOUBT_STEP_LEAVING}. {CREATE}"
 #: CREATE's clause where a directory entry is in doubt, DOUBT_LEAVE applies and an
 #: AppEnvironmentExtra string is one install-service.ps1 reads as setting the directory
 #: (``ServiceEnvPosture.installer_reads_extra``). It states its own condition, and has the
-#: operator read each value out before removing the string, since the registry may hold its
-#: only copy (code review round 1 on the repair of PR 3142's round-3 open findings 1 and 2).
+#: operator read every line out before removing the string, since the registry may hold its
+#: only copy, a retired store key among them, which protect-key never stores (code review round
+#: 1 on the repair of PR 3142's round-3 open findings 1 and 2; the Lander's hold on PR 3142,
+#: comment 7116005396, F1).
 CREATE_INSTALLER = (
     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra and starts with "
     "MEFOR_SECRETS_DIRECTORY= in any letter case, install-service.ps1, which `messagefoundry "
     "service install` also runs, may read that string as the directory the service names and "
-    "print it, and drops it whole, so before you run the installer read out of that string each "
-    "value the next step puts in the secrets directory, remove the string with each refused "
-    "variable whose value it holds, and put each value you read in the new directory at the next "
-    "step"
+    "print it, and drops it whole, so before you run the installer read out of that string every "
+    "line it holds, remove the string with each refused variable whose value it holds, put each "
+    "refused value you read where the steps below say, keep a retired key for the shell that runs "
+    "`messagefoundry rotate-key`, and add each other line back as an entry of its own, but none "
+    "that may set MEFOR_SECRETS_DIRECTORY"
 )
-
-#: CREATE_INSTALLER's tail where a store key moves to its key file in the step above it.
-CREATE_INSTALLER_KEY = "; a store key in it went to its key file in the step above"
 
 #: How the Put step names the directory wherever a directory entry is in doubt, since the doubt
 #: step has taken every directory line out (code review round 1 on that repair).

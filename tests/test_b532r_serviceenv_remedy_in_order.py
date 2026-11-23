@@ -32,12 +32,15 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
+from tests._serviceenv_remedy import NO_COMMAND_LINE
 
 _DIR = "MEFOR_SECRETS_DIRECTORY"
 _EXTRA = "Parameters\\AppEnvironmentExtra"
 _APP = "Parameters\\AppEnvironment"
 _END = '. [security].enforcement = "warn" does not change this refusal'
 _KEY = KEY_CLASS_NAMES[0]
+_RETIRED = "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
+assert _RETIRED in KEY_CLASS_NAMES and _KEY != _RETIRED
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-for-tests-01").decode()
 _NEW_DIRECTORY = "C:\\synthetic-secrets"
 
@@ -141,11 +144,17 @@ def _take_out(string: str, refused: frozenset[str], *, with_value: bool) -> list
 def _apply_doubt_step(text: str, registry: _Registry, refused: frozenset[str]) -> None:
     """Take each line that may set the directory out of every list, as the step says, and pass
     back what its pass-back clause says to pass back."""
-    leave = "leave as it is each string that holds a refused variable or that a refused" in text
+    # A clause after a comma before the Lander's hold on PR 3142, comment 7116005396, F5, and a
+    # sentence of its own since.
+    leave = (
+        "leave as it is each string that holds a refused variable or that a refused" in text.lower()
+    )
     with_value = (
         "each line below it in its string that the engine reads as part of its value" in text
     )
-    if "pass back every entry, with only those lines taken out" in text:
+    if "every entry kept but those lines" in text or (
+        "pass back every entry, with only those lines taken out" in text
+    ):
         also_removed = False
     elif "the strings and lines this step and the steps above say to remove or take out" in text:
         # 6c6b514's wording: the doubt step sat below the removal and run-on steps, and its
@@ -188,10 +197,15 @@ def _run_installer(registry: _Registry) -> None:
 
 
 def _follow_installer_clause(
-    registry: _Registry, refused: frozenset[str], moves: dict[str, str]
+    clause: str, registry: _Registry, refused: frozenset[str], moves: dict[str, str]
 ) -> None:
-    """The create step's clause: read each value a kept AppEnvironmentExtra string the installer
-    reads holds, then remove that string, with each refused variable whose value it holds."""
+    """The create step's clause: read out of each kept AppEnvironmentExtra string the installer
+    reads what the clause says to read, then remove that string, with each refused variable
+    whose value it holds, and add back what the clause says to add back."""
+    # Every line since the Lander's hold on PR 3142, comment 7116005396, F1; before it, each
+    # value the next step puts in the secrets directory, which no store key is.
+    every_line = "read out of that string every line it holds" in clause
+    add_back = "add each other line back as an entry of its own" in clause
     for where, string in list(registry.entries):
         if where != _EXTRA or not _installer_reads(string):
             continue
@@ -203,13 +217,26 @@ def _follow_installer_clause(
         index = registry.entries.index((where, string))
         registry.entries.remove((where, string))
         lost = {name for name in holders if not registry.readable(name, moves[name])}
-        registry.read_out |= lost
+        registry.read_out |= lost if every_line else lost - set(KEY_CLASS_NAMES)
         # A refused variable whose value it held goes with it: the string before it, when that
         # is the refused name set to nothing that ran on into it.
         if index and registry.entries[index - 1][1].partition("=")[2] == "":
             before = registry.entries[index - 1]
             if _names_refused(before[1], refused):
                 registry.entries.remove(before)
+                index -= 1
+        if add_back:
+            # Each line that is neither a refused variable nor part of a refused value, and, as
+            # the clause says, none that may set the directory.
+            others = [
+                line
+                for line in _LINE_BREAK.split(string)
+                if line.strip()
+                and not _names_refused(line, refused)
+                and not any(secret in line for secret in moves.values())
+                and not ("but none that may set" in clause and _may_name_directory(line))
+            ]
+            registry.entries[index:index] = [(where, line) for line in others]
 
 
 #: The create step's clause where a string the doubt step leaves as it is may be read by the
@@ -217,8 +244,11 @@ def _follow_installer_clause(
 _INSTALLER_CLAUSE = "Where a string the first step leaves as it is lies in AppEnvironmentExtra"
 
 _PASSIVE = (
+    "Leave as it is each string",
     "Take out those lines alone",
     "`nssm set` replaces a whole list",
+    "No refused value may be typed on a command line",
+    "Read AppEnvironment and AppEnvironmentExtra",
     "The service's own Environment value",
     "A retired key belongs",
     'See docs/SERVICE.md, "Protect the store encryption key at rest"',
@@ -238,7 +268,10 @@ def _walk(refusal: str, registry: _Registry, moves: dict[str, str]) -> str:
             for name in KEY_CLASS_NAMES:
                 if name in moves and not registry.readable(name, moves[name]):
                     return f"{name} lost before the protect-key step"
-                if name in moves:
+                # protect-key stores the current key only: a retired key stays where it is, for
+                # the shell that runs rotate-key (the Lander's hold on PR 3142, comment
+                # 7116005396, F1).
+                if name in moves and name != _RETIRED:
                     registry.moved.add(name)
         elif sentence.startswith("Where no secrets directory exists yet"):
             if registry.directory:
@@ -248,13 +281,14 @@ def _walk(refusal: str, registry: _Registry, moves: dict[str, str]) -> str:
                 # that step goes first.
                 _apply_doubt_step(_doubt_step(steps), registry, refused)
             if index + 1 < len(steps) and steps[index + 1].startswith(_INSTALLER_CLAUSE):
-                _follow_installer_clause(registry, refused, moves)
+                _follow_installer_clause(steps[index + 1], registry, refused, moves)
             _run_installer(registry)
         elif sentence.startswith("Put "):
             if not registry.directory:
                 return "no secrets directory at the Put step"
             for name, secret in moves.items():
-                if name in KEY_CLASS_NAMES or name in registry.read_out:
+                # A retired key is not moved yet, so it must still be readable here or read out.
+                if name in registry.moved or name in registry.read_out:
                     continue
                 if not registry.readable(name, secret):
                     return f"{name} lost before the Put step"
@@ -374,6 +408,28 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {"MEFOR_STORE_PASSWORD": "Summer!x"},
         False,
     ),
+    # The Lander's hold on PR 3142, comment 7116005396, F1: a retired store key runs on into
+    # such a string. protect-key never stores it, so the clause has the operator read it out
+    # and keep it for the shell that runs rotate-key.
+    "retired-key-runs-on-into-an-installer-string": (
+        [
+            (_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA"),
+            (_EXTRA, f"{_RETIRED}="),
+            (_EXTRA, f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"),
+        ],
+        frozenset({f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"}),
+        {_RETIRED: _KEY_B64, "MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
+    ),
+    # The same hold, F3: a name written alone below a directory line, its value in the next
+    # string. Taking the directory line out changes how the reader reads it, so the doubt step
+    # leaves that string as it is, and the clause has it removed before the installer runs.
+    "value-name-alone-below-a-directory-line": (
+        [(_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_VALUE_A"), (_EXTRA, _KEY_B64)],
+        frozenset({_KEY_B64}),
+        {"MEFOR_VALUE_A": _KEY_B64},
+        False,
+    ),
 }
 
 
@@ -401,7 +457,51 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
 _READ_OUT = {
     "password-runs-on-into-an-installer-string": {"MEFOR_STORE_PASSWORD"},
     "value-name-alone-above-an-installer-string": {"MEFOR_VALUE_A"},
+    "retired-key-runs-on-into-an-installer-string": {_RETIRED},
+    "value-name-alone-below-a-directory-line": {"MEFOR_VALUE_A"},
 }
+
+
+#: Shapes beyond the walk's, with no entry in doubt: the add-back step, the run-on step and the
+#: keep-one step each tell the operator to pass a list back with `nssm set`.
+_NOT_IN_DOUBT = {
+    "add-back": [(_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA")],
+    "run-on": [(_EXTRA, "MEFOR_STORE_PASSWORD="), (_EXTRA, "SEKRITpw")],
+    "keep-one": [
+        (_EXTRA, "MEFOR_STORE_PASSWORD="),
+        (_EXTRA, "mefor_secrets_directory=C:\\d"),
+        (_EXTRA, f"{_KEY}="),
+        (_EXTRA, "synthetic-run-on"),
+    ],
+    "retired-key": [(_EXTRA, f"{_RETIRED}={_KEY_B64}"), (_EXTRA, "MEFOR_VALUE_A=x")],
+}
+
+#: The one pass-back clause a sentence naming `nssm set` may carry: every refused entry stays
+#: out of what is typed back.
+_PASSES_NO_REFUSED = "pass back every entry but those refused above"
+
+
+@pytest.mark.parametrize("case", sorted([*_CASES, *_NOT_IN_DOUBT]))
+def test_no_step_has_a_refused_value_passed_back_on_a_command_line(case: str) -> None:
+    """The Lander's hold on PR 3142, comment 7116005396, F2: the doubt step comes first and
+    keeps every refused variable, so passing its lists back with `nssm set` would have the
+    operator type store keys, passwords and MEFOR_VALUE_* values on a command line, where they
+    reach the shell's history, a transcript and process-creation audit events. Every sentence
+    that names `nssm set` either forbids it for such a list or passes back no refused entry,
+    and the doubt step says no refused value may be typed on a command line."""
+    entries = _CASES[case][0] if case in _CASES else _NOT_IN_DOUBT[case]
+    posture = read_service_env_posture(probe=_Probe(entries), environ={})
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    steps = refusal.split("each value refused here. ", 1)[1].removesuffix(_END).split(". ")
+    naming = [s for s in steps if "`nssm set`" in s]
+    assert naming or not posture.directory_in_doubt
+    for sentence in naming:
+        assert "do not pass these lists back with `nssm set`" in sentence or (
+            _PASSES_NO_REFUSED in sentence
+        ), sentence
+    if posture.directory_in_doubt:
+        assert NO_COMMAND_LINE in _doubt_step(steps)
 
 
 def test_the_doubt_step_takes_key_text_below_a_directory_line_out_with_it() -> None:

@@ -539,17 +539,19 @@ def test_a_directory_entry_in_doubt_outside_the_extra_list_is_taken_out_too(
 ) -> None:
     """The Lander's ruling B on PR 3142's repair handback, comment 7106776128: a directory
     entry in doubt is taken out whatever list holds it, so the doubt step names every list, says
-    `nssm set` replaces a whole list and to read AppEnvironment and AppEnvironmentExtra first
-    with `nssm get`, and says the service's own Environment value is edited in its registry key
-    (the Lander's hold on PR 3142, comment 7090314503, item 3, read under that ruling; code
-    review round 2 on the repair). The lists still set the directory, so the step never says
-    they set none."""
+    to read AppEnvironment and AppEnvironmentExtra with `Get-ItemProperty` and write them back
+    with `Set-ItemProperty`, since they still hold every refused value (the Lander's hold on PR
+    3142, comment 7116005396, F2), and says the service's own Environment value is edited the
+    same way in its registry key (the Lander's hold on PR 3142, comment 7090314503, item 3, read
+    under that ruling; code review round 2 on the repair). The lists still set the directory, so
+    the step never says they set none."""
     refusal = service_env_refusal(_read_pairs([(_EXTRA, "MEFOR_VALUE_A=x"), (where, plain)]))
     assert refusal is not None
     assert SET_NO not in refusal
     assert refusal.count(ADD_BACK_DOUBT + ADD_BACK_CREATE) == 1
-    assert "read AppEnvironment and AppEnvironmentExtra first with `nssm get`" in DOUBT_STEP
-    assert "Environment value is no NSSM list and is edited in the registry key" in DOUBT_STEP
+    assert "Read AppEnvironment and AppEnvironmentExtra, under Parameters" in DOUBT_STEP
+    assert "write each back with `Set-ItemProperty -Type MultiString`" in DOUBT_STEP
+    assert "Environment value is no NSSM list, and is read and written the same way" in DOUBT_STEP
 
 
 @pytest.mark.parametrize(
