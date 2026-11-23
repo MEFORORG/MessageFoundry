@@ -293,8 +293,8 @@ class StorePrivilegePosture:
     detail: str = ""
     #: Grants the probe named as not read (BACKLOG #6015). Beside an ``OBSERVED`` excess the
     #: over-grant entry names them, so it does not read as a complete observation. Empty does not
-    #: mean every grant was read: at least a skipped or failed SQL Server user-defined role
-    #: enumeration is noted in ``detail`` only.
+    #: mean every grant was read: at least a failed SQL Server user-defined role enumeration is
+    #: noted in ``detail`` and not here.
     unread: tuple[str, ...] = ()
 
 
