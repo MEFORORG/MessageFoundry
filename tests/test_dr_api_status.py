@@ -39,7 +39,11 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         store_settings=StoreSettings(path=str(tmp_path / "status.db")),
         # A DR box ALREADY activated under the profile this boot (enabled + activate): the run-profile
         # threshold is CRITICAL, so a normal-tier inbound is parked status:"filtered" at start.
-        dr_settings=DrSettings(enabled=True, activate=True, priority_threshold=Priority.CRITICAL),
+        # The load refuses activate=true (BACKLOG #5965); model_construct builds the
+        # boot-latched box the engine still models, which only code can hand it now.
+        dr_settings=DrSettings.model_construct(
+            enabled=True, activate=True, priority_threshold=Priority.CRITICAL
+        ),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     yield eng

@@ -45,7 +45,7 @@ async def standby_engine(tmp_path: Path) -> AsyncIterator[Engine]:
         poll_interval=0.05,
         store_settings=StoreSettings(path=str(db)),
         backup_settings=_backup_settings(tmp_path),
-        dr_settings=DrSettings(enabled=True),
+        dr_settings=DrSettings(enabled=True, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
@@ -170,7 +170,9 @@ async def test_a_boot_latched_active_backs_up(tmp_path: Path) -> None:
         poll_interval=0.05,
         store_settings=StoreSettings(path=str(db)),
         backup_settings=_backup_settings(tmp_path),
-        dr_settings=DrSettings(enabled=True, activate=True),
+        # The load refuses activate=true (BACKLOG #5965); model_construct builds the
+        # boot-latched box the engine still models, which only code can hand it now.
+        dr_settings=DrSettings.model_construct(enabled=True, activate=True),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:

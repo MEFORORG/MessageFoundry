@@ -2055,13 +2055,15 @@ def test_vip_enabled_warns_that_nothing_moves_the_address(
 
 def test_dr_activate_with_cluster_is_rejected(tmp_path: Path) -> None:
     # A DR box coming up under the DR run-profile must not also contend for the cluster lease (it could
-    # win leadership and drive the primary store cross-WAN). Refused at config load.
+    # win leadership and drive the primary store cross-WAN). Refused at config load: activate = true
+    # is refused on its own since BACKLOG #5965, before the cluster check runs.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
-        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = true\n",
+        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = true\n"
+        "seed_archive = 'seed.mfbak'\n",
     )
-    with pytest.raises(ValidationError, match="dr.*activate|activate.*cluster"):
+    with pytest.raises(ValidationError, match=r"\[dr\]\.activate = true is not supported"):
         load_settings(config_path=cfg, environ={})
 
 
@@ -2072,7 +2074,8 @@ def test_dr_enabled_but_not_activated_with_cluster_is_rejected(tmp_path: Path) -
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
-        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = false\n",
+        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = false\n"
+        "seed_archive = 'seed.mfbak'\n",
     )
     with pytest.raises(ValidationError, match=r"\[dr\]\.enabled cannot be combined"):
         load_settings(config_path=cfg, environ={})
@@ -2089,15 +2092,24 @@ def test_a_cluster_member_with_dr_off_loads(tmp_path: Path) -> None:
     assert s.cluster.enabled is True and s.dr.enabled is False
 
 
-def test_dr_activate_without_cluster_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The classic DR posture: activate the DR profile with [cluster] disabled — must load fine.
+def test_dr_activate_without_cluster_is_refused_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5965: this posture used to load, and latched the DR run-profile at boot without
+    # what POST /dr/activate runs. The passive box loads; the endpoint promotes it.
     monkeypatch.chdir(tmp_path)
     cfg = _write(
         tmp_path / "messagefoundry.toml",
-        "[dr]\nenabled = true\nactivate = true\n",
+        "[dr]\nenabled = true\nactivate = true\nseed_archive = 'seed.mfbak'\n",
     )
-    s = load_settings(config_path=cfg, environ={})
-    assert s.dr.activate is True and s.cluster.enabled is False
+    with pytest.raises(ValidationError, match=r"POST /dr/activate"):
+        load_settings(config_path=cfg, environ={})
+    passive = _write(
+        tmp_path / "passive.toml",
+        "[dr]\nenabled = true\nseed_archive = 'seed.mfbak'\n",
+    )
+    s = load_settings(config_path=passive, environ={})
+    assert s.dr.enabled is True and s.dr.activate is False and s.cluster.enabled is False
 
 
 # --- [integrity] startup self-attestation (ADR 0041 D3) + dual-control config_reload (D2) ----
@@ -2227,12 +2239,12 @@ def test_delivery_priority_default_and_dr_section(tmp_path: Path) -> None:
     cfg = _write(
         tmp_path / "h.toml",
         "[delivery]\npriority = 'critical'\n"
-        "[dr]\nenabled = true\nactivate = true\npriority_threshold = 'normal'\n"
+        "[dr]\nenabled = true\npriority_threshold = 'normal'\nseed_archive = 'seed.mfbak'\n"
         "takeover_hook = 'echo ok'\ntakeover_timeout_seconds = 5\n",
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.delivery.priority.value == "critical"
-    assert s.dr.enabled and s.dr.activate and s.dr.priority_threshold.value == "normal"
+    assert s.dr.enabled and not s.dr.activate and s.dr.priority_threshold.value == "normal"
     assert s.dr.takeover_hook == "echo ok"
 
 
@@ -2242,7 +2254,8 @@ def test_invalid_priority_and_dr_settings_rejected(tmp_path: Path) -> None:
     bad_configs = [
         "[delivery]\npriority = 'urgent'\n",  # unknown tier
         "[dr]\npriority_threshold = 'bogus'\n",  # invalid threshold
-        "[dr]\nenabled = true\nactivation_mode = 'auto'\n",  # not-yet-supported (deferred) mode
+        # not-yet-supported (deferred) mode; the seed keeps the seed refusal out of the way
+        "[dr]\nenabled = true\nseed_archive = 'seed.mfbak'\nactivation_mode = 'auto'\n",
         "[dr]\ntakeover_hook = '   '\n",  # blank-but-present hook
         "[dr]\ntakeover_timeout_seconds = 0\n",  # non-positive timeout
         "[dr]\nseed_archive = 's3://bucket/seed.mfbak'\n",  # cloud seed source
@@ -2260,9 +2273,11 @@ def test_dr_restore_token_local_path_parses(tmp_path: Path) -> None:
     # BACKLOG #223 / ADR 0102: a LOCAL restore-token path parses (default "" = OFF, byte-identical to
     # #102); a cloud URL is the only rejected form (covered above).
     assert DrSettings().restore_token == ""  # opt-in default OFF
+    # A server-DB store: on SQLite no check reads the token, so it is refused (BACKLOG #5965).
     cfg = _write(
         tmp_path / "dr_token.toml",
-        "[dr]\nenabled = true\nrestore_token = 'D:/dr/restore.token'\n",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[dr]\nenabled = true\nseed_archive = 'seed.mfbak'\nrestore_token = 'D:/dr/restore.token'\n",
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.dr.restore_token == "D:/dr/restore.token"

@@ -342,7 +342,7 @@ async def test_the_coordinator_hands_the_hook_the_dr_setting(
     monkeypatch.setattr(dr, "_run_command", fake_run_command)
     coordinator = dr.DrCoordinator(
         cast(Any, None),  # never read: running a hook touches no store
-        settings.DrSettings(enabled=True, pass_environment=(_PASSED,)),
+        settings.DrSettings(enabled=True, seed_archive="seed.mfbak", pass_environment=(_PASSED,)),
         store_settings=None,
         activate_profile=_never_awaited,
         deactivate_profile=_never_awaited,
@@ -724,7 +724,10 @@ async def test_the_engine_warns_at_construction_about_an_unset_listed_name(
         for hook, expected in (("", False), ("exit 0", True)):
             caplog.clear()
             dr_settings = settings.DrSettings(
-                enabled=True, pass_environment=(_PASSED,), takeover_hook=hook
+                enabled=True,
+                seed_archive="seed.mfbak",
+                pass_environment=(_PASSED,),
+                takeover_hook=hook,
             )
             with caplog.at_level("WARNING", logger=dr.log.name):
                 Engine(store, config_dir=None, dr_settings=dr_settings, egress_settings=_EGRESS)
@@ -746,7 +749,7 @@ async def test_a_failed_hook_points_at_the_setting(
     monkeypatch.setattr(dr, "_run_command", failing)
     coordinator = dr.DrCoordinator(
         cast(Any, None),
-        settings.DrSettings(enabled=True),
+        settings.DrSettings(enabled=True, seed_archive="seed.mfbak"),
         store_settings=None,
         activate_profile=_never_awaited,
         deactivate_profile=_never_awaited,
