@@ -65,11 +65,11 @@ def test_the_to_help_says_what_is_refused_and_gives_the_safe_remedy() -> None:
         "(a file, a directory or a link, a dangling one included), is refused",
         "the store and sidecar names are read again just before the write",
         "Not caught, at least: a sidecar created after that re-read",
-        "Nor, at least on Windows, a taken -wal, -shm or -journal name, or a dangling link at the "
+        "Nor, on Windows, a taken -wal, -shm or -journal name, or a dangling link at the "
         "store name when the store is copied into place, on a share or drive that neither read could "
         "reach",
         "an unreachable share, which reads as free (at least WinError 53 and 67), or a drive letter "
-        "that is gone (at least WinError 3 and 15)",
+        "that is gone (at least WinError 3)",
         "a dangling link planted at the store name after that re-read, which is followed",
         "a name holding ':', and on Windows a name ending in a dot or a space",
         "stop the engine and move the old store aside with its -wal, -shm and -journal as one set",
