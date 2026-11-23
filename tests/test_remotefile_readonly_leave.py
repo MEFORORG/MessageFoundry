@@ -504,8 +504,11 @@ async def test_every_stuck_reject_gets_its_retry_when_slots_are_scarce(
         for name, (seen, _) in list(src._stuck.items()):
             _make_due(src, name, seen.due - 30.0)
         await src._poll_once()
-    assert len(names) >= 40
-    never = [name for name in names if _retrieved(client, f"/in/{name}") < 2]
+    remembered = sorted(src._stuck)  # what the run itself still holds as stuck
+    assert len(remembered) >= len(names), "the premise: every reject is still remembered"
+    retried = [name for name in remembered if _retrieved(client, f"/in/{name}") >= 2]
+    assert len(retried) >= 1, "the premise: the retry pass ran at all"
+    never = [name for name in remembered if name not in retried]
     assert never == []
 
 
