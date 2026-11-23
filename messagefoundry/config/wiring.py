@@ -54,7 +54,15 @@ import threading
 import tokenize
 import traceback
 import urllib.parse
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -6157,6 +6165,57 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     return found
 
 
+# The verdict types :func:`accepts_verdict` refuses unless the class has a truth value of its own:
+# each otherwise reads as True without being awaited or iterated.
+_ALWAYS_TRUE_VERDICT_TYPES: Final = (Awaitable, Iterator, AsyncIterator)
+
+
+def accepts_verdict(hname: str, verdict: object) -> bool:
+    """The truth value of ``verdict``, the value an ``accepts=`` predicate returned, or
+    :class:`TypeError` when it is an awaitable, an iterator or an async iterator (BACKLOG #5514).
+
+    The router stage reads the verdict as a truth value without awaiting or iterating it. A coroutine,
+    a generator, an async generator and iterators such as ``filter`` or ``re.finditer`` each read as
+    True, so the handler would accept every message. The static check in
+    :func:`_check_accepts_predicate` misses a plain function that returns one. The raise propagates
+    out of ``route_only`` like any predicate raise, into the router-stage error path. The text names
+    the handler and the verdict's type, never its value. Every mode applies this one rule, so
+    ``[sandbox].mode`` does not change the verdict (ADR 0087).
+
+    The refusal neither consumes nor closes the object, because the predicate may share it, for
+    example a module-level generator, and closing it would end it for its other holders. It drops its
+    own reference before raising. ``dryrun._accepted`` and the sandbox worker pass the verdict straight
+    in rather than binding it to a local, so on those paths an object the predicate made for this
+    call, and that is in no reference cycle, is collected before the error leaves this function, on
+    the calling thread and inside whatever run context the caller holds. The dry-run tracer's
+    recorder keeps the predicate's frame, so on the traced path the object waits for the cyclic
+    collector, as does an object in a cycle on any path. When Python finalizes it, a started
+    generator's ``finally`` runs, a raise from that ``finally`` goes to Python's unraisable-exception
+    hook rather than into this error, and a coroutine draws Python's "never awaited" warning.
+
+    An object whose class defines ``__bool__`` or ``__len__`` has a truth value of its own, so it is
+    read by that value as before, iterator or not."""
+    if verdict is None or type(verdict) is bool:  # the contract's shapes: the routing hot path
+        return bool(verdict)
+    cls = type(verdict)
+    if (
+        isinstance(verdict, _ALWAYS_TRUE_VERDICT_TYPES)
+        and not hasattr(cls, "__bool__")
+        and not hasattr(cls, "__len__")
+    ):
+        # A class name is author-controlled and type() accepts one with CR or LF in it, so it is
+        # escaped before it reaches text that is logged. hname goes in through repr, which escapes.
+        type_name = scrub_log_argument(cls.__name__)
+        del verdict, cls  # see the docstring: the traceback must not keep the verdict alive
+        raise TypeError(
+            f"accepts= predicate for handler {hname!r} returned an object of type "
+            f"{type_name}, which the router stage cannot await or iterate "
+            "and would read as True; it must return a value whose truth value is the verdict, "
+            "such as a bool"
+        )
+    return bool(verdict)
+
+
 def _check_accepts_predicate(hname: str, pred: object) -> None:
     """Fail closed on an ``accepts=`` predicate that can't hold its contract (ADR 0084).
 
@@ -6169,7 +6228,9 @@ def _check_accepts_predicate(hname: str, pred: object) -> None:
     * **Async** — an ``async def`` predicate, or a partial, method, wrapper or callable instance that
       runs one (:func:`_accepts_is_async`), returns a coroutine, which the router stage reads as
       truthy, so the handler would accept every message (BACKLOG #5514). A plain function that returns
-      an awaitable is not seen.
+      an awaitable, an iterator or an async iterator is not seen here; :func:`accepts_verdict`
+      refuses such a verdict at run time instead, as a router-stage error, unless its class has a
+      truth value of its own.
     * **Fail-open run-scoped read** — a predicate that can reach ``state_get``/``response_get`` (ADR
       0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
       suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
