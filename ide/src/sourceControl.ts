@@ -263,7 +263,8 @@ function hookPathValues(ws: string): { check: CheckPaths; hook: CheckPaths | und
   if (configRel === undefined || messagesRel === undefined) {
     const key = configRel === undefined ? "configDir" : "messageSetsDir";
     void vscode.window.showWarningMessage(
-      `MessageFoundry: messagefoundry.${key} names a path outside the workspace folder. The commit hook is ` +
+      `MessageFoundry: messagefoundry.${key} is not spelled as a path inside the workspace folder (a letter ` +
+        "outside A-Z must have the folder's own case). The commit hook is " +
         "committed to the repository, so it names folders inside the workspace only; no commit hook was set up.",
     );
     return { check, hook: undefined };
@@ -305,11 +306,16 @@ function isUncSpelling(p: string): boolean {
  * workspace on a mapped drive still matches its UNC spelling, through the real path of `ours`.
  * Open limits: a `theirs` spelled locally that reaches a share is still opened when its real path is
  * read, at least through a link or a mapped drive letter, though no longer on the extension host's
- * own thread. Setup runs only in a trusted window, where the repository's code runs.
+ * own thread. Setup runs only in a trusted window, where the repository's code runs. Exported, with
+ * `win32` (by default, on Windows) choosing the fold, for the unit suite only.
  */
-async function sameDir(ours: string, theirs: string): Promise<boolean> {
+export async function sameDir(
+  ours: string,
+  theirs: string,
+  win32: boolean = process.platform === "win32",
+): Promise<boolean> {
   // ASCII A-Z only: toLowerCase() maps U+212A KELVIN SIGN onto "k", so another folder would match.
-  const fold = (p: string): string => (process.platform === "win32" ? foldAsciiCase(p) : p);
+  const fold = (p: string): string => (win32 ? foldAsciiCase(p) : p);
   const real = async (p: string): Promise<string> => {
     try {
       return fold(await fs.promises.realpath(p));

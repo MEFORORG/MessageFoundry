@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 // ASCII-only case fold on Windows: path.relative folded with toLowerCase(), so a sibling named with
 // U+212A KELVIN SIGN for "k" read as the workspace (BACKLOG #5832).
-import { isPathWithin as isWithin } from "./pathFold";
+import { isPathWithin as isWithin, isSamePath, nonAsciiCaseVariant } from "./pathFold";
 
 function realpath(p: string): string {
   try {
@@ -186,7 +186,9 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * real path cannot be read. The repository supplies the link whichever scope named the path, so the
  * manifest default and a relative user value are checked too. A value spelled outside the folder can
  * only be the operator's own user value, theirs to point anywhere, so it is not checked, and the
- * spelling test runs first, with no I/O.
+ * spelling test runs first, with no I/O. A value spelled outside only by a case outside A-Z that a
+ * file system may fold is the exception: the file system is asked whether it names the workspace
+ * folder, and if so it is checked (escapesUnderCaseVariant, BACKLOG #5832).
  *
  * At least these spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
@@ -207,16 +209,51 @@ export function escapesByLink(ws: string | undefined, value: string, win32: bool
   }
   const rel = committedRelativePath(ws, value);
   if (rel === undefined) {
-    return false;
+    return escapesUnderCaseVariant(ws, value, win32);
   }
-  // A backslash separates components on Windows only; on POSIX it is part of a name.
-  if (value.split(win32 ? /[\\/]/ : /[/]/).includes("..")) {
+  if (climbs(value, win32)) {
     return true;
   }
   if (hasTrailingDotOrSpaceName(rel, win32) || hasColonInName(rel, win32) || hasReservedDeviceName(rel, win32)) {
     return true;
   }
   return resolveInsideWorkspace(ws, value) === undefined;
+}
+
+/** Whether `value` has a `..` component. A backslash separates components on Windows only; on
+ *  POSIX it is part of a name. */
+function climbs(value: string, win32: boolean): boolean {
+  return value.split(win32 ? /[\\/]/ : /[/]/).includes("..");
+}
+
+/**
+ * {@link escapesByLink} for a value spelled outside `ws` only because a folder name on it differs
+ * from the workspace's by a case outside A-Z (BACKLOG #5832). NTFS folds some such differences and
+ * not others, so the file system is asked: the real path of the folder the value names at the
+ * workspace's depth. When that is the workspace folder's own real path, the value is the workspace
+ * spelled another way, and it is checked as the same path spelled from the workspace, links
+ * included; before this, the ASCII fold read it as outside and skipped the check. When it is
+ * another folder, the value is the operator's own and is not checked. A `..`, or a real path that
+ * cannot be read, refuses. A value outside under every case fold makes no file-system call.
+ */
+function escapesUnderCaseVariant(ws: string, value: string, win32: boolean): boolean {
+  const root = path.resolve(ws);
+  const variant = nonAsciiCaseVariant(root, path.resolve(root, value));
+  if (variant === undefined) {
+    return false;
+  }
+  if (climbs(value, win32)) {
+    return true;
+  }
+  const realRoot = realpathOfNearestExisting(root);
+  const realHead = realpathOfNearestExisting(variant.head);
+  if (realRoot === undefined || realHead === undefined) {
+    return true;
+  }
+  if (!isSamePath(realRoot, realHead)) {
+    return false;
+  }
+  return escapesByLink(ws, path.join(root, ...variant.rest), win32);
 }
 
 /**
@@ -321,8 +358,8 @@ export interface ContainedPathSetting {
  *  the scope it was written in, never the value (docs/REVIEW-STANDARDS.md R12). */
 function droppedWhy(key: string, dropped: DroppedScope): string {
   return dropped === "workspace"
-    ? `messagefoundry.${key}, set in workspace settings, is not a path inside the workspace folder, is not ` +
-        "text, or no folder is open"
+    ? `messagefoundry.${key}, set in workspace settings, is not a path inside the workspace folder as ` +
+        "spelled (a letter outside A-Z must have the folder's own case), is not text, or no folder is open"
     : `messagefoundry.${key}, set in user settings, is not text`;
 }
 

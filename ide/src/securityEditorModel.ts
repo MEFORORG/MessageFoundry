@@ -6,6 +6,7 @@
 // check fails closed: a refusal names what is wrong and nothing is run.
 import * as path from "node:path";
 
+import { isSamePath, nonAsciiCaseVariant, segmentsBelow } from "./pathFold";
 import type { Field, FieldType } from "./securityEditorWebview";
 import {
   hasColonInName,
@@ -37,14 +38,6 @@ export function securityConfigInput(
 
 /** The service-settings file the editor reads and writes, or why it may not. */
 export type ConfigTarget = { readonly ok: true; readonly path: string } | { readonly ok: false; readonly problem: string };
-
-/** Whether `target` lies strictly inside `root`. path.relative so a sibling sharing a name prefix
- *  does not match, and on Windows the comparison ignores case as the file system does. A first
- *  component that only starts with two dots, such as `..conf`, is inside. */
-function inside(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return rel !== "" && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
-}
 
 /** The file-system reads the link check makes, as fs.lstatSync and fs.realpathSync.native make
  *  them: each throws an error carrying `code` for a path it cannot read. */
@@ -78,10 +71,27 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
     deepest = next;
   }
   try {
-    const expected = path.join(fsx.realpath(root), path.relative(root, deepest));
-    return path.relative(expected, fsx.realpath(deepest)) === "";
+    // ASCII case only on Windows: toLowerCase() maps U+212A KELVIN SIGN onto "k" (BACKLOG #5832).
+    const expected = path.join(fsx.realpath(root), ...(segmentsBelow(root, deepest) ?? [""]));
+    return isSamePath(expected, fsx.realpath(deepest));
   } catch {
     return false; // any realpath error refuses
+  }
+}
+
+/** Whether `head` is the folder `root` by real path: true, false, or undefined when `root`'s real
+ *  path, or `head`'s for any reason but its absence, cannot be read. */
+function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | undefined {
+  let realRoot: string;
+  try {
+    realRoot = fsx.realpath(root);
+  } catch {
+    return undefined;
+  }
+  try {
+    return isSamePath(realRoot, fsx.realpath(head));
+  } catch (e) {
+    return missing(e) ? false : undefined;
   }
 }
 
@@ -119,7 +129,15 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    can choose it, since the workspace folder used is the first in `folders`.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` included, it gets the checks of rule 2, and the folder itself
- *    is refused. Otherwise it is accepted as written, with no file-system call.
+ *    is refused. Otherwise it is accepted as written, with no file-system call, except in one case.
+ *
+ * On Windows a spelling is inside the folder when it matches with only ASCII case ignored (BACKLOG
+ * #5832): toLowerCase() maps U+212A KELVIN SIGN onto "k", a name NTFS keeps apart. A path that
+ * differs from the folder's spelling only by a case outside A-Z may still be the folder, since NTFS
+ * folds at least e-acute against E-acute. Set in workspace settings, it is refused. Set in user
+ * settings, the real path of the folder it names at the workspace's depth is read: when that is the
+ * workspace folder, the path gets rule 2's checks, spelled from the workspace folder; when it does
+ * not exist or is another folder, it is accepted as written; any other error refuses.
  *
  * Open limit: rule 3 compares spellings only. A user-set path that reaches the workspace folder by
  * an alias is accepted as written, and no link the repository holds is checked on it. That covers at
@@ -141,22 +159,44 @@ export function securityConfigTarget(
   }
   const root = path.resolve(workspace);
   const target = path.resolve(root, setting);
-  const rel = path.relative(root, target);
-  // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
-  if (rel === "") {
-    return { ok: false, problem: "messagefoundry.serviceConfig names the workspace folder itself, not a file" };
-  }
-  if (!inside(root, target)) {
+  let below = segmentsBelow(root, target);
+  if (below === undefined) {
+    const variant = nonAsciiCaseVariant(root, target);
     if (scope.fromWorkspace) {
       return {
         ok: false,
         problem:
-          "messagefoundry.serviceConfig, set in workspace settings, names a path outside the workspace folder. " +
-          "To use a file elsewhere, set it in user settings",
+          variant === undefined
+            ? "messagefoundry.serviceConfig, set in workspace settings, names a path outside the workspace folder. " +
+              "To use a file elsewhere, set it in user settings"
+            : "messagefoundry.serviceConfig, set in workspace settings, spells a folder on its path with a case " +
+              "outside A-Z that differs from the workspace folder's. Spell it with the folder's own case, or, to " +
+              "use a file elsewhere, set it in user settings",
       };
     }
-    return { ok: true, path: target };
+    if (variant === undefined) {
+      return { ok: true, path: target };
+    }
+    const same = isWorkspaceFolder(root, variant.head, fsx);
+    if (same === undefined) {
+      return {
+        ok: false,
+        problem:
+          "messagefoundry.serviceConfig spells a folder on its path with a case outside A-Z that differs from the " +
+          "workspace folder's, and whether it is the workspace folder could not be read. Spell it with the " +
+          "folder's own case",
+      };
+    }
+    if (!same) {
+      return { ok: true, path: target };
+    }
+    below = [...variant.rest];
   }
+  // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
+  if (below.length === 0) {
+    return { ok: false, problem: "messagefoundry.serviceConfig names the workspace folder itself, not a file" };
+  }
+  const rel = below.join(path.sep);
   if (hasTrailingDotOrSpaceName(rel)) {
     return {
       ok: false,
