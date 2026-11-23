@@ -3188,6 +3188,79 @@ def test_prove_absences_screen_outer_rule_reads_only_a_shape_that_is_fixed_and_l
     assert any("functools.cache" in p for p in _screen(plain, cached, tmp_path))
 
 
+# The four tests below are red on b1ce5d29f47, the head before the outer rule read call forms, loop
+# bodies and its own refusal text.
+
+_OUTER_HEAD: Final = (
+    "import functools\n\ndef g(): ...\n\ndef h(fn):\n    return fn.__wrapped__\n\n"
+    "def ident(fn):\n    return fn\n\nw = WRAP\n\n"
+)
+
+
+def test_prove_absences_screen_outer_rule_reads_a_call_of_a_call_as_unnamed(
+    tmp_path: Path,
+) -> None:
+    """``@functools.wraps(g)(h)`` applies what ``h`` returns, and ``@lru_cache(maxsize=1)(ident)``
+    binds ``ident(f)``, so neither tells what the name is bound to."""
+    plain = _decorated((), method=False)
+    for live in (
+        ("functools.wraps(g)(h)", "functools.cache", "w"),
+        ("functools.lru_cache(maxsize=1)(ident)", "w"),
+    ):
+        target = _OUTER_HEAD + _decorated(live, method=False)
+        assert _screen(plain, target, tmp_path) == [], live
+        assert _differs_under_every_w(target, plain, method=False) is False, live
+
+
+def test_prove_absences_screen_outer_rule_reads_lru_cache_given_a_callable_as_unnamed(
+    tmp_path: Path,
+) -> None:
+    """``lru_cache(ident)`` and ``lru_cache(maxsize=ident)`` wrap ``ident`` and bind ``ident(f)``.
+    Control: ``lru_cache(maxsize=1)`` and ``lru_cache(None)`` return a decorator, and still refuse."""
+    plain = _decorated((), method=False)
+    for size in ("ident", "maxsize=ident"):
+        target = _OUTER_HEAD + _decorated((f"functools.lru_cache({size})", "w"), method=False)
+        assert _screen(plain, target, tmp_path) == [], size
+        assert _differs_under_every_w(target, plain, method=False) is False, size
+    for size in ("maxsize=1", "None"):
+        target = _OUTER_HEAD + _decorated((f"functools.lru_cache({size})", "w"), method=False)
+        assert _refused(plain, target, tmp_path), size
+        assert _differs_under_every_w(target, plain, method=False), size
+
+
+def test_prove_absences_screen_outer_rule_distrusts_a_decorator_rebound_in_its_loop(
+    tmp_path: Path,
+) -> None:
+    """The reading takes a loop body's first pass, where ``deco`` is ``property``; the second pass
+    binds a cache. A name rebound anywhere in an enclosing loop body tells nothing."""
+    target = (
+        "import functools\n\nw = WRAP\ndeco = property\n\nfor i in range(2):\n"
+        "    for j in range(1):\n        @deco\n        @w\n        def f(a):\n"
+        "            return 1\n    deco = functools.cache\n"
+    )
+    mutation = "@functools.cache\ndef f(a):\n    return 1\n"
+    assert _screen(mutation, target, tmp_path) == []
+    assert _differs_under_every_w(target, mutation, method=False) is False
+    # Control: a name the loop does not bind is still read.
+    steady = target.replace("    deco = functools.cache\n", "    other = functools.cache\n")
+    assert _refused(mutation, steady, tmp_path)
+
+
+def test_prove_absences_screen_outer_refusal_says_what_the_change_does(tmp_path: Path) -> None:
+    """A dropped cache beside an unnamed decorator leaves every call working, so the refusal says
+    the results stop being cached, and not that the change breaks every call site."""
+    plain = _decorated((), method=False)
+    cached = _OUTER_HEAD + _decorated(("functools.cache", "w"), method=False)
+    (problem,) = _screen(plain, cached, tmp_path)
+    assert "breaks every call site" not in problem
+    assert "the function the def itself makes" in problem
+    assert "a cache wrapper, whose call results are cached" in problem
+    # Control: a signature refusal keeps its own text.
+    bare = _OUTER_HEAD + plain
+    (renamed,) = _screen("def f(b):\n    return 1\n", bare, tmp_path)
+    assert "breaks every call site" in renamed
+
+
 def test_signature_fields_name_every_signature_value() -> None:
     """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
     assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))
