@@ -144,7 +144,12 @@ def test_a_marker_from_before_the_live_schema_check_takes_the_slow_path() -> Non
     ms_input = unchecked + f"\nschema_check_rev={rev}"
     assert hashlib.sha256(ms_input.encode()).hexdigest() == sqlserver._schema_hash()
     # SQL Server alone wrote a revision before this one; Postgres's earlier marker is pg_before.
+    # Given the control above, an inequality against a hand-built marker cannot fail, so the marker
+    # one revision back is the one _schema_hash itself writes at that revision (BACKLOG #5062).
     previous = "\n".join(sqlserver._SCHEMA) + f"\nschema_check_rev={rev - 1}"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(server_schema_verify, "SCHEMA_CHECK_REV", rev - 1)
+        assert sqlserver._schema_hash() == hashlib.sha256(previous.encode()).hexdigest()
     assert hashlib.sha256(previous.encode()).hexdigest() != sqlserver._schema_hash()
 
 

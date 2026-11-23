@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.store.server_schema_verify import declared_schema
+from messagefoundry.store.server_schema_verify import (
+    ServerSchemaMismatchError,
+    declared_schema,
+    refuse_short_schema,
+)
 
 
 def test_add_column_takes_any_name_as_a_column() -> None:
@@ -491,15 +495,16 @@ def test_a_data_word_in_a_predicate_does_not_end_the_opaque_words(word: str) -> 
 
 
 def test_opaque_words_are_kept_per_table_on_sqlserver() -> None:
-    """A SQL Server index name is unique only within its table, so a plain ix on u must not hide
-    the partial ix on t."""
+    """A SQL Server index name is unique only within its table, so dropping ix on u must not forget
+    the partial ix on t. (A second ix on u now raises on its own: see
+    test_a_second_create_index_of_a_held_name_raises.)"""
     with pytest.raises(ValueError, match="drop column"):
         declared_schema(
             (
                 "CREATE TABLE t (a INT NULL, c INT NULL)",
                 "CREATE TABLE u (a INT NULL, c INT NULL)",
                 "CREATE INDEX ix ON t (a) WHERE c > 0",
-                "CREATE INDEX ix ON u (a)",
+                "DROP INDEX ix ON u",
                 "ALTER TABLE t DROP COLUMN c",
             ),
             "sqlserver",
@@ -518,3 +523,172 @@ def test_a_sqlserver_data_statement_ends_an_unterminated_predicate() -> None:
         "sqlserver",
     )
     assert "ix" in shape.named_indexes
+
+
+# --- BACKLOG #8302 items 3, 5 and 6, and the #5062 remainder built with them -------------------
+
+
+@pytest.mark.parametrize("second", ["CREATE INDEX ix ON u (a)", "CREATE INDEX ix ON t (c)"])
+def test_a_second_create_index_of_a_held_name_raises(second: str) -> None:
+    """The expected shape keys an index by name alone. A second ix on another SQL Server table
+    replaced the first, and one on the same table is skipped by its guard where the first ran."""
+    with pytest.raises(ValueError, match="second create index"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT NULL, c INT NULL)",
+                "CREATE TABLE u (a INT NULL)",
+                "CREATE INDEX ix ON t (a)",
+                second,
+            ),
+            "sqlserver",
+        )
+
+
+def test_an_index_dropped_first_may_be_created_again() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT NULL, c INT NULL)",
+            "CREATE INDEX ix ON t (a)",
+            "DROP INDEX ix ON t",
+            "CREATE INDEX ix ON t (c)",
+        ),
+        "sqlserver",
+    )
+    assert shape.named_indexes["ix"].columns == ("c",)
+
+
+def test_an_else_outside_a_case_ends_an_unterminated_predicate() -> None:
+    """On SQL Server an IF's ELSE starts another statement, whose words are not the index's, so
+    dropping a column only that statement names keeps the index rather than raising."""
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT NULL, c INT NULL, d INT NULL)",
+            "IF 1 = 1 CREATE INDEX ix ON t (a) WHERE c > 0 ELSE PRINT d",
+            "ALTER TABLE t DROP COLUMN d",
+        ),
+        "sqlserver",
+    )
+    assert "ix" in shape.named_indexes
+
+
+def test_an_else_and_end_inside_a_case_stay_in_the_predicate() -> None:
+    with pytest.raises(ValueError, match="drop column"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT, c INT, d INT)",
+                "CREATE INDEX ix ON t (a) WHERE CASE WHEN c > 0 THEN 1 ELSE d END = 1",
+                "ALTER TABLE t DROP COLUMN d",
+            ),
+            "postgres",
+        )
+
+
+def test_a_quote_inside_a_subscript_is_a_string() -> None:
+    """``m['...']`` is a PostgreSQL subscript, not a bracketed name, so the literal inside it is
+    blanked before the reader looks for the table's PRIMARY KEY, as the other scanners read it."""
+    shape = declared_schema(
+        ("CREATE TABLE t (m JSONB, b INT, CHECK (m['PRIMARY KEY (b)'] IS NULL))",), "postgres"
+    )
+    assert shape.column_shapes["t"]["b"].nullable is True
+
+
+def test_an_index_taking_a_table_name_does_not_hide_that_table() -> None:
+    """On SQL Server an index may share a table's name. A statistics object holding the index's
+    name once hid the table's own missing column, and named the table as never created."""
+    expected = declared_schema(
+        (
+            "CREATE TABLE foo (a INT NULL, b INT NULL)",
+            "CREATE TABLE bar (x INT NULL)",
+            "CREATE INDEX foo ON bar (x)",
+        ),
+        "sqlserver",
+    )
+    rows = [("foo", "table", "a", None), ("bar", "table", "x", None)]
+    with pytest.raises(ServerSchemaMismatchError) as caught:
+        refuse_short_schema("sqlserver", None, expected, rows, {}, {"foo": "statistics object"})
+    assert caught.value.differences == (
+        "index 'foo' was never built: the name is taken by a statistics object"
+        " (expected on bar(x))",
+        "table 'foo' is missing column 'b'",
+    )
+
+
+def test_an_alter_column_that_opens_its_statement_reaches_every_store() -> None:
+    shape = declared_schema(
+        ("CREATE TABLE t (a VARCHAR(64))", "ALTER TABLE t ALTER COLUMN a TYPE TEXT"), "postgres"
+    )
+    assert shape.column_shapes["t"]["a"].type == "text"
+    bin2 = "CREATE TABLE t (a NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL)"
+    plain = "ALTER TABLE t ALTER COLUMN a NVARCHAR(64) NOT NULL"
+    assert declared_schema((bin2, plain), "sqlserver").column_shapes["t"]["a"].collation is None
+
+
+def test_an_added_primary_key_follows_the_alter_column_rule() -> None:
+    """An added PRIMARY KEY is read as an ALTER COLUMN SET NOT NULL is: everywhere when it opens
+    its statement, and otherwise only on an older store, so a nullable CREATE TABLE raises."""
+    created = "CREATE TABLE t (a INT)"
+    unguarded = declared_schema((created, "ALTER TABLE t ADD PRIMARY KEY (a)"), "postgres")
+    assert unguarded.column_shapes["t"]["a"].nullable is False
+    for guarded in (
+        "DO $$ BEGIN ALTER TABLE t ADD PRIMARY KEY (a); END $$",
+        "DO $$ BEGIN ALTER TABLE t ALTER COLUMN a SET NOT NULL; END $$",
+    ):
+        with pytest.raises(ValueError, match="built two ways"):
+            declared_schema((created, guarded), "postgres")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "IF 1 = 0 PRINT 'ALTER TABLE t ADD b INT NULL'",
+        "DECLARE @s nvarchar(100) = N'ALTER TABLE t ADD b INT NULL'",
+        "SELECT 'CREATE INDEX ix ON t (a)'",
+    ],
+)
+def test_ddl_in_a_literal_no_exec_runs_raises(statement: str) -> None:
+    with pytest.raises(ValueError, match="no EXEC runs"):
+        declared_schema(("CREATE TABLE t (a INT NULL)", statement), "sqlserver")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "EXEC(N'ALTER TABLE t ADD b INT NULL')",
+        "DECLARE @s nvarchar(100) = N'ALTER TABLE t ADD b INT NULL'; EXEC(@s)",
+        "EXEC sp_executesql N'ALTER TABLE t ADD b INT NULL'",
+    ],
+)
+def test_ddl_in_a_literal_an_exec_runs_is_read(statement: str) -> None:
+    shape = declared_schema(("CREATE TABLE t (a INT NULL)", statement), "sqlserver")
+    assert shape.columns["t"] == frozenset({"a", "b"})
+
+
+def test_ddl_in_a_literal_joined_to_more_text_raises() -> None:
+    """The literal cut the clause short: ``DROP COLUMN b`` read alone left c expected."""
+    with pytest.raises(ValueError, match="joins to more text"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT NULL, b INT NULL, c INT NULL)",
+                "EXEC(N'ALTER TABLE t DROP COLUMN b' + N', COLUMN c')",
+            ),
+            "sqlserver",
+        )
+
+
+def test_a_drop_constraint_named_by_quotename_is_still_read() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (a INT NOT NULL)",
+            "DECLARE @drop nvarchar(400) = N'ALTER TABLE t DROP CONSTRAINT ' + QUOTENAME(@pk);"
+            " EXEC(@drop);",
+        ),
+        "sqlserver",
+    )
+    assert shape.columns["t"] == frozenset({"a"})
+
+
+def test_a_default_of_more_than_one_token_is_named_as_the_default() -> None:
+    with pytest.raises(ValueError, match="a default the live-schema check cannot read"):
+        declared_schema(
+            ("CREATE TABLE t (a TIMESTAMPTZ DEFAULT now() + interval '1 day')",), "postgres"
+        )

@@ -344,7 +344,10 @@ def test_the_compare_names_each_shortfall_and_tolerates_extras() -> None:
 def test_a_name_held_by_another_kind_of_object_says_so() -> None:
     expected = live_shape({"queue": {"seq"}, "messages": {"id"}}, {_FIFO: _FIFO_SHAPE})
     live = live_shape({"queue": {"seq"}}, {})
-    assert server_schema_differences(expected, live, {_FIFO: "table", "messages": "index"}) == [
+    taken_tables = {"messages": "index"}
+    assert server_schema_differences(
+        expected, live, {_FIFO: "table"}, taken_tables=taken_tables
+    ) == [
         f"index {_FIFO!r} was never built: the name is taken by a table"
         " (expected on queue(stage, channel_id, status, seq))",
         "table 'messages' was never created: the name is taken by an index",
@@ -1493,14 +1496,17 @@ def test_a_guarded_alter_column_that_a_new_store_never_runs_must_match_the_creat
         declared_schema((create, widen), "sqlserver")
     # SQL Server resets an altered column's collation unless the ALTER restates it.
     bin2 = "CREATE TABLE t (a NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL)"
-    plain = "ALTER TABLE t ALTER COLUMN a NVARCHAR(64) NOT NULL"
+    plain = "IF 1 = 1 ALTER TABLE t ALTER COLUMN a NVARCHAR(64) NOT NULL"
     with pytest.raises(ValueError, match="built two ways"):
         declared_schema((bin2, plain), "sqlserver")
     restated = "ALTER TABLE t ALTER COLUMN a NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL"
     assert declared_schema((bin2, restated), "sqlserver").column_shapes["t"]["a"].collation
     with pytest.raises(ValueError, match="built two ways"):
         declared_schema(
-            ("CREATE TABLE t (a VARCHAR(64))", "ALTER TABLE t ALTER COLUMN a TYPE TEXT"),
+            (
+                "CREATE TABLE t (a VARCHAR(64))",
+                "DO $$ BEGIN ALTER TABLE t ALTER COLUMN a TYPE TEXT; END $$",
+            ),
             "postgres",
         )
 
@@ -1651,8 +1657,8 @@ def test_a_nextval_default_reads_as_numbered_without_not_null() -> None:
     assert declared_column("postgres", "a BIGINT DEFAULT 0") == ColumnShape("bigint", True)
     created = declared_schema(("CREATE TABLE t (a BIGINT DEFAULT nextval('s'))",), "postgres")
     assert created.column_shapes["t"]["a"] == ColumnShape("bigint", True, True)
-    # An ALTER COLUMN reaches only an older store, so its result must match the CREATE: a nextval()
-    # default it sets or drops changes the numbering, and any other default does not.
+    # A guarded ALTER COLUMN reaches only an older store, so its result must match the CREATE: a
+    # nextval() default it sets or drops changes the numbering, and any other default does not.
     same = declared_schema(
         (
             "CREATE TABLE t (a BIGINT DEFAULT nextval('s'), b INT)",
@@ -1666,13 +1672,16 @@ def test_a_nextval_default_reads_as_numbered_without_not_null() -> None:
         declared_schema(
             (
                 "CREATE TABLE t (a BIGINT DEFAULT nextval('s'))",
-                "ALTER TABLE t ALTER COLUMN a DROP DEFAULT",
+                "DO $$ BEGIN ALTER TABLE t ALTER COLUMN a DROP DEFAULT; END $$",
             ),
             "postgres",
         )
     with pytest.raises(ValueError, match="built two ways"):
         declared_schema(
-            ("CREATE TABLE t (a BIGINT)", "ALTER TABLE t ALTER COLUMN a SET DEFAULT nextval('s')"),
+            (
+                "CREATE TABLE t (a BIGINT)",
+                "DO $$ BEGIN ALTER TABLE t ALTER COLUMN a SET DEFAULT nextval('s'); END $$",
+            ),
             "postgres",
         )
 
