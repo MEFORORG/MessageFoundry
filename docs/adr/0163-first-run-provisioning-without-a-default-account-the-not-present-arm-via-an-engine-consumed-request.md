@@ -276,8 +276,10 @@ see its *What it widens* and *Left open*.
   shares one security descriptor, so once the published store is restricted the staged link carries the
   same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** built where the
   write succeeds: for these callers `_secure_file` now writes one protected DACL whole, granting the
-  account the process runs as alone, so the explicit entries are removed too. Where it fails, or the token
-  cannot be read, it logs a WARNING and the file keeps the list it had.
+  account the process runs as, so explicit allows for other principals are removed too. It carries over
+  the file's explicit denies and an explicit OWNER RIGHTS allow that withholds WRITE_DAC, which the icacls
+  rewrite kept. Where the current list cannot be read or parsed, it runs the icacls rewrite instead.
+  Where the write fails, or the token cannot be read, it logs a WARNING and the file keeps the list it had.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 
@@ -313,7 +315,8 @@ replaces only the principals it names (measured while building this); that preda
 **AMENDED 2026-11-23:** this rewrite is unchanged for the store trio. At least the DR and restore
 staging callers and the config editors' fallback now get one protected DACL written whole by
 `_secure_file`, granting the account in the process token, so
-where that write succeeds no other principal's entry is left on those files.
+where that write succeeds no other principal's explicit allow is left on those files. Explicit denies,
+and an explicit OWNER RIGHTS allow that withholds WRITE_DAC, are carried over.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.
 

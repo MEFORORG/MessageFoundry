@@ -15,8 +15,10 @@ On Windows those modes do not restrict the file, so the candidate is given a pro
 granting the editing account, and the live file's owner when that is another account, before its
 first byte is written. An own-account replaced file is then given the editing account's list
 alone; a foreign-owned one gets the list the next paragraph describes. ``_restrict_to_editor``
-writes that one whole list. ``store._secure_file``, which can grant only the editing account, is
-the fallback when that write fails, and on Windows only for a file no other account owns. The
+writes that one whole list. When that write fails, ``store._secure_file``, which can grant only
+the editing account, is the fallback for a file no other account owns. On Windows, a file another
+account owns takes its kept icacls rewrite instead, which removes inherited entries and keeps the
+explicit ones, the owner's entry among them where the candidate's write took. The
 caller's ``validate`` runs against that candidate. Only a candidate that
 validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
@@ -444,10 +446,11 @@ def replace_validated(
     if sys.platform == "win32" and _restrict_to_editor(path, owner=live.windows_owner):
         return
     if sys.platform == "win32" and live.windows_owner is not None:
-        # store._secure_file writes a list granting the editing account alone, which would take the
-        # owning account's entry the candidate gave the file (vault BACKLOG #5619). The file keeps
-        # whatever list it has: the candidate's where that write took, else the staging directory's,
-        # which may not grant the owner. _restrict_to_editor has logged its failure.
+        # The bare store._secure_file writes a list granting the editing account alone, which would
+        # take the owning account's entry the candidate gave the file (vault BACKLOG #5619). The
+        # kept icacls rewrite removes inherited entries, such as the staging directory's, and keeps
+        # every explicit one, the owner's among them where the candidate's write took.
+        _secure_file(path, keep_explicit_entries=True)
         return
     _secure_file(path)
 
@@ -865,9 +868,10 @@ def _remove_private_dir(private: Path) -> None:
     shutil.rmtree(private, onexc=_report)
 
 
-def _secure_file(path: Path) -> None:
-    # Owner-only permissions (defence in depth). Reuse the store's primitive, imported here rather than
-    # at module top so the config layer does not pull the store package in at import time.
+def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
+    # The store's primitive (defence in depth; its docstring says what each mode grants), imported
+    # here rather than at module top so the config layer does not pull the store package in at
+    # import time.
     from messagefoundry.store.store import _secure_file as _secure
 
-    _secure(path)
+    _secure(path, keep_explicit_entries=keep_explicit_entries)

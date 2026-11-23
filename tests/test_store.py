@@ -81,18 +81,25 @@ _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="icacls DACL 
 _TOKEN_SID = "S-1-5-21-1000000001-1000000002-1000000003-1001"
 
 
+#: What the file's list reads as when a test does not say: one inherited entry, which a whole-list
+#: write drops, and nothing explicit to carry over.
+_INHERITED_ONLY_SDDL = "D:AI(A;ID;FA;;;SY)"
+
+
 def _capture_dacl_writes(
-    monkeypatch: pytest.MonkeyPatch, *, written: object = None
+    monkeypatch: pytest.MonkeyPatch, *, written: object = None, current: str = _INHERITED_ONLY_SDDL
 ) -> list[tuple[str, str, bool]]:
     """Capture the access-list writes _secure_file makes (none reach a file), with the process
     token reporting ``_TOKEN_SID`` and ``USERNAME`` naming someone else entirely. ``written`` is what
-    each write reports, a successful DACL write when ``None``. No process may be started."""
+    each write reports, a successful DACL write when ``None``; ``current`` is the list the file
+    reads as before the write. No process may be started."""
     import messagefoundry.store.store as store_mod
 
     captured: list[tuple[str, str, bool]] = []
     result = store_mod._SddlWrite(dacl_status=0) if written is None else written
 
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _TOKEN_SID)
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _path, owner=False: current)
     monkeypatch.setenv("USERNAME", "minter")
 
     def _write(path: object, sddl: str, *, protected: bool) -> object:
@@ -240,6 +247,94 @@ def test_secure_file_drops_another_principals_explicit_entry(tmp_path, others: s
     assert len(entries) > 1, f"fixture: {entries}"
     store_mod._secure_file(path)
     assert_owner_only(path, sid)
+
+
+@_windows_only
+def test_secure_file_keeps_explicit_denies_and_a_restrictive_owner_rights_entry(tmp_path) -> None:
+    # The whole-list write must not loosen what main's `icacls /grant:r` kept: an explicit deny,
+    # and an explicit OWNER RIGHTS entry that withholds WRITE_DAC from the owner. Everyone's grant,
+    # and the inherited-style entries, still go. RED before the carry-over: the list written whole
+    # held the token account alone, so the deny and OW:FR were dropped.
+    import messagefoundry.store.store as store_mod
+    from tests._win_acl import folder_granting, protected_entries
+
+    sid = store_mod._current_user_sid()
+    assert sid is not None
+    path = folder_granting(tmp_path / "store", sid) / "seeded.db"
+    path.write_bytes(b"x")
+    seeded = store_mod._set_security_from_sddl(
+        path, f"D:P(D;;FW;;;BG)(A;;FA;;;{sid})(A;;FR;;;OW)(A;;FR;;;WD)", protected=True
+    )
+    assert seeded.failure is None and seeded.dacl_status == 0, seeded
+    store_mod._secure_file(path)
+    sddl, _, entries = protected_entries(path)
+    assert entries == [
+        ("D", "", "FW", "S-1-5-32-546"),
+        ("A", "", "FA", sid),
+        ("A", "", "FR", "S-1-3-4"),
+    ], sddl
+
+
+@_windows_only
+def test_secure_file_carries_explicit_denies_first_and_drops_inherited_and_full_owner_rights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # What the one write carries over, read from the file's current list: explicit denies (first,
+    # in canonical order), and an explicit OWNER RIGHTS allow that withholds WRITE_DAC. Dropped:
+    # every other allow, every inherited entry, and an OWNER RIGHTS allow that grants WRITE_DAC,
+    # because without it the owner keeps only READ_CONTROL and WRITE_DAC, which is no wider.
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    current = (
+        "O:BAD:PAI(A;;FA;;;WD)(D;;FW;;;BG)(A;;FR;;;OW)(A;;0x1f01ff;;;OW)"
+        "(A;;WD;;;OW)(A;ID;FA;;;SY)(D;ID;FA;;;BU)"
+    )
+    captured = _capture_dacl_writes(monkeypatch, current=current)
+    store_mod._secure_file(Path("store.db"))
+    assert captured == [("store.db", f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})(A;;FR;;;OW)", True)]
+
+
+@_windows_only
+@pytest.mark.parametrize(
+    "current",
+    [pytest.param(None, id="unreadable"), pytest.param("D:NO_ACCESS_CONTROL", id="unparseable")],
+)
+def test_secure_file_takes_the_kept_icacls_rewrite_when_the_list_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, current: str | None
+) -> None:
+    # With no list to read, the whole-list write cannot tell what it would drop, so it takes main's
+    # icacls rewrite instead, which keeps every explicit entry. No whole list is written.
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    runs: list[list[str]] = []
+
+    class _R:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def _run(argv: list[str], **_kw: object) -> _R:
+        runs.append(argv)
+        return _R()
+
+    def _no_list_write(*_a: object, **_kw: object) -> None:
+        raise AssertionError("a whole list was written over a list that was not read")
+
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _TOKEN_SID)
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _path, owner=False: current)
+    monkeypatch.setattr(store_mod, "_set_security_from_sddl", _no_list_write)
+    monkeypatch.setattr(subprocess, "run", _run)
+    with caplog.at_level("WARNING"):
+        store_mod._secure_file(Path("store.db"))
+    assert [argv[1:] for argv in runs] == [
+        ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
+    ]
+    if current is not None:
+        assert "could not parse the access list of store.db" in caplog.text
 
 
 #: A per-service virtual account's shape (NT SERVICE\<name>); no service here holds it.

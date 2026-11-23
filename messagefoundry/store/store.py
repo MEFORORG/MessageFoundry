@@ -9147,11 +9147,15 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     starting (``docs/PHI.md``'s ops checklist covers directory-level ACLs as the backstop). On
     POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so it
     writes one protected DACL whole instead, granting full control to the account read from this
-    process's token. Written whole, the list replaces every entry the file carried, explicit ones
-    included (an explicit grant on a moved-in file, or the entries a temp directory hands a file).
-    The owner is not changed, and an owner keeps the access Windows gives it beyond the list, so a
-    file another account owns is left to this process's account, not to its owner. A skipped or
-    failed restriction is **logged** (STORE-2), and leaves the file's access list as it was.
+    process's token. Written whole, the list replaces the entries the file carried: inherited ones,
+    and explicit allows (an explicit grant on a moved-in file, or the entries a temp directory hands
+    a file). Two kinds of explicit entry are carried into it, because ``icacls /grant:r`` kept them
+    and dropping them would widen access: a deny, and an OWNER RIGHTS allow that withholds
+    WRITE_DAC (:func:`_entries_the_one_list_keeps`). When the current list cannot be read or
+    parsed, the kept icacls rewrite runs instead. The owner is not changed, and an owner keeps the
+    access Windows gives it beyond the list, so a file another account owns is left to this
+    process's account, not to its owner. A skipped or failed restriction is **logged** (STORE-2),
+    and leaves the file's access list as it was.
 
     ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
     and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
@@ -9180,9 +9184,22 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
             if keep_explicit_entries:
                 _icacls_grant_keeping_explicit_entries(path, sid)
                 return
+            current = _read_dacl_sddl(path)
+            kept = None if current is None else _entries_the_one_list_keeps(current)
+            if kept is None:
+                if current is not None:
+                    log.warning(
+                        "could not parse the access list of %s; restricting it with icacls, which "
+                        "keeps its explicit entries",
+                        path,
+                    )
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            denies, owner_rights = kept
             # One SetNamedSecurityInfoW call, as _write_trio_dacl makes: icacls cannot drop an
-            # unnamed principal's explicit entry while granting.
-            result = _set_security_from_sddl(path, f"D:P(A;;FA;;;{sid})", protected=True)
+            # unnamed principal's explicit entry while granting. Denies first, the canonical order.
+            sddl = "D:P" + "".join(denies) + f"(A;;FA;;;{sid})" + "".join(owner_rights)
+            result = _set_security_from_sddl(path, sddl, protected=True)
             if result.failure is not None or result.dacl_status != 0:
                 log.warning(
                     "could not restrict %s to this account: %s",
@@ -9193,6 +9210,56 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+#: An SDDL right that includes WRITE_DAC: file all, generic all, or WRITE_DAC itself.
+_SDDL_RIGHTS_WITH_WRITE_DAC = frozenset({"FA", "GA", "WD"})
+_WRITE_DAC = 0x40000
+_GENERIC_ALL = 0x10000000
+#: OWNER RIGHTS, as an SDDL alias and as a SID.
+_OWNER_RIGHTS = frozenset({"OW", "S-1-3-4"})
+
+
+def _grants_write_dac(rights: str) -> bool:
+    """Does the upper-cased SDDL ``rights`` field include WRITE_DAC? A field this cannot read
+    answers ``False``, so the entry is kept, as ``icacls /grant:r`` kept it."""
+    if rights.startswith("0X"):
+        try:
+            return bool(int(rights, 16) & (_WRITE_DAC | _GENERIC_ALL))
+        except ValueError:
+            return False
+    return any(rights[i : i + 2] in _SDDL_RIGHTS_WITH_WRITE_DAC for i in range(0, len(rights), 2))
+
+
+def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None:
+    """The explicit entries of ``sddl`` that :func:`_secure_file`'s one list carries over, as SDDL
+    ACE text: ``(denies, owner_rights)``. ``None`` when the list is not plainly parseable.
+
+    A deny is kept because dropping it widens access. An OWNER RIGHTS allow is kept when it
+    withholds WRITE_DAC, because without any OWNER RIGHTS entry the owner holds READ_CONTROL and
+    WRITE_DAC whatever the list says; one that grants WRITE_DAC is dropped, which leaves the owner
+    no more than that. Inherited entries are not kept. The ACE text is copied as written, so an
+    object deny keeps its GUIDs."""
+    dacl = _parse_sddl_dacl(sddl)
+    if dacl is None:
+        return None
+    body = sddl[sddl.find("D:") + 2 :]
+    end = body.find("S:")
+    if end >= 0:
+        body = body[:end]
+    texts = _SDDL_ACE.findall(body)
+    if len(texts) != len(dacl.aces):
+        return None
+    denies: list[str] = []
+    owner_rights: list[str] = []
+    for text, (kind, flags, rights, ace_sid) in zip(texts, dacl.aces, strict=True):
+        if "ID" in _sddl_flag_set(flags):
+            continue
+        if kind in _SDDL_DENY_TYPES:
+            denies.append(f"({text})")
+        elif kind == "A" and ace_sid in _OWNER_RIGHTS and not _grants_write_dac(rights):
+            owner_rights.append(f"({text})")
+    return denies, owner_rights
 
 
 def _icacls_grant_keeping_explicit_entries(path: Path, sid: str) -> None:
