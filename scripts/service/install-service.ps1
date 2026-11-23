@@ -78,6 +78,12 @@ param(
     # the service as MEFOR_SECRETS_DIRECTORY in its NSSM environment. Default: the directory the
     # service already names, else <DataDir>-secrets, beside the data directory.
     [string]$SecretsDir,
+    # The custody directory (vault BACKLOG #3411, ADR 0214's 2026-11-22 amendment), made only under
+    # [store].key_provider = 'host'. Created owned by Administrators, with the service account allowed
+    # to read it and add a file to it and nothing else, and named to the service as
+    # MEFOR_CUSTODY_DIRECTORY in its NSSM environment. Default: the directory the service already
+    # names, else <DataDir>-custody, beside the data directory.
+    [string]$CustodyDir,
     [string]$ListenHost = "127.0.0.1",
     [int]$Port = 8765,
     # Least-privilege service account (DEPLOY-1). Override the default run-as with a specific account -
@@ -951,7 +957,8 @@ function New-RestrictedDirectory {
       would hand this call their folder. The owner and the protection are read back to catch that.
       $OwnerSid is a parameter so the unelevated tests can make a folder they own.
     #>
-    param([Parameter(Mandatory)][string]$Path, [string]$OwnerSid = "S-1-5-32-544")
+    param([Parameter(Mandatory)][string]$Path, [string]$OwnerSid = "S-1-5-32-544",
+        [string]$What = "the secrets directory")
     $sec = New-Object System.Security.AccessControl.DirectorySecurity
     $sec.SetOwner([Security.Principal.SecurityIdentifier]$OwnerSid)
     $sec.SetAccessRuleProtection($true, $false)
@@ -972,14 +979,18 @@ function New-RestrictedDirectory {
     $acl = Get-Acl -LiteralPath $Path
     $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($owner -ne $OwnerSid -or -not $acl.AreAccessRulesProtected) {
+        # The custody directory may hold a store's only key, so its refusal never says remove.
+        $remedy = if ($What -eq "the custody directory") {
+            "Check who made it. A master.key or handoff.key in it may be a store's only key: do not " +
+                "delete it; follow docs/SERVICE.md 'Reinstalling over a kept custody directory'."
+        } else { "Remove it, check who made it, and re-run the installer." }
         throw ("'$Path' was there before this install made it (its owner is $owner), so it is not " +
-            "the restricted folder the install asked for. Remove it, check who made it, and re-run " +
-            "the installer.")
+            "the restricted folder the install asked for. $remedy")
     }
     # Read again after the create, as Set-SecretsDirAcl does: a folder above may have become a
     # junction since the preflight judged the path.
     $above = Get-ReparsePointAncestor -Path $Path
-    if ($above) { throw "'$Path' cannot be the secrets directory: $above." }
+    if ($above) { throw "'$Path' cannot be ${What}: $above." }
 }
 
 function Set-SecretsDirAcl {
@@ -1094,6 +1105,190 @@ function Get-SecretsDirHeldProblem {
         "old access list")
 }
 
+function Get-CustodyGrantProblem {
+    <#
+      Why the access list $Acl does not give the account $AccountSid exactly what the custody
+      directory grants it, or "" when it does (vault BACKLOG #3411, ADR 0214's 2026-11-22
+      amendment): read and add-file on the directory itself, inherited by nothing. At least a right
+      beyond those, an allow entry that files or folders inside inherit, a missing read or add-file,
+      and any deny entry that applies to the directory itself, whoever it names, are problems.
+
+      WHY ADD-FILE AND NOTHING MORE. The service's first start writes its own key file, master.key,
+      into this directory, so it must add a file there. It deletes the handoff through the handle it
+      read it with, which the handoff's own access list allows, so it needs no right to delete a file
+      in the directory, or to change the directory's list.
+    #>
+    param([Parameter(Mandatory)][System.Security.AccessControl.FileSystemSecurity]$Acl,
+        [Parameter(Mandatory)][string]$AccountSid)
+    $rights = [System.Security.AccessControl.FileSystemRights]
+    $read = $rights::ReadAndExecute
+    $add = $rights::CreateFiles
+    $allowed = [int64]($read -bor $add -bor $rights::Synchronize)
+    $held = [int64]0
+    foreach ($rule in @($Acl.Access)) {
+        $sid = try { $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+               catch { "$($rule.IdentityReference)" }
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            # A deny is read before an allow, and one for a group the account is in, such as
+            # Users, binds it as one for the account does. Which groups it is in is not read here,
+            # so any deny that applies to the directory itself is refused.
+            if (-not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) {
+                return "a deny entry for $($rule.IdentityReference) applies to the directory ($($rule.FileSystemRights))"
+            }
+            continue
+        }
+        if ($sid -ne $AccountSid) { continue }
+        if ($rule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None) {
+            return "an entry for it is inherited by what the directory holds ($($rule.FileSystemRights))"
+        }
+        $mask = [int64]$rule.FileSystemRights
+        if ($mask -band -bnot $allowed) {
+            return "it holds $($rule.FileSystemRights), more than read and add-file"
+        }
+        $held = $held -bor $mask
+    }
+    if (($held -band [int64]$read) -ne [int64]$read) { return "it cannot read the directory" }
+    if (($held -band [int64]$add) -ne [int64]$add) { return "it cannot add a file to the directory" }
+    return ""
+}
+
+function Get-CustodyDirProblem {
+    <#
+      Why $Path cannot be this install's custody directory, or "" when it can (vault BACKLOG #3411).
+      The secrets directory's rules, with $Holds and $NotWithin as the caller builds them. A
+      directory that already exists is accepted only when the service names it ($Named) and its
+      owner is one of $AcceptedOwners, Administrators or SYSTEM, as each install sets; any other
+      is refused, not adopted, as the secrets directory is, and the refusal never says to remove
+      it, since it may hold a store's only key. $AcceptedOwners is a parameter so the unelevated
+      tests can accept a folder they own.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ServiceName,
+        [switch]$Named, [string[]]$Holds = @(), [string[]]$NotWithin = @(),
+        [string[]]$AcceptedOwners = @("S-1-5-32-544", "S-1-5-18"))
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { return "it is a file" }
+    $problem = Get-LockPathProblem -Path $Path -Holds $Holds -NotWithin $NotWithin -OnlyFolders @() -AllowMissing
+    if (-not $problem) { $problem = Get-ReparsePointAncestor -Path $Path }
+    if ($problem) { return $problem }
+    # Another service's custody or secrets directory: the lockdown here would strip its grants.
+    $sharers = @(foreach ($name in @("MEFOR_CUSTODY_DIRECTORY", "MEFOR_SECRETS_DIRECTORY")) {
+            Get-OtherServiceNamingPath -ServiceName $ServiceName -Name $name -Path $Path })
+    if ($sharers) {
+        return ("the service(s) $(@($sharers | Select-Object -Unique) -join ', ') name it, a folder " +
+            "inside it, a folder around it, or a path this installer cannot compare with it, as their " +
+            "custody or secrets directory, and the lockdown here could reach theirs. Pass -CustodyDir " +
+            "with a folder for this service")
+    }
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    if (-not $Named) {
+        return ("it already exists and the service does not name it. It may hold master.key or " +
+            "handoff.key, which may be the only copy of a store's key on this host, so do not " +
+            "delete it or anything in it; follow docs/SERVICE.md 'Reinstalling over a kept " +
+            "custody directory'")
+    }
+    $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($AcceptedOwners -notcontains $owner) {
+        return ("the service names it, but its owner is now $owner, not the Administrators each " +
+            "install sets, so it may not be the folder the install made. Check who made it")
+    }
+    return ""
+}
+
+function Remove-CustodyDirMadeHere {
+    <#
+      Remove the custody directory $Path when this run made it ($MadeHere) and it still holds
+      nothing, so a re-run, which refuses a directory the service does not name, can make it
+      again (vault BACKLOG #3411). A directory this run did not make, or one that holds anything,
+      is never touched. Returns what it did, for the refusal that follows.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [switch]$MadeHere)
+    if (-not $MadeHere) { return "" }
+    $held = @(try { Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop } catch { "unread" })
+    if ($held.Count -ne 0) { return "" }
+    try { Remove-Item -LiteralPath $Path -ErrorAction Stop } catch { return "" }
+    return " This run made '$Path' and it held nothing, so it was removed."
+}
+
+function Set-CustodyDirAcl {
+    <#
+      Restrict the custody directory (vault BACKLOG #3411, ADR 0214's 2026-11-22 amendment):
+      Administrators as the owner, inheritance off, SYSTEM and Administrators full control inherited
+      by the files in it, and the service account read and add-file on the directory alone
+      (Get-CustodyGrantProblem says why no more). The engine applies the secrets directory's check
+      to it at start.
+
+      THE ACCOUNT'S GRANT IS REPLACED, unlike the secrets directory's: no route needs more, so a
+      rerun takes back any wider grant. Every entry for another account is removed. The owner goes
+      first, for the reason Set-SecretsDirAcl gives. Throws when the result is not that.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Account)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw ("The custody directory '$Path' is no longer a plain folder, so its access list was not " +
+            "changed. Check what is at that path, and re-run the installer.")
+    }
+    $above = Get-ReparsePointAncestor -Path $Path
+    if ($above) {
+        throw ("The custody directory '$Path' was not restricted: $above. Check what is at that path, " +
+            "and re-run the installer.")
+    }
+    $problems = @()
+    & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
+    if ($LASTEXITCODE -ne 0) { $problems += "Administrators could not be made its owner (icacls exit $LASTEXITCODE)" }
+    & icacls $Path /inheritance:r /grant:r "*S-1-5-18:(OI)F" "*S-1-5-32-544:(OI)F" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $problems += "inheritance could not be turned off with SYSTEM and Administrators granted (icacls exit $LASTEXITCODE)"
+    }
+    # A deny for the account, or for a group it is in, would outrank its grant, and /grant:r and
+    # /remove:g leave every deny in place, so each one goes. The read-back refuses any left.
+    $denied = @(try { (Get-Acl -LiteralPath $Path).Access } catch { @() }) | Where-Object {
+        $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny -and -not $_.IsInherited }
+    foreach ($holder in @($denied | ForEach-Object {
+                $who = $_.IdentityReference
+                try { $who.Translate([Security.Principal.SecurityIdentifier]).Value } catch { "$who" }
+            } | Select-Object -Unique)) {
+        $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
+        & icacls $Path /remove:d $spelled | Out-Null
+    }
+    # /grant:r replaces only an entry with the same inheritance flags, so every allow entry for the
+    # account goes first, and a wider one cannot survive beside the grant.
+    & icacls $Path /remove:g $Account | Out-Null
+    # No inheritance flag: the grant is on the directory, and the key files carry their own lists.
+    & icacls $Path /grant:r "${Account}:(RX,WD)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $problems += "'$Account' could not be granted read and add-file (icacls exit $LASTEXITCODE)"
+    }
+    $broad = Get-WellKnownBroadSids
+    & icacls $Path /remove:g @broad | Out-Null
+    foreach ($holder in @(Get-BroadAclResidue -Path $Path -Account $Account)) {
+        $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
+        & icacls $Path /remove:g $spelled | Out-Null
+    }
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -ne "S-1-5-32-544" -and $owner -ne "S-1-5-18") { $problems += "its owner is still $owner" }
+        if (-not $acl.AreAccessRulesProtected) { $problems += "it still inherits entries from the folder above" }
+        $residue = @(Get-BroadAclResidue -Path $Path -Account $Account -Acl $acl)
+        if ($residue) { $problems += "it still grants access to: $($residue -join ', ')" }
+        $accountSid = $null
+        try { $accountSid = ([Security.Principal.NTAccount]$Account).Translate([Security.Principal.SecurityIdentifier]).Value }
+        catch [System.Security.Principal.IdentityNotMappedException] {
+            $problems += "'$Account' does not resolve to an account, so its grant could not be checked"
+        }
+        if ($accountSid) {
+            $grant = Get-CustodyGrantProblem -Acl $acl -AccountSid $accountSid
+            if ($grant) { $problems += "'$Account': $grant" }
+        }
+    } catch {
+        $problems += "its access list could not be read back ($($_.Exception.Message))"
+    }
+    if ($problems) {
+        throw ("The custody directory '$Path' is not restricted as the host key provider needs: " +
+            "$($problems -join '; '). The service's first start writes its store key file there. " +
+            "Check the directory's access list.")
+    }
+}
+
 function Get-MergedEnvironmentList {
     <#
       $Existing, an NSSM environment list of NAME=value entries, with every entry for $Name replaced
@@ -1134,6 +1329,89 @@ function Get-RegisteredEnvironmentValue {
         -ErrorAction SilentlyContinue
     if (-not $key) { return $null }
     return Get-EnvironmentListValue -List $key.GetValue('AppEnvironmentExtra', $null) -Name $Name
+}
+
+function Get-SettingsKeyProvider {
+    <#
+      The [store].key_provider the settings file $Path names, or $null when this reader finds none
+      (vault BACKLOG #3411, key custody S3 slice B3c).
+
+      READ AS TEXT. Running the install's interpreter would run its code from this elevated prompt,
+      which the interpreter check below declines to do. So this reads at least a key_provider line in
+      a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table
+      with no table nested before the key, each holding a one-line string with no escape. Lines
+      inside a multi-line array or string are skipped. Names compare case-sensitively, as TOML's
+      do. Other forms can misread either way: at least a header it does not recognize (a tab, or a
+      quoted key with a space or punctuation) leaves the lines after it credited to the table
+      before it, and a triple quote in a comment or a one-line string, or a multi-line string
+      holding the other delimiter, can make it misread every line after it. What the installer does
+      with the answer is an early refusal: the engine applies its own key custody refusals at start
+      whatever this returns.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $value = '(?:"(?<v>[^"\\]*)"|''(?<v>[^'']*)'')'
+    $key = '(?:key_provider|"key_provider"|''key_provider'')'
+    $store = '(?:store|"store"|''store'')'
+    $tail = '\s*(?:#.*)?$'
+    $table = ""
+    $found = $null
+    $inString = $false
+    $arrayDepth = 0
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        $line = $line.TrimStart([char]0xFEFF)
+        # A line inside a multi-line string is never a header or a key; an odd count of
+        # triple quotes opens or closes one.
+        $wasInString = $inString
+        if (([regex]::Matches($line, '"""|''''''').Count % 2) -eq 1) { $inString = -not $inString }
+        if ($wasInString -or $inString) { continue }
+        # A line inside a multi-line array is an element, never a header or a key, even one shaped
+        # like a header such as ["store"] or [1]. The depth counts the brackets left open, outside
+        # strings and comments, by the lines before this one.
+        $inArray = $arrayDepth -gt 0
+        $code = ($line -creplace '"(?:[^"\\]|\\.)*"|''[^'']*''', '""') -creplace '#.*$', ''
+        $arrayDepth = [Math]::Max(0, $arrayDepth + ([regex]::Matches($code, '\[').Count -
+            [regex]::Matches($code, '\]').Count))
+        if ($inArray) { continue }
+        if ($line -cmatch '^\s*\[\[') { $table = "[[]]"; $arrayDepth = 0; continue }
+        # A header names a table by bare or quoted keys.
+        if ($line -cmatch ('^\s*\[(?<t>[A-Za-z0-9_.\-"'' ]+)\]' + $tail)) {
+            $table = $Matches.t -creplace '[\s"'']', ''
+            $arrayDepth = 0
+            continue
+        }
+        # A [store] line; a top-level dotted key; a top-level one-line inline table.
+        if (($table -ceq "store" -and $line -cmatch ('^\s*' + $key + '\s*=\s*' + $value + $tail)) -or
+            ($table -ceq "" -and $line -cmatch ('^\s*' + $store + '\s*(?:\.\s*' + $key + '\s*=\s*' +
+                $value + $tail + '|=\s*\{(?:(?:[^{}"''#]|"[^"\\]*"|''[^'']*'')*[,\s])?' + $key + '\s*=\s*' + $value + ')'))) {
+            $found = $Matches.v
+        }
+    }
+    return $found
+}
+
+function Get-HostCustodyAccountProblem {
+    <#
+      Why the service cannot run as the account this install would give it under
+      [store].key_provider = 'host', or "" when this check finds no reason (vault BACKLOG #3411, key
+      custody S3 slice B3c; Manager decision d20261105T144832834-1567f8). The host provider refuses
+      at least SYSTEM, LOCAL SERVICE and NETWORK SERVICE as the engine account, so a service that runs
+      as one of them refuses to start. This names them before anything acts. An explicit
+      -ServiceAccount wins over -AllowLocalSystem, as it does when the account is set.
+    #>
+    param([string]$ServiceAccount, [switch]$AllowLocalSystem)
+    if (-not $ServiceAccount) {
+        if ($AllowLocalSystem) { return "-AllowLocalSystem would run the service as LocalSystem" }
+        return ""
+    }
+    $shared = '^(\.\\)?LocalSystem$|^(NT AUTHORITY\\)?(SYSTEM|LocalService|NetworkService|LOCAL SERVICE|NETWORK SERVICE)$|^\*?S-1-5-(18|19|20)$'
+    # By SID too, so a spelling the pattern misses still counts once the name resolves.
+    $sid = try {
+        ([Security.Principal.NTAccount]$ServiceAccount.Trim()).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch { "" }
+    if ($ServiceAccount.Trim() -match $shared -or $sid -match '^S-1-5-(18|19|20)$') {
+        return "-ServiceAccount '$ServiceAccount' is SYSTEM, LOCAL SERVICE or NETWORK SERVICE"
+    }
+    return ""
 }
 
 function Set-ServiceEnvironmentValue {
@@ -2710,13 +2988,17 @@ $secretsProblem = if (Test-Path -LiteralPath $SecretsDir -PathType Leaf) { "it i
     else { Get-LockPathProblem -Path $SecretsDir -Holds $SecretsHolds -NotWithin $SecretsNotWithin -OnlyFolders @() -AllowMissing }
 if (-not $secretsProblem) { $secretsProblem = Get-ReparsePointAncestor -Path $SecretsDir }
 if (-not $secretsProblem) {
-    $SecretsDirSharers = @(Get-OtherServiceNamingPath -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY" -Path $SecretsDir)
+    # Another service's custody directory too (vault BACKLOG #3411): this lockdown would strip the
+    # add-file grant its first start needs.
+    $SecretsDirSharers = @(foreach ($named in @("MEFOR_SECRETS_DIRECTORY", "MEFOR_CUSTODY_DIRECTORY")) {
+            Get-OtherServiceNamingPath -ServiceName $ServiceName -Name $named -Path $SecretsDir }) |
+        Select-Object -Unique
     if ($SecretsDirSharers) {
-        $secretsProblem = ("the service(s) $($SecretsDirSharers -join ', ') name it, a folder inside " +
+        $secretsProblem = ("the service(s) $(@($SecretsDirSharers) -join ', ') name it, a folder inside " +
             "it, a folder around it, or a path this installer cannot compare with it, as their secrets " +
-            "directory, and the lockdown here could reach theirs. Pass -SecretsDir with a folder for " +
+            "or custody directory, and the lockdown here could reach theirs. Pass -SecretsDir with a folder for " +
             "this service. A path this installer cannot compare is refused whatever -SecretsDir names, " +
-            "so correct that service's MEFOR_SECRETS_DIRECTORY instead")
+            "so correct that service's MEFOR_SECRETS_DIRECTORY or MEFOR_CUSTODY_DIRECTORY instead")
     }
 }
 # Does the service already name this directory? Then it is a rerun's own directory, and its files
@@ -2772,6 +3054,84 @@ if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Le
     throw "Service settings file not found at: $ServiceConfig"
 }
 
+# --- key custody: [store].key_provider = 'host' (vault BACKLOG #3411, S3 slice B3c) --------------------
+# On a rerun, a MEFOR_STORE_KEY_PROVIDER in the service's NSSM environment (AppEnvironmentExtra)
+# wins over the settings file, as an environment variable does at start. No other environment is
+# read here, the machine's included. Refused before anything acts. Get-SettingsKeyProvider says
+# what it reads, and why the engine's own refusal at start does not rest on it.
+$RegisteredKeyProvider = Get-RegisteredEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_STORE_KEY_PROVIDER"
+$HostCustody = if ($null -ne $RegisteredKeyProvider) { $RegisteredKeyProvider -ceq "host" }
+               else { (Get-SettingsKeyProvider -Path $ServiceConfig) -ceq "host" }
+if ($HostCustody) {
+    $custodyAccountProblem = Get-HostCustodyAccountProblem -ServiceAccount $ServiceAccount -AllowLocalSystem:$AllowLocalSystem
+    if ($custodyAccountProblem) {
+        $namedBy = if ($null -ne $RegisteredKeyProvider) {
+            "the service's own environment sets MEFOR_STORE_KEY_PROVIDER=host"
+        } else { "the settings file '$ServiceConfig' names [store].key_provider = 'host'" }
+        $remedy = if ($ServiceAccount) { "Pass a -ServiceAccount of the service's own, or leave it and -AllowLocalSystem out" }
+                  else { "Leave out -AllowLocalSystem" }
+        throw ("$custodyAccountProblem, and $namedBy, a key provider whose custody refuses that " +
+            "account, so the service would not start. $remedy to run as the virtual account " +
+            "'NT SERVICE\$ServiceName' (docs/SERVICE.md 'Run as a least-privilege account').")
+    }
+}
+
+# --- the custody directory (vault BACKLOG #3411, ADR 0214's 2026-11-22 amendment) --------------------
+# Under the host provider the service's first start writes its own key file, master.key, beside the
+# handoff provision-admin leaves, so it must add a file where those two live. The secrets directory
+# is administrator-written (ADR 0214), so they get a directory of their own, named to the service as
+# MEFOR_CUSTODY_DIRECTORY, which the engine reads in place of MEFOR_SECRETS_DIRECTORY for them.
+# Judged here, before anything acts, by the secrets directory's rules, and made before the service
+# is registered; restricted (Set-CustodyDirAcl) once the account resolves.
+$CustodyDirNamed = $false
+$CustodyDirMadeHere = $false
+if (-not $HostCustody) {
+    if ($CustodyDir) {
+        throw ("-CustodyDir is used only under [store].key_provider = 'host', which this install " +
+            "did not read from the service's environment or the settings file '$ServiceConfig'. " +
+            "Leave -CustodyDir out, or set that provider first.")
+    }
+} else {
+    $RegisteredCustodyDir = Get-RegisteredEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_CUSTODY_DIRECTORY"
+    if ($RegisteredCustodyDir) { $RegisteredCustodyDir = ConvertTo-EngineStripped $RegisteredCustodyDir }
+    if ($RegisteredCustodyDir -and ($RegisteredCustodyDir -match '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])')) {
+        $normal = ConvertTo-NormalPath $RegisteredCustodyDir
+        if (-not $normal) {
+            throw ("The service's MEFOR_CUSTODY_DIRECTORY, '$RegisteredCustodyDir', is not a usable path. " +
+                "Pass -CustodyDir with the directory to use.")
+        }
+        $RegisteredCustodyDir = $normal
+    }
+    if ($CustodyDir) {
+        $normal = ConvertTo-NormalPath (Resolve-AbsolutePath $CustodyDir)
+        if (-not $normal) { throw "-CustodyDir '$CustodyDir' is not a usable path." }
+        $CustodyDir = $normal
+    }
+    elseif ($RegisteredCustodyDir) {
+        if ($RegisteredCustodyDir -notmatch '^([A-Za-z]:\\|\\\\[^\\])') {
+            throw ("The service's MEFOR_CUSTODY_DIRECTORY, '$RegisteredCustodyDir', is not an absolute " +
+                "path, and the engine refuses it. Pass -CustodyDir with the directory to use.")
+        }
+        $CustodyDir = $RegisteredCustodyDir
+    } else {
+        $DataParent = Split-Path -Parent $DataDir
+        if (-not $DataParent) {
+            throw "-DataDir '$DataDir' is a volume root, so the custody directory has no default. Pass -CustodyDir."
+        }
+        $CustodyDir = Join-Path $DataParent "$(Split-Path -Leaf $DataDir)-custody"
+    }
+    Assert-NoNssmExpansion $CustodyDir
+    # The secrets directory's rules, with that directory added to what it must not be, hold or sit in.
+    $CustodyDirNamed = [bool]$RegisteredCustodyDir -and ($RegisteredCustodyDir.TrimEnd('\') -eq $CustodyDir.TrimEnd('\'))
+    $custodyProblem = Get-CustodyDirProblem -Path $CustodyDir -ServiceName $ServiceName `
+        -Named:$CustodyDirNamed -Holds (@($SecretsHolds) + $SecretsDir) `
+        -NotWithin (@($SecretsNotWithin) + $SecretsDir)
+    if ($custodyProblem) {
+        throw ("'$CustodyDir' cannot be the custody directory: $custodyProblem. Pass -CustodyDir " +
+            "naming a new folder of this service's own, one that does not exist yet.")
+    }
+}
+
 # An install that builds its root (vault BACKLOG #2626) resolves NSSM first. Resolve-Nssm's
 # refusals, at least a -NssmPath off the pin, an -NssmDir others can write and a failed download,
 # need no engine root, and one after the build would leave a built root that -EngineWheel then
@@ -2820,6 +3180,24 @@ if (-not $SecretsDirNamed -or -not (Test-Path -LiteralPath $SecretsDir)) {
     New-RestrictedDirectory -Path $SecretsDir
     $heldProblem = Get-SecretsDirHeldProblem -Path $SecretsDir
     if ($heldProblem) { throw "-SecretsDir '$SecretsDir' cannot be the secrets directory: $heldProblem." }
+}
+# The custody directory the same way (vault BACKLOG #3411): made restricted in one step, and then
+# empty, since a key file in it that this install did not see made would be read as the store's.
+if ($HostCustody) {
+    $CustodyParent = Split-Path -Parent $CustodyDir
+    if (-not (Test-Path -LiteralPath $CustodyParent)) { New-AdminOnlyFolder -Path $CustodyParent }
+    if (-not $CustodyDirNamed -or -not (Test-Path -LiteralPath $CustodyDir)) {
+        New-RestrictedDirectory -Path $CustodyDir -What "the custody directory"
+        $CustodyDirMadeHere = $true
+        $custodyHeld = @(Get-ChildItem -LiteralPath $CustodyDir -Force -ErrorAction Stop)
+        if ($custodyHeld.Count -ne 0) {
+            throw ("-CustodyDir '$CustodyDir' cannot be the custody directory: it holds " +
+                "$($custodyHeld.Count) item(s) the installer did not put there, such as " +
+                "'$($custodyHeld[0].Name)'. Check who wrote them. A master.key or handoff.key there " +
+                "may be a store's only key: do not delete it; follow docs/SERVICE.md 'Reinstalling " +
+                "over a kept custody directory'.")
+        }
+    }
 }
 # NB the data-dir + config-dir ACL lockdown is applied LATER, AFTER the service is registered and its
 # ObjectName (run-as account) is set - see "ACLs" below. The default run-as is now a per-service VIRTUAL
@@ -3222,6 +3600,42 @@ try {
     Write-Warning ("Could not name the secrets directory in the service's environment " +
         "($($_.Exception.Message)). Add MEFOR_SECRETS_DIRECTORY=$SecretsDir to its AppEnvironmentExtra " +
         "by hand, keeping the entries already there.")
+}
+# The custody directory (vault BACKLOG #3411, ADR 0214's 2026-11-22 amendment): the service's own
+# grant there is read and add-file, so its first start can write master.key. A directory left
+# otherwise is a refusal, and the service is disabled first, as above.
+if ($HostCustody) {
+    # Each refusal below removes the directory only when this run made it and it holds nothing
+    # (Remove-CustodyDirMadeHere), so the re-run it asks for can make it again; any other
+    # directory is left, and a re-run over a service that names it accepts it.
+    try { Set-CustodyDirAcl -Path $CustodyDir -Account $ServiceAccount }
+    catch {
+        $removed = Remove-CustodyDirMadeHere -Path $CustodyDir -MadeHere:$CustodyDirMadeHere
+        throw ("$($_.Exception.Message)$removed Re-run the installer. " +
+            "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'its first start cannot write its store key file as the custody directory needs')")
+    }
+    # A refusal, not a warning: without the variable the service reads the secrets directory, where
+    # it cannot write its key file, and a mint made as SERVICE.md says lands where it does not look.
+    $custodyNamingError = $null
+    $replacedCustodyDir = $null
+    try {
+        $replacedCustodyDir = Set-ServiceEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_CUSTODY_DIRECTORY" -Value $CustodyDir
+    } catch { $custodyNamingError = $_.Exception.Message }
+    if ($null -ne $custodyNamingError) {
+        $removed = Remove-CustodyDirMadeHere -Path $CustodyDir -MadeHere:$CustodyDirMadeHere
+        throw ("Could not name the custody directory in the service's environment " +
+            "($custodyNamingError), and without MEFOR_CUSTODY_DIRECTORY the service looks for its " +
+            "key file in the secrets directory, where it cannot write one.$removed " +
+            "Re-run the installer. " +
+            "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it would not find its custody directory')")
+    }
+    if ($replacedCustodyDir -and -not $CustodyDirNamed) {
+        Write-Warning ("The service's MEFOR_CUSTODY_DIRECTORY named '$replacedCustodyDir' and now " +
+            "names '$CustodyDir', as -CustodyDir asked. The engine reads no key file from the old " +
+            "directory. If master.key or handoff.key is there, do not delete it; follow " +
+            "docs/SERVICE.md 'Reinstalling over a kept custody directory'.")
+    }
+    Write-Host "  Custody: '$CustodyDir', named to the service as MEFOR_CUSTODY_DIRECTORY (docs/SERVICE.md)."
 }
 # The lockdown above removes Users and Authenticated Users, so a named account writes the data
 # directory through its own grant. That grant is read back on the two directories the service must

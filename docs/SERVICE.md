@@ -170,6 +170,7 @@ Defaults:
 | Message store | `<DataDir>\messagefoundry.db` |
 | Logs | `<DataDir>\logs\service.out.log`, `service.err.log` |
 | Secrets directory (`-SecretsDir`) | the one the service already names, else `<DataDir>-secrets`; named to the service as `MEFOR_SECRETS_DIRECTORY` |
+| Custody directory (`-CustodyDir`), under `[store].key_provider = 'host'` only | the one the service already names, else `<DataDir>-custody`; named to the service as `MEFOR_CUSTODY_DIRECTORY` ([The custody directory](#the-custody-directory-under-the-host-key-provider)) |
 | Bind | `127.0.0.1:8765` |
 | Log level | `INFO` |
 
@@ -243,6 +244,67 @@ Administrator from an elevated shell on the host:
 
 ```powershell
 messagefoundry provision-admin --username <name> --email <address> --db C:\ProgramData\MessageFoundry\messagefoundry.db
+```
+
+Under `[store].key_provider = 'host'` (vault BACKLOG #3411) the service cannot run as SYSTEM,
+LOCAL SERVICE or NETWORK SERVICE: that provider refuses them as the engine account. When the
+install script reads that setting, from the settings file as its `Get-SettingsKeyProvider`
+describes, or from `MEFOR_STORE_KEY_PROVIDER` in the service's own
+environment, it refuses such an account before it changes anything: `-AllowLocalSystem` with no
+`-ServiceAccount`, and at least the usual spellings of those accounts as `-ServiceAccount`. Under
+`[security].enforcement = 'enforce'` the provider also refuses an account that is not local to
+this host, such as a domain user or a gMSA, and the script does not check for that.
+
+The steps above do not yet cover that provider. It refuses a store key set beside it, so step 1's
+key makes `provision-admin` refuse; and it mints the store key, which `--service-account` mints for
+the service's account rather than yours (vault BACKLOG #3411).
+
+#### The custody directory under the host key provider
+
+The host key provider keeps two files, `handoff.key`, which `provision-admin --service-account`
+writes, and `master.key`, which the service's first start writes from it and then reads at every
+start. The service must be able to add a file where they live, and the secrets directory gives it
+read only, since administrators write that directory (ADR 0214). So when the install script reads
+`[store].key_provider = 'host'` it also makes a **custody directory** of its own for those two
+files, `-CustodyDir`, else the one the service already names, else `<DataDir>-custody`, and names
+it to the service as `MEFOR_CUSTODY_DIRECTORY`. It is judged before anything acts by the secrets
+directory's rules, made restricted in one step, and then given this list:
+
+- owner: Administrators, with inheritance off;
+- SYSTEM and Administrators: full control, inherited by the files in it;
+- the service account: read and add-file on the directory itself, inherited by nothing.
+
+The script replaces any other grant the service account holds there, and removes every other
+account's allow entry and every deny entry, whoever it names. It then reads the list back, and
+refuses, disabling the service, at least when it has another owner, still inherits, still has an
+allow entry for another account or a deny entry on the directory, or gives the service account
+more or less than that grant. When the script does not read that provider, it refuses
+`-CustodyDir`.
+
+**The engine.** When `MEFOR_CUSTODY_DIRECTORY` is set, the host provider reads and writes the two
+files there, in place of the directory `MEFOR_SECRETS_DIRECTORY` names or the store's own data
+directory. Before it reads or mints, it checks that directory as it checks a secrets directory, at
+any enforcement setting: a known broad group's right to read it, add a file to it or delete one in
+it is refused, and so is a link. That check reads known broad groups only, so it refuses no entry
+for one account, the service's or any other; the list the script sets is what leaves other
+accounts no entry. While the variable is set and neither file is there, a key file in the secrets
+directory or beside a SQLite store refuses a read and a mint, rather than being taken for no key at
+all, so a mint run without the variable does not lead to a second key.
+
+**Reinstalling over a kept custody directory.** The install script refuses an existing custody
+directory the service does not name, as after an uninstall, and it never removes one that holds
+anything: `master.key` or `handoff.key` there may be the only copy of a store's key on this host,
+so do not delete either. To go on, re-run the install script with `-CustodyDir` naming a new
+folder. Then, with the service stopped, move each key file from the kept directory into the new
+one as an administrator, on the same volume so it keeps its own access list, and start the
+service. The same move applies to a key file left in a custody directory the service named before
+a `-CustodyDir` change.
+
+**Minting.** Set the variable in the elevated shell that runs `provision-admin --service-account`,
+to the same path, so the handoff lands where the service looks:
+
+```powershell
+$env:MEFOR_CUSTODY_DIRECTORY = 'C:\ProgramData\MessageFoundry-custody'
 ```
 
 If the service started first, at the shipped posture it refuses to start. Once the earlier start
@@ -709,7 +771,7 @@ NSSM environment.
   file or a folder holding a folder, that sits below a junction, or that is, holds or sits inside
   at least the data, log, store, config, value-file and settings-file folders, NSSM's folder, the
   engine install, the checkout, the Windows folder and Program Files. It refuses a path another
-  service already names as its `MEFOR_SECRETS_DIRECTORY`, or a folder inside or around one, so a second service on the same
+  service already names as its `MEFOR_SECRETS_DIRECTORY` or `MEFOR_CUSTODY_DIRECTORY`, or a folder inside or around one, so a second service on the same
   `-DataDir` needs its own `-SecretsDir`. The installer makes the directory with its owner and
   access list in one step. The directory starts empty: as an administrator, create or copy in one
   file per setting, named as its variable, and restart the service. Do not move a file in: a
@@ -1268,6 +1330,7 @@ list below says what it covers.
 | The `DataDir` tree — logs and message store | Your data | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
 | The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself only when no other service installed with the same `-NssmDir` remains and you are not reinstalling |
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
+| Under `[store].key_provider = 'host'`, the custody directory `MEFOR_CUSTODY_DIRECTORY` names, with `master.key` (and `handoff.key` before the first start), and the run-as account's read and add-file entry on it | The files hold the store's key, maybe its only copy on this host. Each file carries its own access-control entry for the account, and `-RemoveAccountAces` takes the account's entry off the directory only, not off the files. A reinstall refuses the kept directory while the new service does not name it | Keep the directory and its files while the store is kept; never delete them. `-RemoveAccountAces` removes the directory's entry. To reinstall, see [Reinstalling over a kept custody directory](#the-custody-directory-under-the-host-key-provider) |
 | The `SeServiceLogonRight` ("Log on as a service") grant | Setting the service's run-as account does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
 | Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |
