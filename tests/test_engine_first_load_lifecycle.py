@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -13,34 +12,10 @@ import pytest
 
 from messagefoundry.config.settings import EgressSettings, SecretRotationSettings
 from messagefoundry.config.wiring import load_config
-from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, TeardownReason
-
-
-def _graph(cfgdir: Path, tmp_path: Path) -> None:
-    cfgdir.mkdir()
-    inbox = tmp_path / f"in-{cfgdir.name}"
-    inbox.mkdir()
-    (cfgdir / "c.py").write_text(
-        textwrap.dedent(
-            f"""
-            from messagefoundry import inbound, outbound, router, handler, Send, File
-            inbound("in", File(directory={str(inbox)!r}, pattern="*.hl7", poll_seconds=0.05),
-                    router="r")
-            outbound("out", File(directory={str(tmp_path / "out")!r}, filename="x.hl7"))
-
-            @router("r")
-            def route(msg):
-                return ["h"]
-
-            @handler("h")
-            def handle(msg):
-                return Send("out", msg)
-            """
-        ),
-        encoding="utf-8",
-    )
+from tests.test_cluster_graph_gating import _FlipCoordinator
+from tests.test_cluster_graph_gating import _minimal_graph as _graph
 
 
 async def _engine(tmp_path: Path, **kwargs: Any) -> Engine:
@@ -172,20 +147,6 @@ async def test_a_cancelled_first_load_keeps_a_runner_it_could_not_unwind(
     finally:
         await eng.stop()
     assert runner is not None and not runner._destinations
-
-
-class _FlipCoordinator(NullCoordinator):
-    """Clustered, with leadership a test sets (BACKLOG #5743)."""
-
-    def __init__(self, *, leader: bool) -> None:
-        super().__init__(node_id="flip")
-        self.leader = leader
-
-    def is_leader(self) -> bool:
-        return self.leader
-
-    def is_clustered(self) -> bool:
-        return True
 
 
 def _record_starts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:

@@ -942,9 +942,6 @@ class Engine:
         # Set as stop() begins. A first load reads it under _first_load_lock once its build check
         # returns, so a stop that found no runner to stop is not followed by one starting.
         self._stopping = False
-        # What a clustered first load's CA check refused, for the one start it may make (BACKLOG
-        # #5743). Cleared when that load's reconcile returns, so a later promotion checks afresh.
-        self._first_start_refused: dict[str, Exception] | None = None
         self._graph_reconcile_interval = 1.0
         # The config writes started and not finished: today the connection flag's store write
         # (BACKLOG #2623), the one write this engine tracks. A caller that is cancelled stops
@@ -1714,11 +1711,7 @@ class Engine:
                 # the start goes through the reconcile. The supervisor comes after it: spawned
                 # first, it would swallow a leader's start failure and this reload would report
                 # success with no graph.
-                self._first_start_refused = refused
-                try:
-                    await self._reconcile_graph()
-                finally:
-                    self._first_start_refused = None
+                await self._reconcile_graph(fhir_lookup_refused=refused)
                 if self._stopping and not runner.running:
                     raise RuntimeError(
                         "the engine is stopping, so the first load started no runner"
@@ -2757,12 +2750,16 @@ class Engine:
             return
         check_reference_backend_supported(self._registry_runner.registry, self.store)
 
-    async def _start_graph(self) -> None:
+    async def _start_graph(
+        self, *, fhir_lookup_refused: dict[str, Exception] | None = None
+    ) -> None:
         """Bring the wired graph up: (A4) recover the prior leader's stranded in-flight rows + lane
         leases on promotion, (A3) dead-letter rows whose outbound/handler left the config, materialize
         reference sets, then start the listeners + workers. In a cluster this runs ONLY on the leader and
         is (re)invoked on each leadership acquire; single-node runs it once at startup. Idempotent
-        against the runner's own ``running`` guard."""
+        against the runner's own ``running`` guard. ``fhir_lookup_refused`` is a clustered first
+        load's CA result, from the build check it just ran (BACKLOG #5743); no other caller has one,
+        so a promotion checks afresh."""
         if self._registry_runner is None:
             return
         # H1 FENCING TOKEN. Push THIS node's held leader epoch (+ the lease row to validate it against)
@@ -2877,11 +2874,11 @@ class Engine:
         # from this read to the start taking the runner's reload lock.
         if self._stopping:
             return
-        if self._first_start_refused is None:
+        if fhir_lookup_refused is None:
             await self._registry_runner.start()
         else:
             await self._registry_runner.start(
-                warn_query_credentials=False, fhir_lookup_refused=self._first_start_refused
+                warn_query_credentials=False, fhir_lookup_refused=fhir_lookup_refused
             )
         log.info("engine graph started — this node is processing")
 
@@ -2947,15 +2944,18 @@ class Engine:
         # tests/test_cluster_graph_gating.py, which asserts no (None, None) push ever happens.
         log.info("engine graph stopped — this node is now standby")
 
-    async def _reconcile_graph(self) -> None:
+    async def _reconcile_graph(
+        self, *, fhir_lookup_refused: dict[str, Exception] | None = None
+    ) -> None:
         """Align the running graph with this node's leadership: start it on becoming leader, stop it on
-        losing leadership. Serialized by ``_graph_lock`` so overlapping triggers can't double act."""
+        losing leadership. Serialized by ``_graph_lock`` so overlapping triggers can't double act.
+        ``fhir_lookup_refused`` goes to :meth:`_start_graph`, if this pass starts the graph."""
         if self._registry_runner is None:
             return
         async with self._graph_lock:
             running = self._registry_runner.running
             if self._coordinator.is_leader() and not running:
-                await self._start_graph()
+                await self._start_graph(fhir_lookup_refused=fhir_lookup_refused)
                 # Leadership can be lost DURING the (potentially slow) bring-up — a fence mid-start. If
                 # so, tear straight back down within the same lock so a demoted node never keeps the
                 # graph running for a whole extra poll cycle.
