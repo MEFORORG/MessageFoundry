@@ -3849,7 +3849,9 @@ def _sync_reply_defaults() -> dict[str, Any]:
     return {name: params[name].default for name in _SYNC_REPLY_KNOBS}
 
 
-def apply_sync_reply_capture_implication(registry: Registry) -> None:
+def apply_sync_reply_capture_implication(
+    registry: Registry, env_values: Mapping[str, Any] | None = None
+) -> None:
     """Make ``reply_from`` imply capturing the partner's ``content-type`` (ADR 0154 D4, owner ruling).
 
     **Resolves a contradiction in the ADR itself.** ``reply_content_type`` defaults to
@@ -3870,13 +3872,23 @@ def apply_sync_reply_capture_implication(registry: Registry) -> None:
     and only those whose factory has the setting at all (it exists on 3 of the 8 outbound factories).
     A capturing outbound with no allow-list is left alone and refused explicitly by
     :func:`~messagefoundry.pipeline.wiring_runner.check_http_sync_reply`.
+
+    ``env_values`` resolves a deployed inbound's ``reply_from`` and ``reply_content_type`` first
+    (BACKLOG #5745), so a reference still implies the capture. A value that will not resolve is left
+    for the build check to refuse by name, and a ``deployed=False`` inbound's references are never
+    resolved, as everywhere else.
     """
     targets: set[str] = set()
     for ic in registry.inbound.values():
-        if ic.spec.type is not ConnectorType.HTTP:
+        if (
+            ic.spec.type is not ConnectorType.HTTP
+            or not ic.spec.settings.get("reply_from")
+            or _dark_env_setting(ic, "reply_from", "reply_content_type")
+        ):
             continue
-        reply_from = ic.spec.settings.get("reply_from")
-        if reply_from and ic.spec.settings.get("reply_content_type") == "passthrough":
+        reply_from = _resolved_setting(ic.spec.settings, "reply_from", None, env_values)
+        content_type = _resolved_setting(ic.spec.settings, "reply_content_type", None, env_values)
+        if reply_from is not _UNRESOLVED and reply_from and content_type == "passthrough":
             targets.add(str(reply_from))
 
     for name in sorted(targets):

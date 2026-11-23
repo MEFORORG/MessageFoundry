@@ -725,8 +725,8 @@ def reply_seconds(s: Mapping[str, Any], key: str) -> float:
     ``docs/CONNECTIONS.md`` says, because each bounds a blocked HTTP turn (BACKLOG #3432). The
     ``float(s.get(key) or 30.0)`` this replaces read ``True`` as one second, took a NaN, and let
     ``"0"`` through as a zero budget while a numeric ``0`` became the default. The runner reads
-    ``reply_timeout`` for its reply resolver through this function too, from the unresolved spec
-    settings; that agrees with this connector while the ``Http`` factory refuses a non-literal."""
+    ``reply_timeout`` for its reply resolver through this function too, from the same env()-resolved
+    settings this connector is built from (BACKLOG #5745)."""
     value = s.get(key)
     if value is None or value == "":
         return 30.0

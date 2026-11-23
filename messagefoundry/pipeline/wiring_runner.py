@@ -2968,12 +2968,17 @@ class RegistryRunner:
         return _sink
 
     def _make_sync_reply_resolver(
-        self, ic: InboundConnection, rendezvous: ReplyRendezvous
+        self, ic: InboundConnection, rendezvous: ReplyRendezvous, settings: Mapping[str, Any]
     ) -> SyncReplyResolver | None:
         """The per-inbound synchronous-reply resolver (ADR 0154 D2/D3), or ``None``.
 
         ``None`` unless this inbound declares ``reply_from``, which is what keeps every other
-        connection on the shipped ``202`` path byte for byte (AC-8).
+        connection on the shipped ``202`` path byte for byte (AC-8). That test reads the WRITTEN
+        setting, so a reference resolving to nothing reaches the check below and is refused rather
+        than becoming a ``202`` inbound.
+
+        ``settings`` is the inbound's env()-RESOLVED settings, as the source is built from (BACKLOG
+        #5745): ``ic.spec.settings`` may still hold an unresolved env() reference.
 
         Also re-runs the cross-registry validation **here**, where ``[delivery]`` is resolved. The
         offline arm in ``build_check_registry`` skips the effective ``ordering``/``max_attempts``
@@ -2995,7 +3000,6 @@ class RegistryRunner:
             ),
             env_values=self._env_values,
         )
-        settings = ic.spec.settings
         metrics = self._sync_reply_metrics.setdefault(ic.name, SyncReplyMetrics(ic.name))
         return SyncReplyResolverImpl(
             self.store,
@@ -6228,7 +6232,7 @@ class RegistryRunner:
         # BACKLOG #5893: a scope per start, so this listener's stop() drains only its own turns and
         # its next start arms again, while delivery hints on the root still reach every scope.
         reply_scope = self._reply_rendezvous.scope()
-        source.sync_reply = self._make_sync_reply_resolver(ic, reply_scope)
+        source.sync_reply = self._make_sync_reply_resolver(ic, reply_scope, source_cfg.settings)
         if source.sync_reply is not None:
             # ADR 0154 D5/AC-10: stop() wakes blocked turns through this BEFORE closing writers.
             source.reply_drain = reply_scope.drain
@@ -8782,7 +8786,10 @@ class RegistryRunner:
         WARNING (:func:`_build_off_loop`); one that began and then failed raises."""
 
         def prepare() -> Callable[[], None]:
-            apply_sync_reply_capture_implication(registry)
+            # The values the build below reads, so its repeat of this write stays a no-op.
+            apply_sync_reply_capture_implication(
+                registry, self._env_values if env_values is None else env_values
+            )
             return self._build_check_call(registry, env_values, now)
 
         # Prepared here, on the loop; only the builds run in the thread, through the connector
@@ -15586,7 +15593,7 @@ def _build_check_connectors(
     ``exposure_gated`` says would be bound (:func:`build_check_registry` says why)."""
     # ADR 0154 D4: normalise the graph BEFORE validating it, so the passthrough content-type rule
     # below sees the implied header rather than refusing the ADR's own headline shape. Idempotent.
-    apply_sync_reply_capture_implication(registry)
+    apply_sync_reply_capture_implication(registry, env_values)
     listener_starts = exposure_gated if exposure_gated is not None else inbound_listener_starts
     for ic in registry.inbound.values():
         if not ic.deployed:
@@ -16316,12 +16323,28 @@ def check_http_sync_reply(
     ``env_values`` is the same contract. Left ``None``, a target's ``env()`` capture flag is not read
     at all, default included, so it passes as undecided. A mapping resolves it, so an empty one reads
     a ref with no default as missing.
+
+    The inbound's own reply settings follow it (BACKLOG #5745). A mapping resolves them, and a
+    missing key raises as it does for any other setting. Left ``None``, they are read as written,
+    so a ``reply_from`` reference names no outbound and is refused.
     """
-    settings = ic.spec.settings
-    reply_from = settings.get("reply_from")
-    if not reply_from:
+    settings: Mapping[str, Any] = ic.spec.settings
+    written = settings.get("reply_from")
+    if not written:
         return
-    name, target = ic.name, str(reply_from)
+    if env_values is not None:
+        settings = resolve_env_settings(
+            {key: settings.get(key) for key in ("reply_from", "reply_content_type")},
+            env_values,
+            connection=inbound_record_name(ic.name),
+        )
+        resolved = settings["reply_from"]
+        if isinstance(written, EnvRef) and (not isinstance(resolved, str) or not resolved.strip()):
+            raise WiringError(
+                f"inbound connection {ic.name!r}: reply_from (env {written.key!r}) resolves to no "
+                "outbound name (value withheld)"
+            )
+    name, target = ic.name, str(settings["reply_from"])
 
     oc = registry.outbound.get(target)
     if oc is None:
