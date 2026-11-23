@@ -23,6 +23,7 @@ import importlib.machinery
 import importlib.util
 import marshal
 import os
+import posixpath
 import re
 import runpy
 import subprocess
@@ -413,6 +414,40 @@ def test_a_code_set_spelled_in_upper_case_is_hashed_as_it_loads(tmp_path: Path) 
     table.write_text("k,v\na,c\n", encoding="utf-8")
     assert config_fingerprint(tmp_path) != before
     assert "codesets/diets.CSV" in read_config_snapshot(tmp_path, strict=True).files
+
+
+@pytest.mark.parametrize("posix_case", [False, True], ids=["platform-case", "posix-case"])
+@pytest.mark.parametrize("name", ["X.CSV", "X.Csv", "x.cSv", "X.TOML", "x.Toml"])
+def test_every_code_set_spelling_the_loader_reads_is_in_the_strict_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, posix_case: bool
+) -> None:
+    """BACKLOG #5323: the strict digest a dual-control reload binds covers each code-set table the
+    loader reads, whatever case its suffix is spelled in. ``posix-case`` makes ``os.path.normcase``
+    case-preserving, as it is on POSIX, so a rule that leaned on the platform's case folding fails
+    here on Windows too, not only on a Linux runner."""
+    if posix_case:
+        monkeypatch.setattr(os.path, "normcase", posixpath.normcase)
+    (tmp_path / "graph.py").write_text(_graph("V1"), encoding="utf-8")
+    (tmp_path / "codesets").mkdir()
+    table = tmp_path / "codesets" / name
+    body = "k,v\na,{}\n" if name.lower().endswith(".csv") else 'a = "{}"\n'
+    table.write_text(body.format("b"), encoding="utf-8")
+    assert Path(name).stem in load_config(tmp_path).code_sets
+    assert f"codesets/{name}" in read_config_snapshot(tmp_path, strict=True).files
+    before = config_fingerprint(tmp_path, strict=True)
+    table.write_text(body.format("c"), encoding="utf-8")
+    assert config_fingerprint(tmp_path, strict=True) != before
+
+
+def test_a_file_the_loader_does_not_read_as_a_code_set_is_not_in_the_digest(tmp_path: Path) -> None:
+    """The control for the test above: the rule is the loader's, not "everything in the folder"."""
+    (tmp_path / "graph.py").write_text(_graph("V1"), encoding="utf-8")
+    (tmp_path / "codesets").mkdir()
+    (tmp_path / "codesets" / "notes.txt").write_text("k,v\na,b\n", encoding="utf-8")
+    assert "notes" not in load_config(tmp_path).code_sets
+    before = config_fingerprint(tmp_path, strict=True)
+    (tmp_path / "codesets" / "notes.txt").write_text("k,v\na,c\n", encoding="utf-8")
+    assert config_fingerprint(tmp_path, strict=True) == before
 
 
 def test_a_module_linked_in_beside_another_changes_the_digest(tmp_path: Path) -> None:
