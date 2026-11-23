@@ -35,9 +35,9 @@ encoded with :meth:`float.hex`, which is exact, so a value that round-trips thro
 ``0.0`` does, for every caller of the encoder, because a SQLite ``REAL`` column reads ``-0.0`` back
 as ``0.0``; that one change to v1 predates any deployment. :meth:`RowSealer.seal` and
 :meth:`TransitRowSealer.seal_async` raise :class:`NonFiniteSealValueError` when a field is a float
-that is not finite. :func:`seal_bytes` itself encodes one, so a check over a row someone set to such
-a value fails rather than raises, and so does a digest built on the encoder, such as the store's
-``passkey_digest`` (BACKLOG #6717).
+that is not finite. :func:`seal_bytes` itself encodes one without refusing it, so a check over a
+row someone set to such a value fails rather than raises. Other callers of :func:`seal_bytes`, at
+least the store's ``passkey_digest``, encode one without refusing it too (BACKLOG #6717).
 """
 
 from __future__ import annotations
@@ -1021,7 +1021,8 @@ async def require_seal_for_write(
     if kind != SESSION_KIND:
         # A record holding a value the encoder cannot read fails its seal, as main's record checks
         # say. Only the encoding is inside this try, so a TypeError from a defect anywhere in the
-        # check below propagates as itself. A session's encoding error propagates, as on main.
+        # check below propagates as itself. A session's encoding error propagates, as on main,
+        # unless its stored seal is malformed (not text included), which fails before encoding.
         unreadable = False
         try:
             seal_bytes(kind, fields)

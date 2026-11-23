@@ -94,8 +94,8 @@ async def test_the_transit_sealer_refuses_a_float_that_is_not_finite(value: floa
 
 @pytest.mark.parametrize(
     "as_type",
-    [lambda s: s.encode("ascii"), lambda s: bytearray(s, "ascii")],
-    ids=["bytes", "bytearray"],
+    [lambda s: s.encode("ascii"), lambda s: bytearray(s, "ascii"), lambda s: 7, lambda s: 7.5],
+    ids=["bytes", "bytearray", "int", "float"],
 )
 async def test_a_transit_seal_that_is_not_text_fails_every_check_without_raising(
     as_type: Callable[[str], Any],
@@ -111,12 +111,16 @@ async def test_a_transit_seal_that_is_not_text_fails_every_check_without_raising
     assert await sealer.verify_async(SESSION_KIND, fields, stored)
     assert await sealer.verify_held_async(SESSION_KIND, fields, stored)
     assert await sealer.sealed_by_retired_key_async(SESSION_KIND, fields, old_stored)
+    # A fresh sealer on the same backend, so no answer cached by the controls can stand in.
+    fresh = TransitRowSealer(backend, clock=Clock(), retired_key_names=[RETIRED])
     calls = backend.verify_calls
-    assert not sealer.is_active(as_type(stored))
-    assert not await sealer.verify_async(SESSION_KIND, fields, as_type(stored))
-    assert not await sealer.verify_held_async(SESSION_KIND, fields, as_type(stored))
-    assert not await sealer.sealed_by_retired_key_async(SESSION_KIND, fields, as_type(old_stored))
+    assert not fresh.is_active(as_type(stored))
+    assert not await fresh.verify_async(SESSION_KIND, fields, as_type(stored))
+    assert not await fresh.verify_held_async(SESSION_KIND, fields, as_type(stored))
+    assert not await fresh.sealed_by_retired_key_async(SESSION_KIND, fields, as_type(old_stored))
     assert backend.verify_calls == calls  # read as malformed, with no Transit call
+    assert await fresh.verify_async(SESSION_KIND, fields, stored)  # control: fresh does call
+    assert backend.verify_calls == calls + 1
 
 
 async def test_a_session_row_whose_seal_cell_is_a_blob_fails_its_check_on_transit() -> None:

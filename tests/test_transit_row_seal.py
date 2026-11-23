@@ -471,8 +471,9 @@ async def test_require_seal_for_write_names_each_cause() -> None:
     blob: Any = stored.encode()
     with pytest.raises(RowSealError):
         await require_seal_for_write(sealer, USER_KIND, FIELDS, blob, subject=subject)
-    with pytest.raises(RowSealError):
+    with pytest.raises(RowSealError) as blob_session:
         await require_seal_for_write(sealer, SESSION_KIND, FIELDS, blob, subject="s")
+    assert blob_session.value.args == (SESSION_KIND, "s")
 
     # A TypeError from a defect in the check itself is not a Forged row: it propagates.
     def broken_verify(key_name: str, digest: bytes, mac: str) -> bool:
