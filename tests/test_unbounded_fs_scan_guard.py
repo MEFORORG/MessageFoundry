@@ -883,6 +883,67 @@ def test_the_refined_view_adds_no_deny_main_did_not_have(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
+def _nested_subshell_substitutions(depth: int) -> str:
+    """`echo "$(( $(( ... $((find /proc) ) ... ) ) )"`, DEPTH sites deep, every one a subshell."""
+    inner = "$((find /proc) )"
+    for _ in range(depth - 1):
+        inner = "$(( " + inner + " ) )"
+    return 'echo "' + inner + '"'
+
+
+# THE PER-SITE TEXTS (BACKLOG #5607). Each row was allowed on origin/main at 3cf5d973237. The refined
+# view gave up on its budget past about 45 nested sites, never read a `$((cmd) )` nested inside
+# arithmetic as a site, and is not built for a command with no quote, where Hide-HeredocBodies read
+# a spaced shift in arithmetic as a heredoc opener and blanked the walk on the lines after it.
+SITE_TEXT_DENY = [
+    pytest.param(_nested_subshell_substitutions(50), id="fifty-nested-subshell-substitutions"),
+    pytest.param(
+        _nested_subshell_substitutions(200), id="two-hundred-nested-subshell-substitutions"
+    ),
+    pytest.param(
+        'echo "' + "$(($(" * 60 + "echo a" + ") ) )" * 60 + '"; echo "$((find /proc) )"',
+        id="walk-after-sixty-nested-subshell-substitutions",
+    ),
+    pytest.param(
+        'echo "' + "$(( ${a:-$(" * 20 + "echo a" + ")} ) )" * 20 + '"; echo "$((find /proc) )"',
+        id="walk-after-nested-sites-under-unclosed-parameter-expansions",
+    ),
+    pytest.param('echo "$(( $((find /proc) ) + 1 ))"', id="subshell-substitution-in-arithmetic"),
+    pytest.param("(( a << b ))\nfind /proc", id="spaced-shift-in-an-arithmetic-command-no-quote"),
+    pytest.param("x=$(( 1 << n ))\nfind /proc", id="spaced-shift-in-arithmetic-no-quote"),
+    pytest.param(
+        "echo $[ a << b ]\nfind /proc", id="spaced-shift-in-old-style-arithmetic-no-quote"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", SITE_TEXT_DENY)
+def test_a_walk_a_per_site_text_exposes_is_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# THE CONTROLS FOR THE PER-SITE TEXTS, each allowed on origin/main: a site that closes with `))` is
+# arithmetic and adds no subshell text, a site in single quotes or in a quoted heredoc body is data,
+# `((` inside double quotes is no site, a blanked shift leaves the quote after it intact, and prose
+# after a subshell site stays inside its quotes.
+SITE_TEXT_ALLOW = [
+    pytest.param("x=$(( 1 << n )); echo done", id="shift-in-arithmetic-before-a-bounded-command"),
+    pytest.param('(( x << y )); echo "x; find /proc"', id="blanked-shift-keeps-the-quote"),
+    pytest.param("echo '$((find /proc) )'", id="site-in-single-quotes"),
+    pytest.param("cat <<'EOF'\n$((find /proc) )\nEOF", id="site-in-a-quoted-heredoc-body"),
+    pytest.param('echo "(( find /proc ))"', id="double-parens-in-double-quotes"),
+    pytest.param('echo "$((echo a) ) x; find /proc"', id="prose-after-a-subshell-site"),
+    pytest.param(
+        'echo "find"; x=' + "$(( " * 300 + "1" + " ))" * 300, id="deep-arithmetic-adds-no-text"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", SITE_TEXT_ALLOW)
+def test_a_per_site_text_adds_no_deny_for_data(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
 def _guard_seconds(command: str) -> float:
     started = time.monotonic()
     run_guard(bash(command))
@@ -905,6 +966,130 @@ def test_many_arithmetic_commands_are_read_in_linear_time() -> None:
 
 def test_deeply_nested_arithmetic_is_read_in_bounded_time() -> None:
     assert _guard_seconds('echo "find"; x=' + "$((" * 5000 + "1" + "))" * 5000) < 30
+
+
+def test_nested_subshell_substitutions_are_read_in_linear_time() -> None:
+    """Doubling the nested `$(( ... ) )` sites must not quadruple the time, and both are denied.
+
+    Every site is a subshell. The refined view gave up on its budget at these depths and allowed the
+    walk, so the verdict is checked too. The bound allows for pwsh's fixed start cost, as above.
+    """
+    started = time.monotonic()
+    assert_denied(run_guard(bash(_nested_subshell_substitutions(2000))))
+    half = time.monotonic() - started
+    started = time.monotonic()
+    assert_denied(run_guard(bash(_nested_subshell_substitutions(4000))))
+    full = time.monotonic() - started
+    assert full < 3 * half + 3
+
+
+# ============================================ the differential against the guard before #5607's per-site texts
+
+
+# THE PER-SITE TEXTS MAY ONLY ADD DENIES. A row list pins the forms someone thought of; this compares
+# the guard with its copy at 3cf5d973237, the last commit on main to change it before them, over every
+# corpus row and the two-site rows below, so a row nobody filed as a deny is compared too. An earlier
+# cut of this change (branch w8-5607) replaced the refined view and allowed two-site commands with a
+# `<<` in a subshell comment that this base denies; the rows below hold that shape. The copy is read
+# from git history, so a checkout without it skips; CI's test legs fetch the full history.
+_BASE_SHA = "3cf5d9732370e7c73cd308aaaa3a5167ae29f34a"
+
+# Runs each copy of the hook once per command with the payload on a redirected stdin, in one pwsh
+# process, and prints one line per copy: a 1 for a deny and a 0 for an allow, per command.
+_VERDICT_DRIVER = r"""
+param([string]$Scripts, [string]$Commands)
+$ErrorActionPreference = 'Stop'
+$cmds = @(Get-Content -Raw -Encoding utf8 $Commands | ConvertFrom-Json)
+$inner = [Console]::In
+$outer = [Console]::Out
+foreach ($s in @(Get-Content -Raw $Scripts | ConvertFrom-Json)) {
+    $line = [System.Text.StringBuilder]::new()
+    foreach ($c in $cmds) {
+        $payload = @{ tool_name = 'Bash'; tool_input = @{ command = [string]$c } } | ConvertTo-Json -Compress
+        $sink = [System.IO.StringWriter]::new()
+        [Console]::SetIn([System.IO.StringReader]::new($payload))
+        [Console]::SetOut($sink)
+        try { & $s *> $null } finally { [Console]::SetIn($inner); [Console]::SetOut($outer) }
+        [void]$line.Append($(if ($sink.ToString().Contains('"deny"')) { '1' } else { '0' }))
+    }
+    $line.ToString()
+}
+"""
+
+
+def _two_site_rows() -> list[str]:
+    """A site whose comment holds a `<<`, beside a second site, before or after a walk."""
+    firsts = [
+        "$((echo # <<X\n) )",
+        "$((true # a<<X b\n) )",
+        "((echo # <<X\n) )",
+        "$(( 1 # <<X\n ))",
+        "$((echo # <<'X'\n) )",
+    ]
+    seconds = ["$((true) )", "$(( 1 ))", "(( 1 ))", "$((cat <<X) )", "$((grep -r 'a;b' /proc) )"]
+    leads = ['echo "', 'echo \\" ', "echo 'q'; ", ""]
+    tails = ["\"; grep -r 'a;b' /proc", "\nX\ngrep -r 'a;b' /proc", '"\nX\nfind /proc', '"']
+    rows = []
+    for lead in leads:
+        for first in firsts:
+            for second in seconds:
+                for tail in tails:
+                    rows.append(lead + first + " " + second + tail)
+                    rows.append(lead + second + " " + first + tail)
+    return rows
+
+
+def _differential_rows() -> list[str]:
+    rows: list[str] = []
+    for name in EXPECTED_ROW_COUNTS:
+        for row in globals()[name]:
+            rows.append(row.values[0] if hasattr(row, "values") else row)
+    return rows + _two_site_rows()
+
+
+_DIFFERENTIAL_CHUNKS = 4
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("chunk", range(_DIFFERENTIAL_CHUNKS))
+def test_every_command_the_base_denies_is_still_denied(tmp_path: Path, chunk: int) -> None:
+    proc = subprocess.run(
+        ["git", "show", f"{_BASE_SHA}:scripts/hooks/block-unbounded-fs-scan.ps1"],
+        cwd=GUARD.parents[2],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"{_BASE_SHA} is not in this checkout: {proc.stderr.decode(errors='replace')}")
+    base = tmp_path / "base-guard.ps1"
+    base.write_bytes(proc.stdout)
+    rows = _differential_rows()[chunk::_DIFFERENTIAL_CHUNKS]
+    commands = tmp_path / "commands.json"
+    commands.write_text(json.dumps(rows), encoding="utf-8")
+    scripts = tmp_path / "scripts.json"
+    scripts.write_text(json.dumps([str(base), str(GUARD)]), encoding="utf-8")
+    driver = tmp_path / "driver.ps1"
+    driver.write_text(_VERDICT_DRIVER, encoding="utf-8")
+    run = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(driver),
+            str(scripts),
+            str(commands),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=580,
+    )
+    assert run.returncode == 0, f"driver exited {run.returncode}: {run.stderr}"
+    old, new = run.stdout.splitlines()[-2:]
+    assert len(old) == len(new) == len(rows)
+    # The floor: a run in which both copies failed open would compare nothing.
+    assert old.count("1") > len(rows) // 4, f"the base denied only {old.count('1')} commands"
+    lost = [rows[i] for i in range(len(rows)) if old[i] == "1" and new[i] == "0"]
+    assert lost == [], f"{len(lost)} commands the base denies are now allowed: {lost[:10]}"
 
 
 # ============================================ the corpora must not quietly shrink
@@ -940,6 +1125,8 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FLOOR_DENY": 3,
     "REFINED_CONTROL_ALLOW": 2,
     "REFINED_FALSE_DENY_ALLOW": 14,
+    "SITE_TEXT_DENY": 8,
+    "SITE_TEXT_ALLOW": 7,
 }
 
 

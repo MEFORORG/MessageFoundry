@@ -116,6 +116,8 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # `(` or later on a line that opened arithmetic, a `$((cmd) )` nested inside arithmetic, a case
 # pattern's `)`, a terminator compared after trimming, delimiters such as `<<END-X` and
 # `<<E"O"F`, and a glued opener whose word is not a plain name. The older masker in block-blanket-git-stage.ps1 is untouched.
+# Get-SiteTexts, below, adds texts for two of these, a spaced shift in arithmetic and a `$((cmd) )`
+# nested inside arithmetic, and for a nesting past this view's budget; this view is unchanged.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
     if ($Plain) {
@@ -691,6 +693,196 @@ function Hide-PowerShellSpans([string]$Text) {
     return $sb.ToString()
 }
 
+# THE PER-SITE TEXTS (BACKLOG #5607). A `$((` or word-start `((` site is arithmetic when the `)` that
+# closes its inner `(` is followed by `)`, and otherwise a subshell, `$(` or `(` around a `(`. The
+# refined view decides each site by backtracking, and past its budget it gives up on the whole
+# command: measured, about 45 nested `$((cmd) )` levels. Its reading of one site can also mask
+# another. This pass decides every site in one pass over the text, with a stack, and returns texts
+# for the caller to read on their own, so no site's reading depends on another's:
+#   - a site read as a subshell, or one this pass cannot decide, gives its subshell's text, which
+#     bash reads as a fresh command whatever quotes surround the site;
+#   - a `<<` in a site read as arithmetic is a shift, never a heredoc opener, so it gives the whole
+#     command with that `<<` blanked. Without a quote no view masks anything, and Hide-HeredocBodies
+#     then read `(( a << b ))` as an opener and blanked the walk on the lines after it.
+# A site is undecided when a word-start `#`, or a line end after a `<<`, falls inside it, because a
+# subshell reads those as a comment or a heredoc body and arithmetic does not. A site never closed
+# is undecided too. `$[ ... ]` is arithmetic. Inside a site the pass reads `#` and `<<` as arithmetic
+# does; a `$(` or backtick inside it is a command either way. Single-quoted text, `$'...'` and
+# heredoc bodies hold no site. It still does not read at least these: a case pattern's `)`, a `((`
+# glued to a keyword, and a substitution in a heredoc body. Past its step budget it returns $null,
+# and the caller then adds nothing.
+function Get-SiteTexts([string]$Text) {
+    $len = $Text.Length
+    $steps = 0
+    $budget = 8 * $len + 4096
+    $frames = [System.Collections.Generic.List[object]]::new()
+    $frames.Add(@{ K = 'top'; U = $false; Site = $null; D = 0 })
+    $sites = [System.Collections.Generic.List[object]]::new()
+    $pending = [System.Collections.Generic.List[string]]::new()
+    $braceDepth = 0
+    $wordStart = $true
+    $delimRe = [regex]::new('\G-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
+    $n = 0
+    while ($n -lt $len) {
+        if (++$steps -gt $budget) { return $null }
+        $f = $frames[$frames.Count - 1]
+        $k = $f.K
+        $ch = $Text[$n]
+        $next = if ($n + 1 -lt $len) { $Text[$n + 1] } else { [char]0 }
+        $quoted = $k -ceq 'dq'
+        if ($quoted) {
+            if ($ch -ceq '\') { $n += 2; continue }
+            if ($ch -ceq '"') { $frames.RemoveAt($frames.Count - 1); $wordStart = $false; $n++; continue }
+        }
+        if ($ch -ceq '$' -and $next -ceq '(' -and $n + 2 -lt $len -and $Text[$n + 2] -ceq '(') {
+            $s = @{ T = 'dol'; S = $n; ILo = $n + 2; IHi = $len; Dec = $null; Unc = $false
+                Sh = [System.Collections.Generic.List[int]]::new() }
+            $sites.Add($s)
+            $frames.Add(@{ K = 'A'; U = $f.U; Site = $s; D = 0 })
+            $frames.Add(@{ K = 'B'; U = $true; Site = $s; D = 0 })
+            $wordStart = $true; $n += 3; continue
+        }
+        if ($ch -ceq '$' -and $next -ceq '(') {
+            $frames.Add(@{ K = 'sub'; U = $false; Site = $null; D = 0 }); $wordStart = $true; $n += 2; continue
+        }
+        if ($ch -ceq '$' -and $next -ceq '[') {
+            $s = @{ T = 'brk'; S = $n; ILo = $n + 2; IHi = $len; Dec = 'arith'; Unc = $false
+                Sh = [System.Collections.Generic.List[int]]::new() }
+            $sites.Add($s)
+            $frames.Add(@{ K = 'brk'; U = $true; Site = $s; D = 0 }); $wordStart = $true; $n += 2; continue
+        }
+        if ($ch -ceq '$' -and $next -ceq '{') {
+            $frames.Add(@{ K = 'brace'; U = $f.U; Site = $null; D = 0 }); $braceDepth++; $wordStart = $false
+            $n += 2; continue
+        }
+        if ($ch -ceq '`') {
+            if ($k -ceq 'bt') { $frames.RemoveAt($frames.Count - 1); $wordStart = $false }
+            else { $frames.Add(@{ K = 'bt'; U = $false; Site = $null; D = 0 }); $wordStart = $true }
+            $n++; continue
+        }
+        if ($quoted) { $n++; continue }
+        # Unquoted from here. A newline under heredoc openers starts their bodies, read as data.
+        if ($ch -ceq "`n" -and $pending.Count -gt 0 -and -not $f.U) {
+            $n++
+            foreach ($term in $pending) {
+                while ($n -lt $len) {
+                    $end = $Text.IndexOf("`n", $n)
+                    if ($end -lt 0) { $end = $len }
+                    $steps++
+                    $hit = $Text.Substring($n, $end - $n).Trim() -ceq $term
+                    $n = $end + 1
+                    if ($hit) { break }
+                }
+            }
+            $pending.Clear(); $wordStart = $true; continue
+        }
+        if ($f.U -and ($ch -ceq "`n" -or ($ch -ceq '#' -and $wordStart))) {
+            # Inside a site: a comment, or a line end after a `<<`, is where the readings part.
+            for ($i = $frames.Count - 1; $i -ge 0 -and $frames[$i].U; $i--) {
+                $steps++
+                $fs = $frames[$i].Site
+                if ($frames[$i].K -ceq 'B' -and ($ch -ceq '#' -or $fs.Sh.Count -gt 0 -or $pending.Count -gt 0)) {
+                    $fs.Unc = $true
+                }
+            }
+            $wordStart = $ch -ceq "`n"; $n++; continue
+        }
+        if ($ch -ceq '\') { $wordStart = $false; $n += 2; continue }
+        if ($ch -ceq "'") {
+            $close = $Text.IndexOf("'", $n + 1)
+            $n = if ($close -lt 0) { $len } else { $close + 1 }
+            $wordStart = $false; continue
+        }
+        if ($ch -ceq '$' -and $next -ceq "'") {
+            $n += 2
+            while ($n -lt $len -and $Text[$n] -cne "'") { $n += $(if ($Text[$n] -ceq '\') { 2 } else { 1 }) }
+            $n++; $wordStart = $false; continue
+        }
+        if ($ch -ceq '"') { $frames.Add(@{ K = 'dq'; U = $f.U; Site = $null; D = 0 }); $wordStart = $false; $n++; continue }
+        if ($ch -ceq '#' -and $wordStart -and $braceDepth -eq 0) {
+            $end = $Text.IndexOf("`n", $n)
+            if ($end -lt 0) { $end = $len }
+            if ($k -ceq 'bt') {
+                $tick = $Text.IndexOf('`', $n)
+                if ($tick -ge 0 -and $tick -lt $end) { $end = $tick }
+            }
+            $n = $end; continue
+        }
+        if ($ch -ceq '<' -and $next -ceq '<' -and -not ($n + 2 -lt $len -and $Text[$n + 2] -ceq '<') -and
+            -not ($n -gt 0 -and $Text[$n - 1] -ceq '<')) {
+            if ($f.U) {
+                # A shift, in the innermost site that reads it as arithmetic.
+                for ($i = $frames.Count - 1; $i -ge 0; $i--) {
+                    $steps++
+                    if ($frames[$i].K -ceq 'B' -or $frames[$i].K -ceq 'brk') { $frames[$i].Site.Sh.Add($n); break }
+                }
+            } else {
+                $d = $delimRe.Match($Text, $n + 2)
+                if ($d.Success) {
+                    $pending.Add((@($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
+                        Where-Object { $_ } | Select-Object -First 1))
+                }
+            }
+            $wordStart = $false; $n += 2; continue
+        }
+        if ($ch -ceq '(') {
+            if ($next -ceq '(' -and $wordStart -and $braceDepth -eq 0 -and $k -cne 'brk') {
+                $s = @{ T = 'dbl'; S = $n; ILo = $n + 1; IHi = $len; Dec = $null; Unc = $false
+                    Sh = [System.Collections.Generic.List[int]]::new() }
+                $sites.Add($s)
+                $frames.Add(@{ K = 'A'; U = $f.U; Site = $s; D = 0 })
+                $frames.Add(@{ K = 'B'; U = $true; Site = $s; D = 0 })
+                $n += 2; continue
+            }
+            $frames.Add(@{ K = 'par'; U = $f.U; Site = $null; D = 0 }); $wordStart = $true; $n++; continue
+        }
+        if ($ch -ceq ')' -and ($k -ceq 'par' -or $k -ceq 'sub' -or $k -ceq 'A' -or $k -ceq 'B')) {
+            $frames.RemoveAt($frames.Count - 1)
+            if ($k -ceq 'B') { $f.Site.Dec = $(if ($next -ceq ')') { 'arith' } else { 'sub' }) }
+            elseif ($k -ceq 'A') { $f.Site.IHi = $n }
+            $wordStart = $false; $n++; continue
+        }
+        if ($k -ceq 'brk' -and $ch -ceq '[') { $f.D++ }
+        elseif ($k -ceq 'brk' -and $ch -ceq ']') {
+            if ($f.D -gt 0) { $f.D-- } else { $frames.RemoveAt($frames.Count - 1); $f.Site.IHi = $n }
+        }
+        elseif ($k -ceq 'brace' -and $ch -ceq '}') { $frames.RemoveAt($frames.Count - 1); $braceDepth-- }
+        $wordStart = [char]::IsWhiteSpace($ch) -or ';&|('.IndexOf($ch) -ge 0
+        $n++
+    }
+    # Each entry names a text without building it, so a deep nesting costs nothing it does not read:
+    # a range of $Text, or the shifts to blank in a copy of it. Shifts in decided arithmetic are
+    # blanked together, in the first entry; an undecided site's shifts each get their own copy too.
+    $decided = [System.Collections.Generic.List[int]]::new()
+    foreach ($s in $sites) { if ($s.Dec -ceq 'arith' -and -not $s.Unc) { $decided.AddRange($s.Sh) } }
+    $texts = [System.Collections.Generic.List[object]]::new()
+    if ($decided.Count -gt 0) { $texts.Add(@{ Cost = $len; Lo = 0; Hi = $len; Sh = $decided }) }
+    $local = [System.Collections.Generic.List[object]]::new()
+    foreach ($s in $sites) {
+        if ($s.T -ceq 'brk') { continue }
+        $undecided = $s.Unc -or $null -eq $s.Dec
+        if ($undecided -or $s.Dec -ceq 'sub') {
+            $local.Add(@{ Cost = $s.IHi - $s.ILo; Lo = $s.ILo; Hi = $s.IHi; Sh = $null })
+        }
+        if ($undecided -and $s.Sh.Count -gt 0) {
+            $sh = [System.Collections.Generic.List[int]]::new($decided); $sh.AddRange($s.Sh)
+            $local.Add(@{ Cost = $len; Lo = 0; Hi = $len; Sh = $sh })
+        }
+    }
+    # Shortest first: the innermost site of a deep nesting is read before the budget can run out.
+    $local.Sort([System.Comparison[object]] { param($a, $b) $a.Cost.CompareTo($b.Cost) })
+    $texts.AddRange($local)
+    return , $texts
+}
+
+# The text a Get-SiteTexts entry names.
+function Get-SiteText([string]$Text, $Entry) {
+    if ($null -eq $Entry.Sh) { return $Text.Substring($Entry.Lo, $Entry.Hi - $Entry.Lo) }
+    $chars = $Text.ToCharArray()
+    foreach ($p in $Entry.Sh) { $chars[$p] = ' '; $chars[$p + 1] = ' ' }
+    return [string]::new($chars)
+}
+
 # A token as bash hands it to the program. Quotes are removed throughout the word, not just at its
 # ends (`/''` and `/pro'c'` are /proc), and an unquoted backslash escapes the next character and is
 # itself removed (`/\proc` is /proc; unquoted `/proc\registry` is /procregistry, which is nothing).
@@ -817,13 +1009,15 @@ try {
     # Split into simple commands. `(`, `)` and the backtick are separators too, or `$(find /proc)`,
     # a backtick substitution and a `( find /proc )` subshell were each allowed.
     $bounds = New-Object 'System.Collections.Generic.List[object[]]'
-    function Add-ScanBounds([string]$Scan) {
+    # A bound is a range of a view, the raw text its operands are read from at the same offsets, and
+    # a tag that keeps a per-site text's ranges apart from the command's own in $checked below.
+    function Add-ScanBounds([string]$Scan, [string]$Raw = $cmd, [string]$Tag = '') {
         $cursor = 0
         foreach ($m in [regex]::Matches($Scan, '(\|\||&&|[;|&\n()`])')) {
-            $bounds.Add(@($Scan, $cursor, ($m.Index - $cursor)))
+            $bounds.Add(@($Scan, $cursor, ($m.Index - $cursor), $Raw, $Tag))
             $cursor = $m.Index + $m.Length
         }
-        $bounds.Add(@($Scan, $cursor, ($Scan.Length - $cursor)))
+        $bounds.Add(@($Scan, $cursor, ($Scan.Length - $cursor), $Raw, $Tag))
     }
     # Called once the loop below has judged every bound it holds; true when it added more.
     function Add-PowerShellBounds {
@@ -854,6 +1048,53 @@ try {
         Add-ScanBounds $refinedScan
         return $bounds.Count -gt $before
     }
+    # THE PER-SITE TEXTS (BACKLOG #5607) COME AFTER EVERY VIEW ABOVE, under the same rule, so they can
+    # only add denies to the verdict those views reach: they are read only once every earlier bound
+    # has been judged and allowed, their bounds are appended, and a throw, a slow path or a budget
+    # giving up returns that allow. Each text is read under the plain, bash and refined views, with
+    # its own raw text, one text per call, so the loop judges it before the next is read. Built only
+    # for a command holding `((` or `$[`.
+    $sitePending = @{ Value = ($tool -cne 'PowerShell' -and
+        ($cmd.IndexOf('((', [StringComparison]::Ordinal) -ge 0 -or $cmd.IndexOf('$[', [StringComparison]::Ordinal) -ge 0))
+        Texts = $null; Next = 0; Spent = 0 }
+    function Add-SiteBounds {
+        if (-not $sitePending.Value) { return $false }
+        if ($null -eq $sitePending.Texts) {
+            $sitePending.Texts = Get-SiteTexts $cmd
+            if ($null -eq $sitePending.Texts) { $sitePending.Value = $false; return $false }
+        }
+        $cap = 16 * $cmd.Length + 65536
+        while ($sitePending.Next -lt $sitePending.Texts.Count) {
+            $entry = $sitePending.Texts[$sitePending.Next]
+            $tag = "site $($sitePending.Next)|"
+            $sitePending.Next++
+            $sitePending.Spent += 2 * $entry.Cost
+            if ($sitePending.Spent -gt $cap) { break }
+            $t = Get-SiteText $cmd $entry
+            $refine = $t.IndexOf('((', [StringComparison]::Ordinal) -ge 0 -or
+                $t.IndexOf('<<', [StringComparison]::Ordinal) -ge 0 -or $t.IndexOf('$[', [StringComparison]::Ordinal) -ge 0
+            if ($refine) {
+                # The refined view's own budget is 8 characters a character.
+                $sitePending.Spent += 8 * $entry.Cost
+                if ($sitePending.Spent -gt $cap) { $refine = $false }
+            }
+            $views = [System.Collections.Generic.List[string]]::new()
+            $views.Add((Hide-HeredocBodies $t (Hide-QuotedSpans $t -Plain)))
+            $v = Hide-HeredocBodies $t (Hide-QuotedSpans $t)
+            if (-not $views.Contains($v)) { $views.Add($v) }
+            if ($refine) {
+                $r = Hide-QuotedSpans $t -Refined
+                if ($null -ne $r) {
+                    $v = Hide-HeredocBodies $t $r
+                    if (-not $views.Contains($v)) { $views.Add($v) }
+                }
+            }
+            foreach ($v in $views) { Add-ScanBounds $v $t $tag }
+            return $true
+        }
+        $sitePending.Value = $false
+        return $false
+    }
     foreach ($scan in $scans) { Add-ScanBounds $scan }
 
     # Options whose value is a SEPARATE word, so the value is skipped rather than read as a program,
@@ -879,13 +1120,13 @@ try {
 
     # A segment both views mask alike is checked once.
     $checked = [System.Collections.Generic.HashSet[string]]::new()
-    for ($bi = 0; $bi -lt $bounds.Count -or (Add-PowerShellBounds) -or (Add-RefinedBounds); $bi++) {
+    for ($bi = 0; $bi -lt $bounds.Count -or (Add-PowerShellBounds) -or (Add-RefinedBounds) -or (Add-SiteBounds); $bi++) {
         $b = $bounds[$bi]
         if ($b[2] -le 0) { continue }
         $seg = $b[0].Substring($b[1], $b[2])
-        if (-not $checked.Add("$($b[1]):$seg")) { continue }
+        if (-not $checked.Add("$($b[4])$($b[1]):$seg")) { continue }
         $s = $seg.Trim()
-        $rawSeg = $cmd.Substring($b[1], $b[2]).Trim()
+        $rawSeg = $b[3].Substring($b[1], $b[2]).Trim()
         if (-not $s) { continue }
 
         # Program position is decided on the blanked view; a first token carrying a quote is the
