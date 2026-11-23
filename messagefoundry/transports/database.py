@@ -2815,13 +2815,33 @@ def _sqlstate(exc: BaseException) -> str | None:
 
 def _log_sqlstate(exc: BaseException) -> str | None:
     """:func:`_sqlstate`, read first from asyncpg's ``sqlstate`` attribute when that is a SQLSTATE,
-    for the arms that classify an error a PostgreSQL store's driver may raise. Never for a
-    ``UnicodeError`` or an exception that holds one, whose text a codec name can make read like a
-    SQLSTATE. Like :func:`_sqlstate`, it classifies; :func:`_shown_state` says what text names."""
+    for the arms that classify an error a PostgreSQL store's driver may raise. An asyncpg error
+    whose attribute is absent, empty or no SQLSTATE reads as none, never by ``args[0]``, which is
+    asyncpg's message: a message such as ``MRN42`` would otherwise be classified, and printed, as
+    a state (:func:`_an_asyncpg_error`). Never for a ``UnicodeError`` or an exception that holds
+    one, whose text a codec name can make read like a SQLSTATE. Like :func:`_sqlstate`, it
+    classifies; :func:`_shown_state` says what text names."""
     if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
     state = getattr(exc, "sqlstate", None)
-    return state if reads_as_a_sqlstate(state) else _shaped_state(getattr(exc, "args", ()))
+    if reads_as_a_sqlstate(state):
+        return state
+    if _an_asyncpg_error(exc):
+        return None
+    return _shaped_state(getattr(exc, "args", ()))
+
+
+def _an_asyncpg_error(exc: BaseException) -> bool:
+    """Whether ``exc``'s class, or a class it inherits, is from the ``asyncpg`` package, whose
+    ``args[0]`` is its message rather than a SQLSTATE. A class that cannot be read answers
+    ``False``, so it is classified by shape, as :func:`_sqlstate` classifies it."""
+    try:
+        return any(
+            isinstance(kind.__module__, str) and kind.__module__.split(".")[0] == "asyncpg"
+            for kind in type(exc).__mro__
+        )
+    except Exception:  # noqa: BLE001 - an unreadable class is classified by shape
+        return False
 
 
 def _shaped_state(args: object) -> str | None:
@@ -2888,11 +2908,13 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     identifier in the middle rather than removing it. asyncpg's errors, from a PostgreSQL store,
     count too: their ``str()`` appends a ``DETAIL`` that quotes the key. A driver error with no
     SQLSTATE (:func:`_raised_by_a_driver`), such as asyncpg's client-side ``DataError``, which quotes
-    the argument it could not encode, renders as its type alone (engine PR 2658, finding 4). Anything
-    else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful text for a bug or
-    an unreachable host, unless ``withhold`` says it is held by a driver error, as a link of its
-    chain (:func:`_redacted_copy`), or it carries a SQLSTATE although it is no driver's
-    (:func:`_shown_state`): either renders as its type alone. That is a bound, not a guarantee:
+    the argument it could not encode, renders as ``<type> [driver message withheld]``, with SQLite's
+    result-code name inside the brackets when it has one (:func:`_withheld`; engine PR 2658, finding
+    4). Anything else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful
+    text for a bug or an unreachable host, unless ``withhold`` says it is held by a driver error, as
+    a link of its chain (:func:`_redacted_copy`), which renders as ``<type> [driver message
+    withheld]``, or it carries a SQLSTATE although it is no driver's (:func:`_shown_state`), which
+    renders as ``<type> [message withheld]``. That is a bound, not a guarantee:
     an error a driver raises as a builtin type with any other arguments, or wraps in another
     library's, is printed as ``safe_exc`` prints it.
 

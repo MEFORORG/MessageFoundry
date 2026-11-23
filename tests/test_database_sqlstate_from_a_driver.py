@@ -13,6 +13,7 @@ control or a regression check that is not red on main. All values are synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import sys
@@ -414,13 +415,46 @@ class _AsyncpgMessage(Exception):
     sqlstate = ""
 
 
+class _AsyncpgClientMessage(Exception):
+    """asyncpg's client-side shape: the message in ``args[0]``, and no ``sqlstate`` at all."""
+
+    __module__ = "asyncpg.exceptions._base"
+
+
 def test_the_traceback_line_never_reads_a_message_as_a_sqlstate() -> None:
-    """Red on the previous head: past an unusable ``sqlstate`` the traceback line read ``args[0]``,
-    asyncpg's message, and printed ``[MRN42]``. The connector's log reading still falls back, as
-    main's did."""
+    """Red on 2c4ced1906e: past an unusable ``sqlstate`` the connector's reading fell back to
+    ``args[0]``, asyncpg's message, so ``_log_sqlstate`` returned ``MRN42``. The traceback line
+    already read no state there."""
     exc = _AsyncpgMessage(_VALUE)
     assert _VALUE not in safe_traceback((type(exc), exc, None))
-    assert database._log_sqlstate(exc) == _VALUE  # main's log reading, for a driver's own error
+    assert database._log_sqlstate(exc) is None
+    assert database._log_sqlstate(_AsyncpgClientMessage(_VALUE)) is None
+    assert _VALUE not in database._safe_db_error(exc)
+
+
+@pytest.mark.parametrize("make", [_AsyncpgMessage, _AsyncpgClientMessage])
+async def test_an_asyncpg_message_is_never_printed_as_a_sqlstate(
+    make: type[Exception], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on 2c4ced1906e: an asyncpg error whose ``sqlstate`` is unusable or absent was read by
+    its ``args[0]``, its message, so the connect error, the ``last_error`` the runner stores from
+    it and the log line all printed ``[MRN42]``."""
+    exc = make(_VALUE)
+
+    async def refuse() -> Any:
+        raise exc
+
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(DeliveryError) as raised:
+        await database._connect(refuse, 1.0)
+    assert _VALUE not in str(raised.value)
+    assert _VALUE not in str(getattr(raised.value, "code", ""))
+    assert _VALUE not in safe_exc(raised.value)  # what the runner stores as last_error
+    closing: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    closing.set_exception(exc)
+    database._log_late_pool_close("DATABASE", closing)
+    assert "pool close failed" in caplog.text
+    assert _VALUE not in caplog.text
 
 
 class _NoArgs(DriverError):
