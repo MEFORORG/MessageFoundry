@@ -41,8 +41,10 @@ DDL the reader cannot place raises ``ValueError`` rather than being skipped or m
 ``CREATE ... INDEX``, ``CREATE TABLE``, ``DROP TABLE``, ``DROP INDEX`` or ``sp_rename`` its patterns do
 not match, an ``ALTER TABLE`` with more than one clause or an action it does not know, a table rename,
 an ``ALTER INDEX``, a second ``CREATE TABLE`` of a table no ``DROP`` removed, a second ``CREATE
-INDEX`` of a name no ``DROP INDEX`` freed, DDL in a string literal that no ``EXEC`` runs or that a
-``+`` joins to more text, a default of more than one token, a ``USING`` access
+INDEX`` of a name an index it read still holds, DDL in a single-quoted string literal the reader
+sees no ``EXEC`` run, at any depth of ``EXEC``, or that a ``+`` joins to more text (other than a
+``DROP CONSTRAINT`` named by ``QUOTENAME``), a default followed by a token that opens no column
+clause, a ``USING`` access
 method, a key column or expression carrying a collation, an operator class or a ``NULLS`` order, a key
 that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server
 inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it does not know, a SQL
@@ -50,11 +52,13 @@ Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFA
 or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text. A unit test
 reads each shipped batch, so a new form fails there before it reaches an open.
 
-An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its statement is read as reaching every
-store, and one with anything before it as reaching only an older store, so the latter raises where
-its result differs from the ``CREATE TABLE``, even if its guard would hold on a new store too.
+An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its entry in the batch, with nothing
+before it, is read as reaching every store, and one with anything before it, even a statement a
+``;`` ends, as reaching only an older store, so the latter raises where its result differs from
+the ``CREATE TABLE``, even if it would run on a new store too.
 
-Not every misread raises (BACKLOG #5062). At least: a
+Not every misread raises (BACKLOG #5062). At least: DDL in a PostgreSQL dollar-quoted body is read
+as run, a function's body included, which runs only when it is called; and a
 ``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
 ``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
 a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
@@ -885,7 +889,7 @@ class _Built:
     and what an ``ALTER COLUMN`` or an added ``PRIMARY KEY`` leaves on an older store. A guarded
     one is not taken to reach a new store, because its guard may test for the old state: its result
     must equal ``create``, or the column is built two ways. An ``ALTER TABLE`` that opens its
-    statement, with nothing before it, runs on every store, so it changes ``create`` too (BACKLOG
+    entry in the batch, with nothing before it, runs on every store, so it changes ``create`` too (BACKLOG
     #5062)."""
 
     create: ColumnShape | None = None
@@ -1050,13 +1054,12 @@ class _Reader:
     def alter(self, text: str, m: re.Match[str], spans: list[tuple[int, int]]) -> None:
         table = _bare(m["table"])
         segment = text[m.end() :]
-        # Only an ALTER TABLE that opens its statement is known to run on every store; anything
+        # Only an ALTER TABLE that opens its batch entry is known to run on every store; anything
         # before it, an IF or an EXEC among them, may guard it (BACKLOG #5062).
         everywhere = not text[: m.start()].strip()
-        for start, end in spans:
-            if start < m.start() < end:  # inside an EXEC string: its own text, quotes undoubled
-                segment = text[m.end() : end - 1].replace("''", "'")
-                break
+        if span := _enclosing_span(spans, m.start()):
+            # Inside an EXEC string: its own text, quotes undoubled.
+            segment = text[m.end() : span[1] - 1].replace("''", "'")
         # SQL Server's WITH [NO]CHECK says whether an added constraint checks the existing rows.
         clause = re.sub(r"^WITH\s+(?:NO)?CHECK\s+(?=ADD\b)", "", _clause(segment), flags=re.I)
         words = clause.split()
@@ -1236,38 +1239,55 @@ class _Reader:
         )
 
 
-#: What opens a string literal that SQL Server runs as SQL: an ``EXEC`` or ``sp_executesql``
-#: argument, or a value assigned to a variable, which counts only once an ``EXEC`` runs that
-#: variable later in the statement.
-_EXEC_LITERAL = re.compile(r"\b(?:EXEC(?:UTE)?\s*\(|sp_executesql)\s*N?$", re.I)
-_ASSIGNED_LITERAL = re.compile(r"@(?P<var>\w+)(?:\s+\w+(?:\s*\([^()]*\))?)?\s*=\s*N?$", re.I)
+#: What opens a string literal the server runs as SQL: an ``EXEC`` or ``EXECUTE`` argument, an
+#: ``sp_executesql`` statement, or a value assigned to a variable, which counts only once an
+#: ``EXEC`` outside any literal runs that variable later in the text.
+_EXEC_LITERAL = re.compile(
+    r"\b(?:EXEC(?:UTE)?\s*\(\s*|EXECUTE\s+|sp_executesql\s+(?:@\w+\s*=\s*)?)N?$", re.I
+)
+_ASSIGNED_LITERAL = re.compile(
+    r"@(?P<var>\w+)(?:\s+(?:AS\s+)?\w+(?:\s*\([^()]*\))?)?\s*=\s*N?$", re.I
+)
 #: A literal joined to a quoted name and nothing else, as a ``DROP CONSTRAINT`` takes its name.
 _QUOTENAME_TAIL = re.compile(r"\s*\+\s*QUOTENAME\s*\(\s*@\w+\s*\)\s*(?:;|$)", re.I)
 
 
-def _check_literal(text: str, spans: list[tuple[int, int]], kind: str, m: re.Match[str]) -> None:
-    """Raise when DDL the reader matched sits in a string literal it cannot read as run (BACKLOG
-    #5062): one that no ``EXEC`` runs, which the server never executes, or one joined to more text
-    by ``+``, whose clause the literal cuts short. The one join read is an ``ALTER TABLE ... DROP
-    CONSTRAINT`` given its name by ``QUOTENAME``, a clause the reader does not apply."""
-    span = next(((start, end) for start, end in spans if start < m.start() < end), None)
-    if span is None:
+def _enclosing_span(spans: list[tuple[int, int]], pos: int) -> tuple[int, int] | None:
+    """The string literal of ``spans`` that ``pos`` lies inside, or ``None``."""
+    return next(((start, end) for start, end in spans if start < pos < end), None)
+
+
+def _check_literal(
+    text: str, spans: list[tuple[int, int]], kind: str, at: int, stop: int, label: str
+) -> None:
+    """Raise when DDL the reader matched, ``text[at:stop]``, sits in a string literal it cannot
+    read as run (BACKLOG #5062): one it sees no ``EXEC`` run, or one joined to more text by ``+``,
+    whose clause the literal cuts short. The one join read is an ``ALTER TABLE ... DROP
+    CONSTRAINT`` given its name by ``QUOTENAME``, a clause the reader does not apply. A literal
+    that is run is read again as SQL of its own, its quotes undoubled, so a literal inside it
+    is held to the same rule."""
+    if (span := _enclosing_span(spans, at)) is None:
         return
     start, end = span
-    before = text[:start]
-    run = _EXEC_LITERAL.search(before) is not None
-    if not run and (assigned := _ASSIGNED_LITERAL.search(before)):
+    run = _EXEC_LITERAL.search(text, 0, start) is not None
+    if not run and (assigned := _ASSIGNED_LITERAL.search(text, 0, start)):
         var = assigned["var"]
-        runs = rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{var}\s*\)|sp_executesql\s+@{var}\b)"
-        run = re.search(runs, text[end:], re.I) is not None
+        runs = re.compile(rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{var}\s*\)|sp_executesql\s+@{var}\b)", re.I)
+        run = any(_enclosing_span(spans, f.start()) is None for f in runs.finditer(text, end))
     if not run:
-        raise ValueError(f"DDL inside a string literal that no EXEC runs: {m.group(0)[:120]!r}")
+        raise ValueError(
+            f"DDL inside a string literal the reader sees no EXEC run: {label[:120]!r}"
+        )
     if text[end:].lstrip().startswith("+") and not (
         kind == "alter"
-        and re.fullmatch(r"\s*DROP\s+CONSTRAINT\s*", text[m.end() : end - 1], re.I)
+        and re.fullmatch(r"\s*DROP\s+CONSTRAINT\s*", text[stop : end - 1], re.I)
         and _QUOTENAME_TAIL.match(text, end)
     ):
-        raise ValueError(f"DDL in a string literal that a + joins to more text: {m.group(0)!r}")
+        raise ValueError(f"DDL in a string literal that a + joins to more text: {label!r}")
+    body = text[start + 1 : end - 1].replace("''", "'")
+    offset = len(text[start + 1 : at].replace("''", "'"))
+    length = len(text[at:stop].replace("''", "'"))
+    _check_literal(body, _string_spans(body), kind, offset, offset + length, label)
 
 
 @cache
@@ -1304,7 +1324,7 @@ def declared_schema(
         ):
             events.extend((m.start(), kind, m) for m in pattern.finditer(text))
         for _pos, kind, m in sorted(events, key=lambda e: e[0]):
-            _check_literal(text, spans, kind, m)
+            _check_literal(text, spans, kind, m.start(), m.end(), m.group(0))
             if kind == "table":
                 reader.table(text, m)
             elif kind == "index":
@@ -1330,23 +1350,24 @@ def _a(noun: str) -> str:
 def server_schema_differences(
     expected: SchemaShape,
     live: SchemaShape,
-    taken: Mapping[str, str],
-    unusable: Mapping[str, str] | None = None,
     *,
+    taken_indexes: Mapping[str, str] | None = None,
     taken_tables: Mapping[str, str] | None = None,
+    unusable: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Every way ``live`` falls short of ``expected``, one clause each. Extras are not listed.
 
-    ``taken`` maps an expected index name to the kind of object that holds it instead (a table
-    holding an index's name), and ``taken_tables`` an expected table name (a view holding a
-    table's). They are kept apart because on SQL Server an index may share a table's name, so a
-    name taken from one must not hide the other's clauses (BACKLOG #5062). Such a name gets its own
-    clause, which says why the guarded ``CREATE`` skipped it, in place of a bare "is missing".
-    ``unusable`` maps an
+    ``taken_indexes`` maps an expected index name to the kind of object that holds it instead (a
+    table holding an index's name), and ``taken_tables`` an expected table name (a view holding a
+    table's). They are kept apart, and keyword-only, because on SQL Server an index may share a
+    table's name, so a name taken from one must not hide the other's clauses (BACKLOG #5062). Such
+    a name gets its own clause, which says why the guarded ``CREATE`` skipped it, in place of a
+    bare "is missing". ``unusable`` maps an
     expected index that exists under its name to why it cannot serve, such as ``disabled``. A column
     both shapes describe is compared by :meth:`ColumnShape.core_differs` and
     :meth:`ColumnShape.collation_differs`, one clause for each that differs."""
     unusable = unusable or {}
+    taken = taken_indexes or {}
     taken_tables = taken_tables or {}
     problems: list[str] = []
     for name in sorted({*taken_tables, *taken}):
@@ -1519,7 +1540,11 @@ def refuse_short_schema(
             if shape is not None:
                 shapes.setdefault(table, {})[column] = shape
     problems = server_schema_differences(
-        expected, live_shape(columns, indexes, shapes), taken, unusable, taken_tables=taken_tables
+        expected,
+        live_shape(columns, indexes, shapes),
+        taken_indexes=taken,
+        taken_tables=taken_tables,
+        unusable=unusable,
     )
     if problems:
         exc = ServerSchemaMismatchError(backend, database, problems, schema)

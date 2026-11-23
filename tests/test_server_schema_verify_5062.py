@@ -643,10 +643,15 @@ def test_an_added_primary_key_follows_the_alter_column_rule() -> None:
         "IF 1 = 0 PRINT 'ALTER TABLE t ADD b INT NULL'",
         "DECLARE @s nvarchar(100) = N'ALTER TABLE t ADD b INT NULL'",
         "SELECT 'CREATE INDEX ix ON t (a)'",
+        # A literal inside an EXEC string is held to the same rule, at any depth.
+        "EXEC('PRINT ''ALTER TABLE t ADD b INT NULL''')",
+        "EXEC('EXEC(''PRINT ''''ALTER TABLE t ADD b INT NULL'''''')')",
+        # An EXEC that is itself only a literal's text runs nothing.
+        "DECLARE @s nvarchar(99) = N'ALTER TABLE t ADD b INT NULL'; PRINT 'EXEC(@s)'",
     ],
 )
 def test_ddl_in_a_literal_no_exec_runs_raises(statement: str) -> None:
-    with pytest.raises(ValueError, match="no EXEC runs"):
+    with pytest.raises(ValueError, match="sees no EXEC run"):
         declared_schema(("CREATE TABLE t (a INT NULL)", statement), "sqlserver")
 
 
@@ -655,11 +660,21 @@ def test_ddl_in_a_literal_no_exec_runs_raises(statement: str) -> None:
     [
         "EXEC(N'ALTER TABLE t ADD b INT NULL')",
         "DECLARE @s nvarchar(100) = N'ALTER TABLE t ADD b INT NULL'; EXEC(@s)",
+        "DECLARE @s AS nvarchar(100) = N'ALTER TABLE t ADD b INT NULL'; EXEC(@s)",
         "EXEC sp_executesql N'ALTER TABLE t ADD b INT NULL'",
+        "EXEC sp_executesql @stmt = N'ALTER TABLE t ADD b INT NULL'",
     ],
 )
 def test_ddl_in_a_literal_an_exec_runs_is_read(statement: str) -> None:
     shape = declared_schema(("CREATE TABLE t (a INT NULL)", statement), "sqlserver")
+    assert shape.columns["t"] == frozenset({"a", "b"})
+
+
+def test_ddl_in_a_plpgsql_execute_literal_is_read() -> None:
+    shape = declared_schema(
+        ("CREATE TABLE t (a INT)", "DO $$ BEGIN EXECUTE 'ALTER TABLE t ADD COLUMN b INT'; END $$"),
+        "postgres",
+    )
     assert shape.columns["t"] == frozenset({"a", "b"})
 
 
