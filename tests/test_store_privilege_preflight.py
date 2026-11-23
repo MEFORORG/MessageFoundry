@@ -1582,7 +1582,6 @@ async def test_posture_route_reports_an_observed_over_grant(engine: Engine) -> N
     )
     assert body["store_privilege"]["status"] == "observed"
     assert body["store_privilege"]["excess"] == ["server role sysadmin"]
-    assert body["store_privilege"]["unread"] == []
     switches = [entry["switch"] for entry in body["loosenings"]]
     assert "store_principal_over_granted" in switches
 
@@ -1596,7 +1595,10 @@ async def test_posture_route_reports_the_unread_grants_beside_an_over_grant(engi
             unread=("database role db_owner",),
         ),
     )
-    assert body["store_privilege"]["unread"] == ["database role db_owner"]
+    # The view's shape is the web-console seam, so the signal rides the loosening entry's risk text.
+    risk = {e["switch"]: e["risk"] for e in body["loosenings"]}["store_principal_over_granted"]
+    assert "not read" in risk
+    assert "database role db_owner" in risk
 
 
 async def test_posture_route_reports_an_unobservable_probe(engine: Engine) -> None:

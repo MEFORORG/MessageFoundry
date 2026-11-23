@@ -5564,7 +5564,6 @@ def create_app(
                 status=store_privilege.status.value,
                 excess=list(store_privilege.excess),
                 detail=store_privilege.detail,
-                unread=list(store_privilege.unread),
             )
         )
         # FIPS-provider attestation of the interpreter's ssl/_hashlib OpenSSL (report-only, #73 / ADR 0120):

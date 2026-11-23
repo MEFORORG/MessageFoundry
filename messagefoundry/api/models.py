@@ -1560,9 +1560,6 @@ class StorePrivilegeView(BaseModel):
     excess: list[str] = Field(default_factory=list)
     #: Why the probe could not observe, or what it observed against. Never secret material.
     detail: str = ""
-    #: Grants the probe named as not read (BACKLOG #6015); beside an ``excess`` the list may be
-    #: incomplete. Grant labels only, never secret material.
-    unread: list[str] = Field(default_factory=list)
 
 
 class StartupCodeItemView(BaseModel):
