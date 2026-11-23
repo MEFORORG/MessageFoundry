@@ -5115,7 +5115,8 @@ time changes or its retry falls due, and the same two exceptions apply. Its retr
 separate pass after the poll's other files, earliest due first, those past the ceiling's break
 included. Before each retry the directory is listed again only if a retrieve has begun since the last
 listing, on the main pass or in an earlier retry; a poll with no retrieve since its listing does not
-list again. It differs from `File(...)` in at least two ways. The first wait is
+list again. A listing that has only aged with elapsed time (a slow ledger read, a quarantine move,
+a store call) is not taken again. It differs from `File(...)` in at least two ways. The first wait is
 `STUCK_TRANSIENT_RETRY_SECONDS` and each later one `STUCK_RETRY_SECONDS`, whatever the failure, because
 a remote failure does not say reliably whether it will clear; only a retry that passes every gate and
 then fails its hand-off takes the short wait again. And one poll examines at most a tenth of

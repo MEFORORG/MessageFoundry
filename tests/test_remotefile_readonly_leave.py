@@ -504,6 +504,7 @@ async def test_every_stuck_reject_gets_its_retry_when_slots_are_scarce(
         for name, (seen, _) in list(src._stuck.items()):
             _make_due(src, name, seen.due - 30.0)
         await src._poll_once()
+    assert len(names) >= 40
     never = [name for name in names if _retrieved(client, f"/in/{name}") < 2]
     assert never == []
 
@@ -1021,8 +1022,9 @@ def test_each_real_listing_says_whether_it_gave_a_size() -> None:
 async def test_a_poll_with_a_due_retry_and_no_retrieve_before_it_lists_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The listing is repeated only after a retrieve has run since it, because nothing else can
-    have outdated it. The one due retry here settles first, so no retrieve precedes its slot."""
+    """The listing is taken again only after a retrieve has begun since it. A listing that aged
+    with elapsed time alone is not covered. The one due retry here settles first, so no retrieve
+    precedes its slot."""
     client = _read_only({"/in/z.hl7": _BAD})
     src = _leave(monkeypatch, client)
     await _settle(src)
@@ -1064,6 +1066,49 @@ async def test_a_second_retry_slot_lists_again_after_the_first_slot_retrieved(
     src._handler = rewriting
     await src._poll_once()
     assert handler.bodies == [_GOOD], "z's partial must not be handed over"
+
+
+async def test_a_stop_landing_during_the_relist_starts_no_further_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second slot lists again because the first retrieved. A stop that lands during that
+    listing must not let the slot go on to download."""
+    trigger: list[Any] = []
+
+    class _StoppingClient(_StampedClient):
+        def list_entries(self, remote_dir: str) -> list[_Listed]:
+            if trigger:
+                trigger[0]._stop.set()
+            return super().list_entries(remote_dir)
+
+    client = _StoppingClient(
+        {"/in/y.hl7": _BAD, "/in/z.hl7": _BAD}, {"/in/y.hl7": "1", "/in/z.hl7": "1"}
+    )
+    client._rename_exc = _REFUSED
+    src = _leave(
+        monkeypatch, client, after_read="move", poll_max_files=20
+    )  # a retry allowance of two
+    await _settle(src)
+    await src._poll_once()  # both are rejected and remembered
+    _make_due(src, "y.hl7", 1.0)
+    _make_due(src, "z.hl7", 2.0)
+    await _settle(src)  # both take a slot and settle
+    before = _retrieved(client, "/in/z.hl7")
+    seen = _retrieved(client, "/in/y.hl7")
+    original = client.list_entries
+    calls = 0
+
+    def arm(remote_dir: str) -> list[_Listed]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # the poll's own listing is the first; the relist before slot two is next
+            trigger.append(src)
+        return original(remote_dir)
+
+    client.list_entries = arm  # type: ignore[method-assign]
+    await src._poll_once()
+    assert _retrieved(client, "/in/y.hl7") == seen + 1, "the premise: the first slot retrieved"
+    assert _retrieved(client, "/in/z.hl7") == before, "no download after the stop"
 
 
 @pytest.mark.parametrize("time_returns", [True, False])

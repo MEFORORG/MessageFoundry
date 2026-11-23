@@ -2872,7 +2872,9 @@ class RemoteFileSource(SourceConnector):
         # polls in a row have not listed it. In memory only and never logged. See _held_for_size.
         self._size_held: dict[str, tuple[_HeldRead, int]] = {}
         self._error_dir_asked = False  # this poll already asked for error_subdir (leave mode)
-        # Retrieves begun, ever. A listing is as old as the count it was taken at (_retry_stuck).
+        # Retrieves begun, ever. _retry_stuck lists again only when this count has moved since its
+        # listing, so a listing that aged with elapsed time alone (a slow ledger read, a quarantine
+        # move, a store call) is NOT taken again.
         self._retrieves = 0
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
@@ -3118,7 +3120,9 @@ class RemoteFileSource(SourceConnector):
         Before each slot, the directory is listed again if a retrieve has begun since the last
         listing (``listed_at`` is the retrieve count the poll's listing was taken at), on the main
         pass or in an earlier slot, whether or not it disposed of a file, because a hand-off that
-        failed takes time too. A poll with no retrieve since its listing does not list again. The
+        failed takes time too. A poll with no retrieve since its listing does not list again, and a
+        listing that has aged with elapsed time alone (a slow ledger read, a quarantine move, a store
+        call) is not covered. The
         size check (:meth:`_held_for_size`) cannot see a rewrite on a listing with no size, or one
         that keeps the length, and a moved time can show either. A slot that listing cannot judge,
         because it failed or no longer names the file, stays due and drops its sighting; so does
@@ -3154,6 +3158,8 @@ class RemoteFileSource(SourceConnector):
                     return recorded
                 listed_at = self._retrieves
                 latest = {entry.name: entry for entry in current}
+                if self._stop.is_set():
+                    break  # a stop landed during the listing: start no further download
             now_listed = latest.get(slot.name)
             if now_listed is None:
                 self._settle_seen.pop(slot.name, None)  # _prune_memories forgets the rest
