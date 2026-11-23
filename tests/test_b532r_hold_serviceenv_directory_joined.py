@@ -36,6 +36,8 @@ from tests._serviceenv_remedy import (
     ADD_BACK_MIXED,
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
+    CHOOSE,
+    CHOSEN,
     COPIED,
     COPIED_UNPLAIN,
     CREATE,
@@ -56,6 +58,7 @@ from tests._serviceenv_remedy import (
     lookalike_add,
     lookalike_next,
     lookalike_step,
+    repoint,
 )
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
@@ -129,7 +132,7 @@ def test_a_padded_directory_name_joined_to_a_value_sets_no_directory(refused: st
     refusal = service_env_refusal(posture)
     assert refusal is not None and RUNS_ON in refusal
     moved = refused.startswith("MEFOR_VALUE_")
-    ending = LOOKALIKE_NEXT if moved else lookalike_add(remove_other=False)
+    ending = lookalike_next(CHOSEN) if moved else lookalike_add(remove_other=False)
     assert refusal.count(lookalike_step(padded=True, ending=ending)) == 1
     assert LOOKALIKE_ANY not in refusal
     assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
@@ -570,7 +573,7 @@ def test_a_lookalike_directory_alone_is_taken_out_not_kept(where: str) -> None:
     assert posture.directory_lookalikes == (_LONG_S,) and posture.directory_listed_as_lookalike
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_NEXT)) == 1
+    assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=lookalike_next(CHOSEN))) == 1
     assert refusal.count(CREATE) == 1 and refusal.count(ADD_BACK_ANY) == 1
     assert refusal.index(LOOKALIKE_ANY) < refusal.index(ADD_BACK_ANY)
     control = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=C:\\d"]))
@@ -613,7 +616,7 @@ def test_the_lookalike_step_names_each_one_by_its_code_points() -> None:
     refusal = service_env_refusal(posture)
     assert refusal is not None and refusal.isascii()
     named = ("mefor_<U+017F>ecrets_d<U+0131>rectory", _LONG_S_NAMED)
-    assert refusal.count(lookalike_step(*named, ending=LOOKALIKE_NEXT)) == 1
+    assert refusal.count(lookalike_step(*named, ending=lookalike_next(CHOSEN))) == 1
     assert _directory_lookalike("\u00a0MEFOR_SECRETS_DIRECTORY=C:\\f") is None
     assert _directory_lookalike(f"{_LONG_S}=C:\\f") == _LONG_S
 
@@ -688,7 +691,7 @@ def test_a_padded_directory_name_is_no_directory_entry(written: str) -> None:
     assert posture.directory_lookalikes == () and not posture.directory_in_lists
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert refusal.count(lookalike_step(padded=True, ending=LOOKALIKE_NEXT)) == 1
+    assert refusal.count(lookalike_step(padded=True, ending=lookalike_next(CHOSEN))) == 1
     assert refusal.count(CREATE) == 1 and refusal.count(SET_NO) == 1
 
 
@@ -712,29 +715,80 @@ def test_a_lookalike_value_is_copied_only_where_it_is_plainly_a_path() -> None:
 
 def test_an_ascii_entry_the_engine_does_not_receive_is_not_left_as_the_directory() -> None:
     """The Lander's hold on PR 3142, comment 7096232111, item 4: NSSM replaces the environment
-    with AppEnvironment where that holds anything, so an ASCII entry in the Service Control
-    Manager's Environment then reaches no engine. The remedy does not leave it as the one that
-    names the directory, and says to add one to AppEnvironmentExtra. With AppEnvironment empty,
-    the control, the engine receives it, so the remedy leaves it, repointed before the Put step
-    (item 6)."""
+    with AppEnvironment where that holds a non-blank entry, so an ASCII entry in the Service
+    Control Manager's Environment then reaches no engine. The remedy does not leave it as the
+    one that names the directory: it chooses the path before the Put step, says how the
+    directory is created, and adds the entry back to AppEnvironmentExtra. With AppEnvironment
+    blank, the control, the engine receives it, so the remedy leaves it, repointed before the
+    Put step (item 6)."""
     entries = [
         (_EXTRA, "MEFOR_VALUE_A=x"),
         ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\s"),
         (_EXTRA, f"{_LONG_S}=C:\\d"),
     ]
     posture = _read_pairs([*entries, (_PLAIN, "OTHER=1")])
-    assert not posture.directory_named_received
+    assert not posture.directory_named_received and not posture.directory_listed_received
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    ending = lookalike_add(remove_other=True)
+    ending = lookalike_next(CHOSEN)
     assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=ending)) == 1
+    assert refusal.count(CHOOSE) == 1 and refusal.index(CHOOSE) < refusal.index("Put ")
+    assert refusal.count(CREATE) == 1 and refusal.count(ADD_BACK_JOINED + ADD_BACK_CREATE) == 1
     assert REPOINT not in refusal and LOOKALIKE_LEAVE_MOVED not in refusal
-    control = _read_pairs(entries)
+    control = _read_pairs([*entries, (_PLAIN, " ")])
     assert control.directory_named_received
     control_refusal = service_env_refusal(control)
     assert control_refusal is not None
     leave = lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_LEAVE_MOVED)
     assert control_refusal.count(leave) == 1 and control_refusal.count(REPOINT) == 1
+
+
+def test_review_round_one_shapes_leave_the_engine_on_one_received_directory() -> None:
+    """Code review round 1 on comment 7096232111. A second ASCII entry the engine receives, a
+    blank one included, may win, so LEAVE applies only to one. An ASCII entry the engine does
+    not receive names no directory, with no look-alike too, so the create and add-back steps
+    print. A padded entry beside the received ASCII one is never offered as the files' path. A
+    stray whose value runs on into lines below is not plainly a path."""
+    two = _read_pairs(
+        [
+            (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+            (_EXTRA, "MEFOR_VALUE_A=x"),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY="),
+            (_EXTRA, f"{_LONG_S}=C:\\d"),
+        ]
+    )
+    assert not two.directory_named_received
+    refusal = service_env_refusal(two)
+    assert refusal is not None and LOOKALIKE_LEAVE_MOVED not in refusal
+    assert (
+        refusal.count(
+            lookalike_step(_LONG_S_NAMED, ending=lookalike_add(CHOSEN, remove_other=True))
+        )
+        == 1
+    )
+    unreceived = service_env_refusal(
+        _read_pairs(
+            [
+                (_EXTRA, "MEFOR_VALUE_A=x"),
+                ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\s"),
+                (_PLAIN, "OTHER=1"),
+            ]
+        )
+    )
+    assert unreceived is not None and CREATE in unreceived and ADD_BACK_ANY in unreceived
+    padded = service_env_refusal(
+        _read(
+            [
+                "MEFOR_VALUE_A=x",
+                "MEFOR_SECRETS_DIRECTORY=C:\\real",
+                " MEFOR_SECRETS_DIRECTORY=C:\\d",
+            ]
+        )
+    )
+    assert padded is not None
+    assert padded.count(repoint(None)) == 1 and "which may be the path" not in padded
+    runs_on = _read(["MEFOR_VALUE_A=x", f"{_LONG_S}=C:\\d\n{_KEY_B64}"])
+    assert not runs_on.directory_stray_paths_plain
 
 
 def test_a_padded_entry_beside_a_lookalike_is_not_left_as_the_directory() -> None:
@@ -746,7 +800,7 @@ def test_a_padded_entry_beside_a_lookalike_is_not_left_as_the_directory() -> Non
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert LOOKALIKE_LEAVE not in refusal and LOOKALIKE_LEAVE_MOVED not in refusal
-    step = lookalike_step(_LONG_S_NAMED, padded=True, ending=LOOKALIKE_NEXT)
+    step = lookalike_step(_LONG_S_NAMED, padded=True, ending=lookalike_next(CHOSEN))
     assert refusal.count(step) == 1 and refusal.count(ADD_BACK_JOINED + ADD_BACK_CREATE) == 1
 
 

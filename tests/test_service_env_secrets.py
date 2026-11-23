@@ -62,6 +62,7 @@ from tests._serviceenv_remedy import (
     REMOVE,
     RUNS_ON,
     SET_NO,
+    TAKE_OUT_ANY,
 )
 
 #: Synthetic stand-ins. Never a real key: the tests check that no value is kept, by searching for
@@ -441,15 +442,20 @@ def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
     assert CREATE in refusal
 
 
-def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
-    """The whole-string reading strips the name, so a blank first line moves the first name down.
-    The secrets directory below one is set, and the refusal must not tell the operator to add
-    it."""
+def test_a_blank_first_line_leaves_the_secrets_directory_below_it_unread() -> None:
+    """The Lander's hold on PR 3142, comment 7096232111, the name rule: NSSM reads the item
+    whole, so its name is the line break and the name below it, which ``os.environ`` keeps. The
+    engine reads no secrets directory there, so the refusal says how to create one, and to take
+    the entry out as a padded one. A refused name below a blank first line still refuses, so no
+    refusal is relaxed."""
     posture = _service(["\nMEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
-    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
+    assert "MEFOR_SECRETS_DIRECTORY" not in posture.listed and posture.directory_padded
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert CREATE not in refusal
+    assert CREATE in refusal and TAKE_OUT_ANY in refusal
+    assert _service(["\nMEFOR_STORE_PASSWORD=x"]).listed_directory_names == (
+        "MEFOR_STORE_PASSWORD",
+    )
 
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
