@@ -123,6 +123,7 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.cell_tag import (
     CellTagError,
+    UnreadableParentMetadataError,
     audits_cell_tag,
     dead_letters_on_cell_tag,
     is_row_tagged,
@@ -148,6 +149,7 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    StoreKeylessError,
     allows_unmarked,
     cell_aad,
     cipher_info,
@@ -355,6 +357,7 @@ from messagefoundry.store.store import (
     create_batch_failure,
     decoded_rows,
     delivery_key,
+    edit_child_metadata,
     enrolment_code_issue,
     enrolment_code_revoke,
     enrolment_code_spend,
@@ -5122,9 +5125,46 @@ class PostgresStore:
                 if pt_deliveries:
                     parent_meta: dict[str, Any] = {}
                     if pmeta_json:
-                        loaded = json.loads(pmeta_json)
-                        if isinstance(loaded, dict):
-                            parent_meta = loaded
+                        # BACKLOG #5758: refuse only a cell that would make the child's own reads
+                        # raise, by running them; a valid non-object still reads as no lineage.
+                        # Raised outside the except: json's error holds the whole cell.
+                        unreadable = False
+                        try:
+                            loaded = json.loads(pmeta_json)
+                            if isinstance(loaded, dict):
+                                child_depth = int(loaded.get("correlation_depth", 0) or 0) + 1
+                                str(child_depth)  # the child's cap branch formats it
+                                if child_depth <= correlation_depth_cap:  # else no child is encoded
+                                    json.dumps(
+                                        {
+                                            "correlation_id": message_id,
+                                            "correlation_root_id": loaded.get("correlation_root_id")
+                                            or message_id,
+                                            "correlation_depth": child_depth,
+                                            "passthrough_from": message_id,
+                                        }
+                                    )
+                                parent_meta = loaded
+                        except (ValueError, TypeError, OverflowError, RecursionError):
+                            unreadable = True
+                        if unreadable:
+                            # A keyless open hands an mfenc: cell back unchanged: the engine's
+                            # fault, so the runner re-pends the row rather than dead-lettering it.
+                            if (
+                                pmeta_json.startswith(_ENC_MARKER_PREFIX)
+                                and not self._cipher.encrypts
+                            ):
+                                raise StoreKeylessError(
+                                    "store table 'messages' carries encrypted metadata (mfenc:"
+                                    " markers) but no store encryption key is configured; set"
+                                    " MEFOR_STORE_ENCRYPTION_KEY to the key that wrote it"
+                                    " (fail-closed)"
+                                )
+                            err = UnreadableParentMetadataError(
+                                "messages", "metadata", message_id, msg_channel
+                            )
+                            log.warning("%s; the handoff was refused", str(err))
+                            raise err
                     inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_pg(
@@ -5143,7 +5183,9 @@ class PostgresStore:
                         )
                     # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                     await self._inherit_attachments(conn, message_id, inherits)
-                for namespace, key, value in state_ops:
+                # Sorted by (namespace, key) only, as SQL Server does: one lock order across
+                # concurrent handoffs (BACKLOG #5758). The values do not order; the sort is stable.
+                for namespace, key, value in sorted(state_ops, key=lambda op: (op[0], op[1])):
                     value_json = json.dumps(value)
                     await self._apply_state_op(conn, namespace, key, value_json, message_id, now)
                     applied.append(((namespace, key), value))
@@ -8609,22 +8651,7 @@ class PostgresStore:
                         message_id=message_id,
                         channel_id=src_channel,
                     )
-                    try:
-                        parent_meta = json.loads(raw_meta) if raw_meta else {}
-                    except (ValueError, TypeError):
-                        parent_meta = {}
-                    if not isinstance(parent_meta, dict):
-                        parent_meta = {}
-                    child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                    root = parent_meta.get("correlation_root_id") or message_id
-                    child_meta = json.dumps(
-                        {
-                            "correlation_id": message_id,
-                            "correlation_root_id": root,
-                            "correlation_depth": child_depth,
-                            "edited_from": message_id,
-                        }
-                    )
+                    child_meta = edit_child_metadata(raw_meta, origin_message_id=message_id)
                     # ROUTED child with its single outbound delivery already in flight (skips router/
                     # transform); the finalizer drives it to PROCESSED/ERROR. Idempotency is the
                     # resend_log gate above (single txn), so a uuid4 child id is safe.
@@ -8800,22 +8827,7 @@ class PostgresStore:
                     message_id=origin_message_id,
                     channel_id=channel_id,
                 )
-                try:
-                    parent_meta = json.loads(raw_meta) if raw_meta else {}
-                except (ValueError, TypeError):
-                    parent_meta = {}
-                if not isinstance(parent_meta, dict):
-                    parent_meta = {}
-                child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                root = parent_meta.get("correlation_root_id") or origin_message_id
-                child_meta = json.dumps(
-                    {
-                        "correlation_id": origin_message_id,
-                        "correlation_root_id": root,
-                        "correlation_depth": child_depth,
-                        "edited_from": origin_message_id,
-                    }
-                )
+                child_meta = edit_child_metadata(raw_meta, origin_message_id=origin_message_id)
                 new_mid = MessageStore._edit_resubmit_message_id(idempotency_key, channel_id, raw)
                 exists = await conn.fetchval("SELECT 1 FROM messages WHERE id=$1", new_mid)
                 if exists is None:

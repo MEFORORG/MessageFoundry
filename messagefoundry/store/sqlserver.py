@@ -112,6 +112,7 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.cell_tag import (
     CellTagError,
+    UnreadableParentMetadataError,
     audits_cell_tag,
     dead_letters_on_cell_tag,
     is_row_tagged,
@@ -137,6 +138,7 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    StoreKeylessError,
     allows_unmarked,
     cell_aad,
     cipher_info,
@@ -365,6 +367,7 @@ from messagefoundry.store.store import (
     create_batch_failure,
     decoded_rows,
     delivery_key,
+    edit_child_metadata,
     enrolment_code_issue,
     enrolment_code_revoke,
     enrolment_code_spend,
@@ -1396,15 +1399,47 @@ def _finalize_from_message_status(mrows: Sequence[Any]) -> tuple[str, str | None
     return ("update", MessageStatus.FILTERED.value)
 
 
-def _parent_meta_from_row(pmeta_json: str | None) -> dict[str, Any]:
-    """Decode a PT parent's ``metadata`` (already decrypted) into a dict for depth computation — absent
-    / non-dict -> ``{}`` (depth 0). Shared by the async + sync transform twins so the lineage parse
-    can never drift."""
+def _parent_meta_from_row(
+    pmeta_json: str | None,
+    *,
+    message_id: str,
+    channel_id: str,
+    encrypts: bool,
+    correlation_depth_cap: int,
+) -> dict[str, Any]:
+    """Decode a PT parent's ``metadata`` (already decrypted) into a dict for depth computation —
+    absent / valid non-object -> ``{}`` (depth 0). A cell that would make the child's own depth,
+    format or encode step raise is refused with :class:`UnreadableParentMetadataError`, so the
+    handoff dead-letters it (BACKLOG #5758). Shared by the async + sync transform twins so the
+    lineage parse can never drift."""
+    if not pmeta_json:
+        return {}
     parent_meta: dict[str, Any] = {}
-    if pmeta_json:
+    unreadable = False
+    try:
         loaded = json.loads(pmeta_json)
         if isinstance(loaded, dict):
+            child_depth = int(loaded.get("correlation_depth", 0) or 0) + 1
+            str(child_depth)  # the child's cap branch formats it
+            if child_depth <= correlation_depth_cap:  # else no child is encoded
+                root = loaded.get("correlation_root_id") or message_id
+                _passthrough_child_meta(message_id, root, child_depth)
             parent_meta = loaded
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        unreadable = True
+    if unreadable:
+        # A keyless open hands an mfenc: cell back unchanged: the engine's fault, so the runner
+        # re-pends the row rather than dead-lettering it.
+        if pmeta_json.startswith(_ENC_MARKER_PREFIX) and not encrypts:
+            raise StoreKeylessError(
+                "store table 'messages' carries encrypted metadata (mfenc: markers) but no store"
+                " encryption key is configured; set MEFOR_STORE_ENCRYPTION_KEY to the key that"
+                " wrote it (fail-closed)"
+            )
+        # Raised outside the except: json's error holds the whole cell.
+        err = UnreadableParentMetadataError("messages", "metadata", message_id, channel_id)
+        log.warning("%s; the handoff was refused", str(err))
+        raise err
     return parent_meta
 
 
@@ -8018,7 +8053,13 @@ class SqlServerStore:
                             channel_id=msg_channel,
                         )
                 if pt_deliveries:
-                    parent_meta = _parent_meta_from_row(pmeta_dec)
+                    parent_meta = _parent_meta_from_row(
+                        pmeta_dec,
+                        message_id=message_id,
+                        channel_id=msg_channel,
+                        encrypts=self._cipher.encrypts,
+                        correlation_depth_cap=correlation_depth_cap,
+                    )
                     inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_mssql(
@@ -8229,7 +8270,13 @@ class SqlServerStore:
                         channel_id=msg_channel,
                     )
             if pt_deliveries:
-                parent_meta = _parent_meta_from_row(pmeta_dec)
+                parent_meta = _parent_meta_from_row(
+                    pmeta_dec,
+                    message_id=message_id,
+                    channel_id=msg_channel,
+                    encrypts=self._cipher.encrypts,
+                    correlation_depth_cap=correlation_depth_cap,
+                )
                 inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = self._insert_passthrough_child_mssql_sync(
@@ -13372,22 +13419,7 @@ class SqlServerStore:
                             message_id=message_id,
                             channel_id=src_channel,
                         )
-                        try:
-                            parent_meta = json.loads(raw_meta) if raw_meta else {}
-                        except (ValueError, TypeError):
-                            parent_meta = {}
-                        if not isinstance(parent_meta, dict):
-                            parent_meta = {}
-                        child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                        root = parent_meta.get("correlation_root_id") or message_id
-                        child_meta = json.dumps(
-                            {
-                                "correlation_id": message_id,
-                                "correlation_root_id": root,
-                                "correlation_depth": child_depth,
-                                "edited_from": message_id,
-                            }
-                        )
+                        child_meta = edit_child_metadata(raw_meta, origin_message_id=message_id)
                         # ROUTED child with its single outbound delivery already in flight (skips router/
                         # transform); the finalizer drives it. Idempotency is the resend_log gate above.
                         child_mid = uuid4().hex
@@ -13628,22 +13660,7 @@ class SqlServerStore:
                         message_id=origin_message_id,
                         channel_id=channel_id,
                     )
-                    try:
-                        parent_meta = json.loads(raw_meta) if raw_meta else {}
-                    except (ValueError, TypeError):
-                        parent_meta = {}
-                    if not isinstance(parent_meta, dict):
-                        parent_meta = {}
-                    child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                    root = parent_meta.get("correlation_root_id") or origin_message_id
-                    child_meta = json.dumps(
-                        {
-                            "correlation_id": origin_message_id,
-                            "correlation_root_id": root,
-                            "correlation_depth": child_depth,
-                            "edited_from": origin_message_id,
-                        }
-                    )
+                    child_meta = edit_child_metadata(raw_meta, origin_message_id=origin_message_id)
                     new_mid = MessageStore._edit_resubmit_message_id(
                         idempotency_key, channel_id, raw
                     )
