@@ -13,7 +13,9 @@ errors in :mod:`messagefoundry.parsing.x12.errors` — so a Handler's ``except V
 swallow a deploy/config error.
 
 This module imports ``pyx12`` (third-party, not an engine package) and nothing from
-``messagefoundry.config``/``pipeline``/``store``/``transports`` — the codec's purity is preserved.
+``messagefoundry.config``/``pipeline``/``store``/``transports``, so that import boundary holds. It
+is not pure: :mod:`messagefoundry.parsing.x12` says what the strict path reads and keeps, and
+:func:`load_x12_map_segment_ids` how it keeps it.
 """
 
 from __future__ import annotations

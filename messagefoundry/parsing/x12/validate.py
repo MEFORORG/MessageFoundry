@@ -26,8 +26,8 @@ well-formed; see :class:`X12ValidationResult`.
 :class:`X12SegmentError` drops those strings and holds structural locators (its docstring names them,
 and a limit on its segment id), and a refusal chains no pyx12 exception. The ack does echo sender
 values, so it is left out of the result's repr. The full interchange goes only to the secured store
-(CLAUDE.md §9). The pyx12 logger tree (which logs the raw, value-bearing strings at ERROR) is muted
-from the first validation pass on, and never unmuted.
+(CLAUDE.md §9). The pyx12 logger tree is muted from the first validation pass on, and never
+unmuted, because its ERROR records can carry those values (:func:`_mute_pyx12_logger` says when).
 
 No network I/O and no engine imports. Disk reads include pyx12's bundled map XML, by pyx12 and by
 the segment id check. ``pyx12``'s sole runtime dependency is ``defusedxml`` (already in tree), used
@@ -69,9 +69,10 @@ class X12SegmentError:
     ``segment_id`` comes from the input, so it is kept only when it has an X12 segment id's shape (a
     capital, then one or two capitals or digits) and a map in pyx12's bundled index defines it, and
     is ``None`` otherwise (BACKLOG #5370). The set is the union of those maps, so a sender value equal
-    to any id in it, for example the surname ``LIN``, standing where the id goes is still kept, in
+    to any id in it, for example ``LIN`` or ``PAT``, standing where the id goes is still kept, in
     ``segment_id`` and in ``message``, even in a transaction whose own map does not define that id.
-    A terminator inside a name can put the name's tail there, with ``loop`` naming the field before."""
+    A terminator inside a name can put the name's tail there: ``O~LE`` keeps ``LE``, with ``loop``
+    naming the segment the name was in."""
 
     code: str
     message: str
@@ -114,17 +115,20 @@ _MUTED = logging.CRITICAL + 1
 def _mute_pyx12_logger() -> None:
     """Mute the whole ``pyx12`` logger tree, and never unmute it (BACKLOG #1603).
 
-    pyx12 logs each violation's *raw* error string, which embeds the offending data value (potential
-    PHI), at ERROR from child loggers such as ``pyx12.error_handler``. We build our own errors from
-    pyx12's structured JSON instead, so nothing pyx12 logs is wanted anywhere.
+    pyx12 logs each violation at ERROR from child loggers such as ``pyx12.error_handler``. The
+    record embeds the *raw* error string, with the offending data value (potential PHI), under
+    pyx12 4.0.1, and under 4.1.0 when ``log_data_values`` is on, which a pyx12 config file can set.
+    We build our own errors from pyx12's structured JSON instead, so nothing pyx12 logs is wanted
+    anywhere.
 
     **No restore step, on purpose.** The old context manager raised the level for one pass and put
     the previous level back afterwards. Two overlapping passes on two threads would interleave: the
-    first to finish would unmute the logger while the second was still logging. No caller runs
-    passes concurrently today (a Handler calls :func:`validate` synchronously on its transform
-    worker). But the fix costs nothing: every call writes the same muted state, so concurrent calls
-    cannot disagree. Calling it on every pass, not once at import, also re-mutes a tree that a later
-    logging reconfiguration has reset.
+    first to finish would unmute the logger while the second was still logging. Passes can overlap:
+    without a subprocess sandbox, the transform workers of two inbound connections run their
+    Handlers on ``asyncio.to_thread`` threads, and a Handler calls :func:`validate` synchronously
+    there. Every call writes the same muted state, so concurrent calls cannot disagree. Calling it
+    on every pass, not once at import, also re-mutes a tree that a later logging reconfiguration
+    has reset.
 
     Two layers, in this order:
 
@@ -203,6 +207,7 @@ def _structural_segment_id(seg: dict[str, Any]) -> str | None:
     segment (``NM1|IL|1|DOE|ROBERT``) puts the sender's whole segment there, and a terminator inside
     a name (``NM1*IL*1*O~LEE*A*B~``) puts the name's tail there, in an id's shape. The error code
     cannot tell those apart: pyx12 emits code 1 for sender text and for a real id in the wrong place.
+    The map check drops ``LEE``; :class:`X12SegmentError` states what it cannot drop.
     The shape is checked first, so text without it never makes this read the maps."""
     seg_id = seg.get("seg_id")
     if (

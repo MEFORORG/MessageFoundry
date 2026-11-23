@@ -17,6 +17,7 @@ import threading
 import traceback
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -773,6 +774,8 @@ def test_a_failed_map_read_is_not_kept_and_is_retried_after_a_pause(
     deps = importlib.import_module("messagefoundry.parsing.x12._deps")
     results = iter([frozenset[str](), frozenset({"NM1"})])
     reads: list[object] = []
+    start = 1000.0
+    now = [start]
 
     def read(map_dir: object) -> frozenset[str]:
         reads.append(map_dir)
@@ -781,11 +784,18 @@ def test_a_failed_map_read_is_not_kept_and_is_retried_after_a_pause(
     monkeypatch.setattr(deps, "_read_map_segment_ids", read)
     monkeypatch.setattr(deps, "_map_ids", frozenset())
     monkeypatch.setattr(deps, "_map_ids_retry_at", 0.0)
+    # A clock only this module sees. The test moves the clock and never the deadline, so the
+    # deadline the failed read wrote is what decides whether the retry fires.
+    monkeypatch.setattr(deps, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    pause = deps._MAP_IDS_RETRY_SECONDS
+    assert pause > 0
+
     assert load_x12_map_segment_ids() == frozenset()
+    now[0] = start + pause - 0.001
     assert load_x12_map_segment_ids() == frozenset()  # inside the pause: no second read
     assert len(reads) == 1
 
-    monkeypatch.setattr(deps, "_map_ids_retry_at", 0.0)  # the pause is over
+    now[0] = start + pause  # the pause is over
     assert load_x12_map_segment_ids() == {"NM1"}
     assert load_x12_map_segment_ids() == {"NM1"}  # a good read is kept
     assert len(reads) == 2
