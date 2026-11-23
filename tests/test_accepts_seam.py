@@ -23,11 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import gc
-import logging
 import re
-import warnings
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -1031,6 +1028,12 @@ class _Awaitable:
         yield None
 
 
+# The refusal leaves the verdict untouched (the predicate may share it), so a coroutine a predicate
+# made draws Python's "never awaited" warning when it is collected, which can be during a later test.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:coroutine '_verdict_coro' was never awaited:RuntimeWarning"
+)
+
 _STATIC_PASSING_VERDICTS = [
     pytest.param(_returns_coroutine, id="coroutine"),
     pytest.param(_returns_generator, id="generator"),
@@ -1046,33 +1049,60 @@ def test_an_awaitable_or_iterator_verdict_passes_validate_but_raises(
     tmp_path: Path, pred: Any
 ) -> None:
     reg = _reg(tmp_path, accepts={"h": pred})  # the static check does not see it
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with pytest.raises(
-            TypeError, match="accepts= predicate for handler 'h' returned an object"
-        ):
-            route_only(reg, reg.inbound["IB"], ADT)
-        gc.collect()
-    # The coroutine is closed before the raise, so no "was never awaited" warning leaks. Filtered on
-    # this test's own coroutine, since the collection can finalize an earlier test's garbage.
-    assert [w for w in caught if "_verdict_coro" in str(w.message)] == []
+    with pytest.raises(TypeError, match="accepts= predicate for handler 'h' returned an object"):
+        route_only(reg, reg.inbound["IB"], ADT)
 
 
-def test_a_started_generator_whose_finally_raises_still_names_the_handler(tmp_path: Path) -> None:
-    def gen() -> Iterator[bool]:
+# --- PR 3177 hold (c): the refusal must not consume or close a verdict the predicate may share ---
+
+
+def test_a_shared_generator_is_still_usable_after_the_refusal(tmp_path: Path) -> None:
+    def counter() -> Generator[int]:
+        n = 0
+        while True:
+            n += 1
+            yield n
+
+    shared = counter()
+    assert next(shared) == 1
+    reg = _reg(tmp_path, accepts={"h": lambda m: shared})
+    with pytest.raises(TypeError, match="handler 'h' returned an object of type generator"):
+        route_only(reg, reg.inbound["IB"], ADT)
+    assert trace_dry_run(reg, ADT, inbound="IB")["disposition"] == MessageStatus.ERROR.value
+    # Neither path advanced it or closed it: the next value is the one after the test's own read.
+    assert next(shared) == 2
+    shared.close()
+
+
+async def _await(coro: Any) -> Any:
+    return await coro
+
+
+def test_a_shared_coroutine_can_still_be_awaited_after_the_refusal(tmp_path: Path) -> None:
+    shared = _verdict_coro()
+    reg = _reg(tmp_path, accepts={"h": lambda m: shared})
+    with pytest.raises(TypeError, match="handler 'h' returned an object of type coroutine"):
+        route_only(reg, reg.inbound["IB"], ADT)
+    assert asyncio.run(_await(shared)) is False  # a closed coroutine raises RuntimeError here
+
+
+def test_a_started_generator_is_refused_without_running_its_finally(tmp_path: Path) -> None:
+    ran: list[str] = []
+
+    def gen() -> Generator[bool]:
         try:
             yield False
         finally:
-            raise ValueError("synthetic: finally boom")
+            ran.append("finally")
 
-    def pred(msg: Any) -> Any:
-        g = gen()
-        next(g)
-        return g
-
-    reg = _reg(tmp_path, accepts={"h": pred})
+    g = gen()
+    next(g)
+    reg = _reg(tmp_path, accepts={"h": lambda m: g})
     with pytest.raises(TypeError, match="handler 'h' returned an object of type generator"):
         route_only(reg, reg.inbound["IB"], ADT)
+    assert ran == []  # its finally belongs to whoever owns it, not to the refusal
+    g.close()
+    assert ran == ["finally"]
 
 
 @pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
@@ -1281,30 +1311,6 @@ def test_a_crafted_class_name_reaches_the_refusal_text_escaped(make: Any) -> Non
     text = str(exc.value)
     assert "\r" not in text and "\n" not in text
     assert "Evil" in text and "INJECTED line" in text  # escaped, not dropped
-
-
-def test_a_crafted_exception_name_from_close_reaches_the_debug_log_escaped(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    evil = type("Boom\r\nINJECTED line", (ValueError,), {})
-
-    def gen() -> Iterator[bool]:
-        try:
-            yield False
-        finally:
-            raise evil("synthetic")
-
-    g = gen()
-    next(g)
-    with (
-        caplog.at_level(logging.DEBUG, logger="messagefoundry.config.wiring"),
-        pytest.raises(TypeError),
-    ):
-        accepts_verdict("h", g)
-    messages = [r.getMessage() for r in caplog.records if "closing the" in r.getMessage()]
-    assert len(messages) == 1
-    assert "\r" not in messages[0] and "\n" not in messages[0]
-    assert "INJECTED line" in messages[0]
 
 
 def test_the_refusal_text_does_not_demand_a_strict_bool() -> None:

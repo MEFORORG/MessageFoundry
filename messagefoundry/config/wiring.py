@@ -6176,10 +6176,12 @@ def accepts_verdict(hname: str, verdict: object) -> bool:
     a generator, an async generator and iterators such as ``filter`` or ``re.finditer`` each read as
     True, so the handler would accept every message. The static check in
     :func:`_check_accepts_predicate` misses a plain function that returns one. The raise propagates
-    out of ``route_only`` like any predicate raise, into the router-stage error path. A coroutine or
-    generator is closed first, so no "never awaited" warning follows. The text names the handler and
-    the verdict's type, never its value. Every mode applies this one rule, so ``[sandbox].mode`` does
-    not change the verdict (ADR 0087).
+    out of ``route_only`` like any predicate raise, into the router-stage error path. The refused
+    object is left as it was, neither consumed nor closed: the predicate may share it, for example a
+    module-level generator, and closing it would end it for every other holder. So a coroutine the
+    predicate made for this call may draw Python's "never awaited" warning when it is collected. The
+    text names the handler and the verdict's type, never its value. Every mode applies this one rule,
+    so ``[sandbox].mode`` does not change the verdict (ADR 0087).
 
     An object whose class defines ``__bool__`` or ``__len__`` has a truth value of its own, so it is
     read by that value as before, iterator or not."""
@@ -6191,22 +6193,6 @@ def accepts_verdict(hname: str, verdict: object) -> bool:
         and not hasattr(cls, "__bool__")
         and not hasattr(cls, "__len__")
     ):
-        if inspect.iscoroutine(verdict) or inspect.isgenerator(verdict):
-            # close() runs the body's finally on a started one. An Exception from it must not
-            # replace the TypeError below, which is the fault the author has to read, so it is
-            # logged by type only (its text may quote message content). MemoryError and any
-            # BaseException still propagate, so the sandbox child can recycle its worker.
-            try:
-                verdict.close()
-            except MemoryError:
-                raise
-            except Exception as exc:  # noqa: BLE001 -- author code; logged, then the TypeError
-                _logger.debug(
-                    "closing the %s that accepts= predicate for handler %r returned raised %s",
-                    scrub_log_argument(cls.__name__),
-                    hname,
-                    scrub_log_argument(type(exc).__name__),
-                )
         # A class name is author-controlled and type() accepts one with CR or LF in it, so it is
         # escaped before it reaches text that is logged. hname goes in through repr, which escapes.
         raise TypeError(
