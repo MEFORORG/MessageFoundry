@@ -895,7 +895,8 @@ async def test_inject_with_no_runner_still_stores(engine: Engine) -> None:
         ("C" * 257, "ADT^A01", (None, "ADT^A01")),
         ("MSG1", "A" * 64, ("MSG1", "A" * 64)),
         ("MSG1", "A" * 65, ("MSG1", None)),
-        # SQL Server counts UTF-16 units, so 129 astral characters are 258 units.
+        # SQL Server counts UTF-16 units: 128 astral characters are 256 units, 129 are 258.
+        ("\U0001f600" * 128, "ADT^A01", ("\U0001f600" * 128, "ADT^A01")),
         ("\U0001f600" * 129, "ADT^A01", (None, "ADT^A01")),
     ],
 )

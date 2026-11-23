@@ -2896,7 +2896,9 @@ class RegistryRunner:
         A value a store column could not hold is dropped to ``None``, because storing it would fail
         an inject that stores with no labels: wider than SQL Server's ``NVARCHAR(256)`` control id or
         ``NVARCHAR(64)`` type, counted in UTF-16 units as it counts them, or holding a NUL, which a
-        hex escape can decode into a summary after the guard's NUL check and Postgres refuses."""
+        hex escape can decode into a summary after the guard's NUL check and Postgres refuses. The
+        widths apply on every backend, so an inject can store ``None`` where a listener on SQLite
+        or Postgres would keep a longer value."""
 
         def storable(value: str | None, max_units: int | None = None) -> str | None:
             if value is None or "\x00" in value:
@@ -2912,14 +2914,16 @@ class RegistryRunner:
             if ic.content_type is not ContentType.HL7V2:
                 return None, ic.content_type.value, None
             ceiling = peek_max_bytes(ic)
-            fields = await asyncio.to_thread(
-                lambda: _read_ingress_fields(Peek.parse(raw, max_bytes=ceiling))
-            )
-            return (
-                storable(fields.control_id, 256),
-                storable(fields.message_type, 64),
-                storable(fields.summary),
-            )
+
+            def read() -> tuple[str | None, str | None, str | None]:
+                fields = _read_ingress_fields(Peek.parse(raw, max_bytes=ceiling))
+                return (
+                    storable(fields.control_id, 256),
+                    storable(fields.message_type, 64),
+                    storable(fields.summary),
+                )
+
+            return await asyncio.to_thread(read)
         except Exception as exc:  # CancelledError is a BaseException, so a cancel still propagates
             log.warning(
                 "inject on %r: reading the stored fields raised %s; storing none",

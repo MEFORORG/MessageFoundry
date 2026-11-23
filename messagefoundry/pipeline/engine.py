@@ -4129,7 +4129,8 @@ class Engine:
         #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
         (BACKLOG #2624). Returns the new message id. The message's origin is ``operator_upload`` with
         ``actor`` as its acting user (vault BACKLOG #2615). The row records the control id, type and
-        summary the listener would (BACKLOG #5707); with no runner to read them they stay ``None``."""
+        summary, read as the listener reads them, less any value a store column could not hold
+        (BACKLOG #5707, :meth:`RegistryRunner.ingress_fields_for`). With no runner they stay ``None``."""
         runner = self._registry_runner
         control_id, message_type, summary = (
             (None, None, None)
