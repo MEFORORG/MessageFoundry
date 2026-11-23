@@ -23,7 +23,6 @@ import importlib.machinery
 import importlib.util
 import marshal
 import os
-import posixpath
 import re
 import runpy
 import subprocess
@@ -35,7 +34,9 @@ from typing import Any, cast
 
 import pytest
 
+from messagefoundry.config import snapshot as snapshot_module
 from messagefoundry.config import wiring
+from messagefoundry.config.code_sets import is_code_set_name
 from messagefoundry.config.fingerprint import (
     UNREADABLE_FILES_KEY,
     config_fingerprint,
@@ -416,37 +417,63 @@ def test_a_code_set_spelled_in_upper_case_is_hashed_as_it_loads(tmp_path: Path) 
     assert "codesets/diets.CSV" in read_config_snapshot(tmp_path, strict=True).files
 
 
-@pytest.mark.parametrize("posix_case", [False, True], ids=["platform-case", "posix-case"])
+@pytest.mark.parametrize("strict", [False, True], ids=["observational", "strict"])
 @pytest.mark.parametrize("name", ["X.CSV", "X.Csv", "x.cSv", "X.TOML", "x.Toml"])
-def test_every_code_set_spelling_the_loader_reads_is_in_the_strict_digest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, posix_case: bool
+def test_every_code_set_spelling_the_loader_reads_is_in_the_digest(
+    tmp_path: Path, name: str, strict: bool
 ) -> None:
-    """BACKLOG #5323: the strict digest a dual-control reload binds covers each code-set table the
-    loader reads, whatever case its suffix is spelled in. ``posix-case`` makes ``os.path.normcase``
-    case-preserving, as it is on POSIX, so a rule that leaned on the platform's case folding fails
-    here on Windows too, not only on a Linux runner."""
-    if posix_case:
-        monkeypatch.setattr(os.path, "normcase", posixpath.normcase)
+    """Vault BACKLOG #5323: the digest, the strict one a dual-control reload binds included, covers
+    each code-set table the loader reads, whatever case its suffix is spelled in. As the test
+    above says, only a POSIX run discriminates a case-sensitive glob here; the next test pins the
+    rule itself, on any platform."""
     (tmp_path / "graph.py").write_text(_graph("V1"), encoding="utf-8")
     (tmp_path / "codesets").mkdir()
     table = tmp_path / "codesets" / name
     body = "k,v\na,{}\n" if name.lower().endswith(".csv") else 'a = "{}"\n'
     table.write_text(body.format("b"), encoding="utf-8")
     assert Path(name).stem in load_config(tmp_path).code_sets
-    assert f"codesets/{name}" in read_config_snapshot(tmp_path, strict=True).files
-    before = config_fingerprint(tmp_path, strict=True)
+    assert f"codesets/{name}" in read_config_snapshot(tmp_path, strict=strict).files
+    before = config_fingerprint(tmp_path, strict=strict)
     table.write_text(body.format("c"), encoding="utf-8")
-    assert config_fingerprint(tmp_path, strict=True) != before
+    assert config_fingerprint(tmp_path, strict=strict) != before
+
+
+def test_the_snapshot_selects_code_sets_by_the_loader_s_own_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #5323, on any platform: the snapshot asks
+    :func:`~messagefoundry.config.code_sets.is_code_set_name` about every name in ``codesets/``
+    and keeps exactly the ones it accepts. A selection by the platform's own case rule, such as
+    the ``codesets/*.csv`` glob that was case-sensitive only on POSIX, would not consult it, and
+    the rule itself folds the suffix to lower case without asking the platform."""
+    (tmp_path / "codesets").mkdir()
+    names = ["X.CSV", "x.Toml", "x.csv.bak", "xcsv", "x.tsv", "keep.txt"]
+    for name in names:
+        (tmp_path / "codesets" / name).write_text("k,v\na,b\n", encoding="utf-8")
+    asked: list[str] = []
+
+    def rule(name: str) -> bool:
+        asked.append(name)
+        return name == "keep.txt"  # the opposite of the real rule, so obedience is visible
+
+    monkeypatch.setattr(snapshot_module, "is_code_set_name", rule)
+    held = read_config_snapshot(tmp_path, strict=True).files
+    assert set(asked) >= set(names)
+    assert [rel for rel in held if rel.startswith("codesets/")] == ["codesets/keep.txt"]
+    assert [n for n in names if is_code_set_name(n)] == ["X.CSV", "x.Toml"]
 
 
 def test_a_file_the_loader_does_not_read_as_a_code_set_is_not_in_the_digest(tmp_path: Path) -> None:
-    """The control for the test above: the rule is the loader's, not "everything in the folder"."""
+    """The control for the tests above: the rule is the loader's, not "everything in the folder"."""
     (tmp_path / "graph.py").write_text(_graph("V1"), encoding="utf-8")
     (tmp_path / "codesets").mkdir()
-    (tmp_path / "codesets" / "notes.txt").write_text("k,v\na,b\n", encoding="utf-8")
-    assert "notes" not in load_config(tmp_path).code_sets
+    skipped = [tmp_path / "codesets" / n for n in ("notes.txt", "x.csv.bak", "xcsv", "x.TSV")]
+    for path in skipped:
+        path.write_text("k,v\na,b\n", encoding="utf-8")
+    assert not load_config(tmp_path).code_sets
     before = config_fingerprint(tmp_path, strict=True)
-    (tmp_path / "codesets" / "notes.txt").write_text("k,v\na,c\n", encoding="utf-8")
+    for path in skipped:
+        path.write_text("k,v\na,c\n", encoding="utf-8")
     assert config_fingerprint(tmp_path, strict=True) == before
 
 
