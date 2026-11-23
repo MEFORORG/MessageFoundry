@@ -4858,9 +4858,8 @@ def _full_open_check(
         if walked_cells:
             # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
             if walked[0] != "PASS":
-                # A finding of a kind in `_MISREADABLE_KINDS` is offered the reading that this
-                # build read another version's cells or schema differently. Those kinds also take
-                # faults that are no misread, so the reading is a possible cause, not a finding.
+                # Which findings get the misread reading, and what it does not claim, is
+                # `_MISREADABLE_KINDS`'s to say.
                 why = (
                     " (the remedy leads because this build can misread another version's cells"
                     " or schema)"
@@ -4970,12 +4969,11 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
 
 #: What decided a :func:`_decrypt_check` verdict. ``cell`` is, under a key, at least a sealed value
 #: that did not open, other than one :func:`gave_no_verdict` reads as the key service's
-#: (``outage``); a failure that function does not recognise is ``cell``, such as a single-value
-#: Transit decrypt answered 2xx with no ``data.plaintext``, or a batch result with neither
-#: ``plaintext`` nor ``error``. It is also a value that opened but its reader refuses (a
-#: ``QueueTagError``); a value whose AAD the open refused (an ``AADComponentError``); a marker in
-#: another ASCII case; and, on a surface the keyed store sealed and without
-#: ``allow_unmarked_ciphertext``, a value with no marker. ``damaged`` is a BLOB, or a
+#: (``outage``); a single-value Transit decrypt answered 2xx with no ``data.plaintext`` is one, and
+#: so is a batch result with neither ``plaintext`` nor ``error``. It is also a value that opened
+#: but its reader refuses (a ``QueueTagError``); a value whose AAD the open refused (an
+#: ``AADComponentError``); a marker in another ASCII case; and, on a surface the keyed store sealed
+#: and without ``allow_unmarked_ciphertext``, a value with no marker. ``damaged`` is a BLOB, or a
 #: TEXT value that is not UTF-8, for which Python's sqlite3 module raises a decode error; at least
 #: this build's own writer stores neither. ``sqlite_schema`` is a statement the snapshot's schema
 #: could not answer, by :func:`is_schema_step_error`, other than a virtual table's missing module;
@@ -4996,14 +4994,14 @@ WalkKind = Literal[
 #: that a walk under this build read another version's cells or schema differently, as well as
 #: real damage. The reading is a possible cause there, never a finding that the cells are sound.
 #: They are not every kind a fault of that shape can reach, and a fault of any other kind gets no
-#: such framing. At least two such gaps are known, each a misread only if a version this build
-#: cannot check wrote the snapshot. One is kind ``damaged`` (see :data:`WalkKind`), should another
-#: version's writer store what that kind names, which this build's writer does not. The other is a
-#: keyed walk of a cipher column with an unregistered collation ("no such collation sequence"),
-#: kind ``sqlite``: that text is not in ``schema_verify._SHAPE_MESSAGES``, so
-#: :func:`is_schema_step_error` rejects it and :func:`_sqlite_kind` falls through to ``sqlite``.
-#: This build's code calls no ``create_collation``, so in a snapshot it wrote that fault is an
-#: object another tool left.
+#: such framing. At least two such gaps are known, each a misread where another version wrote the
+#: snapshot. One is kind ``damaged`` (see :data:`WalkKind`), should another version's writer store
+#: what that kind names. The other is a keyed walk of a cipher column with an unregistered
+#: collation ("no such collation sequence"), kind ``sqlite`` where the collation's own
+#: name holds no ``schema_verify._SHAPE_MESSAGES`` entry: :func:`is_schema_step_error` matches
+#: those entries as substrings of the whole message, so it rejects that one, and
+#: :func:`_sqlite_kind` falls through to ``sqlite``. This build's SQLite schema declares no
+#: collation.
 _MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
 
 
