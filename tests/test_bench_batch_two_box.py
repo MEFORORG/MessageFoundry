@@ -30,6 +30,7 @@ from harness.load.connscale.runner import ConnScaleError, _excusal
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import FailoverError
 from harness.load.metrics import Counters
+from messagefoundry.terminal_text import escape_for_terminal
 
 _MINIMAL_BATCH = """
 [connscale]
@@ -671,7 +672,8 @@ async def test_an_operator_limit_too_small_for_the_largest_cell_stops_before_any
 # --------------------------------------------------------------------------------------------------
 
 # Stands in for a driver error's text, which can carry connection details.
-_SECRET_TEXT = "Server=db.invalid;Password=not-a-real-one"
+_SECRET_VALUE = "not-a-real-one"
+_SECRET_TEXT = f"Server=db.invalid;Password={_SECRET_VALUE}"
 _SERVER_BATCH = _MINIMAL_BATCH.replace(
     "trials = 3", 'trials = 1\nstore_backend = "sqlserver"'
 ).replace("batch_modes = [false, true]", "batch_modes = [false]")
@@ -691,11 +693,11 @@ def _raiser(exc: BaseException) -> Callable[..., Any]:
 
 def _assert_logged_by_type_only(report: Any, caplog: pytest.LogCaptureFixture) -> None:
     assert any("RuntimeError" in r.getMessage() for r in caplog.records)
-    assert _SECRET_TEXT not in repr(report.notes) + caplog.text
+    assert _SECRET_VALUE not in repr(report.notes) + caplog.text
 
 
 @pytest.mark.usefixtures("no_auth_env")
-async def test_a_failed_store_reset_fails_the_cell_by_type_name_only_bug_5857(
+async def test_a_failed_store_reset_fails_the_cell_without_its_secret_bug_5857(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     eng_rec = _install_engine_fakes(monkeypatch)
@@ -707,8 +709,69 @@ async def test_a_failed_store_reset_fails_the_cell_by_type_name_only_bug_5857(
     assert not report.ok
     assert all("store reset failed: RuntimeError" in (c.error or "") for c in report.cells)
     assert all("store reset failed: RuntimeError" in r["error"] for r in readies)
-    assert _SECRET_TEXT not in repr(report.to_json_dict())
-    assert _SECRET_TEXT not in repr(readies)
+    assert _SECRET_VALUE not in repr(report.to_json_dict())
+    assert _SECRET_VALUE not in repr(readies)
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_a_failed_store_reset_keeps_the_remedy_and_drops_the_secret_bug_5857(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Before this path failed the cell, the store's refusal reached the operator through the engine's
+    # log tail. Failing earlier must not lose its remedy, and must not print the driver's secret.
+    remedy = (
+        "a DBA must run once: alter database [mefor_test] SET READ_COMMITTED_SNAPSHOT on"
+        " with rollback immediate"
+    )
+    _install_engine_fakes(monkeypatch)
+    # The store puts the driver's diagnostics BEFORE the remedy, so a long one must not cut it off.
+    diagnostics = "driver diagnostic; " * 80
+    monkeypatch.setattr(
+        bb,
+        "_reset_server_store",
+        _raiser(RuntimeError(f"{diagnostics}{remedy}\nnote: forged\n{_SECRET_TEXT}")),
+    )
+
+    report, readies = await _engine_report()
+
+    for text in [c.error or "" for c in report.cells] + [r["error"] for r in readies]:
+        assert "store reset failed: RuntimeError" in text
+        assert remedy in text
+        assert "not-a-real-one" not in text
+        assert "\n" not in text  # driver text cannot print a line that reads as a real note
+    assert "not-a-real-one" not in repr(report.to_json_dict())
+
+
+_REMEDY = "a DBA must run once: alter database [mefor_test] SET READ_COMMITTED_SNAPSHOT on"
+
+
+@pytest.mark.parametrize("diagnostic_chars", [3900, 5000])
+def test_a_long_diagnostic_cannot_cut_the_remedy_after_it_bug_5857(diagnostic_chars: int) -> None:
+    # Words, because the redactor masks one unbroken run whole and nothing would need cutting.
+    diagnostic = ("driver diagnostic; " * 300)[:diagnostic_chars]
+    text = bb._store_reset_failure(RuntimeError(f"{diagnostic}{_REMEDY}"))
+    assert _REMEDY in text
+    assert bb._RESET_CUT_MARK in text
+    assert len(text) + bb._RESET_ERROR_WRAP <= bb._RESET_ERROR_CHARS
+
+
+def test_text_within_the_cap_carries_no_cut_marker_bug_5857() -> None:
+    text = bb._store_reset_failure(RuntimeError(_REMEDY))
+    assert _REMEDY in text
+    assert bb._RESET_CUT_MARK not in text
+
+
+def test_the_cap_holds_after_escaping_and_never_splits_an_escape_bug_5857() -> None:
+    emoji = "\U0001f600"
+    one = escape_for_terminal(emoji, single_line=True)
+    assert len(one) > 1  # the input must actually grow when escaped, or this proves nothing
+
+    text = bb._store_reset_failure(RuntimeError(emoji * 5000))
+
+    assert len(text) + bb._RESET_ERROR_WRAP <= bb._RESET_ERROR_CHARS
+    tail = text.split(bb._RESET_CUT_MARK, 1)[1]
+    assert tail and len(tail) % len(one) == 0
+    assert tail == one * (len(tail) // len(one))
 
 
 @pytest.mark.usefixtures("no_auth_env")
@@ -764,7 +827,7 @@ async def test_a_stop_failure_after_a_failed_start_does_not_read_as_a_fault_bug_
     assert all((c.error or "").startswith("engine did not start") for c in report.cells)
     stop_notes = [n for n in report.notes if "stop" in n and "RuntimeError" in n]
     assert stop_notes
-    assert all("may never have started" in n and "RUNNING" not in n for n in stop_notes)
+    assert all("root process is not running" in n and "RUNNING" not in n for n in stop_notes)
     _assert_logged_by_type_only(report, caplog)
 
 
@@ -782,7 +845,7 @@ async def test_a_failed_start_that_left_a_live_process_says_so_bug_5857(
 
     stop_notes = [n for n in report.notes if "stop" in n and "RuntimeError" in n]
     assert stop_notes
-    assert all("RUNNING" in n and "may never have started" not in n for n in stop_notes)
+    assert all("RUNNING" in n and "root process is not running" not in n for n in stop_notes)
     _assert_logged_by_type_only(report, caplog)
 
 
