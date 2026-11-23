@@ -518,8 +518,7 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     """Whether Digest is selected, after refusing what cannot stand beside it (BACKLOG #5529).
 
     The connectors call this at the top of construction, so a connection that will not build logs
-    no insecure-hop crossing or warning first; :func:`digest_handler_from_settings` calls it again
-    unless the caller passes the answer it already holds.
+    no insecure-hop crossing or warning first; :func:`digest_handler_from_settings` calls it again.
     Refuses an unrecognised ``http_auth`` (:func:`http_digest_selected`), and with Digest selected,
     a static ``bearer_token``, ``basic_user``, ``basic_password`` or ``Authorization`` entry in
     ``headers``: beside Digest, a connection configures exactly one HTTP credential. Where such a
@@ -536,8 +535,7 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     _, (_, _, conn), _ = hop_declarations_from_settings(s, HttpAuthError)
     prefix = hop_name_prefix(conn)
     static = [name for name in ("bearer_token", "basic_user", "basic_password") if s.get(name)]
-    extra = s.get("headers")
-    if isinstance(extra, Mapping) and any(is_authorization_header_name(str(k)) for k in extra):
+    if _static_authorization_header(s):
         static.append("an Authorization entry in headers")
     if static:
         raise HttpAuthError(
@@ -583,10 +581,15 @@ def authorization_credential(s: Mapping[str, Any], *, digest: bool) -> str | Non
         return "HTTP Basic"
     if s.get("bearer_token"):
         return "a bearer_token"
-    extra = s.get("headers")
-    if isinstance(extra, Mapping) and any(is_authorization_header_name(str(k)) for k in extra):
+    if _static_authorization_header(s):
         return "an Authorization entry in headers"
     return None
+
+
+def _static_authorization_header(s: Mapping[str, Any]) -> bool:
+    """Whether the static ``headers`` table holds ``Authorization`` in any spelling."""
+    extra = s.get("headers")
+    return isinstance(extra, Mapping) and any(is_authorization_header_name(str(k)) for k in extra)
 
 
 def refuse_authorization_signer_beside_credential(
@@ -597,6 +600,8 @@ def refuse_authorization_signer_beside_credential(
     BACKLOG #5526 item 6). ``_post`` writes the signature per request after the configured or
     minted credential, so under that name it would replace the credential on every send. Called
     by REST and SOAP; a signature under that name with no credential beside it still builds."""
+    if sign_header is None or not is_authorization_header_name(sign_header):
+        return
     _refuse_authorization_signer(
         sign_header, authorization_credential(s, digest=digest), connection
     )
@@ -613,7 +618,7 @@ def _refuse_authorization_signer(
 
 
 def digest_handler_from_settings(
-    s: Mapping[str, Any], *, url: str, digest_selected: bool | None = None
+    s: Mapping[str, Any], *, url: str
 ) -> urllib.request.HTTPDigestAuthHandler | None:
     """An :class:`urllib.request.HTTPDigestAuthHandler` pre-loaded with the connection's credentials
     (BACKLOG #65, RFC 7616), or ``None`` when HTTP Digest auth is off (``http_auth`` unset, falsy
@@ -626,13 +631,8 @@ def digest_handler_from_settings(
     through the rule the delivery cells' credentials share (``refuse_cleartext_credential_hop``): only
     a loopback host lifts it, never ``tls_hop_attested`` or ``cleartext_accepted`` (vault BACKLOG #3533
     item 4). A missing user/password is a loud :class:`HttpAuthError` (fail-closed, never a silent
-    no-auth request).
-
-    ``digest_selected`` is :func:`refuse_http_digest_conflicts`'s answer where the caller already
-    ran it on these settings, so it is not run twice per build (BACKLOG #5526 item 4); ``None``, the
-    default, runs it here."""
-    selected = refuse_http_digest_conflicts(s) if digest_selected is None else digest_selected
-    if not selected:
+    no-auth request)."""
+    if not refuse_http_digest_conflicts(s):
         return None
     # The declarations are read strictly: a non-bool flag raises HttpAuthError naming the connection
     # (vault BACKLOG #2232), and the mirrored connection name heads the refusal below.

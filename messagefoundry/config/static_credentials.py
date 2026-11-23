@@ -183,16 +183,24 @@ def _oauth2(settings: Mapping[str, Any]) -> bool:
     return oauth2_auth_configured(settings)
 
 
-def _digest(settings: Mapping[str, Any]) -> bool:
+def _digest(
+    settings: Mapping[str, Any], *, token: bool = False, env_values: Mapping[str, Any] | None = None
+) -> bool:
     """Whether ``http_auth`` selects Digest, read as the REST, SOAP and FHIR destinations read it.
     DICOMweb and ``FhirLookup`` build no Digest handler, so on them a ``True`` here names a
-    credential the hop does not send; the census lists it all the same."""
+    credential the hop does not send; the census lists it all the same.
+
+    BACKLOG #5526 item 9: an ``env()`` ``http_auth`` is read as the build resolves it, against
+    ``env_values`` (``config.wiring._resolved_setting``). One this reading cannot resolve may
+    resolve to ``digest``, so it reads as Digest, as an unresolved ``oauth2_enabled`` reads as on,
+    except beside a minted bearer (``token``): the build refuses Digest there, so none crosses."""
     from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
 
-    if isinstance(settings.get("http_auth"), EnvRef):
-        # BACKLOG #5526 item 9: read before env() resolves, the mode is unknown, and it may resolve
-        # to 'digest', so it is listed, as an unresolved oauth2_enabled reads as on.
-        return True
+    mode = _resolved_setting(settings, "http_auth", None, env_values)
+    if mode is _UNRESOLVED:
+        return not token
+    if mode is not settings.get("http_auth"):
+        settings = {**settings, "http_auth": mode}
     try:
         return http_digest_selected(settings)
     except HttpAuthError as exc:
@@ -205,8 +213,9 @@ def _digest(settings: Mapping[str, Any]) -> bool:
 
 def _static_authorization(settings: Mapping[str, Any]) -> list[str]:
     """The static credential the connector writes into its own ``Authorization`` header. With both
-    a ``bearer_token`` and a Basic pair set, REST, SOAP and DICOMweb refuse to build, and FHIR
-    sends Basic, so only Basic is listed (BACKLOG #5526 item 2)."""
+    a ``bearer_token`` and a Basic pair set, FHIR sends Basic, so only Basic is listed (BACKLOG
+    #5526 item 2). REST, SOAP and DICOMweb refuse to build on both, and Basic is listed for them
+    all the same: this reader does not take the connector type."""
     if settings.get("basic_user") and settings.get("basic_password"):
         return ["HTTP Basic"]
     if settings.get("bearer_token"):
@@ -214,7 +223,13 @@ def _static_authorization(settings: Mapping[str, Any]) -> list[str]:
     return []
 
 
-def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool) -> list[str]:
+def _http_static(
+    ctype: ConnectorType,
+    settings: Mapping[str, Any],
+    token: bool,
+    *,
+    env_values: Mapping[str, Any] | None = None,
+) -> list[str]:
     """The static credentials an HTTP-family hop actually puts on the wire.
 
     A minted SMART or OAuth2 bearer replaces the ``Authorization`` header, so a static bearer or
@@ -228,7 +243,7 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
     out = [] if token else _static_authorization(settings)
     # The connector answers a Digest challenge only in http_auth='digest' mode, and refuses to build
     # in that mode with either half missing, so the mode is the predicate, not the credential keys.
-    if _digest(settings):
+    if _digest(settings, token=token, env_values=env_values):
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
         # With ws_security on the connector refuses to build on one half of the pair (#5526), so
@@ -350,7 +365,7 @@ def _http_hop(
     presents (:func:`_http_literal_static`), so it lists the hop even beside a compliant kind."""
     compliant_kind = ctype is not ConnectorType.DICOMWEB
     token = _http_token(ctype, settings, lookup=lookup)
-    static = _http_static(ctype, settings, token)
+    static = _http_static(ctype, settings, token, env_values=env_values)
     displaced = token or bool(_static_authorization(settings))
     static += _http_literal_static(ctype, settings, displaced=displaced, env_values=env_values)
     if static:

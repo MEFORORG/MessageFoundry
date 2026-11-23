@@ -343,7 +343,11 @@ def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
         return None, 0
     # One scan from 0, so markup opened before the Body start tag is known after it.
     outside = _search_outside_markup(_FAULT_OUTSIDE_MARKUP_RE, body, 0, len(body))
-    m = _search_outside_markup(_BODY_OUTSIDE_MARKUP_RE, body, 0, len(body))
+    m = _BODY_RE.search(body)
+    if m is not None and (body.find("<!", 0, m.start()) >= 0 or body.find("<?", 0, m.start()) >= 0):
+        # Closing step 6: only markup opened ahead of the first plain Body start tag can hide it,
+        # so the Python-level step-over runs only then.
+        m = _search_outside_markup(_BODY_OUTSIDE_MARKUP_RE, body, 0, len(body))
     if m is None:
         return outside or plain, 0
     after = outside
@@ -962,7 +966,7 @@ class SoapDestination(DestinationConnector):
         # #65: or HTTP Digest folded into the opener. None (default) -> byte-identical.
         from messagefoundry.transports.http_auth import digest_handler_from_settings
 
-        digest = digest_handler_from_settings(s, url=self.url, digest_selected=digest_selected)
+        digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
             # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
             if _is_shared_no_redirect_opener(self._opener):
@@ -1426,8 +1430,9 @@ class SoapDestination(DestinationConnector):
         Code close-tag search. The name scans still run, in :func:`_searched_code`, wherever that
         first-child read yields no code, as it does on a ``<Fault>`` followed by a run of ``<``; the PR 2936 repair moved the Fault start-tag search and the Fault
         and Code close-tag searches into :func:`_search_outside_markup`'s Python-level loop, which
-        a reply of many markup runs makes several times slower. So they are not a reading of this
-        code."""
+        a reply of many markup runs makes several times slower, and BACKLOG #5912 closing step 6
+        moved the Body start-tag search there too wherever a ``<!`` or ``<?`` precedes the first
+        plain Body start tag. So they are not a reading of this code."""
         # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
         # boundary), so the per-call MessageID and Timestamp never live in a pure transform.
         if self._ws_mode:

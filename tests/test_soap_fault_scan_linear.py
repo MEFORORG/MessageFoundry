@@ -858,6 +858,7 @@ def test_the_fault_is_read_from_the_body(
     patched out the shape reads otherwise, as it did when the first Fault, and any WS-Security
     code, anywhere was read."""
     assert _outcome(_classify_soap(200, body)) == outcome
+    monkeypatch.setattr(soap, "_BODY_RE", _NO_BODY_ANCHOR)
     monkeypatch.setattr(soap, "_BODY_OUTSIDE_MARKUP_RE", _NO_BODY_ANCHOR)
     assert _outcome(_classify_soap(200, body)) == unanchored
 

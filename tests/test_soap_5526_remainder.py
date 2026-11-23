@@ -2,10 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5526, the items left after engine PRs 2883 and 3144: one credential owns the
 ``Authorization`` header on SOAP, and a signing header does not replace it on SOAP or REST; the
-static-credential census lists what is sent; and the Digest refusal runs once per SOAP build and
-names the connection. Synthetic credentials only.
+static-credential census lists what is sent; and the SOAP Digest refusal names the connection.
+Synthetic credentials only.
 
-Items 2, 4, 5, 6 and 9 are pinned here; each test names its item."""
+Items 2, 5, 6 and 9 are pinned here; each test names its item."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.static_credentials import http_hop_credentials
+from messagefoundry.config.static_credentials import _http_hop, http_hop_credentials
 from messagefoundry.config.tls_policy import MIRRORED_CONNECTION_SETTING
 from messagefoundry.config.wiring import EnvRef, Rest, Soap
-from messagefoundry.transports import build_destination, http_auth
+from messagefoundry.transports import build_destination
 from messagefoundry.transports.http_auth import (
     HttpAuthError,
     is_authorization_header_name,
@@ -163,33 +163,44 @@ def test_the_census_reads_an_unresolved_env_http_auth_as_digest() -> None:
     assert "HTTP Digest" not in http_hop_credentials(ConnectorType.REST, {"http_auth": "digset"})
 
 
-# --- items 4 and 5: the Digest refusal runs once on SOAP and names the connection --------------
-
-
-def test_the_digest_conflict_check_runs_once_per_soap_build(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("env_values", "listed"),
+    [({"MF_HTTP_AUTH_SYNTHETIC": "digest"}, True), ({"MF_HTTP_AUTH_SYNTHETIC": ""}, False)],
+    ids=["resolves-to-digest", "resolves-empty"],
+)
+def test_the_census_resolves_an_env_http_auth_against_the_values(
+    env_values: dict[str, str], listed: bool
 ) -> None:
-    """Item 4: ``SoapDestination`` refused Digest conflicts at the top of its build and
-    ``digest_handler_from_settings`` refused them again. Control: the handler is still built."""
-    calls: list[object] = []
-    original = http_auth.refuse_http_digest_conflicts
+    """Item 9, review round 1: with the values the serve-time guard holds, the mode is read as
+    the build resolves it, so an empty one lists no Digest and a SOAP mTLS hop is not listed."""
+    settings = {
+        "url": URL,
+        "http_auth": EnvRef("MF_HTTP_AUTH_SYNTHETIC"),
+        "client_cert_file": "client.pem",
+    }
+    hop = _http_hop("OB_SOAP", ConnectorType.SOAP, settings, "peer", env_values=env_values)
+    assert (hop is not None and "HTTP Digest" in hop.detail) is listed
+    if not listed:
+        assert hop is None
 
-    def counting(s: Any) -> bool:
-        calls.append(s)
-        return original(s)
 
-    monkeypatch.setattr(http_auth, "refuse_http_digest_conflicts", counting)
-    settings = with_http_digest(Soap(url=URL), user="u", password=_PW).settings
-    dest = _build(ConnectorType.SOAP, settings)
-    assert any(type(h).__name__ == "_ApprovedDigestAuthHandler" for h in dest._opener.handlers)
-    assert len(calls) == 1
+def test_the_census_reads_no_digest_beside_a_minted_bearer() -> None:
+    """Item 9, review round 1: Digest beside an OAuth2 or SMART provider refuses the build, so an
+    unresolved ``env()`` ``http_auth`` there lists no Digest and the hop is not reported."""
+    settings = _oauth(Rest(url=URL)).settings
+    settings["http_auth"] = EnvRef("MF_HTTP_AUTH_SYNTHETIC")
+    assert "HTTP Digest" not in http_hop_credentials(ConnectorType.REST, settings)
+    assert _http_hop("OB_REST", ConnectorType.REST, settings, "peer") is None
+
+
+# --- item 5: the SOAP Digest refusal names the connection --------------------------------------
 
 
 def test_a_soap_digest_refusal_names_the_connection_built_directly() -> None:
     """Item 5: the Digest refusals read the connection name the runner mirrors into the settings,
     while the rest of the SOAP build reads ``config.name``. A destination built without the runner
-    had no mirror, so its Digest refusal named no connection. Control: the mirror, where set,
-    is what the refusal names."""
+    had no mirror, so its Digest refusal named no connection. Control: a mirror the runner set
+    is kept, so the refusal names it and not ``config.name``."""
     settings = with_http_digest(Soap(url=URL, bearer_token=_TOKEN), user="u", password=_PW).settings
     assert MIRRORED_CONNECTION_SETTING not in settings
     with pytest.raises(HttpAuthError, match="beside a static credential") as ei:
@@ -198,10 +209,11 @@ def test_a_soap_digest_refusal_names_the_connection_built_directly() -> None:
     with pytest.raises(HttpAuthError) as mirrored:
         _build(
             ConnectorType.SOAP,
-            {**settings, MIRRORED_CONNECTION_SETTING: "OB_SOAP_DIRECT"},
+            {**settings, MIRRORED_CONNECTION_SETTING: "OB_SOAP_MIRRORED"},
             name="OB_SOAP_DIRECT",
         )
-    assert "OB_SOAP_DIRECT" in str(mirrored.value)
+    assert "OB_SOAP_MIRRORED" in str(mirrored.value)
+    assert "OB_SOAP_DIRECT" not in str(mirrored.value)
 
 
 def test_control_the_soap_build_does_not_alter_its_settings() -> None:

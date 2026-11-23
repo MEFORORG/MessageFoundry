@@ -3002,7 +3002,7 @@ follow-on and is **not** built.
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — via `env()`). Beside a Basic pair it is refused at construction, since the two share the header (BACKLOG #5526) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`). Set both or neither: one alone is refused at construction (BACKLOG #5526). A configured `bearer_token` or Basic pair replaces a static `Authorization` header of any casing |
-| OAuth2 client credentials | — | wrap the spec: `with_oauth2_client_credentials(Soap(...), token_url=..., client_id=..., client_secret=...)` (from `messagefoundry.transports.http_auth`; keep the secret in `env()`). A static `Authorization` header, a `bearer_token` and a Basic pair are then not sent, and the construction length check does not judge them. |
+| OAuth2 client credentials | — | wrap the spec: `with_oauth2_client_credentials(Soap(...), token_url=..., client_id=..., client_secret=...)` (from `messagefoundry.transports.http_auth`; keep the secret in `env()`). A static `Authorization` header, a `bearer_token` or a Basic pair is then not sent, and the construction length check does not judge it; a `bearer_token` and a Basic pair together are still refused at construction (BACKLOG #5526). |
 | `timeout_seconds` | `30` | per-request timeout, in seconds above zero: zero or a negative is refused when the connection is built |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
@@ -3024,8 +3024,8 @@ can decide the class, and a `</Fault>` inside one ends its range, so
 `<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`
 reads no code and dead-letters. The read, its fallback and the one shape read again are stated once,
 in the `_fault_code` docstring in [`transports/soap.py`](../messagefoundry/transports/soap.py). The
-Fault is the first Fault start tag after the first Body start tag, or with no Fault after it the first
-in the reply, each searched for outside terminated markup; only where every Fault start tag after that Body start tag (with none there, every
+Fault is the first Fault start tag after the first Body start tag outside terminated markup, or with
+no Fault after it the first in the reply, the Fault start tag also searched for outside such markup; only where every Fault start tag after that Body start tag (with none there, every
 one) is inside such markup is the first of them taken as the Fault, so such a reply never reads as
 delivered. A Fault where neither read finds a code reads as a permanent fault.
 The WS-Security check is separate: a WS-Security code anywhere from where the Fault search starts (after
