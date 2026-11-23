@@ -1176,8 +1176,9 @@ def test_loading_settings_logs_no_renew_bound_warning(
     assert not [r for r in caplog.records if _TWICE_THE_CLAMP in r.getMessage()]
 
 
-# Where ``serve`` logs the warning is pinned in tests/test_b1497_serve_warning_order.py, which needs
-# no database. Its docstring says why it was split out of this server-gated file.
+# Where ``serve`` logs the warning is pinned in tests/test_b1497_serve_warning_order.py. It reads
+# ``messagefoundry.__main__``, which this server-gated file must not import: the ``serverdb`` regex
+# does not admit ``messagefoundry/__init__.py`` (tests/test_serverdb_ci_coverage.py).
 
 
 # --- against a real server -----------------------------------------------------
