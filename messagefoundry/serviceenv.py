@@ -207,6 +207,12 @@ class ServiceEnvPosture:
     #: such a string and keep each other line no step above removes, never to remove the string
     #: whole (the Lander's hold on PR 3142, comment 7090314503).
     directory_mixed_in_extra: bool = False
+    #: Each look-alike spelling of ``MEFOR_SECRETS_DIRECTORY`` a line of any string in the lists
+    #: sets, as written (:func:`_directory_lookalike`), once each in the order read. The remedy
+    #: alone reads this: it names each one by its code points, says to take it out, and never
+    #: keeps it, since install-service.ps1 does not match it and a re-run adds an ASCII entry
+    #: beside it (the Lander's hold on PR 3142, comment 7092584745).
+    directory_lookalikes: tuple[str, ...] = field(default=(), repr=False)
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -941,7 +947,13 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                 path = _directory_entry_value(strings[i])
                 only_after[i] = only_after[i] and path is not None
                 any_after[i] = True
-                path_after[i] = path_after[i] or (path is not None and not _still_blank(path))
+                # Only the ASCII spelling is ever kept: a look-alike is one to take out
+                # (_directory_lookalike; the Lander's hold on PR 3142, comment 7092584745).
+                path_after[i] = path_after[i] or (
+                    path is not None
+                    and not _still_blank(path)
+                    and _directory_lookalike(strings[i]) is None
+                )
         for variable in joined:
             index = bisect.bisect_right(starts, variable.line or 1) - 1
             local = (variable.line or 1) - starts[index] + 1
@@ -984,8 +996,31 @@ def _sets_directory(entry: str) -> bool:
     are stripped, so a blank such as U+00A0 stays in it and the name does not count (the
     Lander's hold on PR 3142, comment 7091598959)."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
-    written, equals, _rest = first.partition("=")
-    return bool(equals) and written.strip(" \t").upper() == _DIRECTORY_VARIABLE
+    return _directory_name(first) is not None
+
+
+def _directory_name(line: str) -> str | None:
+    """The name ``line`` sets, as written with ASCII spaces and tabs stripped, when it sets
+    ``MEFOR_SECRETS_DIRECTORY`` as :func:`_sets_directory` reads one; else None."""
+    written, equals, _rest = line.partition("=")
+    name = written.strip(" \t")
+    return name if equals and name.upper() == _DIRECTORY_VARIABLE else None
+
+
+def _directory_lookalike(line: str) -> str | None:
+    """The name ``line`` sets when it is a look-alike spelling of ``MEFOR_SECRETS_DIRECTORY``:
+    one :func:`_directory_name` reads as that name that is not ASCII, such as one holding U+017F.
+    ``os.environ`` reads it as the directory, but install-service.ps1's ``OrdinalIgnoreCase``
+    match does not, so a re-run of it adds the ASCII spelling beside it (the Lander's hold on PR
+    3142, comment 7092584745)."""
+    name = _directory_name(line)
+    return name if name is not None and not name.isascii() else None
+
+
+def _with_code_points(name: str) -> str:
+    """``name`` with each character outside ASCII written as ``<U+XXXX>``, so the remedy names a
+    look-alike exactly, and prints on any console."""
+    return "".join(c if c.isascii() else f"<U+{ord(c):04X}>" for c in name)
 
 
 def _sets_only_directory(entry: str) -> bool:
@@ -1167,6 +1202,14 @@ def read_service_env_posture(
         ),
         directory_mixed_in_extra=any(
             _sets_directory_beside_more(entry) for where, entry in entries if where == _EXTRA_LIST
+        ),
+        directory_lookalikes=tuple(
+            dict.fromkeys(
+                name
+                for _where, entry in entries
+                for line in _LINE_BREAK.split(entry)
+                if (name := _directory_lookalike(line)) is not None
+            )
         ),
     )
 
@@ -1379,6 +1422,22 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             "At least one refused variable's value runs on past its own entry, so remove the "
             "entries it runs on into with it, or the value stays in the registry key"
         )
+    lookalikes = posture.directory_lookalikes
+    if lookalikes:
+        # Never kept, blank or not, and never taken as the real entry: the engine reads it
+        # through os.environ, install-service.ps1 does not see it, and a blank one beside an
+        # ASCII entry still reads as '' (the Lander's hold on PR 3142, comment 7092584745).
+        steps.append(
+            f"At least one entry spells {_DIRECTORY_VARIABLE} with a character outside ASCII, "
+            "written here with each such character as its code point: "
+            f"{', '.join(_with_code_points(name) for name in lookalikes)}. The engine reads such "
+            "a name as the secrets directory, but install-service.ps1 does not, so a re-run of "
+            "it adds a second entry beside it and the engine may read either. Take each such "
+            "entry out of the service's environment, whether its value is blank or not, taking "
+            "only its own line out of an entry that holds other lines too, and where it named "
+            f"the secrets directory, name that path under the ASCII spelling {_DIRECTORY_VARIABLE} "
+            "instead"
+        )
     if (
         (others or values or posture.directory_run_on)
         and _DIRECTORY_VARIABLE not in posture.listed
@@ -1427,7 +1486,12 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             "`nssm get`, running the service's own nssm.exe by its full path, and pass back "
             "every entry but those refused above"
         )
-        if posture.value_runs_on or posture.directory_joined or posture.directory_only_in_extra:
+        if (
+            posture.value_runs_on
+            or posture.directory_joined
+            or posture.directory_only_in_extra
+            or lookalikes
+        ):
             add_back += " and the strings this step and any step above say to remove"
         if posture.directory_mixed_in_extra:
             add_back += ", leaving out the lines this step says to take out"
@@ -1446,9 +1510,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # A path alone holds no secret, and the service may read it as its directory (fourth
         # hold, H2), so only a joined entry that is plainly a path is spared, and only when
         # every refused variable that runs on takes nothing else (sixth hold, H1).
+        spelled = ", spelled in ASCII," if lookalikes else ""
         steps.append(
-            f"Keep any of them that sets {_DIRECTORY_VARIABLE} to a path and nothing else, as its "
-            "own entry"
+            f"Keep any of them that sets {_DIRECTORY_VARIABLE}{spelled} to a path and nothing "
+            "else, as its own entry"
         )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value refused "

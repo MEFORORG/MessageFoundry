@@ -135,3 +135,25 @@ CREATE = (
     'Where no secrets directory exists yet, the bullet "The other secrets: a secrets directory" '
     'under docs/SERVICE.md, "Protect the store encryption key at rest", says how it is created'
 )
+
+
+def lookalike_step(*named: str) -> str:
+    """The step printed wherever a line of any string in the lists sets a look-alike spelling of
+    MEFOR_SECRETS_DIRECTORY, one ``os.environ`` folds to it that is not ASCII. ``named`` is each
+    look-alike as the step writes it, every character outside ASCII as ``<U+XXXX>``. It says to
+    take each one out, blank or not, and never to keep one (the Lander's hold on PR 3142,
+    comment 7092584745)."""
+    return (
+        "At least one entry spells MEFOR_SECRETS_DIRECTORY with a character outside ASCII, "
+        "written here with each such character as its code point: "
+        f"{', '.join(named)}. The engine reads such a name as the secrets directory, but "
+        "install-service.ps1 does not, so a re-run of it adds a second entry beside it and the "
+        "engine may read either. Take each such entry out of the service's environment, whether "
+        "its value is blank or not, taking only its own line out of an entry that holds other "
+        "lines too, and where it named the secrets directory, name that path under the ASCII "
+        "spelling MEFOR_SECRETS_DIRECTORY instead"
+    )
+
+
+#: Text every form of the look-alike step carries, so a negative arm sees any.
+LOOKALIKE_ANY = "At least one entry spells MEFOR_SECRETS_DIRECTORY with a character outside ASCII"

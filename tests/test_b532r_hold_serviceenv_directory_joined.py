@@ -36,6 +36,7 @@ from tests._serviceenv_remedy import (
     ADD_BACK_STEP,
     CREATE,
     KEEP,
+    LOOKALIKE_ANY,
     REMOVE,
     REMOVE_OTHER,
     RUNS_ON,
@@ -43,6 +44,7 @@ from tests._serviceenv_remedy import (
     TAKE_LINE,
     TAKE_OUT,
     WIDER,
+    lookalike_step,
 )
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
@@ -519,6 +521,59 @@ def test_a_directory_name_folds_as_os_environ_folds_it(name: str, counts: bool) 
     control = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY="]))
     assert control is not None
     assert SET_NO not in control and REMOVE_OTHER in control
+
+
+_LONG_S = "MEFOR_\u017fECRETS_DIRECTORY"
+
+
+@pytest.mark.parametrize("where", [_EXTRA, _PLAIN])
+def test_a_lookalike_directory_alone_is_taken_out_not_kept(where: str) -> None:
+    """The Lander's hold on PR 3142, comment 7092584745, finding 1: a look-alike that names a
+    path, and no ASCII entry beside it, does not stand in for the real entry. The remedy says to
+    take it out and name the path under the ASCII spelling, and keeps nothing."""
+    posture = _read_pairs([(_EXTRA, "MEFOR_VALUE_A=x"), (where, f"{_LONG_S}=C:\\d")])
+    assert posture.directory_lookalikes == (_LONG_S,)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert refusal.count(lookalike_step("MEFOR_<U+017F>ECRETS_DIRECTORY")) == 1
+    assert "Keep any of them" not in refusal
+    control = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=C:\\d"]))
+    assert control is not None and LOOKALIKE_ANY not in control
+
+
+def test_a_blank_lookalike_beside_a_real_directory_entry_is_taken_out() -> None:
+    """The Lander's hold on PR 3142, comment 7092584745, finding 2: ``os.environ`` reads the
+    blank look-alike as ``''`` beside the ASCII entry, so the remedy says to take it out, though
+    the ASCII entry names the directory."""
+    posture = _read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=C:\\real", f"{_LONG_S}="])
+    assert posture.directory_lookalikes == (_LONG_S,)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert refusal.count(lookalike_step("MEFOR_<U+017F>ECRETS_DIRECTORY")) == 1
+    assert refusal.index(REMOVE) < refusal.index(LOOKALIKE_ANY)
+    control = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=C:\\real"]))
+    assert control is not None and LOOKALIKE_ANY not in control
+
+
+def test_the_lookalike_step_names_each_one_by_its_code_points() -> None:
+    """The Lander's hold on PR 3142, comment 7092584745, finding 3: each look-alike is named as
+    written, once, in the order read, a later line of a mixed entry included, with each
+    character outside ASCII as its code point, so the remedy prints on any console. A name
+    padded with U+00A0 is no look-alike: ``os.environ`` does not read it as the directory."""
+    posture = _read(
+        [
+            "MEFOR_VALUE_A=x",
+            "mefor_\u017fecrets_d\u0131rectory=",
+            f"PATH=C:\\x\n{_LONG_S}=C:\\d",
+            f"{_LONG_S}=C:\\e",
+            "\u00a0MEFOR_SECRETS_DIRECTORY=C:\\f",
+        ]
+    )
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and refusal.isascii()
+    named = ("mefor_<U+017F>ecrets_d<U+0131>rectory", "MEFOR_<U+017F>ECRETS_DIRECTORY")
+    assert refusal.count(lookalike_step(*named)) == 1
+    assert "U+00A0" not in refusal
 
 
 @pytest.mark.parametrize(
