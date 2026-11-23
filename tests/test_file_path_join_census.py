@@ -1117,6 +1117,14 @@ SITES: dict[str, Site] = {
     "messagefoundry/uploads.py::UploadStore._reseal_to_active_sync": Site(
         1, INTERNAL, "The fixed pair lock file name (`LOCK_FILE_NAME`) under the uploads root."
     ),
+    "messagefoundry/uploads.py::UploadStore._sweep_orphans_sync": Site(
+        1,
+        REVIEWED,
+        "A sidecar name built from the stem of a listed `.blob` name that passed `_FILE_ID_RE`, "
+        "plus the fixed `.meta` suffix. The join is reached only when that sidecar name is not in "
+        "the listing, and the path is passed to the absence check `_sidecar_is_absent` and nowhere "
+        "else. The unlink acts on the listed entry.",
+    ),
     "messagefoundry/uploads.py::_atomic_write_text": Site(
         1, INTERNAL, "A random-token temp name beside a path the store built."
     ),
