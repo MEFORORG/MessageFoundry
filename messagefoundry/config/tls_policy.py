@@ -324,8 +324,8 @@ def harden_crl_check(
     the start rule reads the CAs loaded from the operator's own client-CA setting, not an OS trust
     store. The outbound hops under ``[tls].crl_file`` pass it only with ``[tls].crl_check_chain``,
     and only where they trust operator CAs alone (:func:`build_verifying_client_context`): a hop
-    on the OS trust store, whose roots no CRL file names, is refused at build instead. The start
-    rule's refusal is worded for a server chain when ``setting`` is
+    on the OS trust store, whose roots the start rule cannot judge, is refused at build instead.
+    The start rule's refusal is worded for a server chain when ``setting`` is
     :data:`OUTBOUND_CRL_SETTING`. Every other hop keeps the leaf check.
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
@@ -3466,8 +3466,9 @@ def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
     """Refuse ``[tls].crl_check_chain`` on a hop that trusts the OS roots (vault BACKLOG #5511).
 
     The whole-chain check needs a CRL in ``[tls].crl_file`` from every CA in the peer's chain, the
-    root included, and no CRL file names the OS trust store's roots. So the setting cannot be
-    honoured there, and building the hop would refuse every server at the handshake."""
+    root included. The start rule that refuses a file missing one reads the CAs the hop loaded,
+    and the OS trust store's roots are not a list the engine can judge that way, so the setting
+    is refused there rather than honoured unchecked."""
     if not (anchor.crl_check_chain and anchor.load_system_roots):
         return
     arm = (
@@ -3478,8 +3479,8 @@ def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
     )
     raise ValueError(
         f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}. The "
-        "whole-chain check needs a CRL from every CA in the chain, and [tls].crl_file holds none "
-        "for the OS trust store's roots, so the setting cannot be honoured here. Pin this "
+        "whole-chain check needs a CRL from every CA in the chain, and the engine cannot check "
+        "[tls].crl_file against the OS trust store's roots, so the setting is refused here. Pin this "
         "hop's CA with its own CA setting, such as a connection's tls_ca_file, or set "
         '[tls].internal_ca_file with [tls].trust_anchor_mode = "pinned", or unset '
         "[tls].crl_check_chain"
