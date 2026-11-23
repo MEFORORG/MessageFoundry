@@ -13,8 +13,9 @@ What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block o
 ``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
 ``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body with no
 closing delimiter ``--<boundary>--`` where a delimiter counts, a body whose first delimiter
-text does not start a line, a delimiter line with other text after the delimiter (all three
-BACKLOG #5787, stated on ``_LineStartDelimiters``), and, in
+text does not start a line, a delimiter line the walk reaches, up to and including the close,
+with text after the delimiter that RFC 2046 does not allow there (all three BACKLOG #5787, stated
+on ``_LineStartDelimiters``), and, in
 :func:`parse_single_file_upload`, a body with no file part or with more than one.
 
 Scope: exactly what an upload form needs — one file part + optional small text fields. It is not a
@@ -295,7 +296,7 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             closed = _line_end(body, start + 2) != -1
             bad_close = not closed
             break
-        if start == len(body) - 1 and body.endswith(b"-"):
+        if start + 1 == len(body) and body.startswith(b"-", start):
             # A body cut inside its close marker (``--<boundary>-`` and nothing after it): leave it
             # unclosed, so it gets the missing-terminator refusal that names the cause.
             break
@@ -375,7 +376,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     # does (_LineStartDelimiters), so close-marker text in the middle of a content line no longer
     # makes a cut-short body pass as complete. At least two shapes _LineStartDelimiters names still
     # do: a content line that is the close marker with only padding after it (up to a CR, an LF or
-    # the end), and a preamble line that starts with one. The first-delimiter and delimiter-tail
+    # the end), and a preamble line that starts with one and has only padding after it. The
+    # first-delimiter and delimiter-tail
     # refusals it describes are raised here too, after the checks above on the parts the walk
     # reached.
     if not delims.first_starts_line:
@@ -392,16 +394,16 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
         )
     if bad_tail:
         raise MultipartError(
-            "multipart line that starts with a boundary delimiter has text after it other than "
-            "spaces, tabs or the two dashes of a close; a body built with a longer boundary than "
-            "its Content-Type names can be refused this way"
+            "multipart line that starts with a boundary delimiter has text after it that is "
+            "neither spaces or tabs nor two dashes and then spaces or tabs; a body built with a "
+            "longer boundary than its Content-Type names can be refused this way"
         )
     if not closed:
         if not seen:
             # No delimiter text at all. At least an empty body, one built with another boundary than
             # the Content-Type names, and one cut before its first ``--<boundary>`` is whole land here.
             # A body built with a boundary the declared one is a prefix of (declared B, body uses
-            # BX) does not: it has delimiters, so it gets the missing-terminator refusal below.
+            # BX) does not: it holds delimiter text, so it gets one of the refusals above.
             raise MultipartError(
                 "multipart body holds no delimiter for the boundary its Content-Type names"
             )
