@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Outside a hardened data directory, opening a store leaves each file's access list granting the
-process token's account alone, whatever USERNAME says (vault BACKLOG #5612).
+"""Outside a hardened data directory, in a folder whose entries its files inherit, opening a store
+leaves each file's access list granting the process token's account alone, for each USERNAME
+value sampled below (vault BACKLOG #5612). A folder that hands its entries down as explicit ones is
+not built here.
 
 These cover the owner-only restriction only: a hardened directory's grants, and the file owner,
 are not read here. They drive ``MessageStore.open`` with a real icacls, then read each file's
@@ -132,10 +134,10 @@ def _acl(path: Path) -> _Acl:
     return _Acl(lines[0] == "protected=1", tuple(entries), out)
 
 
-# Replaces the whole access list with the SDDL given, writing only the access section. ``icacls
-# /inheritance:r /grant:r`` is not enough: it drops only entries marked inherited, and on the hosted
-# runners the SYSTEM, Administrators and OWNER RIGHTS entries from pytest's mode-0700 temp folder
-# arrive on a child folder as explicit entries and survive it (CI run 45151393786).
+# Replaces the whole access list with the SDDL given, writing only the access section.
+# ``icacls /inheritance:r /grant:r`` is not enough: the first removes only entries marked inherited
+# and the second replaces only the named SID's entries, so other explicit entries survive, and
+# ``tests/_win_acl.py`` says why the hosted runners have them (here also CI run 45151393786).
 _SET_ACL = (
     "$ErrorActionPreference = 'Stop';"
     "$a = Get-Acl -LiteralPath $env:MF_ACL_PATH;"
@@ -145,17 +147,22 @@ _SET_ACL = (
 )
 
 
-def _folder_granting_only(path: Path, sid: str) -> Path:
-    """Make ``path`` a folder whose protected list grants ``sid`` alone, inherited by what is made
-    in it, and check that it took."""
-    path.mkdir()
+def _grant_only(path: Path, sid: str) -> Path:
+    """Replace the folder ``path``'s list with a protected one granting ``sid`` alone, inherited by
+    what is made in it, and check that it took."""
     _run(
         [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", _SET_ACL],
         extra_env={"MF_ACL_PATH": str(path), "MF_ACL_SDDL": f"D:PAI(A;OICI;FA;;;{sid})"},
     )
     acl = _acl(path)
-    assert acl.protected and {e.sid for e in acl.entries} == {sid}, acl.raw
+    assert acl.protected, acl.raw
+    assert acl.entries == (_Entry("AccessAllowed", False, _FULL_CONTROL, sid),), acl.raw
     return path
+
+
+def _folder_granting_only(path: Path, sid: str) -> Path:
+    path.mkdir()
+    return _grant_only(path, sid)
 
 
 def _clear_user_variables(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,3 +215,18 @@ def test_control_the_instrument_sees_an_unrestricted_file(tmp_path: Path) -> Non
     granted.write_bytes(b"x")
     _run([str(_SYSTEM32 / "icacls.exe"), str(granted), "/grant", f"*{_EVERYONE}:F"])
     assert _EVERYONE in {e.sid for e in _acl(granted).entries}
+
+
+def test_control_the_folder_setup_clears_explicit_entries(tmp_path: Path) -> None:
+    """A folder already holding explicit SYSTEM, Administrators and OWNER RIGHTS entries, the shape
+    the hosted runners hand down from a mode-0700 temp folder, ends with the token's entry alone, so
+    the setup above does not depend on how this machine passes entries down."""
+    folder = tmp_path / "seeded"
+    folder.mkdir()
+    seeded = ("S-1-5-18", "S-1-5-32-544", "S-1-3-4")
+    _run(
+        [str(_SYSTEM32 / "icacls.exe"), str(folder), "/grant"]
+        + [f"*{sid}:(OI)(CI)F" for sid in seeded]
+    )
+    assert set(seeded) <= {e.sid for e in _acl(folder).entries if not e.inherited}
+    _grant_only(folder, _token_sid())
