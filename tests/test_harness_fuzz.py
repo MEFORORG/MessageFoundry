@@ -18,18 +18,21 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+import harness.fuzz.campaign as fuzz_campaign
 import harness.fuzz.cli as fuzz_cli
 from harness import drivers
 from harness.__main__ import main
 from harness.endpoints import Endpoints
 from harness.fuzz import (
     LAYERS,
+    CampaignResult,
     Case,
     Exchange,
     FuzzConfig,
@@ -378,6 +381,11 @@ def _plain_ack(payload: bytes, code: str = "AA") -> bytes:
     cid = control_id_of(payload) or ""
     if not queryable(cid) or any(ch in cid for ch in "|^~\\&"):
         cid = ""
+    return _ack_echoing(cid, code)
+
+
+def _ack_echoing(cid: str, code: str = "AA") -> bytes:
+    """A fake engine's reply under the standard delimiters, with ``cid`` as MSA-2."""
     return f"MSH|^~\\&|E|E|H|H|||ACK||P|2.5.1\rMSA|{code}|{cid}\r".encode()
 
 
@@ -428,8 +436,12 @@ class _FakeClient:
             raise ApiError("server error", status=self.health_status)
         return Health()
 
+    def _row_ids(self) -> list[str | None]:
+        """The control id of every stored row, oldest first."""
+        return [control_id_of(f) for data in self.transport.sent for f in frames(data)]
+
     def list_messages(self, *, control_id: str | None = None, limit: int = 50) -> MessageList:
-        ids = [control_id_of(f) for data in self.transport.sent for f in frames(data)]
+        ids = self._row_ids()
         if control_id is None:
             total = len(ids) if self.frozen_total is None else self.frozen_total
             return MessageList(total=total, limit=limit, offset=0, messages=[])
@@ -602,6 +614,235 @@ def test_each_positive_ack_of_a_doubled_case_owes_its_own_row(tmp_path: Path) ->
     both = cast(EngineClient, _FakeClient(transport))
     result = replay(both, transport, [kept], config, emit=lambda _: None)
     assert result.ok and result.stored_checked == 2
+
+
+def _hl7(control_id: str) -> bytes:
+    return frame(f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|{control_id}|P|2.5.1\rPID|1\r")
+
+
+class _ScriptedTransport(_EchoTransport):
+    """Answers each send from a script of (MSA-1, the MSA-2 of each frame, the rows it stores)."""
+
+    def __init__(
+        self,
+        script: list[tuple[str, tuple[str, ...], tuple[str, ...]]],
+        rows: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__()
+        self.script = script
+        self.rows: list[str | None] = list(rows)
+
+    def send(self, data: bytes) -> Exchange:
+        code, echoes, stored = self.script[len(self.sent)]
+        self.sent.append(data)
+        self.rows.extend(stored)
+        replies = tuple(_ack_echoing(echo, code) for echo in echoes)
+        return Exchange(REPLY if replies else CLOSED, replies)
+
+
+class _ScriptedClient(_FakeClient):
+    """A store holding exactly the rows the scripted transport says it stored."""
+
+    transport: _ScriptedTransport
+
+    def _row_ids(self) -> list[str | None]:
+        return self.transport.rows
+
+
+def _replay_script(
+    tmp_path: Path, datas: list[bytes], transport: _ScriptedTransport
+) -> CampaignResult:
+    """Replay ``datas`` as one batch against the scripted store."""
+    paths = []
+    for index, data in enumerate(datas):
+        path = tmp_path / f"fuzz-seed3-iter{index}.mllp.bin"
+        path.write_bytes(data)
+        paths.append(path)
+    config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3)
+    client = cast(EngineClient, _ScriptedClient(transport))
+    return replay(client, transport, paths, config, emit=lambda _: None)
+
+
+@pytest.mark.parametrize("first_code", ["AR", "AA"])
+def test_a_row_from_an_earlier_case_does_not_satisfy_a_later_ack_of_its_id(
+    tmp_path: Path, first_code: str
+) -> None:
+    """BACKLOG #5567: the pre-send count was read once a batch, so a NAKed case's row satisfied a
+    dropped AA of the same id, and one surplus row kept the batch count quiet too."""
+    data = _hl7("SHARED")
+    dropped = _ScriptedTransport(
+        [(first_code, ("SHARED",), ("SHARED",)), ("AA", ("SHARED",), ("SURPLUS",))]
+    )
+    result = _replay_script(tmp_path, [data, data], dropped)
+    assert [f.reason for f in result.failures] == [
+        "positively ACKed control id 'SHARED' is not in the store (1 row(s), more than 1 owed)"
+    ]
+    assert result.failures[0].case is not None and result.failures[0].case.iteration == 1
+    # Control: the same exchange with the row stored passes. A re-read already holds case 0's row,
+    # so a leftover cross-case increment would demand a row that never existed and fail this.
+    stored = _ScriptedTransport(
+        [(first_code, ("SHARED",), ("SHARED",)), ("AA", ("SHARED",), ("SHARED",))]
+    )
+    result = _replay_script(tmp_path, [data, data], stored)
+    assert result.ok
+    assert result.stored_checked == (2 if first_code == "AA" else 1)
+
+
+def test_an_echoed_id_with_no_pre_send_count_is_not_counted_as_a_new_row(tmp_path: Path) -> None:
+    """BACKLOG #5567: an id the campaign could not predict has no baseline, so any older row
+    satisfies its check. That is a presence check, and it must not read as a matched new row."""
+    transport = _ScriptedTransport([("AA", ("OLD",), ("SURPLUS",))], rows=("OLD",))
+    result = _replay_script(tmp_path, [_hl7("PREDICTED")], transport)
+    assert result.ok
+    assert (result.stored_checked, result.stored_presence_only) == (0, 1)
+    # Control: the check still runs, so an echoed id with no row at all fails.
+    transport = _ScriptedTransport([("AA", ("OLD",), ("SURPLUS",))])
+    result = _replay_script(tmp_path, [_hl7("PREDICTED")], transport)
+    assert not result.ok
+    assert "control id 'OLD' is not in the store (0 row(s)" in result.failures[0].reason
+    assert (result.stored_checked, result.stored_presence_only) == (0, 0)
+
+
+def test_a_second_frame_echoing_an_unpredicted_id_still_owes_its_own_row(tmp_path: Path) -> None:
+    """The within-case bookkeeping holds for an id with no baseline, and the owed count it writes
+    is not a pre-send count, so the second frame stays out of ``stored_checked`` too."""
+    doubled = _hl7("PREDICTED") * 2
+    surplus = ("SURPLUS", "SURPLUS")
+    short = _ScriptedTransport([("AA", ("OLD", "OLD"), surplus)], rows=("OLD",))
+    result = _replay_script(tmp_path, [doubled], short)
+    assert "is not in the store (1 row(s), more than 1 owed)" in result.failures[0].reason
+    assert (result.stored_checked, result.stored_presence_only) == (0, 1)
+    both = _ScriptedTransport([("AA", ("OLD", "OLD"), surplus)], rows=("OLD", "OLD"))
+    result = _replay_script(tmp_path, [doubled], both)
+    assert result.ok
+    assert (result.stored_checked, result.stored_presence_only) == (0, 2)
+
+
+class _UnpredictedEchoTransport(_ScriptedTransport):
+    """Answers every frame AA echoing one id no case carried, and stores a row under it."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def send(self, data: bytes) -> Exchange:
+        ids = ("UNPREDICTED",) * len(frames(data))
+        self.script.append(("AA", ids, ids))
+        return super().send(data)
+
+
+def test_a_campaign_of_presence_checks_alone_reads_vacuous(tmp_path: Path) -> None:
+    """A campaign whose every ACK echoed an unpredicted id never proved a NEW row was stored."""
+    transport = _UnpredictedEchoTransport()
+    config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3, iterations=30)
+    lines: list[str] = []
+    client = cast(EngineClient, _ScriptedClient(transport))
+    result = run(client, transport, config, emit=lines.append)
+    assert result.stored_checked == 0 and result.stored_presence_only > 0
+    assert "no pre-send count" in result.vacuous and not result.ok
+    assert any(f"stored_presence_only={result.stored_presence_only}" in x for x in lines)
+
+
+def test_an_ack_echoing_another_case_of_the_batch_keeps_that_ids_floor(tmp_path: Path) -> None:
+    """The per-case re-read covers a case's own ids only, so the batch's floor must still hold for
+    an ACK that echoes an earlier case's id, or that case's own row would satisfy it."""
+    transport = _ScriptedTransport(
+        [("AA", ("FIRST",), ("FIRST",)), ("AA", ("FIRST",), ("SURPLUS",))]
+    )
+    result = _replay_script(tmp_path, [_hl7("FIRST"), _hl7("SECOND")], transport)
+    assert [f.reason for f in result.failures] == [
+        "positively ACKed control id 'FIRST' is not in the store (1 row(s), more than 1 owed)"
+    ]
+
+
+def test_an_ack_echoing_a_refused_earlier_cases_id_is_presence_only(tmp_path: Path) -> None:
+    """That id was not re-read for this case and a NAK raises no floor, so the NAK's row can
+    satisfy the ACK. The check still runs, and does not claim a new row was proved."""
+    transport = _ScriptedTransport(
+        [("AR", ("FIRST",), ("FIRST",)), ("AA", ("FIRST",), ("SURPLUS",))]
+    )
+    result = _replay_script(tmp_path, [_hl7("FIRST"), _hl7("SECOND")], transport)
+    assert result.ok
+    assert (result.stored_checked, result.stored_presence_only) == (0, 1)
+
+
+def test_a_sibling_frame_acked_under_another_id_leaves_its_id_presence_only(
+    tmp_path: Path,
+) -> None:
+    """Frame 1 of a doubled X is ACKed as OLD but stores X, so that row can satisfy frame 2's AA."""
+    transport = _ScriptedTransport([("AA", ("OLD", "X"), ("X", "SURPLUS"))], rows=("OLD",))
+    result = _replay_script(tmp_path, [_hl7("X") * 2], transport)
+    assert result.ok
+    assert (result.stored_checked, result.stored_presence_only) == (0, 2)
+
+
+@pytest.mark.parametrize("codes", [("AR", "AA"), ("AA", "AR")])
+def test_a_positive_ack_beside_a_nak_of_its_id_in_one_case_is_presence_only(
+    tmp_path: Path, codes: tuple[str, str]
+) -> None:
+    """No read can fall between two frames of one send, so the NAKed frame's row may be the one
+    that satisfies the AA. The check still runs, and does not claim a new row was proved."""
+    data = _hl7("SHARED") * 2
+
+    class _Mixed(_ScriptedTransport):
+        def send(self, sent: bytes) -> Exchange:
+            self.sent.append(sent)
+            self.rows.extend(("SHARED", "SURPLUS"))
+            return Exchange(REPLY, tuple(_ack_echoing("SHARED", code) for code in codes))
+
+    result = _replay_script(tmp_path, [data], _Mixed([]))
+    assert result.ok
+    assert (result.stored_checked, result.stored_presence_only) == (0, 1)
+
+
+class _IdReadClient(_FakeClient):
+    """Runs ``on_read`` with the running count of control-id reads, before answering each."""
+
+    def __init__(self, transport: _EchoTransport, on_read: Callable[[int], None]) -> None:
+        super().__init__(transport)
+        self.on_read = on_read
+        self.id_reads = 0
+
+    def list_messages(self, *, control_id: str | None = None, limit: int = 50) -> MessageList:
+        if control_id is not None:
+            self.id_reads += 1
+            self.on_read(self.id_reads)
+        return super().list_messages(control_id=control_id, limit=limit)
+
+
+def test_a_pre_send_read_that_outlasts_the_budget_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(fuzz_campaign, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def past_the_budget_on_the_re_read(reads: int) -> None:
+        if reads == 2:
+            clock[0] = 2.0
+
+    transport, _, config = _offline(tmp_path, seed=3, iterations=1, batch=1, seconds=1.0)
+    client = _IdReadClient(transport, past_the_budget_on_the_re_read)
+    result = run(cast(EngineClient, client), transport, config, emit=lambda _: None)
+    assert client.id_reads == 2 and transport.sent == [] and result.cases == 0
+
+
+def test_a_fault_on_a_pre_send_read_does_not_name_the_unsent_case(tmp_path: Path) -> None:
+    def fail_on_the_second_re_read(reads: int) -> None:
+        # Reads 1-2 are the batch's, 3 is case 0's re-read, 4 its check, 5 case 1's re-read.
+        if reads == 5:
+            raise ApiError("server error", status=503)
+
+    transport = _EchoTransport()
+    client = _IdReadClient(transport, fail_on_the_second_re_read)
+    session_cases = [_hl7("FIRST"), _hl7("SECOND")]
+    paths = [tmp_path / f"fuzz-seed3-iter{i}.mllp.bin" for i in range(2)]
+    for path, data in zip(paths, session_cases, strict=True):
+        path.write_bytes(data)
+    config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3)
+    lines: list[str] = []
+    result = replay(cast(EngineClient, client), transport, paths, config, emit=lines.append)
+    assert transport.sent == [session_cases[0]] and result.cases == 1
+    assert [f.case for f in result.failures] == [None]
+    assert any("iterations=0-0 (batch-level)" in line for line in lines)
 
 
 class _BlankEchoTransport(_EchoTransport):

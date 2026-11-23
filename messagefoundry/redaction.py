@@ -94,18 +94,23 @@ from types import (
     TracebackType,
     WrapperDescriptorType,
 )
-from typing import Any, Final
+from typing import Any, Final, TypeGuard
 
 __all__ = [
     "RepeatedKeyError",
+    "args_hold_a_message",
     "clamp_untrusted",
     "codec_safe_line",
     "codec_safe_str",
+    "driver_sqlstate_of",
+    "is_a_sqlite_error",
+    "known_driver_error",
     "json_loads_or_refusal",
     "log_timestamp",
     "prepare_log_record",
     "prints_a_codec_error",
     "raised_by_a_driver",
+    "reads_as_a_sqlstate",
     "redact",
     "redact_binary_carriage",
     "redact_untrusted",
@@ -117,6 +122,8 @@ __all__ = [
     "safe_text",
     "safe_text_bound",
     "safe_traceback",
+    "sqlite_errorname_of",
+    "sqlstate_text",
 ]
 
 _REDACTED = "[redacted]"
@@ -673,7 +680,7 @@ _USERINFO_TAIL_MAX = 256
 
 #: The password ``http.client`` quotes as a "port" when an endpoint URL carries userinfo: its
 #: ``InvalidURL("nonnumeric port: 'PW@host'")`` (BACKLOG #1793; the mechanism is on
-#: ``transports/rest.py`` ``refuse_url_credentials``). It is a CREDENTIAL, not PHI. It lives here
+#: ``messagefoundry/urlscreen.py`` ``refuse_url_credentials``). It is a CREDENTIAL, not PHI. It lives here
 #: because :func:`redact` is the one pass that the stored error, the log chain and the support bundle
 #: all run.
 #:
@@ -682,7 +689,7 @@ _USERINFO_TAIL_MAX = 256
 #: the ``@`` is kept so the diagnostic still says where. The bound is load-bearing on
 #: attacker-influenceable log text; the literal prefix limits it to one bounded walk per occurrence.
 #: A password tail longer than the bound is NOT matched -- the construction-time refusal in
-#: ``transports/rest.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
+#: ``messagefoundry/urlscreen.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
 #:
 #: **Its tail never crosses a span it already scrubbed (BACKLOG #2312).** The greedy tail used to.
 #: Each scrub shortens the line, so two spans more than the bound apart on the first pass could fall
@@ -3095,19 +3102,135 @@ def _a_driver_class(kind: type) -> bool:
     )
 
 
-#: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters.
+#: Driver packages whose error holds its MESSAGE in ``args[0]``, never a SQLSTATE: at least
+#: asyncpg, which names its state in a ``sqlstate`` attribute when it names one. Not a complete
+#: list of such drivers; SQLite is tested apart (:func:`is_a_sqlite_error`). What each reader does
+#: with such an error is in :func:`args_hold_a_message`.
+_MESSAGE_IN_ARGS_DRIVERS = frozenset({"asyncpg"})
+
+
+def args_hold_a_message(exc: BaseException) -> bool:
+    """Whether ``exc``'s class, or a class it inherits, is from a package in
+    :data:`_MESSAGE_IN_ARGS_DRIVERS`, so its ``args[0]`` is its message. :func:`driver_sqlstate_of`,
+    the traceback line's reader, reads no state from such an ``args[0]``, and the DATABASE
+    connector's ``_shown_state`` names a state for it only from the error's own ``sqlstate``
+    attribute, as a copy of its data (:func:`sqlstate_text`), and only when that equals the state
+    it was asked about. The connector still CLASSIFIES such an error by the shape of ``args[0]``,
+    and the store's ``driver_sqlstate`` does not call this, so it still reads and prints that
+    ``args[0]``. A class that cannot be read answers ``False``, so it is read by shape, as any other
+    error is; that does not raise, so this runs on every link of a traceback."""
+    try:
+        return any(
+            isinstance(kind.__module__, str)
+            and kind.__module__.split(".")[0] in _MESSAGE_IN_ARGS_DRIVERS
+            for kind in type(exc).__mro__
+        )
+    except Exception:  # noqa: BLE001 - an unreadable class is read by shape, as the docstring says
+        return False
+
+
+#: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters. Lowercase is refused, so
+#: a word such as ``OSError('reset')``'s or a codec name such as ``ascii`` does not read as one.
 _DRIVER_SQLSTATE = re.compile(r"[0-9A-Z]{5}")
-#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``.
+#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
+#: such as ``SQLITE_CONSTRAINT_UNIQUE``, never a value.
 _SQLITE_ERRORNAME = re.compile(r"SQLITE_[A-Z_]{1,40}")
+
+
+def known_driver_error(exc: BaseException) -> bool:
+    """:func:`raised_by_a_driver`, except that a class whose driver test raises answers ``False``.
+    For a caller that would NAME something a driver's error carries, where the safe answer for a
+    class that cannot be classed is no (engine PR 3150, finding 1)."""
+    try:
+        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+    except Exception:  # noqa: BLE001 - fail closed for naming: an unclassable error names nothing
+        return False
+
+
+def is_a_sqlite_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is one of ``sqlite3``'s own errors or warnings. The class is read with
+    ``type()``, not ``isinstance``, which falls back to ``exc.__class__``, an attribute a class can
+    define to raise; an error arm calls this before its cleanup (engine PR 3163)."""
+    # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
+    # and the CLI defers loading it (tests/test_startup_import_budget.py).
+    sqlite = sys.modules.get("sqlite3")
+    return sqlite is not None and issubclass(type(exc), (sqlite.Error, sqlite.Warning))
+
+
+def reads_as_a_sqlstate(value: object) -> TypeGuard[str]:
+    """Whether ``value`` is text of a SQLSTATE's shape: five digits or uppercase Latin letters.
+    Exactly ``str``: a subclass's ``__str__`` can print anything, such as a value from the
+    message, however its data matches (engine PR 3163); :func:`sqlstate_text` reads a subclass by
+    its data. A ``TypeGuard``, not a ``TypeIs``: a
+    ``False`` answer does not say ``value`` is no ``str``."""
+    return type(value) is str and _DRIVER_SQLSTATE.fullmatch(value) is not None
+
+
+def sqlstate_text(value: object) -> str | None:
+    """``value`` as an exact ``str`` copy of its data when that data has a SQLSTATE's shape, else
+    None. A ``str`` subclass is read by its data, as before, so it classifies an error as it did,
+    but what is returned is ``str``'s own copy, so no reader prints the subclass's ``__str__``
+    (engine PR 3163). ``str.__str__`` is called on ``str`` itself, which a subclass cannot
+    override. The type is read with ``type()``, not ``isinstance``, which an object faking
+    ``__class__`` would pass; and the length is read first, so a long message is never copied.
+    It does not raise for any value."""
+    if not issubclass(type(value), str) or str.__len__(value) != 5:  # type: ignore[arg-type]
+        return None
+    text = str.__str__(value)
+    return text if reads_as_a_sqlstate(text) else None
+
+
+def driver_sqlstate_of(
+    exc: BaseException, *, attribute: bool = True, past_attribute: bool = False
+) -> str | None:
+    """The SQLSTATE a known driver's own error (:func:`known_driver_error`) names, read in this
+    order, each as :func:`sqlstate_text` returns it. When ``attribute`` is true, the ``sqlstate``
+    attribute of any such driver's error, if it has a SQLSTATE's shape; an attribute that is set
+    but is no SQLSTATE then ends the read with None unless ``past_attribute`` is true. Then None
+    for an error from a package in :func:`args_hold_a_message`, at least asyncpg, whose
+    ``args[0]`` is its message. Otherwise ``args[0]``, if it reads as a SQLSTATE, as pyodbc's
+    does. None for any error that is no known driver's, so a ``KeyError('MRN42')`` is never read
+    as one, and None for a SQLite error, whose ``args[0]`` is its message (vault BACKLOG #1661).
+    :func:`safe_traceback` names a driver error's SQLSTATE by it. The DATABASE connector reads its
+    own state, which can differ from this one.
+
+    A class whose driver test raises counts as no driver's here, where :func:`raised_by_a_driver`
+    answers ``True`` to withhold its text: here ``True`` would read its argument as a SQLSTATE. A
+    ``sqlstate`` attribute that raises when read propagates; ``attribute=False`` never reads it.
+    ``args`` is read with ``getattr`` and a default, so a missing one reads as empty."""
+    if not known_driver_error(exc) or is_a_sqlite_error(exc):
+        return None
+    if attribute:
+        state = getattr(exc, "sqlstate", None)
+        text = sqlstate_text(state)
+        if text is not None:
+            return text
+        if state is not None and not past_attribute:
+            return None
+    if args_hold_a_message(exc):
+        return None
+    args = getattr(exc, "args", ())
+    return sqlstate_text(args[0] if isinstance(args, tuple) and args else None)
+
+
+def sqlite_errorname_of(exc: BaseException) -> str | None:
+    """SQLite's result-code name for one of ``sqlite3``'s errors, such as
+    ``SQLITE_CONSTRAINT_UNIQUE``, or None. SQLite has no SQLSTATE, so this fixed word is its only
+    diagnostic free of the statement's values."""
+    if not is_a_sqlite_error(exc):
+        return None
+    name = getattr(exc, "sqlite_errorname", None)
+    return name if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name) else None
 
 
 def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     """What a traceback prints after the class name for a database driver's error
     (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
     link (vault BACKLOG #1661, added item 3). A driver's message can quote a value the statement
-    carried, such as a duplicate key, so it is withheld. A driver error keeps its SQLSTATE,
-    asyncpg's ``sqlstate`` or else ``args[0]``, when that is five characters of SQL's alphabet; a
-    SQLite error keeps only its result-code name, since its ``args[0]`` is its message. A
+    carried, such as a duplicate key, so it is withheld. A driver error keeps the SQLSTATE
+    :func:`driver_sqlstate_of` reads, with its defaults, which says which attribute or argument
+    that is for which drivers; a SQLite error keeps only its result-code name, since its
+    ``args[0]`` is its message. A
     link under a driver error is withheld whole, since a driver can raise its error from the
     builtin one its codec raised, whose text can quote the value too. An attribute that raises
     when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
@@ -3126,25 +3249,11 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
 
 def _driver_code(exc: BaseException) -> str | None:
     """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code."""
-    # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
-    # and the CLI defers loading it (tests/test_startup_import_budget.py).
-    sqlite = sys.modules.get("sqlite3")
-    if sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning)):
-        # SQLite has no SQLSTATE, and its args[0] is the message itself, which can be a value as
-        # short as five characters; only its result-code name, a fixed word, is read.
-        name = getattr(exc, "sqlite_errorname", None)
-        if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
-            return f"[driver message withheld {name}]"
-        return None
-    state = getattr(exc, "sqlstate", None)
-    if state is None and exc.args:
-        state = exc.args[0]
-    if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state):
-        return f"[{state}] [driver message withheld]"
-    name = getattr(exc, "sqlite_errorname", None)
-    if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
+    name = sqlite_errorname_of(exc)
+    if name is not None:
         return f"[driver message withheld {name}]"
-    return None
+    state = driver_sqlstate_of(exc)
+    return f"[{state}] [driver message withheld]" if state is not None else None
 
 
 def safe_traceback(ei: ExcInfo) -> str:

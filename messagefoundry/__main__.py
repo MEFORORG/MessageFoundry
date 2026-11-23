@@ -1255,8 +1255,19 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--to",
         default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
-        "except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
+        "is unrecoverable, so a taken store name, or a taken SQLite -wal/-shm/-journal name beside it "
+        "(a file, a directory or a link, a dangling one included), is refused, and the store and "
+        "sidecar names are read again just before the write. Not caught, at least: a sidecar created "
+        "after that re-read. Nor, on Windows, a taken -wal, -shm or -journal name, or a "
+        "dangling link at the store name when the store is copied into place, on a share or drive "
+        "that neither read could reach: an unreachable share, which reads as free (at least WinError "
+        "53 and 67), or a drive letter that is gone (at least WinError 3). Nor, on Windows, "
+        "when the store is copied rather than hard-linked into place, a dangling link planted at the "
+        "store name after that re-read, which is followed. "
+        "Also refused: a name holding ':', and on Windows a "
+        "name ending in a dot or a space or otherwise opened as another path. To reuse a path, stop "
+        "the engine and move the old store aside with its -wal, -shm and -journal as one set. "
+        "Required, except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
         "whose bundle --config-to restores alone",
     )
     restore.add_argument(
@@ -14927,7 +14938,7 @@ def _warn_on_an_unrevoked_store_hop(settings: ServiceSettings) -> None:
         context = _verifying_context(store)
     except (ValueError, OSError):
         return
-    _refuse_store_revocation(host=store.server or "", posture=posture, context=context)
+    _refuse_store_revocation(host=store.server, posture=posture, context=context)
 
 
 async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:

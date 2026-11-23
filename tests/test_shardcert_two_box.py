@@ -19,6 +19,7 @@ new engine/driver halves + the CLI arg-threading; the #836 single-box path + rat
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import types
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -36,7 +37,8 @@ from harness.config.shardcert._shape import (
     fanout_refusal,
     fifo_lane_destination,
 )
-from harness.load.coord import DRIVE_START, SHARDS_READY, FileDropCoord
+from harness.load.coord import DRIVE_START, ENGINE_DRAINED, SHARDS_READY, FileDropCoord
+from tests.test_shardcert_pass_bars import _report
 
 
 def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
@@ -1530,3 +1532,111 @@ def test_shardcert_driver_cli_report_json_banks_the_count_balance(
     assert banked["copies_ok"] is True
     assert banked["notes"] == ["SHARDS_READY carried no `routing`"]
     assert banked["verdict"] == "PASS"
+
+
+# --- BACKLOG #5950: a nonzero in-pipeline residual never reads as drained ---------------------------
+
+
+def _three_engine_shards_reading(
+    monkeypatch: pytest.MonkeyPatch, in_pipeline: int
+) -> types.SimpleNamespace:
+    """The offline fakes over three engine shards, whose summed poller reading is ``in_pipeline``."""
+    monkeypatch.setenv("MEFOR_SHARDCERT_SHARDS", "a,b,c")
+    monkeypatch.setenv("MEFOR_SHARDCERT_LANES_PER_SHARD", "1")
+    monkeypatch.delenv("MEFOR_SHARDCERT_PERSISTENT", raising=False)
+    rec = _install_fakes(monkeypatch)
+    fake_poller: Any = vars(sc)["EnginePoller"]
+
+    class ReadingPoller(fake_poller):  # type: ignore[misc]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.final = types.SimpleNamespace(done=0, dead=0, in_pipeline=in_pipeline)
+
+    monkeypatch.setattr(sc, "EnginePoller", ReadingPoller)
+    return rec
+
+
+@pytest.mark.parametrize(
+    ("summed", "expected"),
+    [(2, 1), (3, 1), (4, 2), (0, 0), (-1, -1)],
+    ids=["residual-2-0-0", "exact", "rounds-up", "drained", "negative-keeps-its-meaning"],
+)
+async def test_run_shardcert_rounds_a_residual_up(
+    monkeypatch: pytest.MonkeyPatch, summed: int, expected: int
+) -> None:
+    """The single-box path. A floor division reads the residual ``2 // 3`` as 0, and a bare
+    ``-(-x // n)`` reads a negative as 0."""
+    _three_engine_shards_reading(monkeypatch, summed)
+    report = await sc.run_shardcert(
+        dests=3, aggregate_rate=20.0, hold_seconds=0.05, drain_timeout=1.0, store_env={}
+    )
+    assert report.in_pipeline_final == expected
+    # The pass bar, on a report otherwise healthy: only an exact zero may pass.
+    assert dataclasses.replace(_report(), in_pipeline_final=expected).ok is (expected == 0)
+
+
+@pytest.mark.parametrize(
+    ("summed", "expected"),
+    [(2, 1), (0, 0), (-1, -1)],
+    ids=["residual-2-0-0", "drained", "negative-keeps-its-meaning"],
+)
+async def test_run_shardcert_engine_rounds_a_residual_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, summed: int, expected: int
+) -> None:
+    """The two-box engine half. Its own ``ok`` does not read this value, so the test pins what it
+    reports and what it posts on the ENGINE_DRAINED gate."""
+    _three_engine_shards_reading(monkeypatch, summed)
+    coord = FileDropCoord(tmp_path, run_id="round-up")
+    engine = sc.run_shardcert_engine(
+        dests=3,
+        hold_seconds=0.05,
+        kill=False,
+        drain_timeout=2.0,
+        sink_port=47100,
+        sink_ports=1,
+        store_env={"MEFOR_STORE_BACKEND": "sqlserver"},
+        coord=coord,
+        inbound_bind_host="127.0.0.1",
+        sink_host="127.0.0.1",
+        post_drain_grace=0.0,
+        signal_drained=True,
+    )
+    driver = sc.run_shardcert_driver(
+        engine_host="127.0.0.1",
+        aggregate_rate=20.0,
+        hold_seconds=0.05,
+        drain_timeout=2.0,
+        coord=FileDropCoord(tmp_path, run_id="round-up"),
+        sink_host="127.0.0.1",
+    )
+    report, _ = await asyncio.gather(engine, driver)
+    assert report.in_pipeline_final == expected
+    posted = coord.read(ENGINE_DRAINED)
+    assert posted is not None and posted["in_pipeline_final"] == expected
+
+
+@pytest.mark.parametrize(("summed", "expected"), [(2, 1), (3, 1), (0, 0), (-1, 0)])
+async def test_peak_sampler_rounds_a_residual_up(
+    monkeypatch: pytest.MonkeyPatch, summed: int, expected: int
+) -> None:
+    """The high-water starts at 0, so a negative reading leaves it there, as it always has."""
+    stop = asyncio.Event()
+
+    class OneReadingPoller:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def open(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def sample_once(self) -> types.SimpleNamespace:
+            stop.set()
+            return types.SimpleNamespace(in_pipeline=summed)
+
+    monkeypatch.setattr(sc, "EnginePoller", OneReadingPoller)
+    out = [0]
+    await sc._sample_in_pipeline_peak(["http://a", "http://b", "http://c"], stop, out)
+    assert out[0] == expected

@@ -178,7 +178,7 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
-from messagefoundry.parsing.split import batch_member_collides
+from messagefoundry.parsing.split import batch_member_collides, head_control_id
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
@@ -312,7 +312,7 @@ from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.egress import warn_url_query_credentials_before_build
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
-from messagefoundry.transports.http_listener import reply_seconds
+from messagefoundry.transports.http_listener import DEFAULT_BIND_HOST, reply_seconds
 from messagefoundry.transports.intake import IntakeContext, intake_handler
 from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
@@ -12093,7 +12093,7 @@ class RegistryRunner:
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
-        # the head is PARSED here, for the BHS-11 control id. How encode_batch reads the BHS
+        # the head's MSH-10 is READ here, for the BHS-11 control id. How encode_batch reads the BHS
         # separators, parsing the head where its MSH line alone does not hold them, is in
         # parsing/split.py, _head_separators (BACKLOG #5919).
         refused: list[_RefusedMember] = []
@@ -12184,11 +12184,13 @@ class RegistryRunner:
                 first = kept[0]  # the envelope's head is the first member that survived
                 # The head's own fields: a non-HL7 head faults here, and it is this member's.
                 current = first.id
-                # This parse and encode_batch below each run in a thread (BACKLOG #5706). Both scale
+                # This read and encode_batch below each run in a thread (BACKLOG #5706). Both scale
                 # with the members' size, and on the event loop a large member would stall every
-                # lane, listener and the API while it parsed.
-                parsed = await asyncio.to_thread(Message.parse, first.payload)
-                control_id = parsed.control_id or first.id  # stable
+                # lane, listener and the API while it was read. head_control_id reads MSH-10 as a
+                # parse of the head does, parsing only its first line where that reads the same
+                # (BACKLOG #5919).
+                head_id = await asyncio.to_thread(head_control_id, first.payload)
+                control_id = head_id or first.id  # stable
                 timestamp = _hl7_batch_timestamp(first.created_at)
                 # encode_batch reads the HYDRATED head's MSH-1 and MSH-2 and frames every member in
                 # one call, so a fault inside it cannot be told apart by member; the send is the
@@ -12291,9 +12293,9 @@ class RegistryRunner:
             # dead-letters the members still present (bad data can never frame/deliver —
             # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
             # A fault one member's own step raised (its re-attach, its frame check, or the head's
-            # parse) names that member by its outbox id, never its content, in the log, the stored
-            # error and the alert (vault BACKLOG #5100). One the send of a connector a reload
-            # retired raised is the reload's (BACKLOG #5718), as the single row.
+            # MSH-10 read) names that member by its outbox id, never its content, in the log,
+            # the stored error and the alert (vault BACKLOG #5100). One the send of a connector
+            # a reload retired raised is the reload's (BACKLOG #5718), as the single row.
             if sending and self._connector_retired(name, connector):
                 return await self._release_retired(name, [it.id for it in items])
             member = _batch_member(current)
@@ -16437,10 +16439,11 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
     """
     if source.type is not ConnectorType.HTTP:
         return
-    host = str(source.settings.get("host", "127.0.0.1"))
-    # CIDR-aware, and it treats an empty host as loopback — which matches HttpSource's own
-    # `s.get("host") or "127.0.0.1"` fallback. Reused rather than minting another _LOOPBACK_HOSTS
-    # frozenset; the tree already carries five same-named copies across two distinct contents.
+    # A blank host binds HttpSource's own default, so the gate judges that address: the shared
+    # predicate does not take "" as loopback (BACKLOG #5512).
+    host = str(source.settings.get("host", DEFAULT_BIND_HOST)) or DEFAULT_BIND_HOST
+    # CIDR-aware. Reused rather than minting another _LOOPBACK_HOSTS frozenset; the tree already
+    # carries five same-named copies across two distinct contents.
     if is_loopback_hop_host(host):
         return
     if _has_effective_peer_control(source.settings):

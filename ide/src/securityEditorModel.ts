@@ -6,8 +6,10 @@
 // check fails closed: a refusal names what is wrong and nothing is run.
 import * as path from "node:path";
 
+import { isSamePath, nonAsciiCaseVariant, sameIgnoringAnyCase, segmentsBelow } from "./pathFold";
 import type { Field, FieldType } from "./securityEditorWebview";
 import {
+  CASE_RULE,
   hasColonInName,
   hasReservedDeviceName,
   hasTrailingDotOrSpaceName,
@@ -38,19 +40,14 @@ export function securityConfigInput(
 /** The service-settings file the editor reads and writes, or why it may not. */
 export type ConfigTarget = { readonly ok: true; readonly path: string } | { readonly ok: false; readonly problem: string };
 
-/** Whether `target` lies strictly inside `root`. path.relative so a sibling sharing a name prefix
- *  does not match, and on Windows the comparison ignores case as the file system does. A first
- *  component that only starts with two dots, such as `..conf`, is inside. */
-function inside(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return rel !== "" && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
-}
-
 /** The file-system reads the link check makes, as fs.lstatSync and fs.realpathSync.native make
- *  them: each throws an error carrying `code` for a path it cannot read. */
+ *  them: each throws an error carrying `code` for a path it cannot read. `fileId`, a file's device
+ *  and file id as text, as fs.statSync reads them, places a case-variant spelling of the workspace
+ *  where its real path keeps the spelling's case; without it such a spelling is refused. */
 export interface LinkFs {
   lstat(p: string): { isSymbolicLink(): boolean };
   realpath(p: string): string;
+  fileId?(p: string): string;
 }
 
 /** Whether `e` says only that the path does not exist, the one lstat error the check passes over. */
@@ -78,10 +75,45 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
     deepest = next;
   }
   try {
-    const expected = path.join(fsx.realpath(root), path.relative(root, deepest));
-    return path.relative(expected, fsx.realpath(deepest)) === "";
+    // The folder's own real path must be the root of the deepest one's, ASCII case only on Windows
+    // (pathFold.ts, BACKLOG #5832). Below it, the same names in any case: a real path names the
+    // case on disk, which NTFS may have folded from the spelling, and stays inside the folder.
+    const spelled = segmentsBelow(root, deepest) ?? [];
+    const real = segmentsBelow(fsx.realpath(root), fsx.realpath(deepest));
+    return (
+      real !== undefined && real.length === spelled.length && real.every((seg, i) => sameIgnoringAnyCase(seg, spelled[i]))
+    );
   } catch {
     return false; // any realpath error refuses
+  }
+}
+
+/** Whether `head` is the folder `root`, by real path and then by {@link LinkFs.fileId}, as
+ *  escapesByLink places it: true, false when `head` does not exist or its file id differs, or
+ *  undefined when a read fails for any reason but absence, a dangling link at `head` included, or
+ *  when the real paths differ and there is no `fileId` to settle it. */
+function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | undefined {
+  let realRoot: string;
+  try {
+    realRoot = fsx.realpath(root);
+  } catch {
+    return undefined;
+  }
+  try {
+    if (isSamePath(realRoot, fsx.realpath(head))) {
+      return true;
+    }
+    return fsx.fileId === undefined ? undefined : fsx.fileId(root) === fsx.fileId(head);
+  } catch (e) {
+    if (!missing(e)) {
+      return undefined;
+    }
+  }
+  try {
+    fsx.lstat(head);
+    return undefined; // the entry exists but its target does not: a dangling link
+  } catch (e) {
+    return missing(e) ? false : undefined;
   }
 }
 
@@ -110,7 +142,9 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    ({@link hasReservedDeviceName}), which a Win32 open can read as the device. Then
  *    every existing path below the workspace folder, down to the target, must lstat as not a link,
  *    a dangling one included; the walk stops at the first that does not exist. The deepest
- *    existing one must then realpath to the folder's own realpath joined with the same parts,
+ *    existing one must then realpath to the folder's own realpath, ASCII case only on Windows,
+ *    joined with the same parts in any case (pathFold.sameIgnoringAnyCase), since NTFS may have
+ *    folded the spelling's case onto the disk's and the result stays inside the folder,
  *    because lstat does not report every reparse point as a link, at least not a junction onto a
  *    volume GUID path. An lstat error other than ENOENT or ENOTDIR, or any realpath error, the
  *    folder's own included, refuses. An 8.3 short name below the folder is refused too, since
@@ -119,9 +153,19 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    can choose it, since the workspace folder used is the first in `folders`.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` included, it gets the checks of rule 2, and the folder itself
- *    is refused. Otherwise it is accepted as written, with no file-system call.
+ *    is refused. Otherwise it is accepted as written, with no file-system call, except in one case.
  *
- * Open limit: rule 3 compares spellings only. A user-set path that reaches the workspace folder by
+ * On Windows a spelling is inside the folder when it matches with only ASCII case ignored, not
+ * toLowerCase()'s fold (pathFold.ts, BACKLOG #5832). A path that
+ * differs from the folder's spelling only by a case outside A-Z may still be the folder, since NTFS
+ * folds at least e-acute against E-acute. Set in workspace settings, it is refused. Set in user
+ * settings, the real path of the folder it names at the workspace's depth is read: when that is the
+ * workspace folder, the path gets rule 2's checks, spelled from the workspace folder; when it does
+ * not exist or is another folder, it is accepted as written; any other error, a dangling link
+ * included, refuses. Where the real paths differ, the file ids decide, as escapesByLink decides;
+ * a caller that passes no `fileId` refuses then.
+ *
+ * Open limit: rule 3 compares spellings only, but for the case variant above. A user-set path that reaches the workspace folder by
  * an alias is accepted as written, and no link the repository holds is checked on it. That covers at
  * least a subst drive, an 8.3 short name, a UNC spelling of the folder, a junction or symbolic link
  * outside the folder that leads into it, and a mapped network drive. Nor does this check cover the
@@ -141,22 +185,44 @@ export function securityConfigTarget(
   }
   const root = path.resolve(workspace);
   const target = path.resolve(root, setting);
-  const rel = path.relative(root, target);
-  // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
-  if (rel === "") {
-    return { ok: false, problem: "messagefoundry.serviceConfig names the workspace folder itself, not a file" };
-  }
-  if (!inside(root, target)) {
+  let below = segmentsBelow(root, target);
+  if (below === undefined) {
+    const variant = nonAsciiCaseVariant(root, target);
     if (scope.fromWorkspace) {
       return {
         ok: false,
         problem:
-          "messagefoundry.serviceConfig, set in workspace settings, names a path outside the workspace folder. " +
-          "To use a file elsewhere, set it in user settings",
+          variant === undefined
+            ? "messagefoundry.serviceConfig, set in workspace settings, names a path outside the workspace folder. " +
+              "To use a file elsewhere, set it in user settings"
+            : "messagefoundry.serviceConfig, set in workspace settings, is not a path inside the workspace folder " +
+              `as spelled ${CASE_RULE}. Spell it with the folder's own case, or, to use a file elsewhere, set it ` +
+              "in user settings",
       };
     }
-    return { ok: true, path: target };
+    if (variant === undefined) {
+      return { ok: true, path: target };
+    }
+    const same = isWorkspaceFolder(root, variant.head, fsx);
+    if (same === undefined) {
+      return {
+        ok: false,
+        problem:
+          "messagefoundry.serviceConfig spells a folder on its path with a case outside A-Z that differs from the " +
+          "workspace folder's, and whether it is the workspace folder could not be read. Spell it with the " +
+          `folder's own case ${CASE_RULE}`,
+      };
+    }
+    if (!same) {
+      return { ok: true, path: target };
+    }
+    below = [...variant.rest];
   }
+  // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
+  if (below.length === 0) {
+    return { ok: false, problem: "messagefoundry.serviceConfig names the workspace folder itself, not a file" };
+  }
+  const rel = below.join(path.sep);
   if (hasTrailingDotOrSpaceName(rel)) {
     return {
       ok: false,

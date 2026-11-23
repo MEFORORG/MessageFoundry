@@ -43,6 +43,7 @@ import hmac
 import io
 import json
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -5149,9 +5150,12 @@ def _safe_segment(value: str) -> str:
 # activation is the consumer (the DR box restores here, then activates onto the restored store).
 
 #: A WAL-mode store is three files. Restoring `store.db` beside a leftover `store.db-wal` from a
-#: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so the sidecars
-#: are refused as destinations too, not just the main file.
-_SIDECAR_SUFFIXES = ("-wal", "-shm")
+#: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so a taken
+#: sidecar name is refused too, not just the main file: a file, a directory or a link, a dangling one
+#: included. When the names are read, and what that misses, is :func:`_refuse_taken_store_names`.
+#: ``-journal`` is here for the same reason: SQLite replays a hot rollback journal on first open, even
+#: into a WAL-mode store (measured).
+_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 #: ASVS 5.2.3 bounds on the restored CONFIG bundle, which the per-member cap alone cannot give: N
 #: members each just under that cap would still fill the destination volume. A real config dir is a
@@ -5163,7 +5167,8 @@ _MAX_CONFIG_MEMBERS = 10_000
 #: the same sentence as the one who was refused up front.
 _OVERWRITE_REFUSAL = (
     "refusing to overwrite an existing path at {path} — restoring over a live store is unrecoverable; "
-    "choose an empty --to path (or move the existing store aside first)"
+    "choose an empty --to path, or stop the engine and move the existing store aside with its -wal, "
+    "-shm and -journal as one set"
 )
 
 #: The one place the RESTORE path words a codec-level archive failure, so the operator whose header will
@@ -5721,6 +5726,9 @@ def _restore_blocking(
             except sqlite3.Error as exc:
                 raise BackupError("restore", safe_exc(exc)) from exc
             row_counts = {**row_counts, "restore_marker": 1}
+            # The second read of the store's names, while nothing is placed; its docstring says why
+            # and what it misses.
+            _refuse_taken_store_names(dest_store_path)
             # The exclusive create sits OUTSIDE the rollback on purpose: a lost create race raises
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
@@ -6347,10 +6355,101 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     return row_counts
 
 
+#: The ``--to`` refusals of :func:`_refuse_existing_destination`, one per trigger, so each is true
+#: on every host it can fire on. The ':' one fires on every host; the other two only on Windows.
+_COLON_TO_REFUSAL = (
+    "refusing --to {path}: its file name holds a ':'. It is refused on every host, so one --to means "
+    "the same everywhere: on Windows, and on some NTFS volumes reached from other systems, a ':' "
+    "names an alternate data stream, where the never-overwrite check could miss the store's real "
+    "-wal, -shm and -journal — choose a --to whose file name holds no ':'"
+)
+_TRAILING_TO_REFUSAL = (
+    "refusing --to {path}: its file name ends in a {what}, which Windows does not keep as part of "
+    "the name, so the never-overwrite check could miss the store's real -wal, -shm and -journal — "
+    "choose a --to whose file name does not end in a dot or a space"
+)
+_DEVICE_TO_REFUSAL = (
+    "refusing --to {path}: Windows would not open that name as a file of its own, for example a "
+    "device name such as NUL, or a path with no file name — choose another --to file name"
+)
+#: The fault refusal of :func:`_occupied` for WinError 123, an invalid name.
+_INVALID_NAME_REFUSAL = (
+    "cannot use {path}: {exc} — Windows refuses the path as invalid, for example for a character "
+    "such as < > | ? or * in its file name or in one of its directories; choose another --to path"
+)
+_FAULT_REFUSAL = (
+    "cannot tell whether {path} is free: {exc} — choose another --to path, or check that this "
+    "account can read its directory"
+)
+
+
+def _rewritten_to_refusal(path: Path) -> str:
+    """The refusal for a ``--to`` that :func:`_refuse_existing_destination` refuses by its spelling."""
+    if ":" in path.name:
+        return _COLON_TO_REFUSAL.format(path=path)
+    if path.name.endswith((".", " ")) and path.name not in (".", ".."):
+        what = "dot" if path.name.endswith(".") else "space"
+        return _TRAILING_TO_REFUSAL.format(path=path, what=what)
+    return _DEVICE_TO_REFUSAL.format(path=path)
+
+
+def _occupied(path: Path) -> bool:
+    """Whether anything has the name ``path``, a link included, dangling or not. Read without
+    following a link, so a dangling ``store.db-wal`` symlink, which SQLite would write through,
+    counts as taken. ``FileNotFoundError`` and ``NotADirectoryError`` read as free; on Windows
+    ``FileNotFoundError`` also covers at least network, invalid-drive, bad-path and too-long-path
+    errors (WinError 53, 67, 15, 161 and 206). Any other fault is a refusal, where
+    ``os.path.lexists`` would answer ``False``."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError) as exc:  # ValueError: an embedded NUL, from a programmatic caller
+        text = _INVALID_NAME_REFUSAL if getattr(exc, "winerror", None) == 123 else _FAULT_REFUSAL
+        raise BackupError("destination", text.format(path=path, exc=safe_exc(exc))) from exc
+    return True
+
+
+def _store_names(dest_store_path: Path) -> tuple[Path, ...]:
+    """The store's name, then the ``-wal``, ``-shm`` and ``-journal`` names SQLite derives from it."""
+    return (
+        dest_store_path,
+        *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
+    )
+
+
+def _refuse_taken_store_names(dest_store_path: Path) -> None:
+    """Refuse a ``--to`` whose store name or any sidecar name is taken, by a file, a directory or a link
+    (:func:`_occupied`), naming the first one taken.
+
+    Run up front by :func:`_refuse_existing_destination` and again just before the placement in
+    :func:`_restore_blocking`, because the decrypt between them can take minutes. A sidecar planted
+    then would be replayed over the verified pages on first open. A dangling link planted at the
+    store's own name would be followed by the copy fallback's exclusive create on Windows, which
+    writes the store to the link's target (measured), so the store name is read again too.
+
+    After the second read, a regular file at the store name is still refused, by the placement's
+    exclusive create. Not caught, at least: a sidecar created after the second read, including while
+    the store is copied into place; and, on Windows when the store is copied rather than hard-linked
+    into place, a dangling link planted at the store name after it, which that create follows."""
+    for path in _store_names(dest_store_path):
+        if _occupied(path):
+            raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
+
+
 def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path | None) -> None:
     """Refuse every destination that already holds something, BEFORE any decrypt work. Restoring over a
     live store is unrecoverable and a CLI cannot ask for permission, so the answer is no and the message
     names the path the operator must move or choose differently.
+
+    The store arm refuses at least: an existing store name, and an existing ``-wal``, ``-shm`` or
+    ``-journal`` beside it, whether file, directory or link, a dangling link included
+    (:func:`_occupied`); and a ``--to`` whose last component holds a ``:``, or that Windows would open
+    as another name, such as one ending in a dot or a space (:func:`_win_rewritten`). On Windows those
+    spellings derive sidecar names SQLite never uses, so the sidecar check would read the wrong files.
+    The ``:`` is refused on every host, so one ``--to`` means the same everywhere; a POSIX host can
+    reach an NTFS volume, where a ``:`` can name a stream. The names are read again just before the
+    placement (:func:`_refuse_taken_store_names`).
 
     The last arm refuses a pair of destinations that are individually empty and still collide, because
     this restore writes BOTH of them: see :func:`_refuse_config_dest_under_the_store`. Its mirror image
@@ -6359,12 +6458,9 @@ def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path
     ``dest_store_path`` is ``None`` on the config-only route (vault BACKLOG #5233): there is no store
     to place, so only the config destination is checked."""
     if dest_store_path is not None:
-        for path in (
-            dest_store_path,
-            *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
-        ):
-            if path.exists():
-                raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
+        if ":" in dest_store_path.name or _win_rewritten(dest_store_path):
+            raise BackupError("destination", _rewritten_to_refusal(dest_store_path))
+        _refuse_taken_store_names(dest_store_path)
     if config_dest is not None:
         # is_file() BEFORE iterdir(): a --config-to that names an existing FILE is a typo to report, and
         # iterdir() on one raises NotADirectoryError, which escapes the CLI's BackupError handler as a
@@ -6429,7 +6525,13 @@ def _refuse_colliding_config_members(
     Run before the store is extracted, so a refusal costs neither the extract nor a half-finished
     restore. Traversal names are compared like any other: a ``../store.db`` member resolving back onto
     the store is the same collision, and refusing it here beats refusing it after placement. The
-    exclusive create in :func:`_extract_config_members` is the backstop under this, not the control."""
+    exclusive create in :func:`_extract_config_members` is the backstop under this, not the control.
+
+    On a Windows host the question is also asked under Win32 naming, of the member and of each
+    directory above it (:func:`_win32_path_key`). There ``config/store.db-wal.`` compares unequal to
+    ``store.db-wal`` and is then created AS it once the store is placed, and the exclusive create
+    cannot catch that, because no WAL exists yet. A planted WAL would change verified rows on first
+    open, after ``integrity_check`` and the row-count compare."""
     published = {
         _norm_for_compare(p)
         for p in (
@@ -6439,6 +6541,21 @@ def _refuse_colliding_config_members(
     }
     seen: set[str] = set()
     try:
+        win32_root_key: tuple[str, ...] = ()
+        win32_published: set[tuple[str, ...]] = set()
+        store_key: tuple[str, ...] = ()
+        win32_depth = 0  # the store key's length; 0 off Windows, where this comparison never runs
+        if sys.platform == "win32":
+            win32_root_key = _win32_path_key(str(config_dest.resolve()))
+            store_key = _win32_path_key(str(dest_store_path.resolve()))
+            # Sidecars are suffixed AFTER normalizing: SQLite names them from the path spelling the
+            # store is opened with, and `--to D/store.db.` places `store.db`, whose plain spelling
+            # has its WAL at `store.db-wal`, not `store.db.-wal`.
+            win32_published = {
+                store_key,
+                *(store_key[:-1] + (store_key[-1] + s,) for s in _SIDECAR_SUFFIXES),
+            }
+            win32_depth = len(store_key)
         with tarfile.open(tar_path, "r:") as tar:
             for member in tar.getmembers():
                 if not _is_config_payload_member(member):
@@ -6454,8 +6571,45 @@ def _refuse_colliding_config_members(
                         "same command without --config-to",
                     )
                 seen.add(member.name)
-                out = config_dest / member.name[len(_CONFIG_PREFIX) :]
-                if _norm_for_compare(out) not in published:
+                rel = member.name[len(_CONFIG_PREFIX) :]
+                out = config_dest / rel
+                exact = _norm_for_compare(out) in published
+                if not exact and win32_depth:
+                    # Resolved first, so an 8.3 spelling of an existing parent is expanded.
+                    resolved = ntpath.normpath(str(out.resolve()))
+                    prefix = _win32_path_key(resolved)[:win32_depth]
+                    # The short-name case applies to the COPY-FALLBACK placement: a hard-linked
+                    # store has no 8.3 name (measured), so there `RESTOR~1.DB` is an unrelated new
+                    # file. A copied store gets its 8.3 name only when placed, so it cannot be
+                    # resolved here. A plain spelling of it then meets the exclusive create; a
+                    # STREAM on it would not, and would write onto the store. So a stream on any
+                    # `~` name in the store's directory is refused under BOTH placements, failing
+                    # closed because which one will run is not known yet. The generated name itself
+                    # is not predicted.
+                    # LIMIT, on the copy path: this does not cover a plain `RESTOR~1.DB-wal` member.
+                    # It lands, and becomes the store's WAL if the store is later opened by its 8.3
+                    # path, because SQLite names sidecars from the spelling the store was opened with.
+                    at_store_dir = len(prefix) == win32_depth and prefix[:-1] == store_key[:-1]
+                    component = resolved.split("\\")[win32_depth - 1] if at_store_dir else ""
+                    stem, stream_mark, _ = component.partition(":")
+                    # A prefix equal to the root's own is the operator's path, not the member's.
+                    if (prefix in win32_published and prefix != win32_root_key[:win32_depth]) or (
+                        stream_mark and "~" in stem
+                    ):
+                        # The member's name is not echoed, because this check runs before the name
+                        # gate and a name can still carry control characters. The exact-match
+                        # refusal below does echo it, so it is not safe against such a name.
+                        raise BackupError(
+                            "destination",
+                            "the archive's config bundle carries a member that may resolve, on "
+                            "Windows, to or under a path this restore would publish for the store "
+                            f"({dest_store_path}), so it could replace or corrupt the restored "
+                            "database. Nothing was extracted. The name may be a forgery or may simply "
+                            "alias on Windows. If --config-to contains the --to path, choose a "
+                            "--config-to directory that does not contain the --to path; a name "
+                            "that climbs out of --config-to is refused wherever it is restored",
+                        )
+                if not exact:
                     continue
                 raise BackupError(
                     "destination",
@@ -6470,6 +6624,26 @@ def _refuse_colliding_config_members(
         # this reads ATTACKER-SUPPLIED member names into ``Path``: a name the platform cannot parse
         # must be a refusal, not a traceback out of a check whose whole job is to refuse.
         raise BackupError("restore", safe_exc(exc)) from exc
+
+
+def _win32_path_key(path: str) -> tuple[str, ...]:
+    """A deliberately CONSERVATIVE key for "could this name reach that path on Windows", one
+    lower-cased entry per component. Pure, on every platform. It is not how Win32 names a path.
+
+    Each component loses an alternate-stream suffix and then its trailing dots and spaces. Win32
+    does less (measured): it keeps a trailing space on an intermediate component, and ``name.:x``
+    is a stream on a literal ``name.``. So this key OVER-REFUSES ``store.db-wal /x.toml`` and
+    ``store.db-wal.:x``, which name other paths; failing closed on a forged-looking name is the
+    intent. A component of ONLY dots or spaces keeps its spelling, so it cannot fuse its neighbours,
+    although Win32 can collapse one in final position; this key does not model that. Case is lowered ONE
+    CHARACTER AT A TIME, because ``str.lower`` on a whole string picks final sigma by context and would
+    separate two names NTFS treats as one. Per character, measured against ``RtlUpcaseUnicodeChar``
+    over the BMP on one Windows 11 host, it separates no two characters that function folds together."""
+    key: list[str] = []
+    for part in ntpath.normpath(path).split("\\"):
+        stem = part.split(":", 1)[0]
+        key.append("".join(map(str.lower, stem.rstrip(". ") or stem)))
+    return tuple(key)
 
 
 def _dangling_link_refusal(member: tarfile.TarInfo) -> str:

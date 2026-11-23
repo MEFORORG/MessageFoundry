@@ -319,8 +319,16 @@ async def test_rotating_the_transit_key_keeps_the_attestation(
     _use_fake(monkeypatch, transit)
     db = tmp_path / "rotating.db"
     store = await _transit_store(db)
-    await _attest(store)
-    await store.close()
+    try:
+        await _attest(store)
+        # The chain as written, before the key moves (BACKLOG #2720 closing step 4's before half).
+        before_ok, before_msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert before_ok, before_msg
+    assert transit.verified and set(transit.verified) == {1}, transit.verified
+    transit.verified.clear()  # so the checks below count only calls after the move, the reopen's
+    # own check included
     transit.latest = 2  # Transit rotated the key; new MACs are vault:v2:
     again = await _transit_store(db)
     try:

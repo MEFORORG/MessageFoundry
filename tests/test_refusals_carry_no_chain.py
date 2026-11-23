@@ -11,7 +11,7 @@ would have leaked on first deployment:
   whose own cause, from ``pipeline/ingress_guards.py``, was a Unicode error holding the WHOLE body;
 * ``transports/database.py`` ``_lookup_max_rows``, where ``int()``'s ``ValueError`` quotes the
   env()-resolved value the message says it withholds;
-* ``transports/rest.py`` ``refuse_url_credentials``, where ``urlsplit().port``'s ``ValueError``
+* ``messagefoundry/urlscreen.py`` ``refuse_url_credentials``, where ``urlsplit().port``'s ``ValueError``
   quotes the port field, which is the password in ``https://svc:PW/path``.
 
 Every refusal test here fails against the pre-fix code; the controls pass on both (measured
@@ -294,7 +294,7 @@ def test_a_numeric_max_rows_is_still_read() -> None:
     assert _lookup_max_rows(0, "LK_1796") is None
 
 
-# ---- transports/rest.py refuse_url_credentials ----------------------------------------------------
+# ---- urlscreen.py refuse_url_credentials ----------------------------------------------------------
 
 
 def test_a_password_read_as_a_port_stays_off_the_chain() -> None:

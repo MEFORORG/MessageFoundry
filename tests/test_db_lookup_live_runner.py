@@ -46,6 +46,7 @@ from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports import database
+from tests._fake_dbapi_driver import DriverError
 
 # An ADT carrying a Meditech provider id in PV1-7.1 for the NPI substitution.
 ADT = (
@@ -274,7 +275,7 @@ async def test_handler_db_lookup_error_dead_letters(
 ) -> None:
     # A driver error (carrying a SQLSTATE) → DbLookupError in the worker → the transform fails → ERROR /
     # dead-letter. This happens AFTER the ACK-on-receipt ingress commit, so the sender is not NAK'd.
-    _patch_pool(monkeypatch, columns=["npi"], error=Exception("08S01", "connection reset"))
+    _patch_pool(monkeypatch, columns=["npi"], error=DriverError("08S01", "connection reset"))
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -333,7 +334,7 @@ async def test_a_handler_can_catch_a_down_database_as_a_lookup_error(
     # Handler as the driver's own exception, past an `except DbLookupError`. A Handler that falls
     # back on a failed lookup now gets to, and its message is delivered unchanged.
     async def down(dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None) -> Any:
-        raise Exception("08001", "cannot connect")
+        raise DriverError("08001", "cannot connect")
 
     monkeypatch.setattr(database, "_make_pool", down)
     caught: list[str] = []
@@ -356,5 +357,5 @@ async def test_a_handler_can_catch_a_down_database_as_a_lookup_error(
         await _until_status(store, MessageStatus.PROCESSED.value)
     finally:
         await runner.stop()
-    assert caught == ["db_lookup on 'clarity': could not open a connection (Exception [08001])"]
+    assert caught == ["db_lookup on 'clarity': could not open a connection (DriverError [08001])"]
     assert "MEDITECH123" in (outdir / "NPI1.hl7").read_text("utf-8")

@@ -953,7 +953,7 @@ def test_generic_guard_is_none_off_the_arm() -> None:
         ("[::1]remote.example", {}, ("[::1]remote.example", 0)),
         ("[::1]:5432x", {}, ("[::1]:5432x", 0)),
         ("127.0.0.1 : 5432", {}, ("127.0.0.1 : 5432", 0)),
-        # An empty bracketed host is read whole: the loopback check reads an empty host as on-box.
+        # An empty bracketed host is read whole, so a refusal names the text the driver is handed.
         ("[]", {}, ("[]", 0)),
         ("[]:5432", {}, ("[]:5432", 0)),
     ],

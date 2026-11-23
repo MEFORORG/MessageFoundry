@@ -6421,6 +6421,14 @@ jobs:
         # broken hashed dep or the Debian/MS-key issue the Dockerfile warns about turns the job red here.
         run: docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver-ci .
 
+      - name: Build the -postgres variant and import asyncpg and the Postgres store in it
+        # The `ha` compose profile and docker/k8s/ha-postgres.yaml run the Postgres store on this
+        # variant. The import runs on the image's own interpreter, so a lock that dropped asyncpg turns
+        # the job red here rather than at a deploying site's first store open.
+        run: |
+          docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres-ci .
+          docker run --rm --entrypoint /opt/venv/bin/python messagefoundry:postgres-ci -I -c "import asyncpg, messagefoundry.store.postgres"
+
       - name: Build the test smoke image (baked minimal config + MLLP sender)
         run: docker build -f docker/smoke/Dockerfile --build-arg BASE=messagefoundry:ci -t messagefoundry:smoke .
 
