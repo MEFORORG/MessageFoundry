@@ -1448,24 +1448,29 @@ def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[
     return missing
 
 
-def cas_not_self_signed(ca_ders: Iterable[bytes]) -> list[str]:
-    """Each CA in ``ca_ders`` that is not self-signed, named with its serial number, sorted (vault
-    BACKLOG #5511). A CA whose self-signature cannot be checked is listed too, failing closed."""
-    issued = []
+def cas_not_reaching_a_root(ca_ders: Iterable[bytes]) -> list[str]:
+    """Each CA in ``ca_ders`` with no path through ``ca_ders`` to a self-signed root also in it,
+    named with its serial number, sorted (vault BACKLOG #5511). Each link needs the issuer's key
+    to verify the CA's signature, so a CA whose signature cannot be checked, or that does not
+    parse, is listed too, failing closed."""
+    named = []
+    pending = []
     for index, der in enumerate(ca_ders, 1):
         try:
-            cert = x509.load_der_x509_certificate(der)
+            pending.append(x509.load_der_x509_certificate(der))
         except _UNREADABLE_CA:
-            issued.append(f"CA certificate {index}, which does not parse")
-            continue
-        try:
-            cert.verify_directly_issued_by(cert)
-        except (ValueError, TypeError, InvalidSignature, UnsupportedAlgorithm):
-            issued.append(
-                f"{quoted_issuer(cert.subject.rfc4514_string())} "
-                f"(serial number {cert.serial_number:#x})"
-            )
-    return sorted(issued)
+            named.append(f"CA certificate {index}, which does not parse")
+    rooted = [cert for cert in pending if _directly_issued(cert, cert)]
+    pending = [cert for cert in pending if cert not in rooted]
+    # A fixed point: each pass roots every pending CA that a rooted CA issued.
+    while reached := [c for c in pending if any(_directly_issued(c, r) for r in rooted)]:
+        rooted.extend(reached)
+        pending = [cert for cert in pending if cert not in reached]
+    named.extend(
+        f"{quoted_issuer(cert.subject.rfc4514_string())} (serial number {cert.serial_number:#x})"
+        for cert in pending
+    )
+    return sorted(named)
 
 
 #: The CA setting an outbound whole-chain hop loads its CAs from, as a refusal names it.

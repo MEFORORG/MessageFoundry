@@ -3485,16 +3485,18 @@ def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
     )
 
 
-def _require_self_signed_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
-    """Refuse a whole-chain hop whose CA file loads a CA that is not self-signed, then make the
-    chain end at a self-signed root (vault BACKLOG #5511).
+def _require_rooted_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
+    """Refuse a whole-chain hop whose CA file loads a CA that does not chain to a self-signed
+    root in that file, then make the chain end at a self-signed root (vault BACKLOG #5511).
 
     ``ssl.create_default_context`` sets ``VERIFY_X509_PARTIAL_CHAIN``, so OpenSSL accepts a chain
     that ends at any CA in the store. Measured on OpenSSL 3.5.7: with an intermediate in the CA
     file, the chain ended there, and every handshake was refused with ``unable to get certificate
-    CRL``. So a CA file holding a CA another CA issued is refused here, at build, and the flag is
-    cleared, so a chain must end at a root."""
-    from messagefoundry.pki import cas_not_self_signed
+    CRL``. So the flag is cleared, so a chain must end at a root, and a CA file holding a CA whose
+    root it does not hold is refused here, at build, since no chain through that CA could end at
+    a root the CRL file covers. An intermediate beside its root is admitted: the chain runs on
+    through it to the root, and the own-CRL rule then asks for the intermediate's CRL too."""
+    from messagefoundry.pki import cas_not_reaching_a_root
 
     stats = ctx.cert_store_stats()
     if stats["x509"] != stats["x509_ca"]:
@@ -3505,17 +3507,20 @@ def _require_self_signed_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
             f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
             f"loads {stats['x509'] - stats['x509_ca']} certificate(s) that are not CAs. The "
             "whole-chain check needs the chain to end at a root whose CRL is in [tls].crl_file. "
-            "Put only the root CA(s) in that CA file"
+            "Put only CA certificates in that CA file"
         )
-    issued = cas_not_self_signed(ctx.get_ca_certs(binary_form=True))
-    if issued:
+    unrooted = cas_not_reaching_a_root(ctx.get_ca_certs(binary_form=True))
+    if unrooted:
         raise ValueError(
             f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
-            f"loads CA(s) that are not self-signed: {', '.join(issued)}. The whole-chain "
-            "check needs the chain to end at a root whose CRL is in [tls].crl_file. Put only the "
-            "root CA(s) in that CA file; the server sends its intermediates"
+            f"loads CA(s) that do not chain to a self-signed root CA in that file: "
+            f"{', '.join(unrooted)}. The whole-chain check needs the chain to end at a root "
+            "whose CRL is in [tls].crl_file. Add each one's root CA to that CA file, or remove "
+            "the CA; the server can send its intermediates"
         )
-    ctx.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN
+    # int(): the complement of the IntFlag member keeps only VerifyFlags' own bits, so it would
+    # also clear a flag above them that OpenSSL or an earlier step set.
+    ctx.verify_flags &= ~int(ssl.VERIFY_X509_PARTIAL_CHAIN)
 
 
 def _harden_outbound_crl(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
@@ -3524,7 +3529,7 @@ def _harden_outbound_crl(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
     if anchor.crl_file is None:
         return
     if anchor.crl_check_chain:
-        _require_self_signed_cas(ctx, anchor)
+        _require_rooted_cas(ctx, anchor)
     harden_crl_check(
         ctx, anchor.crl_file, setting=OUTBOUND_CRL_SETTING, chain=anchor.crl_check_chain
     )
@@ -3550,9 +3555,11 @@ def build_verifying_client_context(
 
     With ``anchor.crl_check_chain`` (``[tls].crl_check_chain``, vault BACKLOG #5511) the CRL is
     checked against the peer's whole chain. Only a hop that trusts operator CAs alone can honour
-    that, a connection's ``tls_ca_file`` or a pinned ``[tls].internal_ca_file``. A hop on the OS
-    trust store is refused before anything is built, as is a CA file that loads a CA another CA
-    issued; on the rest the chain must end at a root."""
+    that, such as one whose CA file is a connection's ``tls_ca_file``,
+    ``[alerts].email_tls_ca_file`` or a pinned ``[tls].internal_ca_file``. A hop on the OS trust
+    store is refused before anything is built. A CA file that loads a CA with no path to a
+    self-signed root in that file is refused once it loads, and on the rest the chain must end at
+    such a root."""
     _refuse_chain_check_on_os_roots(anchor)
     ctx: ssl.SSLContext
     if anchor.load_system_roots:

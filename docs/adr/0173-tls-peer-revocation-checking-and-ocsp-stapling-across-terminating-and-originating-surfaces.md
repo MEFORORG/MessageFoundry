@@ -1819,10 +1819,13 @@ OpenSSL 3.5.7: `ssl.create_default_context` sets `VERIFY_X509_PARTIAL_CHAIN`, so
 an intermediate ends the chain there, and every handshake is refused with `unable to get
 certificate CRL`.
 
-**Where it holds, and where it refuses.** It holds on a hop that trusts operator CAs alone, a
-connection's `tls_ca_file` or a pinned `[tls].internal_ca_file`. There
-`build_verifying_client_context` refuses a CA file that loads a CA that is not self-signed, clears
-`VERIFY_X509_PARTIAL_CHAIN`, and applies section 14's start rule, worded for a server chain. The
+**Where it holds, and where it refuses.** It holds on a hop that trusts operator CAs alone, such as
+one whose CA file is a connection's `tls_ca_file`, `[alerts].email_tls_ca_file` or a pinned
+`[tls].internal_ca_file`. There `build_verifying_client_context` clears
+`VERIFY_X509_PARTIAL_CHAIN`, refuses a CA file that loads a CA with no path through that file to a
+self-signed root also in it, and applies section 14's start rule, worded for a server chain. An
+intermediate beside its root is admitted: the chain runs on through it to the root, and the start
+rule then asks for the intermediate's own CRL too. The
 running-hop reload applies the same rule. On the `system` and `augment` arms it refuses the build,
 since no CRL file covers the OS roots. LDAPS, OIDC, the log forwarder and the Postgres store, which
 have CRL settings of their own, keep the leaf check.

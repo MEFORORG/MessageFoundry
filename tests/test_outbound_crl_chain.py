@@ -5,8 +5,9 @@
 ``[tls].crl_file`` sets only the leaf CRL flag on the outbound hops it reaches, so with a two-tier
 PKI a server whose intermediate CA the root's CRL revokes completes the handshake. The opt-in
 ``[tls].crl_check_chain`` turns on the whole-chain check on a hop that trusts operator CAs alone,
-clears ``VERIFY_X509_PARTIAL_CHAIN`` there, refuses at build a CA file holding a CA that is not
-self-signed, and refuses at build a hop on the OS trust store. Off, every arm is as before.
+clears ``VERIFY_X509_PARTIAL_CHAIN`` there, refuses at build a CA file holding a CA with no path to
+a self-signed root in that file, and refuses at build a hop on the OS trust store. Off, every arm
+is as before.
 
 The two-tier PKI and the in-memory handshake are the API suite's: the "client" leaf it mints
 carries ``localhost`` and serverAuth, so here it is the server's certificate, sent with its
@@ -21,17 +22,21 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from messagefoundry.config.settings import TlsSettings
 from messagefoundry.config.tls_policy import (
     TrustAnchor,
     TrustAnchorPolicy,
+    _require_rooted_cas,
     build_anchored_https_handler,
     build_verifying_client_context,
     resolve_trust_anchor,
     urllib_handler_context,
 )
 from messagefoundry.pipeline import crl_reload
+from messagefoundry.pki import cas_not_reaching_a_root
 from tests import test_api_tls_client_trust as _api_suite
 from tests.test_api_tls_client_trust import _TwoTier
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -115,22 +120,86 @@ def test_the_chain_check_admits_a_server_whose_chain_nobody_revoked(
         _handshake(build(anchor), _server(two_tier))
 
 
+def _root_and_intermediate(pki: _TwoTier, tmp_path: Path) -> Path:
+    bundle = tmp_path / "root-and-inter.pem"
+    bundle.write_bytes(pki.root_file.read_bytes() + pki.inter_file.read_bytes())
+    return bundle
+
+
 @_BUILDERS
-def test_a_ca_file_holding_an_intermediate_refuses_the_build(
+def test_a_ca_file_holding_an_intermediate_beside_its_root_is_admitted(
     build: _Builder, two_tier: _TwoTier, tmp_path: Path
 ) -> None:
-    """With PARTIAL_CHAIN set the chain would end at the intermediate and every handshake be refused
-    with "unable to get certificate CRL", so the build refuses, naming the CA setting."""
-    bundle = tmp_path / "root-and-inter.pem"
-    bundle.write_bytes(two_tier.root_file.read_bytes() + two_tier.inter_file.read_bytes())
+    """Red on d24ca1bc059, which refused any CA that is not self-signed. With PARTIAL_CHAIN cleared
+    the chain runs on through the loaded intermediate to the loaded root, so the hop admits a
+    server nobody revoked and still refuses one under the revoked intermediate."""
+    bundle = _root_and_intermediate(two_tier, tmp_path)
+    for crl, admitted in ((two_tier.revokes_nothing, True), (two_tier.revokes_intermediate, False)):
+        for anchor in (
+            _anchor(crl, ca_file=bundle),
+            _anchor(crl, internal_ca=bundle, mode="pinned"),
+        ):
+            ctx = build(anchor)
+            assert not ctx.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN
+            if admitted:
+                _handshake(ctx, _server(two_tier))
+            else:
+                with pytest.raises(ssl.SSLError, match="revoked"):
+                    _handshake(ctx, _server(two_tier))
+
+
+@_BUILDERS
+def test_an_intermediate_whose_root_the_ca_file_does_not_hold_refuses_the_build(
+    build: _Builder, two_tier: _TwoTier
+) -> None:
+    """No chain through that intermediate can end at a root once PARTIAL_CHAIN is cleared, so
+    every handshake would be refused; the build refuses instead, naming the CA setting."""
     with pytest.raises(
         ValueError,
         match=rf"\[tls\]\.crl_check_chain is set, and tls_ca_file of connection "
-        rf"'{_CONNECTION}' loads CA\(s\) that are not self-signed: 'CN=Client Issuing'",
+        rf"'{_CONNECTION}' loads CA\(s\) that do not chain to a self-signed root CA in that "
+        rf"file: 'CN=Client Issuing'",
     ):
-        build(_anchor(two_tier.revokes_nothing, ca_file=bundle))
-    with pytest.raises(ValueError, match=r"\[tls\]\.internal_ca_file loads CA\(s\) that are not"):
-        build(_anchor(two_tier.revokes_nothing, internal_ca=bundle, mode="pinned"))
+        build(_anchor(two_tier.revokes_nothing, ca_file=two_tier.inter_file))
+    with pytest.raises(ValueError, match=r"\[tls\]\.internal_ca_file loads CA\(s\) that do not"):
+        build(_anchor(two_tier.revokes_nothing, internal_ca=two_tier.inter_file, mode="pinned"))
+
+
+def test_a_ca_reaches_a_root_through_loaded_cas_in_any_order() -> None:
+    """Three tiers listed leaf-most first still root, which takes more than one pass; a CA whose
+    named issuer is loaded under another key does not, since each link is checked by signature."""
+    root_key, mid_key, low_key, other_key = (
+        ec.generate_private_key(ec.SECP256R1()) for _ in range(4)
+    )
+    root = _api_suite._cert("Root", root_key, "Root", root_key, ca=True)
+    mid = _api_suite._cert("Mid", mid_key, "Root", root_key, ca=True)
+    low = _api_suite._cert("Low", low_key, "Mid", mid_key, ca=True)
+    forged = _api_suite._cert("Forged", low_key, "Root", other_key, ca=True)
+    der = [c.public_bytes(serialization.Encoding.DER) for c in (low, mid, root)]
+    assert cas_not_reaching_a_root(der) == []
+    assert cas_not_reaching_a_root(der[:2]) == [
+        f"'CN=Low' (serial number {low.serial_number:#x})",
+        f"'CN=Mid' (serial number {mid.serial_number:#x})",
+    ]
+    forged_der = forged.public_bytes(serialization.Encoding.DER)
+    assert cas_not_reaching_a_root([*der, forged_der]) == [
+        f"'CN=Forged' (serial number {forged.serial_number:#x})"
+    ]
+
+
+def test_clearing_partial_chain_keeps_a_flag_above_verify_flags_own_bits(
+    two_tier: _TwoTier,
+) -> None:
+    """Red on d24ca1bc059: ``~ssl.VERIFY_X509_PARTIAL_CHAIN`` is the complement within the
+    IntFlag's own members, so ``&=`` with it also cleared any higher bit, such as OpenSSL's
+    ``X509_V_FLAG_NO_ALT_CHAINS`` (0x100000), which VerifyFlags does not name."""
+    no_alt_chains = 0x100000
+    assert not no_alt_chains & sum(int(flag) for flag in ssl.VerifyFlags)
+    ctx = ssl.create_default_context(cafile=str(two_tier.root_file))
+    ctx.verify_flags |= no_alt_chains
+    _require_rooted_cas(ctx, _anchor(two_tier.revokes_nothing, ca_file=two_tier.root_file))
+    assert ctx.verify_flags & no_alt_chains
+    assert not ctx.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN
 
 
 @_BUILDERS
@@ -227,6 +296,39 @@ def test_a_reload_applies_the_same_rules(two_tier: _TwoTier, tmp_path: Path) -> 
     assert "client CA" not in outcome.refusal.reason
     assert outcome.reloaded == 0
     _handshake(ctx, _server(two_tier))  # the copy it holds still admits the server
+
+
+def _reordered(crl: Path) -> bytes:
+    """The same CRLs, intermediate's first: new bytes for the reload, no newer CRL needed."""
+    marker = b"-----BEGIN X509 CRL-----"
+    blocks = [marker + block for block in crl.read_bytes().split(marker)[1:]]
+    assert len(blocks) == 2
+    return blocks[1] + blocks[0]
+
+
+@pytest.mark.parametrize("with_intermediate", [False, True], ids=["root-only", "root-and-inter"])
+def test_the_no_issuer_remedy_holds_under_the_chain_check(
+    two_tier: _TwoTier, tmp_path: Path, with_intermediate: bool
+) -> None:
+    """The reload's ``no_issuer`` remedy says adding the issuing intermediate to the hop's own CA
+    file lets later reloads verify its CRL. Red on d24ca1bc059 for the second case, whose build
+    refused that CA file under the chain check, so the remedy could not be followed there."""
+    ca_file = (
+        _root_and_intermediate(two_tier, tmp_path) if with_intermediate else two_tier.root_file
+    )
+    crl = tmp_path / "outbound-crl.pem"
+    crl.write_bytes(two_tier.revokes_nothing.read_bytes())
+    ctx = build_verifying_client_context(_anchor(crl, ca_file=ca_file))
+
+    crl.write_bytes(_reordered(two_tier.revokes_nothing))
+    gc.collect()
+    (outcome,) = [o for o in crl_reload.reload_replaced_crls() if Path(o.path) == crl.resolve()]
+    if with_intermediate:
+        assert outcome.refusal is None and outcome.reloaded == 1
+    else:
+        assert outcome.refusal is not None and outcome.refusal.remedy == crl_reload.NO_ISSUER
+        assert outcome.reloaded == 0
+    _handshake(ctx, _server(two_tier))
 
 
 def test_the_setting_needs_a_crl_file_and_reaches_the_policy(two_tier: _TwoTier) -> None:

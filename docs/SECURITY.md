@@ -8277,8 +8277,8 @@ from a **private / internal CA** not in the box-global store can pin that CA onc
   single-anchor posture as the off-box syslog `forward_tls_ca_file`).
 - `[tls].crl_check_chain` — opt-in, default off (vault BACKLOG #5511): `[tls].crl_file` is checked against
   the server's whole chain, so a revoked intermediate CA refuses the servers under it. A hop that verifies against the OS
-  trust store (under `system` or `augment`, with no CA of its own) refuses at build, and so does a CA file holding a CA that is not
-  self-signed; [CONFIGURATION.md](CONFIGURATION.md#tls--outbound-client-trust-anchors) says what it
+  trust store (under `system` or `augment`, with no CA of its own) refuses at build, and so does a CA file holding a CA that does not
+  chain to a self-signed root in that file; [CONFIGURATION.md](CONFIGURATION.md#tls--outbound-client-trust-anchors) says what it
   takes. Off, each hop keeps the leaf check.
 
 A connection that names its **own** `tls_ca_file` always **wins verbatim**; a loopback (on-box) hop is
