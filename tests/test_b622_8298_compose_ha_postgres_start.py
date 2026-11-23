@@ -29,7 +29,7 @@ from tests.test_compose_revocation_attestation import _compose_doc
 _SH = shutil.which("sh")
 _STUBS = {
     "id": '#!/bin/sh\n[ "$1 $2" = "-u postgres" ] && echo 999\n',
-    "stat": '#!/bin/sh\ncase "$3" in %u) echo "$STUB_UID" ;; %a) echo "$STUB_MODE" ;; esac\n',
+    "stat": '#!/bin/sh\n[ "$3" = "%u %a" ] && echo "$STUB_UID $STUB_MODE"\n',
     "gosu": '#!/bin/sh\nshift\n[ -z "$STUB_UNREADABLE" ] || exit 1\nexec "$@"\n',
     "docker-entrypoint.sh": '#!/bin/sh\necho "$*" > "$MARKER"\n',
 }
@@ -143,7 +143,36 @@ def test_a_server_command_naming_no_tls_files_is_refused(tmp_path: Path) -> None
 
 
 @pytest.mark.skipif(_SH is None, reason="no sh on PATH")
-@pytest.mark.parametrize("command", (["psql", "-U", "mefor"], ["bash"]))
+@pytest.mark.parametrize("command", ([], ["-c", "ssl=on"]))
+def test_an_empty_or_flag_first_server_command_is_checked(
+    tmp_path: Path, command: list[str]
+) -> None:
+    code, err, ran = _run(tmp_path, files=_BOTH, uid="999", mode="600", command=command)
+    assert code != 0 and not ran, (code, err, ran)
+    assert "names no ssl_cert_file" in err, err
+
+
+@pytest.mark.skipif(_SH is None, reason="no sh on PATH")
+def test_an_encrypted_key_with_a_passphrase_command_passes(tmp_path: Path) -> None:
+    files = {"server.crt": b"cert", "server.key": b"-----BEGIN ENCRYPTED PRIVATE KEY-----\n"}
+    tls = (tmp_path / "tls").as_posix()
+    command = [
+        "postgres",
+        "-c",
+        f"ssl_cert_file={tls}/server.crt",
+        "-c",
+        f"ssl_key_file={tls}/server.key",
+        "-c",
+        "ssl_passphrase_command=/bin/true",
+    ]
+    code, err, ran = _run(tmp_path, files=files, uid="999", mode="600", command=command)
+    assert code == 0 and ran, err
+
+
+@pytest.mark.skipif(_SH is None, reason="no sh on PATH")
+@pytest.mark.parametrize(
+    "command", (["psql", "-U", "mefor"], ["bash"], ["postgres", "-V"], ["postgres", "--help"])
+)
 def test_a_command_that_does_not_start_the_server_passes_through(
     tmp_path: Path, command: list[str]
 ) -> None:
@@ -166,6 +195,8 @@ def test_a_key_postgres_accepts_hands_the_command_to_the_image_entrypoint(
 def _health_refusal(test: list[str]) -> str | None:
     """Why the health check could pass before the real server serves the database, or None."""
     assert test[:1] == ["CMD-SHELL"], test
+    if "||" in test[1] or ";" in test[1]:
+        return "the probe has a step that runs whatever the one before it returned"
     steps = [shlex.split(part) for part in test[1].split("&&")]
     probes = {s[0]: s for s in steps if s}
     for tool in ("pg_isready", "psql"):
@@ -192,6 +223,12 @@ def test_the_health_check_waits_for_the_real_server_and_its_database() -> None:
     assert _health_refusal(list(_postgres()["healthcheck"]["test"])) is None
 
 
+def test_the_first_initialization_does_not_count_toward_the_retries() -> None:
+    hc = _postgres()["healthcheck"]
+    period = str(hc.get("start_period", "0s"))
+    assert period.endswith("s") and int(period[:-1]) >= 60, hc
+
+
 @pytest.mark.parametrize(
     "test",
     (
@@ -205,6 +242,11 @@ def test_the_health_check_waits_for_the_real_server_and_its_database() -> None:
             "CMD-SHELL",
             "pg_isready -h 127.0.0.1 -d messagefoundry"
             " && psql -h 127.0.0.1 -d messagefoundry --no-psqlrc",
+        ],
+        [
+            "CMD-SHELL",
+            "pg_isready -h 127.0.0.1 -d messagefoundry"
+            " && psql -h 127.0.0.1 -d messagefoundry -c 'select 1' || true",
         ],
     ),
 )

@@ -352,34 +352,37 @@ services:
     # This server still accepts a plaintext session from another client on the compose network;
     # the engines never open one.
     # Reads the certificate and key paths from the command's ssl_cert_file and ssl_key_file, so
-    # the check reads the files the server is told to load. A command that does not start the
-    # server, such as `docker compose run postgres psql ...`, goes straight to the image's
-    # entrypoint, as it did before. `$$` is a literal `$` to compose.
+    # the check reads the files the server is told to load, and reads the key's owner and mode
+    # as the postgres account, as the server does. A command that does not start the server,
+    # such as `docker compose run postgres psql ...` or `postgres -V`, goes straight to the
+    # image's entrypoint, as it did before. `$$` is a literal `$` to compose.
     entrypoint:
       - "sh"
       - "-c"
       - |
         set -eu
+        die() { echo "error: refusing to start Postgres before the image's entrypoint runs: $$*. The postgres service's comment in docker/compose.yaml says what ./pg-tls and the command must hold." >&2; exit 1; }
         case "$${1:-}" in
-          postgres|-*) ;;
+          postgres|-*|"") ;;
           *) exec docker-entrypoint.sh "$$@" ;;
         esac
-        crt=; key=
+        crt=; key=; pass=
         for a in "$$@"; do
           case "$$a" in
-            ssl_cert_file=*) crt="$${a#ssl_cert_file=}" ;;
-            ssl_key_file=*) key="$${a#ssl_key_file=}" ;;
+            -V|--version|--help|-\?|-C|--describe-config) exec docker-entrypoint.sh "$$@" ;;
+            ssl_cert_file=*|--ssl_cert_file=*|--ssl-cert-file=*) crt="$${a#*=}" ;;
+            ssl_key_file=*|--ssl_key_file=*|--ssl-key-file=*) key="$${a#*=}" ;;
+            ssl_passphrase_command=*|--ssl_passphrase_command=*|--ssl-passphrase-command=*) pass=1 ;;
           esac
         done
-        die() { echo "error: refusing to start Postgres before the image's entrypoint runs: $$*. Fix server.crt and server.key in ./pg-tls as the postgres service's comment in docker/compose.yaml says, then start again." >&2; exit 1; }
         [ -n "$$crt" ] && [ -n "$$key" ] || die "the command names no ssl_cert_file or no ssl_key_file"
         for f in "$$crt" "$$key"; do
           [ -f "$$f" ] && [ -s "$$f" ] || die "$$f is missing or empty"
+          gosu postgres test -r "$$f" || die "the postgres account cannot read $$f"
         done
-        ! grep -q ENCRYPTED "$$key" || die "$$key is encrypted, and this command sets no ssl_passphrase_command"
-        pg=$$(id -u postgres)
-        owner=$$(stat -L -c %u "$$key")
-        mode=$$(stat -L -c %a "$$key")
+        pg=$$(id -u postgres) || die "the image has no postgres account"
+        st=$$(gosu postgres stat -L -c '%u %a' "$$key") || die "the postgres account cannot stat $$key"
+        owner=$${st% *}; mode=$${st#* }
         if [ "$$owner" = "$$pg" ]; then
           bad=$$(( 0$$mode & 077 ))
         elif [ "$$owner" = 0 ]; then
@@ -388,9 +391,12 @@ services:
           die "$$key is owned by uid $$owner, neither the postgres account ($$pg) nor root"
         fi
         [ "$$bad" -eq 0 ] || die "$$key has mode $$mode, wider than Postgres allows for its owner: at most 0600 owned by uid $$pg, or 0640 owned by root"
-        for f in "$$crt" "$$key"; do
-          gosu postgres test -r "$$f" || die "the postgres account cannot read $$f"
-        done
+        if [ -z "$$pass" ]; then
+          rc=0
+          gosu postgres grep -q ENCRYPTED "$$key" || rc=$$?
+          [ "$$rc" -ne 0 ] || die "$$key is encrypted, and the command sets no ssl_passphrase_command"
+          [ "$$rc" -eq 1 ] || die "the postgres account cannot read $$key"
+        fi
         exec docker-entrypoint.sh "$$@"
       - "pg-tls-check"
     command:

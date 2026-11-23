@@ -9,7 +9,7 @@
   through. The health check now probes over TCP on
   127.0.0.1 and queries the `messagefoundry` database, where it used to probe the Unix socket,
   which the image's temporary initialization server answers on, and passed with the database
-  missing, and it has a start period for the first initialization. At least a key that does not
-  match its certificate, and a file that is not PEM, still pass the entrypoint check; that
-  start leaves the volume half-initialized, and the health check now keeps every engine from
-  starting against it. (`BACKLOG #8298`)
+  missing, and it has a start period for the first initialization. A fault the check does not
+  catch still half-initializes the volume, and the health check then keeps every engine from
+  starting against it; the postgres service's comment in `docker/compose.yaml` names at least
+  those faults and the recovery. (`BACKLOG #8298`)
