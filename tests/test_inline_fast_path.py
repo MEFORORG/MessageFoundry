@@ -20,6 +20,7 @@ lives in backend-agnostic ``wiring_runner.py`` and ``handoff`` exists in all thr
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from messagefoundry.config.wiring import (
     SetState,
 )
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.dryrun import route_only
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxItem, OutboxStatus, Stage
@@ -669,16 +671,19 @@ async def test_inline_g6_dead_letters_at_finite_attempts_ceiling(
 # --- BACKLOG #5707: a reload that lands while the Router is awaited ---------------------------
 
 
-def _reload_during_router(runner: RegistryRunner, *swaps: Registry) -> None:
-    """Assign each registry in turn, on the loop, as the Router's await returns. The worker read
-    ``_inline_ok`` before that await and does not read it again, so only the registry is swapped."""
+def _reload_during_router(runner: RegistryRunner, *swaps: tuple[Registry, bool]) -> None:
+    """Apply each ``(registry, inline_ok)`` on the loop as the FIRST Router await returns. The second
+    pass reads ``_inline_ok`` again, so the eligibility has to move with the registry."""
     real = runner._off_loop_sandboxed
+    pending = list(swaps)
 
     async def racing(name: str, fn: Any, registry: Registry, /, *a: Any, **k: Any) -> Any:
         result = await real(name, fn, registry, *a, **k)
         if fn is route_only:
-            for new_registry in swaps:
+            for new_registry, inline_ok in pending:
                 runner.registry = new_registry
+                runner._inline_ok = {"file_in": inline_ok}
+            pending.clear()
         return result
 
     runner._off_loop_sandboxed = racing  # type: ignore[method-assign]
@@ -713,7 +718,7 @@ async def test_reload_during_router_takes_the_split_path_not_the_new_lookup_hand
     assert runner._inline_ok["file_in"] is True
     spy = _HandoffSpy(store)
     spy.install()
-    _reload_during_router(runner, new)
+    _reload_during_router(runner, (new, False))
 
     item = await _claimed_ingress(store)
     await runner._process_ingress_item("file_in", item)
@@ -744,9 +749,165 @@ async def test_reload_rolled_back_during_router_stays_inline(
     runner._recompute_inline_ok()
     spy = _HandoffSpy(store)
     spy.install()
-    _reload_during_router(runner, new, old)
+    _reload_during_router(runner, (new, False), (old, True))
 
     item = await _claimed_ingress(store)
     await runner._process_ingress_item("file_in", item)
 
     assert (spy.handoff_calls, spy.route_handoff_calls) == (1, 0)
+
+
+def _hold_first_router(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, threading.Event]:
+    """Park the worker's thread inside its first Router call, so a real reload lands in that await."""
+    held, release = threading.Event(), threading.Event()
+    calls = [0]
+
+    def call(*args: Any, **kwargs: Any) -> Any:
+        calls[0] += 1
+        if calls[0] == 1:
+            held.set()
+            assert release.wait(30), "the test never released the held Router"
+        return route_only(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "route_only", call)
+    return held, release
+
+
+async def test_real_reload_during_router_keeps_arrival_order(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2 is queued behind M1. The reload's graph is inline-eligible too, so a row that left the
+    inline path for the routed stage would let M2 reach the outbound lane first."""
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    outdir.mkdir()
+    old = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    new = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    order: list[str] = []
+    real_handoff = store.handoff
+
+    async def handoff(**kw: Any) -> bool:
+        order.append(kw["message_id"])
+        return await real_handoff(**kw)
+
+    store.handoff = handoff  # type: ignore[method-assign]
+    held, release = _hold_first_router(monkeypatch)
+    runner = await _run(old, store)
+    try:
+        first = await store.enqueue_ingress(
+            channel_id="file_in", raw=ADT, control_id="MSG1", message_type="ADT^A01"
+        )
+        second = await store.enqueue_ingress(
+            channel_id="file_in",
+            raw=ADT.replace("MSG1", "MSG2"),
+            control_id="MSG2",
+            message_type="ADT^A01",
+        )
+        runner._wake_lane(Stage.INGRESS, "file_in")
+        assert await asyncio.to_thread(held.wait, 30), "the worker never reached the Router"
+        await runner.reload(new)
+        assert runner.registry is new
+        release.set()
+        for _ in range(500):
+            if len(order) == 2:
+                break
+            await asyncio.sleep(0.02)
+        assert order == [first, second]
+    finally:
+        release.set()
+        await runner.stop()
+
+
+async def test_real_reload_dropping_the_inbound_during_router_repends_the_ingress_row(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second pass takes the missing-inbound path: the row is pending at ingress, with no routed
+    row to strand, and a reload that restores the inbound delivers it."""
+    inbox, outdir, other = tmp_path / "in", tmp_path / "out", tmp_path / "other"
+    for directory in (inbox, outdir, other):
+        directory.mkdir()
+    old = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    dropped = Registry()
+    dropped.add_outbound(old.outbound["file_out"])
+    dropped.add_inbound(
+        InboundConnection(
+            "other_in",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(other), "pattern": "*.hl7", "poll_seconds": 0.02},
+            ),
+            router="r",
+        )
+    )
+    route: Any = _route_arch
+    handle: Any = _handle_deliver
+    dropped.add_router("r", route)
+    dropped.add_handler("arch", handle)
+    held, release = _hold_first_router(monkeypatch)
+    runner = await _run(old, store)
+    try:
+        mid = await store.enqueue_ingress(
+            channel_id="file_in", raw=ADT, control_id="MSG1", message_type="ADT^A01"
+        )
+        runner._wake_lane(Stage.INGRESS, "file_in")
+        assert await asyncio.to_thread(held.wait, 30), "the worker never reached the Router"
+        await runner.reload(dropped)
+        release.set()
+        rows: list[tuple[str, str]] = []
+        for _ in range(250):
+            cur = await store._db.execute(
+                "SELECT stage, status FROM queue WHERE message_id=?", (mid,)
+            )
+            rows = [(r["stage"], r["status"]) for r in await cur.fetchall()]
+            if rows == [(Stage.INGRESS.value, OutboxStatus.PENDING.value)]:
+                break
+            await asyncio.sleep(0.02)
+        assert rows == [(Stage.INGRESS.value, OutboxStatus.PENDING.value)]
+
+        restored = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+        await runner.reload(restored)
+        runner._wake_lane(Stage.INGRESS, "file_in")
+        await _until_message(store, MessageStatus.PROCESSED.value, timeout=20.0)
+    finally:
+        release.set()
+        await runner.stop()
+
+
+async def test_a_worker_death_on_the_second_pass_is_counted_once(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second pass runs inside the first pass's death accounting, and must not add its own."""
+
+    class _Death(BaseException):
+        pass
+
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    old = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    new = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    runner = RegistryRunner(old, store, egress=EgressSettings(deny_by_default=False))
+    runner._recompute_inline_ok()
+    calls = [0]
+
+    def router(*args: Any, **kwargs: Any) -> Any:
+        calls[0] += 1
+        if calls[0] == 2:
+            raise _Death
+        return route_only(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "route_only", router)
+    real_off_loop = runner._off_loop_sandboxed
+
+    async def racing(name: str, fn: Any, registry: Registry, /, *a: Any, **k: Any) -> Any:
+        result = await real_off_loop(name, fn, registry, *a, **k)
+        runner.registry = new
+        return result
+
+    runner._off_loop_sandboxed = racing  # type: ignore[method-assign]
+    item = await _claimed_ingress(store)
+    with pytest.raises(_Death):
+        await runner._process_ingress_item("file_in", item)
+
+    cur = await store._db.execute("SELECT worker_deaths FROM queue WHERE id=?", (item.id,))
+    row = await cur.fetchone()
+    assert row is not None
+    assert row["worker_deaths"] == 1

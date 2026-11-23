@@ -9765,8 +9765,8 @@ class RegistryRunner:
                 # Rebuild the live-lookup executor from the new graph, with no await since the swap, so
                 # no worker that reads them after the swap pairs the new graph with the old graph's
                 # lookups or inline cache. A router worker that read _inline_ok BEFORE the swap and
-                # then awaited the Router rechecks the registry it read it with, and takes the split
-                # path if this swap replaced it (_process_ingress_item, BACKLOG #5707).
+                # then awaited the Router rechecks the registry it read it with, and processes the
+                # row again if this swap replaced it (_process_ingress_item, BACKLOG #5707).
                 # build_check already validated the new specs, so this can't fail on a bad spec here.
                 # The OLD executor is closed only once the swap commits, below the except, since a
                 # rollback puts it back, pools and all.
@@ -12716,6 +12716,7 @@ class RegistryRunner:
         # route_only and transform_one have both returned and every per-message gate held. The
         # handoff that commits them runs AFTER the try (ADR 0057 G1 as amended 2026-10-07).
         fused: list[tuple[str, str]] | None = None
+        swapped = False  # BACKLOG #5707: a reload replaced `registry` during the Router's await
         try:
             # Publish the live graph's run-scoped views (code sets / reference snapshots /
             # active environment) so a call-time code_set(...)/reference(...)/
@@ -12758,9 +12759,10 @@ class RegistryRunner:
             # AND the graph has no live lookup AND ack_after=ingest AND not LOOPBACK
             # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
             # BACKLOG #5707: those gates describe `registry`. A reload during the Router's await
-            # may have swapped in a graph they say nothing about, so such a row takes the split
-            # path, whose transform worker reads the served graph and its lookups afresh.
-            if inline and len(names) == 1 and self.registry is registry:
+            # may have swapped in a graph they say nothing about, so this row commits nothing here
+            # and is processed again below, against the served graph, before any later row.
+            swapped = inline and len(names) == 1 and self.registry is not registry
+            if inline and len(names) == 1 and not swapped:
                 # M-single held. Run the single handler's transform OFF the loop (G4: keep the
                 # to_thread hop — SEC-013), mirroring _transform_worker. No lookup ExitStack:
                 # self._inline_ok already guaranteed no live lookup runner (INV-7), so a
@@ -12838,6 +12840,12 @@ class RegistryRunner:
             # policy decides (factored into _apply_router_internal_error, the single source of
             # truth shared with the fused route branch; byte-identical).
             return await self._apply_router_internal_error(name, item, exc)
+        if swapped:
+            # Outside the try, so a store fault in the second pass reaches the caller's fault arm
+            # and is not read as a Router error. The undecorated body, because the decorator on
+            # this call already counts a worker death against the row, and would count it twice.
+            body: _ItemBody = RegistryRunner._process_ingress_item.__wrapped__  # type: ignore[attr-defined]
+            return await body(self, name, item)
         # `inline and` is redundant with how `fused` is set; it keeps the fused commit visibly
         # gated on the inline cache (tests/test_crit2_inline_doc_drift.py reads that link).
         if inline and fused is not None:
