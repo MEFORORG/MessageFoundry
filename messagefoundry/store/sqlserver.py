@@ -5182,10 +5182,13 @@ class SqlServerStore:
         the name does not resolve for the caller, so the argument above — *an empty enumeration must
         not render as a clean bill of health* — was defeated by its own replacement until this arm
         distinguished the three states. A fixed role, ``CONTROL SERVER`` or database ``CONTROL``
-        that is not read makes the whole report :attr:`StorePrivilegeStatus.UNOBSERVABLE`, named grant
-        by grant in the detail, even beside a role read as held (#1234 pins that): a role that was
-        never read is not a role the principal does not hold. Grants that DID read as held are still
-        reported, since a partial read can only understate an over-grant, never invent one.
+        that is not read is named grant by grant in the detail and in ``unread``: a role that was
+        never read is not a role the principal does not hold. With no over-grant read, that makes
+        the report :attr:`StorePrivilegeStatus.UNOBSERVABLE` (#1234). With one read, such as
+        ``sysadmin``, ``db_owner`` or a ``CONTROL``, the report stays ``OBSERVED`` with it in the
+        excess, so under enforce with no accepted opt-out the start refuses (owner ruling
+        2026-11-23 on #6015 item 1). A partial read can only understate an over-grant, never
+        invent one.
 
         The grants that count only under ``external`` (``CREATE TABLE``, ``ALTER`` on the default
         schema, ``VIEW DEFINITION`` on the default schema and ``dbo``, the audit-table rights) are
@@ -5294,15 +5297,36 @@ class SqlServerStore:
                     held_labels.append(view_definition_grant(*view_definition))
                 if external_unread:
                     also_unread = f"; also not read: {', '.join(external_unread)}"
+            # Owner ruling 2026-11-23 on #6015 item 1 ("Refuse when read"): an over-grant that WAS
+            # read keeps the report OBSERVED with it in the excess, so it is weighed as one (under
+            # enforce it refuses) rather than demoted to an unobserved warning by a neighbouring
+            # unread column. Unread reads as not held here, which can only understate the excess.
+            read_excess = sqlserver_excess(
+                server_roles=server_roles,
+                database_roles=database_roles,
+                control_server=control_server is True,
+                control_database=control_database is True,
+                database=database,
+                external=external,
+                create_table=create_table is True,
+                alter_schema=(default_schema if alter_schema else None),
+                audit_writes=audit_writes,
+                view_definition=tuple(view_definition),
+            )
             # The catalog enumeration below is skipped deliberately: it is additive only, and widening
             # a report already saying the read was incomplete buys nothing an operator can act on.
             return StorePrivilegeReport(
                 backend=self.backend,
-                status=StorePrivilegeStatus.UNOBSERVABLE,
+                status=(
+                    StorePrivilegeStatus.OBSERVED
+                    if read_excess
+                    else StorePrivilegeStatus.UNOBSERVABLE
+                ),
                 principal=str(row["login_name"] or ""),
                 database=database,
                 server_roles=server_roles,
                 database_roles=database_roles,
+                excess=read_excess,
                 unread=tuple(unread + (external_unread if external else [])),
                 detail=(
                     f"the privilege query returned NULL, or a value that is not 0 or 1, for"
