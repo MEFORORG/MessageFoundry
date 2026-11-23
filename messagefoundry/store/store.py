@@ -9140,23 +9140,23 @@ def write_restore_marker(
     )
 
 
-def _secure_file(path: Path, *, keep_trio_entries: bool = False) -> None:
-    """Restrict a store file to its owner — it holds PHI at rest.
+def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
+    """Restrict a file to the account this process runs as — a store file holds PHI at rest.
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
     starting (``docs/PHI.md``'s ops checklist covers directory-level ACLs as the backstop). On
     POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so it
     writes one protected DACL whole instead, granting full control to the account read from this
     process's token. Written whole, the list replaces every entry the file carried, explicit ones
-    included (an explicit grant on a moved-in file, or the entries a temp directory hands a file),
-    which the ``icacls /inheritance:r /grant:r`` rewrite this replaced left in place. The owner is
-    not changed, and an owner keeps the access Windows gives it beyond the list. A skipped or failed
-    restriction is **logged** (STORE-2), and leaves the file's access list as it was.
+    included (an explicit grant on a moved-in file, or the entries a temp directory hands a file).
+    The owner is not changed, and an owner keeps the access Windows gives it beyond the list, so a
+    file another account owns is left to this process's account, not to its owner. A skipped or
+    failed restriction is **logged** (STORE-2), and leaves the file's access list as it was.
 
-    ``keep_trio_entries`` is for the store trio's owner-only fallback (:func:`_secure_store_file`):
-    the list also keeps the file's own explicit entries in the hardened directory's shape
-    (:func:`_kept_trio_entries`), as the icacls rewrite did, so a fallback open does not shut the
-    service account out of a store file the installer's rule already named it on (ADR 0163).
+    ``keep_explicit_entries`` is the store trio's owner-only fallback (:func:`_secure_store_file`),
+    unchanged: ``icacls /inheritance:r /grant:r``, which removes only INHERITED entries and replaces
+    only this account's own grant, so every explicit entry the file carries stays. ADR 0163 relies
+    on that: an existing store file keeps the service account's trio entry when an open falls back.
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
     exists, and only logs when it cannot, so a key written and then passed here would sit under the
@@ -9176,11 +9176,13 @@ def _secure_file(path: Path, *, keep_trio_entries: bool = False) -> None:
                 )
                 return
             # The principal is the token's SID, never a name, so no environment variable or name
-            # lookup chooses who is granted (vault BACKLOG #5612). One SetNamedSecurityInfoW call,
-            # as _write_trio_dacl makes, rather than icacls: icacls cannot drop an unnamed
-            # principal's explicit entry while granting, and an API call has no program to plant.
-            kept = _kept_trio_entries(path, sid) if keep_trio_entries else ""
-            result = _set_security_from_sddl(path, f"D:P(A;;FA;;;{sid}){kept}", protected=True)
+            # lookup chooses who is granted (vault BACKLOG #5612).
+            if keep_explicit_entries:
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            # One SetNamedSecurityInfoW call, as _write_trio_dacl makes: icacls cannot drop an
+            # unnamed principal's explicit entry while granting.
+            result = _set_security_from_sddl(path, f"D:P(A;;FA;;;{sid})", protected=True)
             if result.failure is not None or result.dacl_status != 0:
                 log.warning(
                     "could not restrict %s to this account: %s",
@@ -9193,29 +9195,34 @@ def _secure_file(path: Path, *, keep_trio_entries: bool = False) -> None:
         log.warning("could not restrict permissions on %s: %s", path, exc)
 
 
-def _kept_trio_entries(path: Path, sid: str) -> str:
-    """The SDDL entries of ``path``'s own explicit allows that have the store trio's shape, for
-    :func:`_secure_file` to keep: SYSTEM or Administrators at full control, and an account at the
-    run-as Modify right whose SID has the shape of a per-service virtual account or of one user
-    account (:func:`_account_shape_refusal`, which makes no lookup). ``sid``, the token's own
-    account, is left out because the caller grants it full control. Any other entry is dropped, so
-    a broad grant such as Everyone does not survive. An access list this cannot read or parse keeps
-    nothing, so the file is left to the token's account alone."""
-    current = _read_dacl_sddl(path)
-    parsed = _parse_sddl_dacl(current) if current is not None else None
-    if parsed is None:
-        return ""
-    kept: dict[str, str] = {}
-    for kind, flags, rights, ace_sid in parsed.aces:
-        if kind != "A" or flags or ace_sid == sid or rights != _trio_right(ace_sid):
-            continue
-        if (
-            ace_sid in _TRIO_RIGHTS
-            or _SERVICE_SID.fullmatch(ace_sid)
-            or _account_shape_refusal(ace_sid) is None
-        ):
-            kept[ace_sid] = _TRIO_RIGHTS.get(ace_sid, _RUN_AS_RIGHTS)
-    return "".join(f"(A;;{rights};;;{ace_sid})" for ace_sid, rights in kept.items())
+def _icacls_grant_keeping_explicit_entries(path: Path, sid: str) -> None:
+    """:func:`_secure_file`'s ``keep_explicit_entries`` rewrite. Windows only; logs, never raises
+    except ``OSError``, which the caller logs."""
+    # icacls is pinned to its absolute System32 path and invoked without a shell; the principal is
+    # a single argv token in icacls's ``*S-...`` form, never a shell word, so it can't inject a
+    # flag (low-27/STORE-5). The pin is what makes "fixed system tool" true: CreateProcess resolves
+    # an unqualified name through a search path that reaches the caller's working directory, and
+    # because this call only logs on a non-zero exit, a planted icacls.exe that exits 0 would leave
+    # this PHI-adjacent file its inherited (possibly broad) ACL while reporting nothing (#1769).
+    result = subprocess.run(  # nosec B603 B607
+        [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
+        check=False,
+        env=system_tool_environment(),  # the platform's start-up names only (#2716)
+        capture_output=True,
+        text=True,
+        # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+        # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+        # failed decode loses the output this warning logs. Only logged, so replace.
+        encoding="oem",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        log.warning(
+            "icacls could not restrict %s (exit %s): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
 
 
 def _grant_read(path: Path, principal: str) -> None:
@@ -9861,8 +9868,8 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     """Restrict one file of the SQLite store trio, or a restored store.
 
     ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
-    outside a hardened directory -- is :func:`_secure_file`, owner-only, keeping the file's own
-    entries in the trio's shape (``keep_trio_entries``). Otherwise
+    outside a hardened directory -- is :func:`_secure_file` with ``keep_explicit_entries``, the
+    owner-only icacls rewrite, exactly as before. Otherwise
     the file gets an explicit, protected DACL naming exactly those principals, which is the same
     whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
     one). An owner outside those principals is moved to Administrators where the opener may do that,
@@ -9871,7 +9878,7 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     fail and warn on every start. A file that is itself a link gets the old owner-only rewrite, as
     before this change. Best-effort, like :func:`_secure_file`: it logs rather than raises."""
     if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
-        _secure_file(path, keep_trio_entries=True)
+        _secure_file(path, keep_explicit_entries=True)
         return
     current = _read_dacl_sddl(path, owner=True)
     parsed = _parse_sddl_dacl(current) if current is not None else None

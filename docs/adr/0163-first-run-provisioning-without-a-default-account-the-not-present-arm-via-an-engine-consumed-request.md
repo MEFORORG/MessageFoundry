@@ -274,10 +274,10 @@ see its *What it widens* and *Left open*.
   file carries explicitly -- and the hosted runners showed Python 3.13+ temp-directory entries arriving
   as explicit ones (CI run 36039014999). Placement hard-links the store where it can, and a hard link
   shares one security descriptor, so once the published store is restricted the staged link carries the
-  same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** `_secure_file` now
-  writes one protected DACL whole, granting the operator's user SID alone, so where that write
-  succeeds the explicit entries are removed too. Where it fails, or the token cannot be read, it
-  logs a WARNING and the file keeps the list it had.
+  same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** built where the
+  write succeeds: for these callers `_secure_file` now writes one protected DACL whole, granting the
+  operator's user SID alone, so the explicit entries are removed too. Where it fails, or the token
+  cannot be read, it logs a WARNING and the file keeps the list it had.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 
@@ -310,10 +310,9 @@ checks resolve the path by name, so someone able to swap an ancestor for a junct
 create and the check could misdirect it. Outside a hardened directory, the owner-only rewrite still
 leaves any explicit entry for another principal in place, because `icacls /inheritance:r /grant:r`
 replaces only the principals it names (measured while building this); that predates this change.
-**AMENDED 2026-11-23:** the owner-only rewrite is now one protected DACL written whole, granting the
-account in the process token, so where that write succeeds another principal's entry is left only
-when it has the trio's shape (the 2026-11-05 note's *Left open* paragraph says which). Where it
-fails it logs a WARNING and the file keeps the list it had.
+**AMENDED 2026-11-23:** this rewrite is unchanged for the store trio. Every other caller of
+`_secure_file` now writes one protected DACL whole, granting the account in the process token, so
+where that write succeeds no other principal's entry is left on those files.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.
 
@@ -372,8 +371,7 @@ computer account included if it resolves that way (*Left open*, below):
   is refused as a second principal, and the store falls back to the owner-only rewrite, as it did
   before this note for a virtual run-as. That rewrite keeps the explicit entries of a store file
   that already exists, at least the main database file (*Left open*, below), so it does not by
-  itself remove a run-as the trio already named there. **AMENDED 2026-11-23:** it now keeps only
-the entries in the trio's shape, which a run-as in the installer's shape is. A user is admitted there only when its
+  itself remove a run-as the trio already named there. A user is admitted there only when its
   grant REPLACES the existing run-as grant and SYSTEM or Administrators owns the directory.
 
 Tying the admitted SID to the service's configured account was not chosen.
@@ -393,13 +391,7 @@ from the process token (vault BACKLOG #5612; it read a name from the environment
 it names (measured, above). A file that already exists keeps any trio entries it carries: the main
 database file, and a `-wal` or `-shm` still on disk because another process has the store open or a
 crash left them. A file that start creates, a `-wal`, a `-shm` or a new store, carries no explicit
-entries, so where `icacls` succeeds it is left to that account alone. **AMENDED 2026-11-23:** the
-fallback now writes one protected DACL whole. It grants that account full control and keeps, of
-the file's own explicit entries, only those in the trio's shape: SYSTEM or Administrators at full
-control, and an account at the run-as Modify right whose SID has the shape of a per-service virtual
-account or of one user account. So an existing file keeps its trio entries, as before, and loses
-any other explicit entry, such as a broad grant. Where the file's list cannot be read, it is left
-to that account alone. A later start that resolves
+entries, so where `icacls` succeeds it is left to that account alone. A later start that resolves
 the account rewrites the trio only after it has opened the store, so an opener the fallback shut
 out cannot heal it that way. That rewrite also needs WRITE_DAC on each file, which the service,
 holding Modify, lacks on a file it does not own. So where an elevated operator's open took the

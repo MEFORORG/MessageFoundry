@@ -247,12 +247,12 @@ _SERVICE_SID = "S-1-5-80-1000000001-1000000002-1000000003-1000000004-1000000005"
 
 
 @_windows_only
-def test_the_store_trio_fallback_keeps_its_trio_entries_and_drops_the_rest(tmp_path) -> None:
+def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path) -> None:
     # A store file the installer's rule already restricted (SYSTEM, Administrators, the service at
-    # Modify) whose directory is later refused, so the open takes the owner-only fallback. The
-    # fallback keeps those three, as the icacls rewrite did (ADR 0163), or it would shut the service
-    # out. Broad or stray explicit entries are dropped. RED before the fix: icacls kept every
-    # explicit entry, so Everyone and OWNER RIGHTS stayed.
+    # Modify) whose directory is later refused, so the open takes the owner-only fallback. That
+    # fallback is unchanged: it keeps every explicit entry and adds the opener, so it does not shut
+    # the service out (ADR 0163). A guard against this change reaching it, green before and after;
+    # the stray entries it keeps are the gap the ADR records.
     import messagefoundry.store.store as store_mod
     from tests._win_acl import folder_granting, protected_entries
 
@@ -260,9 +260,8 @@ def test_the_store_trio_fallback_keeps_its_trio_entries_and_drops_the_rest(tmp_p
     assert sid is not None
     path = folder_granting(tmp_path / "store", sid) / "messagefoundry.db"
     path.write_bytes(b"x")
-    trio = f"(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_SERVICE_SID})"
-    stray = "(A;;FR;;;WD)(A;;FA;;;OW)(A;;0x1301bf;;;S-1-5-32-545)"
-    seeded = store_mod._set_security_from_sddl(path, f"D:P{trio}{stray}", protected=True)
+    explicit = f"(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_SERVICE_SID})(A;;FR;;;WD)"
+    seeded = store_mod._set_security_from_sddl(path, f"D:P{explicit}", protected=True)
     assert seeded.failure is None and seeded.dacl_status == 0, seeded
     store_mod._secure_store_file(path, dir_grants=None)
     sddl, _, entries = protected_entries(path)
@@ -272,8 +271,51 @@ def test_the_store_trio_fallback_keeps_its_trio_entries_and_drops_the_rest(tmp_p
             ("A", "", "FA", "S-1-5-18"),
             ("A", "", "FA", "S-1-5-32-544"),
             ("A", "", "0X1301BF", _SERVICE_SID),
+            ("A", "", "FR", "S-1-1-0"),
         ]
     ), sddl
+
+
+@_windows_only
+def test_the_kept_icacls_rewrite_grants_the_token_account_by_its_pinned_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The store trio's fallback still runs icacls, and it WRITES the ACL of a store file, so it
+    # must name icacls by absolute path: CreateProcess resolves an unqualified name through a search
+    # path that reaches the caller's working directory, and the call logs only on a non-zero exit,
+    # so a planted icacls.exe that exits 0 would make the hardening a silent no-op (BACKLOG #1769).
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+    from messagefoundry import service_status
+
+    captured: list[list[str]] = []
+
+    class _R:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def _run(argv: list[str], **kw: object) -> _R:
+        captured.append(argv)
+        return _R()
+
+    def _no_list_write(*_a: object, **_kw: object) -> None:
+        raise AssertionError("the kept rewrite wrote a whole list")
+
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _TOKEN_SID)
+    monkeypatch.setattr(store_mod, "_set_security_from_sddl", _no_list_write)
+    monkeypatch.setattr(subprocess, "run", _run)
+    store_mod._secure_file(Path("store.db"), keep_explicit_entries=True)
+    # Guard the guard: with no call recorded, every assertion below passes over nothing.
+    assert captured, "icacls was never invoked; the pin assertions would pass vacuously"
+    program = captured[0][0]
+    assert captured[0][1:] == ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
+    assert os.path.isabs(program), f"icacls must be pinned to an absolute path, got {program!r}"
+    assert os.path.basename(program).lower() == "icacls.exe"
+    # The OS-reported system directory, not a literal "System32": GetSystemDirectoryW answers
+    # "SysWOW64" to a 32-bit process (tests/test_service_control.py tests _system_dir).
+    assert os.path.dirname(program) == service_status._system_dir()
 
 
 @_windows_only

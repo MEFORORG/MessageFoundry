@@ -377,8 +377,7 @@ path** (no separate at-rest tier):
   ~33%, so **size/retention budgets (§8) measure the encoded size.**
 
 **File permissions `[BUILT — SQLite only]`.** `MessageStore.open()` restricts the DB and its
-`-wal`/`-shm` siblings on every open — POSIX `chmod 0600`; on Windows, a protected DACL granting
-the process's own account, written whole by
+`-wal`/`-shm` siblings on every open — POSIX `chmod 0600`; on Windows, `icacls` through
 `_secure_file()` ([store/store.py](../messagefoundry/store/store.py)), **except** in a data
 directory hardened the way `install-service.ps1` leaves it (the exact test is stated once, in the
 ADR 0163 note linked below). There each file gets an explicit, protected DACL naming only the
