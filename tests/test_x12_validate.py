@@ -15,6 +15,7 @@ import io
 import logging
 import threading
 import traceback
+import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -876,3 +877,48 @@ def test_only_a_segment_id_the_maps_define_is_kept(seg_id: Any, kept: str | None
     shown = kept or "?"
     assert (seg_err.segment_id, seg_err.message) == (kept, f"segment {shown}: error 1")
     assert (ele_err.segment_id, ele_err.message) == (kept, f"element {shown}02: error 8")
+
+
+@pytest.mark.parametrize(
+    ("target", "fault"),
+    [
+        ("_read_map_segment_ids", MemoryError),
+        ("_read_map_segment_ids", lambda: zipfile.BadZipFile(_PLANT)),
+        ("files", lambda: ModuleNotFoundError(_PLANT)),
+        ("files", lambda: TypeError(_PLANT)),
+    ],
+    ids=["read-memory", "read-badzip", "files-module", "files-type"],
+)
+def test_a_finished_pass_survives_a_failed_map_read(
+    target: str,
+    fault: Callable[[], Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    deps = importlib.import_module("messagefoundry.parsing.x12._deps")
+    calls: list[object] = []
+
+    def failing(*args: object) -> Any:
+        calls.append(args)
+        raise fault()
+
+    start = 1000.0
+    monkeypatch.setattr(deps, target, failing)
+    monkeypatch.setattr(deps, "_map_ids", frozenset())
+    monkeypatch.setattr(deps, "_map_ids_retry_at", 0.0)
+    monkeypatch.setattr(deps, "time", SimpleNamespace(monotonic=lambda: start))
+
+    with caplog.at_level(logging.WARNING, logger=deps.__name__):
+        result = validate(_270_with("LIN*A~"))
+
+    # The pass's verdict and ack are kept; the id it could not check fails closed to `?`.
+    assert result.valid is False and result.ack is not None
+    assert "LIN" not in {e.segment_id for e in result.errors}
+    assert "segment ?: error 1" in [e.message for e in result.errors]
+    assert type(fault()).__name__ in caplog.text and "no segment id" in caplog.text
+    assert _PLANT not in caplog.text
+    # The retry pause still ran: inside it, a later use reads nothing.
+    assert deps._map_ids_retry_at == start + deps._MAP_IDS_RETRY_SECONDS
+    assert len(calls) == 1
+    assert load_x12_map_segment_ids() == frozenset()
+    assert len(calls) == 1

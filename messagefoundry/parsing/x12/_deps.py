@@ -61,6 +61,14 @@ def load_x12_validator() -> tuple[Any, Any]:
     return pyx12.x12n_document.x12n_document, pyx12.params.params
 
 
+def _log_maps_unreadable(exc: Exception) -> None:
+    """The one warning for a failed map-id read. It holds the class name and nothing else."""
+    _log.warning(
+        "pyx12's maps could not be read (%s); X12 errors will carry no segment id",
+        type(exc).__name__,
+    )
+
+
 def _parse_map_xml(source: IO[bytes]) -> Any:
     """THE XML parse surface of this module: the vendored defusedxml with every hardening flag on.
 
@@ -91,10 +99,7 @@ def _read_map_segment_ids(map_dir: Traversable) -> frozenset[str]:
     # ValueError covers defusedxml's refusals and a multi-byte encoding declaration; LookupError an
     # unknown one.
     except (OSError, ParseError, ValueError, LookupError) as exc:
-        _log.warning(
-            "pyx12's maps could not be read (%s); X12 errors will carry no segment id",
-            type(exc).__name__,
-        )
+        _log_maps_unreadable(exc)
         return frozenset()
     if not ids:
         _log.warning("pyx12's maps define no segment; X12 errors will carry no segment id")
@@ -108,13 +113,21 @@ def load_x12_map_segment_ids() -> frozenset[str]:
     a noticeable fraction of a second, so it runs only when a violation has an id-shaped value to
     check, and the lock keeps threads that miss together to one read. A good read is kept for the
     process. An empty one is not, so a passing fault cannot remove every id until a restart; it is
-    retried at most once per :data:`_MAP_IDS_RETRY_SECONDS`, and until then no id is kept."""
+    retried at most once per :data:`_MAP_IDS_RETRY_SECONDS`, and until then no id is kept.
+
+    No failed read raises. This runs after a pass has finished, so an exception here would discard
+    that pass's verdict and ack over a locator it can do without."""
     global _map_ids, _map_ids_retry_at
     if _map_ids:
         return _map_ids
     with _MAP_IDS_LOCK:
         if not _map_ids and time.monotonic() >= _map_ids_retry_at:
-            _map_ids = _read_map_segment_ids(files("pyx12").joinpath("map"))
+            try:
+                _map_ids = _read_map_segment_ids(files("pyx12").joinpath("map"))
+            # Broad on purpose: at least MemoryError and a zip import's BadZipFile get past the
+            # reader's own tuple, and the class name is all that is logged.
+            except Exception as exc:  # noqa: BLE001
+                _log_maps_unreadable(exc)
             if not _map_ids:
                 _map_ids_retry_at = time.monotonic() + _MAP_IDS_RETRY_SECONDS
         return _map_ids
