@@ -327,7 +327,9 @@ def test_restore_refuses_a_to_that_windows_opens_as_another_name(
     )
     assert rc == 1
     err = _refusal(capsys)
-    assert "refusing --to" in err and "holds no ':'" in err
+    assert "refusing --to" in err
+    expected = "holds no ':'" if ":" in suffix else "does not end in a dot or a space"
+    assert expected in err
     assert sorted(p.name for p in dr.iterdir()) == ["restored.db-wal"]  # nothing written
     assert stale.read_bytes() == b"stale wal"
 
@@ -404,8 +406,41 @@ def test_a_fault_reading_a_sidecar_name_is_a_refusal_not_a_free_name(tmp_path, m
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", _denied)
-    with pytest.raises(dr_backup.BackupError, match="cannot tell whether"):
+    with pytest.raises(dr_backup.BackupError, match="cannot tell whether") as caught:
         dr_backup._refuse_existing_destination(tmp_path / "restored.db", None)
+    assert "check that this account can read its directory" in str(caught.value)
+
+
+def test_an_invalid_name_fault_gets_its_own_remedy(tmp_path, monkeypatch) -> None:
+    # WinError 123 is an invalid name, not a permission fault, so the directory-permission remedy
+    # would send the operator the wrong way. The winerror is set by hand so this runs on every host.
+    real_lstat = os.lstat
+
+    class _InvalidName(OSError):
+        winerror = 123  # what Windows reports for an invalid name; a class attribute on every host
+
+    def _invalid(path, *args, **kwargs):
+        if str(path).endswith("-wal"):
+            raise _InvalidName(
+                22, "The filename, directory name, or volume label syntax is incorrect"
+            )
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _invalid)
+    with pytest.raises(dr_backup.BackupError, match="as a file name") as caught:
+        dr_backup._refuse_existing_destination(tmp_path / "restored.db", None)
+    text = str(caught.value)
+    assert "Windows refuses it as invalid" in text and "choose another --to file name" in text
+    assert "check that this account can read its directory" not in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a reserved device name is a Win32 rewrite")
+def test_restore_refuses_a_to_that_names_a_device(tmp_path) -> None:
+    with pytest.raises(dr_backup.BackupError) as caught:
+        dr_backup._refuse_existing_destination(tmp_path / "NUL", None)
+    text = str(caught.value)
+    assert "Windows opens that name as another object" in text
+    assert "holds a ':'" not in text and "trailing dot" not in text
 
 
 # --- (3) the archive must verify before anything lands -----------------------

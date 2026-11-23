@@ -6355,29 +6355,55 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     return row_counts
 
 
-_REWRITTEN_TO_REFUSAL = (
-    "refusing --to {path}: its file name holds a ':', which names an alternate data stream on an NTFS "
-    "volume, or Windows would open it as a different name, such as one ending in a dot or a space; "
-    "the never-overwrite check could then miss the store's real -wal, -shm and -journal — choose a "
-    "--to whose file name holds no ':' and does not end in a dot or a space"
+#: The ``--to`` refusals of :func:`_refuse_existing_destination`, one per trigger, so each is true
+#: on every host it can fire on. The ':' one fires on every host; the other two only on Windows.
+_COLON_TO_REFUSAL = (
+    "refusing --to {path}: its file name holds a ':'. On Windows a ':' names an alternate data "
+    "stream, where the never-overwrite check could miss the store's real -wal, -shm and -journal, so "
+    "a ':' is refused on every host, and the store can later be opened on Windows — choose a --to "
+    "whose file name holds no ':'"
+)
+_TRAILING_TO_REFUSAL = (
+    "refusing --to {path}: Windows drops a trailing dot or space from a file name, so the "
+    "never-overwrite check could miss the store's real -wal, -shm and -journal — choose a --to whose "
+    "file name does not end in a dot or a space"
+)
+_DEVICE_TO_REFUSAL = (
+    "refusing --to {path}: Windows opens that name as another object, such as the device NUL, not "
+    "as a file of its own — choose another --to file name"
+)
+#: The fault refusal of :func:`_occupied` for WinError 123, an invalid name.
+_INVALID_NAME_REFUSAL = (
+    "cannot use {path} as a file name: {exc} — Windows refuses it as invalid, for example for a "
+    "character such as < > | ? or *; choose another --to file name"
+)
+_FAULT_REFUSAL = (
+    "cannot tell whether {path} is free: {exc} — choose another --to path, or check that this "
+    "account can read its directory"
 )
 
 
+def _rewritten_to_refusal(path: Path) -> str:
+    """The refusal for a ``--to`` that :func:`_refuse_existing_destination` refuses by its spelling."""
+    if ":" in path.name:
+        return _COLON_TO_REFUSAL.format(path=path)
+    if path.name.endswith((".", " ")):
+        return _TRAILING_TO_REFUSAL.format(path=path)
+    return _DEVICE_TO_REFUSAL.format(path=path)
+
+
 def _occupied(path: Path) -> bool:
-    """Whether anything has the name ``path``, a link included, dangling or not. Read without following
-    a link, so a dangling ``store.db-wal`` symlink, which SQLite would write through, counts as
-    occupied. Only a name proven absent reads as free: any other fault is a refusal, never a free
-    name, unlike ``os.path.lexists``, which answers ``False`` for every ``OSError``."""
+    """Whether anything has the name ``path``, a link included, dangling or not, read without
+    following a link. ``FileNotFoundError`` and ``NotADirectoryError`` read as free; on Windows
+    ``FileNotFoundError`` also covers at least network and invalid-drive errors (WinError 53, 67, 15,
+    161 and 206). Any other fault is a refusal, where ``os.path.lexists`` would answer ``False``."""
     try:
         os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
         return False
     except (OSError, ValueError) as exc:  # ValueError: an embedded NUL, from a programmatic caller
-        raise BackupError(
-            "destination",
-            f"cannot tell whether {path} is free: {safe_exc(exc)} — choose another --to path, or "
-            "check that this account can read its directory",
-        ) from exc
+        text = _INVALID_NAME_REFUSAL if getattr(exc, "winerror", None) == 123 else _FAULT_REFUSAL
+        raise BackupError("destination", text.format(path=path, exc=safe_exc(exc))) from exc
     return True
 
 
@@ -6397,9 +6423,12 @@ def _refuse_taken_store_names(dest_store_path: Path) -> None:
     :func:`_restore_blocking`, because the decrypt between them can take minutes. A sidecar planted
     then would be replayed over the verified pages on first open. A dangling link planted at the
     store's own name would be followed by the copy fallback's exclusive create on Windows, which
-    writes the store to the link's target (measured), so the store name is read again too. A name
-    taken after the second read is not caught, including one taken while a volume with no hard links
-    copies the store into place."""
+    writes the store to the link's target (measured), so the store name is read again too.
+
+    After the second read, a regular file at the store name is still refused, by the placement's
+    exclusive create. Not caught: a sidecar created after the second read, including while a volume
+    with no hard links copies the store into place; and, on Windows with no hard links, a link
+    planted at the store name after it, which that create follows."""
     for path in _store_names(dest_store_path):
         if _occupied(path):
             raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
@@ -6427,7 +6456,7 @@ def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path
     to place, so only the config destination is checked."""
     if dest_store_path is not None:
         if ":" in dest_store_path.name or _win_rewritten(dest_store_path):
-            raise BackupError("destination", _REWRITTEN_TO_REFUSAL.format(path=dest_store_path))
+            raise BackupError("destination", _rewritten_to_refusal(dest_store_path))
         _refuse_taken_store_names(dest_store_path)
     if config_dest is not None:
         # is_file() BEFORE iterdir(): a --config-to that names an existing FILE is a typo to report, and

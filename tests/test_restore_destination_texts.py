@@ -16,7 +16,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pytest
+
 from messagefoundry.__main__ import _build_parser
+from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import _OVERWRITE_REFUSAL
 
 _GUIDE = Path(__file__).resolve().parents[1] / "docs" / "EARLY-ADOPTER-GUIDE.md"
@@ -61,6 +64,8 @@ def test_the_to_help_says_what_is_refused_and_gives_the_safe_remedy() -> None:
     for needle in (
         "(a file, a directory or a link, a dangling one included), is refused",
         "the sidecar names are read again just before the write",
+        "Not caught: a sidecar created after that re-read",
+        "on Windows without hard links a link planted at the store name after it, which is followed",
         "a name holding ':', and on Windows a name ending in a dot or a space",
         "stop the engine and move the old store aside with its -wal, -shm and -journal as one set",
     ):
@@ -73,3 +78,36 @@ def test_the_overwrite_refusal_gives_the_safe_remedy() -> None:
         "stop the engine and move the existing store aside with its -wal, -shm and -journal as one set"
         in _flat(_OVERWRITE_REFUSAL)
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "own", "foreign"),
+    [
+        ("store.db::$DATA", "its file name holds a ':'", ("trailing dot", "device")),
+        ("store.db.", "drops a trailing dot or space", ("':'", "device")),
+        ("store.db ", "drops a trailing dot or space", ("':'", "device")),
+        ("NUL", "opens that name as another object", ("':'", "trailing dot")),
+    ],
+)
+def test_each_to_refusal_names_only_its_own_trigger(
+    name: str, own: str, foreign: tuple[str, ...]
+) -> None:
+    # One text per trigger, chosen by name alone, so this runs on every host. The ':' text, the one
+    # that fires on POSIX too, must not say the check could miss a sidecar there.
+    text = dr_backup._rewritten_to_refusal(Path("dr") / name)
+    assert own in text, text
+    for other in foreign:
+        assert other not in text, (other, text)
+
+
+def test_the_colon_refusal_gives_its_cross_host_reason() -> None:
+    text = _flat(dr_backup._COLON_TO_REFUSAL)
+    assert "On Windows a ':' names an alternate data stream" in text
+    assert "refused on every host, and the store can later be opened on Windows" in text
+
+
+def test_the_fault_refusals_give_their_own_remedies() -> None:
+    assert "check that this account can read its directory" in dr_backup._FAULT_REFUSAL
+    invalid = _flat(dr_backup._INVALID_NAME_REFUSAL)
+    assert "Windows refuses it as invalid" in invalid
+    assert "check that this account" not in invalid
