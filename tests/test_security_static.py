@@ -822,12 +822,10 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``re.escape``, and a slot's body comes from ``_SLOT_PATTERNS`` by its kind.
     #
     # Read on 2026-11-23 by running this file's own matchers over every built pattern:
-    # ``_has_nested_quantifier`` flagged none. ``_has_many_starts_shape`` flagged six, and that shape
-    # costs only under a scanning call. The one call site, ``_screened_line`` in ``transports/dicom.py``,
-    # uses ``fullmatch``, so there is one start position; a switch to ``.search`` would make those six
-    # quadratic. A template has at most two unbounded runs. Where it has two, they cannot trade
-    # characters: ``quoted_uid`` stops at the quote that follows it, and ``{indent}{hex_dump}`` is
-    # spaces then a hex digit. Nothing re-reads this when a template or slot changes.
+    # ``_has_nested_quantifier`` flagged none. The patterns are applied with ``fullmatch``, at
+    # ``_screened_line`` in ``transports/dicom.py``. A template has at most two unbounded runs. Where
+    # it has two, they cannot trade characters: ``quoted_uid`` stops at the quote that follows it,
+    # and ``{indent}{hex_dump}`` is spaces then a hex digit.
     "messagefoundry/transports/_dicom_log_lines.py": ("''.join(parts)",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
