@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from typing import Final, Protocol
 
 from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
@@ -794,9 +795,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # Each one swallows its own failure, so this only waits.
             await asyncio.gather(*self._recording, return_exceptions=True)
 
-    async def _handle(self, event: SecurityEvent) -> bool:
+    async def _handle(self, event: SecurityEvent, delivered: Callable[[], None]) -> None:
         try:
-            return await asyncio.to_thread(self._send, event)
+            if await asyncio.to_thread(self._send, event):
+                delivered()
         except Exception:
             # Best-effort: a failed send must never propagate. The event is usually also in the audit
             # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
@@ -813,7 +815,6 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # The reason only. The exception's text can quote the relay's reply or the address, and
             # even its class would tell the recipient, in their own feed, that the relay is broken.
             await self._record_undelivered(event, {"reason": "send_failed"})
-            return False
 
     async def _record_undelivered(self, event: SecurityEvent, why: dict[str, str]) -> None:
         """Write the audit row that says this notice never left the engine (BACKLOG #2383).

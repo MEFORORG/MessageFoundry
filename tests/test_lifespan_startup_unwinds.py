@@ -431,8 +431,8 @@ async def test_an_alert_the_email_took_counts_as_delivered_whatever_the_webhook_
     """BACKLOG #5907 step 4, Lander hold finding 1 on PR 3191: whether an alert counted as
     delivered depended on timing. A webhook that failed fast beside an email that took the alert
     read delivered, and the same webhook hanging until the unwind cut the drain read undelivered.
-    One rule now holds in both: an alert one selected transport took counts as delivered. The cut
-    still logs its line, so the webhook send it ended shows."""
+    One rule now holds in both: an alert one selected transport took counts as delivered. The
+    webhook's loss is logged either way, by transport name."""
     monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", 1.5)
     monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
     webhook: Any = (
@@ -442,16 +442,17 @@ async def test_an_alert_the_email_took_counts_as_delivered_whatever_the_webhook_
     sink = NotifierAlertSink([webhook, email] if webhook_first else [email, webhook])
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
     store: Any = _ClosingStore()
-    with caplog.at_level(logging.ERROR, logger=appmod._log.name):
-        await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    caplog.set_level(logging.WARNING)
+    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the email took it
     assert sink.undelivered == 0
+    assert "not confirmed delivered" not in caplog.text
     if webhook_kind == "hangs-until-cut":
         assert webhook.entered.is_set()  # the control: the webhook did hang
-        assert "did not drain" in caplog.text
-        assert "0 alert(s) not confirmed delivered" in caplog.text
+        assert "alert transport(s) webhook cut with the drain" in caplog.text
     else:
-        assert "not confirmed delivered" not in caplog.text
+        assert webhook.calls == 1  # the control: the webhook did run and fail
+        assert "alert transport webhook failed" in caplog.text
 
 
 class _CancelIgnoringEmail(_HealthyEmail):
@@ -486,9 +487,11 @@ async def test_a_send_left_past_the_cut_takes_the_alert_off_when_it_takes_it() -
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert sink.undelivered == 1  # cut, and nothing had taken it
-    assert len(sink._left_sends) == 1  # the control: the send was left running
-    email.release.set()
+    try:
+        assert sink.undelivered == 1  # cut, and nothing had taken it
+        assert len(sink._left_sends) == 1  # the control: the send was left running
+    finally:
+        email.release.set()  # a send that swallows every cancel must not outlive the test
     for _ in range(20):
         if not sink._left_sends:
             break
@@ -502,7 +505,11 @@ class _FailingTransport:
 
     name = "webhook"
 
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.calls += 1
         raise OSError("synthetic refusal")
 
 
