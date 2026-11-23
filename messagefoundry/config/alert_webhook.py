@@ -41,9 +41,11 @@ _SETTING = "[alerts].webhook_url"
 def alert_host_allowed(host: str, allowed_hosts: Sequence[str]) -> bool:
     """Whether the ``[alerts]`` egress allowlist ``allowed_hosts`` admits ``host``.
 
-    The one test the build and every send of the webhook and the SMTP relay apply, and the one the
-    serve gate's security-channel check reads (BACKLOG #5088), so no two of them can disagree on
-    which host is listed. Hosts compare without case.
+    The one comparison the build and every send of the webhook and the SMTP relay apply, and the
+    one the serve gate's security-channel check reads (BACKLOG #5088). Hosts compare without case.
+    The webhook's callers percent-decode the host and each entry before they call it; the SMTP
+    relay's and the serve gate's do not, so an entry holding a '%' can name a different host in
+    ``webhook_allowed_hosts`` than in ``smtp_allowed_hosts``.
 
     An empty allowlist admits every host: that is the settings' documented ``[]`` = any, and an
     environment value that splits to no host, such as ``""`` or ``","``, yields it too. A non-empty
