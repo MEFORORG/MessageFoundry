@@ -1255,7 +1255,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--to",
         default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm/-journal sidecar) is refused. "
+        "is unrecoverable, so a taken store name, or a taken SQLite -wal/-shm/-journal name beside it "
+        "(a file, a directory or a link, a dangling one included), is refused, and the sidecar names "
+        "are read again just before the write. Also refused: a name holding ':', and on Windows a "
+        "name ending in a dot or a space or otherwise opened as another path. To reuse a path, stop "
+        "the engine and move the old store aside with its -wal, -shm and -journal as one set. "
         "Required, except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
         "whose bundle --config-to restores alone",
     )

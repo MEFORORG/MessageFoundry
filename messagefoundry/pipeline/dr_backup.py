@@ -5150,9 +5150,12 @@ def _safe_segment(value: str) -> str:
 # activation is the consumer (the DR box restores here, then activates onto the restored store).
 
 #: A WAL-mode store is three files. Restoring `store.db` beside a leftover `store.db-wal` from a
-#: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so the sidecars
-#: are refused as destinations too, not just the main file. ``-journal`` is here for the same reason:
-#: SQLite replays a hot rollback journal on first open, even into a WAL-mode store (measured).
+#: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so a taken
+#: sidecar name is refused too, not just the main file: a file, a directory or a link, a dangling one
+#: included, read before the decrypt and again just before the placement
+#: (:func:`_refuse_existing_sidecars`). A sidecar created after that second read is not caught.
+#: ``-journal`` is here for the same reason: SQLite replays a hot rollback journal on first open, even
+#: into a WAL-mode store (measured).
 _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 #: ASVS 5.2.3 bounds on the restored CONFIG bundle, which the per-member cap alone cannot give: N
