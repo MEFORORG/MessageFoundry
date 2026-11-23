@@ -373,11 +373,17 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   found leaves a logger outside the named list unscreened until the next SCP start, C-STORE or SCU association puts
   the factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
   `propagate = False` on a logger of its own. A traceback's frames and exception class names are written, since
-  they are code. A failure inside the screen withholds the line. A
-  delivery error the SCU raises holds an empty exception of the library's class on its chain, not the library's
-  text. A library exception the SCU does not wrap, at least one raised while it opens the association, keeps its
-  text: the delivery worker logs only its class, but if the worker's store write for that row then fails with
-  an error that is not a database driver's, its fault log prints that text. Matching is linear in the line's length.
+  they are code. A failure inside the screen withholds the line. Matching is linear in the line's length.
+
+  A delivery error raised while the SCU stores an object holds, on its chain, an empty exception of the library's
+  class or nothing, and never the library's text. A failed association release cannot replace that error. It is
+  logged through the screen, and a Success or Warning status then counts as a transient failure, so the retry may
+  store the object a second time.
+
+  **A library exception the SCU does not wrap keeps its text.** At least one raised while the SCU opens the
+  association does. The delivery worker logs only its class, but the text would reach the row's `last_error`
+  through `safe_exc`, which does not recognise a refused UID. If the worker's write of that error to the store
+  then fails with an error that is not a database driver's, its fault log prints the text as well.
 
   `tests/_dicom_log_census.py` scans both installed libraries' log and `warn_and_log` calls against a pinned
   census, so a call it can read that a library adds or rewords fails a test until it is read: at least a
