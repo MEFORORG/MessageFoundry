@@ -2332,8 +2332,41 @@ class Engine:
             # clear, which resolves a pause alert an earlier run left open (slice 3).
             await self._intake_monitor.check_once()
             self._intake_monitor.start()
-        # BACKLOG #5615: before the graph block, so a single node refuses an expired key or
-        # secret under enforce before any listener binds or worker runs.
+        if self._registry_runner is not None:
+            # Fail loud (not at the first received message) if the configured store can't run the
+            # staged ingress pipeline: the inbound path unconditionally calls store.enqueue_ingress,
+            # so a FUTURE backend whose enqueue_ingress/handoff is a NotImplementedError stub would
+            # otherwise wedge every inbound at runtime with no ACK/NAK. All three shipped backends
+            # (SQLite, Postgres, SQL Server) set supports_ingest_stage=True, so this is the fail-closed
+            # allow-list guard for a staging-incapable backend, not a live restriction. It fails loud on
+            # EVERY node (leader or standby) — a misconfigured backend should refuse at startup, not
+            # only when this node is promoted.
+            if not getattr(self.store, "supports_ingest_stage", True):
+                raise RuntimeError(
+                    "the configured store backend does not support the staged ingress pipeline "
+                    "(ADR 0001) — SQLite, Postgres, and SQL Server all do"
+                )
+            # Fail-fast (not at the first Handler Send into a PT connector) if the wired graph contains a
+            # pass-through (PT) inbound but the configured backend doesn't implement PT re-ingress (the
+            # `pt_deliveries` branch of transform_handoff). PT is ALLOW-LISTED to backends that opt in via
+            # `supports_pt_reingress` (SQLite, Postgres, SQL Server today): any future backend that hasn't
+            # implemented the branch is rejected here, before any inbound listener binds,
+            # so the runtime NotImplementedError (after the inbound is already ACKed) can never surface.
+            self._check_pt_backend_supported()
+            # Fail-fast (not per-message, post-ACK, forever) if the graph declares a reference set but the
+            # backend has no ADR 0006 snapshot store to materialize it into. This MUST run before
+            # _start_graph below: that path calls _reconcile_reference_sync(startup=True) -> sync_all() ->
+            # write_reference_snapshot, which is exactly what detonates on such a backend. Like the
+            # supports_ingest_stage check it fires on EVERY node (leader or standby) — which also covers
+            # the clustered branch, where the reference runner starts on every node before leadership.
+            self._check_reference_backend_supported()
+            # Vault BACKLOG #3139: serve runs no build check, so a reference set's raw hop flag is
+            # refused here, before any sync, rather than surfacing later as a failed sync, and so
+            # is a non-bool literal on a boolean source setting (vault BACKLOG #3234).
+            refuse_reference_hop_flags(self._registry_runner.registry)
+        # BACKLOG #5615: after the graph's static refusals, so a graph they refuse stamps no
+        # rotation, and before its start, so a graph wired before start() is refused on an
+        # expired key or secret before any listener binds. A later first load skips this.
         if self._secret_rotation_settings is not None:  # noqa: SIM102 - the moved block is verbatim
             # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
             # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
@@ -2405,37 +2438,6 @@ class Engine:
                     alert_sink=self._alert_sink,
                 )
         if self._registry_runner is not None:
-            # Fail loud (not at the first received message) if the configured store can't run the
-            # staged ingress pipeline: the inbound path unconditionally calls store.enqueue_ingress,
-            # so a FUTURE backend whose enqueue_ingress/handoff is a NotImplementedError stub would
-            # otherwise wedge every inbound at runtime with no ACK/NAK. All three shipped backends
-            # (SQLite, Postgres, SQL Server) set supports_ingest_stage=True, so this is the fail-closed
-            # allow-list guard for a staging-incapable backend, not a live restriction. It fails loud on
-            # EVERY node (leader or standby) — a misconfigured backend should refuse at startup, not
-            # only when this node is promoted.
-            if not getattr(self.store, "supports_ingest_stage", True):
-                raise RuntimeError(
-                    "the configured store backend does not support the staged ingress pipeline "
-                    "(ADR 0001) — SQLite, Postgres, and SQL Server all do"
-                )
-            # Fail-fast (not at the first Handler Send into a PT connector) if the wired graph contains a
-            # pass-through (PT) inbound but the configured backend doesn't implement PT re-ingress (the
-            # `pt_deliveries` branch of transform_handoff). PT is ALLOW-LISTED to backends that opt in via
-            # `supports_pt_reingress` (SQLite, Postgres, SQL Server today): any future backend that hasn't
-            # implemented the branch is rejected here, before any inbound listener binds,
-            # so the runtime NotImplementedError (after the inbound is already ACKed) can never surface.
-            self._check_pt_backend_supported()
-            # Fail-fast (not per-message, post-ACK, forever) if the graph declares a reference set but the
-            # backend has no ADR 0006 snapshot store to materialize it into. This MUST run before
-            # _start_graph below: that path calls _reconcile_reference_sync(startup=True) -> sync_all() ->
-            # write_reference_snapshot, which is exactly what detonates on such a backend. Like the
-            # supports_ingest_stage check it fires on EVERY node (leader or standby) — which also covers
-            # the clustered branch, where the reference runner starts on every node before leadership.
-            self._check_reference_backend_supported()
-            # Vault BACKLOG #3139: serve runs no build check, so a reference set's raw hop flag is
-            # refused here, before any sync, rather than surfacing later as a failed sync, and so
-            # is a non-bool literal on a boolean source setting (vault BACKLOG #3234).
-            refuse_reference_hop_flags(self._registry_runner.registry)
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener

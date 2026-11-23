@@ -380,16 +380,18 @@ async def test_an_undetermined_opted_in_class_aborts_Engine_start(
     [
         (SecretRotationSettings(store_key_last_rotated="2020-01-01"), StoreKeyRotationOverdueError),
         (SecretRotationSettings(enforce_secret_expiry_classes=[_AD]), SecretRotationOverdueError),
+        (SecretRotationSettings(), None),
     ],
-    ids=["store-key", "secret"],
+    ids=["store-key", "secret", "control-not-refused"],
 )
 async def test_a_refused_single_node_start_brings_up_no_graph(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     settings: SecretRotationSettings,
-    refusal: type[Exception],
+    refusal: type[Exception] | None,
 ) -> None:
-    """BACKLOG #5615: the refusal comes before the runner starts, so no listener binds first."""
+    """BACKLOG #5615: the refusal comes before the runner starts, so no listener binds first. The
+    control shows the recorder does see a start of this same graph."""
     value = "test-only-bind-password"  # nosec B105 - a test value, never a real credential
     monkeypatch.setenv(_AD, value)
     cfg = tmp_path / "cfg"
@@ -419,9 +421,49 @@ async def test_a_refused_single_node_start_brings_up_no_graph(
 
     monkeypatch.setattr(RegistryRunner, "start", recording_start)
     try:
-        with pytest.raises(refusal):
+        if refusal is None:
             await engine.start()
-        assert starts == []
+            assert len(starts) == 1
+        else:
+            with pytest.raises(refusal):
+                await engine.start()
+            assert starts == []
+    finally:
+        await engine.stop()
+
+
+async def test_a_graph_the_static_checks_refuse_stamps_no_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A candidate secret must not be stamped as rotated by a start that refuses its graph: rolling
+    back would then read as a second rotation and reset an overdue secret's clock (BACKLOG #5615)."""
+    cfg = tmp_path / "cfg"
+    _minimal_graph(cfg, tmp_path)
+    reconciled: list[object] = []
+
+    async def recording_reconcile(*args: Any, **_k: Any) -> dict[str, SecretStamp]:
+        reconciled.append(args)
+        return {}
+
+    def refuse(*_a: Any, **_k: Any) -> None:
+        raise ValueError("refused by a static graph check")
+
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.engine.reconcile_rotation_meta", recording_reconcile
+    )
+    monkeypatch.setattr("messagefoundry.pipeline.engine.refuse_reference_hop_flags", refuse)
+    store = await MessageStore.open(tmp_path / "static.db", cipher=make_cipher(generate_key()))
+    engine = Engine(
+        store,
+        secret_rotation_settings=SecretRotationSettings(),
+        security_enforcement=SecurityEnforcement.ENFORCE,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        engine.add_registry(load_config(cfg))
+        with pytest.raises(ValueError, match="static graph check"):
+            await engine.start()
+        assert reconciled == []
     finally:
         await engine.stop()
 
