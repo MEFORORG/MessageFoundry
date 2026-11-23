@@ -2108,43 +2108,22 @@ jobs:
       # pointer, not a hosted measurement.
       #
       # THE SIXTH RE-DERIVATION, the web console step-margin gate re-measure of 2026-11-23. That day
-      # the gate reddened ubuntu with every test passing on at least engine PRs 3172, 3192 and 3145,
-      # against its 6:55 red line: merge-group runs 45176215261 (7:02) and 45188760810 (7:09), and
-      # pull-request run 45166569322 (7:05). Same instrument, filter and rule as the fifth. The
-      # pool's definition, n, percentiles and worst runs live ONCE, in the three web console rows of
-      # scripts/ci/step_margin_baseline.toml. The sizing input:
+      # the gate reddened ubuntu with every test passing on at least engine PRs 3172, 3192 and 3145.
+      # Same instrument, filter and rule as the fifth, over a narrower window. The pool, the worst
+      # runs and the attribution check live ONCE, in the web console rows of
+      # scripts/ci/step_margin_baseline.toml and the note above them. The sizing input:
       #
       #   leg             worst passing   x 1.35   cap
       #   ubuntu-latest   7:13            9:45     10   was 9
       #   windows-2022    9:27            12:45    13   was 11
       #   windows-2025    10:11           13:45    14   unchanged
       #
-      # The kills moved with the caps, to 13 / 17 / 19, so each stays at least 1.30x its cap. The
-      # job caps moved with the kills; the nesting table above carries both sums.
+      # The kills moved with the caps, to 13 / 17 / 19, and the job caps with the kills; the nesting
+      # table above carries both sums. windows-2022's 13 rests on one run, and its next worst would
+      # size the leg at 12. It is kept because excluding a run is a change to the sizing rule.
       #
-      # ONE PR WAS NOT THE CAUSE, CHECKED BEFORE RE-SIZING. ubuntu's 30 red success rows span 23
-      # branches, at most 5 from one, and 7 merge groups. In their logs no two adjacent 72-test
-      # progress lines are more than 0:34 apart, so none holds a stall of a minute. This step passes
-      # no `--durations`, so a hosted log cannot rank single tests. One local run at this step's
-      # flags, on main d2ed8a8bd, put the largest single test at 0.58 percent of summed test time
-      # and the 9 test files added since the pool opened at 7.2 percent. It is a pointer, not a
-      # hosted measurement. Passed tests in the hosted logs rose 1325 -> 1472 over the pool, across
-      # 21 commits, the largest holding 20 percent of the added test lines.
-      #
-      # THE RUNNER IMAGE MOVED IN THE SAME WEEK, AND NO SHARE OF THE RISE IS ATTRIBUTED TO IT.
-      # ubuntu's image went from 20261103.629 to 20261111.635 during the pool. Among the 55 ubuntu
-      # rows of 2026-11-20, each running 1395 to 1421 tests, 36 on the older image took a median
-      # 6:00 and 19 on the newer 6:21. That is one day, not controlled for load, so it says the
-      # image may matter and not how much.
-      #
-      # windows-2022's 13 RESTS ON ONE RUN, AND THAT RUN IS RUNNER TIME. Run 44592652313 took 9:27
-      # on this leg in attempt 1 and 7:20 in attempt 2, on the same tree; attempt 1's ubuntu and
-      # windows-2025 legs took 4:46 and 5:45. The row's next worst, 8:35, would size the leg at 12.
-      # It is kept for the reason the fourth and fifth re-derivations kept theirs: excluding a run
-      # is a change to the sizing rule, which this re-measure did not make.
-      #
-      # AT THESE CAPS the gate reds from 7:42 on ubuntu, 10:01 on windows-2022 and 10:47 on
-      # windows-2025 -- 6.7, 6.0 and 5.9 percent over each leg's worst pooled run.
+      # AT THESE CAPS the gate reds above 7:41 on ubuntu, 10:00 on windows-2022 and 10:46 on
+      # windows-2025 -- 6.6, 5.8 and 5.8 percent over each leg's worst pooled run.
       #
       # THE CONSOLE SUITE HAS ITS OWN TIMING-SENSITIVE TESTS, and contention is the cost this change
       # pays rather than one it avoids. `test_webui_account.py`'s TOTP helper,
