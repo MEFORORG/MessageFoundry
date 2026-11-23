@@ -705,9 +705,8 @@ async function readAnchorPem(file: string): Promise<PemRead> {
   return { pem };
 }
 
-/** How a file is identified: Windows paths are case-insensitive, as `trustPinsFor` treats them, so
- *  only ASCII case is folded there; toLowerCase() maps U+212A KELVIN SIGN onto "k", which names
- *  another file (BACKLOG #5832). */
+/** How a file is identified: Windows paths are case-insensitive, and only ASCII case is folded
+ *  there, as `trustPinsFor` folds it (pathFold.ts, BACKLOG #5832). */
 function fileId(file: string): string {
   return process.platform === "win32" ? foldAsciiCase(file) : file;
 }

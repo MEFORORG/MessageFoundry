@@ -2,8 +2,8 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Case-insensitive path comparison that folds ASCII A-Z only (BACKLOG #5404, #5832).
 //
-// toLowerCase() folds more than ASCII: at least U+212A KELVIN SIGN becomes "k", a name NTFS keeps
-// apart from "k". path.win32.relative calls toLowerCase() on both sides, so a directory whose name
+// The fact every ASCII-fold site in the IDE links here for: toLowerCase() folds more than ASCII, at
+// least U+212A KELVIN SIGN becomes "k", a name NTFS keeps apart from "k". path.win32.relative calls toLowerCase() on both sides, so a directory whose name
 // differs from the workspace's only by such a character read as inside it. These helpers fold only
 // A-Z, so a non-ASCII case difference reads as a different path. That is not a pure tightening: a
 // non-ASCII case difference NTFS does fold, such as e-acute against E-acute, also reads as another
@@ -19,16 +19,12 @@ export function foldAsciiCase(s: string): string {
   return s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
 }
 
-/** Whether `a` and `b` are one name when every case difference JavaScript knows of is ignored: at
- *  least toLowerCase(), as path.win32.relative folds, and the upper-then-lower fold, which also
- *  joins U+017F LONG S to "s". Wider than any file system's fold is safe for its one use, choosing
- *  when to ask the file system. */
-function sameIgnoringAnyCase(a: string, b: string): boolean {
-  return (
-    foldAsciiCase(a) === foldAsciiCase(b) ||
-    a.toLowerCase() === b.toLowerCase() ||
-    a.toUpperCase().toLowerCase() === b.toUpperCase().toLowerCase()
-  );
+/** Whether `a` and `b` are one name under at least two JavaScript case folds: toLowerCase(), as
+ *  path.win32.relative folds, and upper-then-lower, which also joins U+017F LONG S to "s". Each
+ *  covers the ASCII fold. Open limit: no case fold joins the NFC and NFD forms of one letter, which
+ *  a normalization-insensitive file system (APFS or HFS+, reached over SMB) treats as one name. */
+export function sameIgnoringAnyCase(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase() || a.toUpperCase().toLowerCase() === b.toUpperCase().toLowerCase();
 }
 
 /** `s` resolved, as its root (drive, UNC share or `/`) and its non-empty segments. */

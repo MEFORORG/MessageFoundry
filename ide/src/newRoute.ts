@@ -9,7 +9,7 @@ import * as vscode from "vscode";
 import { workspaceDir, writerPathSetting } from "./cli";
 import { nonce } from "./cspNonce";
 import { SCRIPT_STARTED_MARK, STARTUP_BANNERS } from "./webviewMessaging";
-import { resolveInsideWorkspace } from "./workspaceContainment";
+import { CASE_RULE, resolveInsideWorkspace } from "./workspaceContainment";
 
 interface RoutePayload {
   ib: { kind: "mllp-in" | "file-in"; name: string; port?: string; directory?: string; pattern?: string };
@@ -82,7 +82,7 @@ async function createRoute(p: RoutePayload, onCreated?: () => void): Promise<voi
     // renders markdown command links.
     void vscode.window.showErrorMessage(
       "MessageFoundry: the messagefoundry.configDir setting does not resolve inside this workspace folder: it lies " +
-        "outside it as spelled (a letter outside A-Z must have the folder's own case), passes through a link that leads out of it, or a real path could not be read. No route was created.",
+        `outside it as spelled ${CASE_RULE}, passes through a link that leads out of it, or a real path could not be read. No route was created.`,
     );
     return;
   }

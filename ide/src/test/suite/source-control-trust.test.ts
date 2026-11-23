@@ -256,7 +256,7 @@ trustSuite("sameDir folds ASCII case only on Windows (BACKLOG #5832)", () => {
 
   test("an ASCII case twin is one folder under win32, and a KELVIN SIGN twin is another", async () => {
     assert.strictEqual(await sc.sameDir(path.join(absent, "kit"), path.join(absent, "KIT"), true), true);
-    assert.strictEqual(await sc.sameDir(path.join(absent, "kit"), path.join(absent, "Kit"), true), false);
+    assert.strictEqual(await sc.sameDir(path.join(absent, "kit"), path.join(absent, "\u212Ait"), true), false);
   });
 
   test("elsewhere spellings are compared exactly", async () => {

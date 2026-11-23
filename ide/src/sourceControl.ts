@@ -11,7 +11,7 @@ import * as vscode from "vscode";
 import { logChecks, showChecks } from "./checksChannel";
 import { baselineBypassRecord } from "./checksLog";
 import { configDir, run, workspaceDir, writerPathSetting } from "./cli";
-import { committedRelativePath } from "./workspaceContainment";
+import { CASE_RULE, committedRelativePath } from "./workspaceContainment";
 import { foldAsciiCase } from "./pathFold";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
@@ -263,8 +263,8 @@ function hookPathValues(ws: string): { check: CheckPaths; hook: CheckPaths | und
   if (configRel === undefined || messagesRel === undefined) {
     const key = configRel === undefined ? "configDir" : "messageSetsDir";
     void vscode.window.showWarningMessage(
-      `MessageFoundry: messagefoundry.${key} is not spelled as a path inside the workspace folder (a letter ` +
-        "outside A-Z must have the folder's own case). The commit hook is " +
+      `MessageFoundry: messagefoundry.${key} is not spelled as a path inside the workspace folder ${CASE_RULE}. ` +
+        "The commit hook is " +
         "committed to the repository, so it names folders inside the workspace only; no commit hook was set up.",
     );
     return { check, hook: undefined };
@@ -314,7 +314,7 @@ export async function sameDir(
   theirs: string,
   win32: boolean = process.platform === "win32",
 ): Promise<boolean> {
-  // ASCII A-Z only: toLowerCase() maps U+212A KELVIN SIGN onto "k", so another folder would match.
+  // ASCII A-Z only, not toLowerCase() (pathFold.ts, BACKLOG #5832).
   const fold = (p: string): string => (win32 ? foldAsciiCase(p) : p);
   const real = async (p: string): Promise<string> => {
     try {

@@ -9,8 +9,7 @@
 // link cases are caught too. It is vscode-free so the node-side unit suite can drive it.
 import * as fs from "node:fs";
 import * as path from "node:path";
-// ASCII-only case fold on Windows: path.relative folded with toLowerCase(), so a sibling named with
-// U+212A KELVIN SIGN for "k" read as the workspace (BACKLOG #5832).
+// ASCII-only case fold on Windows, not path.relative's toLowerCase() (pathFold.ts, BACKLOG #5832).
 import { isPathWithin as isWithin, isSamePath, nonAsciiCaseVariant } from "./pathFold";
 
 function realpath(p: string): string {
@@ -23,6 +22,27 @@ function realpath(p: string): string {
       throw e;
     }
     return fs.realpathSync(p);
+  }
+}
+
+/**
+ * The case rule a refusal states when a path is not spelled inside the workspace folder (BACKLOG
+ * #5832): on Windows only A-Z case is ignored, elsewhere none. It names the workspace folder's
+ * spelling as VS Code holds it, which can differ from the case on disk.
+ */
+export const CASE_RULE =
+  "(letter case must match the workspace folder's spelling, except that Windows ignores the case of A-Z)";
+
+/** Whether `a` and `b` are one file by identity (device and file id): true, false when either does
+ *  not exist, or undefined when either cannot be read for another reason. */
+function sameFileIdentity(a: string, b: string): boolean | undefined {
+  try {
+    const x = fs.statSync(a, { bigint: true });
+    const y = fs.statSync(b, { bigint: true });
+    return x.dev === y.dev && x.ino === y.ino;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? false : undefined;
   }
 }
 
@@ -190,7 +210,8 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * file system may fold is the exception: the file system is asked whether it names the workspace
  * folder, and if so it is checked (escapesUnderCaseVariant, BACKLOG #5832).
  *
- * At least these spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
+ * For a value spelled inside the folder, at least these spellings are refused outright, before any
+ * I/O; for a variant value the real-path reads that place it come first. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
  * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
  * {@link hasTrailingDotOrSpaceName}, {@link hasColonInName} or {@link hasReservedDeviceName} names,
@@ -230,15 +251,17 @@ function climbs(value: string, win32: boolean): boolean {
  * {@link escapesByLink} for a value spelled outside `ws` only because a folder name on it differs
  * from the workspace's by a case outside A-Z (BACKLOG #5832). NTFS folds some such differences and
  * not others, so the file system is asked: the real path of the folder the value names at the
- * workspace's depth. When that is the workspace folder's own real path, the value is the workspace
- * spelled another way, and it is checked as the same path spelled from the workspace, links
- * included; before this, the ASCII fold read it as outside and skipped the check. When it is
- * another folder, the value is the operator's own and is not checked. A `..`, or a real path that
- * cannot be read, refuses. A value outside under every case fold makes no file-system call.
+ * workspace's depth. When that is the workspace folder, by real path or, where the real path keeps
+ * the spelling's case (the fallback realpath() takes on some volumes), by device and file id, the
+ * value is the workspace spelled another way, and it is checked as the same path spelled from the
+ * workspace, links included; before this, the ASCII fold read it as outside and skipped the check.
+ * When it is another folder, the value is the operator's own and is not checked. A `..`, or a path
+ * that cannot be read, refuses. A value outside under every case fold makes no file-system call;
+ * nor does one when `win32` is false, which reads paths exactly.
  */
 function escapesUnderCaseVariant(ws: string, value: string, win32: boolean): boolean {
   const root = path.resolve(ws);
-  const variant = nonAsciiCaseVariant(root, path.resolve(root, value));
+  const variant = nonAsciiCaseVariant(root, path.resolve(root, value), win32);
   if (variant === undefined) {
     return false;
   }
@@ -251,7 +274,13 @@ function escapesUnderCaseVariant(ws: string, value: string, win32: boolean): boo
     return true;
   }
   if (!isSamePath(realRoot, realHead)) {
-    return false;
+    const same = sameFileIdentity(root, variant.head);
+    if (same === undefined) {
+      return true;
+    }
+    if (!same) {
+      return false;
+    }
   }
   return escapesByLink(ws, path.join(root, ...variant.rest), win32);
 }
@@ -359,7 +388,7 @@ export interface ContainedPathSetting {
 function droppedWhy(key: string, dropped: DroppedScope): string {
   return dropped === "workspace"
     ? `messagefoundry.${key}, set in workspace settings, is not a path inside the workspace folder as ` +
-        "spelled (a letter outside A-Z must have the folder's own case), is not text, or no folder is open"
+        `spelled ${CASE_RULE}, is not text, or no folder is open`
     : `messagefoundry.${key}, set in user settings, is not text`;
 }
 

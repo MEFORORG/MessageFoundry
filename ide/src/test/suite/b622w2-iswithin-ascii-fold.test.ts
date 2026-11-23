@@ -185,14 +185,33 @@ windowsSuite("escapesByLink still checks a value that names the workspace by a n
     assert.strictEqual(escapesByLink(ws, path.join(variant, "plain", "new.toml")), false);
   });
 
+  test("where the native realpath fails with EISDIR, the variant is still placed, by file id", function () {
+    const ws = path.join(base, `ws-${E_ACUTE}`);
+    fs.mkdirSync(ws);
+    if (!fs.existsSync(path.join(base, `ws-${E_ACUTE_UPPER}`))) {
+      this.skip();
+    }
+    fs.symlinkSync(outside, path.join(ws, "cfg"), "junction");
+    // The JS fallback realpath() takes keeps the spelling's case, so the real paths differ.
+    const native = fs.realpathSync.native;
+    fs.realpathSync.native = ((): never => {
+      throw Object.assign(new Error("EISDIR"), { code: "EISDIR" });
+    }) as unknown as typeof fs.realpathSync.native;
+    try {
+      assert.strictEqual(escapesByLink(ws, path.join(base, `ws-${E_ACUTE_UPPER}`, "cfg")), true);
+    } finally {
+      fs.realpathSync.native = native;
+    }
+  });
+
   test("a KELVIN SIGN sibling is another folder, the operator's own, and is not checked", function () {
     const ws = path.join(base, "kit");
     const sibling = path.join(base, `${KELVIN}it`);
     fs.mkdirSync(ws);
-    fs.mkdirSync(sibling);
-    if (fs.realpathSync.native(sibling) === fs.realpathSync.native(ws)) {
+    if (fs.existsSync(sibling)) {
       this.skip(); // this file system folds KELVIN SIGN onto k
     }
+    fs.mkdirSync(sibling);
     fs.symlinkSync(outside, path.join(sibling, "cfg"), "junction");
     assert.strictEqual(escapesByLink(ws, path.join(sibling, "cfg")), false);
     // Control: the same junction inside the workspace is refused.
@@ -217,7 +236,7 @@ windowsSuite("the Security Settings target folds ASCII case only (BACKLOG #5404,
     const ws = "C:\\ws\\kit";
     const kelvin = securityConfigTarget(ws, `C:\\ws\\${KELVIN}it\\messagefoundry.toml`, { ...trusted, fromWorkspace: true }, fakeFs([]));
     assert.strictEqual(kelvin.ok, false, JSON.stringify(kelvin));
-    assert.ok(!kelvin.ok && kelvin.problem.includes("case outside A-Z"), JSON.stringify(kelvin));
+    assert.ok(!kelvin.ok && kelvin.problem.includes("letter case must match"), JSON.stringify(kelvin));
     const twin = securityConfigTarget(ws, "C:\\WS\\KIT\\messagefoundry.toml", { ...trusted, fromWorkspace: true }, fakeFs([]));
     assert.deepStrictEqual(twin, { ok: true, path: "C:\\ws\\kit\\messagefoundry.toml" });
   });
@@ -249,5 +268,34 @@ windowsSuite("the Security Settings target folds ASCII case only (BACKLOG #5404,
     assert.strictEqual(got.ok, false, JSON.stringify(got));
     const control = securityConfigTarget(ws, "cfg", { ...trusted, fromWorkspace: true }, fakeFs([], { "C:\\ws\\kit\\cfg": "C:\\WS\\KIT\\CFG" }));
     assert.deepStrictEqual(control, { ok: true, path: "C:\\ws\\kit\\cfg" });
+  });
+
+  test("a folder below the workspace spelled with another non-ASCII case than on disk is accepted", () => {
+    // NTFS opens it as the folder on disk, which is inside the workspace; it is not a link.
+    const ws = "C:\\ws\\kit";
+    const fsx = fakeFs([], { [`${ws}\\${E_ACUTE}val`]: `${ws}\\${E_ACUTE_UPPER}val` });
+    const got = securityConfigTarget(ws, `${E_ACUTE}val`, { ...trusted, fromWorkspace: true }, fsx);
+    assert.deepStrictEqual(got, { ok: true, path: `${ws}\\${E_ACUTE}val` });
+  });
+
+  test("a user value whose case-variant head is a dangling link is refused, as escapesByLink refuses it", () => {
+    const ws = `C:\\ws\\${E_ACUTE}`;
+    const head = `C:\\ws\\${E_ACUTE_UPPER}`;
+    const fsx: LinkFs = {
+      lstat: (p: string) => {
+        if (p === head) {
+          return { isSymbolicLink: () => true };
+        }
+        throw Object.assign(new Error("absent"), { code: "ENOENT" });
+      },
+      realpath: (p: string): string => {
+        if (p === head) {
+          throw Object.assign(new Error("dangling"), { code: "ENOENT" });
+        }
+        return p;
+      },
+    };
+    const got = securityConfigTarget(ws, `${head}\\cfg.toml`, { ...trusted, fromWorkspace: false }, fsx);
+    assert.strictEqual(got.ok, false, JSON.stringify(got));
   });
 });

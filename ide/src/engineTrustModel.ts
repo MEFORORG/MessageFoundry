@@ -497,7 +497,7 @@ export function trustPinsFor(
     const earlier = byKey.get(key);
     if (earlier !== undefined) {
       // Windows paths are case-insensitive, so C:\PKI\ca.pem and c:\pki\ca.pem are one file. ASCII
-      // A-Z only: toLowerCase() maps U+212A KELVIN SIGN onto "k", which names another file.
+      // A-Z only, not toLowerCase() (pathFold.ts).
       const same =
         flavour.sep === "\\" ? foldAsciiCase(earlier) === foldAsciiCase(file) : earlier === file;
       if (!same) {
