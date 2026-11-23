@@ -682,9 +682,10 @@ def _refuse_webhook_revocation(
     if urllib.parse.urlsplit(url).scheme.lower() != "https":
         return
     RevocationHopGuard.capture(
-        # The host urllib dials. A userinfo URL, which could make a parser disagree with it, is
-        # refused before this runs (refuse_url_credentials).
-        host=hop_url_host(url, cell="[alerts].webhook_url"),
+        # The host urllib dials, percent-decoded as urllib decodes it (vault BACKLOG #3533 item
+        # 14): "[::1%3a2]" dials ::1:2, not ::1 in zone "3a2". A userinfo URL, which could make a
+        # parser disagree with it, is refused before this runs (refuse_url_credentials).
+        host=urllib.parse.unquote(hop_url_host(url, cell="[alerts].webhook_url")),
         cell="[alerts] webhook POST (verified TLS, no revocation check)",
         description=(
             "can carry the alert webhook's path token over verified https and performs no "

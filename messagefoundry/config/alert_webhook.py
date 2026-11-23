@@ -65,7 +65,8 @@ def _refuse_hostless_or_off_allowlist(url: str, allowed_hosts: Sequence[str]) ->
     The host is judged as urllib dials it: percent-decoded, as ``urllib.request.Request`` decodes
     it before ``http.client`` validates it. A decoded host ``http.client`` could not send (a
     space, a control character or a non-ASCII character, written as ``%20``, ``%0d%0a`` or
-    ``%7f`` say) is refused without naming it, and the allowlist judges the decoded host, so
+    ``%7f`` say), or one holding ``/``, ``?`` or a backslash, is refused without naming it, and
+    the allowlist judges the decoded host, so
     ``hooks%2Eexample`` is judged as the ``hooks.example`` it dials. Each allowlist entry is
     decoded the same way before the comparison.
 
@@ -76,11 +77,15 @@ def _refuse_hostless_or_off_allowlist(url: str, allowed_hosts: Sequence[str]) ->
         # Whatever the allowlist: the build's revocation guard refuses a hostless URL in every
         # posture too, so this keeps settings load from passing one the build refuses.
         raise ValueError(f"{_SETTING} names no host")
-    if unsendable_request_target(host):
+    # '/', '?' and a backslash too: no host holds one, and a decoded one means part of the path, the
+    # token perhaps, was written into the authority, where the allowlist refusal and the
+    # revocation guard's text would name it.
+    if unsendable_request_target(host) or any(ch in host for ch in "/?\\"):
         raise ValueError(
-            f"{_SETTING} has a percent-encoded space, control character, non-ASCII character or "
-            "'#' in its host, which urllib cannot dial once it decodes the host; the value is not "
-            "repeated here, since its path can carry the webhook's token"
+            f"{_SETTING} has a space, control character, non-ASCII character, '#', '/', '?' or "
+            "'\\' in its host, written as is or percent-encoded, which no host holds once urllib "
+            "decodes it; the value is not repeated here, since its path can carry the webhook's "
+            "token"
         )
     # Each entry is decoded too, so an entry written as the URL spells the host, such as an IPv6
     # zone's "%25", names the host urllib dials, as it did before the host was decoded.

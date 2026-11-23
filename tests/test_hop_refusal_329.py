@@ -40,7 +40,11 @@ from messagefoundry.config.settings import (
     SecuritySettings,
     load_settings,
 )
-from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    InsecureHopRefused,
+    active_hop_posture,
+)
 from messagefoundry.pipeline import Engine, alert_sinks
 from messagefoundry.pipeline.alert_sinks import (
     NotifierAlertSink,
@@ -220,6 +224,19 @@ _REFUSED_WEBHOOK_URLS = [
     pytest.param(f"https://hooks.example%20/{_WEBHOOK_TOKEN}", (), id="encoded-space-in-host"),
     pytest.param(f"https://hooks%0d%0aexample/{_WEBHOOK_TOKEN}", (), id="encoded-crlf-in-host"),
     pytest.param(f"https://hooks.example%7f/{_WEBHOOK_TOKEN}", (), id="encoded-del-in-host"),
+    # A path written into the authority: the decoded host would hold the token.
+    pytest.param(
+        f"https://hooks.example%2Fservices%2F{_WEBHOOK_TOKEN}%2Fpath",
+        (),
+        id="encoded-slash-in-host",
+    ),
+    pytest.param(
+        f"https://hooks.example%2Fservices%2F{_WEBHOOK_TOKEN}%2Fpath",
+        ("hooks.example",),
+        id="encoded-slash-in-host-listed",
+    ),
+    pytest.param(f"https://hooks.example%3F{_WEBHOOK_TOKEN}/x", (), id="encoded-query-in-host"),
+    pytest.param(f"https://hooks.example\\{_WEBHOOK_TOKEN}/x", (), id="backslash-in-host"),
     # Whitespace both readers strip is stripped, so an http URL inside it is still refused.
     pytest.param(f" http://hooks.example/{_WEBHOOK_TOKEN}\n", (), id="space-http"),
     pytest.param(f"https://hooks.example/{_WEBHOOK_TOKEN}", ("other.example",), id="off-allowlist"),
@@ -243,7 +260,9 @@ def test_a_webhook_the_build_refuses_is_refused_at_load_without_echoing_it(
         AlertsSettings(webhook_url=url, webhook_allowed_hosts=list(allowed))
     text = str(info.value)
     assert str(built.value) in text  # one refusal, the same at load and at the build
-    assert _WEBHOOK_TOKEN not in text and _WEBHOOK_TOKEN not in info.value.json()
+    # Case-folded: urlsplit lower-cases a host, so an echo through one is lower-case.
+    token = _WEBHOOK_TOKEN.lower()
+    assert token not in text.lower() and token not in info.value.json().lower()
     assert "ftp" not in text.lower()
 
 
@@ -282,6 +301,29 @@ def test_an_ipv6_zone_entry_written_as_the_url_spells_it_still_matches() -> None
     url = "https://[fe80::1%25eth0]/x"
     alerts = AlertsSettings(webhook_url=url, webhook_allowed_hosts=["fe80::1%25eth0"])
     assert alerts.webhook_url == url
+
+
+@pytest.mark.parametrize("posture", [PROD_PHI, STAGING_PHI], ids=["enforcing", "warn"])
+def test_a_token_in_the_host_reaches_no_text_at_the_build(
+    posture: HopPosture, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Finding 2: refused before the revocation guard runs, so neither its refusal nor its
+    # crossing WARNING can name the decoded host that holds the token.
+    url = f"https://hooks.example%2Fservices%2F{_WEBHOOK_TOKEN}%2Fpath"
+    with caplog.at_level(logging.DEBUG), pytest.raises(ValueError) as info:
+        WebhookTransport(url, posture=posture)
+    assert _WEBHOOK_TOKEN not in str(info.value)
+    assert _WEBHOOK_TOKEN.lower() not in str(info.value).lower()
+    assert _WEBHOOK_TOKEN.lower() not in caplog.text.lower()
+
+
+def test_the_revocation_guard_judges_the_decoded_host() -> None:
+    # Finding 1: "[::1%3a2]" dials ::1:2, an off-box address, not ::1 in zone "3a2", so under an
+    # enforcing posture with no attestation the guard refuses it as it refuses any off-box host.
+    with pytest.raises(InsecureHopRefused):
+        WebhookTransport("https://[::1%3a2]/x", posture=PROD_PHI)
+    # The control: the loopback host itself still crosses unattested.
+    WebhookTransport("https://[::1]/x", posture=PROD_PHI)
 
 
 def test_a_listed_webhook_host_loads() -> None:
