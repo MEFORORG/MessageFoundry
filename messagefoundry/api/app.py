@@ -258,7 +258,6 @@ from messagefoundry.api.security import (
     authorize_ws,
     authorizes_in_body,
     bearer_token,
-    charge_deferred_monitoring_read,
     client_ip,
     deadline_utc,
     enforce_phi_read_hop,
@@ -269,6 +268,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline,
     public_route,
     quiet_deliberate_export_stops,
+    raise_deferred_monitoring_refusal,
     recheck_standing,
     recheck_standing_or_refusal,
     refuse_from_new_address,
@@ -5702,12 +5702,12 @@ def create_app(
         # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
         # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
         # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
-        # behind a 429. The gate defers its monitoring-read charge on a reveal for that reason, and
-        # it is charged here, after this check (vault BACKLOG #1191). A scoped caller's dashboard
-        # carries no outbound rows at all.
+        # behind a 429. For that reason the gate holds its monitoring-read 429 on a reveal, and it
+        # is raised here, after this check; the read was charged at admission either way (vault
+        # BACKLOG #1191). A scoped caller's dashboard carries no outbound rows at all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
-        await charge_deferred_monitoring_read(request)
+        await raise_deferred_monitoring_refusal(request)
         await _admit_reveal(request, identity, reveal)
         out = await _dashboard_rows(engine, identity, reveal=reveal)
         if reveal is not None:

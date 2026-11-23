@@ -10,7 +10,7 @@ six paced routes, their key and the default's basis are stated in docs/SECURITY.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +23,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.base import Row
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"
@@ -200,23 +201,39 @@ async def test_retry_after_is_the_whole_window_while_the_global_count_is_spent(
         assert (refused.status_code, refused.headers["Retry-After"]) == (429, "38")
 
 
+def _decisions_on(rows: Sequence[Row], path: str) -> list[tuple[str, dict[str, object]]]:
+    """The gate decision rows on ``path``, oldest first."""
+    ordered = sorted(rows, key=lambda row: int(str(row["id"])))
+    return [
+        (str(row["action"]), json.loads(str(row["detail"] or "{}")))
+        for row in ordered
+        if row["action"] in {"auth.permission_granted", "auth.gate_refused"}
+        and json.loads(str(row["detail"] or "{}")).get("path") == path
+    ]
+
+
+async def _scoped_service(engine: Engine, **overrides: object) -> AuthService:
+    service = await _service(engine, **overrides)
+    scoped = await service.store.get_user_by_username("vw")
+    assert scoped is not None
+    await service.set_channel_scope(scoped.id, ["IB_MINE"], actor="test")
+    return service
+
+
 async def test_an_out_of_scope_reveal_is_denied_and_audited_with_the_budget_spent(
     engine: Engine,
 ) -> None:
     """As on main, the scope check and its ``auth.channel_denied`` row come before the monitoring
     pace: an account whose budget is spent still gets the channel denial for an out-of-scope
-    reveal, not a 429 that hides the probe."""
-    service = await _service(engine, monitoring_read_rate_limit_per_actor=1)
-    scoped = await service.store.get_user_by_username("vw")
-    assert scoped is not None
-    await service.set_channel_scope(scoped.id, ["IB_MINE"], actor="test")
+    reveal, not a 429 that hides the probe. An in-scope reveal past the budget is still refused,
+    with one ``auth.gate_refused`` row and no grant row (BACKLOG #1197)."""
+    service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
     async with _client(engine, service) as c:
         h = await _bearer(c, "vw")
         assert (await c.get("/status", headers=h)).status_code == 200
         assert (await c.get("/status", headers=h)).status_code == 429  # the budget is spent
         denied = await c.get("/connections", params={"reveal": "IB_THEIRS"}, headers=h)
         assert denied.status_code == 403, denied.text
-        # An in-scope reveal past the budget is still paced.
         paced = await c.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
         assert paced.status_code == 429
         assert int(paced.headers["Retry-After"]) >= 1
@@ -227,13 +244,40 @@ async def test_an_out_of_scope_reveal_is_denied_and_audited_with_the_budget_spen
         if row["action"] == "auth.channel_denied"
     ]
     assert any("IB_THEIRS" in json.dumps(d) for d in denials), denials
-    # The in-scope reveal's 429, charged in the route body, still writes its throttled row.
-    refused = [
-        json.loads(str(row["detail"] or "{}"))
-        for row in rows
-        if row["action"] == "auth.gate_refused"
-    ]
-    assert any(d.get("path") == "/connections" and d.get("reason") == "throttled" for d in refused)
+    on_path = _decisions_on(rows, "/connections")
+    # Only the in-scope reveal's refusal is written: the out-of-scope one was answered, and
+    # recorded, as a channel denial, and its held 429 was never raised.
+    assert [a for a, _ in on_path] == ["auth.gate_refused"], on_path
+    assert {d["reason"] for _, d in on_path} == {"throttled"}
+
+
+async def test_a_refused_reveal_still_spends_the_budget(engine: Engine) -> None:
+    """The reveal's charge is taken at admission: a reveal the scope check denies, and one whose
+    value fails validation, each spend a read, so neither is an unpaced probe."""
+    service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
+    async with _client(engine, service) as c:
+        h = await _bearer(c, "vw")
+        denied = await c.get("/connections", params={"reveal": "IB_THEIRS"}, headers=h)
+        assert denied.status_code == 403
+        assert (await c.get("/status", headers=h)).status_code == 429
+        h_other = await _bearer(c, "other")
+        invalid = await c.get("/connections", params={"reveal": ""}, headers=h_other)
+        assert invalid.status_code == 422
+        assert (await c.get("/status", headers=h_other)).status_code == 429
+
+
+async def test_an_in_scope_reveal_under_the_budget_is_charged_once(engine: Engine) -> None:
+    service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=2)
+    async with _client(engine, service) as c:
+        h = await _bearer(c, "vw")
+        # A Viewer passes the scope check and the pace, and is then refused by the reveal's own
+        # permission check, which runs after both.
+        passed = await c.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
+        assert passed.status_code == 403
+        assert passed.json()["detail"] == "a reveal needs messages:view_summary"
+        # One read of the budget of 2 is left.
+        assert (await c.get("/status", headers=h)).status_code == 200
+        assert (await c.get("/status", headers=h)).status_code == 429
 
 
 async def test_the_web_console_reads_are_not_charged(engine: Engine) -> None:
