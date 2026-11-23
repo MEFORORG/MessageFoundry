@@ -3071,7 +3071,11 @@ class RemoteFileSource(SourceConnector):
         break, whose due rejects join them, or a sustained backlog would keep them waiting. A due
         reject with no slot stays due for a later poll. A stop takes every slot away. Every
         remembered reject without a slot drops any settle sighting, which must come from
-        consecutive polls."""
+        consecutive polls.
+
+        A poll with a slot to run lists the directory once more, because the pass's hand-offs sit
+        between the first listing and these retries, so a file rewritten meanwhile is judged on
+        what it lists at now. A listing that fails runs no retry, and they stay due."""
         now = time.monotonic()
         for entry in unreached if self._stuck else ():
             stuck = self._stuck_reject(entry.name, entry.size, entry.mtime)
@@ -3081,11 +3085,27 @@ class RemoteFileSource(SourceConnector):
         slots = heapq.nsmallest(allowance, due.values(), key=itemgetter(0))
         for name in (self._stuck.keys() & self._settle_seen.keys()) - {e.name for _, e in slots}:
             del self._settle_seen[name]
+        if not slots:
+            return 0
+        try:
+            current = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
+        except _RemoteError as exc:
+            logger.warning(
+                "REMOTEFILE %s: could not list the directory again before retrying rejected "
+                "files; they stay due: %s",
+                _where(self._host, self._remote_dir),
+                safe_exc(exc),
+            )
+            return 0
+        latest = {entry.name: entry for entry in current}
         recorded = 0
         for _, entry in slots:
             if self._stop.is_set():
                 break
-            step = await self._examine(entry, retry=True)
+            now_listed = latest.get(entry.name)
+            if now_listed is None:
+                continue  # gone since the first listing: _prune_memories forgets it
+            step = await self._examine(now_listed, retry=True)
             if step is _Step.STOP:
                 break
             recorded += step is _Step.RECORDED
@@ -3508,8 +3528,8 @@ class RemoteFileSource(SourceConnector):
         due = time.monotonic() + STUCK_TRANSIENT_RETRY_SECONDS
         self._stuck[name] = (_StuckReject(size, mtime, due), 0)
         logger.warning(
-            "REMOTEFILE %s: rejected file %s stays in place; it is tried again once it changes "
-            "or %.0f seconds pass, then less often",
+            "REMOTEFILE %s: rejected file %s was not moved; while it stays it is tried again once "
+            "it changes or %.0f seconds pass, then less often",
             _where(self._host, self._remote_dir),
             safe_name(name),
             STUCK_TRANSIENT_RETRY_SECONDS,
@@ -3681,7 +3701,7 @@ class RemoteFileSource(SourceConnector):
     async def _after_processing(self, path: str, name: str, read_size: int) -> None:
         if self._after_read == "leave":
             # #142 process-in-place: never move/delete — the durable dedup ledger (recorded by
-            # _poll_once AFTER this returns) is what stops it being re-ingested next poll.
+            # _examine AFTER this returns) is what stops it being re-ingested next poll.
             # No #116 size check here: it would cost a connection per file, and the dedup key folds
             # the listed size, so a file that grew after this read gets a new key and is re-read.
             return

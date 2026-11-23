@@ -371,18 +371,79 @@ async def test_a_waiting_reject_past_the_ceiling_does_not_keep_an_old_sighting(
 async def test_a_stopped_poll_drops_the_sighting_of_a_due_reject(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stop gives no reject a slot, so none keeps a sighting into the next start."""
+    """A stop during the pass gives no reject a slot, so none keeps a sighting into the next start."""
     client = _read_only({"/in/a.hl7": _BAD})
     src = _leave(monkeypatch, client)
     await _settle(src)
     await src._poll_once()
+    client.files["/in/z.hl7"] = _GOOD
     _make_due(src, "a.hl7")
-    await src._poll_once()  # it takes the slot and settles
+    await src._poll_once()  # z is first seen; a takes the slot and settles
     assert "a.hl7" in src._settle_seen
-    src._stop.set()
+    handler = _RecordingHandler()
+
+    async def stopping(raw: bytes) -> str | None:
+        src._stop.set()  # after the pass has met a, which is due
+        return await handler(raw)
+
+    src._handler = stopping
     await src._poll_once()
+    assert handler.bodies == [_GOOD]
     assert "a.hl7" not in src._settle_seen
     assert _retrieved(client, "/in/a.hl7") == 1
+
+
+async def test_a_retry_is_judged_on_a_listing_taken_after_the_fresh_hand_offs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partner starts rewriting z while a's hand-off runs, so the poll's first listing no longer
+    describes it. The retry must see that, as the File source's re-stat does."""
+    client = _read_only({"/in/z.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()  # z is rejected and remembered
+    client.files["/in/a.hl7"] = _GOOD
+    _make_due(src, "z.hl7")
+    await src._poll_once()  # a is first seen; z takes the slot and settles
+    partial = b"MSH|^~\\&|PARTIAL"
+    handler = _RecordingHandler()
+
+    async def rewriting(raw: bytes) -> str | None:
+        client.files["/in/z.hl7"] = partial
+        return await handler(raw)
+
+    src._handler = rewriting
+    await src._poll_once()
+    assert handler.bodies == [_GOOD], "the partial must not be handed over"
+    assert _retrieved(client, "/in/z.hl7") == 1
+    assert "z.hl7" not in src._stuck, "a changed listing is a new file"
+
+
+async def test_a_failed_second_listing_leaves_the_retry_due(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _read_only({"/in/z.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    _make_due(src, "z.hl7")
+    await src._poll_once()  # z takes the slot and settles
+    listed = client.list_dir
+    calls = 0
+
+    def second_fails(remote_dir: str) -> list[tuple[str, int]]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise _RemoteError("synthetic listing failure", permanent=False)
+        return listed(remote_dir)
+
+    monkeypatch.setattr(client, "list_dir", second_fails)
+    await src._poll_once()
+    assert calls == 2
+    assert _retrieved(client, "/in/z.hl7") == 1, "nothing is read on a listing that failed"
+    assert src._stuck["z.hl7"][0].due <= time.monotonic(), "it stays due"
+    assert "could not list" in caplog.text
 
 
 async def test_a_due_retry_already_in_the_ledger_does_not_hold_a_slot(
