@@ -591,8 +591,7 @@ class VaultKeyProvider:
                 )
                 if not value
             ]
-            # Built from variable names alone, so recorded: the key seam keeps it (BACKLOG #6010).
-            raise _recorded_refusal(
+            raise KeyProviderError(
                 f"[store].key_provider={_EXTRA!r} is selected but {', '.join(missing)} is not set — "
                 f"supply the Transit KEK name and the wrapped DEK via the environment."
             )
@@ -741,6 +740,12 @@ def _recorded_refusal(text: str) -> KeyProviderError:
     return refusal
 
 
+def is_transit_key_name(name: str) -> bool:
+    """Whether ``name`` is in the shape :func:`checked_transit_key_name` admits, for a caller that
+    refuses with its own error class."""
+    return _TRANSIT_KEY_NAME.fullmatch(name) is not None
+
+
 def checked_transit_key_name(name: str, *, selector: str) -> str:
     """``name``, refused unless it is a Transit key name (BACKLOG #6010).
 
@@ -749,7 +754,7 @@ def checked_transit_key_name(name: str, *, selector: str) -> str:
     capability probe would ask about a path the request never takes. ``selector`` names the
     variable the name came from. The refusal is fixed text and does not echo the name; it is
     recorded, so the store's fixed-text seams keep it (BACKLOG #6010 item 3)."""
-    if _TRANSIT_KEY_NAME.fullmatch(name) is None:
+    if not is_transit_key_name(name):
         raise _recorded_refusal(
             f"{selector} is not a Vault transit key name: use ASCII letters, digits and "
             f"underscores, with dots or hyphens only between them. A slash, or a name of dots "

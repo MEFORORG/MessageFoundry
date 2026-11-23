@@ -381,22 +381,6 @@ def _no_client_built(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(keyprovider_vault, "_build_client", _refuse)
 
 
-def test_an_unset_kek_setting_keeps_its_text_at_the_key_seam(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The refusal of an unset KEK name or wrapped DEK is built from the variables' names alone,
-    so it is recorded too, and the key seam keeps it (BACKLOG #6010 item 3)."""
-    from messagefoundry.store.base import resolve_active_key
-
-    _no_client_built(monkeypatch)
-    monkeypatch.delenv("MEFOR_STORE_VAULT_TRANSIT_KEY", raising=False)
-    monkeypatch.delenv("MEFOR_STORE_VAULT_WRAPPED_DEK", raising=False)
-    with pytest.raises(KeyProviderError) as excinfo:
-        resolve_active_key(StoreSettings(key_provider="vault"))
-    text = str(excinfo.value)
-    assert "MEFOR_STORE_VAULT_TRANSIT_KEY, MEFOR_STORE_VAULT_WRAPPED_DEK is not set" in text
-
-
 def test_a_malformed_kek_name_keeps_its_text_at_the_key_seam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

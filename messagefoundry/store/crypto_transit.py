@@ -94,6 +94,7 @@ from messagefoundry.store.keyprovider_vault import (
     _recorded_refusal,
     _vault_ca_kwargs,
     checked_transit_key_name,
+    is_transit_key_name,
     is_vault_bad_request,
     is_vault_forbidden,
     is_vault_timeout_reply,
@@ -1388,13 +1389,7 @@ class TransitCipher(_UnmarkedPolicy):
 
         ``key_name`` goes into the request path, so a name that is not a Transit key name raises
         :class:`CipherError` before any request (BACKLOG #6010 item 9)."""
-        try:
-            checked_transit_key_name(key_name, selector="the row seal's key name")
-        except KeyProviderError:
-            refused_name = True
-        else:
-            refused_name = False
-        if refused_name:
+        if not is_transit_key_name(key_name):
             raise CipherError(
                 "Transit row seal verify was given a key name that is not a Transit key name"
             )
