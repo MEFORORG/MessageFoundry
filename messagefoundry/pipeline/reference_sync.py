@@ -739,6 +739,10 @@ class ReferenceSyncRunner:
         # BACKLOG #5892: taken first, because the env() read below is part of what this load read.
         self._load_sequence += 1
         started = self._load_sequence
+        # A pass can still be iterating the graph a reload replaced. This load is ordered as started
+        # now, so it must read what is declared now, or the replaced source outranks the reload's
+        # own load. A name the live graph no longer declares keeps the spec the pass holds.
+        spec = next((s for s in self._specs() if s.name == spec.name), spec)
         # Resolve env() refs in the source settings against this instance's environment. A hop-policy
         # flag is refused first, while still raw, as build_check does (vault BACKLOG #2232).
         try:
@@ -779,8 +783,9 @@ class ReferenceSyncRunner:
                 f"reference set {spec.name!r}: unknown source kind {kind!r} (file, database)"
             )
         # BACKLOG #5892: held for the check and the write only. Held across the source read above, a
-        # wedged source would block a reload's load of this set. It orders loads in this process, so
-        # it cannot order a former leader's in-flight write against a new leader's on another node.
+        # wedged source would block a reload's load of this set. It orders loads in this process
+        # only: at least another engine shard's write, or a former leader's on another node, is not
+        # ordered against this one.
         async with hold_keyed_lock(self._write_locks, spec.name):
             if self._written_sequence.get(spec.name, 0) > started:
                 log.debug("reference set %r: a later-started load already wrote it", spec.name)

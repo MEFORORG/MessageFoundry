@@ -25,11 +25,11 @@ _EGRESS = EgressSettings(deny_by_default=False)
 _BOUND = 5.0  # a hang fails the test rather than the run
 
 
-def _spec(name: str) -> ReferenceSpec:
+def _spec(name: str, server: str = "db.example.test") -> ReferenceSpec:
     return ReferenceSpec(
         name=name,
         source=DatabaseRef(
-            server="db.example.test",
+            server=server,
             database="refdb",
             statement="SELECT k, v FROM t",
             key_column="k",
@@ -229,6 +229,55 @@ async def test_write_in_progress_is_not_interleaved_by_a_later_load(
         assert store.reference_view()["codes"] == {"A": "NEW"}
     finally:
         finish.set()
+        await store.close()
+
+
+async def test_pass_on_the_old_graph_does_not_outrank_a_reload_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass still iterating the old graph starts its next set after the reload's load of it, so
+    that load must read the live declaration, or the replaced source wins the ordering."""
+    old_host, new_host = "old.example.test", "new.example.test"
+    a_entered, a_release, b_entered, b_release = (asyncio.Event() for _ in range(4))
+    new_b_reads = 0
+
+    async def load(settings: Mapping[str, Any], _egress: Any, **kw: Any) -> dict[str, Any]:
+        nonlocal new_b_reads
+        server = str(settings["server"])
+        if kw["name"] == "a" and server == old_host:
+            a_entered.set()
+            await a_release.wait()
+        if kw["name"] == "b" and server == new_host:
+            new_b_reads += 1
+            if new_b_reads == 1:  # the reload's own load of b holds here
+                b_entered.set()
+                await b_release.wait()
+        return {"K": server}
+
+    monkeypatch.setattr(reference_sync, "_load_database_source", load)
+    graph = {name: _spec(name, old_host) for name in ("a", "b")}
+    current = [graph]
+    store = await MessageStore.open(tmp_path / "r.db")
+    runner = ReferenceSyncRunner(
+        store, lambda: current[0].values(), ReferenceSettings(), egress=_EGRESS
+    )
+    background = asyncio.create_task(runner.run_once())
+    forced: asyncio.Task[Any] | None = None
+    try:
+        await asyncio.wait_for(a_entered.wait(), _BOUND)
+        current[0] = {name: _spec(name, new_host) for name in ("a", "b")}
+        forced = asyncio.create_task(runner.sync_all())
+        await asyncio.wait_for(b_entered.wait(), _BOUND)
+        a_release.set()
+        await asyncio.wait_for(background, _BOUND)
+        b_release.set()
+        await asyncio.wait_for(forced, _BOUND)
+        assert store.reference_view()["a"] == {"K": new_host}
+        assert store.reference_view()["b"] == {"K": new_host}
+    finally:
+        a_release.set()
+        b_release.set()
+        await asyncio.gather(background, *([forced] if forced else []), return_exceptions=True)
         await store.close()
 
 
