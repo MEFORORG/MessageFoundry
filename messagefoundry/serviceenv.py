@@ -220,31 +220,33 @@ class ServiceEnvPosture:
     #: keeps it, since install-service.ps1 does not match it and a re-run adds an ASCII entry
     #: beside it (the Lander's hold on PR 3142, comment 7092584745).
     directory_lookalikes: tuple[str, ...] = field(default=(), repr=False)
-    #: Whether ``MEFOR_SECRETS_DIRECTORY`` is in ``listed`` only through look-alike spellings, so
-    #: the remedy does not take it as the real entry. The remedy alone reads this.
-    directory_listed_as_lookalike: bool = False
     #: Whether a line of any string in the lists sets ``MEFOR_SECRETS_DIRECTORY`` with a blank
     #: around the name (:func:`_padded_directory`), which the engine does not read. The remedy
     #: alone reads this: it says to take each such entry out (the Lander's hold on PR 3142,
     #: comment 7096232111, item 1).
     directory_padded: bool = False
     #: Whether every look-alike and padded entry in the lists is its entry's one non-blank line
-    #: and sets a value that is blank or plainly a path (:func:`_stray_value_plain`), so the
+    #: and sets a value that is blank or plainly a path (:func:`_plain_directory_value`), so the
     #: remedy may say to name that path under the ASCII spelling. False unless read, so a
     #: posture built without it offers no value (comment 7096232111, item 3).
     directory_stray_paths_plain: bool = False
-    #: Whether a look-alike line is in a list the engine receives. NSSM replaces the environment
-    #: with AppEnvironment where that holds a non-blank entry, so the Service Control Manager's
-    #: ``Environment`` then reaches no engine. The remedy alone reads this.
+    #: The same, for the look-alike entries alone, which the remedy may offer as the files' path
+    #: beside an ASCII entry it leaves. False unless read.
+    directory_lookalike_paths_plain: bool = False
+    #: Whether an item NSSM reads as named with a look-alike spelling is in a list the engine
+    #: receives. NSSM replaces the environment with AppEnvironment where that holds a non-blank
+    #: entry, so the Service Control Manager's ``Environment`` then reaches no engine. The remedy
+    #: alone reads this.
     directory_lookalike_received: bool = False
     #: Whether an ASCII spelling of ``MEFOR_SECRETS_DIRECTORY`` that :func:`_names` keeps is in a
     #: list the engine receives, read as above. The remedy alone reads this, as whether an entry
     #: names the directory (comment 7096232111, item 4).
     directory_listed_received: bool = False
-    #: Whether exactly one line spelled in ASCII sets ``MEFOR_SECRETS_DIRECTORY`` in the lists the
-    #: engine receives, and it is one :func:`_names` keeps or one kept as a joined path
-    #: (``directory_path_joined``), so the remedy may leave it as the one that names the
-    #: directory. The remedy alone reads this (comment 7096232111, item 4).
+    #: Whether exactly one item in AppEnvironmentExtra, which NSSM sets last and install-service.ps1
+    #: reads, is named ``MEFOR_SECRETS_DIRECTORY`` in ASCII, it is a line of its own, and it is one
+    #: :func:`_names` keeps or one kept as a joined path (``directory_path_joined``), so the
+    #: remedy may leave it as the one that names the directory. The remedy alone reads this
+    #: (comment 7096232111, item 4).
     directory_named_received: bool = False
 
     @property
@@ -690,8 +692,8 @@ class _Variable:
     #: The rest of its line, and every line after it up to the next variable's.
     value: str = field(repr=False)
     #: The name as written, unstripped, which :func:`_names_directory` reads, since
-    #: ``os.environ`` keeps any padding in a name.
-    raw: str = field(default="", repr=False)
+    #: ``os.environ`` keeps any padding in a name. No default, so no reader leaves it out.
+    raw: str = field(repr=False)
     #: Its line on its registry string, counted from 1, when that is not the string's first.
     line: int | None = None
     #: Whether NSSM may read the name with a line break in it.
@@ -1088,14 +1090,6 @@ def _padded_directory(line: str) -> bool:
     return bool(equals) and not _names_directory(written) and _names_directory(written.strip())
 
 
-def _stray_value_plain(line: str) -> bool:
-    """Whether the value ``line`` sets is blank or plainly a path, as :func:`_directory_entry_value`
-    judges a directory entry's value, whatever name it sets. The remedy alone reads this, to copy
-    a look-alike's or a padded entry's value under the ASCII spelling only where it is a path."""
-    value = line.partition("=")[2]
-    return _directory_entry_value(f"{_DIRECTORY_VARIABLE}={value}") is not None
-
-
 def _with_code_points(name: str) -> str:
     """``name`` with each character outside ASCII written as ``<U+XXXX>``, so the remedy names a
     look-alike exactly, and prints on any console."""
@@ -1131,14 +1125,19 @@ def _directory_entry_value(entry: str) -> str | None:
     if _LINE_BREAK.search(line):
         return None
     written, equals, value = line.partition("=")
-    if not equals or not _names_directory(written):
-        return None
-    if _still_blank(value):
-        return value  # nothing in it, so no key and no path to keep
-    path = value.strip()
-    if not _PLAIN_PATH.fullmatch(path) or _EITHER_KEY_RUN.search(path):
+    if not equals or not _names_directory(written) or not _plain_directory_value(value):
         return None
     return value
+
+
+def _plain_directory_value(value: str) -> bool:
+    """Whether ``value`` holds no key and is blank, with nothing in it to keep, or plainly a path
+    (:data:`_PLAIN_PATH`) with no key run in it (:data:`_EITHER_KEY_RUN`). The remedy alone
+    reads it."""
+    if _still_blank(value):
+        return True
+    path = value.strip()
+    return _PLAIN_PATH.fullmatch(path) is not None and _EITHER_KEY_RUN.search(path) is None
 
 
 def _kept_empty(variable: _Variable) -> bool:
@@ -1265,23 +1264,29 @@ def read_service_env_posture(
 
     kept_ascii = [v for v in kept if _names_directory(v.raw) and v.raw.isascii()]
     lines = [(where, line) for where, entry in entries for line in _LINE_BREAK.split(entry)]
-    # A look-alike or padded entry, which the remedy says to take out, and whether its value is
-    # plainly a path: only where it is its entry's one non-blank line, since a value that runs on
-    # into the lines below may hold key material (items 1 and 3).
+    # Each item as NSSM reads it, its name the text before its first equals sign (code review
+    # round 2 on comment 7096232111). A look-alike or padded item, which the remedy says to take
+    # out, has a value plainly a path only where it is its item's one non-blank line, since a
+    # value that runs on into the lines below may hold key material (items 1 and 3).
     stray_plain: list[bool] = []
-    for _where, entry in entries:
+    lookalike_plain: list[bool] = []
+    lookalike_received = False
+    # The non-blank lines of each AppEnvironmentExtra item named the directory in ASCII. NSSM
+    # sets that list last, so such an item wins over the other lists.
+    extra_ascii: list[list[str]] = []
+    for where, entry in entries:
         own = [line for line in _LINE_BREAK.split(entry) if line.strip()]
-        for line in own:
-            if _directory_lookalike(line) or _padded_directory(line):
-                stray_plain.append(len(own) == 1 and _stray_value_plain(line))
-        if _padded_directory(entry) and len(own) == 1 and not _padded_directory(own[0]):
-            # A name led by a line break, which os.environ keeps whole, as NSSM reads the item.
-            stray_plain.append(_stray_value_plain(own[0]))
-    ascii_lines_received = sum(
-        1
-        for where, line in lines
-        if reaches(where) and (name := _directory_name(line)) is not None and name.isascii()
-    )
+        plain = len(own) == 1 and _plain_directory_value(own[0].partition("=")[2])
+        lookalike = any(_directory_lookalike(line) for line in own)
+        if lookalike or _padded_directory(entry) or any(_padded_directory(line) for line in own):
+            stray_plain.append(plain)
+        if lookalike:
+            lookalike_plain.append(plain)
+        item, equals, _value = entry.partition("=")
+        if equals and _names_directory(item):
+            lookalike_received = lookalike_received or (not item.isascii() and reaches(where))
+            if item.isascii() and where == _EXTRA_LIST:
+                extra_ascii.append(own)
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
@@ -1315,21 +1320,23 @@ def read_service_env_posture(
                 name for _where, line in lines if (name := _directory_lookalike(line)) is not None
             )
         ),
-        directory_listed_as_lookalike=any(name == _DIRECTORY_VARIABLE for name, _w, _l in found)
-        and all(not v.raw.isascii() for v in kept if _names_directory(v.raw)),
         directory_padded=any(_padded_directory(line) for _where, line in lines)
         or any(_padded_directory(entry) for _where, entry in entries),
         directory_stray_paths_plain=all(stray_plain),
-        directory_lookalike_received=any(
-            reaches(where) and _directory_lookalike(line) is not None for where, line in lines
-        ),
+        directory_lookalike_paths_plain=all(lookalike_plain),
+        directory_lookalike_received=lookalike_received,
         directory_listed_received=any(reaches(v.where) for v in kept_ascii),
-        # The one ASCII line the engine receives, so no other entry, a blank one among them,
-        # can win over it (code review round 1 on comment 7096232111, item 4).
-        directory_named_received=ascii_lines_received == 1
+        # The one ASCII item in AppEnvironmentExtra, a line of its own, so no other entry, a
+        # blank one among them, can win over it, and install-service.ps1 reads it (code review
+        # rounds 1 and 2 on comment 7096232111, item 4).
+        directory_named_received=len(extra_ascii) == 1
+        and len(extra_ascii[0]) == 1
         and (
-            any(reaches(v.where) for v in kept_ascii)
-            or (directory_path_joined and any(v.keeps_directory and reaches(v.where) for v in kept))
+            any(v.where == _EXTRA_LIST for v in kept_ascii)
+            or (
+                directory_path_joined
+                and any(v.keeps_directory and v.where == _EXTRA_LIST for v in kept)
+            )
         ),
     )
 
@@ -1471,20 +1478,28 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     leave = takes_out and posture.directory_named_received
     files_path = "the path of the directory that holds the secrets directory's files"
 
+    # Where an ASCII entry is left, only a look-alike the engine receives may have been read in
+    # its place, never a padded entry, so only the look-alikes' values are judged (code review
+    # rounds 1 and 2).
+    plain = (
+        posture.directory_lookalike_paths_plain if leave else posture.directory_stray_paths_plain
+    )
+
     def target(stray: str | None) -> str:
         # A stray entry's value is offered as that path only where it is plainly one (item 3).
         if stray is None:
             return files_path
-        if posture.directory_stray_paths_plain:
+        if plain:
             return f"{files_path}, which may be the path {stray} named"
         return f"{files_path}, not the value of {stray}, which is not plainly a path"
 
-    # Where an ASCII entry the engine receives is left, only a look-alike it receives may have
-    # been read in its place, never a padded entry (code review round 1).
     def stray(where: str) -> str | None:
         if not leave:
             return f"an entry {where}"
         return f"a look-alike spelling {where}" if posture.directory_lookalike_received else None
+
+    # The ASCII entry a LEAVE step leaves: the one in the list NSSM sets last (round 2).
+    left = f"the entry spelled in ASCII in AppEnvironmentExtra that sets {_DIRECTORY_VARIABLE}"
 
     repoint = False
     steps: list[str] = []
@@ -1515,17 +1530,23 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             # fixed first (the Lander's hold on PR 3142, comment 7096232111, item 6).
             later = target(stray("a later step says to take out"))
             steps.append(
-                "Before moving anything into the secrets directory, set the entry spelled in "
-                f"ASCII that sets {_DIRECTORY_VARIABLE} to {later}"
+                f"Before moving anything into the secrets directory, set {left} to {later}"
                 if leave
-                else f"Before moving anything into the secrets directory, choose its path: {later}. "
-                f"A later step names that path under the ASCII spelling {_DIRECTORY_VARIABLE}, "
-                f"so move the files there, whatever {_DIRECTORY_VARIABLE} names now"
+                else "Before moving anything into the secrets directory, choose its path: "
+                f"{later}. A later step names that path under the ASCII spelling "
+                f"{_DIRECTORY_VARIABLE}, so move the files there, whatever {_DIRECTORY_VARIABLE} "
+                "names now"
             )
+        # Where the path was chosen above, the files go there (code review round 2).
+        into = (
+            "the secrets directory the step above chose"
+            if repoint and not leave
+            else "the secrets directory MEFOR_SECRETS_DIRECTORY names"
+        )
         parts = (
             [
-                f"Put {' and '.join(put)} in the secrets directory MEFOR_SECRETS_DIRECTORY "
-                "names, as one restricted file per setting named as its variable"
+                f"Put {' and '.join(put)} in {into}, as one restricted file per setting named as "
+                "its variable"
             ]
             if put
             else []
@@ -1654,7 +1675,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             # The one ASCII entry the engine receives names the directory, so adding one would
             # make two. The engine may be reading a look-alike's path, so the ASCII entry names
             # the path that holds the files before the look-alike goes (items 4 and 6).
-            takeout += ", and leave the entry spelled in ASCII as the one that names it, " + (
+            takeout += f", and leave {left} as the one that names it, " + (
                 "set to the path the step before the move into the secrets directory gave it"
                 if repoint
                 else f"first setting it to {target(stray('this step takes out'))}"
@@ -1724,7 +1745,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "directory is created"
             )
         steps.append(add_back)
-    if posture.directory_path_joined:
+    # Where the take-out step adds a new entry as the only one, keeping a joined one would make
+    # two (code review round 2), so the run-on step's removal stands.
+    if posture.directory_path_joined and (leave or not takes_out):
         # A path alone holds no secret, and the service may read it as its directory (fourth
         # hold, H2), so only a joined entry that is plainly a path is spared, and only when
         # every refused variable that runs on takes nothing else (sixth hold, H1).

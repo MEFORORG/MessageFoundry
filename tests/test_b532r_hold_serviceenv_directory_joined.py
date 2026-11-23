@@ -570,7 +570,7 @@ def test_a_lookalike_directory_alone_is_taken_out_not_kept(where: str) -> None:
     take it out, and the create and add-back steps print as where no entry names the directory,
     the add-back step naming the path under the ASCII spelling in AppEnvironmentExtra."""
     posture = _read_pairs([(_EXTRA, "MEFOR_VALUE_A=x"), (where, f"{_LONG_S}=C:\\d")])
-    assert posture.directory_lookalikes == (_LONG_S,) and posture.directory_listed_as_lookalike
+    assert posture.directory_lookalikes == (_LONG_S,) and not posture.directory_listed_received
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=lookalike_next(CHOSEN))) == 1
@@ -587,7 +587,7 @@ def test_a_blank_lookalike_beside_a_real_directory_entry_is_taken_out() -> None:
     since the ASCII entry names the directory, to add none."""
     posture = _read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=C:\\real", f"{_LONG_S}="])
     assert posture.directory_lookalikes == (_LONG_S,)
-    assert not posture.directory_listed_as_lookalike
+    assert posture.directory_listed_received and posture.directory_named_received
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert refusal.count(lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_LEAVE_MOVED)) == 1
@@ -719,8 +719,10 @@ def test_an_ascii_entry_the_engine_does_not_receive_is_not_left_as_the_directory
     Control Manager's Environment then reaches no engine. The remedy does not leave it as the
     one that names the directory: it chooses the path before the Put step, says how the
     directory is created, and adds the entry back to AppEnvironmentExtra. With AppEnvironment
-    blank, the control, the engine receives it, so the remedy leaves it, repointed before the
-    Put step (item 6)."""
+    blank, the control, the engine receives it, so it names the directory and no create or
+    add-back step prints; but it is not in AppEnvironmentExtra, which install-service.ps1 reads,
+    so the remedy still does not leave it, and adds one there (code review round 2). An ASCII
+    entry there, the second control, is left, repointed before the Put step (item 6)."""
     entries = [
         (_EXTRA, "MEFOR_VALUE_A=x"),
         ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\s"),
@@ -736,11 +738,17 @@ def test_an_ascii_entry_the_engine_does_not_receive_is_not_left_as_the_directory
     assert refusal.count(CREATE) == 1 and refusal.count(ADD_BACK_JOINED + ADD_BACK_CREATE) == 1
     assert REPOINT not in refusal and LOOKALIKE_LEAVE_MOVED not in refusal
     control = _read_pairs([*entries, (_PLAIN, " ")])
-    assert control.directory_named_received
+    assert control.directory_listed_received and not control.directory_named_received
     control_refusal = service_env_refusal(control)
-    assert control_refusal is not None
+    assert control_refusal is not None and CREATE not in control_refusal
+    added = lookalike_step(_LONG_S_NAMED, ending=lookalike_add(CHOSEN, remove_other=True))
+    assert control_refusal.count(added) == 1 and control_refusal.count(CHOOSE) == 1
+    in_extra = _read_pairs([*entries[:1], (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\s"), entries[2]])
+    assert in_extra.directory_named_received
+    left = service_env_refusal(in_extra)
+    assert left is not None
     leave = lookalike_step(_LONG_S_NAMED, ending=LOOKALIKE_LEAVE_MOVED)
-    assert control_refusal.count(leave) == 1 and control_refusal.count(REPOINT) == 1
+    assert left.count(leave) == 1 and left.count(REPOINT) == 1
 
 
 def test_review_round_one_shapes_leave_the_engine_on_one_received_directory() -> None:
@@ -789,6 +797,55 @@ def test_review_round_one_shapes_leave_the_engine_on_one_received_directory() ->
     assert padded.count(repoint(None)) == 1 and "which may be the path" not in padded
     runs_on = _read(["MEFOR_VALUE_A=x", f"{_LONG_S}=C:\\d\n{_KEY_B64}"])
     assert not runs_on.directory_stray_paths_plain
+
+
+def test_review_round_two_shapes_read_each_item_as_nssm_reads_it() -> None:
+    """Code review round 2 on comment 7096232111. A blank-line-led item is padded, so it does not
+    count as a second ASCII entry against LEAVE. An ASCII item holding more lines is not left,
+    since its value carries them. A padded value that is no path does not make a look-alike's
+    path unplain beside a left entry; a padded name and value on separate lines are not plain.
+    Where the path is chosen before the move, the Put step says to put the files there. Where
+    the take-out step adds a new entry as the only one, no step keeps a joined one."""
+    blank_led = _read(
+        ["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=C:\\real", "\nMEFOR_SECRETS_DIRECTORY=C:\\pad"]
+    )
+    assert blank_led.directory_named_received and blank_led.directory_padded
+    more = _read(
+        ["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=C:\\real\nOTHER=1", f"{_LONG_S}=C:\\d"]
+    )
+    assert not more.directory_named_received
+    mixed = _read(
+        [
+            f"{KEY_CLASS_NAMES[0]}={_KEY_B64}",
+            "MEFOR_SECRETS_DIRECTORY=C:\\real",
+            f"{_LONG_S}=C:\\d",
+            " MEFOR_SECRETS_DIRECTORY=Summer!",
+        ]
+    )
+    assert not mixed.directory_stray_paths_plain and mixed.directory_lookalike_paths_plain
+    mixed_refusal = service_env_refusal(mixed)
+    assert mixed_refusal is not None
+    assert (
+        mixed_refusal.count(lookalike_step(_LONG_S_NAMED, padded=True, ending=LOOKALIKE_LEAVE)) == 1
+    )
+    assert not _read(
+        ["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY\n=Summer!"]
+    ).directory_stray_paths_plain
+    chosen = service_env_refusal(_read(["MEFOR_VALUE_A=x", f"{_LONG_S}=C:\\d"]))
+    assert chosen is not None
+    assert "Put each MEFOR_VALUE_* variable in the secrets directory the step above chose" in chosen
+    two = _read_pairs(
+        [
+            (_EXTRA, f"{KEY_CLASS_NAMES[0]}="),
+            (_EXTRA, "mefor_secrets_directory=C:\\a"),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\b"),
+            (_PLAIN, f"{_LONG_S}=C:\\d"),
+        ]
+    )
+    assert two.directory_path_joined and not two.directory_named_received
+    joined = service_env_refusal(two)
+    assert joined is not None and KEEP_ASCII not in joined and "Keep any" not in joined
+    assert lookalike_add(remove_other=True) in joined
 
 
 def test_a_padded_entry_beside_a_lookalike_is_not_left_as_the_directory() -> None:
