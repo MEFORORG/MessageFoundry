@@ -566,7 +566,7 @@ SITES: dict[str, Site] = {
         1, REVIEWED, "The guard itself: it resolves the candidate to check its parent."
     ),
     "messagefoundry/config/codeset_edit.py::rename_code_set": Site(
-        1,
+        2,
         GUARDED,
         _CODESET_NAME,
         "messagefoundry/config/codeset_edit.py::_validate_name",
