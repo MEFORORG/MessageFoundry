@@ -484,14 +484,16 @@ class _Shape(NamedTuple):
     fixed text the line ends with, found from its last ``anchor``. A line whose end is not ``tail``
     loses everything after its head. ``whole`` is for a line with more than one value: it stays as
     it is where it matches whole and :func:`_kept` keeps each group, and otherwise loses everything
-    after its head. No pattern here can backtrack over the peer's text, so a long value costs one
-    pass, on whatever thread logged it."""
+    after its head. ``warning`` is the pattern of the ``UserWarning`` pydicom raises beside the line,
+    with the same value in it. No pattern here can backtrack over the peer's text, so a long value
+    costs one pass, on whatever thread logged it."""
 
     head: re.Pattern[str]
     anchor: str | None = None
     tail: re.Pattern[str] | None = None
     anywhere: bool = False
     whole: re.Pattern[str] | None = None
+    warning: str | None = None
 
 
 #: The lines, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or flags
@@ -531,23 +533,32 @@ _REFUSALS: tuple[_Shape, ...] = (
         ". Please see <",
         re.compile(r"\. Please see <[^<>\n]*> for allowed values for each VR\."),
         anywhere=True,
+        warning=r".*Invalid value for VR [A-Z]{2}: ",  # not first where a length message leads it
     ),
     # pydicom's Specific Character Set lines. The first names the value twice, its second copy
     # patched from the first, so nothing after the head is fixed text.
-    _Shape(re.compile(r"Incorrect value for Specific Character Set '"), anywhere=True),
+    _Shape(
+        re.compile(r"Incorrect value for Specific Character Set '"),
+        anywhere=True,
+        warning=r"Incorrect value for Specific Character Set '",
+    ),
     _Shape(
         re.compile(r"Unknown encoding '"),
         "' - using default encoding instead",
         re.compile(r"' - using default encoding instead"),
         anywhere=True,
+        warning=r"Unknown encoding '",
     ),
     _Shape(
         re.compile(
             r"Value '[^']*' for Specific Character Set does not allow code extensions, ignoring: "
         ),
         anywhere=True,
+        warning=r"Value '[^']*' for Specific Character Set does not allow code extensions, ",
     ),
-    # A DS or IS value, with the note pydicom adds to it when it raises rather than warns.
+    # A DS or IS value, with the note pydicom adds to it when it raises rather than warns. Its
+    # warning is matched from the start of the text: with a leading ``.*``, this pattern, the first
+    # filter every UserWarning meets, would be quadratic on a value of repeated ``Value "``.
     _Shape(
         re.compile(r'Value "'),
         '" is not valid for elements with a VR of ',
@@ -556,6 +567,7 @@ _REFUSALS: tuple[_Shape, ...] = (
             r"(?:\nSet reading_validation_mode to WARN or IGNORE to bypass)?"
         ),
         anywhere=True,
+        warning=r'Value "(?s:.*)" is not valid for elements with a VR of ',
     ),
 )
 _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
@@ -622,6 +634,8 @@ def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
         head = shape.head.search(text) if shape.anywhere else shape.head.match(text)
         if head is not None and (found is None or head.start() < found[1].start()):
             found = (shape, head)
+            if head.start() == 0:  # no later shape can start ahead of it
+                break
     if found is None:
         return None
     shape, head = found
@@ -629,7 +643,6 @@ def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
         line = shape.whole.fullmatch(text)
         if line is not None and all(_kept("", value) for value in line.groups() if value):
             return None
-        return f"{text[: head.end()]}{_REDACTED}"
     rest = text[head.end() :]
     label = head.groupdict().get("label")
     if label is not None and _kept(label, rest):
@@ -670,13 +683,13 @@ _SHAPES_BY_LOGGER: dict[str, tuple[_Shape, ...]] = {
 #: The start of each ``UserWarning`` pydicom's ``warn_and_log`` raises beside a log line above, with
 #: the same value in it. Each is ignored; the log line, redacted, still says what was wrong.
 #: Unignored, it goes to stderr, which the Windows service writes to a file.
-_PYDICOM_VALUE_WARNINGS = (
-    r".*Invalid value for VR [A-Z]{2}: ",
-    r".*Incorrect value for Specific Character Set '",
-    r".*Unknown encoding '",
-    r".*Value '[^']*' for Specific Character Set does not allow code extensions, ignoring: ",
-    r'.*Value ".*" is not valid for elements with a VR of ',
-)
+_PYDICOM_VALUE_WARNINGS = tuple(shape.warning for shape in _REFUSALS if shape.warning is not None)
+
+#: Those patterns as ``warnings.filterwarnings`` leaves them at the front of ``warnings.filters``.
+_PYDICOM_WARNING_FILTERS = [
+    ("ignore", re.compile(message, re.IGNORECASE), UserWarning, None, 0)
+    for message in reversed(_PYDICOM_VALUE_WARNINGS)
+]
 
 #: ``held`` is a list only inside :func:`_logs_held` on this thread, and every record the filter
 #: sees on the thread then goes into it instead of the log.
@@ -732,10 +745,11 @@ def _uid_names() -> frozenset[str]:
 
 
 class _PeerValueFilter(logging.Filter):
-    """Redact a refused or flagged peer value from the lines :data:`_PEER_VALUE_LINES` names, and
-    hold every line inside :func:`_logs_held`. The line itself is kept, so the warning, its element
-    and its reason are still in the log; only the value goes. A filter on a logger sees only what is
-    logged on that logger itself, so it is added to each by name."""
+    """Redact a refused or flagged peer value from the lines :data:`_PEER_VALUE_LINES` and
+    :data:`_REFUSALS` name, render a codec error without its byte, and hold every line inside
+    :func:`_logs_held`. The line itself is kept, so the warning, its element and its reason are still
+    in the log; only the value goes. A filter on a logger sees only what is logged on that logger
+    itself, so it is added to each by name."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         held: list[logging.LogRecord] | None = getattr(_PRE_READ, "held", None)
@@ -836,6 +850,17 @@ def _redact_flagged_peer_values() -> None:
     idempotent."""
     for name in _FILTERED_LOGGERS:
         logging.getLogger(name).addFilter(_PEER_VALUE_FILTER)
+    _ignore_pydicom_value_warnings()
+
+
+def _ignore_pydicom_value_warnings() -> None:
+    """Put the ignores for pydicom's warning copies first in ``warnings.filters``, unless they are.
+
+    The check keeps this cheap enough for the SCU to run per association, and it matters beyond the
+    cost: each ``filterwarnings`` call resets every module's once-per-location record, so installing
+    them per send would repeat any other library's warning on stderr once per message."""
+    if list(warnings.filters[: len(_PYDICOM_WARNING_FILTERS)]) == _PYDICOM_WARNING_FILTERS:
+        return
     for message in _PYDICOM_VALUE_WARNINGS:
         warnings.filterwarnings("ignore", message=message, category=UserWarning)
 
@@ -2956,7 +2981,7 @@ class DicomScuDestination(DestinationConnector):
     def _build_ae(self) -> Any:
         from pynetdicom import AE
 
-        _redact_flagged_peer_values()  # the SCP's start does this too, and this host may have none
+        _ignore_pydicom_value_warnings()  # the SCP's start does this too; this host may have none
         ae = AE(ae_title=self._calling_ae_title)
         ae.acse_timeout = self._timeout
         ae.dimse_timeout = self._timeout

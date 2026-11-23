@@ -20,6 +20,7 @@ import contextlib
 import functools
 import io
 import logging
+import re
 import socket
 import struct
 import threading
@@ -1392,6 +1393,42 @@ def test_the_scu_puts_the_warnings_filter_back_on_a_host_that_reset_it() -> None
         _scu(1)._build_ae()
         dicom_module._read_command_set(_planted_command())
     assert not [w for w in caught if _PLANTED in str(w.message)]
+
+
+def test_the_warnings_filters_are_not_reinstalled_while_they_are_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each filterwarnings call resets every module's once-per-location record, so a reinstall per
+    # send would repeat any other library's warning on stderr once per message.
+    calls: list[str] = []
+    original = warnings.filterwarnings
+
+    def counted(*args: Any, **kwargs: Any) -> None:
+        calls.append(str(kwargs.get("message")))
+        original(*args, **kwargs)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        monkeypatch.setattr(warnings, "filterwarnings", counted)
+        dicom_module._ignore_pydicom_value_warnings()
+        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)  # CONTROL: it installs them
+        calls.clear()
+        dicom_module._ignore_pydicom_value_warnings()
+        assert calls == []
+        warnings.simplefilter("always")  # now ahead of them, so they must go back in front
+        dicom_module._ignore_pydicom_value_warnings()
+        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)
+        monkeypatch.undo()
+
+
+def test_the_ds_warning_filter_costs_one_pass_on_a_crafted_value() -> None:
+    # A UID of repeated `Value "`, under the 64 KiB command set cap: every UserWarning meets this
+    # filter first, and a leading `.*` here took over a second on it.
+    crafted = "Invalid value for VR UI: '" + 'Value "' * 9000
+    started = time.monotonic()
+    for pattern in dicom_module._PYDICOM_VALUE_WARNINGS:
+        re.compile(pattern, re.IGNORECASE).match(crafted)
+    assert time.monotonic() - started < 0.5
 
 
 async def test_the_scus_delivery_error_names_no_refused_value(
