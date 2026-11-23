@@ -20,10 +20,12 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+import harness.fuzz.campaign as fuzz_campaign
 import harness.fuzz.cli as fuzz_cli
 from harness import drivers
 from harness.__main__ import main
@@ -752,6 +754,27 @@ def test_an_ack_echoing_another_case_of_the_batch_keeps_that_ids_floor(tmp_path:
     ]
 
 
+def test_an_ack_echoing_a_refused_earlier_cases_id_is_presence_only(tmp_path: Path) -> None:
+    """That id was not re-read for this case and a NAK raises no floor, so the NAK's row can
+    satisfy the ACK. The check still runs, and does not claim a new row was proved."""
+    transport = _ScriptedTransport(
+        [("AR", ("FIRST",), ("FIRST",)), ("AA", ("FIRST",), ("SURPLUS",))]
+    )
+    result = _replay_script(tmp_path, [_hl7("FIRST"), _hl7("SECOND")], transport)
+    assert result.ok
+    assert (result.stored_checked, result.stored_presence_only) == (0, 1)
+
+
+def test_a_sibling_frame_acked_under_another_id_leaves_its_id_presence_only(
+    tmp_path: Path,
+) -> None:
+    """Frame 1 of a doubled X is ACKed as OLD but stores X, so that row can satisfy frame 2's AA."""
+    transport = _ScriptedTransport([("AA", ("OLD", "X"), ("X", "SURPLUS"))], rows=("OLD",))
+    result = _replay_script(tmp_path, [_hl7("X") * 2], transport)
+    assert result.ok
+    assert (result.stored_checked, result.stored_presence_only) == (0, 2)
+
+
 @pytest.mark.parametrize("codes", [("AR", "AA"), ("AA", "AR")])
 def test_a_positive_ack_beside_a_nak_of_its_id_in_one_case_is_presence_only(
     tmp_path: Path, codes: tuple[str, str]
@@ -786,16 +809,26 @@ class _IdReadClient(_FakeClient):
         return super().list_messages(control_id=control_id, limit=limit)
 
 
-def test_a_pre_send_read_that_outlasts_the_budget_sends_nothing(tmp_path: Path) -> None:
-    transport, _, config = _offline(tmp_path, seed=3, iterations=1, batch=1, seconds=0.2)
-    client = _IdReadClient(transport, lambda n: time.sleep(0.3) if n == 2 else None)
+def test_a_pre_send_read_that_outlasts_the_budget_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(fuzz_campaign, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def past_the_budget_on_the_re_read(reads: int) -> None:
+        if reads == 2:
+            clock[0] = 2.0
+
+    transport, _, config = _offline(tmp_path, seed=3, iterations=1, batch=1, seconds=1.0)
+    client = _IdReadClient(transport, past_the_budget_on_the_re_read)
     result = run(cast(EngineClient, client), transport, config, emit=lambda _: None)
     assert client.id_reads == 2 and transport.sent == [] and result.cases == 0
 
 
 def test_a_fault_on_a_pre_send_read_does_not_name_the_unsent_case(tmp_path: Path) -> None:
     def fail_on_the_second_re_read(reads: int) -> None:
-        if reads == 4:  # two batch reads, then one re-read per case
+        # Reads 1-2 are the batch's, 3 is case 0's re-read, 4 its check, 5 case 1's re-read.
+        if reads == 5:
             raise ApiError("server error", status=503)
 
     transport = _EchoTransport()
@@ -805,9 +838,11 @@ def test_a_fault_on_a_pre_send_read_does_not_name_the_unsent_case(tmp_path: Path
     for path, data in zip(paths, session_cases, strict=True):
         path.write_bytes(data)
     config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3)
-    result = replay(cast(EngineClient, client), transport, paths, config, emit=lambda _: None)
+    lines: list[str] = []
+    result = replay(cast(EngineClient, client), transport, paths, config, emit=lines.append)
     assert transport.sent == [session_cases[0]] and result.cases == 1
     assert [f.case for f in result.failures] == [None]
+    assert any("iterations=0-0 (batch-level)" in line for line in lines)
 
 
 class _BlankEchoTransport(_EchoTransport):

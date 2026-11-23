@@ -90,9 +90,9 @@ class CampaignResult:
     #: Positive acknowledgements matched to a new stored row against a pre-send count. Zero means
     #: the per-message store invariant never proved a new row, which proves nothing.
     stored_checked: int = 0
-    #: Positive acknowledgements echoing an id with no pre-send count, or one a NAKed frame of the
-    #: same case also carried. Their check runs, but a row that is not theirs can satisfy it, so
-    #: they do not count toward :attr:`stored_checked`.
+    #: Positive acknowledgements echoing an id this case did not re-read just before sending, or
+    #: one another frame of the case carried without a matching ACK. Their check runs, but a row
+    #: that is not theirs can satisfy it, so they do not count toward :attr:`stored_checked`.
     stored_presence_only: int = 0
     failures: list[Failure] = field(default_factory=list)
     #: What a result must have checked to pass: a stored row for a campaign; for a replay, only a
@@ -109,8 +109,8 @@ class CampaignResult:
             if self.stored_presence_only:
                 return (
                     f"no positive acknowledgement was matched to a new stored row: "
-                    f"{self.stored_presence_only} echoed a control id with no pre-send count or "
-                    "one a NAKed frame shared, which a row not their own can satisfy"
+                    f"{self.stored_presence_only} echoed a control id with no pre-send count for "
+                    "their case, or one a sibling frame shared, which a row not theirs can satisfy"
                 )
             return (
                 "no positive acknowledgement was matched to a stored row, so the per-message "
@@ -226,21 +226,20 @@ class _Session:
             # can echo the id of ANOTHER case of the batch, which that case's re-read won't cover.
             predicted = {cid for c in cases for f in frames(c.data) if (cid := control_id_of(f))}
             before = {cid: rows_for(self.client, cid) for cid in predicted if queryable(cid)}
-            baselined = frozenset(before)
             for case in cases:
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 # Read again just before this case goes out: the batch's count would let an
                 # earlier case's row, a NAK's included, satisfy this case's positive ACK (BACKLOG
-                # #5567). Never lowered, and read before the case joins ``sent``, so a fault here
-                # does not report an unsent case as a suspect.
-                for cid in {c for f in frames(case.data) if (c := control_id_of(f))} & baselined:
-                    before[cid] = max(before[cid], rows_for(self.client, cid))
+                # #5567). Read before the case joins ``sent``, so a fault here does not report an
+                # unsent case as a suspect.
+                own = {c for f in frames(case.data) if (c := control_id_of(f))} & before.keys()
+                before.update({cid: rows_for(self.client, cid) for cid in own})
                 # Again, because that read can wait out a rate limit past the budget.
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 sent.append(case)
-                count, problems = self._one(case, before, baselined)
+                count, problems = self._one(case, before, own)
                 acknowledgements += count
                 failures.extend((reason, case) for reason in problems)
             total = store_total(self.client)
@@ -267,9 +266,7 @@ class _Session:
             self._fail(reason, culprit, sent)
         return len(sent), not failures
 
-    def _one(
-        self, case: Case, before: dict[str, int], baselined: frozenset[str]
-    ) -> tuple[int, list[str]]:
+    def _one(self, case: Case, before: dict[str, int], reread: set[str]) -> tuple[int, list[str]]:
         """Send one case; return its acknowledgement count and its broken invariants."""
         self.result.cases += 1
         self.result.layers[case.layer] += 1
@@ -283,14 +280,15 @@ class _Session:
         if not verdict.acks:
             self.result.replies["closed"] += 1
         problems: list[str] = []
-        # A NAKed frame of this case may or may not have stored a row under its id, and no read can
-        # fall between two frames of one send, so a positive ACK of that id proves presence only.
-        nak_ids = {
-            cid
-            for ack, payload in zip(verdict.acks, sent_frames, strict=True)
-            if not ack.positive
-            for cid in (ack.control_id, control_id_of(payload))
-        }
+        # A frame whose ACK did not match its id may still have stored a row under that id, and no
+        # read can fall between two frames of one send, so an ACK of that id proves presence only.
+        shared: set[str | None] = set()
+        for ack, payload in zip(verdict.acks, sent_frames, strict=True):
+            carried = control_id_of(payload)
+            if not ack.positive:
+                shared |= {ack.control_id, carried}
+            elif carried is not None and carried.rstrip() != ack.control_id:
+                shared.add(carried)
         # judge held the count to one acknowledgement per frame, answered in the order sent.
         for ack, payload in zip(verdict.acks, sent_frames, strict=True):
             if not ack.positive:
@@ -310,12 +308,12 @@ class _Session:
             if problem:
                 problems.append(problem)
             else:
-                if stored[0] in baselined and stored[0] not in nak_ids:
+                if stored[0] in reread and stored[0] not in shared:
                     self.result.stored_checked += 1
                 else:
                     self.result.stored_presence_only += 1
                 # A second frame of this case owes a row of its own rather than reusing this one.
-                # A later case needs no increment: its re-read already holds this row.
+                # A later case carrying this id re-reads it; one that only echoes it needs this.
                 before[stored[0]] = stored[1] + 1
         return len(verdict.acks), problems
 
