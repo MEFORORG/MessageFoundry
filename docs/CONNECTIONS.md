@@ -1131,9 +1131,13 @@ safe label; for such a server use `move` or `delete`, or have the partner write 
 name. Even where a time is listed, a same-size replacement within its resolution (whole seconds for SFTP
 and many `MLSD` servers) is not re-ingested, and nothing logs it. In the other direction, a remote file
 whose listed time moves with its bytes unchanged is ingested again, a duplicate. The ledger is bounded
-by an age + count prune. In `leave` mode the `.processed`/`.error` subdirs are created best-effort (a read-only share doesn't fail start),
-so a malformed file on a truly read-only share that can't be moved to `.error` re-logs each poll — fix it
-at the source.
+by an age + count prune. In `leave` mode a read-only share does not fail start. The `File(...)` source
+creates the `.processed`/`.error` subdirs best-effort at start, and a malformed file that can't be moved
+to `.error` is read and logged again on later scans. An `Sftp(...)`/`Ftp(...)` poll in `leave` mode asks
+for no directory until a reject needs `.error`, and then best-effort (BACKLOG #5750). A reject it cannot
+move stays in place and logged, and is remembered rather than read on every poll; the rule and its
+exceptions are under *Files left for a retry do not spend the budget*. Either way, fix such a file at the
+source.
 
 #### File handling & quarantine policy (ASVS 5.1.1)
 
@@ -1609,9 +1613,9 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `tls_ca_pin` | both | — | **`Ftp` only, FTPS** (vault BACKLOG #2371) — the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
 | `poll_seconds` | in | `5.0` | poll interval, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774). It is also the **settle window**: a file is read only once it lists at the same size, and the same modification time where the server lists one, as at the last poll that saw it (BACKLOG #2071, #2758), so every file waits at least one poll. The gate is always on and has no setting. On a server that lists no modification time (at least FTP without `MLSD`, an `MLSD` server without `modify`, and an SFTP server that omits the times) it reads the listed size alone, so there it cannot see a same-size rewrite, nor anything on a server that lists every file at size 0. |
-| `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it. Only `File(...)` implements it; the settle gate on `poll_seconds` above, and the partner's own write-then-rename, are what guard against partial reads here. |
+| `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it. Only `File(...)` implements it; the settle gate on `poll_seconds` above, the size check below, and the partner's own write-then-rename, are what guard against partial reads here. **Size check (BACKLOG #5750):** where the listing gave a size, a retrieved body of another length is not handed off that poll. It stays in place, logged, unrecorded and not quarantined, and settles again. If a later read returns that same length while the listing has not changed, the listed size is treated as unreliable and the file goes on, so a steady disagreement costs a second download rather than holding the file for good. At least one case is not covered: a server whose `SIZE` or `stat` repeats the wrong listed size during the retrieve makes the transfer's own change check fire on every read, so that file is never released, and it is read again on every poll, logged each time and not charged to `poll_max_files`. Each held read on the poll's main pass counts against `poll_max_files`, a hold on a retry pass does not, and a file held twice at different lengths is not read again for `STUCK_TRANSIENT_RETRY_SECONDS` unless its listing changes. The second read cannot tell an unreliable listing from a transfer that ends early at the same byte twice on a server that also refuses `SIZE` or `stat` during the retrieve. A listing with no size (at least FTP `NLST` where `SIZE` is refused, `MLSD` without a `size` fact, and an SFTP server that omits it) is not checked, and neither is a rewrite that keeps the listed length. |
 | `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size + the listed modification time where the server gives one ensures a left file is ingested once; see *Process-in-place* for what a server that lists no modification time misses) |
-| `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
+| `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal moves the file to `error_subdir` and logs it — never a silent drop. If that move fails, the file stays and is logged; *Files left for a retry do not spend the budget* says when it is pulled again. `None`/`0` = unlimited, in both charges, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `poll_max_files` | in | `500` | most files one poll will take. The rest stay on the share and the next poll takes them — a **deferral, not a drop**. Identical in shape and reasoning to the `File(...)` row; see [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. The probe is a **listing** — it never creates. **Out:** the upload dir is then never `ensure_dir`ed either, on send or by `POST /connections/{name}/test`. Instead every send first **lists** `remote_dir`, so the account needs list permission there even with `overwrite = true`, at one extra round trip per delivery. An upload into a vanished dir then fails **retryably** rather than dead-lettering on the partner's permanent no-such-dir; a credential refusal on that listing stops the lane. Left off (the default) the upload dir is still created on first send, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go. A `processed_subdir` that is empty, or whose spelling names `remote_dir` itself or a directory above it (at least `.`, `..`, `a/..`), is refused at build (BACKLOG #5682); the check reads the path's spelling only, so another name for the same directory is not caught. `error_subdir` is not checked at build. |
@@ -5117,8 +5121,21 @@ ceiling's log line does not count. A due retry is judged afresh, so a file that 
 passes is ingested. At least a restart of the connection and a full memory leave such a file read
 and charged again. When a retry falls due is the back-off rule
 stated once at `STUCK_RETRY_SECONDS` in
-[`transports/file.py`](../messagefoundry/transports/file.py). Under `leave`, and on
-`Sftp(...)`/`Ftp(...)`, the gap stands as described.
+[`transports/file.py`](../messagefoundry/transports/file.py). Under `leave` on `File(...)`, the gap
+stands as described. On `Sftp(...)`/`Ftp(...)`, in every `after_read` mode (BACKLOG #5750), a similar
+memory narrows it: such a file is skipped unread and uncharged until its listed size or modification
+time changes or its retry falls due, and the same two exceptions apply. Its retries also run in a
+separate pass after the poll's other files, earliest due first, those past the ceiling's break
+included. Before each retry the directory is listed again only if a retrieve has begun since the last
+listing, on the main pass or in an earlier retry; a poll with no retrieve since its listing does not
+list again. A listing that has only aged with elapsed time (a slow ledger read, a quarantine move,
+a store call) is not taken again. It differs from `File(...)` in at least two ways. The first wait is
+`STUCK_TRANSIENT_RETRY_SECONDS` and each later one `STUCK_RETRY_SECONDS`, whatever the failure, because
+a remote failure does not say reliably whether it will clear; only a retry that passes every gate and
+then fails its hand-off takes the short wait again. And one poll examines at most a tenth of
+`poll_max_files` of them (at least one, at most `STUCK_RETRIES_PER_SCAN_MAX`), so when more are due than
+that, a retry waits past its back-off for its turn. A replacement listing the same size and time is
+seen only by the retry.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it
