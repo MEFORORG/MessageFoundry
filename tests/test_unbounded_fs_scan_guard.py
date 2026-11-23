@@ -917,10 +917,12 @@ def test_a_walk_in_nested_sites_is_read_in_one_pass(command: str) -> None:
     assert_denied(run_guard(bash(command)))
 
 
-# WHERE ARITHMETIC AND A SUBSHELL WOULD CONSUME THE TEXT DIFFERENTLY, the view ends and the raw
-# command is scanned instead, which can only add denies. One row per trigger, each in a site that
-# is still undecided: a comment, a heredoc opener whose line ends inside the site, `$'...'`, `$[`,
-# a nested frame opened inside `${...}`, and a backtick in a `((` inside a backtick substitution.
+# WHERE ARITHMETIC AND A SUBSHELL WOULD CONSUME THE TEXT DIFFERENTLY, the view reads the site as a
+# subshell, and the raw command is scanned beside it. One row per trigger, each in a site that is
+# still undecided: a comment, a heredoc opener whose line ends inside the site, `$'...'`, `$[`, a
+# nested frame opened inside `${...}`, and a backtick in a `((` inside a backtick substitution.
+# The last three were allowed by an earlier cut that scanned the raw command alone, which splits
+# the walk's quoted pattern at its separator, or that left a dropped heredoc opener visible.
 FALLBACK_DENY = [
     pytest.param('echo "$(( a #b ))$((find /proc) )"', id="comment-in-a-site"),
     pytest.param(
@@ -933,6 +935,17 @@ FALLBACK_DENY = [
     ),
     pytest.param(
         'echo "`(( `echo 1` ))`"; echo "$((find /proc) )"', id="backtick-in-a-site-in-backticks"
+    ),
+    pytest.param(
+        "echo \\\" $((echo # c\n) ); grep -r 'a;b' /proc", id="quoted-separator-after-a-comment"
+    ),
+    pytest.param(
+        'echo \\" $((cd x\necho "y") ); grep -r \'a;b\' /proc',
+        id="quoted-separator-after-a-frame-on-a-later-line",
+    ),
+    pytest.param(
+        'echo "q" $((true) ) $(( $((cat <<X) ) + 1 ))\nfind /proc\nX',
+        id="heredoc-in-a-subshell-in-arithmetic",
     ),
 ]
 
@@ -1107,7 +1120,12 @@ def _corpus() -> list[str]:
 _ATOMS = [
     "$((", "((", ") )", "))", ")", "(", '"', "'", "\\", "<<X", " <<X ", "\nX\n", "#", " # ",
     "${", "}", "$[", "]", "\n", " find /proc", "; find /proc", "$(", "`", " ", "a", ";", "$'",
-    "1", " << ", "<<", "$", "|", "&&",
+    "1", " << ", "<<", "$", "|", "&&", '\\"', "$((cat <<X) )", "$((echo # c\n) )",
+]  # fmt: skip
+# Walks whose own operands hold a separator in quotes, which only a quote-aware view keeps whole.
+_WALKS = [
+    " find /proc", "; find /proc", "; grep -r 'a;b' /proc", "; grep -rn 'f(x)' /proc",
+    "; find 'a;b' /proc -name x", "; grep -rE 'p|q' /",
 ]  # fmt: skip
 _WRAPPERS = [
     ("$((", ") )"), ("$((", "))"), ("((", "))"), ("((", ") )"), ("$(", ")"), ('"$(', ')"'),
@@ -1127,9 +1145,13 @@ def _generated_commands(count: int = 2400, seed: int = 5607) -> list[str]:
             for _ in range(depth):
                 left, right = rng.choice(_WRAPPERS)
                 pad = rng.choice(["", " ", "a ", " find /proc ", "'x' ", '"y" '])
-                body = left + pad + body + rng.choice(["", " ", "; find /proc"]) + right
-        lead = rng.choice(['echo "', "echo '", 'x="a"; ', "", 'echo "$(', "echo 'a'; "])
-        tail = rng.choice(['"', "'", ')"', "", '; echo "$((find /proc) )"', "\nfind /proc"])
+                body = left + pad + body + rng.choice(["", " ", rng.choice(_WALKS)]) + right
+        lead = rng.choice(
+            ['echo "', "echo '", 'x="a"; ', "", 'echo "$(', "echo 'a'; ", 'echo \\" ']
+        )
+        tail = rng.choice(
+            ['"', "'", ')"', "", '; echo "$((find /proc) )"', "\n" + rng.choice(_WALKS)]
+        )
         command = lead + body + tail
         if "find" not in command:
             command += " find /proc"
@@ -1163,6 +1185,8 @@ def test_every_command_origin_main_denies_is_still_denied(tmp_path: Path, chunk:
     scripts.write_text(json.dumps([str(base), str(GUARD)]), encoding="utf-8")
     old, new = _run_driver(tmp_path, _VERDICT_DRIVER, str(scripts), str(commands))[-2:]
     assert len(old) == len(new) == len(corpus)
+    # The floor: a run in which both copies failed open would compare nothing.
+    assert old.count("1") > len(corpus) // 4, f"origin/main denied only {old.count('1')} commands"
     lost = [corpus[i] for i in range(len(corpus)) if old[i] == "1" and new[i] == "0"]
     assert lost == [], f"{len(lost)} commands origin/main denies are now allowed: {lost[:10]}"
 
@@ -1201,7 +1225,7 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_CONTROL_ALLOW": 2,
     "REFINED_FALSE_DENY_ALLOW": 14,
     "ONE_PASS_DENY": 5,
-    "FALLBACK_DENY": 6,
+    "FALLBACK_DENY": 9,
     "FALLBACK_FIRES_DENY": 2,
     "FALLBACK_CONTROL_ALLOW": 6,
 }
