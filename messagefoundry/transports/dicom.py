@@ -653,9 +653,10 @@ def _screened_line(text: str) -> str | None:
     return None
 
 
-def _screened_traceback(info: tuple[type[BaseException], BaseException, Any]) -> str | None:
-    """The traceback of ``info`` with each exception's message screened by :func:`_screened_line`,
-    or ``None`` where every message stays as it is and the stock formatter can write it.
+def _screened_traceback(info: tuple[type[BaseException], BaseException, Any]) -> str:
+    """The traceback of ``info``, rendered now, with each exception's message screened by
+    :func:`_screened_line`. Rendered even where every message stays, since a formatter that renders
+    the live exception later would write a note or a ``__str__`` this never read.
 
     Each message is replaced on the ``TracebackException`` node the formatter prints it from, so no
     search of the rendered text can miss a copy. A class name and the frames stay, since those are
@@ -663,7 +664,6 @@ def _screened_traceback(info: tuple[type[BaseException], BaseException, Any]) ->
     is refused, since the stdlib prints its source text from other fields. Any failure here raises,
     and the caller withholds the traceback."""
     root = traceback.TracebackException(*info, compact=True)
-    changed = False
     pending = [root]
     seen: set[int] = set()
     while pending:
@@ -681,11 +681,9 @@ def _screened_traceback(info: tuple[type[BaseException], BaseException, Any]) ->
             screened = f"{screened} {_PARTS_WITHHELD}"
             node.__notes__ = None
             node.exceptions = None
-        if screened != message:
-            node._str = screened  # type: ignore[attr-defined]
-            changed = True
+        node._str = screened  # type: ignore[attr-defined]
         pending += [link for link in (node.__cause__, node.__context__) if link is not None]
-    return "".join(root.format()).removesuffix("\n") if changed else None
+    return "".join(root.format()).removesuffix("\n")
 
 
 def _screen_record(record: logging.LogRecord) -> None:
@@ -713,16 +711,11 @@ def _screen_record(record: logging.LogRecord) -> None:
         record.exc_info = None if not isinstance(info, tuple) else info
         return
     try:
-        rendered = _screened_traceback((type(exc), exc, exc.__traceback__))
+        record.exc_text = _screened_traceback((type(exc), exc, exc.__traceback__))
     except Exception as failed:  # noqa: BLE001 - rendering a third-party exception
-        record.exc_info = None
         record.exc_text = f"{type(exc).__name__} (traceback withheld: it did not render)"
         logger.debug("A DICOM traceback was withheld: %s", type(failed).__name__)
-        return
-    # Cleared when nothing changed too: a formatter prefers exc_text, which has not been read.
-    record.exc_text = rendered
-    if rendered is not None:
-        record.exc_info = None
+    record.exc_info = None
 
 
 class _PeerValueFilter(logging.Filter):
@@ -822,7 +815,7 @@ def _safe_library_exc(exc: BaseException) -> str:
         logger.debug("A DICOM exception's text was withheld: %s", type(failed).__name__)
         line = None
     if line is None:
-        return f"{type(exc).__name__}: {_MESSAGE_WITHHELD}"
+        return f"{type(exc).__name__}: {_MESSAGE_WITHHELD} (raised at {_raised_at(exc)})"
     return f"{type(exc).__name__}: {safe_text(line)}" if line else type(exc).__name__
 
 
@@ -2607,11 +2600,7 @@ class DicomScpSource(SourceConnector):
                 object_bytes, peer_ip=peer_ip, sop_instance=sop_instance, sop_class=sop_class
             )
         except Exception as exc:  # noqa: BLE001 - last-resort: a callback must never raise to pynetdicom
-            logger.error(
-                "DICOM C-STORE failed unexpectedly: %s (raised at %s)",
-                _safe_library_exc(exc),
-                _raised_at(exc),
-            )
+            logger.error("DICOM C-STORE failed unexpectedly: %s", _safe_library_exc(exc))
             return _STATUS_CANNOT_UNDERSTAND
 
     def _raw_over_cap(self, event: Any, *, peer_ip: str, calling_ae: str) -> int | None:

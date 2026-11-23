@@ -444,7 +444,10 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
         if r.name == _LOG and "ended an association with 127.0.0.1" in r.getMessage()
     ]
     assert len(ended) == 1, caplog.text
-    tracebacks = [r for r in caplog.records if r.exc_info and r.name.startswith("pynetdicom")]
+    # The log screen renders a library record's traceback into exc_text and clears exc_info.
+    tracebacks = [
+        r for r in caplog.records if (r.exc_info or r.exc_text) and r.name.startswith("pynetdicom")
+    ]
     assert tracebacks == [], [r.getMessage() for r in tracebacks]
     unthrottled = [
         r.getMessage()

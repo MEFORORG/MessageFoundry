@@ -383,14 +383,16 @@ def test_a_message_that_will_not_format_is_withheld_with_its_args(
     assert "value '[redacted]' - must not exceed 64 characters" in written
 
 
-def test_a_traceback_with_no_flagged_value_is_left_to_the_formatter() -> None:
+def test_a_traceback_with_no_flagged_value_keeps_its_message() -> None:
     try:
         raise ValueError("Unable to decode the received PDU data")
     except ValueError as exc:
         info = (ValueError, exc, exc.__traceback__)
     record = logging.LogRecord("pynetdicom.dul", logging.ERROR, __file__, 1, "x", (), info)
     assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
-    assert record.exc_info == info and record.exc_text is None
+    # Rendered now, so a formatter never renders the live exception after the screen.
+    assert record.exc_info is None and record.exc_text is not None
+    assert "ValueError: Unable to decode the received PDU data" in record.exc_text
 
 
 def test_the_filter_is_on_each_logger_by_name() -> None:
@@ -1477,16 +1479,12 @@ def test_the_warnings_filters_are_not_reinstalled_while_they_are_first(
         monkeypatch.undo()
 
 
-def test_no_warning_filter_nests_an_unbounded_scan_inside_a_leading_one() -> None:
-    # Every UserWarning meets these filters, on text a peer can fill with a pattern's own opening
-    # words, up to the 64 KiB command set cap. A leading `.*` with a second unbounded scan after it
-    # is quadratic there. Read from the patterns, so a loaded machine cannot fail it.
-    def nested(pattern: str) -> bool:
-        return pattern.startswith(".*") and "*" in pattern[2:]
-
-    assert nested(r'.*Value ".*" is not valid for elements with a VR of ')  # CONTROL
-    assert dicom_module._PYDICOM_WARNING_MODULES
-    assert not [p for p in dicom_module._PYDICOM_WARNING_MODULES if nested(p)]
+def test_no_warning_filter_reads_a_warnings_text() -> None:
+    # A warning's text can hold a peer's value, up to the 64 KiB command set cap, so a pattern over it
+    # is a cost on a peer's input. The ignore is by module, so no pattern reads the text at all.
+    filters = dicom_module._PYDICOM_WARNING_FILTERS
+    assert filters  # CONTROL: there is a filter to read
+    assert [entry[1] for entry in filters] == [None] * len(filters)
 
 
 def test_the_scu_ignores_pydicoms_copies_before_it_reads_the_object(

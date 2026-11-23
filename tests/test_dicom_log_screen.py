@@ -330,6 +330,61 @@ def test_a_malformed_exc_info_does_not_raise(exc_info: tuple[object, ...]) -> No
     assert _PLANTED not in record.getMessage()
 
 
+def test_a_note_added_after_the_screen_is_not_written() -> None:
+    # A deferred handler formats later, so the record must not still hold the live exception.
+    exc = ValueError("Network timeout reached")
+    record = logging.LogRecord(
+        "pynetdicom.dul", logging.ERROR, __file__, 1, "x", (), (ValueError, exc, None)
+    )
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    exc.add_note(f"note {_PLANTED}")
+    written = logging.Formatter("%(message)s").format(record)
+    assert "ValueError: Network timeout reached" in written  # CONTROL: the traceback is written
+    assert _PLANTED not in written
+
+
+@pytest.mark.parametrize("name", sorted(lines.ELEMENT_NAMES))
+def test_each_element_name_stays_on_its_refusal_line(name: str) -> None:
+    assert dicom_module._screened_line(f"Invalid '{name}' value 'X' - must be str") == (
+        f"Invalid '{name}' value '[redacted]' - must be str"
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "The value length (20) exceeds the maximum length of 16 allowed for VR DS. Please see "
+        "<https://dicom.nema.org/medical/dicom/current/output/html/part05.html#table_6.2-1> for "
+        "allowed values for each VR.",
+        "The PN component length (70) exceeds the maximum allowed length of 64.",
+        "A value of type 'int' cannot be assigned to a tag with VR LT.",
+        "Invalid A-ASSOCIATE 'Result Source' 9 and/or 'Diagnostic' 9 values",
+        "Invalid A-ABORT 'Source' value '9'",
+        "Invalid 'User Identity Type' None",
+        "  Authentication Mode: 9 - (no value available)",
+    ],
+)
+def test_a_value_free_diagnostic_line_stays(line: str) -> None:
+    assert dicom_module._screened_line(line) == line
+
+
+def test_a_private_creator_with_both_quotes_keeps_its_tag() -> None:
+    error = KeyError(f"(0009,0010) '{_PLANTED}\"X' is not a valid private creator")
+    assert dicom_module._screened_line(str(error)) == (
+        "'(0009,0010) \\'[redacted]\\' is not a valid private creator'"
+    )
+
+
+def test_a_move_destination_holding_a_repr_is_redacted() -> None:
+    assert dicom_module._screened_line("Move Destination              : ['AB', 'CD']") == (
+        "Move Destination              : [redacted]"
+    )
+
+
+def test_a_number_slot_takes_ascii_digits_only() -> None:
+    assert dicom_module._screened_line("Their Max PDU Receive Size:  \u0661\u0662") is None
+
+
 def test_a_syntax_errors_source_text_is_not_written() -> None:
     # The stdlib prints a syntax error's text from its own fields, which no message screen reads.
     exc = SyntaxError("bad", ("peer.py", 1, 1, f"text {_PLANTED}", 1, 2))
@@ -455,7 +510,7 @@ def test_where_an_engine_fault_was_raised_is_named_without_its_message() -> None
         text = dicom_module._safe_library_exc(exc)
     assert where.startswith("test_dicom_log_screen.py:")
     assert where.endswith("in test_where_an_engine_fault_was_raised_is_named_without_its_message")
-    assert text == "OSError: [message withheld]"
+    assert text == f"OSError: [message withheld] (raised at {where})"
     assert dicom_module._raised_at(OSError()) == "an unknown place"
 
 
@@ -660,6 +715,7 @@ def test_every_template_compiles_and_matches_its_own_shape() -> None:
         "assoc_reason": "Reserved",
         "context_result": "Accepted",
         "identity_type": "SAML",
+        "type_name": "int",
         "dataset_encoding": "Little Endian Implicit",
     }
     for text in lines.TEMPLATES:

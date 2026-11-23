@@ -45,12 +45,12 @@ _SLOT_PATTERNS = {
     "move": _TO_LINE_END,
     "value": _TO_LINE_END,
     "quoted_uid": r"[^'\r\n]*",
-    "int": r"\d{1,10}",
-    "number": r"\d{1,10}|None",
+    "int": r"[0-9]{1,10}",
+    "number": r"[0-9]{1,10}|None",
     "hex": r"[0-9A-Fa-f]{1,8}",
     "vr": r"[A-Z]{2}",
     "tag": r"[0-9A-F]{4},[0-9A-F]{4}",
-    "name": r"[A-Za-z][A-Za-z /-]{0,63}",
+    "name": r"[A-Za-z][A-Za-z_ /-]{0,63}",
     "keyword": r"[A-Za-z0-9]{1,64}",
     "message_type": r"[CN][-_][A-Z_-]{2,24}",
     "role": r"SCU|SCP",
@@ -91,7 +91,13 @@ _SLOT_PATTERNS = {
         r"Accepted|User Rejection|Provider Rejection|Rejected - Abstract Syntax Not Supported"
         r"|Rejected - Transfer Syntax Not Supported|\(no value available\)"
     ),
-    "identity_type": r"Username/Password|Username|Kerberos|SAML|JSON Web Token",
+    "identity_type": (
+        r"Username/Password|Username|Kerberos|SAML|JSON Web Token|\(no value available\)"
+    ),
+    "type_name": (
+        r"str|bytes|bytearray|int|float|list|tuple|dict|NoneType|Decimal|UID|MultiValue"
+        r"|DSfloat|DSdecimal|IS|PersonName"
+    ),
     "dataset_encoding": r"(?:Deflated )?(?:Little|Big) Endian (?:Implicit|Explicit)",
 }
 
@@ -161,12 +167,14 @@ TEMPLATES: tuple[str, ...] = (
     "The received PDU is shorter than expected ({int} of {int} bytes received)",
     "Unknown PDU type received '0x{hex}'",
     "A-ASSOCIATE-RQ: Unsupported protocol version '0x{hex}'",
-    "Invalid A-ABORT-RQ 'Source' {int}",
-    "Invalid A-ABORT-RQ 'Reason/Diagnostic' {int}",
-    "Invalid A-ASSOCIATE 'Result' {int}",
-    "Invalid A-ASSOCIATE 'Result Source' {int}",
-    "Invalid Presentation Context Item 'Result' {int}",
-    "Invalid 'User Identity Type' {int}",
+    "Invalid A-ABORT-RQ 'Source' {number}",
+    "Invalid A-ABORT 'Source' value '{number}'",
+    "Invalid A-ABORT-RQ 'Reason/Diagnostic' {number}",
+    "Invalid A-ASSOCIATE 'Result' {number}",
+    "Invalid A-ASSOCIATE 'Result Source' {number}",
+    "Invalid A-ASSOCIATE 'Result Source' {number} and/or 'Diagnostic' {number} values",
+    "Invalid Presentation Context Item 'Result' {number}",
+    "Invalid 'User Identity Type' {number}",
     "Non-conformant VM {int} for '{keyword}', taking the first value",
     "maximum_pdu_size set to {int}",
     'pydicom.read_dataset() TransferSyntax="{dataset_encoding}"',
@@ -193,6 +201,10 @@ TEMPLATES: tuple[str, ...] = (
     "Unable to decode '{value}",
     # --- What pydicom says as it refuses or flags a value ---
     "The value length ({int}) exceeds the maximum length of {int} allowed for VR {vr}.",
+    "The value length ({int}) exceeds the maximum length of {int} allowed for VR {vr}. Please "
+    "see <{see_url}> for allowed values for each VR.",
+    "The PN component length ({int}) exceeds the maximum allowed length of {int}.",
+    "A value of type '{type_name}' cannot be assigned to a tag with VR {vr}.",
     "The value length ({int}) exceeds the maximum length of {int} allowed for VR {vr}. Invalid "
     "value for VR {vr}: {value}. Please see <{see_url}> for allowed values for each VR.",
     "The value length ({int}) exceeds the maximum length of {int} allowed for VR {vr}. Invalid "
@@ -213,7 +225,7 @@ TEMPLATES: tuple[str, ...] = (
     "could not convert string to float: {value}",
     "invalid literal for int() with base {int}: {value}",
     "({tag}) '{value}' is not a valid private creator",
-    "\"({tag}) \\'{value}' is not a valid private creator\"",
+    "'({tag}) \\'{value}\\' is not a valid private creator'",
     "\"({tag}) '{value}' is not a valid private creator\"",
     # --- pynetdicom's DEBUG dumps, by label ---
     "{indent}{hex_dump}",
@@ -263,7 +275,7 @@ TEMPLATES: tuple[str, ...] = (
     "Affected SOP Instance UID     : {instance}",
     "Requested SOP Instance UID    : {instance}",
     "Move Originator               : {move}",
-    "Move Destination              : {title}",
+    "Move Destination              : {move}",
     "Priority                      : {priority}",
     "Data Set                      : {presence}",
     "Identifier                    : {presence}",
