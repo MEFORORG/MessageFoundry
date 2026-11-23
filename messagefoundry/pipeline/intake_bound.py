@@ -62,7 +62,7 @@ from messagefoundry.pipeline.alerts import (
     REMINDER_SECONDS,
     AlertSink,
 )
-from messagefoundry.pipeline.retention import read_disk_floor, sqlite_store_file
+from messagefoundry.pipeline.retention import DiskFloorReading, read_disk_floor, sqlite_store_file
 from messagefoundry.store import Store
 from messagefoundry.subject_checksum import (  # re-exported: its callers import it from here
     shorten_with_checksum as shorten_with_checksum,
@@ -241,6 +241,8 @@ class IntakeBoundMonitor:
         # retention warning (one helper, so the two cannot disagree).
         self._floor_path: str | None = sqlite_store_file(store) if min_free_disk_mb > 0 else None
         self._floor_mb = min_free_disk_mb
+        # The one unfinished disk probe, held across ticks (BACKLOG #5767; see _probe_disk).
+        self._disk_probe: asyncio.Task[DiskFloorReading | None] | None = None
         self._check_seconds = check_seconds
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -547,18 +549,41 @@ class IntakeBoundMonitor:
             )
         self._sync_alert(DEPTH_REASON, value=depth, limit=self._max_depth)
 
+    async def _probe_disk(self, path: str) -> tuple[DiskFloorReading | None, BaseException | None]:
+        """One disk reading for this tick, or why there is none (BACKLOG #5767).
+
+        Single-flight, because a thread blocked on a hung volume cannot be cancelled: one probe per
+        tick would fill the default executor that routing and transforms share. While a probe is
+        unfinished no tick starts another, so a hung volume holds at most one of that executor's
+        workers. Only the tick that started a probe may use its result. One that ends later is
+        dropped, since a stale reading must not release or start a pause."""
+        if self._disk_probe is not None:
+            return None, TimeoutError("an earlier disk probe has not finished")
+        probe = asyncio.create_task(
+            asyncio.to_thread(read_disk_floor, path, self._floor_mb), name="intake-disk-probe"
+        )
+        self._disk_probe = probe
+        probe.add_done_callback(self._disk_probe_finished)
+        # asyncio.wait, not wait_for: a timeout or a cancel of this tick leaves the probe running
+        # and held, so stop() never waits for it and no later tick can overlap it.
+        done, _ = await asyncio.wait({probe}, timeout=PROBE_TIMEOUT_SECONDS)
+        if not done:
+            return None, TimeoutError(f"disk probe still running after {PROBE_TIMEOUT_SECONDS}s")
+        if probe.cancelled():
+            return None, asyncio.CancelledError("disk probe was cancelled")
+        failure = probe.exception()
+        return (None, failure) if failure is not None else (probe.result(), None)
+
+    def _disk_probe_finished(self, probe: asyncio.Task[DiskFloorReading | None]) -> None:
+        """Free the single-flight slot, and mark a dropped probe's exception as retrieved so asyncio
+        does not report it when the task is collected."""
+        self._disk_probe = None
+        if not probe.cancelled():
+            probe.exception()
+
     async def _check_disk(self) -> None:
         assert self._floor_path is not None  # disk_floor_on
-        failure: BaseException | None = None
-        try:
-            # A hung stat leaves its worker thread behind; the loop moves on regardless.
-            reading = await asyncio.wait_for(
-                asyncio.to_thread(read_disk_floor, self._floor_path, self._floor_mb),
-                PROBE_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            # Broad on purpose, as in _check_depth; the cause is logged below, not swallowed.
-            reading, failure = None, exc
+        reading, failure = await self._probe_disk(self._floor_path)
         if reading is None or reading.free_bytes is None:
             if not self._disk_failing:
                 self._disk_failing = True
