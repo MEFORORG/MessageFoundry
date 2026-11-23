@@ -9052,7 +9052,8 @@ def create_app(
                         actor=identity.username,
                     )
                 except ResendError as exc:
-                    # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
+                    # At least an empty edited body, an idempotency key reused for a different target,
+                    # or origin metadata with unreadable lineage (BACKLOG #5758) gives 409. str(exc)
                     # carries ids only (never the body — the messages don't interpolate ``raw``).
                     raise HTTPException(409, str(exc)) from None
                 return EditResendResult(

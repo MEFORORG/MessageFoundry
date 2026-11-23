@@ -710,9 +710,9 @@ def _J(authority: str, reach: str) -> Ui:
 _AS = "AuthService"
 _E = "get_engine"
 
-#: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 129 with OIDC off,
-#: as ADR 0215 measured, and the 4 OIDC legs. A write's authority is its write routes, and a read
-#: only where the write's own gate names a permission that read decides and no write route does:
+#: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 130 with OIDC off,
+#: the number :func:`test_the_ui_route_counts_are_the_measured_ones` pins, and the 4 OIDC legs.
+#: A write's authority is its write routes, and a read only where the write's own gate names a permission that read decides and no write route does:
 #: under ADR 0215 section 2 a write makes one sub-request and redirects, and the page it re-renders
 #: on an error today is read on the following GET. :func:`_write_authority_problems` checks it.
 _UI_ROUTES: dict[str, Ui] = {
@@ -783,6 +783,11 @@ _UI_ROUTES: dict[str, Ui] = {
         "DELETE /users/{user_id}/sessions",
         f"{_AS} admin.admin_revoke_user_sessions admin.federated_identity_view admin.list_roles "
         "admin.user_summary_scoped admin.checked_user",
+    ),
+    # BACKLOG #5559: the delete confirmation reads the account only to see that it fails its seal,
+    # the checked read the users:manage federated-identity read of one account makes.
+    "GET /ui/users/{user_id}/delete-confirm": _J(
+        "GET /users/{user_id}/federated-identity", f"{_AS} admin.checked_user"
     ),
     "POST /ui/users/{user_id}/delete": _J(
         "DELETE /users/{user_id}",
@@ -1563,13 +1568,13 @@ def test_every_ui_route_is_classified_by_the_json_route_carrying_its_authority(
 
 
 def test_the_ui_route_counts_are_the_measured_ones() -> None:
-    """129 ``/ui`` operations with OIDC off: the 127 ADR 0215 measured and ADR 0207's two
-    enrolment-code writes, and 4 OIDC legs."""
+    """130 ``/ui`` operations with OIDC off: the 127 ADR 0215 measured, ADR 0207's two
+    enrolment-code writes and BACKLOG #5559's delete confirmation, and 4 OIDC legs."""
     default = set(_ui_routes(create_app(serve_ui=True)))
-    assert len(default) == 129
+    assert len(default) == 130
     assert set(_UI_ROUTES) == default | _OIDC_ONLY
     counts = Counter(u.kind for u in _UI_ROUTES.values())
-    assert counts == {"json": 109, "public": 15, "confinement": 3, "ceremony": 3, "check": 3}, (
+    assert counts == {"json": 110, "public": 15, "confinement": 3, "ceremony": 3, "check": 3}, (
         counts
     )
 

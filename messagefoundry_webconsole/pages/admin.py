@@ -40,6 +40,7 @@ __all__ = [
     "role_form_page",
     "roles_page",
     "temp_password_page",
+    "user_delete_confirm_page",
     "user_detail_page",
     "user_new_page",
     "users_page",
@@ -259,8 +260,8 @@ def _lock_card(user: UserSummary) -> Markup:
 
 
 def _delete_user_form(user_id: str) -> Markup:
-    """The one-button form that deletes an account, on its detail page and, for an account whose
-    record fails its seal, on the users list (BACKLOG #5559)."""
+    """The one-button form that deletes an account, on its detail page and on the delete
+    confirmation the users list leads to (BACKLOG #5559)."""
     return el(
         "form",
         el("button", "Delete user", type="submit"),
@@ -270,7 +271,40 @@ def _delete_user_form(user_id: str) -> Markup:
     )
 
 
-def users_page(users: Sequence[UserListEntry]) -> Markup:
+def user_delete_confirm_page(user_id: str, *, is_self: bool) -> Markup:
+    """The confirm step for the delete the users list offers on an account whose record fails its
+    integrity seal (BACKLOG #5559): it says what the delete does before the one POST that acts.
+
+    The route renders it only after the checked read refused the record for its seal. That 423
+    carries one fixed text whether the seal failed or could not be verified (ADR 0217), so the
+    page claims neither. It names
+    the account by id alone, so nothing here may read as its name or roles. The caller's own
+    account gets a note and no form, since the delete refuses it. The list leads here with a link,
+    as the federated identity screen leads to its unlink confirmation, so the list itself holds no
+    form that deletes."""
+    action: object = (
+        el("p", "You cannot delete your own account.", class_="muted")
+        if is_self
+        else _delete_user_form(user_id)
+    )
+    body = el(
+        "div",
+        el("h1", f"Delete account {user_id}"),
+        el(
+            "p",
+            "This account's record could not be verified against its seal, so its name and "
+            "roles are not shown. The engine refuses a record whose seal check fails and one "
+            "whose seal it cannot verify the same way, so this page cannot tell which applies. "
+            "Deleting it removes the account; the console has no undo.",
+        ),
+        action,
+        el("p", el("a", "Cancel", href="/ui/users")),
+        class_="card detail-card",
+    )
+    return page(f"Delete account {user_id}", body, active="users")
+
+
+def users_page(users: Sequence[UserListEntry], *, can_delete: bool = False) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms.
 
     The Lock column appears only when the engine disclosed lock state, which it does only to a
@@ -283,8 +317,10 @@ def users_page(users: Sequence[UserListEntry]) -> Markup:
 
     An account whose record fails its integrity seal arrives as an :class:`IntegrityFailedUser`, its
     id alone (BACKLOG #5520). Its row names the id and says the check failed, and every other cell
-    is blank: the engine sent nothing else of it, so nothing here may read as its name or roles. Its
-    Status cell offers the delete, the one action the console takes on it (BACKLOG #5559)."""
+    is blank: the engine sent nothing else of it, so nothing here may read as its name or roles.
+    With ``can_delete``, which the route sets for a ``users:manage`` holder only, its Status cell
+    links to the delete's confirmation, the one action the console takes on it (BACKLOG #5559). A
+    reader without that permission is offered nothing the delete route would refuse."""
     summaries = [u for u in users if isinstance(u, UserSummary)]
     show_lock = any(u.lock_state is not None for u in summaries)
     show_scope = any(not u.channel_scope_withheld for u in summaries)
@@ -297,13 +333,17 @@ def users_page(users: Sequence[UserListEntry]) -> Markup:
     rows: list[list[object]] = []
     for u in users:
         if isinstance(u, IntegrityFailedUser):
-            # Not linked: the detail page answers 423 for this record (BACKLOG #5559). The delete
-            # is offered here instead, as the engine keeps the account listed so it can be removed.
+            # Not linked: the detail page answers 423 for this record (BACKLOG #5559). The engine
+            # keeps the account listed so it can be removed, so a caller who may delete it gets a
+            # link to the delete's confirmation instead.
             failed: list[object] = [""] * len(headers)
             failed[0] = u.id
-            failed[headers.index("Status")] = el(
-                "div", el("p", "integrity check failed"), _delete_user_form(u.id)
-            )
+            status_cell: list[object] = [el("p", "integrity check failed")]
+            if can_delete:
+                status_cell.append(
+                    el("a", "Delete user", href=f"/ui/users/{_seg(u.id)}/delete-confirm")
+                )
+            failed[headers.index("Status")] = el("div", *status_cell)
             rows.append(failed)
             continue
         row: list[object] = [

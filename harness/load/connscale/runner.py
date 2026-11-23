@@ -434,12 +434,14 @@ async def run_connscale(
     # A multi-arm run additionally fails on a throughput regression, a NO-collapse, or a missing pooled
     # arm (comparison.ok folds those in). A single-arm run has no comparison and never swallows a miss
     # (the loop re-raises), so its verdict is the SLOs alone. The fusion/batching A/Bs fold ONLY their
-    # correctness gate (.ok = every B1 arm held zero-loss + present) — a NO-GO/INCONCLUSIVE throughput
-    # verdict is a legitimate measurement, not a red build.
+    # correctness gate (.ok = every B1 arm held zero-loss + present, no B0 baseline missing, no cell
+    # unrun in both arms) — a NO-GO/INCONCLUSIVE throughput verdict is a legitimate measurement, not a
+    # red build.
     #
-    # A swallowed miss also fails the run on its own (BACKLOG #3132). A comparison sees only the
-    # misses it can pair against a present arm: in a fusion A/B, a cell whose B0 and B1 both failed to
-    # start leaves no row and no baseline gap, so nothing else would fail it.
+    # A swallowed miss also fails the run on its own (BACKLOG #3132), because a comparison does not
+    # fail every miss. A fusion or batching cell whose B0 and B1 both failed to start does fail .ok,
+    # through unrun_cells (BACKLOG #5430). A cell that lost only some trials keeps its row and can
+    # still read ok, and a sandbox A/B has no comparison, so steps_missed is what fails those.
     result_ok = (
         # A sweep that recorded nothing measured nothing, whatever its SLOs read (BACKLOG #5432).
         bool(records)
