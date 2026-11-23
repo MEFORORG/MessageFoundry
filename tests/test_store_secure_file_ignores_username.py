@@ -136,14 +136,19 @@ def _acl(path: Path) -> _Acl:
 
 # Replaces the whole access list with the SDDL given, writing only the access section.
 # ``icacls /inheritance:r /grant:r`` is not enough: the first removes only entries marked inherited
-# and the second replaces only the named SID's entries, so other explicit entries survive, and
-# ``tests/_win_acl.py`` says why the hosted runners have them (here also CI run 45151393786).
+# and the second replaces only the named SID's entries, so other explicit entries survive. On the
+# hosted runners the child folder made under pytest's mode-0700 temp folder held SYSTEM,
+# Administrators and OWNER RIGHTS as explicit entries after that call (CI run 45151393786); why
+# they arrive explicit there and inherited on a developer machine is not established.
+# SetAccessControl is used rather than Set-Acl: Windows PowerShell's Set-Acl also writes the audit
+# list when the item is already protected, which needs a privilege an unelevated account lacks.
 _SET_ACL = (
     "$ErrorActionPreference = 'Stop';"
-    "$a = Get-Acl -LiteralPath $env:MF_ACL_PATH;"
+    "$i = Get-Item -LiteralPath $env:MF_ACL_PATH;"
+    "$a = $i.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access);"
     "$a.SetSecurityDescriptorSddlForm($env:MF_ACL_SDDL,"
     " [System.Security.AccessControl.AccessControlSections]::Access);"
-    "Set-Acl -LiteralPath $env:MF_ACL_PATH -AclObject $a"
+    "$i.SetAccessControl($a)"
 )
 
 
@@ -161,6 +166,8 @@ def _grant_only(path: Path, sid: str) -> Path:
 
 
 def _folder_granting_only(path: Path, sid: str) -> Path:
+    """Make the folder ``path`` and give it, by :func:`_grant_only`, a protected list granting
+    ``sid`` alone."""
     path.mkdir()
     return _grant_only(path, sid)
 
@@ -218,9 +225,11 @@ def test_control_the_instrument_sees_an_unrestricted_file(tmp_path: Path) -> Non
 
 
 def test_control_the_folder_setup_clears_explicit_entries(tmp_path: Path) -> None:
-    """A folder already holding explicit SYSTEM, Administrators and OWNER RIGHTS entries, the shape
-    the hosted runners hand down from a mode-0700 temp folder, ends with the token's entry alone, so
-    the setup above does not depend on how this machine passes entries down."""
+    """A folder already holding explicit SYSTEM, Administrators and OWNER RIGHTS entries, the
+    entries CI run 45151393786 found on the runner's folder, ends with the token's entry alone, and
+    so does a folder already protected, so a return to ``icacls /inheritance:r`` for the setup
+    fails here too. Whether the runner's files also receive entries as explicit ones is not tested
+    here."""
     folder = tmp_path / "seeded"
     folder.mkdir()
     seeded = ("S-1-5-18", "S-1-5-32-544", "S-1-3-4")
@@ -229,4 +238,6 @@ def test_control_the_folder_setup_clears_explicit_entries(tmp_path: Path) -> Non
         + [f"*{sid}:(OI)(CI)F" for sid in seeded]
     )
     assert set(seeded) <= {e.sid for e in _acl(folder).entries if not e.inherited}
+    _grant_only(folder, _token_sid())
+    # Now protected, which is what made Set-Acl need the audit privilege.
     _grant_only(folder, _token_sid())
