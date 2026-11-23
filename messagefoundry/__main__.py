@@ -1255,8 +1255,19 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--to",
         default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
-        "except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
+        "is unrecoverable, so a taken store name, or a taken SQLite -wal/-shm/-journal name beside it "
+        "(a file, a directory or a link, a dangling one included), is refused, and the store and "
+        "sidecar names are read again just before the write. Not caught, at least: a sidecar created "
+        "after that re-read. Nor, on Windows, a taken -wal, -shm or -journal name, or a "
+        "dangling link at the store name when the store is copied into place, on a share or drive "
+        "that neither read could reach: an unreachable share, which reads as free (at least WinError "
+        "53 and 67), or a drive letter that is gone (at least WinError 3). Nor, on Windows, "
+        "when the store is copied rather than hard-linked into place, a dangling link planted at the "
+        "store name after that re-read, which is followed. "
+        "Also refused: a name holding ':', and on Windows a "
+        "name ending in a dot or a space or otherwise opened as another path. To reuse a path, stop "
+        "the engine and move the old store aside with its -wal, -shm and -journal as one set. "
+        "Required, except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
         "whose bundle --config-to restores alone",
     )
     restore.add_argument(
@@ -12578,8 +12589,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "min_decryption_version above a version stops the values sealed under it from "
             "decrypting. Raising the audit key's min_decryption_version above a version breaks "
             "the audit chain at every row MACed under it; the audit key is the data key unless "
-            "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
-            "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
+            "MEFOR_STORE_TRANSIT_AUDIT_KEY is set to the name of a different Transit key, and set "
+            "empty or to the data key's own name it is still the data key. Trimming a version off "
+            "either key does the same to what it sealed or MACed, and the engine cannot undo it; "
+            "a restore of a Vault snapshot taken before the trim may bring the version back, "
+            "and also returns everything else in Vault, every later key version included, to "
+            "that point. "
+            "docs/SECURITY.md, under "
             f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
             "does to the attestation. Nothing was changed.",
             file=sys.stderr,

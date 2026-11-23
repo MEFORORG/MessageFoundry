@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import tomllib
 from pathlib import Path
 
@@ -72,13 +73,51 @@ _SETTINGS: list[tuple[str, str | None]] = [
     ('[api]\nhosts = [\n  ["store"]\n]\nkey_provider = "host"\n', None),
     ('[api]\nhosts = [ # "]"\n  ["store"]\n]\nkey_provider = "host"\n', None),
     ('[store]\nnote = """\n[api]\n"""\nkey_provider = "host"\n', "host"),
+    # The array is open after a multi-line string ends, so its element lines are not headers.
+    ('[store]\nx = [ """\na""",\n  [1]\n]\nkey_provider = "host"\n', "host"),
+    ('[api]\nx = [ """\nq""",\n  ["store"]\n]\nkey_provider = "host"\n', None),
+    ("[store]\nx = [ '''\nq''', [\n  [[1]]\n]]\nkey_provider = \"host\"\n", "host"),
+    ('[store]\nx = [\n"""a\n""", [\n[[1]]]]\nkey_provider = "host"\n', "host"),
+    # A triple quote that opens no multi-line string: in a one-line string, in a comment.
+    ('[api]\nnote = \'say """\'\n[store]\nkey_provider = "host"\n', "host"),
+    ("# don't '''\n[store]\nkey_provider = \"host\"\n", "host"),
+    ('[store]\nn = """a""""\nkey_provider = "host"\n', "host"),
+    ('[store]\nn = """a\\"""\n[api]\n"""\nkey_provider = "host"\n', "host"),
+    # Headers: tabs, quoted keys, arrays of tables. One the reader cannot classify, such as a
+    # quoted key with an escape, ends [store].
+    ('[\tstore\t]\nkey_provider = "host"\n', "host"),
+    ('[store]\n[\tapi\t]\nkey_provider = "host"\n', None),
+    ('[store]\n["a:b"]\nkey_provider = "host"\n', None),
+    ('["sto re"]\nkey_provider = "host"\n', None),
+    ('[ "store" ]\nkey_provider = "host"\n', "host"),
+    ('[store]\n["\\u0061pi"]\nkey_provider = "host"\n', None),
+    ('[store]\n[[array.of.tables]]\nkey_provider = "host"\n', None),
+    ('[[array.of.tables]]\nx = 1\n[store]\nkey_provider = "host"\n', "host"),
+    # The table named "" is not the root, so a dotted or inline store under it is not [store].
+    ('[""]\nstore.key_provider = "host"\n', None),
+    ("[ '' ]\nstore = { key_provider = \"host\" }\n", None),
+    # Text inside a triple-quoted inline-table value is not a key.
+    ("store = { a = '''x', key_provider = 'host''' }\n", None),
+    ('store = { a = """x", key_provider = "host"""" }\n', None),
     ("", None),
 ]
 
 
-def test_the_settings_reader_finds_the_key_provider(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "host",
+    [
+        "pwsh",
+        pytest.param(
+            "powershell",
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("win"), reason="Windows PowerShell 5.1"
+            ),
+        ),
+    ],
+)
+def test_the_settings_reader_finds_the_key_provider(tmp_path: Path, host: str) -> None:
     """Every case is a real settings file whose [store].key_provider, under Python's own TOML
-    reader, is the value the installer must read."""
+    reader, is the value the installer must read, on both hosts the installer runs under."""
     assert _SCRIPT is not None
     for text, expected in _SETTINGS:
         store = tomllib.loads(text.removeprefix(_BOM)).get("store", {})
@@ -94,7 +133,7 @@ def test_the_settings_reader_finds_the_key_provider(tmp_path: Path) -> None:
         + ")) { $v = Get-SettingsKeyProvider -Path $p; if ($null -eq $v) { '<none>' } else { $v } })\n"
         "  ConvertTo-Json -InputObject $out -Compress\n"
     )
-    got = json.loads(_ok(_extract(_SCRIPT, ["Get-SettingsKeyProvider"], body), tmp_path))
+    got = json.loads(_ok(_extract(_SCRIPT, ["Get-SettingsKeyProvider"], body), tmp_path, host))
     want = ["<none>" if e is None else e for _, e in _SETTINGS]
     assert got == want, list(zip([t for t, _ in _SETTINGS], got, want, strict=True))
 

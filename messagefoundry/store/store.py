@@ -99,6 +99,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
@@ -108,6 +109,7 @@ from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.cell_tag import (
     CellTagError,
+    UnreadableParentMetadataError,
     audits_cell_tag,
     dead_letters_on_cell_tag,
     is_row_tagged,
@@ -146,6 +148,7 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    StoreKeylessError,
     allows_unmarked,
     audit_key_id,
     cell_aad,
@@ -218,6 +221,7 @@ from messagefoundry.store.row_seal import (
     RowSealKeyRetiredError,
     SealPager,
     TransitSealUnavailableError,
+    cipher_call,
     classify_unrotated,
     require_seal_for_write,
     revoke_seal_refusals,
@@ -1011,6 +1015,58 @@ class ReingressOriginMissing(ResendError):
     belt-and-suspenders race guard; the txn rolls back and nothing is written."""
 
 
+class ResendOriginMetadataUnreadable(ResendError):
+    """The origin's ``metadata`` cell opened, but building an edited child's correlation metadata
+    from it raised (BACKLOG #5758). At least: the cell nests too deep to decode, its
+    ``correlation_depth`` cannot be read as an integer, or the child's metadata cannot be
+    serialized from it. Most cells the pass-through transform handoff now dead-letters are such
+    cells, so without this refusal the operator's edit of that message raised out of the API as a
+    500; it is now a 409. The txn rolls back and nothing is written: the origin and its queue rows
+    stay as they were, and the idempotency key stays free."""
+
+
+def edit_child_metadata(raw_meta: str | None, *, origin_message_id: str) -> str:
+    """The ``metadata`` of an edit-and-resend or edit-and-resubmit child of ``origin_message_id``,
+    correlated to the origin from its opened ``raw_meta`` (ADR 0090 §9, BACKLOG #153).
+
+    Every cell the inline copies this replaced turned into a child still does, with the same
+    metadata: a cell that decodes to something other than a JSON object, or fails to decode with a
+    ``ValueError``, carries no lineage. A cell on which they raised one of the errors the outer
+    ``except`` names is now refused with :class:`ResendOriginMetadataUnreadable` (BACKLOG #5758),
+    and that includes one that nests too deep to decode. The refusal is raised outside the
+    ``except``, because json's error holds the whole cell, and neither it nor the log names more
+    than the message id."""
+    try:
+        try:
+            parent_meta = json.loads(raw_meta) if raw_meta else {}
+        except (ValueError, TypeError):
+            parent_meta = {}
+        if not isinstance(parent_meta, dict):
+            parent_meta = {}
+        child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+        root = parent_meta.get("correlation_root_id") or origin_message_id
+        return json.dumps(
+            {
+                "correlation_id": origin_message_id,
+                "correlation_root_id": root,
+                "correlation_depth": child_depth,
+                "edited_from": origin_message_id,
+            }
+        )
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        # json.loads overflows on deep nesting with a RecursionError, not a ValueError, so it lands
+        # here rather than in the inner "no lineage" reading.
+        pass
+    log.warning(
+        "message %s metadata does not hold readable correlation metadata; the edit was refused",
+        origin_message_id,
+    )
+    raise ResendOriginMetadataUnreadable(
+        f"message {origin_message_id} metadata does not hold readable correlation metadata"
+        " -- cannot edit-and-resend or edit-and-resubmit it"
+    )
+
+
 #: The ``resend_log.to_destination`` sentinel prefix an edit-and-resubmit RE-INGRESS records instead of
 #: a real outbound name (ADR 0090 §9, BACKLOG #153). A re-ingress re-enters the ORIGIN channel (not an
 #: outbound lane), so its idempotency-key binding is ``(origin_message_id, "@reingress:<channel>")`` —
@@ -1517,6 +1573,19 @@ class ConnectionEventWrite(TypedDict):
     message_id: str | None
     reason: str | None
     now: NotRequired[float | None]
+
+
+def stamped_connection_event(ev: ConnectionEventWrite) -> ConnectionEventWrite:
+    """``ev``, with ``now`` set to the current time when it is absent or ``None``.
+
+    The writers call this on the event loop before they hand the event's params to the cipher
+    (BACKLOG #3929), so an event is stamped when it is written, not when a busy Transit pool
+    reaches it; the stamp is also in the reason cell's AAD."""
+    if ev.get("now") is not None:
+        return ev
+    stamped = ev.copy()
+    stamped["now"] = time.time()
+    return stamped
 
 
 #: The session columns a session seal leaves out, each with the reason (BACKLOG #2592). Everything
@@ -3852,6 +3921,13 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
 
+def passkey_set_matches(creds: Iterable[WebAuthnCredential], cred_digest: str) -> bool:
+    """Whether ``creds`` digest to ``cred_digest``, the digest the account's seal covers, compared
+    with :func:`~messagefoundry.credential.constant_time_equal` rather than ``==`` (ASVS 11.2.4,
+    BACKLOG #1167). Shared by the three store backends."""
+    return constant_time_equal(passkey_digest(creds), cred_digest)
+
+
 def global_epoch_or_refuse(value: Any) -> int:
     """``value``, the global session epoch a read returned, as an int; a store with no row reads
     ``None`` and is refused with :data:`GLOBAL_SESSION_EPOCH_MISSING` (BACKLOG #5091).
@@ -4388,7 +4464,7 @@ def discoverable_way_past(
     :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
     match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
     written or flipped outside the store must not count. The census asks it too."""
-    if sealed and passkey_digest(passkeys) != cred_digest:
+    if sealed and not passkey_set_matches(passkeys, cred_digest):
         return False
     counts = passkey_counts or passkey_is_way_past
     return any(counts(c) for c in passkeys)
@@ -4716,8 +4792,12 @@ def removal_keeps_way_past(
     row = record.row
     if not drop_totp and _totp_is_way_past(record, totp_counts):
         return True
-    remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
-    trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
+    remaining = [
+        c
+        for c in passkeys
+        if drop_passkey is None or not constant_time_equal(c.credential_id_hash, drop_passkey)
+    ]
+    trusted = not sealed or passkey_set_matches(passkeys, row.cred_digest)
     counts = passkey_counts or passkey_is_way_past
     return trusted and any(counts(c) for c in remaining)
 
@@ -5340,6 +5420,22 @@ def rotation_reseal(
         return r.changed(totp_secret=reencrypt(str(secret), aad))
 
     return apply
+
+
+def marker_test_sql(column: str, *, present: bool) -> str:
+    """SQLite's test of ``column`` against the marker pattern bound as ``?1`` (``<prefix>%``).
+
+    Text compares byte-exact, because ``LIKE`` folds ASCII case and ``MFENC:`` is not a marker to
+    the cipher (BACKLOG #5506, #5611). A BLOB keeps ``LIKE`` and so reads as it did before: ``substr``
+    of a BLOB is a BLOB, which never equals text, so an exact test would call every BLOB unmarked.
+    What ``LIKE`` does with a BLOB depends on the SQLite build (``cipher_cells._sealed_test`` says
+    how), and on a build where it matches none, every BLOB is unmarked here too. ``column`` is a
+    code constant. NULL matches neither form."""
+    compare, like = ("=", "LIKE") if present else ("<>", "NOT LIKE")
+    return (
+        f"CASE WHEN typeof({column}) = 'blob' THEN {column} {like} ?1"
+        f" ELSE substr({column}, 1, length(?1) - 1) {compare} substr(?1, 1, length(?1) - 1) END"
+    )
 
 
 def report_refused_role_holder() -> None:
@@ -7079,6 +7175,21 @@ def audit_seal_next(
     return seq, row_hash
 
 
+def held_append_mac(
+    head: Sequence[Any] | None,
+    expect_prev: str | None,
+    append_mac: Callable[[], tuple[bytes | None, AuditMacFn | None]],
+) -> Callable[[], tuple[bytes | None, AuditMacFn | None]]:
+    """``append_mac``'s answer, taken now, as :func:`audit_seal_next` takes it: after the head check.
+
+    A backend that runs :func:`audit_seal_next` off the event loop (BACKLOG #3929) calls this on the
+    loop first, so the range key is read in the same step as the head, as it was before the hop,
+    and a refusal raises in the same order. The off-loop seal then uses the key read here."""
+    audit_next_link(head, expect_prev)
+    held = append_mac()
+    return lambda: held
+
+
 #: A genesis record writes a store id (vault BACKLOG #3411) as the lowercase hex of its bytes.
 _AUDIT_STORE_ID_FIELD: Final = "store_id"
 #: ``2 * STORE_ID_BYTES`` lowercase hex digits, unanchored: use it with ``fullmatch`` only. The width
@@ -7423,7 +7534,7 @@ async def _store_pin_refusal(
     expected: str | None = None
     if secret is not None:
         with suppress(AuditKeyVersionRefusedError):
-            expected = _audit_row_mac(first, "", secret[0], secret[1])
+            expected = await cipher_call(secret[1], _audit_row_mac, first, "", secret[0], secret[1])
     if expected is None or not hmac.compare_digest(
         audit_mac_bytes(first["row_hash"]), audit_mac_bytes(expected)
     ):
@@ -8284,7 +8395,9 @@ async def settle_audit_ranges(
     if first_secret is not None:
         refused = ""
         try:
-            expected = _audit_row_mac(genesis, "", first_secret[0], first_secret[1])
+            expected = await cipher_call(
+                first_secret[1], _audit_row_mac, genesis, "", first_secret[0], first_secret[1]
+            )
         except AuditKeyVersionRefusedError as exc:  # the genesis row fails, as the walk reports it
             expected, refused = None, f" ({exc})"
         mac_ok = hmac.compare_digest(
@@ -8453,7 +8566,9 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     # different chain from the one the verify passed. The no-op below verifies too: its OK is read
     # as "the rotation is done", so it must not stand over a chain audit-verify fails (#1945).
     rows = await host._audit_rows()
-    ok, msg = verify_audit_rows(
+    ok, msg = await cipher_call(
+        host._audit_mac_fn,
+        verify_audit_rows,
         rows,
         mac_keys=host._audit_mac_keys,
         mac_fn=host._audit_mac_fn,
@@ -9931,12 +10046,14 @@ before the one commit. So a crash, or a failed append, keeps both or neither. ``
 result records nothing, as a replay that re-queued no row records nothing. The row's detail can
 carry the result, such as a count, which is why this is a function and not a row.
 
-DECIDED (BACKLOG #5069): a ``None`` return stays allowed, because it is the caller's own per-result
-statement that this result changed nothing worth a row, which :func:`if_applied` relies on for an
-alert id that matched no row. What is refused, with :class:`TypeError` and before any write, is a
-missing audit: ``None`` or anything not callable in its place (:func:`require_operator_audit`).
-The one exception is an operator inject, which always writes a message, so its ``None`` return is
-refused too (BACKLOG #5071, :func:`require_ingress_audit`).
+DECIDED (BACKLOG #5069): a ``None`` return is allowed for a result that changed nothing, because it
+is the caller's own per-result statement that this result needs no row, which :func:`if_applied`
+relies on for an alert id that matched no row. What is refused, with :class:`TypeError` and before
+any write, is a missing audit: ``None`` or anything not callable in its place
+(:func:`require_operator_audit`). On replay, dead-letter replay, resend, re-ingress and purge, a
+``None`` return for a result that did change the store is refused too, inside the transaction, so
+the change rolls back (:func:`require_mutation_audit`). So is an operator inject's, which always
+writes a message (BACKLOG #5071, :func:`require_ingress_audit`).
 
 It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
 row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
@@ -9946,7 +10063,8 @@ not read chain state."""
 def no_audit_row(_result: object) -> None:
     """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
 
-    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Most of its callers end the sessions
+    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Replay, dead-letter replay, resend,
+    re-ingress and purge refuse it for a result that changed the store (BACKLOG #5069). Most of its callers end the sessions
     as the tail of a change that carries its own row, such as a password reset or a disable, so the
     revoke has nothing of its own to record."""
     return None
@@ -10372,6 +10490,46 @@ def require_operator_audit(audit: object, mutation: str) -> None:
         )
 
 
+def mutation_changed(result: object) -> bool:
+    """Whether the result of replay, dead-letter replay, resend, re-ingress or purge says it changed
+    the store (BACKLOG #5069). A count changed the store unless it is ``0``, so a driver's ``-1``,
+    an unknown count, counts as a change. A resend or re-ingress outcome changed nothing only as a
+    ``duplicate``. Any other result type raises :class:`TypeError`, so a new result type must be
+    classified here rather than read as no change."""
+    if isinstance(result, ResendOutcome | ReingressOutcome):
+        return result.status != "duplicate"
+    if isinstance(result, int) and not isinstance(result, bool):
+        return result != 0
+    raise TypeError(
+        f"an operator mutation returned {type(result).__name__}, which mutation_changed does not"
+        " classify (BACKLOG #5069)"
+    )
+
+
+def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> OperatorAudit[R]:
+    """The entry guard of replay, dead-letter replay, resend, re-ingress and purge (BACKLOG #5069),
+    and the audit each then runs.
+
+    It refuses a missing audit as :func:`require_operator_audit` does, before any write. The audit
+    it returns also refuses a ``None`` row for a result that changed the store
+    (:func:`mutation_changed`). The store calls it inside the mutation's transaction, before the
+    commit, so that :class:`TypeError` keeps the change from committing. It keys on the result the
+    mutation returns, not on every write the mutation made. A result that changed nothing may still
+    record nothing."""
+    require_operator_audit(audit, mutation)
+
+    def row_when_changed(result: R) -> AuditAppend | None:
+        row = audit(result)
+        if row is None and mutation_changed(result):
+            raise TypeError(
+                f"{mutation}'s audit returned no row for a result that changed the store, which"
+                " an operator mutation refuses (BACKLOG #5069)"
+            )
+        return row
+
+    return row_when_changed
+
+
 #: The message origins only an operator's action writes (vault BACKLOG #2615). ``enqueue_ingress``
 #: refuses one of these with no audit (BACKLOG #5071). Listed, not derived from a name, so a new
 #: origin is a decision: the test classifies every member as operator or not.
@@ -10426,7 +10584,8 @@ def operator_audits[R](audit: OperatorAudit[R], result: R) -> tuple[AuditAppend,
     """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624).
 
     A return that is neither ``None`` nor an :class:`AuditAppend` raises :class:`TypeError`
-    (BACKLOG #5069); a ``None`` RETURN stays allowed, see :data:`OperatorAudit`. ``None`` in place
+    (BACKLOG #5069). A ``None`` RETURN is allowed here; :func:`require_mutation_audit` wraps the five
+    mutations' audit to refuse one for a result that changed the store. ``None`` in place
     of ``audit`` raises here too. Each mutation already refused it at entry, before any write; this
     is the backstop for a mutation that forgets that line, and here the raise rolls it back."""
     require_operator_audit(audit, "an operator mutation")
@@ -11917,6 +12076,25 @@ class MessageStore:
         # a v2 marker with this `aad` — a wrong-cell v2 blob fails the tag → CipherError (fail-closed).
         return self._cipher.decrypt(value, aad=aad)
 
+    # BACKLOG #3929: async store methods call these rather than ``_enc``/``_dec`` and the cipher,
+    # so under a cipher that blocks on I/O (``vault_transit``) the call runs on the Transit pool and
+    # the event loop keeps serving. Under an in-process cipher it runs inline, as before.
+    async def _aenc(self, value: str | None, *, aad: bytes) -> str | None:
+        if not value:
+            return value
+        return await cipher_call(self._cipher, self._enc, value, aad=aad)
+
+    async def _adec(self, value: str | None, *, aad: bytes) -> str | None:
+        if value is None:
+            return value
+        return await cipher_call(self._cipher, self._dec, value, aad=aad)
+
+    async def _aencrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        return await cipher_call(self._cipher, self._cipher.encrypt, plaintext, aad=aad)
+
+    async def _adecrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        return await cipher_call(self._cipher, self._cipher.decrypt, stored, aad=aad)
+
     def cipher_info(self) -> CipherInfo:
         """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""
         return cipher_info(self._cipher)
@@ -12417,7 +12595,9 @@ class MessageStore:
             # #241 F2: decrypt+json.loads through the fail-closed helper — a keyless open of an
             # encrypted store raises an operator-facing StoreKeylessError (table + remedy), not a raw
             # JSONDecodeError, and never silently drops an encrypted row.
-            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
+            cache[(r["namespace"], r["key"])] = await cipher_call(
+                self._cipher,
+                decrypt_json_cell,
                 self._cipher,
                 r["value"],
                 aad=cell_aad("state", "value", r["namespace"], r["key"]),
@@ -12448,7 +12628,9 @@ class MessageStore:
                 entry = cache[r["name"]] = new_reference_set(r["name"])  # sealed (BACKLOG #1174)
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
                 # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
-                entry[r["key"]] = decrypt_json_cell(
+                entry[r["key"]] = await cipher_call(
+                    self._cipher,
+                    decrypt_json_cell,
                     self._cipher,
                     r["value"],
                     aad=cell_aad("reference", "value", r["name"], r["version"], r["key"]),
@@ -12769,7 +12951,10 @@ class MessageStore:
         pending, never as a false plant beside its own new ciphertext.
         """
         keys = key_cols if key_cols is not None else aad_cols
-        pending_where = f"{column} NOT LIKE ? AND {column} <> ''"
+        pending_where = f"{marker_test_sql(column, present=False)} AND {column} <> ''"
+        # What this column's LIKE calls unmarked. On a sealed surface the opt-out seals only these,
+        # as it did before the exact test, so where LIKE folds case an `MFENC:` value is left alone.
+        folded_where = f"{column} NOT LIKE ?1 AND {column} <> ''"
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(table, pending_where, like)
@@ -12777,13 +12962,15 @@ class MessageStore:
         if blank_where is not None and not keyed:
             blanks = await self._count_unmarked(table, blank_where)
         is_sealed = keyed
-        if (blanks or (pending and strict)) and not keyed:
+        if (blanks or pending) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # A peer may have sealed the rows between the count and the probe; count again so
                 # its legitimate seal is not reported as a plant. A blank here stays refused.
                 blanks = 0
                 pending = await self._count_unmarked(table, pending_where, like)
+        if pending and is_sealed and not strict:
+            pending = await self._count_unmarked(table, folded_where, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
@@ -12809,12 +12996,13 @@ class MessageStore:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
             # The opt-out reseals plaintext, never a blank on a surface another process keyed.
+            unmarked_where = pending_where if claimed and not is_sealed else folded_where
             seal_where = (
-                f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+                f"({unmarked_where}) OR ({blank_where})" if blanks and claimed else unmarked_where
             )
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
-                # matching NOT LIKE and the loop terminates inside the one transaction.
+                # matching and the loop terminates inside the one transaction.
                 cur = await self._db.execute(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
                     f" WHERE {seal_where} LIMIT {int(batch)}",
@@ -12824,7 +13012,9 @@ class MessageStore:
                 if not rows:
                     break
                 # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
-                sealed_values = encrypt_many(
+                sealed_values = await cipher_call(
+                    self._cipher,
+                    encrypt_many,
                     self._cipher,
                     [
                         (
@@ -12836,12 +13026,14 @@ class MessageStore:
                         for r in rows
                     ],
                 )
-                await self._db.executemany(
+                await self._update_every_row(
                     f"UPDATE {table} SET {column}=? WHERE {where_keys}",
                     [
                         (value, *(r[c] for c in keys))
                         for value, r in zip(sealed_values, rows, strict=True)
                     ],
+                    f"{table}.{column}",
+                    exact=True,
                 )
                 sealed += len(rows)
             await self._commit()
@@ -12852,6 +13044,26 @@ class MessageStore:
         # Top the reserve back up for whatever follows; the burst itself was reserved in step 2.
         await self._charge_bound_batch()
         return sealed
+
+    async def _update_every_row(
+        self, sql: str, params: Sequence[Sequence[object]], cell: str, *, exact: bool = False
+    ) -> None:
+        """Run a seal or rotation UPDATE, refusing when a row it had to write stayed unwritten.
+
+        SQLite allows NULL in a non-INTEGER primary key, and ``key = NULL`` matches nothing, so such
+        a row would stay selected and its pass would encrypt it again forever (BACKLOG #5506). The
+        caller's guard or unwind rolls the uncommitted batch back. Names the cell, never a value.
+        ``exact`` is the seal's, whose read and write share one transaction, so any shortfall is a
+        fault. A rotation reads outside its write, so there only a NULL key refuses: a row another
+        process deleted in between has nothing left to rotate."""
+        cur = await self._db.executemany(sql, params)
+        missed = cur.rowcount != len(params)
+        if missed and (exact or any(v is None for p in params for v in p[1:])):
+            raise CipherError(
+                f"cipher column {cell}: an update wrote {cur.rowcount} of {len(params)} row(s), so"
+                " a row's key is NULL or changed. Nothing in this batch was kept; repair or remove"
+                " that row and retry"
+            )
 
     async def _surface_keyed(self, table: str, column: str) -> bool:
         """Whether ``table.column`` has its persisted ``keyed_surface`` marker (BACKLOG #3383)."""
@@ -12864,7 +13076,7 @@ class MessageStore:
     async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
         """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
         cur = await self._db.execute(
-            f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (like,)
+            f"SELECT 1 FROM {table} WHERE {marker_test_sql(column, present=True)} LIMIT 1", (like,)
         )
         return await cur.fetchone() is not None
 
@@ -12961,7 +13173,7 @@ class MessageStore:
                     # excluding NULL/blank. Rewritten rows match active_like next round, so this ends.
                     cur = await self._db.execute(
                         f"SELECT id, {column} FROM {table}"
-                        f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT ?",
+                        f" WHERE {self._rotation_scan(column)} LIMIT ?",
                         (active_like, batch),
                     )
                     rows = list(await cur.fetchall())
@@ -12979,7 +13191,9 @@ class MessageStore:
                         )
                         for r in rows
                     ]
-                    await self._db.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", updates)
+                    await self._update_every_row(
+                        f"UPDATE {table} SET {column}=? WHERE id=?", updates, f"{table}.{column}"
+                    )
                     await self._commit()
                     await self._charge_bound_batch()
                     total += len(rows)
@@ -13028,6 +13242,17 @@ class MessageStore:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
+    def _rotation_scan(self, column: str) -> str:
+        """The rotation's "not under the active key" filter, whose pattern binds as ``?1``.
+
+        Byte-exact, so a value in another case is selected and the decrypt refuses it (BACKLOG
+        #5611). Under the opt-out that decrypt passes an unmarked value through, so the filter
+        stays the ``LIKE`` it was: this fix widens nothing there. It does not protect such a value
+        either: one that does not fold to the active prefix is selected and re-sealed."""
+        if allows_unmarked(self._cipher):
+            return f"{column} NOT LIKE ?1 AND {column} <> ''"
+        return f"{marker_test_sql(column, present=False)} AND {column} <> ''"
+
     @staticmethod
     def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any configured key) then re-encrypt under the active key, rebinding the
@@ -13062,10 +13287,22 @@ class MessageStore:
         matches the marker filter."""
         total = skipped = 0
         after = ""
+        # The page filter below never selects a NULL or empty id, so such a cell would stay under a
+        # prior key while the rotation reports success (BACKLOG #5506).
+        cur = await self._db.execute(
+            f"SELECT 1 FROM {table} WHERE (id IS NULL OR id = '')"
+            f" AND {self._rotation_scan(column)} LIMIT 1",
+            (active_like,),
+        )
+        if await cur.fetchone() is not None:
+            raise CipherError(
+                f"cipher column {table}.{column}: a row with a NULL or empty id cannot be rotated;"
+                " repair or remove that row and retry"
+            )
         while True:
             cur = await self._db.execute(
                 f"SELECT {select}, {column} AS v FROM {table}"
-                f" WHERE {column} NOT LIKE ? AND {column} <> '' AND id > ? ORDER BY id LIMIT ?",
+                f" WHERE {self._rotation_scan(column)} AND id > ? ORDER BY id LIMIT ?",
                 (active_like, after, batch),
             )
             rows = list(await cur.fetchall())
@@ -13106,7 +13343,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT attachment_id, seq, ciphertext FROM attachment_chunk"
-                " WHERE ciphertext NOT LIKE ? AND ciphertext <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('ciphertext')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13124,8 +13361,10 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?", updates
+            await self._update_every_row(
+                "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?",
+                updates,
+                "attachment_chunk.ciphertext",
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13143,7 +13382,7 @@ class MessageStore:
         rotated = 0
         while True:
             cur = await self._db.execute(
-                "SELECT hash, body FROM shared_body WHERE body NOT LIKE ? AND body <> '' LIMIT ?",
+                f"SELECT hash, body FROM shared_body WHERE {self._rotation_scan('body')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13158,7 +13397,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE shared_body SET body=? WHERE hash=?", updates)
+            await self._update_every_row(
+                "UPDATE shared_body SET body=? WHERE hash=?", updates, "shared_body.body"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13198,7 +13439,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT namespace, key, value FROM state"
-                " WHERE value NOT LIKE ? AND value <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('value')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13214,8 +13455,8 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE state SET value=? WHERE namespace=? AND key=?", updates
+            await self._update_every_row(
+                "UPDATE state SET value=? WHERE namespace=? AND key=?", updates, "state.value"
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13232,7 +13473,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT name, version, key, value FROM reference"
-                " WHERE value NOT LIKE ? AND value <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('value')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13251,8 +13492,10 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?", updates
+            await self._update_every_row(
+                "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?",
+                updates,
+                "reference.value",
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13273,7 +13516,7 @@ class MessageStore:
             while True:
                 cur = await self._db.execute(
                     f"SELECT message_id, destination_name, response_seq, {column} FROM response"
-                    f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT ?",
+                    f" WHERE {self._rotation_scan(column)} LIMIT ?",
                     (active_like, batch),
                 )
                 rows = list(await cur.fetchall())
@@ -13298,10 +13541,11 @@ class MessageStore:
                     )
                     for r in rows
                 ]
-                await self._db.executemany(
+                await self._update_every_row(
                     f"UPDATE response SET {column}=?"
                     " WHERE message_id=? AND destination_name=? AND response_seq=?",
                     updates,
+                    f"response.{column}",
                 )
                 await self._commit()
                 await self._charge_bound_batch()
@@ -13318,7 +13562,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, message_id, ts, event, detail FROM message_events"
-                " WHERE detail NOT LIKE ? AND detail <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('detail')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13335,7 +13579,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE message_events SET detail=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE message_events SET detail=? WHERE id=?", updates, "message_events.detail"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13350,7 +13596,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, connection, ts, kind, reason FROM connection_event"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('reason')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13367,7 +13613,11 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE connection_event SET reason=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE connection_event SET reason=? WHERE id=?",
+                updates,
+                "connection_event.reason",
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13383,7 +13633,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, event_type, connection, reason FROM alert_instance"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('reason')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13400,7 +13650,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE alert_instance SET reason=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE alert_instance SET reason=? WHERE id=?", updates, "alert_instance.reason"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13855,9 +14107,11 @@ class MessageStore:
                         mid,
                         now,
                         "received",
-                        self._enc(
-                            f"{len(deliveries)} destination(s)",
-                            aad=cell_aad("message_events", "detail", mid, now, "received"),
+                        (
+                            await self._aenc(
+                                f"{len(deliveries)} destination(s)",
+                                aad=cell_aad("message_events", "detail", mid, now, "received"),
+                            )
                         ),
                     ),
                 )
@@ -13919,7 +14173,7 @@ class MessageStore:
             (
                 body_hash,
                 # Content-address cell (ASVS 11.3.3): the hash is over the plaintext, rotation-stable.
-                self._cipher.encrypt(payload, aad=cell_aad("shared_body", "body", body_hash)),
+                await self._aencrypt(payload, aad=cell_aad("shared_body", "body", body_hash)),
                 refs,
                 now,
             ),
@@ -14066,9 +14320,11 @@ class MessageStore:
             )
             async for row in cur:
                 # Bound to (attachment_id, seq) — a chunk relocated to another attachment/seq fails closed.
-                yield self._cipher.decrypt(
-                    row["ciphertext"],
-                    aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
+                yield (
+                    await self._adecrypt(
+                        row["ciphertext"],
+                        aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
+                    )
                 )
 
     async def attachments_for(
@@ -14324,7 +14580,7 @@ class MessageStore:
         # the store gains a key while the row is live, the first keyed open seals it (BACKLOG #3495),
         # because a keyed claim refuses a blank. Once the row is terminal, the blank stays and reads
         # as an erasure.
-        stored_payload = self._cipher.encrypt(
+        stored_payload = await self._aencrypt(
             payload if body_ref is None else body_ref,
             aad=queue_payload_aad(
                 row_id=row_id,
@@ -14386,17 +14642,19 @@ class MessageStore:
                 Stage.ROUTED.value,
                 channel_id,
                 handler_name,
-                self._cipher.encrypt(
-                    payload,
-                    aad=queue_payload_aad(
-                        row_id=row_id,
-                        message_id=mid,
-                        stage=Stage.ROUTED.value,
-                        channel_id=channel_id,
-                        destination_name=None,
-                        handler_name=handler_name,
-                        body_ref=None,
-                    ),
+                (
+                    await self._aencrypt(
+                        payload,
+                        aad=queue_payload_aad(
+                            row_id=row_id,
+                            message_id=mid,
+                            stage=Stage.ROUTED.value,
+                            channel_id=channel_id,
+                            destination_name=None,
+                            handler_name=handler_name,
+                            body_ref=None,
+                        ),
+                    )
                 ),
                 OutboxStatus.PENDING.value,
                 now,
@@ -14476,17 +14734,19 @@ class MessageStore:
                     mid,
                     Stage.INGRESS.value,
                     channel_id,
-                    self._cipher.encrypt(
-                        raw,
-                        aad=queue_payload_aad(
-                            row_id=ingress_row_id,
-                            message_id=mid,
-                            stage=Stage.INGRESS.value,
-                            channel_id=channel_id,
-                            destination_name=None,
-                            handler_name=None,
-                            body_ref=None,
-                        ),
+                    (
+                        await self._aencrypt(
+                            raw,
+                            aad=queue_payload_aad(
+                                row_id=ingress_row_id,
+                                message_id=mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=channel_id,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
+                        )
                     ),
                     OutboxStatus.PENDING.value,
                     now,
@@ -14505,9 +14765,11 @@ class MessageStore:
                         mid,
                         now,
                         "received",
-                        self._enc(
-                            "ingress",
-                            aad=cell_aad("message_events", "detail", mid, now, "received"),
+                        (
+                            await self._aenc(
+                                "ingress",
+                                aad=cell_aad("message_events", "detail", mid, now, "received"),
+                            )
                         ),
                     ),
                 )
@@ -14686,9 +14948,11 @@ class MessageStore:
                 name,
                 version,
                 k,
-                self._cipher.encrypt(
-                    text,
-                    aad=cell_aad("reference", "value", name, version, k),
+                (
+                    await self._aencrypt(
+                        text,
+                        aad=cell_aad("reference", "value", name, version, k),
+                    )
                 ),
             )
             for k, text in encoded
@@ -14756,7 +15020,7 @@ class MessageStore:
             (
                 namespace,
                 key,
-                self._cipher.encrypt(value_json, aad=cell_aad("state", "value", namespace, key)),
+                await self._aencrypt(value_json, aad=cell_aad("state", "value", namespace, key)),
                 now,
                 message_id,
             ),
@@ -14841,7 +15105,9 @@ class MessageStore:
                 prow = await pcur.fetchone()
                 if prow is not None:
                     msg_channel = str(prow["channel_id"])
-                    pmeta_json = open_message_cell(
+                    pmeta_json = await cipher_call(
+                        self._cipher,
+                        open_message_cell,
                         self._cipher,
                         "metadata",
                         prow["metadata"],
@@ -14854,9 +15120,42 @@ class MessageStore:
             if pt_deliveries:
                 parent_meta: dict[str, Any] = {}
                 if pmeta_json:
-                    loaded = json.loads(pmeta_json)
-                    if isinstance(loaded, dict):
-                        parent_meta = loaded
+                    # BACKLOG #5758: refuse only a cell that would make the child's own reads raise,
+                    # by running them; a valid non-object still reads as no lineage. Raised outside
+                    # the except: json's error holds the whole cell.
+                    unreadable = False
+                    try:
+                        loaded = json.loads(pmeta_json)
+                        if isinstance(loaded, dict):
+                            child_depth = int(loaded.get("correlation_depth", 0) or 0) + 1
+                            str(child_depth)  # the child's cap branch formats it
+                            if child_depth <= correlation_depth_cap:  # else no child is encoded
+                                json.dumps(
+                                    {
+                                        "correlation_id": message_id,
+                                        "correlation_root_id": loaded.get("correlation_root_id")
+                                        or message_id,
+                                        "correlation_depth": child_depth,
+                                        "passthrough_from": message_id,
+                                    }
+                                )
+                            parent_meta = loaded
+                    except (ValueError, TypeError, OverflowError, RecursionError):
+                        unreadable = True
+                    if unreadable:
+                        # A keyless open hands an mfenc: cell back unchanged: the engine's fault,
+                        # so the runner re-pends the row rather than dead-lettering it.
+                        if pmeta_json.startswith(_ENC_MARKER_PREFIX) and not self._cipher.encrypts:
+                            raise StoreKeylessError(
+                                "store table 'messages' carries encrypted metadata (mfenc: markers)"
+                                " but no store encryption key is configured; set"
+                                " MEFOR_STORE_ENCRYPTION_KEY to the key that wrote it (fail-closed)"
+                            )
+                        err = UnreadableParentMetadataError(
+                            "messages", "metadata", message_id, msg_channel
+                        )
+                        log.warning("%s; the handoff was refused", str(err))
+                        raise err
                 inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = await self._insert_passthrough_child(
@@ -14896,11 +15195,13 @@ class MessageStore:
                 await self._db.execute(
                     "UPDATE messages SET metadata=? WHERE id=?",
                     (
-                        self._enc(
-                            merged,
-                            aad=message_cell_aad(
-                                "metadata", message_id=message_id, channel_id=msg_channel
-                            ),
+                        (
+                            await self._aenc(
+                                merged,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=message_id, channel_id=msg_channel
+                                ),
+                            )
                         ),
                         message_id,
                     ),
@@ -14974,20 +15275,29 @@ class MessageStore:
                 source_type,
                 control_id,
                 message_type,
-                self._cipher.encrypt(
-                    raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aencrypt(
+                        raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                    )
                 ),
                 status,
-                self._enc(
-                    error, aad=message_cell_aad("error", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aenc(
+                        error, aad=message_cell_aad("error", message_id=mid, channel_id=channel_id)
+                    )
                 ),
                 # EF-3: MRN/name is PHI — ciphered at rest like the body
-                self._enc(
-                    summary, aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aenc(
+                        summary,
+                        aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id),
+                    )
                 ),
-                self._enc(
-                    metadata,
-                    aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                (
+                    await self._aenc(
+                        metadata,
+                        aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                    )
                 ),
                 # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
                 origin.value,
@@ -15046,7 +15356,11 @@ class MessageStore:
                         mid,
                         now,
                         event,
-                        self._enc(error, aad=cell_aad("message_events", "detail", mid, now, event)),
+                        (
+                            await self._aenc(
+                                error, aad=cell_aad("message_events", "detail", mid, now, event)
+                            )
+                        ),
                     ),
                 )
             await self._commit()
@@ -15123,7 +15437,9 @@ class MessageStore:
         missing shared body (corruption / premature GC) raises like any undecryptable payload, so the
         caller dead-letters that one row rather than stalling the lane."""
         if row["body_ref"] is None:
-            return OutboxItem.from_row(row, open_queue_cell(self._cipher, row))
+            return OutboxItem.from_row(
+                row, await cipher_call(self._cipher, open_queue_cell, self._cipher, row)
+            )
         async with self._read() as db:
             return OutboxItem.from_row(row, await self._open_queue_body(db, row, alert=False))
 
@@ -15142,7 +15458,7 @@ class MessageStore:
         (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`) takes both paths the same
         way, its alert and audit row saying corrupt rather than drift (BACKLOG #5884)."""
         try:
-            opened = open_queue_cell(self._cipher, row)
+            opened = await cipher_call(self._cipher, open_queue_cell, self._cipher, row)
         except QueueTagError as refused:
             if alert:
                 alert_queue_tag_failure(
@@ -15156,7 +15472,7 @@ class MessageStore:
         if br is None:
             raise CipherError(f"shared body {opened} missing")
         # Deref'd shared body — bound to the shared_body content-address cell, not this queue row.
-        return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
+        return await self._adecrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
 
     async def _dead_letter_unopenable(
         self, row: aiosqlite.Row, exc: Exception
@@ -15697,7 +16013,7 @@ class MessageStore:
                 (
                     OutboxStatus.DEAD.value,
                     now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                 ),
@@ -15754,7 +16070,7 @@ class MessageStore:
                 (
                     OutboxStatus.DEAD.value,
                     now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                 ),
@@ -15930,17 +16246,26 @@ class MessageStore:
                     message_id,
                     destination_name,
                     seq,
-                    self._enc(
-                        body, aad=cell_aad("response", "body", message_id, destination_name, seq)
+                    (
+                        await self._aenc(
+                            body,
+                            aad=cell_aad("response", "body", message_id, destination_name, seq),
+                        )
                     ),
                     outcome,
-                    self._enc(
-                        detail,
-                        aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                    (
+                        await self._aenc(
+                            detail,
+                            aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                        )
                     ),
-                    self._enc(
-                        headers_json,
-                        aad=cell_aad("response", "resp_headers", message_id, destination_name, seq),
+                    (
+                        await self._aenc(
+                            headers_json,
+                            aad=cell_aad(
+                                "response", "resp_headers", message_id, destination_name, seq
+                            ),
+                        )
                     ),
                     now,
                 ),
@@ -15968,17 +16293,19 @@ class MessageStore:
                         reingress_to,
                         None,
                         None,
-                        self._enc(
-                            artifact_ref,
-                            aad=queue_payload_aad(
-                                row_id=work_row_id,
-                                message_id=message_id,
-                                stage=Stage.RESPONSE.value,
-                                channel_id=reingress_to,
-                                destination_name=None,
-                                handler_name=None,
-                                body_ref=None,
-                            ),
+                        (
+                            await self._aenc(
+                                artifact_ref,
+                                aad=queue_payload_aad(
+                                    row_id=work_row_id,
+                                    message_id=message_id,
+                                    stage=Stage.RESPONSE.value,
+                                    channel_id=reingress_to,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            )
                         ),
                         OutboxStatus.PENDING.value,
                         0,
@@ -16115,17 +16442,19 @@ class MessageStore:
                     pt_channel,
                     None,
                     None,
-                    self._cipher.encrypt(
-                        body,
-                        aad=queue_payload_aad(
-                            row_id=pt_ingress_id,
-                            message_id=new_mid,
-                            stage=Stage.INGRESS.value,
-                            channel_id=pt_channel,
-                            destination_name=None,
-                            handler_name=None,
-                            body_ref=None,
-                        ),
+                    (
+                        await self._aencrypt(
+                            body,
+                            aad=queue_payload_aad(
+                                row_id=pt_ingress_id,
+                                message_id=new_mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=pt_channel,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
+                        )
                     ),
                     OutboxStatus.PENDING.value,
                     0,
@@ -16179,17 +16508,19 @@ class MessageStore:
                 channel_id,
                 pt_name,
                 PASSTHROUGH_MARKER_HANDLER,
-                self._cipher.encrypt(
-                    "",
-                    aad=queue_payload_aad(
-                        row_id=marker_id,
-                        message_id=parent_id,
-                        stage=Stage.OUTBOUND.value,
-                        channel_id=channel_id,
-                        destination_name=pt_name,
-                        handler_name=PASSTHROUGH_MARKER_HANDLER,
-                        body_ref=None,
-                    ),
+                (
+                    await self._aencrypt(
+                        "",
+                        aad=queue_payload_aad(
+                            row_id=marker_id,
+                            message_id=parent_id,
+                            stage=Stage.OUTBOUND.value,
+                            channel_id=channel_id,
+                            destination_name=pt_name,
+                            handler_name=PASSTHROUGH_MARKER_HANDLER,
+                            body_ref=None,
+                        ),
+                    )
                 ),
                 status,
                 0,
@@ -16326,7 +16657,11 @@ class MessageStore:
                     " WHERE id=?",
                     (
                         OutboxStatus.DEAD.value,
-                        self._enc(error, aad=cell_aad("queue", "last_error", response_row_id)),
+                        (
+                            await self._aenc(
+                                error, aad=cell_aad("queue", "last_error", response_row_id)
+                            )
+                        ),
                         now,
                         now,
                         response_row_id,
@@ -16338,7 +16673,7 @@ class MessageStore:
                 return True
 
             try:
-                ref = open_queue_cell(self._cipher, wr) or ""
+                ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
             except QueueTagError as err:
@@ -16383,12 +16718,11 @@ class MessageStore:
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
                 )
             body = (
-                self._dec(
+                await self._adec(
                     art["body"],
                     aad=cell_aad("response", "body", origin_msg_id, dest, seq),
                 )
-                or ""
-            )
+            ) or ""
             # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
             cur = await self._db.execute(
                 "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -16399,12 +16733,16 @@ class MessageStore:
             # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
             try:
                 meta_json = (
-                    open_message_cell(
-                        self._cipher,
-                        "metadata",
-                        mrow["metadata"],
-                        message_id=origin_id,
-                        channel_id=mrow["channel_id"],
+                    (
+                        await cipher_call(
+                            self._cipher,
+                            open_message_cell,
+                            self._cipher,
+                            "metadata",
+                            mrow["metadata"],
+                            message_id=origin_id,
+                            channel_id=mrow["channel_id"],
+                        )
                     )
                     if mrow
                     else None
@@ -16426,10 +16764,12 @@ class MessageStore:
                     " WHERE id=?",
                     (
                         OutboxStatus.DEAD.value,
-                        self._enc(
-                            f"re-ingress correlation depth exceeded "
-                            f"({child_depth} > {correlation_depth_cap})",
-                            aad=cell_aad("queue", "last_error", response_row_id),
+                        (
+                            await self._aenc(
+                                f"re-ingress correlation depth exceeded "
+                                f"({child_depth} > {correlation_depth_cap})",
+                                aad=cell_aad("queue", "last_error", response_row_id),
+                            )
                         ),
                         now,
                         now,
@@ -16492,17 +16832,19 @@ class MessageStore:
                             loopback_channel_id,
                             None,
                             None,
-                            self._cipher.encrypt(
-                                body,
-                                aad=queue_payload_aad(
-                                    row_id=reingress_row_id,
-                                    message_id=new_mid,
-                                    stage=Stage.INGRESS.value,
-                                    channel_id=loopback_channel_id,
-                                    destination_name=None,
-                                    handler_name=None,
-                                    body_ref=None,
-                                ),
+                            (
+                                await self._aencrypt(
+                                    body,
+                                    aad=queue_payload_aad(
+                                        row_id=reingress_row_id,
+                                        message_id=new_mid,
+                                        stage=Stage.INGRESS.value,
+                                        channel_id=loopback_channel_id,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
+                                )
                             ),
                             OutboxStatus.PENDING.value,
                             0,
@@ -16557,7 +16899,7 @@ class MessageStore:
             if row is None:
                 return None
             try:
-                ref = open_queue_cell(self._cipher, row) or ""
+                ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, row) or ""
             except QueueTagError as err:
                 refused = err  # reported below, once the read connection is released
             else:
@@ -16578,7 +16920,7 @@ class MessageStore:
             )
             raise refused
         return (
-            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
+            await self._adec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"] is not None)
             else ""
         )
@@ -16616,12 +16958,20 @@ class MessageStore:
             seq = (int(seq_row["m"]) if seq_row else 0) + 1
             # Encrypt AFTER seq is known so body/detail bind to the (message_id, dest, seq) cell.
             enc_body = (
-                self._enc(ack_body, aad=cell_aad("response", "body", message_id, dest, seq))
+                (
+                    await self._aenc(
+                        ack_body, aad=cell_aad("response", "body", message_id, dest, seq)
+                    )
+                )
                 if (ack_body and self._cipher.encrypts)
                 else None
             )
             enc_detail = (
-                self._enc(scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq))
+                (
+                    await self._aenc(
+                        scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq)
+                    )
+                )
                 if scrubbed is not None
                 else None
             )
@@ -16665,40 +17015,46 @@ class MessageStore:
                 destination_name=r["destination_name"],
                 response_seq=r["response_seq"],
                 outcome=r["outcome"],
-                detail=self._dec(
-                    r["detail"],
-                    aad=cell_aad(
-                        "response",
-                        "detail",
-                        r["message_id"],
-                        r["destination_name"],
-                        r["response_seq"],
-                    ),
+                detail=(
+                    await self._adec(
+                        r["detail"],
+                        aad=cell_aad(
+                            "response",
+                            "detail",
+                            r["message_id"],
+                            r["destination_name"],
+                            r["response_seq"],
+                        ),
+                    )
                 ),
                 captured_at=r["captured_at"],
-                body=self._dec(
-                    r["body"],
-                    aad=cell_aad(
-                        "response",
-                        "body",
-                        r["message_id"],
-                        r["destination_name"],
-                        r["response_seq"],
-                    ),
+                body=(
+                    await self._adec(
+                        r["body"],
+                        aad=cell_aad(
+                            "response",
+                            "body",
+                            r["message_id"],
+                            r["destination_name"],
+                            r["response_seq"],
+                        ),
+                    )
                 ),
                 kind=r["kind"],
                 ack_code=r["ack_code"],
                 ack_phase=r["ack_phase"],
                 headers=decode_response_headers(
-                    self._dec(
-                        r["resp_headers"],
-                        aad=cell_aad(
-                            "response",
-                            "resp_headers",
-                            r["message_id"],
-                            r["destination_name"],
-                            r["response_seq"],
-                        ),
+                    (
+                        await self._adec(
+                            r["resp_headers"],
+                            aad=cell_aad(
+                                "response",
+                                "resp_headers",
+                                r["message_id"],
+                                r["destination_name"],
+                                r["response_seq"],
+                            ),
+                        )
                     ),
                     row_id=r["message_id"],
                 ),
@@ -16753,7 +17109,7 @@ class MessageStore:
                 (
                     status,
                     next_at,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                     *(
@@ -16834,7 +17190,7 @@ class MessageStore:
                     (
                         status,
                         next_at,
-                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
                         *(
@@ -16894,7 +17250,7 @@ class MessageStore:
                     (
                         OutboxStatus.DEAD.value,
                         now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
                     ),
@@ -17077,7 +17433,7 @@ class MessageStore:
         skipped: list[Any] = []
         for row in orphans:
             try:
-                reason = self._enc(error, aad=cell_aad("queue", "last_error", row["id"]))
+                reason = await self._aenc(error, aad=cell_aad("queue", "last_error", row["id"]))
             except AADComponentError:
                 skipped.append(row)
                 continue
@@ -17265,7 +17621,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, and the row commits with the
         replay (BACKLOG #2624, :data:`OperatorAudit`)."""
-        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
@@ -17387,15 +17743,16 @@ class MessageStore:
 
         Rejects (raise, no mutation): :class:`ResendSourceNotFound` (no delivered source body),
         :class:`ResendSourceEmpty` (retention nulled the source body — must-fix #2),
-        :class:`ResendSourceAmbiguous` (``from_`` omitted with >1 delivered destination), or
+        :class:`ResendSourceAmbiguous` (``from_`` omitted with >1 delivered destination),
         :class:`ResendKeyConflict` (the ``idempotency_key`` was already used for a different
-        message/target — review #123-4).
+        message/target — review #123-4), or, on the edit path, :class:`ResendOriginMetadataUnreadable`
+        (the origin's correlation lineage cannot be carried onto the child, BACKLOG #5758).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
         origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
         ``new_message_id`` (vault BACKLOG #2615)."""
-        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -17466,29 +17823,16 @@ class MessageStore:
                     )
                 # Correlate the child to the origin (mirrors `reingress`): correlation_id/_root_id/
                 # _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-                raw_meta = open_message_cell(
+                raw_meta = await cipher_call(
+                    self._cipher,
+                    open_message_cell,
                     self._cipher,
                     "metadata",
                     mrow["metadata"],
                     message_id=message_id,
                     channel_id=src_channel,
                 )
-                try:
-                    parent_meta = json.loads(raw_meta) if raw_meta else {}
-                except (ValueError, TypeError):
-                    parent_meta = {}
-                if not isinstance(parent_meta, dict):
-                    parent_meta = {}
-                child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                root = parent_meta.get("correlation_root_id") or message_id
-                child_meta = json.dumps(
-                    {
-                        "correlation_id": message_id,
-                        "correlation_root_id": root,
-                        "correlation_depth": child_depth,
-                        "edited_from": message_id,
-                    }
-                )
+                child_meta = edit_child_metadata(raw_meta, origin_message_id=message_id)
                 # The child is created ROUTED with its single outbound delivery already in flight (it
                 # skips router/transform — the operator supplied the final body); the finalizer drives
                 # it to PROCESSED/ERROR from that row, exactly like any message at the outbound stage.
@@ -17621,14 +17965,15 @@ class MessageStore:
         double-delivers. Defense-in-depth: the child id is a deterministic content-address of the key +
         channel + body, pre-checked before INSERT, so even a partial-rollback re-run cannot double-inject.
 
-        Raises :class:`ReingressOriginMissing` (origin gone — belt-and-suspenders; the API 404s first) or
-        :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target). No mutation
-        on a raise (the whole txn rolls back).
+        Raises :class:`ReingressOriginMissing` (origin gone — belt-and-suspenders; the API 404s first),
+        :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target), or
+        :class:`ResendOriginMetadataUnreadable` (the origin's correlation lineage cannot be carried onto
+        the child, BACKLOG #5758). No mutation on a raise (the whole txn rolls back).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
         ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
-        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -17674,29 +18019,16 @@ class MessageStore:
                 return outcome
             # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
             # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-            raw_meta = open_message_cell(
+            raw_meta = await cipher_call(
+                self._cipher,
+                open_message_cell,
                 self._cipher,
                 "metadata",
                 orow["metadata"],
                 message_id=origin_message_id,
                 channel_id=channel_id,
             )
-            try:
-                parent_meta = json.loads(raw_meta) if raw_meta else {}
-            except (ValueError, TypeError):
-                parent_meta = {}
-            if not isinstance(parent_meta, dict):
-                parent_meta = {}
-            child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-            root = parent_meta.get("correlation_root_id") or origin_message_id
-            child_meta = json.dumps(
-                {
-                    "correlation_id": origin_message_id,
-                    "correlation_root_id": root,
-                    "correlation_depth": child_depth,
-                    "edited_from": origin_message_id,
-                }
-            )
+            child_meta = edit_child_metadata(raw_meta, origin_message_id=origin_message_id)
             new_mid = self._edit_resubmit_message_id(idempotency_key, channel_id, raw)
             # Explicit-id INSERT-OR-IGNORE ingress (defense-in-depth): a re-run after a rolled-back
             # partial re-derives the SAME id and skips the re-insert instead of minting a new one.
@@ -17731,17 +18063,19 @@ class MessageStore:
                         new_mid,
                         Stage.INGRESS.value,
                         channel_id,
-                        self._cipher.encrypt(
-                            raw,
-                            aad=queue_payload_aad(
-                                row_id=resubmit_row_id,
-                                message_id=new_mid,
-                                stage=Stage.INGRESS.value,
-                                channel_id=channel_id,
-                                destination_name=None,
-                                handler_name=None,
-                                body_ref=None,
-                            ),
+                        (
+                            await self._aencrypt(
+                                raw,
+                                aad=queue_payload_aad(
+                                    row_id=resubmit_row_id,
+                                    message_id=new_mid,
+                                    stage=Stage.INGRESS.value,
+                                    channel_id=channel_id,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            )
                         ),
                         OutboxStatus.PENDING.value,
                         now,
@@ -17810,7 +18144,7 @@ class MessageStore:
         **A depth-capped pass-through marker is excluded the same way** (:data:`_NOT_PT_MARKER`,
         BACKLOG #1580), through the same shared ``clause``: no worker drains its inbound-only lane, and
         its parent must keep the ``ERROR`` the breach earned rather than revert to ``ROUTED``."""
-        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -17869,7 +18203,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, zero included, and the row commits
         with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
-        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
@@ -17942,7 +18276,9 @@ class MessageStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        return open_message_cell(
+        return await cipher_call(
+            self._cipher,
+            open_message_cell,
             self._cipher,
             "metadata",
             row["metadata"],
@@ -17998,7 +18334,9 @@ class MessageStore:
         out: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
-            withhold_message_cells(
+            await cipher_call(
+                self._cipher,
+                withhold_message_cells,
                 self._cipher,
                 d,
                 ("error", "summary", "metadata"),
@@ -18168,13 +18506,17 @@ class MessageStore:
             for r in await cur.fetchall():
                 d = dict(r)
                 # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
-                d["last_error"] = open_listed_cell(
+                d["last_error"] = await cipher_call(
+                    self._cipher,
+                    open_listed_cell,
                     self._cipher,
                     d["last_error"],
                     cell_aad("queue", "last_error", r["outbox_id"]),
                     table="queue",
                 )
-                withhold_message_cells(
+                await cipher_call(
+                    self._cipher,
+                    withhold_message_cells,
                     self._cipher,
                     d,
                     ("summary",),
@@ -18282,7 +18624,12 @@ class MessageStore:
                 (message_id, Stage.OUTBOUND.value),
             )
             return [
-                self._decode_row(r, "queue", (r["id"],), "last_error") for r in await cur.fetchall()
+                (
+                    await cipher_call(
+                        self._cipher, self._decode_row, r, "queue", (r["id"],), "last_error"
+                    )
+                )
+                for r in await cur.fetchall()
             ]
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
@@ -18303,7 +18650,9 @@ class MessageStore:
             )
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
-                d = self._decode_row(r, "queue", (r["id"],), "last_error")
+                d = await cipher_call(
+                    self._cipher, self._decode_row, r, "queue", (r["id"],), "last_error"
+                )
                 dead = r["status"] == OutboxStatus.DEAD.value
                 try:
                     d["payload"] = (
@@ -18324,8 +18673,15 @@ class MessageStore:
                 "SELECT * FROM message_events WHERE message_id=? ORDER BY id", (message_id,)
             )
             return [
-                self._decode_row(
-                    r, "message_events", (r["message_id"], r["ts"], r["event"]), "detail"
+                (
+                    await cipher_call(
+                        self._cipher,
+                        self._decode_row,
+                        r,
+                        "message_events",
+                        (r["message_id"], r["ts"], r["event"]),
+                        "detail",
+                    )
                 )
                 for r in await cur.fetchall()
             ]
@@ -18348,17 +18704,21 @@ class MessageStore:
         # scans `FROM queue`). Deliberately no BEGIN of its own: the #1548 cancel-unwind tests use this
         # writer as their probe for an inherited open transaction
         # (tests/test_backlog1548_writer_txn_cancel_unwind.py). Its guard rolls one back on entry.
-        params = self._connection_event_params(
-            ConnectionEventWrite(
-                connection=connection,
-                transport=transport,
-                direction=direction,
-                kind=kind,
-                peer_host=peer_host,
-                message_id=message_id,
-                reason=reason,
-                now=now,
-            )
+        params = await cipher_call(
+            self._cipher,
+            self._connection_event_params,
+            stamped_connection_event(
+                ConnectionEventWrite(
+                    connection=connection,
+                    transport=transport,
+                    direction=direction,
+                    kind=kind,
+                    peer_host=peer_host,
+                    message_id=message_id,
+                    reason=reason,
+                    now=now,
+                )
+            ),
         )
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(_CONNECTION_EVENT_INSERT, params)
@@ -18368,7 +18728,10 @@ class MessageStore:
         # A burst in ONE transaction (BACKLOG #1731): the runner's drainer hands over everything
         # already queued, so a connect-per-message sender pays one commit per burst, not per event.
         # _writer_txn: the whole burst is one explicit transaction, so it commits or unwinds whole.
-        rows = [self._connection_event_params(ev) for ev in events]
+        stamped = [stamped_connection_event(ev) for ev in events]
+        rows = [
+            await cipher_call(self._cipher, self._connection_event_params, ev) for ev in stamped
+        ]
         if not rows:
             return
         async with _writer_txn(self._db, self._lock):
@@ -18440,11 +18803,17 @@ class MessageStore:
                     peer_host=r["peer_host"],
                     message_id=r["message_id"],
                     # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
-                    reason=open_listed_cell(
-                        self._cipher,
-                        r["reason"],
-                        cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
-                        table="connection_event",
+                    reason=(
+                        await cipher_call(
+                            self._cipher,
+                            open_listed_cell,
+                            self._cipher,
+                            r["reason"],
+                            cell_aad(
+                                "connection_event", "reason", r["connection"], r["ts"], r["kind"]
+                            ),
+                            table="connection_event",
+                        )
                     ),
                 )
                 for r in await cur.fetchall()
@@ -18497,9 +18866,11 @@ class MessageStore:
         # Bound to (event_type, connection) — the de-dup grain the upsert keys on, so the SAME AAD covers
         # both the INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3).
         reason_enc = (
-            self._enc(
-                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
-                aad=cell_aad("alert_instance", "reason", event_type, connection),
+            (
+                await self._aenc(
+                    safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
+                    aad=cell_aad("alert_instance", "reason", event_type, connection),
+                )
             )
             if reason
             else None
@@ -18555,7 +18926,10 @@ class MessageStore:
                 " ORDER BY last_seen DESC, id DESC LIMIT ?",
                 params,
             )
-            return [self._alert_instance_row(r, listed=True) for r in await cur.fetchall()]
+            return [
+                await cipher_call(self._cipher, self._alert_instance_row, r, listed=True)
+                for r in await cur.fetchall()
+            ]
 
     async def summarize_active_alert_instances(
         self, *, allowed_channels: Sequence[str] | None
@@ -18596,7 +18970,11 @@ class MessageStore:
                 params,
             )
             row = await cur.fetchone()
-            return self._alert_instance_row(row, listed=False) if row is not None else None
+            return (
+                await cipher_call(self._cipher, self._alert_instance_row, row, listed=False)
+                if row is not None
+                else None
+            )
 
     def _alert_instance_row(self, r: aiosqlite.Row, *, listed: bool) -> AlertInstance:
         aad = cell_aad("alert_instance", "reason", r["event_type"], r["connection"])
@@ -18952,10 +19330,16 @@ class MessageStore:
             )
             last = await cur.fetchone()
             # BACKLOG #1904: raises AuditHeadMovedError when the caller sealed a different head.
-            seq, row_hash = audit_seal_next(
+            seq, row_hash = await cipher_call(
+                self._audit_mac_fn,
+                audit_seal_next,
                 None if last is None else (last["seq"], last["row_hash"]),
                 expect_prev,
-                self._audit_append_mac,
+                held_append_mac(
+                    None if last is None else (last["seq"], last["row_hash"]),
+                    expect_prev,
+                    self._audit_append_mac,
+                ),
                 ts=now,
                 actor=actor,
                 action=action,
@@ -19855,7 +20239,9 @@ class MessageStore:
         ``verify``, which Vault makes with Go's constant-time ``hmac.Equal``, BACKLOG #2720.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
-        return verify_audit_rows(
+        return await cipher_call(
+            self._audit_mac_fn,
+            verify_audit_rows,
             await self._audit_rows(),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
@@ -20060,7 +20446,9 @@ class MessageStore:
             if (
                 self._row_sealer is not None
                 and not removes_all
-                and passkey_digest(await self._account_passkeys(user_id)) != current.row.cred_digest
+                and not passkey_set_matches(
+                    await self._account_passkeys(user_id), current.row.cred_digest
+                )
             ):
                 raise RowSealError(USER_KIND)
         # With no account the statement runs as it always did: an INSERT meets the foreign key and
@@ -20374,7 +20762,7 @@ class MessageStore:
         confirmed by :meth:`enable_totp` after the user proves a live code. Returns the stored cell,
         which :meth:`enable_totp` compares against, or ``None`` when nothing was written."""
         now = time.time() if now is None else now
-        sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
+        sealed = await self._aenc(secret, aad=cell_aad("users", "totp_secret", user_id))
         async with _writer_guard(self._db, self._lock):
             written = await self._write_user(user_id, totp_stage(sealed, now))
             await self._commit()
@@ -20500,7 +20888,7 @@ class MessageStore:
         seed in place."""
         now = time.time() if now is None else now
         change = totp_replace(
-            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            sealed_secret=await self._aenc(secret, aad=cell_aad("users", "totp_secret", user_id)),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
@@ -21213,7 +21601,7 @@ class MessageStore:
             row = await cur.fetchone()
             effective_id = str(row["id"]) if row is not None else preset_id
             # Bound to the row id and its owner (BACKLOG #2593).
-            enc = self._enc(
+            enc = await self._aenc(
                 criteria,
                 aad=preset_criteria_aad(preset_id=effective_id, owner_user_id=owner_user_id),
             )
@@ -21267,8 +21655,13 @@ class MessageStore:
             out = dict(row)
             # Bound to the row id and its owner (BACKLOG #2593): a preset moved to another owner
             # outside the store refuses here.
-            out["criteria"] = open_preset_criteria(
-                self._cipher, row["criteria"], preset_id=preset_id, owner_user_id=owner_user_id
+            out["criteria"] = await cipher_call(
+                self._cipher,
+                open_preset_criteria,
+                self._cipher,
+                row["criteria"],
+                preset_id=preset_id,
+                owner_user_id=owner_user_id,
             )
         # Outside the _read() block: on the :memory: fallback path _read() holds self._lock, and the
         # pooled read connections are PRAGMA query_only=ON — the stamp must go to the writer.
@@ -23095,7 +23488,11 @@ class MessageStore:
                 now,
                 event,
                 destination,
-                self._enc(detail, aad=cell_aad("message_events", "detail", message_id, now, event)),
+                (
+                    await self._aenc(
+                        detail, aad=cell_aad("message_events", "detail", message_id, now, event)
+                    )
+                ),
             ),
         )
 

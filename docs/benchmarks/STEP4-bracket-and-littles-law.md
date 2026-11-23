@@ -411,12 +411,20 @@ Same flags, `--run-id s4-climbB`, its own `--keep-logs-dir` (identical log names
 
 ### 5.2 How N (concurrency) is measured — TWO estimators, cross-checked
 
-**N1 — the EXACT counting process (zero code change; this is the one that matters).**
+**N1 — the counting process (zero code change; this is the one that matters).**
 `concurrency.n_outbound_rows` in the tool's JSON: the time-average of
-`N(t) = #transformed<=t - #delivered<=t` over the rung's steady window. A `transformed` row is the **birth**
-of an outbound row (the routed->outbound handoff produces them in the same committed transaction); a
-`delivered` row is its **death**. It needs **no pairing**, **no `claimed_at` column**, and **no Little's
-law** — it is a count.
+`N(t) = #transformed<=t - #delivered<=t` over the rung's steady window. It needs **no pairing**, **no
+`claimed_at` column**, and **no Little's law** — it is a count. It is **not exact in general**: the stores
+write one `transformed` event per **handler handoff**, however many outbound rows that handoff produced, so
+a `transformed` event stands for one row's birth only where each handler delivers once, as in this plan's
+8-handler, one-delivery-each topology. A `delivered` event is a row's **death**.
+
+The tool checks that premise and **refuses the figure** when it fails: `n_outbound_rows` is `null` when any
+message received before the window's end has different `transformed` and `delivered` counts or a repeated
+destination. `concurrency.n_outbound_parity` gives the count of such messages. The check is **necessary, not
+sufficient**: handlers delivering 2 and 0 pass it with the second birth stamped at the wrong handoff. A null
+figure makes an otherwise passing armed gate **NO VERDICT** (`census.ok` is `null`, `census.unmeasured` names
+the figure), and `--strict` exits 2 on it.
 
 > WARNING: **N1 is NOT capped at 8.** It counts **QUEUED + IN-SERVICE** outbound rows; only rows *in service* are
 > bounded by the 8 lanes. "N is about 8, therefore the lanes are saturated" is a **category error** — resident
@@ -584,7 +592,10 @@ seen the primary does not count.
   tool on each half. Require **|median E2E(2nd half) - median E2E(1st half)| / median E2E(rung) <= 0.10**
   and the same for `n_outbound_rows`. A **filling** rung is not a Little's-law point. A rung failing M2 is
   **EXCLUDED and REPORTED as excluded** — never silently dropped. *(A near-ceiling rung will legitimately
-  fail M2: filling IS what collapse is. That rung **brackets**; it does not regress.)*
+  fail M2: filling IS what collapse is. That rung **brackets**; it does not regress.)* **If
+  `n_outbound_rows` is `null` for the rung or for either half, M2 cannot be evaluated, so the rung FAILS
+  M2**: it is excluded and reported as excluded, with `n_outbound_parity` as the reason. Never read a null
+  as zero, and never pass M2 on the E2E half alone.
 - **M3 — THE RUNGS REALLY DIFFERED.** Achieved lambda (from the tool, engine-side) must be **strictly
   increasing** across admitted rungs and within **2%** of offered. Regress on **ACHIEVED**, never offered.
 - **M4 — SAME SESSION.** Both climbs, the attribution rung, tempdb, MAXDOP and instance state in ONE

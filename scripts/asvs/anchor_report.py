@@ -40,9 +40,12 @@ reader rejects, and a record carrying no anchors. None of them may print "nothin
 clean-looking zero off a broken read is the exact failure this item exists to prevent, and exit
 :data:`EXIT_FINDINGS` off one is worse, because that code asserts a measurement that never happened.
 
-A git range that would not resolve is NOT in that class and does not exit 2. The anchor population
-was read, so the main answer stands; only the narrowing is unavailable, and it says UNKNOWN in its
-own row rather than printing a zero.
+A failure AFTER the record loads is :data:`EXIT_INSTRUMENT` too -- at least a git that is missing or
+hangs, a cited file that will not open, and a console that cannot encode the report.
+
+A git range that would not resolve is NOT in that class and does not exit 2. Git ran and answered
+non-zero, the anchor population was read, so the main answer stands; only the narrowing is
+unavailable, and it says UNKNOWN in its own row rather than printing a zero.
 
 Usage::
 
@@ -53,12 +56,17 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import hashlib
+import os
+import stat
 import subprocess  # nosec B404 - fixed argv, no shell; see _git
 import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # The sibling verifier, imported by PATH rather than as a package: ``scripts/asvs`` has no
 # ``__init__.py``, and the vault runs these tools as bare scripts from its own working directory.
@@ -94,6 +102,10 @@ PATH_MISSING = "path_missing"
 #: certifies nothing, which is the reason ``check_anchors`` treats it as fatal rather than as drift.
 UNRESOLVED = (PATH_MISSING, ANCHOR_GONE, ANCHOR_AMBIGUOUS)
 
+#: Windows' invalid-name error, and its symlink-loop error.
+_ERROR_INVALID_NAME = 123
+_ERROR_CANT_RESOLVE_FILENAME = 1921
+
 
 @dataclass(frozen=True)
 class AnchorOutcome:
@@ -118,6 +130,38 @@ class AnchorOutcome:
 #: already lost it once. See :func:`_refuse_unreadable`.
 
 
+def _read_cited(target: Path) -> str | None:
+    """The cited file's text, or None when it is not there.
+
+    ``stat`` rather than ``Path.is_file``, which answers False on ANY stat failure and so would
+    report a file this run could not examine as a file that is missing. Only the errors that mean
+    "not there" are None; any other reaches the guard in :func:`main`.
+    """
+    try:
+        mode = target.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        if _names_no_file(exc):
+            return None
+        raise
+    if not stat.S_ISREG(mode):
+        return None
+    return target.read_text(encoding="utf-8", errors="replace")
+
+
+def _names_no_file(exc: OSError) -> bool:
+    """A name this filesystem cannot hold, or a symlink loop, which reaches no file on any platform.
+
+    A Windows error is judged by its ``winerror`` alone. CPython gives EINVAL to every Windows error
+    it has no mapping for, at least 64, 1117, 1920 and 362, so EINVAL says nothing about the name.
+    """
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in (_ERROR_INVALID_NAME, _ERROR_CANT_RESOLVE_FILENAME)
+    return exc.errno in (errno.ENAMETOOLONG, errno.ELOOP)
+
+
 def audit(cells: list[Cell], root: Path) -> list[AnchorOutcome]:
     """Resolve every anchor against ``root``, using the verifier's own locator.
 
@@ -132,11 +176,7 @@ def audit(cells: list[Cell], root: Path) -> list[AnchorOutcome]:
         for anchor in cell.evidence:
             target = root / anchor.path
             if target not in text_cache:
-                text_cache[target] = (
-                    target.read_text(encoding="utf-8", errors="replace")
-                    if target.is_file()
-                    else None
-                )
+                text_cache[target] = _read_cited(target)
             text = text_cache[target]
             if text is None:
                 out.append(AnchorOutcome(anchor.path, PATH_MISSING))
@@ -252,7 +292,9 @@ def _file_key(item: tuple[str, int]) -> tuple[int, str]:
 
 
 def _refuse(message: str) -> int:
-    sys.stderr.write(f"REFUSING: {message}\n")
+    # A stderr that cannot be written must not turn "could not measure" into another exit code.
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        sys.stderr.write(f"REFUSING: {message}\n")
     return EXIT_INSTRUMENT
 
 
@@ -278,8 +320,22 @@ def _refuse_unreadable(scorecard: Path, exc: BaseException) -> int:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def _refuse_unfinished(exc: BaseException) -> int:
+    """Refuse a run that failed after the record loaded, naming the exception's TYPE only.
+
+    Its message can quote a path or a line of what was being read, and this output goes to a public
+    log, so it stays behind for the same reason :func:`_refuse_unreadable` withholds the reader's.
+    """
+    return _refuse(
+        f"the report could not finish ({type(exc).__name__}). This run is not evidence about any "
+        "anchor, and the exception's own message is withheld because this output goes to a public "
+        "log."
+    )
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    # `python -OO` strips the docstring, and that must not become a traceback and exit 1.
+    ap = argparse.ArgumentParser(description=(__doc__ or "ASVS anchor report\n").splitlines()[0])
     # REQUIRED, with no default. The record is not in this repository, so a default would name a path
     # here and quietly measure the wrong tree -- or nothing at all -- while printing a full report.
     ap.add_argument(
@@ -301,8 +357,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=f"exit {EXIT_FINDINGS} when any anchor no longer resolves (default: report only)",
     )
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv)
 
+
+def _measure(args: argparse.Namespace) -> int:
     if not args.scorecard.is_file():
         return _refuse(
             f"no scorecard at {args.scorecard}. This run read nothing, so it is not evidence about "
@@ -357,10 +415,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.changed_since and changed is None:
         # Reported inside the summary rather than fatal: the anchor population was read successfully,
         # so the main answer stands. Only the narrowing is unavailable, and it says so in its own row.
-        sys.stderr.write(
-            f"NOTE: git could not resolve {args.changed_since}...HEAD in {args.root}, so the "
-            "changed-file narrowing is UNKNOWN rather than empty.\n"
-        )
+        # A git that RAISED is not this case; it reaches the guard in main.
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            sys.stderr.write(
+                f"NOTE: git could not resolve {args.changed_since}...HEAD in {args.root}, so the "
+                "changed-file narrowing is UNKNOWN rather than empty.\n"
+            )
 
     print(
         "\n".join(
@@ -373,11 +433,40 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     )
+    # Before the guard ends: a buffered stdout would otherwise fail at interpreter exit instead.
+    sys.stdout.flush()
 
     if any(o.status in UNRESOLVED for o in outcomes) and args.strict:
         return EXIT_FINDINGS
     return EXIT_OK
 
 
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    try:
+        return _measure(args)
+    except Exception as exc:
+        # BROAD for the reason the read boundary in _measure is: at least a missing or hung git, a
+        # cited file that will not open and a console that cannot encode the report land here, and
+        # each would otherwise be a traceback and exit 1, a finding nobody measured.
+        return _refuse_unfinished(exc)
+
+
+def _flush_or_discard(stream: Any) -> None:
+    # After a failed write the buffer still holds the text, and the interpreter's own flush at exit
+    # would fail again and turn this exit code into 120. Pointing the descriptor at the null device
+    # is the recipe in the Python docs for SIGPIPE. Not in main(): it would close an in-process
+    # caller's stream.
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        try:
+            stream.flush()
+        except OSError:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Stdout stays strict on purpose: a report it cannot write is a refusal, never one with holes.
+    exit_code = main()
+    _flush_or_discard(sys.stdout)
+    _flush_or_discard(sys.stderr)
+    raise SystemExit(exit_code)

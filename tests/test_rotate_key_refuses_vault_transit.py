@@ -95,9 +95,18 @@ def test_rotate_key_refuses_vault_transit_mode_before_vault_or_the_store(
     assert "audit key's min_decryption_version" in captured.err, captured.err
     # BACKLOG #2720: the audit walk verifies, so min_encryption_version is not a floor it reads.
     assert "min_encryption_version" not in captured.err, captured.err
-    assert "MEFOR_STORE_TRANSIT_AUDIT_KEY names another" in captured.err, captured.err
+    # BACKLOG #2109 item 6: `_key_names` reads an empty value, and the data key's own name, as the
+    # data key, so "names another" alone left both cases to the reader.
+    assert "MEFOR_STORE_TRANSIT_AUDIT_KEY is set to the name of a different" in captured.err
+    assert "set empty or to the data key's own name it is still the data key" in captured.err
     assert "Trimming a version" in captured.err, captured.err
-    assert "cannot be undone" in captured.err, captured.err
+    # BACKLOG #2109 item 5: "cannot be undone" left out a restore from before the trim.
+    assert "the engine cannot undo it" in captured.err, captured.err
+    assert "cannot be undone" not in captured.err, captured.err
+    assert "Vault snapshot taken before the trim may" in captured.err, captured.err
+    # A Transit key backup needs an exportable key with plaintext backup allowed, a one-way
+    # loosening, so the refusal does not offer it.
+    assert "Transit key backup" not in captured.err, captured.err
     assert "says which Vault settings retire one" not in captured.err, captured.err
     assert "Nothing was changed." in captured.err, captured.err
     assert "needs an active key" not in captured.err, captured.err

@@ -920,8 +920,8 @@ default; the [revocation gate](#revocation-guard-behavior) can still refuse that
 - The AI-broker `http` endpoint, refused with no escape since vault BACKLOG #3533, since every call
   sends `[ai].api_key`.
 - The webhook alert sink: an `http` `[alerts].webhook_url`, which can carry the hop's credential as a
-  path token, refuses the start in every posture when `serve` builds the alert notifier (vault
-  BACKLOG #3533 item 5), and no setting turns off the `https` webhook's certificate chain or hostname
+  path token, refuses the start in every posture: settings load refuses it (vault BACKLOG #3533
+  items 5 and 14), and no setting turns off the `https` webhook's certificate chain or hostname
   check.
 - A SMART or OAuth2 token URL over `http` to a host off this machine: the token request carries a
   credential, so it is refused with no escape, and only a loopback host passes.
@@ -1210,7 +1210,8 @@ bind-guard ladder above:
     builds are refused, and so is the alerts test send. The levers are a `[tls].crl_file`, which
     reaches this hop's context, or `[alerts].email_tls_revocation_attested = true` with its
     reason. A relay with no login stays ungated (the table below).
-  - **The https webhook.** The POST carries the webhook's path token. Its one lever is
+  - **The https webhook.** The URL can carry the webhook's path token, and the guard applies
+    whether it does or not. Its one lever is
     `[alerts].webhook_tls_revocation_attested = true` with its reason: it dials through one
     shared opener, so no CRL reaches it, as on the Vault hops.
   - **A build with no instance posture is judged as enforcing**, as on the Vault hops and the

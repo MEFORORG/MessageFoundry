@@ -57,7 +57,7 @@ from messagefoundry.store.crypto import (
     gave_no_verdict,
 )
 from messagefoundry.store.queue_tag import QUEUE_TAG_COLUMNS, QueueTagError, queue_row_aad
-from messagefoundry.store.store import MessageStore, _sqlite_readonly_uri
+from messagefoundry.store.store import MessageStore, _sqlite_readonly_uri, marker_test_sql
 
 __all__ = [
     "COMPOSITE_CIPHER_CELLS",
@@ -363,10 +363,11 @@ def _surface_sealed(conn: sqlite3.Connection, spec: CipherCell, tables: set[str]
         ).fetchone()
     ):
         return True
-    # The store's own test, LIKE as `_surface_holds_ciphertext` spells it, not `_sealed_test`: this
+    # The store's own test, as `_surface_holds_ciphertext` spells it, not `_sealed_test`: this
     # answers what the store will do, so it must read the surface the way the store reads it.
     marked = conn.execute(
-        f"SELECT 1 FROM {spec.table} WHERE {spec.column} LIKE ? LIMIT 1",  # declared constants
+        # declared constants
+        f"SELECT 1 FROM {spec.table} WHERE {marker_test_sql(spec.column, present=True)} LIMIT 1",
         (f"{MARKER_PREFIX}%",),
     ).fetchone()
     return marked is not None

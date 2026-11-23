@@ -10,7 +10,10 @@ inbound message on ``PT_Relay``, whose **own** router/handler then forward it to
 external round-trip — the shape the PT re-ingress throughput rows measure.
 
 Synthetic + generic; reuses the load graph's ``_shape`` for the entry port and sink endpoint, so
-``MEFOR_LOAD_ADT_PORT`` / ``MEFOR_LOAD_SINK_PORT`` behave as in ``harness/config/load``. Serve it::
+``MEFOR_LOAD_ADT_PORT`` / ``MEFOR_LOAD_SINK_PORT`` behave as in ``harness/config/load``.
+
+Prerequisite: the harness wheel or an editable install of this repo. Under ``-P``, a bare checkout with
+only the engine wheel fails on the ``harness`` import below. Serve it::
 
     MEFOR_LOAD_ADT_PORT=2600 MEFOR_LOAD_SINK_PORT=2700 \
       python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/passthrough --db ./pt.db
@@ -18,6 +21,9 @@ Synthetic + generic; reuses the load graph's ``_shape`` for the entry port and s
 
 from __future__ import annotations
 
+# Needs the harness package importable under -P (the harness wheel, or an editable install of this
+# repo): the helper is in another directory, and the loader serves a bare import only from this one
+# (BACKLOG #5853).
 from harness.config.load._shape import NO_PER_HOST_CAP, load_shape
 from messagefoundry import MLLP, PassThrough, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy

@@ -113,7 +113,10 @@ _NON_SITE_PREFIXES: tuple[str, ...] = ()
 
 def reload_site_prefixes() -> None:
     """Recompute the externalized site-code globals from the current environment / local token file.
-    Called once at import and by tests after adjusting the source. Never raises."""
+    Called once at import and by tests after adjusting the source.
+
+    A token file that is not UTF-8 raises ``UnicodeDecodeError``, which stops the import, and that
+    stop is kept on purpose (BACKLOG #3516). A token file that cannot be read loads no prefix."""
     global _SITE_PREFIXES, SITE_CODE_RE, _NON_SITE_PREFIXES
     _SITE_PREFIXES = _load_site_prefixes()
     if _SITE_PREFIXES:

@@ -90,7 +90,11 @@ from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, RefusedBodyPolicy
-from messagefoundry.pipeline.remote_debug_watch import RemoteDebugRefusalWatch
+from messagefoundry.pipeline.remote_debug_watch import (
+    STOP_FLOOR_SECONDS,
+    RemoteDebugRefusalWatch,
+    StopDeadline,
+)
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
@@ -170,6 +174,54 @@ _CONFIG_WRITE_DRAIN_SECONDS = 5.0
 #: the shutdown budget the API reserves for stop (``_ENGINE_STOP_RESERVE_SECONDS`` in
 #: ``api/app.py``), and spent only while such a write is still running.
 _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
+
+#: How long stop waits for the graph supervisor to exit on its own, an in-flight reconcile
+#: included, before it cancels it and waits for the cancel to land. A stop budget does not
+#: shorten it (:class:`_StopBudget`).
+_GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
+
+#: Under a stop budget (BACKLOG #3191, :class:`_StopBudget`): the least any budgeted wait is given,
+#: however little of the budget is left.
+_STOP_WAIT_FLOOR_SECONDS = 0.1
+#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so the CRL
+#: runner's wait alone does not cut the remote-debug watch's last audit pass or the alert-state
+#: drain to the floor. The unbudgeted steps between them can still spend it, and then those waits
+#: get the floor. tests/test_engine_stop_budget.py sums it against the engine's reserve.
+_STOP_WAIT_SHARE_SECONDS = 0.3
+#: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
+#: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
+_STOP_CLOSE_ALLOWANCE_SECONDS = 0.5
+
+
+class _StopBudget:
+    """What each of :meth:`Engine.stop`'s budgeted waits may spend (BACKLOG #3191).
+
+    The budgeted waits are the CRL reload runner's stop, the remote-debug refusal watch's stop and
+    the alert-state drain. With no budget each keeps its fixed bound. Under one, a wait gets the
+    shorter of its fixed bound and what is left of the budget once the time kept for the steps after
+    it is taken out, and never less than :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is
+    less. So a wait is shortened only when its fixed bound would run into the time kept for the
+    later steps. The budget ends the wait, not what follows it: a wait that runs out does what it
+    does at its fixed bound. The CRL runner's wait then cancels the pass it waited for and waits for
+    that cancel to land with no bound, as before. The graph supervisor's wait and the other stop
+    steps are not budgeted, so they can still run past the budget."""
+
+    def __init__(self, seconds: float | None) -> None:
+        self._deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
+
+    def wait(self, fixed: float, *, kept: float) -> float:
+        """The bound for a wait whose fixed bound is ``fixed``, with ``kept`` seconds held back for
+        the steps after it."""
+        if self._deadline is None:
+            return fixed
+        left = self._deadline - asyncio.get_running_loop().time() - kept
+        return min(fixed, max(_STOP_WAIT_FLOOR_SECONDS, left))
+
+    def deadline(self, *, kept: float) -> StopDeadline | None:
+        """The event-loop time a wait that splits its own share must end by, with ``kept``
+        seconds held back for the steps after it; None with no budget."""
+        return None if self._deadline is None else StopDeadline(self._deadline - kept)
+
 
 #: How long a connection flag toggle waits for the lock, then again for the store (BACKLOG #2623). A
 #: write normally takes milliseconds, so this is a stuck or saturated store. Well under the API's
@@ -4213,15 +4265,37 @@ class Engine:
             count += 1
         return count
 
-    async def stop(self) -> None:
-        """Stop the retention task + the wired graph, then close the store."""
+    async def stop(self, *, budget_seconds: float | None = None) -> None:
+        """Stop the retention task + the wired graph, then close the store.
+
+        ``budget_seconds`` is the time the managed API lifespan hands this stop, a share of NSSM's
+        graceful-stop window (BACKLOG #3191). It bounds the waits :class:`_StopBudget` names and no
+        others. With none, every wait keeps its fixed bound.
+
+        A tight budget can cut those waits to :data:`_STOP_WAIT_FLOOR_SECONDS` and lose the work
+        they wait for (the owner ruled on 2026-11-22 that the budget wins).
+        docs/SERVICE.md, *Start / stop / status*, says what each cut loses."""
         log.info("engine stopping")
         self._stopping = True
+        budget = _StopBudget(budget_seconds)
+        # Kept back, at each budgeted wait, for the waits after it and the store's close: each
+        # later budgeted wait its share, the watch's cancel wait its floor, and the config-write
+        # drain the bound it will use, or nothing when the gate is closed and no write runs.
+        if self._config_writes_closed and not self._config_writes:
+            config_kept = 0.0
+        elif self._config_writes_closed:
+            config_kept = _CONFIG_WRITE_LATE_DRAIN_SECONDS
+        else:
+            config_kept = _CONFIG_WRITE_DRAIN_SECONDS
+        alert_kept = _STOP_CLOSE_ALLOWANCE_SECONDS
+        watch_kept = alert_kept + _STOP_WAIT_SHARE_SECONDS + config_kept
+        crl_kept = watch_kept + _STOP_WAIT_SHARE_SECONDS + STOP_FLOOR_SECONDS
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
         # half-started graph), falling back to cancel only if a reconcile hangs past the timeout. The
-        # graph itself is then stopped by the registry_runner.stop() below, as before.
+        # stop budget does not shorten that timeout (BACKLOG #3191). The graph itself is then stopped
+        # by the registry_runner.stop() below, as before.
         if self._graph_supervisor is not None:
             self._graph_stop.set()
             # Paired with _graph_stop: the loop now waits on _graph_wake, so without this the
@@ -4231,7 +4305,7 @@ class Engine:
             supervisor = self._graph_supervisor
             self._graph_supervisor = None
             try:
-                await asyncio.wait_for(supervisor, timeout=10.0)
+                await asyncio.wait_for(supervisor, timeout=_GRAPH_SUPERVISOR_STOP_SECONDS)
             except TimeoutError:
                 # wait_for already cancelled the task on timeout; absorb its cancellation.
                 await asyncio.gather(supervisor, return_exceptions=True)
@@ -4242,7 +4316,8 @@ class Engine:
         if self._cert_expiry_runner is not None:
             await self._cert_expiry_runner.stop()
         if self._crl_reload_runner is not None:
-            await self._crl_reload_runner.stop()
+            crl = self._crl_reload_runner
+            await crl.stop(timeout=budget.wait(crl.stop_timeout_seconds, kept=crl_kept))
             self._crl_reload_runner = None
         if self._log_forward_watch is not None:
             await self._log_forward_watch.stop()
@@ -4300,7 +4375,7 @@ class Engine:
             # reported by the watch's last pass. That pass may write an audit row and raise an alert,
             # so it runs while the store is open, and ahead of the alert-state drain at the end.
             if self._remote_debug_watch is not None:
-                await self._remote_debug_watch.stop()
+                await self._remote_debug_watch.stop(deadline=budget.deadline(kept=watch_kept))
                 self._remote_debug_watch = None
             # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
             # unused remainder of this process's reserved block and unhooks the refill signal, so anything
@@ -4341,7 +4416,7 @@ class Engine:
             # to land before the store closes. Last, so it covers every stop step above.
             drain = getattr(self._alert_sink, "drain_state", None)
             if drain is not None:
-                await drain(_ALERT_STATE_DRAIN_SECONDS)
+                await drain(budget.wait(_ALERT_STATE_DRAIN_SECONDS, kept=alert_kept))
         except asyncio.CancelledError:
             cancelled = True
         except BaseException as exc:  # noqa: BLE001 - held until the store closes, then re-raised

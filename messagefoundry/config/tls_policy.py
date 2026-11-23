@@ -2521,8 +2521,7 @@ def insecure_hop_disposition(
     indistinguishable from a declaration, with every transport hop in the product as its blast radius.
     ``audited_opt_out`` is gone with it, so the blunt global ``MEFOR_ALLOW_INSECURE_TLS`` escape,
     honoured only at ``[security].enforcement = warn``, can no longer influence a cleartext-hop
-    decision (decision 5 — the variable survives for the six
-    non-connection cells that have no per-connection field to carry a declaration).
+    decision (decision 5).
 
     Only an arm that returned ALLOW was deleted, so removing it can only ever turn a crossing into a
     WARN or a REFUSE, never the reverse: ADR 0092 decision 5 (no-loosen) holds **by construction**.
@@ -3741,11 +3740,11 @@ def smtp_login_approved(
     in would have been the WRONG completion, because all three SMTP cells refuse a
     username beside ``use_tls=false`` at CONSTRUCTION *even with the escape set* -- the
     ``refuse_cleartext_credentials`` posture (``transports/rest.py``), which is the shape this repo
-    uses for a CREDENTIAL rather than the escapable shape it uses for a payload hop (the webhook
-    sink, the LDAPS bind, the MLLP/FTPS contexts, the SFTP host-key acceptance). An escapable
-    send-time check behind an absolute construction-time gate is weaker than the gate it backs up,
-    which is how a backstop becomes a hole. So the parameter is gone rather than wired
-    (BACKLOG #1171; zero deployments, so the narrower signature costs nothing).
+    uses for a CREDENTIAL rather than the escapable shape it uses for a payload hop (at least the
+    MLLP and anonymous FTPS contexts, and the SFTP host-key acceptance for a login with no
+    password). An escapable send-time check behind an absolute construction-time gate is weaker
+    than the gate it backs up, which is how a backstop becomes a hole. So the parameter is gone
+    rather than wired (BACKLOG #1171; zero deployments, so the narrower signature costs nothing).
 
     ``smtplib.SMTP.login`` is deliberately NOT called: its preference order is internal and puts
     CRAM-MD5 first. ``auth()`` is driven directly against the server's advertised list instead.

@@ -22,7 +22,9 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -54,6 +56,43 @@ def repo(tmp_path: Path) -> Path:
     return r
 
 
+def _pwsh(
+    script: str,
+    timeout: int = 120,
+    shell: str = "pwsh",
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=env,
+    )
+
+
+@pytest.fixture(params=["pwsh", "powershell.exe"])
+def shell(request: pytest.FixtureRequest) -> str:
+    """Both editions, because Windows PowerShell 5.1 treats native stderr differently."""
+    name: str = request.param
+    if shutil.which(name) is None:
+        pytest.skip(f"{name} is not on this host")
+    return name
+
+
+def _lock_file(repo: Path, name: str = "t") -> Path:
+    common = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    lock_dir = Path(common) / "mefor-coord" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return lock_dir / f"{name}.lock"
+
+
 def acquire(
     repo: Path,
     *,
@@ -62,6 +101,8 @@ def acquire(
     hold_ms: int = 0,
     barrier: Path | None = None,
     witness: Path | None = None,
+    prove_owned: bool = False,
+    attempted: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Take the lock, optionally hold it, release. Prints ACQUIRED on success.
 
@@ -71,9 +112,9 @@ def acquire(
     legitimately, and the caller sees two winners against a lock that never misbehaved. With it, the
     claimant signals readiness *after* start-up and waits for the go file, so pwsh cold-start time is
     excluded from the race. It does NOT cover Enter-CoordLock's own prologue: the ``git rev-parse``
-    spawn at lock.ps1:47 runs after the gate and before the deadline is set at lock.ps1:56, and under
-    CPU load that alone spread the cohort's deadline start by 645-2134 ms. ``witness`` is what makes
-    the test sound despite that -- see the test below.
+    spawn runs after the gate and before the function starts its timeout clock, and under CPU load
+    that alone spread the cohort's start by 645-2134 ms. ``witness`` is what makes the test sound
+    despite that -- see the test below.
     """
     gate = ""
     if barrier is not None:
@@ -83,6 +124,20 @@ def acquire(
             f"while (-not (Test-Path (Join-Path '{barrier}' 'go'))) {{ "
             f"if ((Get-Date) -gt $bd) {{ throw 'barrier timeout' }}; "
             f"Start-Sleep -Milliseconds 10 }}; "
+        )
+    if attempted is not None:
+        # Marks the SECOND real denial, so the function has already chosen to retry a pending file, then
+        # blocks inside the create until the name clears. The wait is outside the function's 5 s window,
+        # so a slow holder cannot turn this into a denial.
+        gate += (
+            "$realOpen = ${function:Open-CoordLockFile}; $script:denials = 0; "
+            "function Open-CoordLockFile([string]$Path) { "
+            "try { & $realOpen $Path } catch [UnauthorizedAccessException] { "
+            "$script:denials++; if ($script:denials -ge 2) { "
+            f"[IO.File]::WriteAllText('{attempted}', ''); "
+            "$bd = (Get-Date).AddSeconds(90); "
+            "while ((Test-Path -LiteralPath $Path) -and (Get-Date) -lt $bd) "
+            "{ Start-Sleep -Milliseconds 20 } }; throw } }; "
         )
     enter = leave = ""
     if witness is not None:
@@ -96,6 +151,12 @@ def acquire(
             f"catch {{ Write-Error 'MUTEX-VIOLATED'; exit 9 }}; "
         )
         leave = f"$w.Dispose(); Remove-Item -LiteralPath '{witness}' -Force; "
+    if prove_owned:
+        # A returned path is not proof: the lock file must name THIS process.
+        enter += (
+            'try { if ((Get-Content -LiteralPath $l -Raw -EA Stop) -match "pid=$PID ") '
+            "{ Write-Output 'OWNED' } } catch { }; "
+        )
     script = (
         f". '{LOCK}'; "
         f"{gate}"
@@ -106,13 +167,7 @@ def acquire(
         f"{leave}"
         f"Exit-CoordLock $l"
     )
-    return subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-    )
+    return _pwsh(script, timeout=180)
 
 
 def test_lock_can_be_taken_and_released(repo: Path) -> None:
@@ -127,8 +182,8 @@ def test_eight_concurrent_claimants_never_hold_it_at_once(repo: Path, tmp_path: 
     """Eight real processes, one lock, all reaching for it at the same instant.
 
     Asserts OCCUPANCY, not winner count. The barrier releases the cohort together, but each process
-    then runs Enter-CoordLock's own prologue (a ``git rev-parse`` spawn, lock.ps1:47) before its deadline
-    is set (lock.ps1:56), and nothing synchronizes that. A winner-count assertion tolerates only
+    then runs Enter-CoordLock's own prologue (a ``git rev-parse`` spawn) before its timeout clock
+    starts, and nothing synchronizes that. A winner-count assertion tolerates only
     (hold - timeout) of that skew; under CPU load the skew was measured at 645-2134 ms, so counting
     winners tests the scheduler, not the mutex. Measured directly: in five multi-winner rounds the hold
     intervals were strictly DISJOINT -- the extra winners acquired legitimately, after release.
@@ -184,20 +239,7 @@ def test_eight_concurrent_claimants_never_hold_it_at_once(repo: Path, tmp_path: 
 
 def test_timeout_refuses_to_steal_and_names_the_holder(repo: Path) -> None:
     """On timeout it must fail loudly with the holder's identity -- never break the lock."""
-    lock_dir = (
-        Path(
-            subprocess.run(
-                ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
-        )
-        / "mefor-coord"
-        / "locks"
-    )
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    held = lock_dir / "t.lock"
+    held = _lock_file(repo)
     held.write_text("pid=999999 host=OTHERBOX at=2026-07-29T00:00:00.0000000Z", encoding="utf-8")
 
     proc = acquire(repo, timeout=1)
@@ -205,28 +247,288 @@ def test_timeout_refuses_to_steal_and_names_the_holder(repo: Path) -> None:
     assert "Timed out" in proc.stderr
     assert "pid=999999" in proc.stderr  # names the holder
     assert "NOT stealing" in proc.stderr
-    assert held.exists(), "the lock must survive a timeout -- stealing re-opens the race"
+    # Its content, not just its name: a holder's file replaced by this call would still exist.
+    assert "pid=999999" in held.read_text(encoding="utf-8"), "stealing re-opens the race"
 
 
 def test_distinct_names_do_not_block_each_other(repo: Path) -> None:
     """One mutex per operation: an unrelated lock must not serialize against this one."""
-    lock_dir = (
-        Path(
-            subprocess.run(
-                ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
-        )
-        / "mefor-coord"
-        / "locks"
-    )
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    (lock_dir / "other.lock").write_text("pid=1", encoding="utf-8")
+    _lock_file(repo, "other").write_text("pid=1", encoding="utf-8")
 
     proc = acquire(repo, name="t", timeout=2)
     assert "ACQUIRED" in proc.stdout, proc.stderr
+
+
+# A real FileStream that creates the file, then fails where a full disk would. FileStream buffers, so
+# the failure can arrive at Write or only at Dispose. The finalizer path must not throw.
+_FAILING_STREAM = r"""
+Add-Type -TypeDefinition @'
+using System.IO;
+public class B4FailingStream : FileStream {
+    private readonly bool onWrite; private bool thrown;
+    public B4FailingStream(string p, bool onWrite)
+        : base(p, FileMode.CreateNew, FileAccess.Write, FileShare.None) { this.onWrite = onWrite; }
+    public override void Write(byte[] b, int o, int c) {
+        if (onWrite) throw new IOException("simulated disk full on write");
+        base.Write(b, o, c);
+    }
+    protected override void Dispose(bool disposing) {
+        base.Dispose(disposing);
+        if (disposing && !onWrite && !thrown) { thrown = true; throw new IOException("simulated disk full on close"); }
+    }
+}
+'@
+"""
+
+
+@pytest.mark.parametrize(
+    ("on_write", "message"),
+    [(True, "simulated disk full on write"), (False, "simulated disk full on close")],
+)
+def test_a_failed_holder_write_removes_only_its_own_file_and_does_not_wedge(
+    repo: Path, shell: str, on_write: bool, message: str
+) -> None:
+    """The failure must surface at once, and the file this call made must not block the next one.
+
+    The caller's SilentlyContinue is what would let a failed write run on if the function's own Stop
+    were lost.
+    """
+    flag = "$true" if on_write else "$false"
+    script = (
+        f". '{LOCK}'; {_FAILING_STREAM}\n"
+        "$ErrorActionPreference = 'SilentlyContinue'\n"
+        f"function Open-CoordLockFile([string]$Path) {{ New-Object B4FailingStream $Path, {flag} }}\n"
+        f"$l = Enter-CoordLock -Name 't' -TimeoutSeconds 2 -Repo '{repo}'; Write-Output 'ACQUIRED'"
+    )
+    proc = _pwsh(script, shell=shell)
+    assert "ACQUIRED" not in proc.stdout, proc.stdout
+    assert message in proc.stderr, proc.stderr
+    assert "Timed out" not in proc.stderr, proc.stderr
+    assert not _lock_file(repo).exists(), "the orphaned lock would wedge every later caller"
+    following = acquire(repo)
+    assert "ACQUIRED" in following.stdout, following.stderr
+
+
+def test_an_unexpected_create_failure_throws_and_leaves_the_holders_file(repo: Path) -> None:
+    """A method failure of another type must stop here, not fall through to the cleanup."""
+    held = _lock_file(repo)
+    held.write_text("pid=999999 host=OTHERBOX at=2026-07-29T00:00:00.0000000Z", encoding="utf-8")
+    script = (
+        f". '{LOCK}'\n"
+        "function Open-CoordLockFile([string]$Path) { [System.IO.File]::Open('', 'CreateNew') }\n"
+        f"$l = Enter-CoordLock -Name 't' -TimeoutSeconds 1 -Repo '{repo}'; Write-Output 'ACQUIRED'"
+    )
+    proc = _pwsh(script, timeout=60)
+    assert "ACQUIRED" not in proc.stdout, proc.stdout
+    assert "pid=999999" in held.read_text(encoding="utf-8")
+
+
+# Puts a real lock file into the NTFS delete-pending state. An ordinary File.Delete does not on this
+# OS, because it uses POSIX semantics and frees the name at once, so this sets the legacy disposition
+# with a second handle open. Measured: CreateNew then raises UnauthorizedAccessException, not IOException.
+_DELETE_PENDING_HOLDER = r"""
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class B4Native {
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern SafeFileHandle CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);
+  [StructLayout(LayoutKind.Sequential)] public struct FDI { [MarshalAs(UnmanagedType.U1)] public bool DeleteFile; }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool SetFileInformationByHandle(SafeFileHandle h, int c, ref FDI i, uint z);
+}
+'@
+$r = [IO.File]::Open($env:B4_LOCK, 'Open', 'Read', [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+$h = [B4Native]::CreateFileW($env:B4_LOCK, 0x00010000, 7, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+$i = New-Object B4Native+FDI; $i.DeleteFile = $true
+if (-not [B4Native]::SetFileInformationByHandle($h, 4, [ref]$i, 1)) { throw 'disposition not set' }
+[Console]::Out.WriteLine('PENDING'); [Console]::Out.Flush()
+$bound = (Get-Date).AddSeconds(90)
+while (-not (Test-Path -LiteralPath $env:B4_RELEASE) -and (Get-Date) -lt $bound) { Start-Sleep -Milliseconds 20 }
+$h.Dispose(); $r.Dispose()
+"""
+
+
+@contextmanager
+def _delete_pending(lock: Path, release: Path) -> Iterator[None]:
+    """Hold ``lock`` in delete-pending until ``release`` exists or the block ends."""
+    lock.write_text("pid=1 host=DELETING at=2026-07-29T00:00:00.0000000Z", encoding="utf-8")
+    holder = subprocess.Popen(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", _DELETE_PENDING_HOLDER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env={**os.environ, "B4_LOCK": str(lock), "B4_RELEASE": str(release)},
+    )
+    try:
+        assert holder.stdout is not None
+        assert "PENDING" in holder.stdout.readline()
+        yield
+    finally:
+        release.write_text("", encoding="utf-8")
+        try:
+            holder.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait(timeout=10)
+        if holder.stdout is not None:
+            holder.stdout.close()
+
+
+def test_a_delete_pending_lock_is_waited_out(repo: Path, tmp_path: Path) -> None:
+    """The name clears when the last handle closes, so this is a wait and not a failure.
+
+    The name is released only after the claimant's create has been denied twice with the file still
+    there, so this cannot pass without the delete-pending branch choosing to retry. The claimant waits
+    for the release inside its create, so no process's speed counts against the 5 s window.
+    """
+    barrier = tmp_path / "barrier"
+    barrier.mkdir()
+    release = tmp_path / "release"
+    attempted = tmp_path / "attempted"
+    with _delete_pending(_lock_file(repo), release), ThreadPoolExecutor(max_workers=1) as pool:
+        claim = pool.submit(
+            acquire, repo, timeout=30, barrier=barrier, prove_owned=True, attempted=attempted
+        )
+        deadline = time.monotonic() + 90
+        while not list(barrier.glob("ready-*")):
+            assert time.monotonic() < deadline, "the claimant never reached the barrier"
+            time.sleep(0.02)
+        (barrier / "go").write_text("", encoding="utf-8")
+        while not attempted.exists():
+            assert time.monotonic() < deadline, "the claimant was never denied"
+            time.sleep(0.02)
+        release.write_text("", encoding="utf-8")
+        proc = claim.result()
+    assert "OWNED" in proc.stdout, f"returned without holding the lock: {proc.stdout}{proc.stderr}"
+
+
+def test_a_delete_pending_lock_that_outlasts_the_wait_names_no_false_holder(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The file's text belongs to a deleted lock, so printing it as the holder would be false."""
+    release = tmp_path / "release"
+    with _delete_pending(_lock_file(repo), release):
+        proc = acquire(repo, timeout=1)
+    assert "ACQUIRED" not in proc.stdout
+    assert "access denied" in proc.stderr.lower(), proc.stderr
+    assert "pending deletion" in proc.stderr, proc.stderr
+    assert "held by" not in proc.stderr, proc.stderr
+
+
+def test_a_genuine_denial_fails_at_once_and_names_no_holder(repo: Path) -> None:
+    """A directory at the lock path raises the same exception as delete-pending and never clears."""
+    _lock_file(repo).mkdir()
+    counter = repo / "open-attempts.txt"
+    script = (
+        f". '{LOCK}'\n"
+        "$realOpen = ${function:Open-CoordLockFile}\n"
+        "function Open-CoordLockFile([string]$Path) { "
+        f"[IO.File]::AppendAllText('{counter}', 'x'); & $realOpen $Path }}\n"
+        f"$l = Enter-CoordLock -Name 't' -TimeoutSeconds 45 -Repo '{repo}'; Write-Output 'ACQUIRED'"
+    )
+    proc = _pwsh(script)
+    assert "ACQUIRED" not in proc.stdout
+    assert "access" in proc.stderr.lower(), proc.stderr
+    assert "held by" not in proc.stderr, proc.stderr
+    assert "Timed out" not in proc.stderr, proc.stderr
+    assert counter.read_text(encoding="utf-8") == "x", "retried a denial that cannot clear"
+    assert "directory" in proc.stderr.lower(), proc.stderr
+
+
+def test_a_name_that_clears_after_the_first_second_is_acquired(repo: Path) -> None:
+    """A pending file that goes away late must be retried, not reported as a denial on a free name.
+
+    The stub's clock starts at the first denial, so a slow git prologue cannot use up the late-clearing
+    delay before the function has seen the file. Its last denial lands after the file is gone, which
+    is the read order that used to throw.
+    """
+    lock = _lock_file(repo)
+    lock.write_text("pid=1 host=DELETING at=2026-07-29T00:00:00.0000000Z", encoding="utf-8")
+    script = (
+        f". '{LOCK}'\n"
+        "$realOpen = ${function:Open-CoordLockFile}\n"
+        "$script:sw = $null\n"
+        "function Open-CoordLockFile([string]$Path) {\n"
+        "  if ($null -eq $script:sw) { $script:sw = [Diagnostics.Stopwatch]::StartNew() }\n"
+        "  if ($script:sw.Elapsed.TotalSeconds -lt 1.3) "
+        "{ throw [UnauthorizedAccessException]::new('simulated pending') }\n"
+        "  if (Test-Path -LiteralPath $Path) { [IO.File]::Delete($Path); "
+        "throw [UnauthorizedAccessException]::new('simulated pending') }\n"
+        "  & $realOpen $Path }\n"
+        f"$l = Enter-CoordLock -Name 't' -TimeoutSeconds 30 -Repo '{repo}'\n"
+        "if ((Get-Content -LiteralPath $l -Raw) -match \"pid=$PID \") { Write-Output 'OWNED' }\n"
+        "Exit-CoordLock $l"
+    )
+    proc = _pwsh(script)
+    assert "OWNED" in proc.stdout, f"{proc.stdout}{proc.stderr}"
+
+
+def test_a_denial_with_no_file_stops_quickly_and_does_not_claim_a_pending_delete(
+    repo: Path,
+) -> None:
+    """Nothing at the path means no delete is pending, so the advice must not say one is.
+
+    Counts attempts rather than timing the call. Each retry sleeps 50 ms, so the 1 s bound allows at
+    most about 21, a slow machine only makes fewer, and spinning to the 5 s window would make about 100.
+    """
+    script = (
+        f". '{LOCK}'\n"
+        "$script:attempts = 0\n"
+        "function Open-CoordLockFile([string]$Path) { $script:attempts++; "
+        "throw [UnauthorizedAccessException]::new('simulated denial') }\n"
+        f"try {{ Enter-CoordLock -Name 't' -TimeoutSeconds 30 -Repo '{repo}' }}\n"
+        "catch { Write-Output $_.Exception.Message }\n"
+        'Write-Output "ATTEMPTS=$script:attempts"'
+    )
+    proc = _pwsh(script)
+    assert "access denied" in proc.stdout.lower(), f"{proc.stdout}{proc.stderr}"
+    assert "pending deletion" not in proc.stdout, proc.stdout
+    assert "no file" in proc.stdout.lower(), proc.stdout
+    attempts = int(proc.stdout.split("ATTEMPTS=")[1].split()[0])
+    assert 2 <= attempts <= 25, f"a denial with no file was tried {attempts} times"
+
+
+def test_a_name_seen_empty_gets_one_more_try_even_past_the_timeout(repo: Path) -> None:
+    """A zero timeout has already expired at the first denial, and the name is free by then."""
+    script = (
+        f". '{LOCK}'\n"
+        "$realOpen = ${function:Open-CoordLockFile}\n"
+        "$script:attempts = 0\n"
+        "function Open-CoordLockFile([string]$Path) { $script:attempts++\n"
+        "  if ($script:attempts -eq 1) { throw [UnauthorizedAccessException]::new('simulated') }\n"
+        "  & $realOpen $Path }\n"
+        f"$l = Enter-CoordLock -Name 't' -TimeoutSeconds 0 -Repo '{repo}'\n"
+        "if ((Get-Content -LiteralPath $l -Raw) -match \"pid=$PID \") { Write-Output 'OWNED' }\n"
+        "Exit-CoordLock $l"
+    )
+    proc = _pwsh(script)
+    assert "OWNED" in proc.stdout, f"{proc.stdout}{proc.stderr}"
+
+
+def test_a_successful_git_call_that_writes_stderr_is_not_fatal(repo: Path, shell: str) -> None:
+    """GIT_TRACE makes a succeeding git write to stderr, which Stop makes fatal under 5.1."""
+    script = (
+        f". '{LOCK}'\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        f"$l = Enter-CoordLock -Name 't' -TimeoutSeconds 2 -Repo '{repo}'\n"
+        "Write-Output 'ACQUIRED'; Exit-CoordLock $l"
+    )
+    proc = _pwsh(script, shell=shell, env={**os.environ, "GIT_TRACE": "1"})
+    assert "ACQUIRED" in proc.stdout, proc.stderr
+
+
+def test_a_failing_git_call_keeps_the_functions_own_error(repo: Path, tmp_path: Path) -> None:
+    """A caller's native-command preference must not replace the message with a raw git failure."""
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    script = (
+        f". '{LOCK}'\n"
+        "$PSNativeCommandUseErrorActionPreference = $true\n"
+        f"try {{ Enter-CoordLock -Name 't' -Repo '{outside}' }} "
+        "catch { Write-Output $_.Exception.Message }"
+    )
+    proc = _pwsh(script)
+    assert "not inside a git repository" in proc.stdout, f"{proc.stdout}{proc.stderr}"
 
 
 def test_lock_is_shared_between_the_primary_and_its_worktrees(repo: Path, tmp_path: Path) -> None:

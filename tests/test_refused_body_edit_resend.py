@@ -14,8 +14,10 @@ the metadata the runner writes. Synthetic HL7 only; no real PHI.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -29,7 +31,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline import Engine, refused_body
 from messagefoundry.pipeline.refused_body import (
     METADATA_KEY,
     RefusedBodyAllowance,
@@ -37,6 +39,7 @@ from messagefoundry.pipeline.refused_body import (
     head_only_resubmit_refusal,
 )
 from messagefoundry.store import MessageStatus
+from messagefoundry.store.store import MessageStore
 
 EDITED = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||200^^^H^MR||DOE^JOHN\r"
 #: A refused body of short segments, so its head still opens as HL7.
@@ -221,3 +224,81 @@ def test_only_a_head_record_refuses() -> None:
         json.dumps({METADATA_KEY: {"bytes": 9000, "stored": "whole"}}),
     ):
         assert head_only_resubmit_refusal("m1", metadata) is None, metadata
+
+
+# --- metadata too deep to decode (BACKLOG #5758) -------------------------------------------------
+
+_SENTINEL = "SYNTHSENTINEL"
+_NEST = 200_000
+#: A head record beside one value nested past the decoder's limit. It is valid JSON at any depth, so
+#: a decoder that does not overflow reads the head record.
+_TOO_DEEP = (
+    f'{{"{METADATA_KEY}": {{"stored": "head"}}, "nested": '
+    + "[" * _NEST
+    + "]" * _NEST
+    + f', "note": "{_SENTINEL}"}}'
+)
+
+
+@pytest.fixture
+def decoder_overflows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the check's decoder raise RecursionError, as deep nesting does.
+
+    THE TRIGGER IS A RAISED ``RecursionError``, NOT REAL RECURSION, as in
+    ``tests/test_sandbox_codec.py``: the depth at which json's C decoder overflows depends on the
+    runner's stack, so a real overflow would measure the runner as much as the code."""
+
+    def loads(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(refused_body, "json", SimpleNamespace(loads=loads, dumps=json.dumps))
+
+
+@pytest.mark.usefixtures("decoder_overflows")
+def test_metadata_too_deep_to_decode_refuses(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger=refused_body.__name__):
+        reason = head_only_resubmit_refusal("m1", _TOO_DEEP)
+    assert reason == (
+        "message m1 metadata is nested too deeply to read, so it cannot be edited and resubmitted"
+        " from this copy"
+    )
+    # The refusal was logged, naming the message id and nothing of the metadata.
+    logged = [rec.getMessage() for rec in caplog.records]
+    assert logged == ["message m1 metadata is nested too deeply to read; the edit was refused"]
+    for leaked in (_SENTINEL, METADATA_KEY, "[", "{"):
+        assert leaked not in reason and leaked not in logged[0], leaked
+
+
+@pytest.mark.usefixtures("decoder_overflows")
+@pytest.mark.parametrize("to", [None, "OB2"], ids=["reroute", "direct"])
+async def test_edit_resend_refuses_metadata_too_deep_to_decode(
+    engine: Engine, to: str | None
+) -> None:
+    # The route's check refuses before the store runs, so the store never sees this edit.
+    mid = await _seed_refused(engine, allowance_bytes=1 << 20)
+    store = engine.store
+    assert isinstance(store, MessageStore)
+    await store._db.execute("UPDATE messages SET metadata=? WHERE id=?", (_TOO_DEEP, mid))
+    await store._db.commit()
+    stored = await store.get_message(mid)
+    assert stored is not None
+    before = await _message_ids(engine)
+
+    payload: dict[str, object] = {"raw": EDITED, "idempotency_key": f"k-{to}"}
+    if to is not None:
+        payload["to"] = to
+    async with _client(engine) as c:
+        r = await c.post(f"/messages/{mid}/edit-resend", json=payload)
+
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == (
+        f"message {mid} metadata is nested too deeply to read, so it cannot be edited and"
+        " resubmitted from this copy"
+    )
+    assert _SENTINEL not in r.text
+    # Nothing was written, and the row is untouched.
+    assert await _message_ids(engine) == before
+    assert await engine.store.outbox_for(mid) == []
+    assert await _edit_resend_audits(engine) == 0
+    assert await engine.store.get_resend_record(f"k-{to}") is None
+    assert await engine.store.get_message(mid) == stored

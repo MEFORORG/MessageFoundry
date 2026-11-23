@@ -813,7 +813,8 @@ def _holds_when_relaxed(
     expr: ast.expr, fn: ast.AST, builders: frozenset[str], seen: frozenset[str] = frozenset()
 ) -> bool:
     """Whether ``expr``, read in ``fn``, is true on a relaxed hop, read off its shape. It is when it
-    is ``True``; reads the setting as ``<x>.get("tls_allow_expired", ...)``; asks
+    is ``True``; reads the setting as ``<x>.get("tls_allow_expired", ...)`` or
+    ``flag_from_settings(<x>, "tls_allow_expired")`` (vault BACKLOG #3234); asks
     ``skips_validity_period`` of the context a relaxing builder returned
     (:func:`_from_relaxing_builder`), never of some other context; is ``bool(...)`` of one of
     those; is an ``or`` with one of them as a part, or an ``and`` of them; or is a local name every
@@ -838,6 +839,9 @@ def _holds_when_relaxed(
             return _holds_when_relaxed(first, fn, builders, seen)
         if name == "skips_validity_period" and len(expr.args) == 1:
             return _from_relaxing_builder(first, fn, builders)
+        if name == "flag_from_settings" and len(expr.args) == 2:
+            key = expr.args[1]
+            return isinstance(key, ast.Constant) and key.value == "tls_allow_expired"
     if isinstance(expr, ast.Call) and callee_name(expr) == "get" and expr.args:
         first = expr.args[0]
         return isinstance(first, ast.Constant) and first.value == "tls_allow_expired"
@@ -1122,6 +1126,10 @@ def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
         ("None if relaxed else self._other", "False", "pass", False),
         ("None if not relaxed else self._other", "False", "pass", True),
         ("None if skips_validity_period(self._other) else self._other", "False", "pass", True),
+        # The strict read of the setting holds; the same reader on another key does not (#3234).
+        ("self._other", 'flag_from_settings(config.settings, "tls_allow_expired")', "pass", False),
+        ("self._other", 'flag_from_settings(config.settings, "tls")', "pass", True),
+        ("self._other", "flag_from_settings(config.settings)", "pass", True),
     ):
         text = _SYNTHETIC_HOP.replace("HANDOFF", handoff).replace("FLAG", flag)
         pre, post = (extra[4:], "pass") if extra.startswith("PRE:") else ("pass", extra)

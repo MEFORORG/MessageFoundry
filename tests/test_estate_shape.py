@@ -154,3 +154,15 @@ def test_shape_fails_loud_on_out_of_range_fraction(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("MEFOR_ESTATE_SIMPLE_FRACTION", "1.5")
     with pytest.raises(ValueError, match="within"):
         load_estate_shape()
+
+
+@pytest.mark.parametrize("value", ["nan", "NaN", "-nan", "inf", "-inf"])
+def test_shape_refuses_a_non_finite_fraction_naming_the_knob(
+    value: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # nan passes a `value < minimum or value > maximum` test, and then fails later in simple_count,
+    # outside the printed refusal and without naming the knob (BACKLOG #5850).
+    monkeypatch.setenv("MEFOR_ESTATE_SIMPLE_FRACTION", value)
+    with pytest.raises(ValueError, match="MEFOR_ESTATE_SIMPLE_FRACTION"):
+        load_estate_shape()
+    assert "MEFOR_ESTATE_SIMPLE_FRACTION" in capsys.readouterr().err

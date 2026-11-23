@@ -496,3 +496,39 @@ def test_provision_admin_open_refusal_quotes_no_key_byte(
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert "xe9" not in out.lower(), out
     assert "nothing was written" in out, out
+
+
+def test_a_cipher_refusal_once_the_write_has_started_reaches_the_floor(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The write's key or cipher arm re-raises a refusal once the write has started (engine PR
+    2755 open finding 3, BACKLOG #5067): one from the write itself may follow a row it wrote, so it
+    must not be reported as could not start, with "nothing was written" and the advice to delete
+    the entry. A real SQLite store, so the open succeeds and the write is reached.
+
+    Mutation: drop the ``if write_started: raise`` branch from that arm; the run then exits 2,
+    which the exit-code assertion catches."""
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store.crypto import CipherError
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise CipherError("synthetic cipher refusal inside the write")
+
+    monkeypatch.setattr(AuthService, "provision_first_administrator", refusing)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    argv = [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        "--db",
+        str(shell / "provision.db"),
+    ]
+    code = main(argv)
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code == 1, out
+    assert _UNUSED_ENTRY not in out, out
+    assert "nothing was written" not in out.lower(), out

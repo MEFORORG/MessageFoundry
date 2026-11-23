@@ -942,13 +942,13 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   sign-on could then serve unfloored sign-ins for as long as `[auth].oidc_max_age_seconds` accepts
   it, and a fresh sign-on starts that again. The engine has no human step to time between such a
   start and its callback, and it cannot check the IdP's own anti-automation. This is a decided
-  limitation of the floors, recorded on 2026-10-09 under BACKLOG #1115. It is no oversight, and it
-  still counts as a gap. The sign-in rate limit would still apply to that path, and it does not
-  detect automation either. Switching it off, or setting its window to 0 or less or both its counts
-  to 0, removes it. [Business-logic limits](#business-logic-limits-asvs-213) gives its size and
-  settings. The [Route to limiter map](#route--limiter-map) lists the routes that charge it, and
-  says when the "you are leaving this site" confirm is shown before the start. That confirm is no control on this
-  path: a script can post the start without loading the page, and nothing times the confirm.
+  limitation of the floors, recorded on 2026-10-09 under BACKLOG #1115. It still counts as a gap.
+  The sign-in rate limit would still apply to that path, and it does not detect automation either.
+  Switching it off, or setting its window to 0 or less or both its counts to 0, removes it.
+  [Business-logic limits](#business-logic-limits-asvs-213) gives its size and settings. The [Route
+  to limiter map](#route--limiter-map) lists the routes that charge it, and says when the "you are
+  leaving this site" confirm is shown before the start. That confirm is no control on this path: a
+  script can post the start without loading the page, and nothing times the confirm.
   Revisit the decision if OIDC ever ships on by default.
 - The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
   refuses a good code until the clocks agree again. A step forward lets a code through early.
@@ -1616,8 +1616,8 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 [`api/app.py`](../messagefoundry/api/app.py) (74 HTTP + 1 WebSocket) and 46 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
 and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 125 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 251
-(121 + the 129 console routes + the `/ui/static` mount). Of the 121: **102 are permission-gated**, 19 are
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 252
+(121 + the 130 console routes + the `/ui/static` mount). Of the 121: **102 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -1692,7 +1692,12 @@ tuple: they act only on the caller's own account.
 record checked against its integrity seal: `GET /users`, `GET /users/{user_id}/permissions`,
 `PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`;
 and in the web console (BACKLOG #5559) at least these. `GET /ui/users` answers 200 and lists a
-failing account by its id alone, with its delete. `GET /ui/users/{user_id}`,
+failing account by its id alone; to a caller holding `users:manage` it links that account's
+delete to `GET /ui/users/{user_id}/delete-confirm`, which, for a record its checked read refuses
+with 423, shows a confirmation naming the id alone rather than the 423 this paragraph gives a
+failing record. Where the id in its path is the caller's own, that page shows a note that the
+caller cannot delete their own account, and no delete form.
+`GET /ui/users/{user_id}`,
 `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
@@ -1702,7 +1707,8 @@ per account and rate-limited, in each engine process: only the first refusal of 
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
 inside that interval, from any of these routes or any other reader of the same account in that
-process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
+process, answers 423, lists the account as failed or, on the delete confirmation, shows its page,
+and adds no row and no alert. Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
@@ -1732,7 +1738,7 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-answered the same way, a 423 or listed as failed, but reported under
+answered the same way as a failing record, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
 lists nothing, pages `authority-seal-transit` and writes no audit row.
@@ -1947,14 +1953,14 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **129 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **130 routes + one `/ui/static` mount** (federation off,
 the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`,
 and the IdP step-up start `POST /ui/reauth/oidc` are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 118 of the 129 carry a gate. The 11 that do not are the
+**Route → permission map (`/ui` plane).** 119 of the 130 carry a gate. The 11 that do not are the
 sign-in, sign-out, re-auth and second-factor entry points and the CSP report sink, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -2078,6 +2084,7 @@ the console routes with a rule of their own.
 | `GET` | `/ui/users/{user_id}` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/channel-scope` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/delete` | `users:manage` | `require_ui_step_up` |
+| `GET` | `/ui/users/{user_id}/delete-confirm` | `users:manage` | `require_ui_step_up`; see *What an admin user read reports* (BACKLOG #5559) |
 | `GET` | `/ui/users/{user_id}/federated-identity` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/federated-identity/link` | `users:manage` | `require_ui_step_up_action` (action `admin_federated_identity`) |
 | `POST` | `/ui/users/{user_id}/federated-identity/unlink` | `users:manage` | `require_ui_step_up_action` (action `admin_federated_identity`) |
@@ -6104,15 +6111,17 @@ A directory sign-in's role sync is a compare-and-set on the roles it read too (v
 #3085), on the Kerberos and the OIDC leg alike. When another writer, at least a reconciler,
 another sign-in or a custom role's deletion, wrote the roles in between, the sign-in reads them
 again. If they are already at the directory's set, the sign-in writes no role and no
-`auth.ad_roles_resynced` row, but still ends the account's other sessions, sends its notice and
-runs the Administrator checks from the roles it first read, as on `main`, so a failed revoke by
-the other writer cannot leave stale sessions live. Otherwise it writes once more against what it
-read, and its `auth.ad_roles_resynced` row, its revoke, its notice and any Administrator alert are
-computed from the roles it replaced. If the roles read after that write are at another set still,
+`auth.ad_roles_resynced` row. It runs the Administrator checks from the roles it first read, and
+when those differ from the directory's set it still ends the account's other sessions and sends
+its notice, so it tries the revoke itself in case the other writer's failed. If the roles it reads
+again are not at the directory's set, it writes once more against what it read, and its
+`auth.ad_roles_resynced` row, its revoke, its notice and any Administrator alert are computed from
+the roles it replaced. If the roles read after that write are at another set still,
 the sign-in is refused with an `auth.login_failed` row whose reason is `role_sync_contended`. A
 record gone or failing its seal when read again after a lost write is refused with
-`account_refused`, and one now disabled or locked with the reason its eligibility gate gives. On
-these refusals the sign-in writes no role: the other writer's
+`account_refused`, and one now ineligible, at least disabled, locked or, off the federated leg,
+holding a federated binding (`federated_sign_in_required`), with the reason its eligibility gate
+gives. On these refusals the sign-in writes no role: the other writer's
 roles and sessions stand until the next sign-in or reconcile pass. Its other writes, such as a
 profile refresh, have already committed. The compare is on the set, so it cannot tell a newer
 directory read from an older one.
@@ -8496,7 +8505,8 @@ HTTP 408 or 504 on both asks of a row's verify, in the walk only.
 **Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under
 that version then reads as a break, `audit-verify` exits 1, and the attestation counts as none. The
-audit key is the data key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` names another. So raising the data
+audit key is the data key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` is set to the name of a different
+Transit key; set empty, or to the data key's own name, it is still the data key. So raising the data
 key's `min_decryption_version` breaks the chain too; ADR 0193's 2026-11-11 amendment says which
 floor applies and what that rests on. Rotating is safe; retiring is not. The break text names both
 causes, a planted version and a retired one.
@@ -8522,7 +8532,8 @@ service account could be such a process. It would then run Python inside the eng
 everything the engine holds.
 
 The first control is a start refusal under `enforce`, which `[security].allow_remote_debugging`
-lifts (vault BACKLOG #2700). Which commands make it, and when it fires, is stated once, in
+lifts (vault BACKLOG #2700). Which commands make that refusal, and when it fires, are stated
+in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
 Three further controls answer it, and they differ in strength:
 

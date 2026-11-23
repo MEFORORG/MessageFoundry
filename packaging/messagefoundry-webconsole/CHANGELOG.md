@@ -29,6 +29,11 @@ this line.**
   code field when the session owes one, the passkey page script sends it in its body, and the
   account page tells a directory user with no factor to ask an Administrator through the site's
   identity check, not by mail or chat.
+- **The nav heart and the status page show a FHIR lookup isolated at start.** The engine names
+  such a lookup in `/status` as `fhir_lookups_failed`. The heart then raises a warn. Its tooltip
+  names the lookup unless another issue takes it first, such as a down-level issue or a failed
+  inbound. `/ui/status` shows a "FHIR lookup start failures" row in the same words. Neither shows
+  for a channel-scoped operator, who gets an empty list. (vault `BACKLOG #3008`)
 - **The sign-in page offers a combined passkey sign-in.** A "Sign in with password and passkey"
   button runs a usernameless passkey ceremony (`POST /ui/login/passkey`, which charges the sign-in
   window first and sets the challenge's handle as an HttpOnly cookie) and submits the assertion with
@@ -84,6 +89,21 @@ this line.**
   the search form, where it used to continue to its own POST path, which `/ui/reauth` refuses. The
   layered search's refusal now keeps its `?presets=` query, without which the run answers 400.
   The supported engine seam moved with it. (`BACKLOG #5646`)
+- **The user pages read an account through the engine's seal-checked read.** The detail page, the
+  federated identity screen and its unlink confirmation, the channel-scope save and the
+  notification-address form read the account through `AdminHandlers.checked_user` rather than the
+  store row, so a record that fails its integrity seal answers 423, or offers no suggestion on the
+  notification-address form, with nothing of the row shown, and the failure goes to the engine's
+  rate-limited seal-failure report. The users list names
+  such an account by its id and, for a `users:manage` holder only, offers its delete through a new
+  confirmation page, `GET /ui/users/{user_id}/delete-confirm`, which sends an intact account to
+  its own page. The page says the record could not be verified against its seal, since the 423
+  does not say whether the seal failed or could not be verified. A page shown after a password
+  reset, a factor reset or an enrolment code was issued names the account by its id on the
+  refusals `_shown_name` in `routes/admin.py` names, and on a defect, which is logged at ERROR
+  without its message; its docstring states that rule and what each case logs. The supported
+  engine seam
+  moved with it: `admin.checked_user` is part of it. (`BACKLOG #5559`)
 - **The cookie WebSocket gate refuses a blank or repeated `Origin`.** `authorize_ui_ws` read
   only the first `Origin` header. It now reads every copy and refuses a blank `Origin`, or more
   than one, as the engine's header path does; an absent header still leaves the handshake to the

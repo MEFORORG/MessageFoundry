@@ -1361,51 +1361,93 @@ function Get-SettingsKeyProvider {
       READ AS TEXT. Running the install's interpreter would run its code from this elevated prompt,
       which the interpreter check below declines to do. So this reads at least a key_provider line in
       a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table
-      with no table nested before the key, each holding a one-line string with no escape. Lines
-      inside a multi-line array or string are skipped. Names compare case-sensitively, as TOML's
-      do. Other forms can misread either way: at least a header it does not recognize (a tab, or a
-      quoted key with a space or punctuation) leaves the lines after it credited to the table
-      before it, and a triple quote in a comment or a one-line string, or a multi-line string
-      holding the other delimiter, can make it misread every line after it. The answer decides, at
-      least, whether the installer refuses a shared account for the host provider, makes a custody
-      directory and names it to the service, and accepts -CustodyDir. The engine applies its own key
-      custody refusals at start whatever this returns.
+      on a line with no triple quote, whose keys and values before key_provider hold no nested
+      table and no escape, each key_provider holding a one-line basic or literal string with no
+      escape. It follows strings, comments and array brackets from line to line, and reads a line
+      as a header or a key only when the line starts outside a multi-line string and outside a
+      multi-line array. A header it classifies names a table, or an array of tables, by bare keys
+      and quoted keys with no escape. Any other line that starts with [ there ends the table before
+      it, so a key under it is credited to no table. Names compare case-sensitively, as TOML's do.
+      Other forms can misread: at least a value or a quoted key with an escape, and a triple-quoted
+      value, are not read, and at least an inline table that spans lines (through a multi-line
+      string or array value, or as TOML 1.1 allows) and a file that is not valid TOML can misread
+      either way. The answer decides, at least, whether the installer refuses a shared account for
+      the host provider, makes a custody directory and names it to the service, and accepts
+      -CustodyDir. The engine applies its own key custody refusals at start whatever this returns.
     #>
     param([Parameter(Mandatory)][string]$Path)
     $value = '(?:"(?<v>[^"\\]*)"|''(?<v>[^'']*)'')'
     $key = '(?:key_provider|"key_provider"|''key_provider'')'
     $store = '(?:store|"store"|''store'')'
     $tail = '\s*(?:#.*)?$'
-    $table = ""
+    $part = '(?:[A-Za-z0-9_\-]+|"[^"\\]*"|''[^'']*'')'
+    $header = '^[ \t]*(?<o>\[\[?)[ \t]*(?<k>' + $part + '(?:[ \t]*\.[ \t]*' + $part + ')*)[ \t]*(?<c>\]\]?)' + $tail
+    # $null is the root table; a header names a string, the empty one of [""] included.
+    $table = $null
     $found = $null
-    $inString = $false
-    $arrayDepth = 0
+    $open = ""   # the multi-line string delimiter the lines before this one left open, or ""
+    $depth = 0   # the array brackets the lines before this one left open, outside strings and comments
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
         $line = $line.TrimStart([char]0xFEFF)
-        # A line inside a multi-line string is never a header or a key; an odd count of
-        # triple quotes opens or closes one.
-        $wasInString = $inString
-        if (([regex]::Matches($line, '"""|''''''').Count % 2) -eq 1) { $inString = -not $inString }
-        if ($wasInString -or $inString) { continue }
-        # A line inside a multi-line array is an element, never a header or a key, even one shaped
-        # like a header such as ["store"] or [1]. The depth counts the brackets left open, outside
-        # strings and comments, by the lines before this one.
-        $inArray = $arrayDepth -gt 0
-        $code = ($line -creplace '"(?:[^"\\]|\\.)*"|''[^'']*''', '""') -creplace '#.*$', ''
-        $arrayDepth = [Math]::Max(0, $arrayDepth + ([regex]::Matches($code, '\[').Count -
-            [regex]::Matches($code, '\]').Count))
-        if ($inArray) { continue }
-        if ($line -cmatch '^\s*\[\[') { $table = "[[]]"; $arrayDepth = 0; continue }
-        # A header names a table by bare or quoted keys.
-        if ($line -cmatch ('^\s*\[(?<t>[A-Za-z0-9_.\-"'' ]+)\]' + $tail)) {
-            $table = $Matches.t -creplace '[\s"'']', ''
-            $arrayDepth = 0
+        # A line that starts inside a multi-line string or array is part of a value, never a header
+        # or a key, even one shaped like a header such as ["store"] or [[1]].
+        $atTop = $open -eq "" -and $depth -eq 0
+        $i = 0
+        while ($i -lt $line.Length) {
+            $c = $line[$i]
+            if ($open) {
+                if ($open -ceq '"""' -and $c -ceq [char]'\') { $i += 2; continue }
+                if ($c -ceq $open[0]) {
+                    $run = 0
+                    while ($i + $run -lt $line.Length -and $line[$i + $run] -ceq $open[0]) { $run++ }
+                    $i += $run
+                    # Up to two quotes before the closing three are part of the string.
+                    if ($run -ge 3) { $open = "" }
+                    continue
+                }
+                $i++
+                continue
+            }
+            if ($c -ceq [char]'#') { break }
+            if ($c -ceq [char]'"' -or $c -ceq [char]"'") {
+                $q = [string]$c
+                if ($line.Substring($i).StartsWith($q * 3, [StringComparison]::Ordinal)) {
+                    $open = $q * 3
+                    $i += 3
+                    continue
+                }
+                $i++
+                while ($i -lt $line.Length -and $line[$i] -cne $c) {
+                    if ($q -ceq '"' -and $line[$i] -ceq [char]'\') { $i++ }
+                    $i++
+                }
+                $i++
+                continue
+            }
+            if ($c -ceq [char]'[') { $depth++ }
+            elseif ($c -ceq [char]']') { $depth = [Math]::Max(0, $depth - 1) }
+            $i++
+        }
+        if (-not $atTop) { continue }
+        if ($line -cmatch '^[ \t]*\[') {
+            # A header line opens no array, whatever its brackets.
+            $depth = 0
+            $table = "?"
+            if ($line -cmatch $header -and $Matches.o.Length -eq $Matches.c.Length) {
+                if ($Matches.o.Length -eq 2) { $table = "[[]]" }
+                else {
+                    $table = ([regex]::Matches($Matches.k, $part) | ForEach-Object {
+                        $_.Value -creplace '^["'']|["'']$', '' }) -join "."
+                }
+            }
             continue
         }
-        # A [store] line; a top-level dotted key; a top-level one-line inline table.
+        # A [store] line; a top-level dotted key; a top-level one-line inline table on a line with no
+        # triple quote, since this pattern would read a triple-quoted string as one-line ones.
         if (($table -ceq "store" -and $line -cmatch ('^\s*' + $key + '\s*=\s*' + $value + $tail)) -or
-            ($table -ceq "" -and $line -cmatch ('^\s*' + $store + '\s*(?:\.\s*' + $key + '\s*=\s*' +
-                $value + $tail + '|=\s*\{(?:(?:[^{}"''#]|"[^"\\]*"|''[^'']*'')*[,\s])?' + $key + '\s*=\s*' + $value + ')'))) {
+            ($null -eq $table -and $line -cmatch ('^\s*' + $store + '\s*\.\s*' + $key + '\s*=\s*' + $value + $tail)) -or
+            ($null -eq $table -and $line -cnotmatch '"""|''''''' -and $line -cmatch ('^\s*' + $store +
+                '\s*=\s*\{(?:(?:[^{}"''#]|"[^"\\]*"|''[^'']*'')*[,\s])?' + $key + '\s*=\s*' + $value))) {
             $found = $Matches.v
         }
     }

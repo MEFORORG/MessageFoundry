@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from harness.config.connscale._shape import make_connscale_shape
+from harness.load._lookup import CONNSCALE_PATTERNS, PROFILES_DIR
 from harness.load.connscale.profile import (
     ConnScaleProfileError,
     get_connscale_profile,
@@ -140,6 +142,27 @@ def test_pooled_ab_builtin_resolves() -> None:
     assert p.claim_modes == ("per_lane", "pooled")
     assert p.sweep_mode == "fixed_aggregate"
     assert "pooled_ab" in list_connscale_profiles()
+
+
+_SHIPPED_PROFILES = sorted(
+    {path for pattern in CONNSCALE_PATTERNS for path in PROFILES_DIR.glob(pattern)}
+)
+
+
+def test_the_shipped_profile_scan_finds_the_profiles() -> None:
+    # An empty parametrize list skips and exits green, which would retire the band check below.
+    assert {"connscale", "fuse_ab", "pooled_ab"} <= {path.stem for path in _SHIPPED_PROFILES}
+
+
+@pytest.mark.parametrize("path", _SHIPPED_PROFILES, ids=lambda path: path.stem)
+def test_shipped_profile_band_clears_the_default_sink_at_every_count(path: Path) -> None:
+    # BACKLOG #5858, #5859, #5860: the documented command passes no --sink-port, so each step builds
+    # its shape against the default sink, and the shape guard refuses a band that contains it.
+    # Globbed from the shipped directory, because in the merged listing an operator-local profile
+    # of the same name would replace the shipped one and take it out of this check.
+    profile = load_connscale_profile(path)
+    for count in profile.counts:
+        make_connscale_shape(count=count, base_port=profile.base_port)
 
 
 def test_file_loader_tolerates_utf8_bom(tmp_path: Path) -> None:

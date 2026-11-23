@@ -137,6 +137,7 @@ from messagefoundry.store.store import (
     ResendError,
     ResendKeyConflict,
     ResendKeyRecord,
+    ResendOriginMetadataUnreadable,
     ResendOutcome,
     ResendSourceAmbiguous,
     ResendSourceEmpty,
@@ -185,6 +186,7 @@ __all__ = [
     "ResendError",
     "ResendKeyConflict",
     "ResendKeyRecord",
+    "ResendOriginMetadataUnreadable",
     "ResendOutcome",
     "ResendSourceAmbiguous",
     "ResendSourceEmpty",
@@ -1274,8 +1276,9 @@ class QueueStore(StoreLifecycle, Protocol):
     # by leaving the argument out, and each backend raises TypeError, before any write, on an
     # explicit ``None`` or anything not callable (BACKLOG #5069). ``enqueue_ingress`` keeps an
     # optional ``audit`` because it is also the live receipt path; see its docstring for what holds
-    # the operator inject there. An ``OperatorAudit`` may still RETURN ``None`` for a result,
-    # which records nothing: that is decided, and the reason is on ``store.OperatorAudit``.
+    # the operator inject there. An ``OperatorAudit`` may still RETURN ``None`` for a result that
+    # changed nothing, which records nothing; for a result that changed the store, a ``None``
+    # return raises inside the transaction. Both are decided on ``store.OperatorAudit``.
     async def replay(
         self,
         message_id: str,
@@ -1329,9 +1332,11 @@ class QueueStore(StoreLifecycle, Protocol):
         audit: OperatorAudit[int],
     ) -> int:
         """``audit`` is REQUIRED (vault BACKLOG #3217), so every caller has to say what the purge
-        records, and the row it returns commits in the cancel's own transaction. It is not a
-        guarantee that a row is written: an :data:`OperatorAudit` may return ``None``, which records
-        nothing. The API's purge paths both return a ``connection_purge`` row for every call."""
+        records, and the row it returns commits in the cancel's own transaction. An
+        :data:`OperatorAudit` may return ``None`` only for a purge that cancelled no row, which then
+        records nothing; for one that cancelled a row, a ``None`` raises :class:`TypeError` inside
+        the transaction (BACKLOG #5069). The API's purge paths both return a ``connection_purge``
+        row for every call."""
         ...
 
     # --- read helpers (API / console) ----------------------------------------

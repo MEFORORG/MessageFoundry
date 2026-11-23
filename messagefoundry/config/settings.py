@@ -4372,7 +4372,7 @@ class AuthSettings(_Section):
     @field_validator("ad_session_recheck_seconds")
     @classmethod
     def _check_ad_recheck_seconds(cls, value: int) -> int:
-        # 0 = off (the default). Anything else is floored at 60 s: a pass costs one LDAP bind per
+        # 0 = off. Anything else must be at least 60 s: a pass costs one LDAP bind per
         # signed-in directory user, so a mistyped `1` would hammer the domain controller.
         if value < 0:
             raise ValueError("ad_session_recheck_seconds must be >= 0 (0 = disabled)")
@@ -6306,7 +6306,7 @@ class AlertsSettings(_Section):
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
     webhook_allowed_hosts: list[str] = []
     # BACKLOG #2193 (ADR 0173 section 12 pattern, owner ruling 2026-10-27): attests that revocation of
-    # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
+    # the webhook host's certificate is covered outside the engine. The POST can carry the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
     # reason. It is the only way across: the webhook rides one shared opener, which no CRL
@@ -6419,6 +6419,22 @@ class AlertsSettings(_Section):
         if isinstance(v, str):
             return [addr.strip() for addr in v.split(",") if addr.strip()]
         return v
+
+    @model_validator(mode="after")
+    def _webhook_url_is_buildable(self) -> AlertsSettings:
+        """Vault BACKLOG #3533 item 14: refuse at load a webhook URL the notifier build would refuse.
+
+        It runs the build's own posture-free checks, ``refuse_unbuildable_webhook_url``, so settings
+        load, ``check`` and the serve pre-flight refuse what the build refuses on them; that
+        function's docstring lists them. The value is kept as written. The revocation guard reads
+        the posture and stays at the build. An empty value stays "not configured", as every
+        consumer reads it."""
+        if self.webhook_url:
+            # Lazy, to keep the edit local; the module imports no transports package.
+            from messagefoundry.config.alert_webhook import refuse_unbuildable_webhook_url
+
+            refuse_unbuildable_webhook_url(self.webhook_url, self.webhook_allowed_hosts)
+        return self
 
     @model_validator(mode="after")
     def _refuse_a_login_over_an_unauthenticated_hop(self) -> AlertsSettings:

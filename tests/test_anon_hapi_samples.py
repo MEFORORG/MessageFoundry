@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The two de-identified HAPI sample corpora, and the manifest that describes the set (BACKLOG #5557, #5558).
+"""The de-identified HAPI sample corpora, and the manifest that describes the set (BACKLOG #5557, #5558, #5825).
 
-``batch_18_messages.txt`` and ``oml_o21.hl7`` under ``samples/messages/hapi-hl7v2/`` were scrubbed
+``batch_18_messages.txt``, ``oml_o21.hl7`` and ``adt_a03.txt`` under ``samples/messages/hapi-hl7v2/`` were scrubbed
 by DEFAULT_RULES plus a committed overlay each, under ``tests/fixtures/anon/``. These tests hold
-each corpus to its overlay in two ways:
+each corpus to its overlay in two ways, and adt_a03 in a third:
 
 * no field of any message is undecided: a rule scrubs it or the overlay keeps it; and
 * each field a rule scrubs holds what that rule writes. A name, clinician or address must come from
@@ -13,7 +13,8 @@ each corpus to its overlay in two ways:
 
 The second check cannot see every kind. A phone, an SSN, a date of birth and the first component of
 an identifier are fabricated in the shape of the value they replace, so a residue of those kinds
-passes it.
+passes it. For adt_a03 a third check covers that gap: digests of its upstream identifying values
+must not match any token of the file.
 
 The README's manifest must count each file's messages, since ``samples/send_mllp.py`` refuses a
 multi-message file; that test checks only counts and the type of a one-message file. Every message
@@ -23,10 +24,12 @@ here is synthetic or upstream public test data (CLAUDE.md section 9).
 from __future__ import annotations
 
 import functools
+import hashlib
 import re
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -53,10 +56,38 @@ from messagefoundry_toolkit.anon.surrogates import (
 _REPO = Path(__file__).resolve().parent.parent
 _HAPI = _REPO / "samples" / "messages" / "hapi-hl7v2"
 _FIXTURES = _REPO / "tests" / "fixtures" / "anon"
+
+
+class _Corpus(NamedTuple):
+    overlay: Path
+    #: How many fields the overlay itself scrubs, so one added or dropped is noticed.
+    overlay_fields: int
+    #: The least number of values of a judged kind the surrogate check must read, so a walk that
+    #: stopped early fails instead of passing empty. adt_a03 is one frozen message, so its floor
+    #: is its exact count.
+    min_checked: int
+
+
 _CORPORA = {
-    "batch_18_messages.txt": _FIXTURES / "batch_18.anon.toml",
-    "oml_o21.hl7": _FIXTURES / "oml_o21.anon.toml",
+    "batch_18_messages.txt": _Corpus(_FIXTURES / "batch_18.anon.toml", 19, 100),
+    "oml_o21.hl7": _Corpus(_FIXTURES / "oml_o21.anon.toml", 7, 100),
+    "adt_a03.txt": _Corpus(_FIXTURES / "adt_a03.anon.toml", 3, 17),
 }
+#: SHA-256 digests of identifying values upstream adt_a03.txt carried, held as digests only so the
+#: literal text is not in this file. They are unsalted, so a short value is easily recovered from
+#: one: this is not de-identification. They are the patient key, the fiscal code, the birth date, the
+#: visit number, the hospital, and the sending facility. The surrogate check cannot see an id or a
+#: birth date put back, since both are fabricated in the shape of the value they replace.
+_ADT_A03_UPSTREAM_DIGESTS = frozenset(
+    {
+        "3c31063b0923ca11d10d15bdddb73c4ef829cd0040632df03a3a42b10fd10dd1",
+        "e68a6c5954f614c27b39ef34431cfc351fc27a8b46246e830bfd9b04215728d8",
+        "d416af96205ae608dc302a2aecdd60216e03fb9b30d560798b67713ca6035035",
+        "76c11cd770cf2925c1f66f1e2fadff9d4033d6912833e24607db0c02265aaf26",
+        "fd3d10d124504d6d08ba270f1d7979686ae53e5c6eed408cb00ea1b9f798991a",
+        "ead80e2d92df57a355f122729044633d4b9f51046947fb84971f074186e0a84e",
+    }
+)
 _SEGMENT = re.compile(r"[A-Z][A-Z0-9]{2}\|")
 # batch_18 keeps one malformed MSH-2 on purpose: three encoding characters, so no parser can read
 # its separators. The README says the scrub repaired it to this and restored it afterward. The
@@ -86,7 +117,7 @@ def _messages(name: str) -> tuple[str, ...]:
 
 @functools.cache
 def _rules(name: str) -> tuple[FieldRule, ...]:
-    return load_rules(_CORPORA[name])
+    return load_rules(_CORPORA[name].overlay)
 
 
 _CASES = [(name, i) for name in _CORPORA for i in range(len(_messages(name)))]
@@ -114,7 +145,10 @@ def _is_filled_date(comps: list[str], rep: str, seps: Seps) -> bool:
 
 
 def _is_identifier(comps: list[str], rep: str, seps: Seps) -> bool:
-    return bool(comps[0]) and _kept_tail(comps, _CX_KEPT_COMPONENTS) == comps[1:]
+    # The surrogate leaves an empty id empty and still writes the kept components, as in adt_a03's
+    # ``^^^^TEAM`` repetition, so an empty id passes when every component set beside it is one the
+    # surrogate keeps. That also passes an empty repetition, which the surrogate writes for ``^``.
+    return _kept_tail(comps, _CX_KEPT_COMPONENTS) == comps[1:]
 
 
 _IDENTIFIER = (_is_identifier, "components an identifier surrogate blanks are set")
@@ -184,9 +218,9 @@ def test_the_coverage_check_names_a_field_whose_keep_is_removed() -> None:
 def test_the_overlay_scrubs_only_fields_no_default_maps(name: str) -> None:
     """Each overlay says why its scrubbed fields are not defaults. If one becomes a default, that
     reason is stale, and this is the prompt to rewrite it."""
-    with _CORPORA[name].open("rb") as handle:
-        overlay_fields = set(tomllib.load(handle)["hl7"]["fields"])
-    assert len(overlay_fields) >= 7
+    with _CORPORA[name].overlay.open("rb") as handle:
+        overlay_fields = set(tomllib.load(handle)["hl7"].get("fields", {}))
+    assert len(overlay_fields) == _CORPORA[name].overlay_fields
     assert overlay_fields.isdisjoint(rule.path for rule in DEFAULT_RULES)
 
 
@@ -198,9 +232,9 @@ def test_every_scrubbed_field_holds_a_surrogate(name: str) -> None:
         count, problems = _residue(message, _rules(name))
         checked += count
         found += [f"msg{i + 1} {problem}" for problem in problems]
-    # Each corpus holds well over a hundred values of a judged kind. Far fewer means the walk
-    # stopped reading fields, and then an empty list below would prove nothing.
-    assert checked >= 100
+    # Far fewer judged values than the corpus holds means the walk stopped reading fields, and
+    # then an empty list below would prove nothing.
+    assert checked >= _CORPORA[name].min_checked
     assert found == []
 
 
@@ -242,6 +276,43 @@ def test_the_surrogate_check_passes_what_the_anonymizer_writes() -> None:
     checked, found = _residue(scrubbed, _CONTROL_RULES)
     assert checked == len(_CONTROL_RULES)
     assert found == []
+
+
+@pytest.mark.parametrize(
+    ("rep", "expected"),
+    [
+        ("^^^^TEAM", True),  # what the surrogate writes for an empty id beside a type code
+        ("6075145^^^PK^PK", True),
+        ("", True),  # what the surrogate writes for ``^``
+        ("^", False),
+        ("^8^M10", False),  # a check digit left beside an empty id
+        ("^^^^TEAM^^20260101", False),  # an effective date left beside an empty id
+    ],
+)
+def test_the_identifier_check_judges_an_empty_id(rep: str, expected: bool) -> None:
+    assert _is_identifier(rep.split("^"), rep, Seps()) is expected
+
+
+def _tokens(text: str) -> set[str]:
+    """Every value in ``text``, comment lines included, split on the separators its first MSH
+    declares."""
+    parsed = read_message_seps(text.replace("\r\n", "\r").split("\r", 1)[0])
+    assert parsed is not None
+    seps = parsed[0]
+    splitters = {"|", seps.component, seps.repetition, seps.subcomponent, "\r", "\n"}
+    return set(re.split("|".join(map(re.escape, splitters)), text)) - {""}
+
+
+def test_no_upstream_identifier_is_left_in_adt_a03() -> None:
+    """A put-back id or birth date passes the surrogate check, so the upstream values are pinned
+    absent by digest. A token of the committed file is found, so the tokens were read; on the
+    upstream file this test fails."""
+    digests = {
+        hashlib.sha256(t.encode()).hexdigest()
+        for t in _tokens((_HAPI / "adt_a03.txt").read_bytes().decode("utf-8"))
+    }
+    assert digests.isdisjoint(_ADT_A03_UPSTREAM_DIGESTS)
+    assert hashlib.sha256(b"ADT").hexdigest() in digests
 
 
 _MANIFEST_ROW = re.compile(r"^\| `([^`]+)` \| ([^|]+) \| [^|]+ \| *(\d+) \|", re.M)

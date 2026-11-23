@@ -318,14 +318,16 @@ class _EndedUnread:
 
 @dataclass(frozen=True, slots=True)
 class _SignInRoleSync:
-    """What :meth:`AuthService._sync_sign_in_roles` wrote (vault BACKLOG #3085). Everything after
-    the write is computed from this, never from the roles the sign-in first read."""
+    """What :meth:`AuthService._sync_sign_in_roles` wrote (vault BACKLOG #3085). The sign-in's
+    revoke, notice and Administrator checks read ``previous``: the set the write replaced, except
+    when the roles were found already at the target, where it is the set the sign-in first read."""
 
     #: The roles the write replaced; or, found already at the target, the roles first read.
     previous: frozenset[str]
     held: Exception | None  #: raise once the sign-in's own steps have run
-    #: Why the sign-in is refused, with nothing written: :data:`ROLE_SYNC_CONTENDED`, or
-    #: :data:`ACCOUNT_REFUSED` for a record gone or failing its seal when read again.
+    #: Why the sign-in is refused, with nothing written: :data:`ROLE_SYNC_CONTENDED`;
+    #: :data:`ACCOUNT_REFUSED` for a record gone or failing its seal when read again; or the
+    #: :func:`_directory_login_refusal` reason for a record read again as ineligible to sign in.
     refusal: str | None = None
 
 
@@ -2286,7 +2288,9 @@ class UserSealRefused(RuntimeError):
     writes the audit row and raises the alert only for the first failure of the account in each report interval
     (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
     service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
-    may still delete it. The admin routes answer it 423. A record Vault transit cannot verify is
+    may still delete it. ``auth_routes._checked_user``, and so the JSON admin routes that read an
+    account through it, answer it 423; docs/SECURITY.md, *What an admin user read reports*, states
+    what at least some web console pages answer. A record Vault transit cannot verify is
     refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 
@@ -6621,10 +6625,13 @@ class AuthService:
         # TOTP on makes, reachable with neither factor: its refusal would escape ``login`` as an
         # unpadded 500, and a pool wait can outlast the pad, so either would name the account as
         # enrolled to anyone who knows the username. It would also add a locked round trip on the
-        # account's row to every wrong code. So a wrong code makes the store calls a password-only
-        # sign-in makes. A refusal here still escapes unpadded, as before, but only on a code that
-        # matched a step, which already tells its sender the account is enrolled. The ``int``
-        # signature of ``consume_totp_step`` keeps this short-circuit the only form that type-checks.
+        # account's row to every wrong code. So a wrong code makes no ``consume_totp_step`` call. It
+        # still opens the TOTP cell above (``open_totp_secret``), and under a Transit cipher that
+        # open is a round trip to the cipher service: a timing difference this line does not
+        # settle. A refusal here still escapes unpadded, as before, but only on a code that matched
+        # a step. The ``int`` parameter refuses an unconditional call on ``step`` itself, not a
+        # coerced one such as ``step or 0``; ``tests/test_constant_time_frame_totp_passkey.py``
+        # pins the short-circuit.
         code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
@@ -6742,9 +6749,10 @@ class AuthService:
         audit_bad_signature: bool,
     ) -> webauthn.AssertionResult | None:
         """Verify an assertion's signature against stored passkey ``cred``: the new sign count and
-        UV flag, or ``None`` when it is refused. The one copy of the refusal handling both passkey legs share,
-        :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write`` runs each audit
-        row: at once on the second-factor leg, deferred into the failure pad on the sign-in.
+        UV flag, or ``None`` when it is refused. The one copy of the refusal handling both passkey
+        legs share, :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write``
+        runs each audit row: at once on the second-factor leg, deferred into the failure pad on the
+        sign-in.
 
         * A stored key the registration rule refuses (BACKLOG #1963) will never sign in again, so it
           is logged and audited with a fixed slug, never the refusal text, which can quote the key.
@@ -8619,8 +8627,10 @@ class AuthService:
         role_ids = sorted(await self._ad_roles_for_groups(principal.groups))
         # Vault BACKLOG #3085: the write is a compare-and-set on the roles this sign-in read, so a
         # reconciler or another sign-in that wrote in between is never overwritten with a stale
-        # set. Every step below reads what the write did, never the roles first read: the revoke,
-        # the notice, the Administrator alerts and the audit row.
+        # set. The revoke, the notice and the Administrator alerts below read ``sync.previous``:
+        # the set the write replaced, or, for roles found already at the target, the set this
+        # sign-in first read (see ``_SignInRoleSync``). A change's audit row is written by the
+        # sync itself (``_write_sign_in_change`` says when it is written apart from the roles).
         sync = await self._sync_sign_in_roles(user, role_ids, federated=federated, client=client)
         if sync.refusal is not None:
             # The SIGN-IN is refused, and this sign-in wrote no role: what the other writer left
@@ -8745,8 +8755,8 @@ class AuthService:
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
                 # window-gated action demands a real step-up: a directory re-bind, or an engine TOTP
                 # or recovery code at the MFA gate, or a user-verified passkey that completes a
-                # pending factor, for a `kerberos` session, since those stamp the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
-                # #296, #2142).
+                # pending factor, for a `kerberos` session, since those stamp the window, and only
+                # the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG #296, #2142).
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
                 # two Kerberos routes disagreed: `GET /ui/sso` passed False while `POST
@@ -8781,7 +8791,10 @@ class AuthService:
             # #5624), not reported as a binding change. NOT THE SAME AS THAT CHECK IN ONE WAY:
             # the role, scope and profile sync above already ran, so a directory role change this
             # sign-in wrote in this window is applied and audited, and it ends the account's
-            # other sessions.
+            # other sessions. When another writer had already moved the roles to this sign-in's
+            # set, and the set this sign-in first read was a different one, those sessions were
+            # ended too, with no role write and no ``auth.ad_roles_resynced`` row of this
+            # sign-in's own (``_SignInRoleSync``, vault BACKLOG #3085).
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
             elif federated:
@@ -9042,9 +9055,11 @@ class AuthService:
                 #
                 # NOT CLOSED HERE: both sign-ins then run the caller's role resync on one new row.
                 # Its write is a compare-and-set on the roles each read (vault BACKLOG #3085), so
-                # only the first writes and revokes; the second finds the roles at its own set
-                # and changes nothing, or writes once more against what it read. The first's
-                # revoke can still end a session the second minted between that write and that
+                # the second either finds the roles at its own set or writes once more against what
+                # it read. Found at its set, it writes no role, but when the set it first read
+                # differs it still revokes and notifies as if it had written them (see
+                # ``_SignInRoleSync``), so it can end the session the first minted. The first's
+                # revoke can likewise end a session the second minted between that write and that
                 # revoke. Two concurrent sign-ins of an existing account meet the same race, so it
                 # belongs to the resync.
                 if winner.auth_provider != AuthProvider.AD.value:
@@ -16424,13 +16439,13 @@ class AuthService:
         """Whether the caller's session re-verified its credential within
         ``[auth].step_up_max_age_seconds`` -- the gate for sensitive operations (ASVS 7.5.3).
 
-        A LOCAL login that owes no second factor is the first verification. No directory login is:
+        A LOCAL login that owes no second factor is the first verification, unless it comes from an
+        address first seen for the account (BACKLOG #288), which opens no window. A combined
+        sign-in, which proves its code in the same request, opens one. No directory login is:
         Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5). A Kerberos session
         opens one by at least a step-up, a TOTP or recovery code, or a user-verified passkey that
         completes its pending factor (a passkey never renews a window once the factor is met), an
-        OIDC
-        session only by the IdP step-up
-        (BACKLOG #2142)."""
+        OIDC session only by the IdP step-up (BACKLOG #2142)."""
         if not token:
             return False
         session = await self._load_session(hash_token(token))
@@ -18766,8 +18781,10 @@ class AuthService:
                 # a replay, or a second use inside the same step. Returning here cost no argon2
                 # work, while a WRONG code falls through to the recovery-code walk below. Both answer
                 # False, so the wall clock was the only thing telling them apart. So fall through
-                # to the SAME walk (same store read, same hashes, same slot count) and refuse after
-                # it. A success stays fast: it already reveals its outcome.
+                # to the SAME walk (same hashes, same slot count) and refuse after it. A success
+                # stays fast: it already reveals its outcome. The two still differ by at least one
+                # store call: a wrong code matched no step, so it never reached
+                # ``consume_totp_step``, and ``verify_mfa`` re-reads more for a matched code.
                 totp_refused = True
         normalized = code.upper()  # recovery codes are minted uppercase
         # The hashes the account's seal covered, not a second read nobody checked (BACKLOG #2592).
@@ -19838,18 +19855,20 @@ class AuthService:
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
         factor satisfied and re-key the session (ASVS 7.2.4). The same factor write, when the row it
-        reads in its own transaction has not met its factor, also re-anchors the session to the WP-L3-13 client as
-        :meth:`verify_mfa` does and stamps ``reauth_at`` only when the authenticator reported user
-        verification, clearing it otherwise. A session that had already met its factor when that
-        write ran, and any ``oidc`` session, is neither re-anchored nor stamped (vault BACKLOG #2964
-        item 14, owner rulings 2026-11-14, ADR 0068 amendment of that date). Returns a not-``ok``
-        :class:`Elevation` (never raises) for any invalid input, always audited.
+        reads in its own transaction has not met its factor, also re-anchors the session to the
+        WP-L3-13 client as :meth:`verify_mfa` does and stamps ``reauth_at`` only when the
+        authenticator reported user verification, clearing it otherwise. A session that had already
+        met its factor when that write ran, and any ``oidc`` session, is neither re-anchored nor
+        stamped (vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068 amendment of that
+        date). Returns a not-``ok`` :class:`Elevation` (never raises) for any invalid input, always
+        audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
-        what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
-        0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
-        secrets and a flaky authenticator must not lock the account; abuse is bounded by the
-        route's ``allow_reauth_attempt`` gate + cookie-holder-only reachability + these audits.
+        what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from
+        :meth:`verify_mfa`** (recorded in ADR 0068): assertion failures do NOT feed
+        ``_register_failure`` — signatures are not guessable secrets and a flaky authenticator must
+        not lock the account; abuse is bounded by the route's ``allow_reauth_attempt`` gate +
+        cookie-holder-only reachability + these audits.
 
         A successful assertion DOES clear the failure counter (BACKLOG #1638). That is the other
         direction and the divergence does not cover it — see the call site.
@@ -19983,7 +20002,7 @@ class AuthService:
             )
             if isinstance(fresh, Elevation):
                 return fresh
-            settled = fresh.cred_digest == user.cred_digest
+            settled = constant_time_equal(fresh.cred_digest, user.cred_digest)
             user = fresh
             if settled or standing != "held":
                 break

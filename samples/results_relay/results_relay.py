@@ -15,9 +15,13 @@ after:
   - collapsing PID-3's identifier repetition list to the single **MR** identifier the EHR wants,
   - dropping **cancelled** results (OBX-11 = ``X``), and
   - remapping each local test code (OBX-3.1) to the EHR's code via a code set,
-  - rebuilding the OBX block in place (renumbered) — the *repeating-segment rebuild* that the
-    mutable-``Message`` API makes first-class (``count_segments`` / ``field(occurrence=…)`` /
-    ``repetitions`` / ``delete_segments`` / ``add_segment``).
+  - renumbering OBX-1 within each order, and across the results before the first OBR, which
+    ``groups`` leaves out — the *repeating-segment edit* that the mutable-``Message`` API makes
+    first-class (``count_segments`` / ``field(occurrence=…)`` / ``repetitions`` /
+    ``delete_segments(occurrence=…)`` / ``groups``).
+
+Every OBX edit goes through the parsed model, never a re-joined line, so the template keeps every
+OBX field and component it does not touch, the message's escaping, and each OBX under its own OBR.
 
 Run it locally::
 
@@ -27,7 +31,6 @@ Run it locally::
 """
 
 from messagefoundry import MLLP, File, Send, code_set, env, handler, inbound, outbound, router
-from messagefoundry.parsing.message import Message
 
 OB_EHR = "OB_EHR_ORU"
 FILE_ARCHIVE = "FILE-OUT_LABCO_ORU"
@@ -48,7 +51,7 @@ outbound(
 )
 
 # Local lab test code (OBX-3.1) -> the EHR's code. Edit codesets/test_codes.csv + reload; no code
-# change. A code not in the table blanks through unchanged (.get(code, code)).
+# change. A code not in the table passes through unchanged.
 TEST_CODES = code_set("test_codes")
 
 
@@ -60,8 +63,6 @@ def route(msg):  # type: ignore[no-untyped-def]
 
 @handler("relay_results")
 def relay_results(msg):  # type: ignore[no-untyped-def]
-    fsep, csep = _separators(msg)
-
     # 1) Collapse PID-3's identifier repetition list to the MR identifier the EHR expects.
     #    repetitions() iterates the ~-list; a whole-field write replaces the whole list.
     identifiers = msg.repetitions("PID-3")
@@ -76,49 +77,63 @@ def relay_results(msg):  # type: ignore[no-untyped-def]
         )
         msg.set("PID-3", mr)
 
-    # 2) Walk every OBX (occurrence=), drop cancelled results, remap the test code; collect what
-    #    to keep, then rebuild the OBX block in place — renumbering OBX-1.
-    kept: list[tuple[str, ...]] = []
-    for i in range(1, msg.count_segments("OBX") + 1):
+    # 2) Walk every OBX back to front (occurrence=), so deleting one never shifts an occurrence
+    #    still to visit: drop each cancelled result and remap each kept test code in place. Editing
+    #    the parsed segment, rather than re-joining its text, keeps every other OBX field and
+    #    component, the message's own escaping, and each OBX under the OBR it arrived with.
+    for i in range(msg.count_segments("OBX"), 0, -1):
         if msg.field("OBX-11", occurrence=i) == "X":  # cancelled / not done -> drop
+            _drop_result(msg, i)
             continue
+        # A blank code is looked up as "", so a code set row with a blank local code maps it.
         local_code = msg.field("OBX-3.1", occurrence=i) or ""
-        observation = csep.join(
-            [
-                TEST_CODES.get(local_code, local_code),  # remapped code (blank-through on a miss)
-                msg.field("OBX-3.2", occurrence=i) or "",  # text
-                msg.field("OBX-3.3", occurrence=i) or "",  # coding system
-            ]
-        )
-        kept.append(
-            (
-                msg.field("OBX-2", occurrence=i) or "",  # value type
-                observation,  # OBX-3
-                msg.field("OBX-5", occurrence=i) or "",  # value
-                msg.field("OBX-6", occurrence=i) or "",  # units
-                msg.field("OBX-7", occurrence=i) or "",  # reference range
-                msg.field("OBX-8", occurrence=i) or "",  # abnormal flag
-                msg.field("OBX-11", occurrence=i) or "",  # result status
-            )
-        )
-    if not kept:
+        if local_code in TEST_CODES:  # an unmapped code is left exactly as it arrived
+            # A component write escapes the new code and leaves OBX-3.2 onward as they were.
+            msg.set("OBX-3.1", TEST_CODES[local_code], occurrence=i)
+    if not msg.count_segments("OBX"):
         return None  # every result cancelled -> nothing to relay (logged FILTERED)
 
-    insert_at = msg.segments().index(
-        "OBX"
-    )  # rebuild where the block began (OBX present: kept non-empty)
-    msg.delete_segments("OBX")
-    for n, (vtype, obs, value, units, ref, abnormal, status) in enumerate(kept, start=1):
-        msg.add_segment(
-            fsep.join(["OBX", str(n), vtype, obs, "", value, units, ref, abnormal, "", "", status]),
-            index=insert_at + n - 1,
-        )
+    # 3) Renumber OBX-1 (Set ID) from 1 within each order, closing the gaps the drops left. An OBX
+    #    before the first OBR is in no group, so those leading results form their own run from 1.
+    orders = [(order, order.count("OBX")) for order in msg.groups("OBR")]
+    leading = msg.count_segments("OBX") - sum(count for _, count in orders)
+    for n in range(1, leading + 1):
+        msg.set("OBX-1", str(n), occurrence=n)
+    for order, count in orders:
+        for n in range(1, count + 1):
+            order.set("OBX-1", str(n), occurrence=n)
 
-    # 3) Fan out: relay to the EHR and archive a copy to file.
+    # 4) Fan out: relay to the EHR and archive a copy to file.
     return [Send(OB_EHR, msg), Send(FILE_ARCHIVE, msg)]
 
 
-def _separators(msg: Message) -> tuple[str, str]:
-    # (field sep, component sep) read from MSH-1/MSH-2 — never hardcoded (CLAUDE.md §8).
-    enc = msg.field("MSH-2") or "^~\\&"
-    return (msg.field("MSH-1") or "|"), enc[0]
+#: Segments that belong to the OBX they follow; a Z-segment does too (see _is_child).
+_CHILD_SEGMENTS = {"NTE", "PRT"}
+
+
+def _is_child(segment_id: str) -> bool:
+    # An allowlist, not a stop list: any other segment after the OBX (the next patient's PID and
+    # PV1, a DSC, FT1 or CTI, a batch trailer, the next MSH) is not this result's and must survive.
+    return segment_id in _CHILD_SEGMENTS or segment_id.startswith("Z")
+
+
+def _drop_result(msg, i):  # type: ignore[no-untyped-def]
+    # Delete the i-th OBX and the rows that belong to it (its NTE comments, PRT participants and
+    # any Z-segment), so none of them ends up attached to the result before it.
+    ids = msg.segments()
+    at = [pos for pos, seg in enumerate(ids) if seg == "OBX"][i - 1]
+    end = at + 1
+    while end < len(ids) and _is_child(ids[end]):
+        end += 1
+    children = ids[at + 1 : end]
+    # segments() lists a fieldless bare line (e.g. "NTE" alone); occurrences skip it. Where one is
+    # present the positions above and the occurrences below disagree, so refuse the message (it
+    # takes the ERROR path) rather than delete another result's rows.
+    if any(ids.count(seg) != msg.count_segments(seg) for seg in {"OBX", *children}):
+        raise ValueError("a fieldless segment line makes the OBX rows ambiguous")
+    # Each deleted child's next sibling takes its occurrence number. A delete that removes nothing
+    # means the numbering disagreed after all, so refuse rather than relay a cancelled result.
+    deletes = [(seg, ids[:at].count(seg) + 1) for seg in children] + [("OBX", i)]
+    for seg, occurrence in deletes:
+        if msg.delete_segments(seg, occurrence=occurrence) != 1:
+            raise ValueError(f"{seg} occurrence {occurrence} is missing; refusing a partial drop")

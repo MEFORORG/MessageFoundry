@@ -23,7 +23,8 @@ present the credential, and only when the engine would actually open it (a conne
 ``deployed=False`` is never built, so it is not a hop). Two shapes are reported:
 
 * ``credential="static"``: the hop presents an unchanging credential (a password, API key, static
-  bearer token, or a Vault token read from the environment).
+  bearer token, or a Vault token read from the environment). The alert webhook is listed as one
+  whatever its URL holds, because a webhook service can put its token in the URL path.
 * ``credential="none"``: the hop presents no credential at all. It is reported because a gate that
   refused a static password but passed the same hop with the password deleted would reward making the
   hop weaker.
@@ -113,9 +114,9 @@ from messagefoundry.config.wiring import (
     EnvRef,
     Registry,
     WiringError,
-    _db_setting,
     _is_secret_header,
     _peer_label,
+    _resolved_setting,
     guarded_env_values,
     static_credential_db_hops,
 )
@@ -281,7 +282,7 @@ def _http_literal_static(
     A table counts only as a ``dict``, the one type every connector's header builder sends.
 
     An ``env()`` reference standing for the whole ``headers`` table, or for the ``url``, is read as
-    the build resolves it (``config.wiring._db_setting``), against ``env_values``, else its literal
+    the build resolves it (``config.wiring._resolved_setting``), against ``env_values``, else its literal
     ``default=``. A ``headers`` reference this reading cannot resolve is listed as possibly a
     credential, as ``static_credential_db_hops`` lists an unresolved dialect, so ``messagefoundry
     check``, which passes no values, does not report as credential-free a hop the serve-time guard
@@ -301,7 +302,7 @@ def _http_literal_static(
 
     out: list[str] = []
     values = env_values or {}
-    headers = _db_setting(settings, "headers", None, values)
+    headers = _resolved_setting(settings, "headers", None, values)
     if headers is _UNRESOLVED:
         out.append(
             "possibly a credential in a headers table from env() this reading cannot resolve"
@@ -313,7 +314,7 @@ def _http_literal_static(
         out.append("a credential in the headers table")
     from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
 
-    url = _db_setting(settings, "url", None, values)
+    url = _resolved_setting(settings, "url", None, values)
     if (
         ctype not in URL_QUERY_REFUSED_DESTINATIONS
         and isinstance(url, str)
@@ -367,7 +368,7 @@ def _dicomweb_build_refused(
 
     view: dict[str, Any] = {}
     for key in ("bearer_token", "basic_user", "basic_password", "headers"):
-        value = _db_setting(settings, key, None, env_values)
+        value = _resolved_setting(settings, key, None, env_values)
         if value is _UNRESOLVED:
             return False
         view[key] = value
@@ -672,9 +673,8 @@ def resolved_secret_refs(settings: ServiceSettings) -> list[str]:
 
     A reference counts only where its credential is resolved: the AD bind password with AD on, and
     with OIDC on the client secret or, under ``private_key_jwt``, the signing key. The SMTP
-    password's reference is resolved whenever ``[alerts]`` is read, with or without an SMTP
-    transport, because ``notifier_from_settings`` resolves it before it decides which transports to
-    build. The single reader: the ``settings:vault.secrets`` hop here
+    password's reference is resolved by ``notifier_from_settings`` with or without an SMTP
+    transport, unless a check it runs before the read refuses first. The single reader: the ``settings:vault.secrets`` hop here
     and the least-privilege table in ``privilege_check`` both call it."""
     auth, alerts = settings.auth, settings.alerts
     oidc_ref = (
@@ -714,8 +714,10 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
     alerts = settings.alerts
     if settings.secrets.provider == "vault" and resolved_secret_refs(settings):
         add("vault.secrets", "static", "Vault token from MEFOR_SECRETS_VAULT_TOKEN", False)
+    # Vault BACKLOG #3533 item 24: a webhook service can put its token in the URL path, which every
+    # POST to that URL carries; the sink offers no other credential kind.
     if alerts.webhook_url:
-        add("alerts.webhook", "none", "the alert webhook sink has no credential field", False)
+        add("alerts.webhook", "static", "alert webhook URL, whose path can carry a token", False)
     # Both SMTP consumers (the alert sinks and the security notifier) need a host and a sender.
     if alerts.email_smtp_host and alerts.email_from:
         if alerts.email_username or alerts.email_password or alerts.email_password_secret:

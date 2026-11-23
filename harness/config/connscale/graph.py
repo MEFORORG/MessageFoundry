@@ -19,7 +19,7 @@ through :func:`harness.config.connscale._wire.wire_graph`. The trivial route+han
 the measured cost the engine's *per-connection machinery* (workers, wake events, pool, executor hops),
 not transform CPU. Serve it on its own::
 
-    MEFOR_CONNSCALE_COUNT=500 MEFOR_CONNSCALE_BASE_PORT=2600 MEFOR_CONNSCALE_SINK_PORT=2700 \
+    MEFOR_CONNSCALE_COUNT=500 MEFOR_CONNSCALE_BASE_PORT=20000 MEFOR_CONNSCALE_SINK_PORT=2700 \
       python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/connscale --db ./connscale.db
 
 Every value here is synthetic and generic — no real partner, site, host, or volume. See
