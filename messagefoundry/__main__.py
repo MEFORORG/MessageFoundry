@@ -7769,11 +7769,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
         _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.", as_json=args.json)
         return 2
-    except RowSealError:
-        # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
-        return _emit_error(
-            _seal_refusal(wanted, "unlock") + ". Nothing was written", as_json=args.json
-        )
+    except RowSealError as exc:
+        # BACKLOG #3510: the store's write helper refused the clear, which wrote nothing; the open
+        # before it may have (BACKLOG #5067).
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
             # What the open may have changed before it, as for a keyless-chain refusal (#5067).
@@ -8113,12 +8113,13 @@ def _show_on_terminal(text: str) -> None:
 def _show_during_enrolment(text: str, *, refusal: str) -> None:
     """Show the key, a prompt or a retry message on the console during enrolment, so an operator
     who redirected stderr still sees what the command is waiting for. Raises
-    :class:`_PasswordEntryRefused` with ``refusal`` and the cause when the console cannot be written;
-    enrolment is before any store write, so the refusal always says nothing was written."""
+    :class:`_PasswordEntryRefused` with ``refusal`` and the cause when the console cannot be written.
+    The refusal does not say what was written: the caller knows whether a store open came first
+    (BACKLOG #5067)."""
     try:
         _show_on_terminal(text)
     except OSError as exc:
-        raise _PasswordEntryRefused(f"{refusal} ({exc}); nothing was written") from exc
+        raise _PasswordEntryRefused(f"{refusal} ({exc})") from exc
 
 
 def _show_recovery_codes_once(
@@ -8205,7 +8206,7 @@ def _enrol_totp_at_terminal(
         code = sys.stdin.readline().strip()
         read_at = _time.time()
         if not code:
-            raise _PasswordEntryRefused("empty authenticator code; nothing was written")
+            raise _PasswordEntryRefused("empty authenticator code")
         if totp.verify_totp_step(enrolment, code, now=read_at, window=skew_steps) is not None:
             return enrolment, code, read_at
         if attempt < _PROVISION_TOTP_ATTEMPTS:  # never "try again" when no attempt is left
@@ -8213,7 +8214,7 @@ def _enrol_totp_at_terminal(
                 "That code did not match. Try the current one.\n", refusal=went_away
             )
     raise _PasswordEntryRefused(
-        f"{_PROVISION_TOTP_ATTEMPTS} codes did not match; nothing was written. Check that the app "
+        f"{_PROVISION_TOTP_ATTEMPTS} codes did not match. Check that the app "
         "uses SHA-256 (add the account by its URI) and that the device's clock is right, then run "
         "the command again."
     )
@@ -10497,6 +10498,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # that open may have changed (BACKLOG #5067).
     precheck_opened = False
 
+    def precheck_left() -> str:
+        """What a refusal before the write's open left behind (BACKLOG #5067): what the
+        pre-check's open may have changed, once it returned, or "Nothing was written" where the
+        store did not exist yet, since then the pre-check opened nothing."""
+        if not precheck_opened:
+            return "Nothing was written"
+        return _open_steps_left_behind(
+            settings.store, keyed=_open_is_keyed(settings), returned=True
+        )
+
     async def administrator_exists() -> tuple[bool, str | None]:
         """``(absent, refusal)``: whether no store exists yet, and what the service refuses."""
         # Opened WITHOUT create, so asking cannot make a SQLite store: an absent one holds no
@@ -10854,8 +10865,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         actor = f"cli:{getpass.getuser()}"
     except OSError as exc:
         return _emit_error(
-            f"cannot name the OS user for the audit row ({exc}); refusing to provision, and "
-            "nothing was written",
+            f"cannot name the OS user for the audit row ({exc}); refusing to provision. "
+            f"{precheck_left()}",
             as_json=args.json,
         )
 
@@ -10877,7 +10888,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 username=username, skew_steps=settings.auth.totp_skew_steps
             )
         except _PasswordEntryRefused as exc:
-            return _emit_error(str(exc), as_json=args.json)
+            return _emit_error(f"{_sentence(exc)} {precheck_left()}", as_json=args.json)
 
     # Set by the service right before its first account write, after its own reads, so a refusal
     # from those reads is still one raised before any account write (BACKLOG #5067).
@@ -11030,7 +11041,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             return (outcome, store.path)
         finally:
             store_slot.current = None
-            await store.close()
+            # A close that fails warns and never replaces the result: after a committed grant it
+            # would lose the recovery codes and the administrator_granted page (BACKLOG #5067).
+            await _close_store_quietly(store)
 
     def refused_write(exc: Exception) -> int:
         """An integrity refusal the service did not name (BACKLOG #2697). Exit 1, this command's
@@ -11891,13 +11904,19 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         return _emit_error(checked, as_json=args.json)
     target = checked
     username = target.username
+    # What check()'s open, which returned, may have changed, for a refusal before the swap's open
+    # (BACKLOG #5067).
+    after_check_open = _open_steps_left_behind(
+        settings.store, keyed=_open_is_keyed(settings), returned=True
+    )
     try:
         # Before the key is shown: a shell whose OS user cannot be named fails here, not after the
         # operator has enrolled a seed that would never be stored.
         actor = f"cli:{getpass.getuser()}"
     except OSError as exc:
+        # After check()'s open, which may have written (BACKLOG #5067).
         return _emit_error(
-            f"cannot name the OS user for the audit row ({exc}); nothing was written",
+            f"cannot name the OS user for the audit row ({exc}). {after_check_open}",
             as_json=args.json,
         )
 
@@ -11927,13 +11946,16 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         # The two refusals that fire before the key reaches the console get no hint: there is no
         # entry to delete. Their openings are fixed texts, here and in _enrol_totp_at_terminal.
         before_key = str(exc).startswith((no_terminal, "could not open the console to show"))
-        return _emit_error(_sentence(exc) + ("" if before_key else unused_entry), as_json=args.json)
+        return _emit_error(
+            f"{_sentence(exc)} {after_check_open}." + ("" if before_key else unused_entry),
+            as_json=args.json,
+        )
     # The prompt proved the code but returns no step (provision-admin hands the code to the service,
     # which derives the step the same way). The swap records this step, so the proving code is spent.
     step = totp.verify_totp_step(secret, code, now=read_at, window=settings.auth.totp_skew_steps)
     if step is None:  # reachable only through a stubbed prompt; refused rather than asserted
         return _emit_error(
-            "the authenticator code did not match; nothing was written." + unused_entry,
+            f"the authenticator code did not match. {after_check_open}." + unused_entry,
             as_json=args.json,
         )
     plain_codes = totp.generate_recovery_codes(settings.auth.mfa_recovery_code_count)

@@ -448,7 +448,8 @@ def test_provision_admin_names_the_os_user_before_the_key_is_shown(
     out = captured.out + captured.err
     assert code != 0, out
     assert not shown, "the key was shown before the OS user was named"
-    assert "cannot name the OS user" in out and "nothing was written" in out, out
+    # No store exists, so the pre-check opened nothing (BACKLOG #5067).
+    assert "cannot name the OS user" in out and "nothing was written" in out.lower(), out
     assert "Traceback" not in out, out
 
 
@@ -1093,3 +1094,103 @@ def test_the_create_open_s_own_database_error_names_the_shown_entry(
     out = _run(_provision_sqlite(shell), capsys)
     assert "cannot open the store at" in out and "unable to open database file" in out, out
     assert _UNUSED_ENTRY in out, out
+
+
+def test_a_close_that_fails_after_a_committed_provision_keeps_the_result(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The store closes quietly once the run has its result, so a close that fails after the
+    grant committed still shows the recovery codes and sends the administrator_granted page, and
+    the run exits 0 with a warning.
+
+    Mutation: close with a bare ``await store.close()`` in ``run()`` again; the run then fails."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.store import MessageStore
+
+    real_close = MessageStore.close
+    shown: list[object] = []
+    paged: list[str] = []
+
+    async def failing_close(self: MessageStore) -> None:
+        await real_close(self)
+        raise sqlite3.OperationalError("synthetic close failure")
+
+    def show(codes: object, **_k: object) -> bool:
+        shown.append(codes)
+        return True
+
+    async def page(*_a: object, username: str, **_k: object) -> bool:
+        paged.append(username)
+        return True
+
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    monkeypatch.setattr(cli, "_show_recovery_codes_once", show)
+    monkeypatch.setattr(cli, "_raise_offline_administrator_granted", page)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    monkeypatch.setattr(
+        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+    )
+    monkeypatch.setattr("messagefoundry.auth.totp.verify_totp_step", lambda *_a, **_k: 1)
+    code = main(_provision_sqlite(shell))
+    captured = capsys.readouterr()
+    assert code == 0, captured.out + captured.err
+    assert shown and paged == ["site-admin"], (shown, paged)
+    assert "closing the store failed (OperationalError)" in captured.err
+
+
+def test_a_totp_refusal_after_the_pre_check_open_says_what_it_may_have_changed(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Over an existing store the pre-check's open returned before the enrolment, so a refused
+    enrolment does not say nothing was written; over no store it still does, since the pre-check
+    opened nothing.
+
+    Mutation: print the enrolment refusal alone again in provision-admin's arm."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store import base
+
+    class _Opened:
+        async def close(self) -> None:
+            return None
+
+    async def opening(*_a: object, **_k: object) -> object:
+        return _Opened()
+
+    async def no_refusal(*_a: object, **_k: object) -> None:
+        return None
+
+    def refused(**_k: object) -> tuple[str, str, float]:
+        raise cli._PasswordEntryRefused("3 codes did not match. Check the app")
+
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(AuthService, "provision_refusal", no_refusal)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", refused)
+    code = main(_provision(_settings(shell, "sqlserver", "auto")))
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code != 0, out
+    assert "codes did not match" in out and _OWN_WRITES in out, out
+    assert "nothing was written" not in out.lower(), out
+
+
+def test_the_enrolment_refusals_leave_what_was_written_to_their_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_enrol_totp_at_terminal``'s refusals no longer say nothing was written: each caller knows
+    whether a store open came first.
+
+    Mutation: say "; nothing was written" again in the empty-code refusal."""
+    from messagefoundry import __main__ as cli
+
+    monkeypatch.setattr(cli, "_show_on_terminal", lambda _text: None)
+    monkeypatch.setattr(
+        sys, "stdin", types.SimpleNamespace(isatty=lambda: True, readline=lambda: "\n")
+    )
+    with pytest.raises(cli._PasswordEntryRefused) as refused:
+        # The real prompt; tests/conftest.py stubs the name for every other test.
+        cli._enrol_totp_at_terminal.__wrapped__(username="site-admin", skew_steps=1)  # type: ignore[attr-defined]
+    assert str(refused.value) == "empty authenticator code"

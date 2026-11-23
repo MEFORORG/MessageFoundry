@@ -401,7 +401,9 @@ def test_a_wrong_code_at_the_terminal_writes_nothing_and_the_old_seed_still_work
     monkeypatch.setattr(cli, "_show_on_terminal", terminal.show)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
-    assert "nothing was written" in error
+    # After check()'s open, which may have written (BACKLOG #5067).
+    assert "this command makes did not land" in error
+    assert "nothing was written" not in error.lower(), error
     # The real prompt names this command, not provision-admin, and labels the new entry apart from
     # the old one, which carries the bare username.
     shown = "".join(terminal.shown)
@@ -1175,4 +1177,28 @@ def test_a_store_failure_at_the_second_open_says_what_the_first_open_may_have_ch
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
     error = _error(capsys)
     assert "the store failed before the replacement (RuntimeError)" in error, error
+    assert "nothing was written" not in error.lower(), error
+
+
+def test_an_unnamed_os_user_after_the_first_open_says_what_it_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: the OS user is named after check()'s open, which may have written, so the
+    refusal does not say nothing was written.
+
+    Mutation: print "nothing was written" again in that refusal."""
+    import getpass
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "no-user.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+
+    def no_user() -> str:
+        raise OSError("no user name for this shell")
+
+    monkeypatch.setattr(getpass, "getuser", no_user)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    error = _error(capsys)
+    assert "cannot name the OS user" in error and "this command makes did not land" in error
     assert "nothing was written" not in error.lower(), error

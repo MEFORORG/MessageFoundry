@@ -20,7 +20,11 @@
   Server under `[store].schema_management = auto`, the snapshot options. Where the command
   cannot tell whether the open reached its writing steps, as for a cipher refusal that can come
   before the open connects, it says the open may or may not have reached them and names those
-  changes only as possible. Other refusals after an open still say nothing was written, at least a store pin
-  refusal under the host key provider, a refusal about the account itself such as a disabled
-  Administrator, an OS user the command cannot name, an authenticator code that did not match,
-  and `admin-unlock`'s refused row seal. (`BACKLOG #5067`)
+  changes only as possible. The same holds for `provision-admin`'s OS-user and authenticator-enrolment refusals
+  over an existing store, `admin-reset-totp`'s OS-user, enrolment and code-mismatch refusals, and
+  `admin-unlock`'s refused row seal. Other refusals after an open still say nothing was written,
+  at least a store pin refusal under the host key provider, a refusal about the account itself
+  such as a disabled Administrator, and `admin-reset-totp`'s refusals of the replacement itself. (`BACKLOG #5067`)
+- **`provision-admin` would now keep its result when the store fails to close after the grant
+  committed.** The failed close is a warning, so the recovery codes are still shown and the
+  administrator_granted page still sent. (`BACKLOG #5067`)

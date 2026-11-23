@@ -3245,7 +3245,8 @@ def test_a_wrong_code_at_the_prompt_writes_nothing(
         != 0
     )
     assert terminal.asked == 5
-    assert "nothing was written" in capsys.readouterr().err
+    # No store exists yet, so the pre-check opened nothing (BACKLOG #5067).
+    assert "nothing was written" in capsys.readouterr().err.lower()
     assert not db.exists()
 
 
@@ -3914,7 +3915,7 @@ def test_a_console_lost_at_the_code_prompt_refuses_and_writes_nothing(
         != 0
     )
     err = capsys.readouterr().err
-    assert "console went away" in err and "nothing was written" in err
+    assert "console went away" in err and "nothing was written" in err.lower()
     assert terminal.asked == 0
     assert not db.exists()
 
