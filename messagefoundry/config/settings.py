@@ -9537,7 +9537,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     """The ``[auth]`` anti-automation limits, and the other numeric ``[auth]`` knobs that weaken a
     control (vault BACKLOG #2600 step 4), set LOOSER THAN THEIR SHIPPED DEFAULT, as
     ``(switch, risk)`` entries for :func:`security_loosenings`, which always calls this, since sign-in
-    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2 and 7.1.2 each field cites).
+    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2, 7.1.2 and 15.2.2 each
+    field cites).
 
     **Why the default is the cutoff.** The first pass named only the values the code reads as OFF,
     and a vault re-read then measured near-off values that were just as off in effect and silent: a
@@ -9548,11 +9549,13 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     **The direction is read from each consumer, not from the name.**
 
-    * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
+    * ``SlidingWindowRateLimiter`` (at least the sign-in, ceremony, PHI-read, monitoring-read and
+      admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
       older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
       before it is counted. A negative count refuses more, so it is not named; the admin-write
-      count refuses a negative value at load (BACKLOG #3293), so only the others reach here. A NaN or infinite
+      count and the two monitoring-read counts refuse a negative value at load (BACKLOG #3293), so
+      only the others reach here. A NaN or infinite
       window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
       ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
       admits a faster burst.

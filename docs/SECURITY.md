@@ -7604,8 +7604,10 @@ additionally front the API with a proxy/WAF limiter and TLS.
 #### Monitoring-read pacing
 
 Vault BACKLOG #1191 (ASVS 15.2.2). Six `monitoring:read` GETs cost work that grows per call:
-`GET /graph/edges` rebuilds the wiring graph, and `GET /status`, `/stats`, `/metrics`,
-`/metrics/history` and `/connections` read aggregates whose cost grows with the store. They are
+`GET /graph/edges` rebuilds the wiring graph, and `GET /status`, `/stats`, `/metrics` and
+`/connections` read aggregates whose cost grows with the store. `GET /metrics/history` copies the
+in-memory metrics ring and reads no store; it is paced with them because the console reads it beside
+`/graph/edges`. They are
 gated by `require_monitoring_read`, which charges a per-actor sliding window at admission, before
 the route's own work. The other `monitoring:read` routes stay on plain `require`.
 
@@ -7626,7 +7628,9 @@ minute per tab. A scraper on `/metrics` every 15 s adds 4 per minute. The rule i
 (tabs x 28 + 4), rounded up, and never below 600 per 60 s. For five tabs that is 4 x 144 = 576, so
 the floor of 600 applies. 600 per minute is 21 such tabs at 1x, or 5 tabs at the 4x margin. The
 tab count of five is a judgment, not a measurement. The global count ships off, as
-`phi_read_rate_limit_global` does.
+`phi_read_rate_limit_global` does. That measurement is of the console, which this pace does not
+charge (below). The in-repo load harness polls the charged routes faster than 600 per minute as one
+account, so its engines run with the pace off (`harness/load/failover.py`, `EngineNode`).
 
 **What it does not charge.** The console calls these handlers in process, through `require_ui`,
 so the route's own dependency does not run and a console tab spends none of this budget. Measured
@@ -7657,8 +7661,8 @@ value **looser than its shipped default** for the sign-in limiter, the lockout
 monitoring-read limiter, the admin-write limiter and its minimum gap, `max_sessions_per_user`, and, with OIDC on,
 `oidc_flow_cache_max`. That covers an off switch, a zeroed count and a window of `0` or less, and
 also a weak but non-zero value: a `1e-6` s window or a count of `1e9` is named. A value at or stricter
-than the default is not. The one count with no looser value is `phi_read_rate_limit_global`, which
-ships off. Each named value reaches the `serve` loosening warning, `messagefoundry security show` and
+than the default is not. The two counts with no looser value are `phi_read_rate_limit_global` and
+`monitoring_read_rate_limit_global`, which ship off. Each named value reaches the `serve` loosening warning, `messagefoundry security show` and
 `GET /security/posture`; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) for the table of values.
 The BACKLOG #2301 time floors are named the same way: `admin_write_min_interval_seconds`,
 `mfa_verify_min_elapsed_seconds` and, with OIDC on, `oidc_callback_min_elapsed_seconds`, each when
