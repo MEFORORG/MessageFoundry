@@ -42,7 +42,7 @@ x-revocation-attestation-check: &revocation-attestation-check
     - "disable-remote-debug"
     - "-B"
     - "-c"
-    - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start any engine: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engine serves and accepts.')"
+    - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start the engines that wait on this check: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engine serves and accepts.')"
   environment:
     MEFOR_TLS_REVOCATION_ATTESTED: *revocation-attested
   network_mode: none
