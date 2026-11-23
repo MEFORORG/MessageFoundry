@@ -84,11 +84,16 @@ async def keyed() -> AsyncIterator[tuple[Any, str]]:
         # keyless open of an empty log, read-only too, under the shared #1916 verdict the command
         # passes: a keyless `cipher-audit` would exit 2 there, never reaching KEY_MISMATCH.
         store = await SqlServerStore.open(
-            settings, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+            settings,
+            cipher=cipher,
+            audit_mac_key=cipher.audit_mac_key(),
+            audit_mac_fn=cipher.audit_mac_fn(),
         )
         try:
             count, _head = await store.audit_anchor()
             assert count >= 1, "the keyed open wrote no genesis row"
+            # A row is not a keyed genesis row; the open's own reading of the chain is.
+            assert store._audit_chain_keyed, "the keyed open's audit chain is not keyed"
             await write_every_cell(store)
             yield store, key
         finally:

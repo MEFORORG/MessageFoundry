@@ -1222,7 +1222,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--chunk-rows",
         type=int,
         default=None,
-        help="rows read per statement, each its own short read transaction (default 500)",
+        help=(
+            "rows read per statement, each its own short read transaction (default 500); on a"
+            " server store the body cells and attachment chunks read at most 16 a statement"
+        ),
     )
     cipher_audit.add_argument(
         "--busy-timeout",
