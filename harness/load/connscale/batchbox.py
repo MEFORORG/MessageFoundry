@@ -71,7 +71,7 @@ from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
 
-_RESET_ERROR_CHARS = 1000  # past any store refusal's remedy; the text travels in the READY message
+_RESET_ERROR_CHARS = 4000  # the engine log tail's own limit, which carried this refusal before
 _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
 _STOP_GRACE = 5.0
@@ -1058,10 +1058,15 @@ async def run_batch_engine(
 
 def _store_reset_failure(exc: Exception) -> str:
     """Why a store reset failed, for the cell's error. The store's refusal names its remedy (the RCSI
-    statement a DBA runs, for one), so its text is kept. It goes through the redactor first, because
-    a driver error's text can carry connection details, and is escaped since it reaches a terminal."""
+    statement a DBA runs, for one), so its text is kept, through the log redactor and escaped to one
+    line because it reaches a terminal.
+
+    The redactor masks credentials, not every connection detail: a host, login or database name can
+    remain, in the READY file and the report. It also over-redacts, so a database name of several
+    words can come out masked inside the remedy, and text past the cap is cut."""
     detail = redact_log_text(str(exc))[:_RESET_ERROR_CHARS]
-    return f"store reset failed: {type(exc).__name__}: {escape_for_terminal(detail)}"
+    text = escape_for_terminal(detail, single_line=True)
+    return f"store reset failed: {type(exc).__name__}: {text}"
 
 
 async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineReport) -> None:
@@ -1081,7 +1086,7 @@ async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineRep
             "RUNNING; check that it exited"
             if node.alive
             else f"CELL {cell_id}: cleanup stop raised {kind}; its root process is not running "
-            "(it may never have started; child processes were not checked)"
+            "(child processes were not checked)"
         )
 
 

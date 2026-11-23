@@ -695,7 +695,7 @@ def _assert_logged_by_type_only(report: Any, caplog: pytest.LogCaptureFixture) -
 
 
 @pytest.mark.usefixtures("no_auth_env")
-async def test_a_failed_store_reset_fails_the_cell_by_type_name_only_bug_5857(
+async def test_a_failed_store_reset_fails_the_cell_without_its_secret_bug_5857(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     eng_rec = _install_engine_fakes(monkeypatch)
@@ -722,8 +722,12 @@ async def test_a_failed_store_reset_keeps_the_remedy_and_drops_the_secret_bug_58
         " with rollback immediate"
     )
     _install_engine_fakes(monkeypatch)
+    # The store puts the driver's diagnostics BEFORE the remedy, so a long one must not cut it off.
+    diagnostics = "driver diagnostic; " * 80
     monkeypatch.setattr(
-        bb, "_reset_server_store", _raiser(RuntimeError(f"{remedy}\n{_SECRET_TEXT}"))
+        bb,
+        "_reset_server_store",
+        _raiser(RuntimeError(f"{diagnostics}{remedy}\nnote: forged\n{_SECRET_TEXT}")),
     )
 
     report, readies = await _engine_report()
@@ -732,6 +736,7 @@ async def test_a_failed_store_reset_keeps_the_remedy_and_drops_the_secret_bug_58
         assert "store reset failed: RuntimeError" in text
         assert remedy in text
         assert "not-a-real-one" not in text
+        assert "\n" not in text  # driver text cannot print a line that reads as a real note
     assert "not-a-real-one" not in repr(report.to_json_dict())
 
 
@@ -788,7 +793,7 @@ async def test_a_stop_failure_after_a_failed_start_does_not_read_as_a_fault_bug_
     assert all((c.error or "").startswith("engine did not start") for c in report.cells)
     stop_notes = [n for n in report.notes if "stop" in n and "RuntimeError" in n]
     assert stop_notes
-    assert all("may never have started" in n and "RUNNING" not in n for n in stop_notes)
+    assert all("root process is not running" in n and "RUNNING" not in n for n in stop_notes)
     _assert_logged_by_type_only(report, caplog)
 
 
@@ -806,7 +811,7 @@ async def test_a_failed_start_that_left_a_live_process_says_so_bug_5857(
 
     stop_notes = [n for n in report.notes if "stop" in n and "RuntimeError" in n]
     assert stop_notes
-    assert all("RUNNING" in n and "may never have started" not in n for n in stop_notes)
+    assert all("RUNNING" in n and "root process is not running" not in n for n in stop_notes)
     _assert_logged_by_type_only(report, caplog)
 
 
