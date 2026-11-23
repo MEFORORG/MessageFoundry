@@ -1194,3 +1194,40 @@ def test_the_enrolment_refusals_leave_what_was_written_to_their_caller(
         # The real prompt; tests/conftest.py stubs the name for every other test.
         cli._enrol_totp_at_terminal.__wrapped__(username="site-admin", skew_steps=1)  # type: ignore[attr-defined]
     assert str(refused.value) == "empty authenticator code"
+
+
+def test_a_key_refusal_at_the_write_open_over_an_existing_store_names_the_pre_check_open(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Over an existing store the pre-check's open returned, and may have written, before the
+    write's open is refused, so the refusal does not say nothing was written.
+
+    Mutation: pass ``opened=store_opened`` alone from the write's key-resolution arm."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store import base
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    class _Opened:
+        async def close(self) -> None:
+            return None
+
+    async def opening(*_a: object, create: bool = False, **_k: object) -> object:
+        if create:
+            raise KeyProviderError("synthetic key service refusal at the write")
+        return _Opened()
+
+    async def no_refusal(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(AuthService, "provision_refusal", no_refusal)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    monkeypatch.setattr(
+        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+    )
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert "synthetic key service refusal at the write" in out, out
+    assert _OWN_WRITES in out and "nothing was written" not in out.lower(), out
+    assert _UNUSED_ENTRY in out, out

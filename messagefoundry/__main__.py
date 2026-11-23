@@ -9968,9 +9968,10 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     (``KeylessAuditChainRefused``), raised itself or as such a cause, can come after the open has
     run its own writing steps, or from a read after a full open. For those it says the change this
     command makes did not land and names, at least, what the open may already have changed
-    (:func:`_open_steps_left_behind`). So does a refused write of this command's own audit row
-    (``_UnauditableWrite``) or a keyless open the settings refuse (``_KeylessProvisionRefused``),
-    each raised after a full open.
+    (:func:`_open_steps_left_behind`). So does the check that this command's audit row could
+    not be written (``_UnauditableWrite``, raised before any write of the command's own) or a
+    keyless open the settings refuse (``_KeylessProvisionRefused``), each raised after a full
+    open.
 
     Not every refusal it returns ``None`` for comes before the database is touched: at least a
     store pin refusal under the host key provider can come after the schema step, and this does
@@ -11047,7 +11048,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     def refused_write(exc: Exception) -> int:
         """An integrity refusal the service did not name (BACKLOG #2697). Exit 1, this command's
-        refusal. Any write can raise one, so the text does not say how far the run got.
+        refusal. Before the first account write landed it says no account was written;
+        after it, any write can have raised it, so the text does not say how far the run
+        got.
 
         Names the exception CLASS only, never its text. The driver's message carries the constraint,
         the table and the duplicate key value, and ``safe_exc`` keeps all three: it redacts PHI
@@ -11186,7 +11189,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 exc,
                 settings.store,
                 kept=kept_key,
-                opened=store_opened,
+                # The pre-check's open, over an existing store, came first (#5067).
+                opened=store_opened or precheck_opened,
                 keyed=_open_is_keyed(settings),
             ),
         )
@@ -11204,7 +11208,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 exc,
                 settings.store,
                 kept=kept_key,
-                opened=store_opened,
+                # The pre-check's open, over an existing store, came first (#5067).
+                opened=store_opened or precheck_opened,
                 keyed=_open_is_keyed(settings),
             ),
         )
@@ -15196,9 +15201,9 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``admin-unlock``,
-    ``cipher-audit``, ``store attest-transit-bound`` or ``store withdraw-transit-bound`` has its
-    result. A close that fails prints a warning naming its
+    """Close ``store`` once a command has its result, at least ``audit-verify``,
+    ``audit-anchor``, ``admin-unlock``, ``cipher-audit``, ``store attest-transit-bound``,
+    ``store withdraw-transit-bound``, ``provision-admin`` and ``admin-set-notify-email``. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
