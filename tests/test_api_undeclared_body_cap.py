@@ -10,6 +10,7 @@ routes are inserted ahead of the app's own so each test reads what actually reac
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -22,6 +23,8 @@ from starlette.routing import Route
 from starlette.types import Message, Receive, Scope, Send
 
 from messagefoundry.api.app import _MAX_REQUEST_BODY_BYTES, create_app
+from messagefoundry.api.security import public_route
+from tests._deadline_capture import GENEROUS_DEADLINE_SECONDS, capture_deadlines
 from tests.test_api_security_header_floor import _DNS_HOST
 
 _CHUNK = 64 * 1024
@@ -288,6 +291,63 @@ async def test_a_non_utf8_query_cannot_raise_past_the_413_on_a_real_route(
     assert run.closes
     bodies = [m["body"] for m in run.sent if m["type"] == "http.response.body"]
     assert bodies == [b'{"detail":"request body too large"}']
+
+
+async def test_a_route_running_on_after_the_counted_413_is_still_cut_off_by_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The 413 is a response start, but the route is still working, so the deadline stays armed.
+
+    ``cut_off`` fires the real deadline from inside the route. On a deadline the 413 disarmed, it
+    records that the response had started and lets the route run on."""
+    outcome: list[str] = []
+    app = create_app(allow_no_auth=True)
+    capture = capture_deadlines(monkeypatch, app)
+
+    @app.post("/_test/runs-on")
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
+    async def _runs_on(request: Request) -> dict[str, str]:
+        with contextlib.suppress(ClientDisconnect):
+            await request.body()
+        try:
+            await capture.cut_off()
+        except asyncio.CancelledError:
+            outcome.append("cut off")
+            raise
+        outcome.append("ran on")
+        return {"status": "ran on"}
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.request_timeout"):
+        run = await asyncio.wait_for(
+            _drive(app, _chunks(_CHUNKS_AT_CAP + 1), path="/_test/runs-on"),
+            GENEROUS_DEADLINE_SECONDS,
+        )
+
+    assert capture.problem is None
+    assert outcome == ["cut off"]
+    assert capture.deadlines[0].expired()
+    assert run.status == 413  # the property asserts one response start: no 503 follows the 413
+    assert any("after the body limit's 413" in r.getMessage() for r in caplog.records)
+
+
+async def test_an_ordinary_response_start_still_ends_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the test above: only the counted 413 holds the deadline past a start."""
+    app = create_app(allow_no_auth=True)
+    capture = capture_deadlines(monkeypatch, app)
+
+    class _StartsThenFires:
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            capture.fire()
+            await send({"type": "http.response.body", "body": b"whole"})
+
+    app.router.routes.insert(0, Route("/probe", _StartsThenFires()))
+    run = await _drive(app, [b"abc"])
+    assert capture.problem == "the request had already started its response"
+    assert run.status == 200
+    assert [m["body"] for m in run.sent if m["type"] == "http.response.body"] == [b"whole"]
 
 
 async def test_a_refusal_is_logged(caplog: pytest.LogCaptureFixture) -> None:

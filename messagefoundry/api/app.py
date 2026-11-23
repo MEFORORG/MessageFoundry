@@ -5231,7 +5231,7 @@ def create_app(
                     scrub_log_argument(client_ip(request) or "unknown"),
                 )
             else:
-                # Before the 413's start, so the layers it passes through can read it.
+                # Before the 413's start: the request deadline must see that the route still runs.
                 request.scope[BODY_REFUSED_KEY] = True
                 refusal = _refuse_body(
                     request, 413, "request body too large", "oversized request body"
@@ -12001,7 +12001,8 @@ def create_app(
     # request rather than on the route function alone. It stays INSIDE ClientNetworkMiddleware
     # (registered after it, so further out): a refused address must be rejected before it can occupy
     # a deadline at all. The clock is cancelled at http.response.start, so a response that has begun
-    # streaming is never cut mid-body — see api/request_timeout.py.
+    # streaming is never cut mid-body; the body limit's counted 413 is the exception, because the
+    # route is still running behind it — see api/request_timeout.py.
     app.add_middleware(RequestTimeoutMiddleware)
 
     # [security].allowed_client_networks — registered so that only the response-header floor below is

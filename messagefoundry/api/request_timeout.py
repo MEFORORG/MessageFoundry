@@ -12,6 +12,10 @@ own timeout the only thing that ever gave up — and a client giving up does not
 large log body — is never cut mid-body over a slow link. That is also the limb ASVS words: the cost
 being bounded is the handler's, not the network's.
 
+**One response start does not end the handler.** The body limit answers a counted over-cap body with
+a 413 from inside the route's own read, so the route is still running when that start goes out. The
+limit sets :data:`BODY_REFUSED_KEY` first, and the deadline then stays armed until the route returns.
+
 **Pure ASGI, not** ``BaseHTTPMiddleware``: no task hop, and the response-start signal is visible
 directly. It is registered inside :class:`~messagefoundry.api.client_networks.ClientNetworkMiddleware`
 (a refused address is rejected before it can occupy a deadline) and outside everything that builds a
@@ -39,6 +43,8 @@ import asyncio
 import logging
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from messagefoundry.controlchars import scrub_log_argument
 
 __all__ = [
     "BODY_REFUSED_KEY",
@@ -110,15 +116,28 @@ class RequestTimeoutMiddleware:
                         started = True
                         # The handler produced a response; from here the clock belongs to the
                         # network, not to us. Cancelling the deadline is what keeps a slow
-                        # attachment download from being cut mid-body.
-                        deadline.reschedule(None)
+                        # attachment download from being cut mid-body. A body-limit 413 is not
+                        # the handler's response, and the handler is still running.
+                        if not scope.get(BODY_REFUSED_KEY):
+                            deadline.reschedule(None)
                     await send(message)
 
                 await self.app(scope, receive, send_wrapper)
         except TimeoutError:
             if started:
-                # Unreachable while the reschedule above stands, and deliberately not swallowed:
-                # the response is already on the wire, so there is nothing to replace it with.
+                if scope.get(BODY_REFUSED_KEY) and deadline.expired():
+                    # The deadline did its work on the route. The 413 is already the response, so
+                    # no 503 follows it, and there is no error left to raise.
+                    _log.warning(
+                        "request cut off after %.1fs, still running after the body limit's 413, "
+                        "on %s %s",
+                        seconds,
+                        scrub_log_argument(str(scope.get("method", "?"))),
+                        scrub_log_argument(str(scope.get("path", "?"))),
+                    )
+                    return
+                # Otherwise unreachable while the reschedule above stands, and deliberately not
+                # swallowed: the response is on the wire, so there is nothing to replace it with.
                 raise
             # Logged, not silent — a control that refuses work must be visible or an operator
             # cannot tell a deadline from an outage. The path is engine-routed, never a body.
