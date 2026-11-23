@@ -12278,9 +12278,9 @@ class RegistryRunner:
             # dead-letters the members still present (bad data can never frame/deliver —
             # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
             # A fault one member's own step raised (its re-attach, its frame check, or the head's
-            # parse) names that member by its outbox id, never its content, in the log, the stored
-            # error and the alert (vault BACKLOG #5100). One the send of a connector a reload
-            # retired raised is the reload's (BACKLOG #5718), as the single row.
+            # MSH-10 read) names that member by its outbox id, never its content, in the log,
+            # the stored error and the alert (vault BACKLOG #5100). One the send of a connector
+            # a reload retired raised is the reload's (BACKLOG #5718), as the single row.
             if sending and self._connector_retired(name, connector):
                 return await self._release_retired(name, [it.id for it in items])
             member = _batch_member(current)

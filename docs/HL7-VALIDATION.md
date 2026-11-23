@@ -88,10 +88,12 @@ refused, and so is a dropped bare defined ID with no field separator (a lone `OR
 `MFN_M01`); a bare line `hl7apy` placed is not. A dropped `MSH`, `DSC`, `MSA`, `ERR`, `QAK` or
 `MFA` line is refused too. A batch or file envelope line (`BHS`, `BTS`, `FHS`, `FTS`) is exempted like any other
 defined segment, because batch splitting can leave one on a message. Every dropped segment is refused where MSH-9.3
-borrows a slot-bearing structure under another message code (`ADT^A01^MFN_M01`). A borrow under
-the same code is also held to MSH-9.2, so `MFN^M02^MFN_M01` is refused because `MFN_M02` is a
-structure of its own; the exact rule is in `_exempts_defined_segments` in
-[`validate.py`](../messagefoundry/parsing/validate.py). Where the slot is required and its group is present, `hl7apy`'s own check
+borrows a slot-bearing structure under another message code (`ADT^A01^MFN_M01`). Under the same
+code, MSH-9.2 decides: a dropped segment in `MFN^M02^MFN_M01` is refused, because `MFN_M02` is a
+structure of its own, while some same-code borrows keep the exemption, at least `PGL^PC7^PGL_PC6`
+in 2.5 and a table 0003 event `hl7apy` gives no structure, such as `MFN^M14^MFN_M01`. The exact
+rule is in `_exempts_defined_segments` in [`validate.py`](../messagefoundry/parsing/validate.py).
+Where the slot is required and its group is present, `hl7apy`'s own check
 refuses at least some such messages, since the slot is never filled (`Missing required child ...
 ANYHL7SEGMENT`; `MFN_M03` for one), but not where the slot is one alternative of a choice: a
 `PRR_PC5` order with its `OBR` passes. Where the slot sits inside a nested group (at least the

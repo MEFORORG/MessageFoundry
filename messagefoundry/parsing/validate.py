@@ -40,9 +40,9 @@ the version does not define, and a dropped bare defined ID with no field separat
 refused, and so is a dropped MSH, DSC, MSA, ERR, QAK or MFA line (``_NEVER_EXEMPT`` says why).
 The exemption is per structure, not per slot: it does not count against the slot's
 cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a
-structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none. One
-borrowed under the same code is also held to MSH-9.2 (``MFN^M02^MFN_M01`` gets none), by the rule
-:func:`_exempts_defined_segments` states. Where the slot sits inside a
+structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none.
+Under the same code, MSH-9.2 decides whether a borrow keeps it (``MFN^M02^MFN_M01`` does not;
+some do), by the rule :func:`_exempts_defined_segments` states. Where the slot sits inside a
 nested group (at least PRR_PC5 and PPV_PCA), such a segment can still break hl7apy's grouping of
 what follows. Segment order is not checked as such: hl7apy keeps each segment where the message
 has it, so an out-of-order message may pass.
@@ -357,36 +357,42 @@ def _exempts_defined_segments(message: Any) -> bool:
     hl7apy takes the structure from MSH-9.3 when one is given, so ``ADT^A01^MFN_M01`` would
     borrow MFN_M01's slot for an ADT body. The exemption holds only where MSH-9.1 names the
     structure's own message code, which fails closed on a structure borrowed under another code.
-    Under the same code, MSH-9.2 is compared too (BACKLOG #5920 step 1): the structure is the
-    message's own when it is ``<MSH-9.1>_<MSH-9.2>``, and a borrow keeps the exemption only for
-    a trigger event of exactly three capital letters or digits that hl7apy's tables give no
-    structure of its own. So ``MFN^M02^MFN_M01`` gets none, since MFN_M02 is a structure, nor
-    does an empty, lower-case or padded event, while ``PGL^PC7^PGL_PC6`` in 2.5 keeps it, one
-    structure serving several trigger events (PGL_PC6 serves PC6 to PC8, for one)."""
+    Under the same code, MSH-9.2 is compared too (BACKLOG #5920 step 1). A message with no
+    MSH-9.3 borrows nothing: hl7apy names its structure from MSH-9.1 and MSH-9.2. One with an
+    MSH-9.3 keeps the exemption where the structure is ``<MSH-9.1>_<MSH-9.2>``, or where MSH-9.2
+    is a trigger event in the version's HL7 table 0003 as hl7apy ships it and hl7apy's tables give
+    it no structure of its own. So ``MFN^M02^MFN_M01`` gets none, since MFN_M02 is a structure,
+    nor does an event outside that table (empty, lower-case, padded or made up, such as ``ZZZ``),
+    nor any borrow in a version hl7apy ships no tables for (2.3), while ``PGL^PC7^PGL_PC6`` in 2.5
+    keeps it, one structure serving several trigger events (PGL_PC6 serves PC6 to PC8, for one).
+    So does an event in the table that the borrowed structure does not serve in the standard
+    (``MFN^M14^MFN_M01``): hl7apy has no table of which structure serves which event."""
     code = message.msh.msh_9.msh_9_1.to_er7()
     if code != message.name.split("_", 1)[0]:
         return False
     if not _has_any_segment_slot(message.name, message.classname, message.version):
         return False
+    if len(message.msh.msh_9.to_er7().split(message.encoding_chars["COMPONENT"])) < 3:
+        return True
     event = message.msh.msh_9.msh_9_2.to_er7()
     own = f"{code}_{event}"
     if own == message.name:
         return True
-    return _TRIGGER_EVENT.fullmatch(event) is not None and own not in _structures(message.version)
+    structures, events = _structures_and_events(message.version)
+    return event in events and own not in structures
 
 
-#: The shape of a trigger event a same-code borrow may keep the exemption for; any other value,
-#: such as ``m02`` or ``M02 `` for an event that has its own structure, fails closed.
-_TRIGGER_EVENT = re.compile(r"[A-Z0-9]{3}")
-
-
-# Keyed by version alone, so a sender's MSH-9.2 text is never kept.
+# Keyed by version alone, so the cache holds none of a sender's MSH-9.2 text.
 @cache
-def _structures(hl7_version: str) -> frozenset[str]:
-    """The message structures hl7apy's tables for ``hl7_version`` define."""
+def _structures_and_events(hl7_version: str) -> tuple[frozenset[str], frozenset[str]]:
+    """The message structures and the trigger events (HL7 table 0003) hl7apy's tables for
+    ``hl7_version`` define; no events where hl7apy ships no tables for the version."""
     import hl7apy
 
-    return frozenset(hl7apy.load_library(hl7_version).MESSAGES)
+    library = hl7apy.load_library(hl7_version)
+    tables = getattr(library, "TABLES", {})
+    events = tables["HL70003"][1] if "HL70003" in tables else ()
+    return frozenset(library.MESSAGES), frozenset(events)
 
 
 # Six IDs a dropped line of which is refused even in a structure with the "any HL7 segment" slot

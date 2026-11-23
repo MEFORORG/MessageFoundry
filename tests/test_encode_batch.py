@@ -95,7 +95,7 @@ _TS = "20260101120000"
 
 
 def _no_parse(*_args: object, **_kwargs: object) -> Message:
-    raise AssertionError("encode_batch parsed a member")
+    raise AssertionError("a member was parsed in full")
 
 
 @pytest.mark.parametrize("head", [M1, M1.replace("\r", "\n")])
@@ -105,7 +105,7 @@ def test_the_head_member_is_not_parsed(monkeypatch: pytest.MonkeyPatch, head: st
     env = encode_batch([head, M2], control_id="1", timestamp=_TS)
     assert env.startswith("BHS|^~\\&|")
     # Negative control: the patch sees a parse when one happens. An envelope-led head is parsed.
-    with pytest.raises(AssertionError, match="parsed a member"):
+    with pytest.raises(AssertionError, match="parsed in full"):
         encode_batch(["BHS|^~\\&\r" + head, M2], control_id="1", timestamp=_TS)
 
 
@@ -322,7 +322,7 @@ def test_the_head_control_id_is_read_without_a_full_parse(
     monkeypatch.setattr(Message, "parse", staticmethod(_no_parse))
     assert head_control_id(head) == "MSG1"
     # Negative control: an envelope-led head is parsed in full.
-    with pytest.raises(AssertionError, match="parsed a member"):
+    with pytest.raises(AssertionError, match="parsed in full"):
         head_control_id("BHS|^~\\&\r" + head)
 
 
@@ -378,3 +378,12 @@ def test_the_head_control_id_matches_the_parser_over_random_heads(
     assert len(heads) - len(read) >= 100
     assert sum(_has_a_short_later_header(h) for h in heads) >= 100
     assert len(heads) - len(full_parses) >= 500, len(full_parses)
+
+
+def test_the_short_later_header_pattern_names_the_parsers_header_ids() -> None:
+    # A literal for the static ReDoS scanner, so a change to HEADER_IDS must reach it by hand.
+    from messagefoundry.parsing._builtin_hl7 import HEADER_IDS
+    from messagefoundry.parsing.split import _SHORT_LATER_HEADER
+
+    named = _SHORT_LATER_HEADER.pattern.split("(?:", 2)[1].split(")", 1)[0].split("|")
+    assert sorted(named) == sorted(HEADER_IDS)

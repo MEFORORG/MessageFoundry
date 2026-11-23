@@ -521,8 +521,9 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
 
 #: A header line after the first that is too short for the parse to read (``_builtin_hl7.parse``
 #: refuses one): a line that is a header ID alone, or the text's last line once the parse's strip
-#: leaves only a header ID there.
-_SHORT_LATER_HEADER = re.compile(r"\r(?:" + "|".join(map(re.escape, HEADER_IDS)) + r")(?:\r|\s*\Z)")
+#: leaves only a header ID there. A literal, so the static ReDoS scanner can read it; a test
+#: holds its IDs to HEADER_IDS.
+_SHORT_LATER_HEADER = re.compile(r"\r(?:MSH|BHS|FHS)(?:\r|\s*\Z)")
 
 
 def head_control_id(text: str) -> str | None:
