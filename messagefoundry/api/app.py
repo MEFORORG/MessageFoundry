@@ -69,6 +69,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
 from pydantic import PrivateAttr
 from starlette.datastructures import MutableHeaders
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
@@ -5177,13 +5178,77 @@ def create_app(
 
     def _limit_request_body(inner: ASGIApp) -> ASGIApp:
         async def middleware(scope: Scope, receive: Receive, send: Send) -> None:
-            refusal = _body_refusal(Request(scope)) if scope["type"] == "http" else None
-            if refusal is None:
+            if scope["type"] != "http":
+                await inner(scope, receive, send)
+                return
+            request = Request(scope)
+            refusal = _body_refusal(request)
+            if refusal is not None:
+                await refusal(scope, receive, send)
+            elif "content-length" in request.headers:
                 await inner(scope, receive, send)
             else:
-                await refusal(scope, receive, send)
+                await _run_counting_body(inner, request, receive, send)
 
         return middleware
+
+    async def _run_counting_body(
+        inner: ASGIApp, request: Request, receive: Receive, send: Send
+    ) -> None:
+        """Run ``inner`` on a request with neither framing header, holding its body to the cap.
+
+        Under ``serve`` llhttp frames such a request as an empty body. A host that frames it another
+        way (HTTP/2, an in-process ASGI call) can deliver a body no header announced, so it is
+        counted here as the route pulls it. It is not read ahead of the route: that would buffer
+        a body for a caller the route's own gate refuses before reading
+        (AuthenticatedBeforeBodyRoute).
+
+        At the first chunk past the cap the route gets ``http.disconnect`` in place of that chunk,
+        so it never holds a partial body as if it were whole, and nothing more is pulled. The 413
+        goes out unless the route already started a response, which cannot then be replaced."""
+        seen = 0
+        over_cap = False
+        started = False
+        answered = False
+
+        async def counted_receive() -> Message:
+            nonlocal seen, over_cap, answered
+            if over_cap:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if message["type"] != "http.request" or not message.get("body"):
+                return message
+            seen += len(message["body"])
+            # Read here, not up front: this path carries every bodyless GET, which needs no cap.
+            if seen <= _body_cap(request):
+                return message
+            over_cap = True
+            refusal = _refuse_body(request, 413, "request body too large", "oversized request body")
+            if not started:
+                answered = True  # set before the first await, so no route response can interleave
+                await refusal(request.scope, receive, send)
+            return {"type": "http.disconnect"}
+
+        async def route_send(message: Message) -> None:
+            nonlocal started
+            if not answered:
+                started = True
+                await send(message)
+
+        try:
+            await inner(request.scope, counted_receive, route_send)
+        except ClientDisconnect:
+            # The route's read of the disconnect above, with the 413 already sent. Any other
+            # outcome, a real client disconnect included, is not this refusal's to absorb.
+            if not answered:
+                raise
+
+    def _body_cap(request: Request) -> int:
+        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
+        upload_store = getattr(request.app.state, "upload_store", None)
+        if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS:
+            return int(upload_store.max_bytes)
+        return _MAX_REQUEST_BODY_BYTES
 
     def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
         _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
@@ -5200,8 +5265,8 @@ def create_app(
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         lengths = request.headers.getlist("content-length")
-        # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
-        # on any line and whatever its value, and the connection is closed. Beside a Content-Length
+        # A chunked body is not accepted: ANY Transfer-Encoding is refused, by presence on any line
+        # and whatever its value, and the connection is closed. Beside a Content-Length
         # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
         # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
         # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
@@ -5232,19 +5297,15 @@ def create_app(
                 "chunked request body",
             )
         if not lengths:
+            # Nothing declared to judge. A bodyless POST, PUT or DELETE looks like this, so it is
+            # not refused here: _run_counting_body holds whatever body does arrive to the cap.
             return None
         # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
         # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
             return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
-        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
-        upload_store = getattr(request.app.state, "upload_store", None)
-        cap = (
-            upload_store.max_bytes
-            if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
-            else _MAX_REQUEST_BODY_BYTES
-        )
+        cap = _body_cap(request)
         # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
         digits = value.lstrip("0") or "0"
         if len(digits) > len(str(cap)) or int(digits) > cap:
