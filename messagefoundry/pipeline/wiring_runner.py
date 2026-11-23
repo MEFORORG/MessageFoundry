@@ -9765,8 +9765,9 @@ class RegistryRunner:
                 # Rebuild the live-lookup executor from the new graph, with no await since the swap, so
                 # no worker that reads them after the swap pairs the new graph with the old graph's
                 # lookups or inline cache. A router worker that read _inline_ok BEFORE the swap and
-                # then awaited the Router rechecks the registry it read it with, and processes the
-                # row again if this swap replaced it (_process_ingress_item, BACKLOG #5707).
+                # whose Router then selected one handler rechecks the registry it read it with, and
+                # processes the row again if this swap replaced it (BACKLOG #5707). A row with no
+                # handler or several still commits the replaced Router's choice to the split path.
                 # build_check already validated the new specs, so this can't fail on a bad spec here.
                 # The OLD executor is closed only once the swap commits, below the except, since a
                 # rollback puts it back, pools and all.
@@ -12759,8 +12760,9 @@ class RegistryRunner:
             # AND the graph has no live lookup AND ack_after=ingest AND not LOOPBACK
             # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
             # BACKLOG #5707: those gates describe `registry`. A reload during the Router's await
-            # may have swapped in a graph they say nothing about, so this row commits nothing here
-            # and is processed again below, against the served graph, before any later row.
+            # may have swapped in a graph they say nothing about, so a row that would run inline
+            # commits nothing here and is processed again below, on the served graph, before any
+            # later row. A row with no handler or several is not inline and keeps the split path.
             swapped = inline and len(names) == 1 and self.registry is not registry
             if inline and len(names) == 1 and not swapped:
                 # M-single held. Run the single handler's transform OFF the loop (G4: keep the
