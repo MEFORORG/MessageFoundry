@@ -49,7 +49,7 @@ suite("b622 #5841 — Comment and Pragma rows render their text", () => {
     const html = renderRowHtml(buildRowViewModel(multi, 0, multiLines), "h");
     assert.match(
       html,
-      /<textarea class="edit" [^>]*data-name="text"[^>]*rows="2" data-lines="2">\n a\n b<\/textarea>/,
+      /<textarea class="edit" [^>]*data-line-end="3"[^>]*data-name="text"[^>]*rows="2" wrap="off">\n a\n b<\/textarea>/,
     );
     assert.doesNotMatch(html, /<pre class="code">/);
   });
@@ -58,15 +58,26 @@ suite("b622 #5841 — Comment and Pragma rows render their text", () => {
     const html = renderRowHtml(buildRowViewModel(comment, 0, lines));
     assert.match(html, /readonly disabled value=" check the MRN"/);
     const ro = renderRowHtml(buildRowViewModel(multi, 0, multiLines));
-    assert.match(ro, /<textarea readonly disabled rows="2">\n a\n b<\/textarea>/);
+    assert.match(ro, /<textarea readonly rows="2" wrap="off">\n a\n b<\/textarea>/);
   });
 
   // The page side: the shipped stepsWebview.js run against the real renderer under jsdom.
   function notePage(): { area: DomNode; page: ReturnType<typeof loadPage> } {
     const first: LensRow = { ...multi, text: "\n b", raw: "    #\n    # b" };
+    // A step after the Comment, so the page's default selection (the last row) is not the Comment.
+    const step: LensRow = {
+      kind: "action",
+      action: "set_field",
+      line_start: 4,
+      line_end: 4,
+      nesting: 0,
+      suite: "1",
+      params: { path: "PID-3", value: "A" },
+      literal_params: ["path", "value"],
+    };
     const page = loadPage({
-      parse: { module: "m", handlers: [{ handler: "h", module: "m", def_line: 1, rows: [first] }] },
-      source: "def h(msg):\n    #\n    # b",
+      parse: { module: "m", handlers: [{ handler: "h", module: "m", def_line: 1, rows: [first, step] }] },
+      source: "def h(msg):\n    #\n    # b\n    msg.set('PID-3', 'A')",
     });
     const area = page.doc.querySelector('textarea.edit[data-name="text"]');
     assert.ok(area, "the multi-line Comment has an editable textarea");
@@ -89,15 +100,29 @@ suite("b622 #5841 — Comment and Pragma rows render their text", () => {
       [edit.name, edit.value, edit.lineStart, edit.lineEnd],
       ["text", " first\n second", 2, 3],
     );
+    assert.strictEqual(page.posted.find((m) => m.command === "noteLineCount"), undefined);
   });
 
-  test("webview: an edit that changes the line count is put back unposted, with a toast", () => {
+  for (const [what, typed] of [
+    ["adds a line", " one\n two\n three"],
+    ["drops a line", " only one"],
+  ] as const) {
+    test(`webview: an edit that ${what} is not posted, keeps the typed text, and reports the span`, () => {
+      const { area, page } = notePage();
+      area.value = typed;
+      area.dispatchEvent(new page.window.Event("change"));
+      assert.strictEqual(page.posted.find((m) => m.command === "edit"), undefined);
+      assert.strictEqual(area.value, typed, "the typed text stays in the field");
+      assert.strictEqual(page.posted.find((m) => m.command === "noteLineCount")?.lines, 2);
+    });
+  }
+
+  test("webview: a click in the Comment textarea does not move the row selection", () => {
     const { area, page } = notePage();
-    area.value = " one\n two\n three";
-    area.dispatchEvent(new page.window.Event("change"));
-    assert.strictEqual(page.posted.find((m) => m.command === "edit"), undefined);
-    assert.strictEqual(area.value, "\n b");
-    const toast = page.posted.find((m) => m.command === "cutInfo");
-    assert.ok(toast && typeof toast.text === "string" && /2 lines/.test(toast.text));
+    const row = page.row(2);
+    area.dispatchEvent(new page.window.MouseEvent("click", { bubbles: true }));
+    assert.strictEqual(row.classList.contains("selected"), false);
+    row.dispatchEvent(new page.window.MouseEvent("click", { bubbles: true }));
+    assert.strictEqual(row.classList.contains("selected"), true, "a click on the row itself selects it");
   });
 });

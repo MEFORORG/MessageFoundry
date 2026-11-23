@@ -3377,15 +3377,25 @@ export function resolveWidget(
   return { kind: "text" };
 }
 
-/** A multi-line Comment's text as a textarea, editable or read-only (BACKLOG #5841). Pure. */
-function noteTextareaHtml(value: string, attrs: string, readOnly: boolean): string {
+/** Whether `p` is a multi-line Comment's text, which an <input> cannot hold (BACKLOG #5841). */
+function isMultilineNoteText(row: RowViewModel, p: ParamField): boolean {
+  return row.kind === "note" && p.name === "text" && p.value.includes("\n");
+}
+
+/**
+ * A multi-line Comment's text as a textarea (BACKLOG #5841), editable when `attrs` carries edit
+ * coordinates, otherwise read-only (still selectable, so not disabled). `wrap="off"` keeps one visual
+ * row per physical line, since the engine counts physical lines. The page reads the note's span from
+ * the edit coordinates, the same span the engine's set_note checks a new text against. Pure.
+ */
+function noteTextareaHtml(value: string, attrs: string): string {
   const lines = value.split("\n").length;
   // The HTML parser drops one newline right after <textarea>, so one is always written there: a Comment
   // whose first line is a bare `#` (empty text) would otherwise lose that line from the field.
   const body = `\n${escapeHtml(value)}`;
-  return readOnly
-    ? `<textarea readonly disabled rows="${lines}">${body}</textarea>`
-    : `<textarea class="edit" ${attrs} rows="${lines}" data-lines="${lines}">${body}</textarea>`;
+  return attrs
+    ? `<textarea class="edit" ${attrs} rows="${lines}" wrap="off">${body}</textarea>`
+    : `<textarea readonly rows="${lines}" wrap="off">${body}</textarea>`;
 }
 
 /** The edit coordinates every editable control of one param carries, echoed back on edit (F7). */
@@ -3425,11 +3435,8 @@ function renderLiteralInputHtml(
   // stale-guard round-trip is unchanged; with no schema (the read-only callers) every param resolves
   // to `text`, so this markup is byte-identical to before.
   const attrs = editCoordAttrs(handlerName, row, p.name);
-  if (row.kind === "note" && p.value.includes("\n")) {
-    // BACKLOG #5841: a multi-line Comment edits in a textarea. The engine refuses a text whose line
-    // count differs from the note's span, so `data-lines` lets the page put a changed count back
-    // unposted rather than send an edit certain to fail.
-    return noteTextareaHtml(p.value, attrs, false);
+  if (isMultilineNoteText(row, p)) {
+    return noteTextareaHtml(p.value, attrs);
   }
   const widget = resolveWidget(row.action, p.name, schema);
   let input: string;
@@ -3659,9 +3666,9 @@ function renderParamsHtml(
       if (editable.has(p.name)) {
         return `<div class="field">${label}${renderLiteralInputHtml(p, handlerName, row, schema)}</div>`;
       }
-      if (row.kind === "note" && p.value.includes("\n")) {
+      if (isMultilineNoteText(row, p)) {
         // An input would drop the line breaks, so a read-only multi-line Comment keeps its textarea.
-        return `<div class="field">${label}${noteTextareaHtml(p.value, "", true)}</div>`;
+        return `<div class="field">${label}${noteTextareaHtml(p.value, "")}</div>`;
       }
       return (
         `<div class="field">${label}` +

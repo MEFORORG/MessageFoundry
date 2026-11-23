@@ -220,17 +220,14 @@
         } else if (inp.dataset.list === 'true') {
           const names = inp.value.split(',').map((h) => h.trim()).filter((h) => h.length > 0);
           value = names.length > 0 ? names : undefined;
-        } else if (inp.dataset.lines !== undefined) {
-          // A multi-line Comment (BACKLOG #5841): the engine refuses a text whose line count changed,
-          // so a changed count is put back unposted, with a toast saying why.
-          const want = Number(inp.dataset.lines);
+        } else if (inp.tagName === 'TEXTAREA') {
+          // A multi-line Comment (BACKLOG #5841): the engine refuses a text whose line count differs
+          // from the note's span, so such a text is not posted. It stays in the field, so the user can
+          // fix the count without retyping, and a toast says why.
+          const want = Number(inp.dataset.lineEnd) - Number(inp.dataset.lineStart) + 1;
           if (inp.value.split('\n').length !== want) {
-            vscode.postMessage({
-              command: 'cutInfo',
-              text: `This comment spans ${want} lines, so its text must keep ${want} lines. ` +
-                'Add or delete a Comment step to change the count, or edit the file as code.',
-            });
-            value = undefined;
+            vscode.postMessage({ command: 'noteLineCount', lines: want });
+            return;
           }
         }
         if (value === undefined) {
@@ -596,7 +593,7 @@
     for (const el of rows) {
       el.addEventListener('click', (ev) => {
         // Clicks on a control or an input do their own thing — never (re)select from them.
-        if (ev.target.closest('button, input, select, a')) { return; }
+        if (ev.target.closest('button, input, select, textarea, a')) { return; }
         selectRow(el);
       });
       el.addEventListener('focus', () => selectRow(el));
