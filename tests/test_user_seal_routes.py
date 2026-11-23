@@ -484,11 +484,11 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "when the record fails its seal at that read, made after the action landed",
         "logs the report's WARNING",
         "at least the pages that read the name through `_shown_name` do",
-        "the interval does not change how it is answered",
+        "the interval decides only whether the report runs",
         "and so does the refused delete in the case this paragraph's last sentence names",
         "refused at the first check that cannot verify it, with no further read",
         "answered as a record that fails its seal is",
-        "Apart from the answers the next two sentences state, a Vault transit Outage",
+        "Except where a console page catches the refusal, as at least the next two sentences state",
         "writes no audit row of its own",
     ):
         assert fact in body, fact

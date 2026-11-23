@@ -1710,7 +1710,7 @@ alert. A console route may log a WARNING of its own on every refusal it catches:
 pages that read the name through `_shown_name` do, as its docstring says, and so does the refused
 delete in the case this paragraph's last sentence names. A refusal inside that interval, from any
 of these routes or any other reader of the same account in that process, adds no row and no
-alert; the interval does not change how it is answered. Each engine
+alert; the interval decides only whether the report runs. Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
@@ -1743,8 +1743,9 @@ answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault tra
 refused at the first check that cannot verify it, with no further read, and then answered as a
 record that fails its seal is, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
-its own. Apart from the answers the next two sentences state, a Vault transit Outage on any
-account these reads check answers 503 with `Retry-After` and lists nothing; it pages
+its own. Except where a console page catches the refusal, as at least the next two sentences
+state, a Vault transit Outage on any account these reads check answers 503 with `Retry-After`
+and lists nothing; it pages
 `authority-seal-transit` and writes no audit row of its own.
 At least the pages that read the name through `_shown_name` catch a 423 or a 503 from that read
 and answer 200, and `GET /ui/users/{user_id}/delete-confirm` does the same for a 423. When
