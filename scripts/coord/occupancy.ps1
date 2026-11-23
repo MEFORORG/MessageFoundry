@@ -263,7 +263,13 @@ function Get-OwningCheckoutRoot([string]$Path) {
 #   * THE DIRECTORY IS STILL THERE. The nearest checkout above the cwd is not the matched worktree, and
 #     its .git pointer names this repository. A checkout of another repository nested inside, such as a
 #     clone, keeps the match, as it did before.
-#   * THE DIRECTORY IS GONE. The cwd is under <matched>/.claude/worktrees/, the nested naming.
+#   * THE DIRECTORY IS GONE. The match stands, deliberately. Unlike a gone SIBLING, which matches no
+#     worktree and would otherwise vanish, this session is still placed in the outer worktree and
+#     fenced for liveness there, so a live one vetoes that worktree. Faulting it instead would turn
+#     every stale record of a nested worktree removed in the ordinary way into a fence that refuses
+#     until someone deletes the record by hand.
+#   * NOT CAUGHT: a deregistered nested checkout whose .git file is gone too. The walk then reaches the
+#     outer worktree and the match stands.
 function Get-NestedUnplaceableReason {
     [CmdletBinding()]
     param(
@@ -271,18 +277,12 @@ function Get-NestedUnplaceableReason {
         [Parameter(Mandatory)][string]$MatchNorm,
         [string]$RepoCommonNorm
     )
-    if (-not $Cwd) { return '' }
-    if (Test-Path -LiteralPath $Cwd) {
-        $root = Get-OwningCheckoutRoot $Cwd
-        if (-not $root -or $root -eq $MatchNorm) { return '' }
-        if (-not $RepoCommonNorm) { return '' }
-        if ((Get-OwningGitCommonDir $Cwd) -ne $RepoCommonNorm) { return '' }
-        return 'cwd is a checkout of this repository nested inside a listed worktree, which `git worktree list` no longer carries, so it can be attributed to no worktree and clears none'
-    }
-    if ((ConvertTo-Norm $Cwd).StartsWith("$MatchNorm/.claude/worktrees/")) {
-        return 'cwd no longer exists and is named as a worktree nested inside a listed worktree, so the session in it can be attributed to no worktree and clears none'
-    }
-    return ''
+    if (-not $Cwd -or -not $RepoCommonNorm) { return '' }
+    if (-not (Test-Path -LiteralPath $Cwd)) { return '' }
+    $root = Get-OwningCheckoutRoot $Cwd
+    if (-not $root -or $root -eq $MatchNorm) { return '' }
+    if ((Get-OwningGitCommonDir $Cwd) -ne $RepoCommonNorm) { return '' }
+    return 'cwd is a checkout of this repository nested inside a listed worktree, which `git worktree list` no longer carries, so it can be attributed to no worktree and clears none'
 }
 
 <#

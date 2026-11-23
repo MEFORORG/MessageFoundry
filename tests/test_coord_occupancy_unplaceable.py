@@ -275,16 +275,19 @@ def test_a_deregistered_nested_worktree_on_disk_is_unplaceable(fx: Fixture) -> N
     assert occ["Sessions"] == [], "the session was still attributed to the primary"
 
 
-def test_a_gone_nested_worktree_is_unplaceable(fx: Fixture) -> None:
-    """The same, with the directory gone: only the nested naming is left as evidence."""
+def test_a_gone_nested_worktree_stays_placed_in_the_outer_one(fx: Fixture) -> None:
+    """With the directory gone the match stands, by design: the session is placed in the outer
+    worktree and fenced for liveness there, so a live one vetoes it and a dead one vetoes nothing.
+    Faulting it would make every stale record of a nested worktree removed in the ordinary way hold
+    the whole fence unavailable until someone deleted the record by hand."""
     gone = fx.repo / ".claude" / "worktrees" / "gone" / "sub"
     fx.write_session(cwd=gone, session_id="acacacac-2222")
 
     occ = fx.occupancy()
 
-    assert occ["Available"] is False, occ
-    assert occ["RecordsUnplaceable"] == 1, occ
-    assert occ["Sessions"] == []
+    assert occ["Available"] is True, occ["Detail"]
+    assert occ["RecordsUnplaceable"] == 0, occ["UnplaceableFiles"]
+    assert [s["Worktree"] for s in occ["Sessions"]] == ["primary"]
 
 
 def test_a_listed_nested_worktree_and_a_primary_subdirectory_still_place(fx: Fixture) -> None:

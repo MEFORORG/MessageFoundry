@@ -1281,3 +1281,11 @@ def test_cli_probes_the_ldap_bind_when_ad_is_on(
     assert _BIND_SECRET not in out
     ldap = next(h for h in json.loads(out)["hops"] if h["hop"] == "ldap")
     assert ldap["state"] == "over_granted"
+
+
+def test_the_transit_minimal_grant_names_the_token_renewal() -> None:
+    """BACKLOG #5609: the grant check-privileges prints for the Transit token names renew-self,
+    which the cipher's renewal calls, so a policy copied from it does not refuse the renewal."""
+    settings = ServiceSettings.model_validate({"store": {"cipher_provider": "vault_transit"}})
+    (consumer,) = vault_consumers(settings)
+    assert "update on auth/token/renew-self" in consumer.minimal

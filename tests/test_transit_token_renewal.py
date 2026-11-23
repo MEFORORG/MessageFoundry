@@ -169,6 +169,60 @@ def test_a_failed_renewal_never_fails_the_call_and_is_tried_again(
     assert cipher.decrypt(sealed) == "value"
 
 
+def test_once_the_token_has_lapsed_renewal_stops_and_says_to_replace_it(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=crypto_transit.log.name)
+    cipher, token, clock = _cipher(monkeypatch, ttl=100, renewable=True)
+    sealed = cipher.encrypt("value")
+    calls = {"n": 0}
+
+    def refused() -> dict[str, Any]:
+        calls["n"] += 1
+        raise _Forbidden("permission denied")
+
+    monkeypatch.setattr(token, "renew_self", refused)
+    clock.now += 150  # no call in the renewal window: the token lapsed at 100 s
+    for _ in range(3):
+        clock.now += 5
+        with pytest.raises(CipherError):
+            cipher.decrypt(sealed)
+    assert calls["n"] == 1, "a lapsed token was renewed again on every call"
+    assert "after the token expired; replace the token" in caplog.text
+
+
+def test_a_renewal_with_no_lease_stops_renewing_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=crypto_transit.log.name)
+    cipher, token, clock = _cipher(monkeypatch, ttl=100, renewable=True)
+    monkeypatch.setattr(token, "renew_self", lambda: {"auth": {}})
+    clock.now += 60
+    cipher.encrypt("value")
+    assert "renewal answered with no lease" in caplog.text
+
+
+def test_a_shorter_lease_than_before_is_reported_as_the_max_ttl_nearing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=crypto_transit.log.name)
+    cipher, token, clock = _cipher(monkeypatch, ttl=100, renewable=True)
+    leases = iter([100, 40])
+
+    def capped() -> dict[str, Any]:
+        lease = next(leases)
+        token.expires_at = clock.now + lease
+        return {"auth": {"lease_duration": lease, "renewable": True}}
+
+    monkeypatch.setattr(token, "renew_self", capped)
+    clock.now += 60
+    cipher.encrypt("value")  # first renewal: 100 s
+    assert "max TTL" not in caplog.text
+    clock.now += 60
+    cipher.encrypt("value")  # second: 40 s, capped
+    assert "granted 40 s, less than the 100 s before" in caplog.text
+
+
 def test_the_renewal_paths_are_in_the_capabilities_the_probe_asks_for(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

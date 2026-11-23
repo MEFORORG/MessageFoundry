@@ -392,6 +392,12 @@ run, not a handshake reading.
 
 CA loading, verification mode and the absence of SNI are what ldap3 did, for the arguments the
 engine passes. ldap3's post-handshake host name check still runs, and still only when verifying.
+
+> **Superseded in part by BACKLOG #5623.** On a verifying bind the host name is now OpenSSL's check,
+> during the handshake: the factory turns `check_hostname` on with `hostname_checks_common_name`
+> off, and `NarrowedTls.wrap_socket` passes the dialled host as `server_hostname`, so it is also sent
+> as SNI. ldap3's own check, which on Python 3.12 and later is its backport of the 3.4 matcher, is
+> no longer called. With verification off nothing changed.
 Each connection gets a fresh context, as before. `tests/test_tls_cipher_assertion_sites.py` now
 ties the context each connection wraps with to one the assertion ran on, by identity. The replica
 and its equivalence test are gone.

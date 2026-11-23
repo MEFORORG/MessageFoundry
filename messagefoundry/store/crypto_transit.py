@@ -604,16 +604,19 @@ class _TokenRenewal:
     renewable token with a TTL, would lapse in a long-running ``serve`` and every Transit call
     after that would be refused until the store was opened again. :meth:`start` reads the token's
     TTL and renewability with ``auth/token/lookup-self``. A renewable token with a TTL is then
-    renewed with ``auth/token/renew-self`` once half of its remaining TTL has passed, on the next
-    Transit call after that. A token with no TTL is not renewed, because it does not expire. A
-    token that is not renewable is not renewed either, and that is logged at WARNING once, with
-    its TTL. Vault still ends any token at its max TTL; this does not change that.
+    renewed with ``auth/token/renew-self`` on the first Transit call made after half of its
+    remaining TTL has passed. **There is no timer:** an engine that makes no Transit call between
+    that point and the token's expiry still lets it lapse. A token with no TTL is not renewed,
+    because it does not expire. A token that is not renewable is not renewed either, and that is
+    logged at WARNING with its TTL each time a cipher is built. Vault still ends any token at its
+    max TTL; this does not change that, and a renewal that grants less than the one before is
+    logged at WARNING.
 
     A renewal runs on whichever thread's call finds it due, with that thread's client, and at most
     one runs at a time; other threads go on without waiting. A failed lookup or renewal is logged
-    by its exception class alone, rate-limited, and never fails the Transit call that ran it: a
-    failed renewal is tried again after :data:`_RENEW_RETRY_S`, or after half the TTL the token
-    has left when that is sooner."""
+    by its exception class alone and never fails the Transit call that ran it. A failed renewal
+    is tried again after :data:`_RENEW_RETRY_S`, or after half the TTL the token has left when
+    that is sooner, and its warning is rate-limited; once the token has expired, renewal stops."""
 
     def __init__(self, clock: Callable[[], float] | None = None) -> None:
         self._clock = time.monotonic if clock is None else clock
@@ -622,6 +625,8 @@ class _TokenRenewal:
         self._next_at: float | None = None
         #: When the token lapses unless renewed, as last read, on ``clock``.
         self._expires_at = 0.0
+        #: The lease the last renewal granted, so a shorter one (the max TTL near) is reported.
+        self._last_lease: int | None = None
 
     def start(self, client: Any) -> None:
         """Read the token's TTL and renewability, and schedule its first renewal."""
@@ -672,22 +677,60 @@ class _TokenRenewal:
             try:
                 response: Any = client.auth.token.renew_self()
             except Exception as exc:  # noqa: BLE001 -- logged by class; retried, never raised
-                now = self._clock()
-                self._next_at = now + min(_RENEW_RETRY_S, max(1.0, (self._expires_at - now) / 2))
-                kind = type(exc)
-                _warn_when_due(
-                    lambda: ("store Vault token renewal", kind),
-                    lambda: (
-                        "store Vault token renewal failed (%s); it is tried again on a later "
-                        "Transit call",
-                        kind.__name__,
-                    ),
-                )
+                self._renewal_failed(type(exc))
                 return
             auth = response.get("auth") if isinstance(response, Mapping) else None
-            self._schedule(_int_field(auth, "lease_duration"), _renewable(auth))
+            lease = _int_field(auth, "lease_duration")
+            if lease is None or lease <= 0:
+                # A renewal reply with no lease says nothing about when the token ends, so the
+                # renewal stops, and says so rather than going quiet.
+                self._next_at = None
+                _warn_quietly(
+                    lambda: (
+                        "store Vault token renewal answered with no lease, so the engine stops "
+                        "renewing the token; Transit calls fail once it expires",
+                    )
+                )
+                return
+            before = self._last_lease
+            if before is not None and lease < before:
+                # Vault grants less than before once the token nears its max TTL.
+                _warn_when_due(
+                    lambda: ("store Vault token max TTL",),
+                    lambda: (
+                        "store Vault token renewal granted %d s, less than the %d s before, so "
+                        "the token is near its max TTL; replace it before it ends",
+                        lease,
+                        before,
+                    ),
+                )
+            self._last_lease = lease
+            self._schedule(lease, _renewable(auth))
         finally:
             self._lock.release()
+
+    def _renewal_failed(self, kind: type[BaseException]) -> None:
+        """Schedule the retry after a failed renewal, or stop once the token has lapsed."""
+        now = self._clock()
+        if now >= self._expires_at:
+            # Lapsed: no renewal can succeed, so stop rather than retry on every call.
+            self._next_at = None
+            _warn_quietly(
+                lambda: (
+                    "store Vault token renewal failed (%s) after the token expired; replace the "
+                    "token and open the store again",
+                    kind.__name__,
+                )
+            )
+            return
+        self._next_at = now + min(_RENEW_RETRY_S, max(1.0, (self._expires_at - now) / 2))
+        _warn_when_due(
+            lambda: ("store Vault token renewal", kind),
+            lambda: (
+                "store Vault token renewal failed (%s); it is tried again on a later Transit call",
+                kind.__name__,
+            ),
+        )
 
 
 class TransitCipher(_UnmarkedPolicy):

@@ -270,6 +270,10 @@ _SELF_READ_GRANT = (
     "serve and this check run"
 )
 
+#: A token's own endpoints, which a provider calls on the token it holds (BACKLOG #5609). One token
+#: serving two hops holds them for both, so they are not read as one hop's grant leaking to the other.
+_TOKEN_SELF_PATHS = frozenset({"auth/token/lookup-self", "auth/token/renew-self"})
+
 #: Which provider uses a token, and so which paths its probe asks about.
 VaultKind = Literal["kek", "transit", "kv"]
 
@@ -302,7 +306,8 @@ def vault_consumers(settings: ServiceSettings) -> list[VaultConsumer]:
                 "store Transit cipher (token in MEFOR_STORE_VAULT_TOKEN)",
                 "read on transit/keys/<data key> and transit/keys/<audit key>; update on "
                 "transit/encrypt/<data key>, transit/decrypt/<data key>, transit/hmac/<audit key> "
-                "and transit/verify/<audit key>; " + _SELF_READ_GRANT,
+                "and transit/verify/<audit key>; update on auth/token/renew-self, for the token "
+                "renewal (BACKLOG #5609); " + _SELF_READ_GRANT,
             )
         )
     elif store.key_provider == "vault":
@@ -445,7 +450,7 @@ def vault_hop(
     for other_hop, other in (shared or {}).items():
         for path in other.required:
             extra = set(other.capabilities.get(path, ())) - {"deny"}
-            if path not in reading.required and extra:
+            if path not in reading.required and path not in _TOKEN_SELF_PATHS and extra:
                 over.append(
                     f"the same token serves {other_hop}, so it also holds {_caps(extra)} on {path}"
                 )
