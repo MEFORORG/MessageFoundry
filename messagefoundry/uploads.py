@@ -101,10 +101,12 @@ _ORPHAN_TMP_RE = re.compile(
     rf"\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\.tmp\Z"
 )
 
-# How stale a leftover must look before the orphan sweep will remove it. This is a floor for a
-# leftover from a process that DIED mid-write, NOT the mechanism that protects a live write — that is
-# ``_inflight_names``, which is an exact identity test. An hour matches the default prune cadence and
-# sits far outside any single write, which is bounded by ``max_bytes``.
+# How stale a leftover must look before the orphan sweep will remove it. A write in THIS process is
+# protected by ``_inflight_names``, an exact identity test, and not by this floor. For a write in
+# another process, at least a sibling engine shard's, this age test is the only protection, and
+# ``max_bytes`` bounds that write's size, not how long it can stall:
+# :meth:`UploadStore._sweep_orphans_sync` states what that leaves open. An hour matches the default
+# prune cadence and sits far outside a healthy write.
 _ORPHAN_MIN_AGE_SECONDS = 3600.0
 
 # How long a cancelled save waits for each engine-shard ledger call, the reserve and the release, to
@@ -1547,10 +1549,11 @@ class PruneResult:
     """What one :meth:`UploadStore.prune_expired` pass did.
 
     ``pruned`` is the aged (blob, meta) pairs it deleted, carried whole because the caller writes one
-    ``upload.prune`` audit row per file from that metadata. ``orphans_removed`` counts the write
-    leftovers the same pass swept (BACKLOG #1678); those have no metadata by definition — a leftover
-    is precisely a file whose sidecar never landed — so they are a count here and a WARNING in the
-    log, not audit rows."""
+    ``upload.prune`` audit row per file from that metadata. ``orphans_removed`` counts what the same
+    pass swept as write leftovers (BACKLOG #1678). The sweep reads no metadata for one, so it is a
+    count here and a WARNING in the log, not an audit row. A body goes on the file system's report
+    that it has no sidecar, which does not prove that none landed
+    (:meth:`UploadStore._sweep_orphans_sync`)."""
 
     pruned: list[UploadedFileMeta] = field(default_factory=list)
     orphans_removed: int = 0
@@ -1655,8 +1658,11 @@ class UploadStore:
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
         # The running UploadRetentionRunner's wake, or None (BACKLOG #3184). See wake_retention.
         self._retention_wake: Callable[[], bool] | None = None
-        # The scan's and the prune's lines for a pair left for an operator, keyed by upload id and
-        # reason, so each is not logged on every pass (BACKLOG #5552).
+        # The scan's, the prune's and the orphan sweep's lines for what they left for an operator,
+        # keyed by what each line is about, so a listing or a save does not repeat one inside
+        # _REPORT_INTERVAL_S (BACKLOG #5552). The default retention pass is as far apart as that
+        # interval, so a lasting fault can log on every scheduled pass, and a key pushed out past
+        # _REPORTED_MAX logs again sooner.
         self._link_logged = _OncePerInterval()
 
     def wake_retention(self) -> bool:
@@ -4227,15 +4233,15 @@ class UploadStore:
     def _sweep_orphans_sync(self, *, now: float, abort: threading.Event | None = None) -> int:
         """Remove the write leftovers no other pass can reach, and return how many went (BACKLOG #1678).
 
-        Two shapes, both meaning a write that started and never landed: a ``.<id>.<suffix>.<tag>.tmp``
-        whose ``os.replace`` never ran, and an ``<id>.blob`` whose sidecar was never written. Neither is
-        reachable through :meth:`_walk_sidecars`, which yields ``.meta`` names only, so
-        :meth:`list_files`, :meth:`prune_expired` and :meth:`reseal_to_active` all walk straight
-        past them: a partial body would otherwise sit in the uploads root for the life of the
-        directory, outside the retention window this module promises, and (under a configured key)
-        as ciphertext ``rotate-key`` would never re-seal.
+        Two shapes, which this pass reads as a write that started and never landed: a
+        ``.<id>.<suffix>.<tag>.tmp`` whose ``os.replace`` never ran, and an ``<id>.blob`` whose
+        sidecar was never written. Neither is reachable through :meth:`_walk_sidecars`, which
+        yields ``.meta`` names only, so :meth:`list_files`, :meth:`prune_expired` and
+        :meth:`reseal_to_active` all walk straight past them: a partial body would otherwise sit in
+        the uploads root for the life of the directory, outside the retention window this module
+        promises, and (under a configured key) as ciphertext ``rotate-key`` would never re-seal.
 
-        **This pass UNLINKS, so it refuses anything it cannot positively identify as ours.** A name
+        **This pass UNLINKS, so it refuses any name it cannot positively identify as ours.** A name
         matching neither exact shape is an operator's own file and is never touched, the same way
         :meth:`_iter_sidecars` skips it. A ``.blob`` whose sidecar exists but cannot be DECRYPTED is
         kept, because this pass checks that the sidecar's name exists without opening it — a
@@ -4253,25 +4259,34 @@ class UploadStore:
         missing parent, a stale client cache and the unmeasured Access-Based Enumeration case. Any
         of them can send a body whose sidecar still exists to the unlink. The check narrows the
         race with a sidecar landing after the listing and does not close it: one can land between
-        that check and the unlink.
+        that check and the unlink. Neither that check nor the unlink holds :func:`_pair_lock`.
+
+        **The floor reads an mtime, which proves less than "abandoned".** ``stat`` follows a link,
+        so a new link to an old file is past the floor the moment it appears, as is a body restored
+        with its mtime preserved. With no sidecar reported, that name is unlinked. The mtime is
+        whatever the writer's clock set, and it is compared with this host's.
 
         A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
         too, the pass stops and returns what it removed, logged at ERROR with the root's own error.
         :class:`_OncePerInterval` damps only a repeat inside its interval, and the default pass
         interval is as long, so a lasting fault can log on every scheduled pass.
 
-        **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
-        in this process currently holds, and a held name is skipped outright, so the threshold never
-        adjudicates a race this process can see. ``_ORPHAN_MIN_AGE_SECONDS`` is the floor for everything
-        else — a leftover the registry cannot see comes from a process that DIED mid-write (every
-        in-process failure, cancellation included, now cleans up after itself), or from a sibling engine
-        shard sharing this ``uploads_dir``.
+        **A live write in THIS process is safe by IDENTITY, not by age.** ``_inflight_names`` holds
+        every name a write in this process currently holds, and a held name is skipped outright, so
+        the threshold never adjudicates a race this process can see. ``_ORPHAN_MIN_AGE_SECONDS`` is
+        the floor for everything else. A file the registry cannot see can come from at least a
+        process that DIED mid-write (every in-process failure, cancellation included, now cleans up
+        after itself), a sibling engine shard sharing this ``uploads_dir``, or a restore.
 
-        **That second case is the residual, stated precisely.** A sibling shard whose single write — one
-        write, bounded by ``max_bytes`` — has been stalled for longer than the floor could have its temp
-        removed underneath it. Its ``os.replace`` then raises and its ``save`` fails cleanly: nothing is
-        published half-written, nothing is left behind, and the operator retries. An hour against a
-        25 MiB default bound is far outside that window.
+        **A sibling shard's stalled write is a residual, in two forms.** ``_inflight_names`` does
+        not reach another process, so only the floor stands between this pass and a write stalled
+        past it. Stalled before a temp's ``os.replace``, it can have that temp removed underneath
+        it: the ``os.replace`` then raises and its ``save`` fails, nothing is published
+        half-written, and the operator retries. Stalled after its body landed and before its
+        sidecar did, it can LOSE THE BODY: this pass sees a body past the floor with no sidecar and
+        unlinks it, with no audit row, and the ``save`` then publishes the sidecar and reports
+        success for an upload with no body. ``max_bytes``, 25 MiB by default, bounds a write's size
+        and not how long it can stall, so an hour is a margin against this and not a bar to it.
 
         ``abort`` is :meth:`prune_expired`'s, checked before each entry, so a slow sweep over a large
         dir does not hold a stop past its bound (BACKLOG #2264). The pass's audit rows are already
@@ -4282,8 +4297,9 @@ class UploadStore:
         if stop.is_set():
             return 0
         cutoff = now - _ORPHAN_MIN_AGE_SECONDS
-        # The one listing, read whole before anything goes, so a failure at any point raises with
-        # nothing removed. prune_expired logs it and keeps its result (BACKLOG #6575).
+        # The one listing, read whole before anything goes, so a failure at any point removes
+        # nothing. An error is_absent reads as no root ends the pass at 0, and any other raises;
+        # prune_expired logs that and keeps its result (BACKLOG #6575).
         try:
             entries = list(root.iterdir())
         except OSError as exc:
@@ -4313,7 +4329,7 @@ class UploadStore:
                 continue  # a write in this process is holding it right now
             try:
                 if entry.stat().st_mtime > cutoff:
-                    continue  # too young to be certain it is abandoned
+                    continue  # inside the floor; being past it does not prove it abandoned
                 # The listing is a snapshot and a share can return a short one with no error, so
                 # ask again, last, before the unlink.
                 if sidecar is not None and not _sidecar_is_absent(sidecar):
@@ -4335,7 +4351,8 @@ class UploadStore:
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
                 # a random tag, never a body. What is_name_absent does not read as gone is logged,
                 # since a body whose sidecar cannot be checked stays until someone looks. A dangling
-                # link whose target alone is missing reads as gone.
+                # link can read as gone too, since the stat follows it: on POSIX with any part of
+                # its target missing, and on Windows with only the target's last part missing.
                 quiet = is_name_absent(exc) or not self._link_logged.first(f"orphan sweep {name}")
                 _log.log(
                     logging.DEBUG if quiet else logging.WARNING,
@@ -4943,7 +4960,11 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     the re-seal's check and rename unguarded: a file system that cannot lock, where both sides go on
     unlocked with a WARNING (:func:`~messagefoundry.config.atomic_edit.edit_lock`), and an engine
     removal that could not take the lock, below. The orphan sweep and a save's own cleanup do not
-    take it; neither removes a pair the re-seal walks.
+    take it. Both aim at files the re-seal does not walk, a temp or a body with no sidecar, but the
+    sweep's sidecar check and unlink run outside this lock, so it orders neither against a re-seal.
+    A sidecar that check misses (:meth:`UploadStore._sweep_orphans_sync`) would have the sweep
+    remove the body of a pair the re-seal walks, and a re-seal past its own check could then put
+    that body back.
 
     **A lock the engine cannot take does not stop it removing uploads.** Retention and delete must
     not depend on a file anyone who can write the uploads directory can plant, so the removal goes
