@@ -151,8 +151,11 @@ class _LineStartDelimiters:
 
     Two ``find`` cursors, one for ``\n--B`` and one for ``\r--B``, each only ever moving forward,
     so a body holding the delimiter text mid-line many times is skipped in C and the walk stays
-    linear. Each delimiter that starts a line is found by exactly one cursor, because its previous
-    byte is one of the two."""
+    linear. One at offset 0 is found by a ``startswith`` check; each later one is found by exactly
+    one cursor, because its previous byte is one of the two.
+
+    The cursors hold state between calls, so :meth:`find` is correct only for a caller whose ``at``
+    never decreases; the walk in :func:`_locate_parts` is that caller."""
 
     def __init__(self, body: bytes, delim: bytes) -> None:
         self._body = body
@@ -169,7 +172,8 @@ class _LineStartDelimiters:
         return self._body.find(needle, at - 1)
 
     def find(self, at: int) -> int:
-        """The offset of the first line-start delimiter at or after ``at``, or -1."""
+        """The offset of the first line-start delimiter at or after ``at``, or -1. ``at`` must not
+        be less than on the previous call."""
         if at == 0 and self._body.startswith(self._delim):
             return 0
         at = max(at, 1)
@@ -303,7 +307,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # here. A body built with a boundary the declared one is a prefix of (declared B, body
             # uses BX) does not: it has delimiters, so it gets the missing-terminator refusal below.
             raise MultipartError(
-                "multipart body holds no delimiter for the boundary its Content-Type names"
+                "multipart body holds no delimiter for the boundary its Content-Type names "
+                "(a delimiter counts only at the start of a line)"
             )
         raise MultipartError(
             "multipart body has no closing boundary delimiter; the upload may be truncated"
@@ -322,7 +327,9 @@ def parse_multipart_form(
     :class:`MultipartTooLargeError` if a file part exceeds ``max_file_bytes`` or a non-file part with
     a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413 at the route). A delimiter counts only at
     a line start (after a CR, an LF, or at the start of the body), and the boundary is trusted not to
-    start a line inside a part body (the RFC-2046 invariant every multipart parser relies on).
+    start a line inside a part body. That trust goes past RFC 2046, which keeps only
+    ``CRLF--<boundary>`` out of content: a content line after a bare CR or a bare LF that starts with
+    ``--<boundary>`` is taken as a delimiter here, though a conforming sender may write one.
 
     The function is synchronous and walks the whole body. The upload route keeps one file and no
     field, so it calls :func:`parse_upload_off_loop`, which runs :func:`parse_single_file_upload`
