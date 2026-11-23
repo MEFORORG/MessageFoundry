@@ -37,6 +37,20 @@ It faults in at least these cases: the pull request's head moved while it read, 
 distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
 not be read.
 
+A FAULT DOES NOT DISCARD A REFUSAL ALREADY PROVEN (BACKLOG #5645 item 1) in these two cases, among
+others:
+
+  * A GraphQL reply carrying ``errors`` beside its ``data`` (a partial error). An error whose
+    ``path`` points inside one commit node leaves that commit unjudged, a fault, because GraphQL
+    nulls the field it could not resolve and a nulled ``author.user`` would read as an unlinked
+    author. The other commits on the page are judged. An error with no such path still faults the
+    whole page, keeping the pages read before it.
+  * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and GitHub's ``headRefOid`` is
+    another commit, or the head moved while the pages were read, the whole read is repeated after
+    a short wait, up to ``len(HEAD_RETRY_DELAYS)`` more times. A read of another head proves
+    nothing about the head the run judges, so if no read reaches that head the run is a fault, and
+    a refusal from such a read is not kept.
+
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
 the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
 2026-11-13). The workflow fails the check on exit 1 only when the output carries this script's
@@ -91,6 +105,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -110,6 +125,13 @@ ACTIONS_BOT_ID = 41898282
 
 DEFAULT_GRAPHQL_URL = "https://api.github.com/graphql"
 DEFAULT_API_URL = "https://api.github.com"
+
+# Seconds to wait before each re-read when the head read is not the head the run judges. GitHub's
+# GraphQL view of a pull request can trail the push event that started the run.
+HEAD_RETRY_DELAYS = (5.0, 10.0)
+
+# Where a commit node sits in the reply, as a GraphQL error ``path`` names it.
+_NODES_PATH = ["repository", "pullRequest", "commits", "nodes"]
 
 # The cursor is nullable: GitHub reads a null `after` as "from the start". The action's empty-string
 # cursor works only because it never asks for a second page.
@@ -153,6 +175,10 @@ class PrecheckFault(Exception):
     partial: PullRequestRead | None = None
 
 
+class _HeadMoved(PrecheckFault):
+    """The pull request's head changed between two pages of one read."""
+
+
 @dataclass(frozen=True)
 class Attribution:
     """Who the vendored action would say made one commit, and whether anyone is linked."""
@@ -170,6 +196,8 @@ class PullRequestRead:
     head: str
     #: How many commits the first page held. The action reads that page and no other.
     first_page: int
+    #: Indexes into ``commits`` that a GraphQL error points inside. They are not judged.
+    tainted: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -286,15 +314,39 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
     ``totalCount`` is returned as it is, for ``evaluate`` to refuse.
     """
     commits: list[Mapping[str, Any]] = []
-    state: dict[str, Any] = {"head": None, "first_page": None}
+    state: dict[str, Any] = {"head": None, "first_page": None, "tainted": set()}
     try:
         return _fetch_pages(transport, owner, name, number, commits, state)
     except PrecheckFault as exc:
         if commits and state["head"] is not None and state["first_page"] is not None:
             exc.partial = PullRequestRead(
-                list(commits), len(commits), state["head"], state["first_page"]
+                list(commits),
+                len(commits),
+                state["head"],
+                state["first_page"],
+                frozenset(state["tainted"]),
             )
         raise
+
+
+def _errored_nodes(errors: object) -> set[int]:
+    """The commit-node indexes a GraphQL ``errors`` list points inside.
+
+    An error that does not name one node by its ``path`` could have touched anything on the page,
+    so it faults the page instead.
+    """
+    if not isinstance(errors, list):
+        raise PrecheckFault("GraphQL returned an error")
+    indexes: set[int] = set()
+    for error in errors:
+        path = error.get("path") if isinstance(error, Mapping) else None
+        if not isinstance(path, list) or len(path) < 5 or path[:4] != _NODES_PATH:
+            raise PrecheckFault("GraphQL returned an error")
+        index = path[4]
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            raise PrecheckFault("GraphQL returned an error")
+        indexes.add(index)
+    return indexes
 
 
 def _fetch_pages(
@@ -311,8 +363,9 @@ def _fetch_pages(
     first_page: int | None = None
     while True:
         reply = transport(QUERY, {"owner": owner, "name": name, "number": number, "cursor": cursor})
-        if reply.get("errors"):
-            raise PrecheckFault("GraphQL returned an error")
+        errors = reply.get("errors")
+        # A partial error: the data beside it still holds the commits no error points inside.
+        errored = _errored_nodes(errors) if errors else set()
         try:
             pull_request = reply["data"]["repository"]["pullRequest"]
             page_head = pull_request["headRefOid"]
@@ -323,15 +376,27 @@ def _fetch_pages(
             raise PrecheckFault("the GraphQL reply holds no pull request commits") from exc
         if not isinstance(nodes, list) or not isinstance(page_info, Mapping):
             raise PrecheckFault("the GraphQL reply's commit nodes or pageInfo have the wrong shape")
-        if not isinstance(page_head, str) or (head is not None and page_head != head):
-            raise PrecheckFault("the pull request's head moved while its commits were being read")
+        if not isinstance(page_head, str):
+            raise PrecheckFault("the GraphQL reply holds no pull request head")
+        if head is not None and page_head != head:
+            raise _HeadMoved("the pull request's head moved while its commits were being read")
         head = page_head
+        if any(index >= len(nodes) for index in errored):
+            raise PrecheckFault(
+                "GraphQL returned an error for a commit node the page does not hold"
+            )
         page: list[Mapping[str, Any]] = []
-        for node in nodes:
+        for index, node in enumerate(nodes):
             commit = node.get("commit") if isinstance(node, Mapping) else None
+            if index in errored:
+                # GraphQL nulls what it could not resolve, up to the node itself: keep the slot,
+                # unjudged, so the first page's length and the other commits stay as read.
+                page.append(commit if isinstance(commit, Mapping) else {})
+                continue
             if not isinstance(commit, Mapping):
                 raise PrecheckFault("a commit node holds no commit object")
             page.append(commit)
+        state["tainted"].update(len(commits) + index for index in errored)
         commits.extend(page)  # whole pages only, so a partial read never holds half a page
         if first_page is None:
             first_page = len(nodes)
@@ -349,7 +414,7 @@ def _fetch_pages(
             raise PrecheckFault("a page reports more commits but gives no new cursor to read them")
         seen_cursors.add(next_cursor)
         cursor = next_cursor
-    return PullRequestRead(commits, total, head, first_page)
+    return PullRequestRead(commits, total, head, first_page, frozenset(state["tainted"]))
 
 
 def _total_count(connection: Mapping[str, Any]) -> int:
@@ -394,7 +459,9 @@ def evaluate(
 
     rule_one: list[str] = []
     rule_two: list[str] = []
-    distinct = len({str(commit.get("oid", "")) for commit in read.commits})
+    # An unjudged commit's oid may be the field GraphQL nulled, so each counts once by its slot.
+    untainted = (c for i, c in enumerate(read.commits) if i not in read.tainted)
+    distinct = len({str(commit.get("oid", "")) for commit in untainted}) + len(read.tainted)
     # A FAULT, not a refusal, until GitHub's commit cap is measured (owner ruling 2026-11-13): if
     # GitHub stops the connection short of totalCount, refusing would fail every large PR closed.
     if complete and distinct != read.total:
@@ -407,6 +474,11 @@ def evaluate(
     slots: list[Attribution | None] = []
     for index, commit in enumerate(read.commits):
         oid = commit.get("oid", "")
+        if index in read.tainted:
+            # GraphQL could not resolve part of it, and a nulled user reads as an unlinked author.
+            faults.append(f"commit {oid or index}: GraphQL reported an error inside it; not judged")
+            slots.append(None)
+            continue
         try:
             refusal = _rule_one(commit)
         except PrecheckFault as exc:
@@ -576,14 +648,57 @@ def _https_url(env: Mapping[str, str], key: str, default: str) -> str:
     return url
 
 
+def read_judged_head(
+    transport: Transport,
+    owner: str,
+    name: str,
+    number: int,
+    expected_head: str,
+    sleep: Callable[[float], None],
+) -> tuple[PullRequestRead, bool, str | None]:
+    """Read the pull request, re-reading while its head is not the head the run judges.
+
+    Returns the read, whether it is complete, and the fault that cut it short, if any. The head
+    judged is ``expected_head`` when set. A read whose head moved partway is re-read too, unless
+    the pages it holds are of ``expected_head``. When the waits run out, a read of another head is
+    a fault, and a read whose head moved partway is judged as far as it got.
+    """
+    delays = iter(HEAD_RETRY_DELAYS)
+    while True:
+        moved = False
+        try:
+            read = fetch_commits(transport, owner, name, number)
+            complete, read_fault = True, None
+        except PrecheckFault as exc:
+            # A later page failed. The pages already read still prove what they prove.
+            if exc.partial is None:
+                raise
+            read, complete, read_fault = exc.partial, False, str(exc)
+            moved = isinstance(exc, _HeadMoved)
+        on_head = read.head == expected_head if expected_head else not moved
+        if on_head:
+            return read, complete, read_fault
+        delay = next(delays, None)
+        if delay is None:
+            if expected_head:
+                raise PrecheckFault(
+                    "the pull request's head is not CLA_HEAD_SHA after "
+                    f"{len(HEAD_RETRY_DELAYS)} re-reads; this run is stale"
+                )
+            return read, complete, read_fault
+        sleep(delay)
+
+
 def run(
     env: Mapping[str, str],
     transport: Transport | None = None,
     signatures: Signatures | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Read the environment, check every commit, print annotations, and return the exit code.
 
-    ``transport`` and ``signatures`` replace the network for tests; both default to GitHub.
+    ``transport``, ``signatures`` and ``sleep`` replace the network and the clock for tests; they
+    default to GitHub and ``time.sleep``.
     """
     try:
         repository = _REPOSITORY.fullmatch(env.get("GITHUB_REPOSITORY", ""))
@@ -618,16 +733,9 @@ def run(
                     raise PrecheckFault("CLA_SIGNATURES_PATH or CLA_SIGNATURES_BRANCH is not set")
                 api = _https_url(env, "GITHUB_API_URL", DEFAULT_API_URL)
                 signatures = rest_signatures(api, token, owner, name, path, branch)
-        try:
-            read = fetch_commits(transport, owner, name, number)
-            complete, read_fault = True, None
-        except PrecheckFault as exc:
-            # A later page failed. The pages already read still prove what they prove.
-            if exc.partial is None:
-                raise
-            read, complete, read_fault = exc.partial, False, str(exc)
-        if expected_head and read.head != expected_head:
-            raise PrecheckFault("the pull request's head is not CLA_HEAD_SHA; this run is stale")
+        read, complete, read_fault = read_judged_head(
+            transport, owner, name, number, expected_head, sleep
+        )
         verdict = evaluate(read, allowlist, signatures, complete=complete)
     except PrecheckFault as exc:
         print(f"::warning title=CLA pre-check fault::{_escape_command(str(exc))}")
