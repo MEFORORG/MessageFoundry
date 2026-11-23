@@ -19,11 +19,8 @@ While the 413 is written the deadline is held off to at least :data:`_REFUSAL_WR
 past its start, so a client that keeps reading gets the whole 413 within that grace. Once the host
 has taken the 413, or the write fails, the deadline is back on its own time.
 
-The deadline cancels the route's task, and cancellation reaches a read the route is awaiting, so a
-write stalled there past the later of the grace and the deadline's own time is cut with the route
-and can leave a 413 head with no body. A read the route shielded or left detached is not cancelled
-by this deadline. Whether its client still receives the 413 once the request ends is up to the
-host, which may close the connection.
+A write on the route's own task is cut with the route and can leave a 413 head with no body. A
+write on another task is not necessarily cut by this deadline.
 
 **Pure ASGI, not** ``BaseHTTPMiddleware``: no task hop, and the response-start signal is visible
 directly. It is registered inside :class:`~messagefoundry.api.client_networks.ClientNetworkMiddleware`
@@ -35,8 +32,7 @@ release and config reload (inline, from ``/ui``, and released through the approv
 operation through :class:`~messagefoundry.api.outlive.OutlivingOperations`,
 so cancelling the handler here leaves the operation running to its own outcome row rather than half
 done (vault BACKLOG #2751-#2753). At least the approval gate's outcome writes shield themselves the
-same way, and the engine runs a connection flag write as its own task. Anything nobody shields is
-cancelled with the handler.
+same way, and the engine runs a connection flag write as its own task.
 
 Being outside the app's ``_security_headers`` middleware, the refusal sets the baseline response
 headers itself rather than shipping a 503 with none of them — the same reason
