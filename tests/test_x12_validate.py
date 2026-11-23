@@ -1053,7 +1053,6 @@ def test_an_ordinary_error_reads_as_a_refusal_with_only_its_class_logged(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # This is also what a damaged map or table that still parses does: a refusal, its class logged.
     monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _walk_raising(fault))
     with caplog.at_level(logging.WARNING), pytest.raises(X12ValidationError) as caught:
         validate(_conformant_270())

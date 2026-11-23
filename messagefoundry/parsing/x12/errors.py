@@ -42,12 +42,11 @@ class X12ValidationError(X12Error):
     instead. A Handler's ``except ValueError`` does not catch that, but left uncaught it takes the
     ``internal_error`` policy, whose default, ``CONTINUE``, also dead-letters the row.
 
-    **A damaged install can land here too.** A map or table that still parses but is wrong raises
-    an ordinary error, and an index that lost a map's entry reads as having no map, so each is this
-    error, which a Handler's ``except ValueError`` would dead-letter. A refusal from a walk that
-    raised logs its exception class at WARNING, rate-limited, so a run of one class can show an
-    operator the damage. The two refusals with no exception to name log nothing: pyx12 wrote no
-    report ("does not look like an X12 data file"), or its report could not be read.
+    **A damaged install can land here too.** An index that lost a map's entry reads as having no
+    map, so it is this error, which a Handler's ``except ValueError`` would dead-letter. A refusal
+    from a walk that raised logs its exception class at WARNING, rate-limited, so a run of one class
+    can show an operator the damage. The two refusals with no exception to name log nothing: pyx12
+    wrote no report ("does not look like an X12 data file"), or its report could not be read.
 
     The X12 analog of
     :class:`~messagefoundry.parsing.fhir.errors.FhirValidationError`. A *failed validation* (a pass
