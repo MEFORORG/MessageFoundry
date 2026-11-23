@@ -732,8 +732,9 @@ async def test_reload_during_router_takes_the_split_path_not_the_new_lookup_hand
 async def test_reload_rolled_back_during_router_stays_inline(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    """A swap the reload rolled back leaves the captured graph served, and rollback restores that
-    graph's eligibility, so the check compares identity and the row stays inline."""
+    """Pins only that the check compares graph identity: the captured graph served again counts as
+    unchanged. Both assignments land in one loop tick and no real reload runs, so this says nothing
+    about whether a rollback restores inline eligibility."""
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     old = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
     new = _registry(

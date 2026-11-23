@@ -12720,9 +12720,9 @@ class RegistryRunner:
             # Publish the live graph's run-scoped views (code sets / reference snapshots /
             # active environment) so a call-time code_set(...)/reference(...)/
             # current_environment() inside the Router resolves (the loader only had them
-            # active during import). Views are read from self.registry/self.store live, so a
-            # reload's swapped tables apply to the next routed row; run_contexts restores
-            # cleanly after each run (no leak). The set of providers is the run_context
+            # active during import). Views are read from the graph this row captured and the live
+            # self.store, so a reload's swapped tables apply to the next routed row; run_contexts
+            # restores cleanly after each run (no leak). The set of providers is the run_context
             # registry (router phase) — features add one provider there, never edit this call.
             router_rc = RunContext(
                 code_sets=registry.code_sets,
