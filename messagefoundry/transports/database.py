@@ -2285,8 +2285,9 @@ def _build_connection(
     that :func:`~messagefoundry.hostlist.names_no_host` matches, which
     :func:`_build_odbc_dsn` refuses at every posture (BACKLOG #5512).
 
-    ``connection`` names the declaring connection in that WARNING (#333); it is used on the generic path
-    only, since the SQL Server preset refuses rather than warns."""
+    ``connection`` names the declaring connection. On the generic path it names that WARNING (#333).
+    On the SQL Server arm it is passed to :func:`_build_dsn`, which uses it to name its refusals and
+    the WARNING it logs when an attested weakened hop is permitted."""
     dialect = str(s.get("dialect", "sqlserver")).lower()
     if dialect == "sqlserver":
         # After _build_dsn, so its server-shape refusals still come before a flag refusal.

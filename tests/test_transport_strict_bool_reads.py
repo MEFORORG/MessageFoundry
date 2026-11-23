@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The DICOM and MLLP connectors read ``tls`` strictly, the DICOM, FHIR, SOAP, FTPS, MLLP and REST
 reads of ``tls_allow_expired`` are strict too, and so are the DATABASE reads of
-``trust_server_certificate`` (vault BACKLOG #3234, added step 8 and the remainder after it).
+``trust_server_certificate`` (vault BACKLOG #3234, added step 8 and at least some of the reads left after it).
 
 The load and the runner's builds (``_source_config``, ``_dest_config``) refuse a non-bool literal
 on a boolean setting. A connector constructed directly from a ``Source`` or ``Destination``, as
@@ -270,8 +270,8 @@ def test_ftps_revocation_guard_reads_a_real_bool_tls_allow_expired(
     assert seen == [value]
 
 
-# Vault BACKLOG #3234's remainder after engine PRs 3169 and 3176: MLLP ``tls`` and
-# ``tls_allow_expired``, REST ``tls_allow_expired`` and DATABASE ``trust_server_certificate``. Each
+# At least these of vault BACKLOG #3234's reads left after engine PRs 3169 and 3176: MLLP ``tls``
+# and ``tls_allow_expired``, REST ``tls_allow_expired`` and DATABASE ``trust_server_certificate``. Each
 # was read with ``bool(...)`` or by truthiness, so ``"false"`` switched MLLP TLS on, relaxed an MLLP
 # or REST expiry check, or, on an attested DATABASE hop, sent ``TrustServerCertificate=yes``. A real
 # ``bool`` reads as before.
