@@ -9,13 +9,14 @@ routes are inserted ahead of the app's own so each test reads what actually reac
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Message, Receive, Scope, Send
@@ -61,13 +62,21 @@ class _Run:
 
 
 async def _drive(
-    app: Any, chunks: list[bytes], *, path: str = "/probe", method: str = "POST"
+    app: Any,
+    chunks: list[bytes],
+    *,
+    path: str = "/probe",
+    method: str = "POST",
+    http_version: str = "1.1",
+    ends_early: bool = False,
 ) -> _Run:
-    """Send ``chunks`` as a body with neither framing header, one ``receive`` each."""
+    """Send ``chunks`` as a body with neither framing header, one ``receive`` each.
+
+    ``ends_early`` is a client that goes away with the body unfinished."""
     scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": "2",
+        "http_version": http_version,
         "method": method,
         "scheme": "http",
         "path": path,
@@ -82,11 +91,12 @@ async def _drive(
     pending = list(chunks) or [b""]
 
     async def receive() -> Message:
+        await asyncio.sleep(0)  # a real server's receive yields, so concurrent readers interleave
         if not pending:
             return {"type": "http.disconnect"}
         run.pulled += 1
         body = pending.pop(0)
-        return {"type": "http.request", "body": body, "more_body": bool(pending)}
+        return {"type": "http.request", "body": body, "more_body": bool(pending) or ends_early}
 
     async def send(message: Message) -> None:
         run.sent.append(message)
@@ -197,6 +207,36 @@ async def test_a_refusal_is_logged(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         await _drive(app, [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)])
     assert any("oversized request body" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("http_version", ["2", "3"])
+async def test_a_refusal_over_http_2_or_3_carries_no_connection_field(http_version: str) -> None:
+    """RFC 9113 8.2.2 and RFC 9114 4.2: a response with this field is malformed there."""
+    app, reads = _app_with_probe()
+    run = await _drive(app, [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)], http_version=http_version)
+    assert run.status == 413
+    assert all(name != b"connection" for name, _ in run.starts[0]["headers"])
+    assert reads == []
+
+
+async def test_two_concurrent_reads_past_the_cap_send_one_refusal() -> None:
+    app = create_app(allow_no_auth=True)
+
+    class _ReadsTwice:
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            await asyncio.gather(receive(), receive())
+
+    app.router.routes.insert(0, Route("/probe", _ReadsTwice()))
+    over_cap = b"x" * (_MAX_REQUEST_BODY_BYTES + 1)
+    run = await _drive(app, [over_cap, over_cap])
+    assert run.status == 413  # the property asserts exactly one response start
+
+
+async def test_a_real_disconnect_under_the_cap_is_not_absorbed() -> None:
+    app, reads = _app_with_probe()
+    with pytest.raises(ClientDisconnect):
+        await _drive(app, [b"abc"], ends_early=True)
+    assert reads == []
 
 
 async def test_a_response_already_started_is_not_given_a_second_start() -> None:

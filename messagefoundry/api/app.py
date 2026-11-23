@@ -5204,8 +5204,8 @@ def create_app(
         (AuthenticatedBeforeBodyRoute).
 
         At the first chunk past the cap the route gets ``http.disconnect`` in place of that chunk,
-        so it never holds a partial body as if it were whole, and nothing more is pulled. The 413
-        goes out unless the route already started a response, which cannot then be replaced."""
+        so it never holds a partial body as if it were whole, and no later read pulls anything. The
+        413 goes out unless the route already started a response, which cannot then be replaced."""
         seen = 0
         over_cap = False
         started = False
@@ -5216,6 +5216,8 @@ def create_app(
             if over_cap:
                 return {"type": "http.disconnect"}
             message = await receive()
+            if over_cap:  # a concurrent read crossed the cap while this one waited
+                return {"type": "http.disconnect"}
             if message["type"] != "http.request" or not message.get("body"):
                 return message
             seen += len(message["body"])
@@ -5252,10 +5254,13 @@ def create_app(
 
     def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
         _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
-        # `Connection: close` makes the server drop the connection after every refusal, so bytes
-        # it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body the
-        # client never sent, are never read as a next request.
-        return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
+        # On HTTP/1.x, `Connection: close` makes the server drop the connection after every refusal,
+        # so bytes it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body
+        # the client never sent, are never read as a next request. HTTP/2 and HTTP/3 frame each
+        # stream and make a response with this field malformed (RFC 9113 §8.2.2, RFC 9114 §4.2).
+        multiplexed = str(request.scope.get("http_version", "")).startswith(("2", "3"))
+        headers = None if multiplexed else {"Connection": "close"}
+        return JSONResponse({"detail": detail}, status_code=status, headers=headers)
 
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
