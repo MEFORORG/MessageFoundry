@@ -40,7 +40,8 @@ def _stages() -> dict[str, list[str]]:
 
 
 def _parent(stage: list[str]) -> str:
-    return stage[0].split()[1].lower()
+    """The stage's FROM image, skipping any ``--flag`` the stage regex above allows."""
+    return next(tok for tok in stage[0].split()[1:] if not tok.startswith("--")).lower()
 
 
 def test_the_postgres_lock_pins_asyncpg_with_hashes() -> None:
@@ -84,5 +85,13 @@ def test_the_ha_compose_engines_run_the_postgres_variant() -> None:
 
 def test_the_ha_manifest_names_the_postgres_variant() -> None:
     text = (_ROOT / "docker" / "k8s" / "ha-postgres.yaml").read_text(encoding="utf-8")
-    assert "FROM messagefoundry:postgres" in text
-    assert "the Postgres store needs only the slim default" not in text
+    header, _, rest = text.partition("\n---\n")
+    assert "FROM messagefoundry:postgres" in header, "the header must name the Postgres base"
+    # The engine container's own REPLACE comment is what an adopter edits beside, so it must name
+    # the Postgres base too, not only the header.
+    engine = rest.partition("- name: engine\n")[2]
+    assert engine, "the manifest has no engine container; this test has gone stale"
+    replace_comment = engine.partition("image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE")[0]
+    assert "FROM messagefoundry:postgres" in replace_comment, (
+        "the engine container's REPLACE comment no longer names the runtime-postgres base"
+    )

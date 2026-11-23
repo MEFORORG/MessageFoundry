@@ -31,7 +31,8 @@
 #     FROM messagefoundry:postgres
 #     COPY config /config
 # where messagefoundry:postgres is the Dockerfile's runtime-postgres target, built as docker/README.md
-# "Image variants" shows. The slim default carries no asyncpg, so the Postgres store cannot open on it.
+# "Image variants" shows, from the checkout of the one release you deploy; the tag names no version,
+# so tag your build with it. The slim default carries no asyncpg, so the Postgres store cannot open on it.
 # The same baked image deploys to all 3 replicas (ADR 0017 same-commit-everywhere).
 ---
 # Headless governing Service — stable in-cluster DNS for the API control/read plane (up on EVERY node).

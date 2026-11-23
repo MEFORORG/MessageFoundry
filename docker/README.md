@@ -38,12 +38,12 @@ establishes that the off-loopback security controls are already built; this is p
 | **`-sqlserver`** | `docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver .` | Adds the OS-level Microsoft ODBC Driver 18 + `[sqlserver]` extra — needed **only** for the SQL Server store or the DATABASE / `db_lookup` connectors. |
 | **`-postgres`** | `docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .` | Adds the `[postgres]` extra (`asyncpg`), which the Postgres store needs. The `ha` compose profile and [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) run that store, so they need this variant; the slim default carries no `asyncpg`. |
 
-Each is multi-stage, run as **non-root uid 10001**, install from per-profile **hash-locked**
+Each is multi-stage, runs as **non-root uid 10001**, installs from per-profile **hash-locked**
 requirements (`docker/locks/*.lock`, kept in sync with `uv.lock` by the DEP-1 step in
-`.github/workflows/security.yml`), and are based on `python:3.14-slim-bookworm`, pinned by digest
+`.github/workflows/security.yml`), and is based on `python:3.14-slim-bookworm`, pinned by digest
 (see the [`Dockerfile`](Dockerfile) header). The pin freezes the base's OS packages, so rebuilding
 an old checkout does not pick up newer Debian fixes; build from a current release. The slim default omits
-PySide6, dev tools, and ODBC; the SQL Server layer (a Microsoft-EULA apt repo) is only in the variant.
+PySide6, dev tools, and ODBC; the SQL Server layer (a Microsoft-EULA apt repo) is only in the `-sqlserver` variant.
 
 ## How the image starts the engine
 
