@@ -1012,7 +1012,8 @@ function Set-SecretsDirAcl {
       THE ACCOUNT'S GRANT IS ADDED, NEVER REPLACED. An existing directory may give a dedicated engine
       account more than read, for the Vault Agent sink route docs/CONFIGURATION.md describes, and a
       rerun must not take that away. Inheritance comes off, so a grant the directory inherited goes.
-      Every entry for another account is removed: none is offered one, and anyone may have made the
+      Every Allow entry for another account is removed (icacls /remove:g removes grants only, so an
+      explicit Deny entry stays): none is offered one, and anyone may have made the
       folder first under ProgramData.
 
       THROWS WHEN THE RESULT IS NOT RESTRICTED. Each step runs whatever the one before it did, so one
@@ -1053,7 +1054,7 @@ function Set-SecretsDirAcl {
     $broad = Get-WellKnownBroadSids
     & icacls $Path /remove:g @broad | Out-Null
     # No other account is offered a grant here (docs/CONFIGURATION.md), and a folder made under
-    # ProgramData may have been made by any local user first. So every other entry is removed.
+    # ProgramData may have been made by any local user first. So every other Allow entry is removed.
     foreach ($holder in @(Get-BroadAclResidue -Path $Path -Account $Account)) {
         $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
         & icacls $Path /remove:g $spelled | Out-Null
@@ -3158,7 +3159,7 @@ if ($HostCustody) {
 # --- the custody directory (vault BACKLOG #3411, ADR 0214's 2026-11-22 amendment) --------------------
 # Under the host provider the service's first start writes its own key file, master.key, beside the
 # handoff provision-admin leaves, so it must add a file where those two live. A service that may add
-# a file to the secrets directory may supply a secret-class setting (ADR 0214's amendment), and the
+# a file to the secrets directory may supply a secret-class setting (ADR 0214's amendment), and
 # neither the installer nor the engine guarantees the service read only there (docs/SERVICE.md 'The custody directory under the host key
 # provider' says which grants survive), so the key files do not rest on the service lacking that
 # right. They get a directory of their own, named to the service as
@@ -3713,8 +3714,9 @@ if ($HostCustody) {
         throw ("$($_.Exception.Message)$removed Re-run the installer. " +
             "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'its first start cannot write its store key file as the custody directory needs')")
     }
-    # A refusal, not a warning: without the variable the service reads the secrets directory for its
-    # key file, so a mint made as SERVICE.md says lands where the service does not look.
+    # A refusal, not a warning: unless the variable names this directory, the service reads its key
+    # file elsewhere (the secrets directory, or a custody directory an earlier install named), so a
+    # key provision-admin mints here as SERVICE.md says lands where the service does not look.
     $custodyNamingError = $null
     $replacedCustodyDir = $null
     try {
@@ -3723,8 +3725,9 @@ if ($HostCustody) {
     if ($null -ne $custodyNamingError) {
         $removed = Remove-CustodyDirMadeHere -Path $CustodyDir -MadeHere:$CustodyDirMadeHere
         throw ("Could not name the custody directory in the service's environment " +
-            "($custodyNamingError), and without MEFOR_CUSTODY_DIRECTORY the service looks for its " +
-            "key file in the secrets directory and would mint where it does not look.$removed " +
+            "($custodyNamingError). Unless MEFOR_CUSTODY_DIRECTORY names it, the service looks for its " +
+            "key file elsewhere, in the secrets directory or a custody directory an earlier install " +
+            "named, so a key provision-admin mints here lands where the service does not look.$removed " +
             "Re-run the installer. " +
             "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it would not find its custody directory')")
     }

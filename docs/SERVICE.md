@@ -284,9 +284,10 @@ install script's own grant to the service there is read, and the engine refuses 
 account, so nothing guarantees the service read only there: a rerun keeps an explicit grant to
 the service account itself, such as the write the Vault Agent sink route
 ([CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)) gives it.
-Only an explicit grant survives: the script turns inheritance off (`/inheritance:r`), which drops
-every inherited entry, and removes every other account's Allow entry, a group's included. So when the
-install script reads
+Of the entries the script does not set itself, only an explicit grant to the service account
+and an explicit Deny entry survive: the script turns inheritance off (`/inheritance:r`), which
+drops every inherited entry, and removes every other account's Allow entry, a group's included.
+So when the install script reads
 `[store].key_provider = 'host'` it also makes a **custody directory** of its own for those two
 files, `-CustodyDir`, else the one the service already names, else `<DataDir>-custody`, and names
 it to the service as `MEFOR_CUSTODY_DIRECTORY`. It is judged before anything acts by the secrets
@@ -373,10 +374,8 @@ tell whose key a file holds, and either file may be the only copy of a store's k
      `AppEnvironmentExtra` list, keeping the other entries.
 
    A new data directory starts a new, empty store. Never copy another store's database, or any
-   key file, into it. Under the host provider, leave this store's database with its `-wal` and
-   `-shm` files where they are: the service mints a new store key for the new store, and that key
-   cannot open them. Under another provider, to keep this store's own data, move into the new
-   one, as step 5 says, only files you know are this store's or this service's, and leave everything else where it is, at
+   key file, into it. To keep this store's own data, move into the new one, as step 5 says, only
+   files you know are this store's or this service's, and leave everything else where it is, at
    least any other database with its `-wal` and `-shm` files, since an old data directory may be
    shared. Those files are at least this store's database, the file the service's `--db` names,
    with that file's own `-wal` and `-shm` files; and, only where no other store's database sits
@@ -385,6 +384,13 @@ tell whose key a file holds, and either file may be the only copy of a store's k
    directory lacks either file, the engine mints a new pair there, and a client that pins the old
    certificate then refuses the new one. Leave `master.key` and `handoff.key` where they are: in
    this step they may be another store's.
+
+   Under the host provider, leave this store's database, with its `-wal` and `-shm` files, out of
+   that move, on the `-CustodyDir` route as well as the `-DataDir` one. The new store needs a key
+   that `messagefoundry provision-admin --service-account` mints for it, and `provision-admin`
+   refuses to mint for a SQLite store that already exists, because a new key cannot open it. So
+   under that provider the `-CustodyDir` route needs a new data directory too, and then
+   `provision-admin` run again for the new store before step 6.
 5. **Moving a file.** Within one volume, move it as an administrator
    (`Move-Item -LiteralPath <file> -Destination <directory>`): the file keeps its own owner and
    access list, which the engine checks exactly on a key file. Across volumes a move is a copy,
@@ -415,11 +421,12 @@ tell whose key a file holds, and either file may be the only copy of a store's k
      handoff is meant to last only from install to the service's first start, which converts it
      into `master.key` and deletes the copy it read. It is machine-scope DPAPI: on this host, any
      process that can read the file can unwrap the store key from it, though it does not unwrap
-     on another host without this host's machine DPAPI keys, which at least a system-state backup,
-     a disk image or a cloned virtual machine of this host carries.
+     on another host without this host's machine DPAPI keys, which at least a disk image or a
+     cloned virtual machine of this host carries.
    - **The `api-generated-cert.pem` and `api-generated-key.pem` originals:** delete both once the
      service presents the copied pair. The key original is a second copy of the private key the
-     service presents, readable by at least whoever its own access list names.
+     service presents, readable by at least the accounts its own access list grants read and any
+     account holding a privilege that reads past an access list, such as SeBackupPrivilege.
    - **The database originals** may hold PHI; dispose of them as [PHI.md](PHI.md) describes.
 6. **Start the service**, and read its log for a refusal ([Verify it's running](#verify-its-running)).
 
@@ -434,13 +441,15 @@ account or root may write, and add the engine's other secret files to a new secr
 within one file system keeps the file's owner and mode; across file systems, copy it keeping them
 (`cp -p`, as root). Once the engine has opened its store from the copy, take the engine
 account's access to a `master.key` original away, since the file stays owned by that account
-with mode 0600 wherever it moves. Record its owner and mode first (`stat -c '%U:%G %a' <file>`), then either make root its owner (`chown root:root <file>`,
-keeping mode 0600), or move it, within its file system, into a directory root owns with mode
-0700; keep it there. On Windows, set a kept `master.key` original's owner and list as step 5
-says rather than only moving it, and delete a `handoff.key` original once the service has
-started from the copy, as step 5 says. Delete the `api-generated-cert.pem` and
-`api-generated-key.pem` originals once the engine presents the copied pair, as step 5 says.
-Keep every other `master.key` or `handoff.key` original.
+with mode 0600 wherever it moves. Record its owner and mode first
+(`stat -c '%U:%G %a' <file>`) and keep that record with it, so they can be restored if the engine
+ever has to read it again. Then make root its owner (`chown root:root <file>`, keeping mode 0600),
+and move it, within its file system, into a directory root owns with mode 0700, so the engine
+account can neither read it nor rename or delete it; keep it there. On Windows, set a kept
+`master.key` original's owner and list as step 5 says rather than only moving it, and delete a
+`handoff.key` original once the service has started from the copy, as step 5 says. Delete the
+`api-generated-cert.pem` and `api-generated-key.pem` originals once the engine presents the copied
+pair, as step 5 says.
 
 ## Update to a new build (restart vs reinstall)
 

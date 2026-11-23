@@ -511,8 +511,8 @@ def test_each_key_file_refusal_points_at_one_service_md_procedure_and_states_no_
         assert needed in section, (needed, section)
     # PR 3168 hold, items 2 and 4 to 8: a new data directory takes only this store's own files,
     # the certificate pair together; a kept master.key original has its list set, not only moved;
-    # a handoff original goes once the service has started; machine-scope DPAPI unwraps on this
-    # host only; and its readers are an "at least" list.
+    # a handoff original goes once the service has started; machine-scope DPAPI does not unwrap on
+    # another host without this host's machine keys; and its readers are an "at least" list.
     for needed in (
         "only files you know are this store's or this service's",
         "any other database with its `-wal` and `-shm` files",
