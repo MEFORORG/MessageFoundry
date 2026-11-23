@@ -20,7 +20,6 @@ import contextlib
 import functools
 import io
 import logging
-import re
 import socket
 import struct
 import threading
@@ -722,10 +721,11 @@ def _associate_against(
     ac: bytes,
     caplog: pytest.LogCaptureFixture,
     then: Callable[[Any], None] | None = None,
+    reply: bytes | None = None,
 ) -> list[logging.LogRecord]:
     """A pynetdicom SCU, as the engine's DICOM destination uses, asks a peer for an association and
-    gets ``ac`` back, and does ``then`` on it if it is established. Every record logged meanwhile is
-    returned."""
+    gets ``ac`` back, and does ``then`` on it if it is established. With ``reply``, the peer answers
+    the next PDU with that command set. Every record logged meanwhile is returned."""
     from pynetdicom import AE
     from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
 
@@ -733,28 +733,34 @@ def _associate_against(
 
         def answer() -> None:
             conn, _ = listener.accept()
-            with conn:
+            with conn, contextlib.suppress(OSError):
                 conn.settimeout(5.0)
                 _read_pdu(conn)
                 conn.sendall(ac)
-                with contextlib.suppress(OSError):
-                    while conn.recv(4096):
-                        pass
+                if reply is not None:
+                    _read_pdu(conn)
+                    conn.sendall(_p_data(0x03, reply))
+                while conn.recv(4096):
+                    pass
 
         peer = threading.Thread(target=answer)
         peer.start()
         ae = AE(ae_title="MODALITY1")
         ae.acse_timeout = 5
+        ae.dimse_timeout = 5
         ae.add_requested_context(Verification)
-        with caplog.at_level(logging.DEBUG):
-            assoc = ae.associate("127.0.0.1", listener.getsockname()[1], ae_title="PLAINSCP")
-            if assoc.is_established:
-                try:
-                    if then is not None:
-                        then(assoc)
-                finally:
-                    assoc.abort()
-        peer.join(10.0)
+        try:
+            with caplog.at_level(logging.DEBUG):
+                assoc = ae.associate("127.0.0.1", listener.getsockname()[1], ae_title="PLAINSCP")
+                if assoc.is_established:
+                    try:
+                        if then is not None:
+                            then(assoc)
+                    finally:
+                        if assoc.is_established:  # a refused reply has already ended it
+                            assoc.abort()
+        finally:
+            peer.join(10.0)
     return list(caplog.records)
 
 
@@ -1421,19 +1427,115 @@ def test_the_warnings_filters_are_not_reinstalled_while_they_are_first(
         monkeypatch.undo()
 
 
-def test_the_ds_warning_filter_costs_one_pass_on_a_crafted_value() -> None:
-    # A UID of repeated `Value "`, under the 64 KiB command set cap: every UserWarning meets this
-    # filter first. Timed against the quadratic form on the same text, so load slows both.
-    crafted = "Invalid value for VR UI: '" + 'Value "' * 9000
+def test_no_warning_filter_nests_an_unbounded_scan_inside_a_leading_one() -> None:
+    # Every UserWarning meets these filters, on text a peer can fill with a pattern's own opening
+    # words, up to the 64 KiB command set cap. A leading `.*` with a second unbounded scan after it
+    # is quadratic there. Read from the patterns, so a loaded machine cannot fail it.
+    def nested(pattern: str) -> bool:
+        return pattern.startswith(".*") and "*" in pattern[2:]
 
-    def seconds(patterns: tuple[str, ...]) -> float:
-        started = time.monotonic()
-        for pattern in patterns:
-            re.compile(pattern, re.IGNORECASE).match(crafted)
-        return time.monotonic() - started
+    assert nested(r'.*Value ".*" is not valid for elements with a VR of ')  # CONTROL
+    assert dicom_module._PYDICOM_VALUE_WARNINGS
+    assert not [p for p in dicom_module._PYDICOM_VALUE_WARNINGS if nested(p)]
 
-    quadratic = seconds((r'.*Value ".*" is not valid for elements with a VR of ',))  # CONTROL
-    assert seconds(dicom_module._PYDICOM_VALUE_WARNINGS) < quadratic / 10
+
+def test_the_scu_ignores_pydicoms_copies_before_it_reads_the_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.parsing.dicom import DicomPeek
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _scu
+
+    class Reached(Exception):
+        """The read is over; the association is not under test."""
+
+    def stop() -> Any:
+        raise Reached
+
+    data = make_sr_part10()
+    uid = DicomPeek.parse(data).sop_instance_uid
+    assert uid
+    planted = ("1.02." + "7" * len(uid))[: len(uid)]
+    scu = _scu(1)
+    monkeypatch.setattr(scu, "_build_ae", stop)
+
+    def warned() -> list[str]:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(Reached):
+                scu._store_object(data.replace(uid.encode(), planted.encode()))
+        return [str(w.message) for w in caught if planted in str(w.message)]
+
+    install = dicom_module._ignore_pydicom_value_warnings
+    monkeypatch.setattr(dicom_module, "_ignore_pydicom_value_warnings", lambda: None)
+    assert warned()  # CONTROL: uninstalled, the read warns with the value
+    monkeypatch.setattr(dicom_module, "_ignore_pydicom_value_warnings", install)
+    assert warned() == []
+
+
+def test_context_aware_warnings_always_reinstall(monkeypatch: pytest.MonkeyPatch) -> None:
+    # There, warnings.filters is not the list in force, so it cannot say the ignores are in place.
+    calls: list[str] = []
+    original = warnings.filterwarnings
+
+    def counted(*args: Any, **kwargs: Any) -> None:
+        calls.append(str(kwargs.get("message")))
+        original(*args, **kwargs)
+
+    with warnings.catch_warnings():
+        dicom_module._ignore_pydicom_value_warnings()
+        monkeypatch.setattr(warnings, "filterwarnings", counted)
+        dicom_module._ignore_pydicom_value_warnings()
+        assert calls == []  # CONTROL: without the flag, in place means no call
+        flags = SimpleNamespace(context_aware_warnings=1)
+        monkeypatch.setattr(dicom_module, "sys", SimpleNamespace(flags=flags))
+        dicom_module._ignore_pydicom_value_warnings()
+        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)
+        monkeypatch.undo()
+
+
+@pytest.mark.parametrize("vr", ["UI", "CS", "IS", "DS"])
+def test_the_engines_error_text_redacts_pydicoms_own_refusal(vr: str) -> None:
+    # redact() rewrites this refusal's head, so the shapes must read the message before it does.
+    from pydicom import config
+    from pydicom.valuerep import validate_value
+
+    value = "1.02.7777777^PLANTED"
+    with pytest.raises(ValueError) as raised:
+        validate_value(vr, value, config.RAISE)
+    assert value in str(raised.value)  # CONTROL
+    assert value not in dicom_module._safe_library_exc(raised.value)
+    assert _REDACTED_MARK in dicom_module._safe_library_exc(raised.value)
+
+
+def test_the_engines_error_text_keeps_a_codec_errors_byte_out() -> None:
+    with pytest.raises(UnicodeDecodeError) as raised:
+        b"\xc3\x28".decode("ascii")
+    assert "0xc3" in str(raised.value)  # CONTROL
+    assert "0xc3" not in dicom_module._safe_library_exc(raised.value)
+
+
+def _with_a_note() -> BaseException:
+    exc = RuntimeError("the handler failed")
+    exc.add_note(f"while reading {_PLANTED}")
+    return exc
+
+
+@pytest.mark.parametrize(
+    "build",
+    [_with_a_note, lambda: ExceptionGroup("failed", [ValueError(_REFUSAL)])],
+    ids=["note", "group-member"],
+)
+def test_a_traceback_with_a_note_or_group_member_is_withheld(
+    build: Callable[[], BaseException], caplog: pytest.LogCaptureFixture
+) -> None:
+    exc = build()
+    with _filter_removed():  # CONTROL: a stock formatter prints both
+        assert [line for line in _logged("pynetdicom.dimse", exc, caplog) if _PLANTED in line]
+    lines = _logged("pynetdicom.dimse", exc, caplog)
+    assert lines
+    assert not [line for line in lines if _PLANTED in line], lines
+    assert [line for line in lines if "traceback withheld" in line], lines
 
 
 async def test_the_scus_delivery_error_names_no_refused_value(
@@ -1504,37 +1606,10 @@ def _c_echo_rsp_command(class_uid: str) -> bytes:
 def _scu_echo_answered_with(command: bytes, caplog: pytest.LogCaptureFixture) -> list[str]:
     """A pynetdicom SCU sends a C-ECHO to a peer that answers with ``command``. Every record logged
     meanwhile is returned as a handler would write it, its traceback included."""
-    from pynetdicom import AE
-    from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
-
-    with socket.create_server(("127.0.0.1", 0)) as listener:
-
-        def answer() -> None:
-            conn, _ = listener.accept()
-            with conn:
-                conn.settimeout(5.0)
-                _read_pdu(conn)
-                conn.sendall(_captured_ac())
-                _read_pdu(conn)
-                conn.sendall(_p_data(0x03, command))
-                with contextlib.suppress(OSError):
-                    while conn.recv(4096):
-                        pass
-
-        peer = threading.Thread(target=answer)
-        peer.start()
-        ae = AE(ae_title="MODALITY1")
-        ae.acse_timeout = 5
-        ae.dimse_timeout = 5
-        ae.add_requested_context(Verification)
-        with caplog.at_level(logging.DEBUG):
-            assoc = ae.associate("127.0.0.1", listener.getsockname()[1], ae_title="PLAINSCP")
-            assert assoc.is_established
-            assoc.send_c_echo()
-            if assoc.is_established:
-                assoc.abort()
-        peer.join(10.0)
-    return _formatted(list(caplog.records))
+    records = _associate_against(
+        _captured_ac(), caplog, then=lambda assoc: assoc.send_c_echo(), reply=command
+    )
+    return _formatted(records)
 
 
 def test_a_refused_value_in_a_peers_dimse_response_never_reaches_the_log(

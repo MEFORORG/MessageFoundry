@@ -68,6 +68,7 @@ import re
 import socket
 import socketserver
 import ssl
+import sys
 import threading
 import time
 import warnings
@@ -112,7 +113,14 @@ from messagefoundry.parsing.dicom._inflate import (
 )
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.redaction import _REDACTED, prepare_log_record, safe_exc, safe_traceback
+from messagefoundry.redaction import (
+    _REDACTED,
+    prepare_log_record,
+    prints_a_codec_error,
+    safe_exc,
+    safe_text,
+    safe_traceback,
+)
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
@@ -804,12 +812,22 @@ def _redact_traceback(
     does not hold verbatim withholds the whole traceback. ``safe_traceback`` rewrites a line, or
     falls back to :func:`~messagefoundry.redaction.safe_exc`'s single line, at least for a codec
     error and on a CPython without ``TracebackException._str``, and the value could survive there
-    in a form the replace does not find."""
+    in a form the replace does not find. A link with notes or group members withholds it too, since
+    the stdlib prints those and this walk does not read them. A codec error's own notes are
+    ``safe_traceback``'s to keep or drop."""
     redactions: list[tuple[str, str]] = []
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, BaseExceptionGroup) or (
+            getattr(current, "__notes__", None) and not isinstance(current, UnicodeError)
+        ):
+            record.exc_info = None
+            record.exc_text = (
+                f"{type(exc).__name__} (traceback withheld: it has notes or group members)"
+            )
+            return
         message = str(current)
         redacted = _redacted_line(shapes, message)
         if redacted is not None:
@@ -858,8 +876,11 @@ def _ignore_pydicom_value_warnings() -> None:
 
     The check keeps this cheap enough for the SCU to run per association, and it matters beyond the
     cost: each ``filterwarnings`` call resets every module's once-per-location record, so installing
-    them per send would repeat any other library's warning on stderr once per message."""
-    if list(warnings.filters[: len(_PYDICOM_WARNING_FILTERS)]) == _PYDICOM_WARNING_FILTERS:
+    them per send would repeat any other library's warning on stderr once per message. With
+    context-aware warnings, ``warnings.filters`` is not the list in force, so it decides nothing."""
+    context_aware = getattr(sys.flags, "context_aware_warnings", 0)
+    in_place = list(warnings.filters[: len(_PYDICOM_WARNING_FILTERS)]) == _PYDICOM_WARNING_FILTERS
+    if in_place and not context_aware:
         return
     for message in _PYDICOM_VALUE_WARNINGS:
         warnings.filterwarnings("ignore", message=message, category=UserWarning)
@@ -870,9 +891,15 @@ _redact_flagged_peer_values()
 
 def _safe_library_exc(exc: BaseException) -> str:
     """:func:`~messagefoundry.redaction.safe_exc` of an exception pydicom or pynetdicom raised, with
-    a refusal's value redacted. ``redact()`` does not recognise a UID, so a refused one survives it."""
-    text = safe_exc(exc)
-    return _redacted_line(_REFUSALS, text) or text
+    a refusal's value redacted. ``redact()`` does not recognise a UID, so a refused one survives it,
+    and it rewrites some of the text a shape starts with, so the shapes read the message before it
+    does. A codec error's ``str()`` is never read here: it names a byte."""
+    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
+        return safe_exc(exc)
+    redacted = _redacted_line(_REFUSALS, str(exc))
+    if redacted is None:
+        return safe_exc(exc)
+    return f"{type(exc).__name__}: {safe_text(redacted)}"
 
 
 def _write_held(held: list[logging.LogRecord]) -> None:
@@ -3021,6 +3048,7 @@ class DicomScuDestination(DestinationConnector):
         inflate here too, ahead of ``dcmread``. (The network-facing SCP has its own guard over the
         negotiated transfer syntax in ``_on_c_store``.) A deflate bomb is a permanent dead-letter (a retry
         re-sends the identical bad object)."""
+        _ignore_pydicom_value_warnings()  # ahead of the reads below, which can flag a value
         dcmread = load_dcmread()
         # Also outside the try, for the same reason: a pydicom without the readers the guard replays is
         # a deploy error, and the broad except below must not turn it into a per-message bad-object.
