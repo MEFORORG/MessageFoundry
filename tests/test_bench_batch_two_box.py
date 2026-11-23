@@ -28,6 +28,7 @@ from harness.load.connscale.compare import FUSE_GO
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.runner import ConnScaleError, _excusal
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
+from harness.load.failover import FailoverError
 from harness.load.metrics import Counters
 
 _MINIMAL_BATCH = """
@@ -422,6 +423,8 @@ def _install_engine_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
     counter = {"pid": 30000}
 
     class FakeNode:
+        alive = False
+
         def __init__(
             self, node_id: str, api_port: int, *, env: Mapping[str, str], config_dir: str, cwd: Any
         ) -> None:
@@ -457,6 +460,7 @@ def _install_engine_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
     monkeypatch.setattr(bb, "_await_node_healthy", fake_await_node_healthy)
     monkeypatch.setattr(bb, "_await_port", fake_await_port)
     monkeypatch.setattr(bb, "_reset_server_store", fake_reset)
+    rec.node_cls = FakeNode
     return rec
 
 
@@ -572,18 +576,23 @@ async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch)
     assert drv_report.exit_code == 0
 
 
-async def _run_engine_half_alone(profile: Any, *, claim_mode: str, sink_procs: int) -> None:
+async def _run_engine_half_alone(
+    profile: Any, *, claim_mode: str, sink_procs: int
+) -> tuple[Any, list[dict[str, Any]]]:
     """The engine half with a stand-in for the load-gen box, which takes each READY and posts DONE
-    at once."""
+    at once. Returns the engine report and each cell's READY."""
     import asyncio
 
+    readies: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory() as tmp:
         coord = FileDropCoord(tmp, run_id="batch_ab")
 
         async def stub_driver() -> None:
             for cell in bb.iter_batch_cells(profile, claim_mode=claim_mode):
                 cc = coord.for_run(f"batch_ab.{cell.cell_id}")
-                await cc.await_message(BATCH_CELL_READY, timeout=10.0, interval=0.02)
+                readies.append(
+                    await cc.await_message(BATCH_CELL_READY, timeout=10.0, interval=0.02)
+                )
                 cc.post(BATCH_CELL_DONE, {"cell_id": cell.cell_id})
 
         engine = bb.run_batch_engine(
@@ -594,7 +603,8 @@ async def _run_engine_half_alone(profile: Any, *, claim_mode: str, sink_procs: i
             sink_procs=sink_procs,
             cell_timeout=10.0,
         )
-        await asyncio.gather(engine, stub_driver())
+        report, _ = await asyncio.gather(engine, stub_driver())
+    return report, readies
 
 
 @pytest.mark.usefixtures("no_auth_env")
@@ -654,6 +664,140 @@ async def test_an_operator_limit_too_small_for_the_largest_cell_stops_before_any
     assert [c.cell_id for c in report.cells] == [c.cell_id for c in cells]
     assert all(c.error and f"{_PER_IP}=4" in c.error for c in report.cells)
     assert all(r is not None and f"{_PER_IP}=4" in r["error"] for r in readies)
+
+
+# --------------------------------------------------------------------------------------------------
+# Engine-half failures that used to pass with no log (BACKLOG #5857)
+# --------------------------------------------------------------------------------------------------
+
+# Stands in for a driver error's text, which can carry connection details.
+_SECRET_TEXT = "Server=db.invalid;Password=not-a-real-one"
+_SERVER_BATCH = _MINIMAL_BATCH.replace(
+    "trials = 3", 'trials = 1\nstore_backend = "sqlserver"'
+).replace("batch_modes = [false, true]", "batch_modes = [false]")
+
+
+async def _engine_report() -> tuple[Any, list[dict[str, Any]]]:
+    profile = load_connscale_profile_text(_SERVER_BATCH)
+    return await _run_engine_half_alone(profile, claim_mode="pooled", sink_procs=6)
+
+
+def _raiser(exc: BaseException) -> Callable[..., Any]:
+    async def _raise(*_args: object, **_kwargs: object) -> Any:
+        raise exc
+
+    return _raise
+
+
+def _assert_logged_by_type_only(report: Any, caplog: pytest.LogCaptureFixture) -> None:
+    assert any("RuntimeError" in r.getMessage() for r in caplog.records)
+    assert _SECRET_TEXT not in repr(report.notes) + caplog.text
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_a_failed_store_reset_fails_the_cell_by_type_name_only_bug_5857(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eng_rec = _install_engine_fakes(monkeypatch)
+    monkeypatch.setattr(bb, "_reset_server_store", _raiser(RuntimeError(_SECRET_TEXT)))
+
+    report, readies = await _engine_report()
+
+    assert eng_rec.started == []  # no cell measures on top of the previous cell's rows
+    assert not report.ok
+    assert all("store reset failed: RuntimeError" in (c.error or "") for c in report.cells)
+    assert all("store reset failed: RuntimeError" in r["error"] for r in readies)
+    assert _SECRET_TEXT not in repr(report.to_json_dict())
+    assert _SECRET_TEXT not in repr(readies)
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_a_cancelled_store_reset_stays_cancelled_bug_5857(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    _install_engine_fakes(monkeypatch)
+    monkeypatch.setattr(bb, "_reset_server_store", _raiser(asyncio.CancelledError()))
+    profile = load_connscale_profile_text(_SERVER_BATCH)
+    with tempfile.TemporaryDirectory() as tmp:
+        coord = FileDropCoord(tmp, run_id="batch_ab")
+        with pytest.raises(asyncio.CancelledError):
+            await bb.run_batch_engine(
+                profile=profile, coord=coord, store_env={}, sink_procs=6, cell_timeout=10.0
+            )
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_a_failed_done_wait_after_a_failed_start_is_logged_bug_5857(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    node_cls = _install_engine_fakes(monkeypatch).node_cls
+    monkeypatch.setattr(node_cls, "start", _raiser(FailoverError("no start")))
+    real_wait = FileDropCoord.await_message
+
+    async def wait(self: FileDropCoord, name: str, **kwargs: Any) -> dict[str, Any]:
+        if name == BATCH_CELL_DONE and self.run_id.startswith("batch_ab."):
+            # Only the engine half's wait fails; the stand-in driver's READY wait is real.
+            raise RuntimeError(_SECRET_TEXT)
+        return await real_wait(self, name, **kwargs)
+
+    monkeypatch.setattr(FileDropCoord, "await_message", wait)
+    with caplog.at_level("WARNING", logger=bb.__name__):
+        report, _ = await _engine_report()
+
+    assert all((c.error or "").startswith("engine did not start") for c in report.cells)
+    assert any("DONE" in n and "RuntimeError" in n for n in report.notes)
+    _assert_logged_by_type_only(report, caplog)
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_a_stop_failure_after_a_failed_start_does_not_read_as_a_fault_bug_5857(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    node_cls = _install_engine_fakes(monkeypatch).node_cls
+    monkeypatch.setattr(node_cls, "start", _raiser(FailoverError("no start")))
+    monkeypatch.setattr(node_cls, "stop", _raiser(RuntimeError(_SECRET_TEXT)))
+    with caplog.at_level("WARNING", logger=bb.__name__):
+        report, _ = await _engine_report()
+
+    assert all((c.error or "").startswith("engine did not start") for c in report.cells)
+    stop_notes = [n for n in report.notes if "stop" in n and "RuntimeError" in n]
+    assert stop_notes
+    assert all("not a fault" in n and "STILL RUNNING" not in n for n in stop_notes)
+    _assert_logged_by_type_only(report, caplog)
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_a_failed_start_that_left_a_live_process_says_so_bug_5857(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A health or port wait can fail on an engine that DID spawn: that note must not clear it.
+    node_cls = _install_engine_fakes(monkeypatch).node_cls
+    monkeypatch.setattr(node_cls, "start", _raiser(FailoverError("no start")))
+    monkeypatch.setattr(node_cls, "stop", _raiser(RuntimeError(_SECRET_TEXT)))
+    monkeypatch.setattr(node_cls, "alive", True)
+    with caplog.at_level("WARNING", logger=bb.__name__):
+        report, _ = await _engine_report()
+
+    stop_notes = [n for n in report.notes if "stop" in n and "RuntimeError" in n]
+    assert stop_notes
+    assert all("STILL RUNNING" in n and "not a fault" not in n for n in stop_notes)
+    _assert_logged_by_type_only(report, caplog)
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_a_stop_failure_after_a_clean_cell_is_a_note_not_a_cell_error_bug_5857(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    node_cls = _install_engine_fakes(monkeypatch).node_cls
+    monkeypatch.setattr(node_cls, "stop", _raiser(RuntimeError(_SECRET_TEXT)))
+    with caplog.at_level("WARNING", logger=bb.__name__):
+        report, _ = await _engine_report()
+
+    assert report.ok  # a teardown fault does not void a cell the driver measured
+    assert any("stop" in n and "RuntimeError" in n for n in report.notes)
+    _assert_logged_by_type_only(report, caplog)
 
 
 # --------------------------------------------------------------------------------------------------

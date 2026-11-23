@@ -942,14 +942,21 @@ class FuseModeComparison:
     baseline_missing: list[tuple[str, str, int]] = field(default_factory=list)
     # The window every rate in `rows` was computed over, read off the records (BACKLOG #2012).
     rate_window: str | None = None
+    # (claim_mode, sweep_mode, count) cells named in missing_detail with NO record in EITHER arm. They
+    # have no row and no baseline gap, so without this a GO on the other counts would mask them
+    # (BACKLOG #5430).
+    unrun_cells: list[tuple[str, str, int]] = field(default_factory=list)
 
     @property
     def overall_verdict(self) -> str:
-        """GO only if EVERY present cell is GO; NO-GO if any cell is NO-GO or the B1 arm is missing;
-        otherwise INCONCLUSIVE (some cell could not clear the noise bar, none failed outright)."""
+        """GO only if EVERY present cell is GO and no cell went unrun; NO-GO if any cell is NO-GO, the
+        B1 arm is missing, or a cell has no record in either arm; otherwise INCONCLUSIVE (some cell
+        could not clear the noise bar, none failed outright)."""
         verdicts = [row.verdict for row in self.rows]
-        if self.baseline_missing:
-            return FUSE_NO_GO  # a swallowed B0 baseline is a run gap, never a GO
+        # A swallowed B0 baseline or an unrun cell is a run gap, never a GO. Checked before the
+        # empty-rows branch, because every cell unrun is not INCONCLUSIVE.
+        if self.baseline_missing or self.unrun_cells:
+            return FUSE_NO_GO
         if not verdicts:
             return FUSE_INCONCLUSIVE
         if any(v in (FUSE_NO_GO, FUSE_MISSING) for v in verdicts):
@@ -963,7 +970,12 @@ class FuseModeComparison:
         """The correctness fold for the run's exit code: every present B1 arm held zero-loss and none
         is missing. The GO/NO-GO throughput decision is reported separately and does NOT fail the run
         (a null/negative fusion result banks nothing but is not an error, ADR 0071 §6.4b)."""
-        return bool(self.rows) and all(row.ok for row in self.rows) and not self.baseline_missing
+        return (
+            bool(self.rows)
+            and all(row.ok for row in self.rows)
+            and not self.baseline_missing
+            and not self.unrun_cells
+        )
 
     @property
     def candidate_zero_loss_ok(self) -> bool:
@@ -986,7 +998,7 @@ class FuseModeComparison:
         return sum(1 for row in self.rows if row.verdict == FUSE_INCONCLUSIVE)
 
     def to_json_dict(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "kind": self.axis_kind,
             "baseline": self.baseline_label,
             "candidate": self.candidate_label,
@@ -1011,6 +1023,9 @@ class FuseModeComparison:
             "rows": [_fuse_row_json(row) for row in self.rows],
             "notes": self.notes,
         }
+        if self.unrun_cells:  # only on a gap, so a banked run's JSON is unchanged
+            out["unrun_cells"] = [list(cell) for cell in self.unrun_cells]
+        return out
 
     def render_table(self) -> str:
         lines: list[str] = []
@@ -1030,6 +1045,9 @@ class FuseModeComparison:
         if self.baseline_missing:
             _bm = ", ".join(f"[{cm}/{sm}] N={n}" for (cm, sm, n) in self.baseline_missing)
             lines.append(f"  BASELINE MISSING (B0 absent -> run FAILS): {_bm}")
+        if self.unrun_cells:
+            _unrun = ", ".join(f"[{cm}/{sm}] N={n}" for (cm, sm, n) in self.unrun_cells)
+            lines.append(f"  UNRUN (no record in either arm -> run FAILS): {_unrun}")
         for row in self.rows:
             lines.append("")
             lines.append(f"[{row.claim_mode}/{row.sweep_mode}] N={row.count}  =>  {row.verdict}")
@@ -1210,6 +1228,19 @@ def build_fuse_comparison(
             "uncomputable. This FAILS the run (overall NO-GO) so a swallowed baseline can never let a GO "
             "on other counts mask it."
         )
+    # Read from `groups`, not `seen`: a cell with only a B1 record is already in baseline_missing.
+    unrun_cells = [
+        key
+        for key in missing_detail
+        if (*key, FUSE_OFF) not in groups and (*key, FUSE_ON) not in groups
+    ]
+    if unrun_cells:
+        notes.append(
+            f"{len(unrun_cells)} cell(s) with NO record in either arm: "
+            + ", ".join(f"[{cm}/{sm}] N={n}" for (cm, sm, n) in unrun_cells)
+            + " -- both arms failed to start there, so nothing was compared. This FAILS the run "
+            "(overall NO-GO) so a GO on other counts can never mask it."
+        )
     return FuseModeComparison(
         min_lift_pct=min_lift_pct,
         sigma_multiple=sigma_multiple,
@@ -1218,6 +1249,7 @@ def build_fuse_comparison(
         rows=rows,
         notes=notes,
         baseline_missing=baseline_missing,
+        unrun_cells=unrun_cells,
         axis_kind=axis_kind,
         title=title,
         guards_ref=guards_ref,
