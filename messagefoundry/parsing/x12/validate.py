@@ -68,9 +68,10 @@ class X12SegmentError:
 
     ``segment_id`` comes from the input, so it is kept only when it has an X12 segment id's shape (a
     capital, then one or two capitals or digits) and a map in pyx12's bundled index defines it, and
-    is ``None`` otherwise (BACKLOG #5370). A sender value equal to such an id, for example the surname
-    ``LIN``, standing where the id goes is still kept, in ``segment_id`` and in ``message``. A
-    terminator inside a name can put the name's tail there, with ``loop`` naming the field before."""
+    is ``None`` otherwise (BACKLOG #5370). The set is the union of those maps, so a sender value equal
+    to any id in it, for example the surname ``LIN``, standing where the id goes is still kept, in
+    ``segment_id`` and in ``message``, even in a transaction whose own map does not define that id.
+    A terminator inside a name can put the name's tail there, with ``loop`` naming the field before."""
 
     code: str
     message: str

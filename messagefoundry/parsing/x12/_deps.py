@@ -18,14 +18,13 @@ This module imports ``pyx12`` (third-party, not an engine package) and nothing f
 
 from __future__ import annotations
 
-import functools
 import logging
 import threading
+import time
 from collections.abc import Callable
 from importlib.resources import files
 from typing import TYPE_CHECKING, Any
 
-from messagefoundry._vendor.defusedxml.common import DefusedXmlException
 from messagefoundry._vendor.defusedxml.ElementTree import ParseError, parse
 
 if TYPE_CHECKING:
@@ -33,6 +32,9 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 _MAP_IDS_LOCK = threading.Lock()
+_MAP_IDS_RETRY_SECONDS = 60.0
+_map_ids: frozenset[str] = frozenset()
+_map_ids_retry_at = 0.0
 
 
 def _missing_extra(feature: str) -> RuntimeError:
@@ -71,7 +73,9 @@ def _read_map_segment_ids(map_dir: Traversable) -> frozenset[str]:
         for map_file in map_files:
             with map_dir.joinpath(map_file).open("rb") as fd:
                 ids.update(xid for seg in parse(fd).iter("segment") if (xid := seg.get("xid")))
-    except (OSError, ParseError, DefusedXmlException) as exc:
+    # ValueError covers defusedxml's refusals and a multi-byte encoding declaration; LookupError an
+    # unknown one.
+    except (OSError, ParseError, ValueError, LookupError) as exc:
         _log.warning(
             "pyx12's maps could not be read (%s); X12 errors will carry no segment id",
             type(exc).__name__,
@@ -82,20 +86,23 @@ def _read_map_segment_ids(map_dir: Traversable) -> frozenset[str]:
     return frozenset(ids)
 
 
-@functools.cache
-def _bundled_map_segment_ids() -> frozenset[str]:
-    return _read_map_segment_ids(files("pyx12").joinpath("map"))
-
-
 def load_x12_map_segment_ids() -> frozenset[str]:
-    """Every segment id the maps in pyx12's bundled index define, read once, on first use.
+    """Every segment id the maps in pyx12's bundled index define, read on first use.
 
     ``validate()`` passes pyx12 no map path, so pyx12 selects from this same index. The read takes
     a noticeable fraction of a second, so it runs only when a violation has an id-shaped value to
-    check. The lock is there because ``functools.cache`` alone lets each thread that misses at once
-    repeat the read."""
+    check, and the lock keeps threads that miss together to one read. A good read is kept for the
+    process. An empty one is not, so a passing fault cannot remove every id until a restart; it is
+    retried at most once per :data:`_MAP_IDS_RETRY_SECONDS`, and until then no id is kept."""
+    global _map_ids, _map_ids_retry_at
+    if _map_ids:
+        return _map_ids
     with _MAP_IDS_LOCK:
-        return _bundled_map_segment_ids()
+        if not _map_ids and time.monotonic() >= _map_ids_retry_at:
+            _map_ids = _read_map_segment_ids(files("pyx12").joinpath("map"))
+            if not _map_ids:
+                _map_ids_retry_at = time.monotonic() + _MAP_IDS_RETRY_SECONDS
+        return _map_ids
 
 
 def load_x12_code_resolver() -> Callable[..., str | None]:

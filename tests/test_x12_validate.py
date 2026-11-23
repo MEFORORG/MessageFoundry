@@ -751,7 +751,8 @@ def test_sender_text_shaped_like_an_id_is_not_kept(
 
 
 def test_a_sender_value_equal_to_a_real_id_is_still_kept() -> None:
-    # The known limit: LIN is a segment the maps define, so nothing tells this value from that id.
+    # The known limit: the set is the union of every indexed map, so LIN is kept here although the
+    # 270's own map does not define it.
     assert "LIN" in {e.segment_id for e in validate(_270_with("LIN*A~")).errors}
 
 
@@ -764,6 +765,30 @@ def test_the_bundled_index_gives_real_ids_of_the_id_shape() -> None:
     ids = load_x12_map_segment_ids()
     assert {"ISA", "GS", "ST", "NM1", "N1", "SE", "GE", "IEA"} <= ids
     assert all(_X12_VALIDATE._SEGMENT_ID.fullmatch(seg_id) for seg_id in ids)
+
+
+def test_a_failed_map_read_is_not_kept_and_is_retried_after_a_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps = importlib.import_module("messagefoundry.parsing.x12._deps")
+    results = iter([frozenset[str](), frozenset({"NM1"})])
+    reads: list[object] = []
+
+    def read(map_dir: object) -> frozenset[str]:
+        reads.append(map_dir)
+        return next(results)
+
+    monkeypatch.setattr(deps, "_read_map_segment_ids", read)
+    monkeypatch.setattr(deps, "_map_ids", frozenset())
+    monkeypatch.setattr(deps, "_map_ids_retry_at", 0.0)
+    assert load_x12_map_segment_ids() == frozenset()
+    assert load_x12_map_segment_ids() == frozenset()  # inside the pause: no second read
+    assert len(reads) == 1
+
+    monkeypatch.setattr(deps, "_map_ids_retry_at", 0.0)  # the pause is over
+    assert load_x12_map_segment_ids() == {"NM1"}
+    assert load_x12_map_segment_ids() == {"NM1"}  # a good read is kept
+    assert len(reads) == 2
 
 
 _MAP_INDEX = "<maps><version><map>a.xml</map><map>b.xml</map></version></maps>"
@@ -787,6 +812,8 @@ def test_the_map_reader_reads_only_the_maps_the_index_lists(tmp_path: Path) -> N
         {"maps.xml": _MAP_INDEX, "a.xml": "<map><segment xid='NM1'/></map>"},
         {"maps.xml": _MAP_INDEX, "a.xml": "<map><segment xid='NM1'/></map>", "b.xml": "<map"},
         {"maps.xml": _MAP_INDEX, "a.xml": "<map/>", "b.xml": "<map/>"},
+        {"maps.xml": "<?xml version='1.0' encoding='no-such-codec'?><maps/>"},  # LookupError
+        {"maps.xml": "<?xml version='1.0' encoding='utf-7'?><maps/>"},  # plain ValueError
     ],
     ids=[
         "no-directory",
@@ -796,6 +823,8 @@ def test_the_map_reader_reads_only_the_maps_the_index_lists(tmp_path: Path) -> N
         "listed-map-missing",
         "listed-map-unparseable",
         "no-segment",
+        "unknown-encoding",
+        "multibyte-encoding",
     ],
 )
 def test_maps_that_cannot_be_read_give_no_ids(

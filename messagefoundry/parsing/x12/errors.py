@@ -31,11 +31,12 @@ class X12FrameError(X12Error):
 
 
 class X12ValidationError(X12Error):
-    """The opt-in strict validator (``pyx12``, ADR 0012) could not run a structural validation pass at
-    all — e.g. the bytes are not a parseable X12 data file, so there is no envelope to walk. The X12
-    analog of :class:`~messagefoundry.parsing.fhir.errors.FhirValidationError`. A *failed validation*
-    (a parseable interchange that violates its implementation guide) is **not** this — it is reported
-    as data on :class:`~messagefoundry.parsing.x12.validate.X12ValidationResult` (``valid=False`` +
+    """The opt-in strict validator (``pyx12``, ADR 0012) could not finish a structural validation
+    pass: at least when the bytes are not a parseable X12 data file, and when pyx12 raises partway
+    through a walk, as a non-numeric GE01 makes it do. The X12 analog of
+    :class:`~messagefoundry.parsing.fhir.errors.FhirValidationError`. A *failed validation* (a pass
+    that finishes with violations of the implementation guide) is **not** this — it is reported as
+    data on :class:`~messagefoundry.parsing.x12.validate.X12ValidationResult` (``valid=False`` +
     structural :class:`~messagefoundry.parsing.x12.validate.X12SegmentError` items + a 997/999 ack), so
     a Handler can route the *message* to the error path while still emitting the negative ack (the ack
     is ``None`` if pyx12 did not complete it). Its message is **PHI-safe**: it names only the failure
