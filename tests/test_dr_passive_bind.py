@@ -373,16 +373,16 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
     ``auto_start = false`` feed a reload on the passive box parked after an operator start.
 
     Cause of the 2026-10-13 ubuntu failure (BACKLOG #3456), read from job 115229267670's log and
-    the code, and not proven: the probe, not the feed. The control after the operator start read
-    False. That start had returned, and a bind that fails raises out of ``start_inbound``, records
-    the feed failed and alerts ``connection_stopped`` (the test after this one pins the first two),
-    so a port another process held would have failed the start, not the probe. The log holds a
-    WARNING alert, ``posture_loosened``, and no ``connection_stopped`` one. A passive box holds
-    no source for this feed, so the start did not return early on an old one. That leaves the
-    probe of that day, which read any ``OSError`` and its own 2s timeout as "not bound"; that suite
-    ran 26:25, so a starved event loop could pass that bound. The probe now reads only a refusal
-    as unbound and fails on no answer, and this control names whether the runner holds the
-    listener, so a recurrence says which side it was."""
+    the code at that run's head, ``a6e9a49f5b``: most consistent with the probe, and not proven.
+    The control after the operator start read False, and that start had returned. At that head a
+    bind that failed raised ``PortConflictError`` out of ``start_inbound``
+    (:func:`test_an_operator_start_onto_a_held_port_raises_rather_than_reading_unbound` pins that),
+    so a port something else held would have failed the start, not the probe. A passive box holds
+    no source for this feed, so the start did not return early on an old one. The probe of that
+    day read any ``OSError`` and its own 2s timeout as "not bound", in a suite that ran 26:25.
+    At least one other suspect stays open: a listener that bound and then closed before the probe
+    would be refused, and that probe read a refusal the same way. The control now names whether
+    the runner holds the listener, and the probe fails on no answer, so a recurrence says more."""
     cfg = tmp_path / "cfg"
     _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
@@ -411,9 +411,11 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
 async def test_an_operator_start_onto_a_held_port_raises_rather_than_reading_unbound(
     tmp_path: Path,
 ) -> None:
-    """Pins the step the cause above rests on (BACKLOG #3456): a port another process holds fails
-    the operator start itself, and records the feed failed, so it cannot pass a start and then
-    read as unbound at the probe."""
+    """Pins a step the cause in
+    :func:`test_an_activation_parks_the_normal_feed_before_its_reload_runs` rests on (BACKLOG
+    #3456): a port another socket holds fails the operator start itself, so the start cannot
+    return and the probe then read the feed as unbound. The ``inbound_failed`` record came later
+    than the 2026-10-13 failure, and is checked here as today's behaviour."""
     cfg = tmp_path / "cfg"
     _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=False)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:

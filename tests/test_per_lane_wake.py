@@ -355,14 +355,16 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
     B12 changes only WHEN a worker wakes, never the FIFO claim (#285 / ADR 0059).
 
     Cause of the 2026-10-12 windows-2025 failure (BACKLOG #3456), read from job 114991525524's log:
-    a slow runner, not a stalled lane. Its suite took 33:39, against the 3s this wait then allowed,
-    counted in sleeps. Its captured log shows both file destinations creating their directories, so
-    at least one message had been delivered to each, and the pipeline was moving when the wait
-    ran out. This pass found no lost wake in the per_lane worker loops: a worker clears its event
-    in ``_wait_for_work`` before it claims again, so a row committed before the clear is claimed
-    and one committed after it sets the event again. A lost wake would still fail here, because the wall-time ceiling of ``_until`` sits
-    below the idle backstop that would otherwise deliver the row. Each file is written only once
-    the one before it is stored, so arrival order no longer rests on a sleep between writes."""
+    most consistent with a slow runner, and not proven. The suite took 33:39, against the 3s this
+    wait then allowed, counted in sleeps. The captured log shows both file destinations creating
+    their directories, so a delivery to each had begun when the wait ran out. This pass found no
+    lost wake in the order ``_wait_for_work`` keeps: a worker clears its event before it claims
+    again, so a row committed before the clear is claimed and one committed after it sets the
+    event again. What a lost wake does to this test is in the ``_UNTIL_CEILING_SECONDS`` comment.
+
+    All three files are written in one step, with no sleep between them. The file source lists by
+    name, so they are taken in in name order whichever poll sees them, and the three rows can sit
+    in the lane together, which is what the FIFO claim is for."""
     inbox, out_a, out_b = tmp_path / "in", tmp_path / "a", tmp_path / "b"
     inbox.mkdir()
     reg = _delivery_registry(inbox, out_a, out_b)
@@ -376,10 +378,8 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
     )
     await r.start()
     try:
-        for i in range(3):
+        for i in range(3):  # no await between the writes; see the docstring for the order
             (inbox / f"m{i}.hl7").write_bytes(ADT.format(cid=f"MSG{i}").encode("utf-8"))
-            # Arrival order by construction: the next file does not exist until this one is stored.
-            await _until(lambda n=i + 1: _n_stored(store, n))
         # Poll the ACTUAL asserted condition — all 3 messages finalized to PROCESSED — not a proxy like
         # "N outbound rows DONE" (each message fans out to 2, so that proxy trips at 1.5 messages; it
         # false-greened on a fast runner and flaked on a slow one — mf-ci-test-flakes).
@@ -400,11 +400,6 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
         "SELECT control_id FROM messages WHERE channel_id=? ORDER BY rowid", ("file_in",)
     )
     assert [row["control_id"] for row in await cur.fetchall()] == ["MSG0", "MSG1", "MSG2"]
-
-
-async def _n_stored(store: MessageStore, n: int) -> bool:
-    """At least ``n`` messages are stored for the inbound, whatever their status."""
-    return len(await store.list_messages(channel_id="file_in", allowed_channels=None)) >= n
 
 
 async def _n_processed(store: MessageStore, n: int) -> bool:
