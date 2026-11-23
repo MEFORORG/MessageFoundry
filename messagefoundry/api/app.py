@@ -5183,24 +5183,24 @@ def create_app(
                 return
             request = Request(scope)
             refusal = _body_refusal(request)
-            if refusal is not None:
-                await refusal(scope, receive, send)
-            elif "content-length" in request.headers:
-                await inner(scope, receive, send)
-            else:
+            if refusal is None:
                 await _run_counting_body(inner, request, receive, send)
+            else:
+                await refusal(scope, receive, send)
 
         return middleware
 
     async def _run_counting_body(
         inner: ASGIApp, request: Request, receive: Receive, send: Send
     ) -> None:
-        """Run ``inner`` on a request with neither framing header, holding its body to the cap.
+        """Run ``inner`` on an admitted HTTP request, holding the body it delivers to the cap.
 
-        Under ``serve`` llhttp frames such a request as an empty body. A host that frames it another
-        way (HTTP/2, an in-process ASGI call) can deliver a body no header announced, so it is
-        counted here as the route pulls it. It is not read ahead of the route: that would buffer
-        a body for a caller the route's own gate refuses before reading
+        ``_body_refusal`` judges what the request declares, and a host need not deliver that: at
+        least HTTP/2, HTTP/3 and an in-process ASGI call can carry a body no header announced, or
+        more than its Content-Length. So every chunk is counted as the route pulls it. Under
+        ``serve`` llhttp ends a body at its Content-Length and frames a request with neither header
+        as empty, so the count cannot pass the cap there. The body is not read ahead of the route:
+        that would buffer a body for a caller the route's own gate refuses before reading
         (AuthenticatedBeforeBodyRoute).
 
         At the first chunk past the cap the route gets ``http.disconnect`` in place of that chunk,
@@ -5209,10 +5209,9 @@ def create_app(
         seen = 0
         over_cap = False
         started = False
-        answered = False
 
         async def counted_receive() -> Message:
-            nonlocal seen, over_cap, answered
+            nonlocal seen, over_cap
             if over_cap:
                 return {"type": "http.disconnect"}
             message = await receive()
@@ -5221,28 +5220,46 @@ def create_app(
             if message["type"] != "http.request" or not message.get("body"):
                 return message
             seen += len(message["body"])
-            # Read here, not up front: this path carries every bodyless GET, which needs no cap.
+            # Read here, not up front: most requests through this path carry no body.
             if seen <= _body_cap(request):
                 return message
-            over_cap = True
-            refusal = _refuse_body(request, 413, "request body too large", "oversized request body")
-            if not started:
-                answered = True  # set before the first await, so no route response can interleave
-                await refusal(request.scope, receive, send)
+            over_cap = True  # before the first await, so no route response can interleave
+            if started:
+                _log.warning(
+                    "oversized request body on %s from %s after a response started: "
+                    "no 413 was sent, and the route's read got a disconnect",
+                    request.url.path,
+                    client_ip(request),
+                )
+            else:
+                refusal = _refuse_body(
+                    request, 413, "request body too large", "oversized request body"
+                )
+                try:
+                    await refusal(request.scope, receive, send)
+                except OSError as exc:  # the client went away; the route still gets its disconnect
+                    _log.warning(
+                        "could not send the 413 for an oversized request body on %s from %s: %s",
+                        request.url.path,
+                        client_ip(request),
+                        type(exc).__name__,
+                    )
             return {"type": "http.disconnect"}
 
         async def route_send(message: Message) -> None:
             nonlocal started
-            if not answered:
+            # Past the cap with no response started, the 413 is the response.
+            if started or not over_cap:
                 started = True
                 await send(message)
 
         try:
             await inner(request.scope, counted_receive, route_send)
         except ClientDisconnect:
-            # The route's read of the disconnect above, with the 413 already sent. Any other
-            # outcome, a real client disconnect included, is not this refusal's to absorb.
-            if not answered:
+            # The route's read of the disconnect above, already answered or logged. A real client
+            # disconnect under the cap is not this refusal's to absorb. A response the route had
+            # started stays unfinished, so the server ends it and the client sees it cut short.
+            if not over_cap:
                 raise
 
     def _body_cap(request: Request) -> int:
@@ -5271,7 +5288,7 @@ def create_app(
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         lengths = request.headers.getlist("content-length")
         # A chunked body is not accepted: ANY Transfer-Encoding is refused, by presence on any line
-        # and whatever its value, and the connection is closed. Beside a Content-Length
+        # and whatever its value, and on HTTP/1.x the connection is closed. Beside a Content-Length
         # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
         # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
         # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
@@ -5306,7 +5323,8 @@ def create_app(
             # not refused here: _run_counting_body holds whatever body does arrive to the cap.
             return None
         # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
-        # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
+        # and a repeated line is a second framing claim (on HTTP/1.x an invalid length closes the
+        # connection, §6.3 item 5).
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
             return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
