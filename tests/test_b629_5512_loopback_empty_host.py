@@ -26,9 +26,11 @@ or allowed everything, would fail too. Nothing here touches the network.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -295,6 +297,44 @@ def test_a_sql_server_preset_server_naming_no_host_is_refused_at_every_posture(
         assert build(server=LOOPBACK)
 
 
+@pytest.mark.parametrize("declared", [{}, "attested"], ids=["plain", "attested"])
+@pytest.mark.parametrize("posture", [ENFORCING, HopPosture(enforcing=False), None], ids=str)
+@pytest.mark.parametrize(("connector", "config"), _PRESET_ENTRY_POINTS)
+def test_a_sql_server_preset_server_of_none_is_refused_whatever_is_declared(
+    connector: Callable[[Any], object] | None,
+    config: Callable[..., Any],
+    posture: HopPosture | None,
+    declared: object,
+) -> None:
+    """``None`` must not become the host ``None`` and ``SERVER=None,1433``. The DatabaseRef path
+    has no required-setting check ahead of the build, so it is the one that sees ``None``; the
+    others are pinned too, so none can start sending it. CONTROL: a named host builds."""
+    extra: dict[str, Any] = {"tls_hop_attested": True} if declared == "attested" else {}
+    if declared == "attested" and config is not _preset_dest:
+        extra = {
+            "tls_hop_attested": True,
+            "tls_hop_attested_reason": "a segment the engine cannot see",
+        }
+
+    def build(**overrides: object) -> object:
+        made = config(**{**extra, **overrides})
+        return made if connector is None else connector(made)
+
+    with active_hop_posture(posture), pytest.raises(ValueError, match="server") as caught:
+        build(server=None)
+    assert "None,1433" not in str(caught.value)
+    with active_hop_posture(posture):
+        assert build(server=LOOPBACK)
+
+
+def test_a_sql_server_preset_dsn_never_carries_the_host_none() -> None:
+    """The build itself, below every entry point."""
+    from messagefoundry.transports.database import _build_dsn
+
+    with pytest.raises(InsecureHopRefused, match="names no host"):
+        _build_dsn({"database": "d", "server": None})
+
+
 def test_a_database_ref_with_an_empty_server_is_refused() -> None:
     """The DatabaseRef path has no required-setting check ahead of the build."""
     with active_hop_posture(None), pytest.raises(InsecureHopRefused, match="names no host"):
@@ -309,19 +349,49 @@ def test_an_attestation_does_not_cover_a_preset_server_with_no_host(server: str)
         assert DatabaseDestination(_preset_dest(server=REMOTE, tls_hop_attested=True))
 
 
+@pytest.mark.parametrize("server", ["1433", "1:2", "12:34", "[1433]", "::", "[::]", "::1", "db"])
+def test_names_no_host_accepts_a_plain_number_and_the_unspecified_literals(server: str) -> None:
+    """Pins what the docs say is accepted, so the stated rule cannot drift from the code."""
+    from messagefoundry.hostlist import names_no_host
+
+    assert names_no_host(server) is False
+
+
+@pytest.mark.parametrize("server", ["[", "]", ":1433:", "[,]", "", ":1433", "[]"])
+def test_names_no_host_refuses_what_the_docs_say_it_refuses(server: str) -> None:
+    from messagefoundry.hostlist import names_no_host
+
+    assert names_no_host(server) is True
+
+
 # --- the leaf module: settings may not import the transports package -----------------------------
 
 
 def test_validating_a_sql_server_store_does_not_import_the_transports_package() -> None:
     """In a subprocess, so another test's imports cannot mask it."""
+    tree = Path(__file__).resolve().parents[1]
     code = (
         "import sys\n"
+        "import messagefoundry\n"
+        "print(messagefoundry.__file__)\n"
         "from messagefoundry.config.settings import StoreBackend, StoreSettings\n"
         "StoreSettings(backend=StoreBackend.SQLSERVER, server='db.example', database='d',"
         " username='u')\n"
         "raise SystemExit(1 if 'messagefoundry.transports' in sys.modules else 0)\n"
     )
-    done = subprocess.run([sys.executable, "-P", "-c", code], capture_output=True, text=True)
+    # PYTHONPATH and cwd name this tree, so an editable install pointing elsewhere cannot make
+    # the subprocess test another one; the imported module's path is asserted below.
+    env = {**os.environ, "PYTHONPATH": str(tree)}
+    done = subprocess.run(
+        [sys.executable, "-P", "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=tree,
+        env=env,
+        timeout=120,
+    )
+    imported = Path(done.stdout.splitlines()[0]).resolve() if done.stdout else None
+    assert imported is not None and imported.is_relative_to(tree), (imported, done.stderr)
     assert done.returncode == 0, done.stderr
 
 

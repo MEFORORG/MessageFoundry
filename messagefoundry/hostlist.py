@@ -236,11 +236,14 @@ def _entry_names_no_host(entry: str) -> bool:
 def names_no_host(server: str) -> bool:
     """Whether ``server`` names no host (BACKLOG #5512): it is blank, or an entry on either side
     of a comma is. An entry names none when it is empty, a bare port such as ``:1433``, empty
-    brackets such as ``[]`` or ``[]:1433``, or text made only of brackets, colons and digits that
-    is not an IPv6 literal, such as ``[``, ``]`` or ``:1433:``. A driver has to pick such a
-    destination itself, so no reading here can place the hop.
+    brackets such as ``[]`` or ``[]:1433``, or a host (the text before a ``:port``, brackets
+    removed) made only of brackets, colons and digits that is neither all digits nor an IPv6 literal,
+    such as ``[``, ``]`` or ``:1433:``. A driver has to pick such a destination itself, so no
+    reading here can place the hop.
 
-    **At least these are not caught.** A single colon reads as ``host:port``, so a protocol prefix
+    **At least these are accepted.** A plain number, bare, bracketed or before a port, such as
+    ``1433``, ``[1433]``, ``1:2`` or ``12:34``, reads as a digits-only host name. ``::`` and ``[::]``
+    are IPv6 literals. A single colon reads as ``host:port``, so a protocol prefix
     with nothing after it, such as ``tcp:``, counts as naming the host ``tcp``. Other text that is
     no host name is not judged either."""
     return any(_entry_names_no_host(entry) for entry in server.split(","))

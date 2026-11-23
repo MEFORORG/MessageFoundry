@@ -285,6 +285,12 @@ def _build_dsn(
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     where = hop_name_prefix(connection)
+    # BACKLOG #5512: `str(None)` is the host name `None`, which no check below reads as unnamed,
+    # and the DatabaseRef path has no required-setting check ahead of this build.
+    if s.get("server", "") is None:
+        raise InsecureHopRefused(
+            f"{where}DATABASE server names no host; name the host to connect to"
+        )
     refusal = sqlserver_preset_refusal(s)
     if refusal is not None:
         raise ValueError(f"{where}DATABASE {refusal}")
