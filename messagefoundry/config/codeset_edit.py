@@ -168,7 +168,7 @@ def upsert_code_set(
             # A create must not silently overwrite an existing code set — refuse loud (mirrors the
             # wizard/form collision refusal, PR #1081). An edit (create=False) overwrites the .csv.
             raise WiringError(_create_collision_message(name, codesets_dir))
-        _reject_toml_collision(codesets_dir, name)
+        _reject_toml_collision(path)
 
         text = _build_csv_text(headers, emitted)
         _write_validated(path, text, validate)
@@ -281,10 +281,19 @@ def rename_code_set(
         try:
             rewritten = len(impact.write_rename(prepared))
         except impact.RenameWriteError as exc:
+            if exc.unrestored:
+                # A reference left naming the new table would lose it to a move back, so the code
+                # set stays; the message names which references read which name, config-relative.
+                left, others = _reference_split(config_dir, prepared, exc.unrestored)
+                raise WiringError(
+                    f"cannot rename code set {old!r} to {new!r}: a reference write failed and "
+                    f"{left} could not be restored, so {left} still name {new!r} and the code set "
+                    f"stays as {_pair(dest, had_sidecar)}; these name {old!r}: {others}. Rewrite "
+                    "the references to one name by hand, and move the code set to match"
+                ) from exc
             # A write failed and the files written were restored, so the table moves back to the
-            # name they read. A file the error names could not be restored and still reads the new
-            # name; the message says so. The move back is never undone: a half that fails leaves
-            # what moved under the old name, which is where the references read it.
+            # name they read. The move back is never undone: a half that fails leaves what moved
+            # under the old name, which is where the references read it.
             try:
                 _move_with_sidecar(dest, src, roll_back=False, has_sidecar=had_sidecar)
             except _SplitPairError as back:
@@ -299,21 +308,17 @@ def rename_code_set(
             # what was cut off inside a write, so an interrupt after a write returned, or while
             # its locks were released, can leave references naming the new table. Read the files:
             # the table goes back only when none is left rewritten, so table and references agree.
-            left = impact.rewritten_files(prepared)
-            if left:
+            rewritten_left = impact.rewritten_files(prepared)
+            if rewritten_left:
+                left, others = _reference_split(config_dir, prepared, rewritten_left)
                 _log.error(
                     "code set rename interrupted: %s left naming %r, so the code set stays as %s; "
                     "these still name %r: %s",
-                    ", ".join(_config_rel(config_dir, f) for f in left),
+                    left,
                     new,
                     _rel(dest),
                     old,
-                    ", ".join(
-                        _config_rel(config_dir, f)
-                        for f, _raw, _new in prepared.files
-                        if f not in left
-                    )
-                    or "none",
+                    others,
                 )
                 raise
             try:
@@ -497,11 +502,13 @@ def _has_drive(name: str) -> bool:
     return ntpath.splitdrive(name)[0] != ""
 
 
-def _reject_toml_collision(codesets_dir: Path, name: str) -> None:
-    """For an upsert: reject if a ``codesets/<name>.toml`` exists (the ``.csv`` is the overwrite
-    target, allowed). Mirrors the loader's duplicate-stem fail-loud."""
+def _reject_toml_collision(target: Path) -> None:
+    """For an upsert of ``target``, ``codesets/<name>.csv``: reject if a ``codesets/<name>.toml``
+    exists (``target`` is the overwrite target, allowed). Mirrors the loader's duplicate-stem
+    fail-loud."""
+    codesets_dir, name = target.parent, target.stem
     # A folder of that name has always collided too.
-    if _taken(codesets_dir / f"{name}.toml") or _case_variant(codesets_dir, name):
+    if _taken(codesets_dir / f"{name}.toml") or _case_variant(codesets_dir, name, besides=target):
         raise WiringError(_collision_message(name, codesets_dir))
 
 
@@ -668,6 +675,16 @@ def _pair(table: Path, has_sidecar: bool) -> str:
     return _rel(table) + (f" and {_rel(_policy_sidecar_path(table))}" if has_sidecar else "")
 
 
+def _reference_split(config_dir: str | Path, prepared: Any, left: list[str]) -> tuple[str, str]:
+    """The referencing files of a rename ``prepared`` that are ``left`` rewritten, and the rest, each
+    joined by config-relative name, so a message or log line carries no host path."""
+    return (
+        ", ".join(_config_rel(config_dir, f) for f in left),
+        ", ".join(_config_rel(config_dir, f) for f, _raw, _new in prepared.files if f not in left)
+        or "none",
+    )
+
+
 def _config_rel(config_dir: str | Path, file: str) -> str:
     """A referencing module ``file`` named relative to ``config_dir``, else by its bare name, so a
     log line carries no host path."""
@@ -700,9 +717,13 @@ def _taken(path: Path) -> bool:
         return _present(path)
 
 
-def _case_variant(codesets_dir: Path, name: str) -> Path | None:
+def _case_variant(codesets_dir: Path, name: str, *, besides: Path | None = None) -> Path | None:
     """A table file of stem ``name`` whose extension differs from ``.csv``/``.toml`` only in case
-    (``name.CSV``), which the loader reads too and a case-sensitive file system keeps apart."""
+    (``name.CSV``), which the loader reads too and a case-sensitive file system keeps apart.
+
+    ``besides`` is the table being edited, which is never its own variant. A case-insensitive file
+    system opens ``name.CSV`` under the name ``name.csv`` and lists it under its own spelling, so
+    the two are compared as files, never as paths: ``WindowsPath`` equality ignores case."""
     with atomic_edit.refused_as(codesets_dir, WiringError, atomic_edit.READ_STEP):
         entries = list(codesets_dir.iterdir())
     return next(
@@ -713,9 +734,22 @@ def _case_variant(codesets_dir: Path, name: str) -> Path | None:
             and p.suffix not in _SUPPORTED_EXTS
             and p.suffix.lower() in _SUPPORTED_EXTS
             and atomic_edit.is_file(p, refused_error=WiringError)
+            and not (besides is not None and _same_file(p, besides))
         ),
         None,
     )
+
+
+def _same_file(listed: Path, target: Path) -> bool:
+    """Whether ``listed``, a file in a directory listing, is ``target``. A ``target`` that does not
+    exist is not it; a stat that fails otherwise is a refusal, never read as a different file."""
+    with atomic_edit.refused_as(target, WiringError, atomic_edit.READ_STEP):
+        try:
+            return os.path.samefile(listed, target)
+        except FileNotFoundError as exc:
+            if is_absent(exc):
+                return False
+            raise
 
 
 def _cause_name(exc: BaseException) -> str:
@@ -795,7 +829,7 @@ def _other_table_exists(path: Path) -> bool:
             for ext in _SUPPORTED_EXTS
             if ext != path.suffix
         )
-        or _case_variant(path.parent, path.stem) is not None
+        or _case_variant(path.parent, path.stem, besides=path) is not None
     )
 
 
