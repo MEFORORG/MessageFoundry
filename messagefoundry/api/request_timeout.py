@@ -16,9 +16,10 @@ being bounded is the handler's, not the network's.
 a 413 from inside the route's own read, so the route is still running when that start goes out. The
 limit sets :data:`BODY_REFUSED_KEY` first, and the deadline then stays armed until the route returns.
 While the 413 is written the deadline is held off to at least :data:`_REFUSAL_WRITE_GRACE_SECONDS`
-past its start, so it cannot leave a client a 413 head with no body. Once written, or once the write
-fails, the deadline is back on its own time. A client that stalls the write past the later of that
-grace and the deadline's own time is cut off with the route.
+past its start, so a client that keeps reading gets the whole 413 within that grace. A client that
+stalls the write past the later of the grace and the deadline's own time is cut off with the route,
+and can be left with a 413 head and no body. Once the host has taken the 413, or the write fails,
+the deadline is back on its own time.
 
 **Pure ASGI, not** ``BaseHTTPMiddleware``: no task hop, and the response-start signal is visible
 directly. It is registered inside :class:`~messagefoundry.api.client_networks.ClientNetworkMiddleware`
@@ -119,20 +120,25 @@ class RequestTimeoutMiddleware:
 
         started = False
         refusal_due: float | None = None  # the deadline's own time, while the 413 is being written
-        refusal_written = False
+        refusal_handed_over = False
+        route_running = True
 
         try:
             async with asyncio.timeout(seconds) as deadline:
 
+                def deadline_can_move() -> bool:
+                    # An expired or exited deadline cannot be rescheduled. A concurrent read can
+                    # still be writing the 413 after the route returned and the deadline exited.
+                    return route_running and not deadline.expired()
+
                 def end_refusal_hold() -> None:
                     nonlocal refusal_due
-                    # An expired deadline cannot be rescheduled, and has nothing left to restore.
-                    if refusal_due is not None and not deadline.expired():
+                    if refusal_due is not None and deadline_can_move():
                         deadline.reschedule(refusal_due)
                     refusal_due = None
 
                 async def send_wrapper(message: Message) -> None:
-                    nonlocal started, refusal_due, refusal_written
+                    nonlocal started, refusal_due, refusal_handed_over
                     refused = bool(scope.get(BODY_REFUSED_KEY))
                     if message["type"] == "http.response.start":
                         started = True
@@ -143,7 +149,7 @@ class RequestTimeoutMiddleware:
                         # deadline is only held off while the 413 is written.
                         if not refused:
                             deadline.reschedule(None)
-                        elif not deadline.expired() and (due := deadline.when()) is not None:
+                        elif deadline_can_move() and (due := deadline.when()) is not None:
                             refusal_due = due
                             earliest = get_running_loop().time() + _REFUSAL_WRITE_GRACE_SECONDS
                             deadline.reschedule(max(due, earliest))
@@ -157,21 +163,26 @@ class RequestTimeoutMiddleware:
                         and message["type"] == "http.response.body"
                         and not message.get("more_body")
                     ):
-                        refusal_written = True
+                        refusal_handed_over = True
                         end_refusal_hold()
 
-                await self.app(scope, receive, send_wrapper)
+                try:
+                    await self.app(scope, receive, send_wrapper)
+                finally:
+                    route_running = False
         except TimeoutError:
             if started:
                 if scope.get(BODY_REFUSED_KEY) and deadline.expired():
                     # The deadline did its work on the route, so there is no error left to raise.
-                    # The 413 was this request's response, written or not, so no 503 follows it.
+                    # The 413 was this request's response, whole or not, so no 503 follows it.
+                    # A host's send can return for a client already gone, so this cannot say the
+                    # client received the 413, only that the host took it.
                     _log.warning(
                         "request cut off by its %.1fs deadline, still running %s, on %s %s",
                         seconds,
-                        "after the body limit's 413"
-                        if refusal_written
-                        else "with the body limit's 413 not fully written",
+                        "after the body limit's 413 was handed to the host"
+                        if refusal_handed_over
+                        else "with the body limit's 413 not fully handed to the host",
                         scrub_log_argument(str(scope.get("method", "?"))),
                         scrub_log_argument(str(scope.get("path", "?"))),
                     )

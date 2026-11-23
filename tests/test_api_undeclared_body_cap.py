@@ -341,7 +341,10 @@ async def test_a_route_running_on_after_the_counted_413_is_still_cut_off_by_its_
     assert outcome == ["cut off"]
     assert capture.deadlines[0].expired()
     assert run.status == 413  # the property asserts one response start: no 503 follows the 413
-    assert any("after the body limit's 413" in r.getMessage() for r in caplog.records)
+    assert any(
+        "after the body limit's 413 was handed to the host" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 _OVER_CAP_ROUTE = "/_test/waits-after-disconnect"
@@ -411,7 +414,10 @@ async def test_a_deadline_due_during_the_413s_send_does_not_cut_the_413(
     assert outcome == ["cut off"]
     # Back on its own time once written, so the send's protection gave the route nothing extra.
     assert capture.deadlines[0].expired() and capture.deadlines[0].when() == due[0]
-    assert any("after the body limit's 413" in r.getMessage() for r in caplog.records)
+    assert any(
+        "after the body limit's 413 was handed to the host" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 async def test_a_client_stalling_the_413s_write_cannot_hold_the_deadline_open(
@@ -440,8 +446,8 @@ async def test_a_client_stalling_the_413s_write_cannot_hold_the_deadline_open(
     assert [m["type"] for m in run.sent] == ["http.response.start"]
     assert capture.deadlines[0].expired()
     messages = [r.getMessage() for r in caplog.records]
-    assert any("413 not fully written" in m for m in messages)
-    assert not any("after the body limit's 413" in m for m in messages)
+    assert any("413 not fully handed to the host" in m for m in messages)
+    assert not any("413 was handed to the host" in m for m in messages)
 
 
 async def test_the_deadline_log_does_not_claim_a_413_that_could_not_be_sent(
@@ -466,8 +472,85 @@ async def test_the_deadline_log_does_not_claim_a_413_that_could_not_be_sent(
     assert outcome == ["cut off"]
     assert capture.deadlines[0].expired() and capture.deadlines[0].when() == due[0]
     messages = [r.getMessage() for r in caplog.records]
-    assert any("413 not fully written" in m for m in messages)
-    assert not any("after the body limit's 413" in m for m in messages)
+    assert any("413 not fully handed to the host" in m for m in messages)
+    assert not any("413 was handed to the host" in m for m in messages)
+
+
+@pytest.mark.parametrize("write_fails", [False, True], ids=["write-completes", "write-raises"])
+async def test_a_413_still_being_written_when_the_route_returns_ends_cleanly(
+    write_fails: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The deadline has exited by the time this write ends. Ending the hold must not raise, and
+    must not replace the ``OSError`` the body limit catches."""
+    app = create_app(allow_no_auth=True)
+    write_started = asyncio.Event()
+    finish_write = asyncio.Event()
+    readers: list[asyncio.Task[Message]] = []
+
+    class _ReadsInATask:
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            readers.append(asyncio.ensure_future(receive()))
+            await write_started.wait()
+
+    async def held_write(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            write_started.set()
+            await finish_write.wait()
+            if write_fails:
+                raise OSError("client gone")
+
+    app.router.routes.insert(0, Route("/probe", _ReadsInATask()))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        run = await asyncio.wait_for(
+            _drive(app, [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)], on_send=held_write),
+            GENEROUS_DEADLINE_SECONDS,
+        )
+        finish_write.set()
+        message = await asyncio.wait_for(readers[0], GENEROUS_DEADLINE_SECONDS)
+
+    assert message == {"type": "http.disconnect"}
+    assert run.status == 413
+    logged = any("could not send the 413" in r.getMessage() for r in caplog.records)
+    assert logged is write_fails
+
+
+async def test_a_read_crossing_the_cap_after_the_route_returned_ends_cleanly() -> None:
+    """The 413 starts on a deadline that has already exited, which cannot be rescheduled."""
+    app = create_app(allow_no_auth=True)
+    readers: list[asyncio.Task[Message]] = []
+
+    class _LeavesAReader:
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            readers.append(asyncio.ensure_future(receive()))
+
+    app.router.routes.insert(0, Route("/probe", _LeavesAReader()))
+    run = await _drive(app, [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)])
+    message = await asyncio.wait_for(readers[0], GENEROUS_DEADLINE_SECONDS)
+    assert message == {"type": "http.disconnect"}
+    assert run.status == 413
+
+
+async def test_a_413_write_with_a_long_deadline_left_is_not_cut_at_the_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The grace only ever moves a deadline later: it must not bring a distant one forward."""
+    monkeypatch.setattr(request_timeout, "_REFUSAL_WRITE_GRACE_SECONDS", 0.05)
+    app, reads = _app_with_probe()
+    capture = capture_deadlines(monkeypatch, app)
+
+    async def write_outlasts_the_grace(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            await asyncio.sleep(0.25)
+
+    run = await asyncio.wait_for(
+        _drive(app, [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)], on_send=write_outlasts_the_grace),
+        GENEROUS_DEADLINE_SECONDS,
+    )
+    assert [m["type"] for m in run.sent] == ["http.response.start", "http.response.body"]
+    assert run.status == 413
+    assert run.sent[1]["body"] == _REFUSAL_BODY
+    assert not capture.deadlines[0].expired()
+    assert reads == []
 
 
 async def test_an_ordinary_response_start_still_ends_the_deadline(
