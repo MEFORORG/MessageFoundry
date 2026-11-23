@@ -59,6 +59,7 @@ from tests._serviceenv_remedy import (
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
     CREATE,
+    KEEP,
     REMOVE,
     RUNS_ON,
     SET_NO,
@@ -712,6 +713,10 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
             ["MEFOR_STORE_ENCRYPTION_KEY=", "abc==", "MEFOR_AUTH_AD_BIND_PASSWORD=x"],
             ADD_BACK_RUN_ON + ADD_BACK_CREATE,
         ),
+        # A joined directory path: the keep-one step names the list, nssm and the installer, as
+        # the add-back step does, and the rest names none (the Lander's hold on PR 3142, comment
+        # 7100710066, items 5 and 8).
+        (["MEFOR_STORE_ENCRYPTION_KEY=", "mefor_secrets_directory=C:\\d"], KEEP),
     ],
 )
 def test_the_remedy_names_no_list_string_or_command(entries: list[str], step: str | None) -> None:
@@ -730,7 +735,7 @@ def test_the_remedy_names_no_list_string_or_command(entries: list[str], step: st
         assert remedy.count(step) == 1
         remedy = remedy.replace(step, "")
     # Removal comes after every step that moves a value (the fourth hold, H1).
-    tail = remedy[remedy.index(REMOVE) :]
+    tail = remedy[remedy.index("Remove each refused variable, with its value") :]
     assert "protect-key" not in tail and "Put " not in tail
     for named in ("appenvironment", "nssm", "string", "install-service.ps1"):
         assert named not in remedy.lower(), named

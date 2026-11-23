@@ -1363,7 +1363,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "secrets directory refuses an empty file"
             )
         if moving_values:
-            if posture.unplain_value_names:
+            # Not for a name that is only told to go (code review on PR 3142).
+            if any(name not in only for name in posture.unplain_value_names):
                 parts.append(
                     "At least one of them is spelled with a character other than an ASCII "
                     "letter, a digit or an underscore, a file name the secrets directory refuses, "

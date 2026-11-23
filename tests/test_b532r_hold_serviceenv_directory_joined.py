@@ -295,6 +295,18 @@ def test_an_empty_value_name_is_told_to_go_and_not_to_move(
     assert not any(text in refusal for text in _VALUE_TEXT)
 
 
+def test_an_oddly_spelled_name_told_only_to_go_gets_no_rename() -> None:
+    """Code review on the repair of the Lander's hold on PR 3142, comment 7100710066, item 10:
+    the rename sentence is about moving a name, so an empty one, which is only told to go, does
+    not print it beside a name that moves. The control spells the moving name oddly."""
+    pairs = [(_EXTRA, "MEFOR_VALUE_A=1"), (_EXTRA, "MEFOR_VALUE_B-X=")]
+    refusal = service_env_refusal(_read_pairs(pairs))
+    assert refusal is not None and "Put each MEFOR_VALUE_*" in refusal
+    assert "rename that env() key" not in refusal
+    control = service_env_refusal(_read_pairs([(_EXTRA, "MEFOR_VALUE_B-X=1")]))
+    assert control is not None and "rename that env() key" in control
+
+
 def test_a_value_name_alone_joined_to_a_directory_path_keeps_the_path_entry() -> None:
     """The KEEP path (the Lander's hold in comment 7085002242): a MEFOR_VALUE_* name whose
     only value is a joined plain-path directory entry has nothing to move, so neither the
