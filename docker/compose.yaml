@@ -337,14 +337,54 @@ services:
     #   sudo chown -R 999:999 ./pg-tls && sudo chmod 0600 ./pg-tls/server.key
     # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 999
     # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and is refused.
-    # Without them Postgres does not start, so no ha engine does. A first start without them
-    # still initializes the mefor-pg volume but never creates the messagefoundry database, and a
-    # later start skips initialization (the health check still passes; schema-provision then
-    # fails). So after fixing them, remove that one volume, never `down -v`, which also removes
-    # the default engine's store: docker compose --profile ha down, then
+    # Without them Postgres does not start, so no ha engine does. The entrypoint below checks
+    # them first and exits naming what is wrong, before the image's own entrypoint runs, so a
+    # start with ./pg-tls empty, or a key Postgres would refuse, initializes nothing; fix the
+    # files and start again (`docker compose logs postgres` shows the refusal). The check is
+    # not Postgres's own: a key that does not match the certificate, or a file that is not
+    # PEM, passes it, and that start still initializes the mefor-pg volume without creating
+    # the messagefoundry database. The health check then never passes, because it queries that
+    # database, so no engine starts against it. Recover by removing that one volume, never
+    # `down -v`, which also removes the default engine's store: docker compose --profile ha
+    # down, then
     #   docker volume rm <project>_mefor-pg
     # This server still accepts a plaintext session from another client on the compose network;
     # the engines never open one.
+    # Reads the certificate and key paths from the command's ssl_cert_file and ssl_key_file, so
+    # the check always reads the files Postgres would. `$$` is a literal `$` to compose.
+    entrypoint:
+      - "sh"
+      - "-c"
+      - |
+        set -eu
+        crt=; key=
+        for a in "$$@"; do
+          case "$$a" in
+            ssl_cert_file=*) crt="$${a#ssl_cert_file=}" ;;
+            ssl_key_file=*) key="$${a#ssl_key_file=}" ;;
+          esac
+        done
+        die() { echo "error: refusing to start Postgres, so nothing was initialized: $$*. Put server.crt and server.key in ./pg-tls as the postgres service's comment in docker/compose.yaml says, then start again." >&2; exit 1; }
+        [ -n "$$crt" ] && [ -n "$$key" ] || die "the command names no ssl_cert_file or no ssl_key_file"
+        for f in "$$crt" "$$key"; do
+          [ -f "$$f" ] && [ -s "$$f" ] || die "$$f is missing or empty"
+        done
+        pg=$$(id -u postgres)
+        owner=$$(stat -L -c %u "$$key")
+        mode=$$(stat -L -c %a "$$key")
+        if [ "$$owner" = "$$pg" ]; then
+          bad=$$(( 0$$mode & 077 ))
+        elif [ "$$owner" = 0 ]; then
+          bad=$$(( 0$$mode & 037 ))
+        else
+          die "$$key is owned by uid $$owner, neither the postgres account ($$pg) nor root"
+        fi
+        [ "$$bad" -eq 0 ] || die "$$key has mode $$mode, wider than Postgres allows for its owner: at most 0600 owned by uid $$pg, or 0640 owned by root"
+        for f in "$$crt" "$$key"; do
+          gosu postgres test -r "$$f" || die "the postgres account cannot read $$f"
+        done
+        exec docker-entrypoint.sh "$$@"
+      - "pg-tls-check"
     command:
       - "postgres"
       - "-c"
@@ -365,8 +405,12 @@ services:
     volumes:
       - mefor-pg:/var/lib/postgresql/data
       - ./pg-tls:/etc/postgresql/tls:ro
+    # Over TCP, not the Unix socket: during initialization the image runs a temporary server on
+    # the socket alone, which a socket probe reports ready. The query also fails when the
+    # messagefoundry database is missing, which pg_isready alone does not see. The image trusts
+    # a 127.0.0.1 login, so the probe needs no password.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mefor -d messagefoundry"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U mefor -d messagefoundry && psql -h 127.0.0.1 -U mefor -d messagefoundry -XtAqc 'select 1' >/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 10
