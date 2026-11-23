@@ -32,8 +32,10 @@ from tests._serviceenv_remedy import (
     CREATE,
     KEEP,
     REMOVE,
+    REMOVE_OTHER,
     RUNS_ON,
     SET_NO,
+    WIDER,
 )
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
@@ -375,6 +377,29 @@ def test_a_value_that_runs_on_is_not_passed_back() -> None:
     assert refusal.count(ADD_BACK_RUN_ON + ADD_BACK_CREATE) == 1
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_RUN_ON)
     assert "synthetic-run-on" not in refusal
+
+
+def test_no_opener_while_a_later_line_sets_the_directory() -> None:
+    """The Lander's hold on PR 3142, comment 7089064404, B: the directory is set on the second
+    line of a string, which NSSM may read as its own variable, so the step never says the lists
+    set none, and says to remove every other entry that sets it."""
+    refusal = service_env_refusal(_read(["MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d"]))
+    assert refusal is not None
+    assert SET_NO not in refusal and ADD_BACK_STEP not in refusal
+    assert refusal.count(ADD_BACK_JOINED) == 1
+
+
+def test_a_blank_directory_item_is_not_passed_back() -> None:
+    """The Lander's hold on PR 3142, comment 7089064404, A: the blank
+    ``MEFOR_SECRETS_DIRECTORY=`` is no refused variable, and no value runs on into it, so only
+    origin/main's clause says to remove it, and the wider exclusion leaves out what this step
+    says to remove. The step is the form every directory-setting shape prints (finding C)."""
+    refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY="]))
+    assert refusal is not None
+    assert SET_NO not in refusal and RUNS_ON not in refusal
+    assert refusal.count(ADD_BACK_JOINED + ADD_BACK_CREATE) == 1
+    assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(ADD_BACK_JOINED)
+    assert refusal.count(REMOVE_OTHER) == 1 and refusal.count(WIDER) == 1
 
 
 def test_an_empty_value_beside_a_listed_directory_path_is_still_moved() -> None:
