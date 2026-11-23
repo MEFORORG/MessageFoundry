@@ -1509,6 +1509,13 @@ _XML_PARSER_ALLOWLIST = {
         "the single lazy loader for the [xml] extra (lxml, xmlschema, signxml) — every consumer in "
         "parsing/xml/ goes through it, and lxml parsing is hardened once in harden.py"
     ),
+    "messagefoundry/parsing/x12/_deps.py": (
+        "the vendored defusedxml copy's ElementTree.parse with forbid_dtd/forbid_entities/"
+        "forbid_external, isolated in _parse_map_xml() so tests/test_xml_parser_consistency.py "
+        "drives THAT surface directly (the reader around it turns a refusal into an empty set). Its "
+        "input is the map XML inside the installed pyx12 package, never interchange data; the "
+        "ParseError import beside it is the exception type"
+    ),
     "messagefoundry/transports/soap.py": (
         "xml.sax well-formedness gate with external general/parameter entities off; it has no "
         "extraction API (a no-op ContentHandler), so it accepts or refuses and returns nothing"
