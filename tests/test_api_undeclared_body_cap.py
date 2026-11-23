@@ -3,7 +3,7 @@
 """The request body limit counts every HTTP request body (BACKLOG #5345); the reason is on
 ``_run_counting_body`` in ``messagefoundry/api/app.py``.
 
-The scopes are hand-built because these shapes cannot be sent to ``serve`` on a socket. The probe
+The scopes are hand-built because a body past the cap cannot reach a route under ``serve``. The probe
 routes are inserted ahead of the app's own so each test reads what actually reached a route.
 """
 
@@ -302,7 +302,7 @@ async def test_a_read_past_the_cap_after_the_response_started_ends_quietly(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         run = await _drive(app, _chunks(_CHUNKS_AT_CAP * 4))
     assert run.status == 200
-    # Left unfinished, so the server ends it and the client can see it was cut short.
+    # The app leaves it unfinished; ending it is the host's.
     assert not [m for m in run.sent if m["type"] == "http.response.body"]
     messages = [r.getMessage() for r in caplog.records]
     assert any("no 413 was sent" in m for m in messages)

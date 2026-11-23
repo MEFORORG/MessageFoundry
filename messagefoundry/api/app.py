@@ -5226,7 +5226,7 @@ def create_app(
                     "oversized request body on %s from %s after a response started: "
                     "no 413 was sent, and the route's read got a disconnect",
                     scrub_log_argument(request.url.path),
-                    client_ip(request),
+                    scrub_log_argument(client_ip(request) or "unknown"),
                 )
             else:
                 refusal = _refuse_body(
@@ -5238,7 +5238,7 @@ def create_app(
                     _log.warning(
                         "could not send the 413 for an oversized request body on %s from %s: %s",
                         scrub_log_argument(request.url.path),
-                        client_ip(request),
+                        scrub_log_argument(client_ip(request) or "unknown"),
                         type(exc).__name__,
                     )
             return {"type": "http.disconnect"}
@@ -5255,7 +5255,8 @@ def create_app(
         except ClientDisconnect:
             # The route's read of the disconnect above, already answered or logged. A real client
             # disconnect under the cap is not this refusal's to absorb. A response the route had
-            # started stays unfinished, so the server ends it and the client sees it cut short.
+            # started stays unfinished: uvicorn closes the connection on that return, and what
+            # another host does with it has not been measured.
             if not over_cap:
                 raise
 
@@ -5267,12 +5268,19 @@ def create_app(
         return _MAX_REQUEST_BODY_BYTES
 
     def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
-        _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
+        _log.warning(
+            "rejected %s on %s from %s",
+            what,
+            scrub_log_argument(request.url.path),
+            scrub_log_argument(client_ip(request) or "unknown"),
+        )
         # On HTTP/1.x, `Connection: close` makes the server drop the connection after every refusal,
         # so bytes it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body
         # the client never sent, are never read as a next request. HTTP/2 and HTTP/3 frame each
         # stream and make a response with this field malformed (RFC 9113 §8.2.2, RFC 9114 §4.2).
-        multiplexed = str(request.scope.get("http_version", "")).startswith(("2", "3"))
+        # Exact ASGI tokens: llhttp takes an `HTTP/2.0` request line on HTTP/1 framing and reports
+        # `2.0`, so a prefix test would let any client turn this close off.
+        multiplexed = request.scope.get("http_version") in ("2", "3")
         headers = None if multiplexed else {"Connection": "close"}
         return JSONResponse({"detail": detail}, status_code=status, headers=headers)
 
