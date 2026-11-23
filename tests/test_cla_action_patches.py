@@ -20,19 +20,40 @@ pins below still run.
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-_BUNDLE = REPO_ROOT / ".github" / "actions" / "cla-assistant-lite" / "dist" / "index.js"
+_SCRIPT = REPO_ROOT / "scripts" / "security" / "build_cla_action_provenance.py"
+
+
+def _load_provenance() -> ModuleType:
+    """The provenance builder, loaded by path: it owns the bundle path and the patch list."""
+    spec = importlib.util.spec_from_file_location("build_cla_action_provenance", _SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+provenance = _load_provenance()
 
 _NODE = shutil.which("node")
 _needs_node = pytest.mark.skipif(_NODE is None, reason="node is not on PATH")
+
+
+@functools.cache
+def _bundle_text() -> str:
+    """The bundle, read once: it is 1.18 MB and every test here slices it."""
+    return (REPO_ROOT / provenance.BUNDLE_PATH).read_text(encoding="utf-8")
 
 
 def _module_factory(module_id: int) -> str:
@@ -41,16 +62,25 @@ def _module_factory(module_id: int) -> str:
     ncc emits each module as ``/***/ <id>:`` then ``/***/ (function(...) {`` ... ``/***/ }),``, so
     the factory is the text between the second marker and the closing one.
     """
-    text = _BUNDLE.read_text(encoding="utf-8")
+    text = _bundle_text()
     start_marker = f"\n/***/ {module_id}:\n/***/ ("
     start = text.index(start_marker) + len(start_marker)
     end = text.index("\n/***/ })", start)
     return text[start:end] + "\n}"
 
 
-#: lodash's escapeRegExp, which module 3661 imports as module 250. The same character class lodash
-#: ships, so the stub escapes exactly what the bundle's own copy escapes.
-_LODASH_STUB = r"""{ escapeRegExp: (s) => String(s).replace(/[\\^$.*+?()[\]{}|]/g, '\\$&') }"""
+def _lodash() -> str:
+    """JavaScript that evaluates to the bundle's OWN lodash (module 250), not a stand-in.
+
+    Module 3661 escapes the non-wildcard parts of an entry with lodash's ``escapeRegExp``, so the
+    dot-is-literal test is evidence about the shipped bundle only if it runs the shipped lodash.
+    """
+    return (
+        f"(() => {{ const f = ({_module_factory(250)}); "
+        "const req = () => { throw new Error('lodash imports nothing'); }; "
+        "req.nmd = (m) => m; const mod = { exports: {} }; "
+        "f.call(undefined, mod, mod.exports, req); return mod.exports; })()"
+    )
 
 
 def _run_node(tmp_path: Path, script: str) -> Any:
@@ -69,7 +99,7 @@ def _allowlist_survivors(tmp_path: Path, allowlist: str, names: list[str]) -> li
     script = f"""
 const factory = ({_module_factory(3661)});
 const stubs = {{
-  250: {_LODASH_STUB},
+  250: {_lodash()},
   3611: {{ getAllowListItem: () => {json.dumps(allowlist)} }},
 }};
 const exports = {{}};
@@ -81,13 +111,17 @@ process.stdout.write(JSON.stringify(kept.map((c) => c.name)));
     return result
 
 
-def _page(names: list[str], has_next: bool, end_cursor: str | None) -> dict[str, Any]:
-    """One synthetic GraphQL page of pull-request commits, each authored by a linked user."""
+def _page(names: list[str], has_next: bool, end_cursor: str | None, total: int) -> dict[str, Any]:
+    """One synthetic GraphQL page of pull-request commits, each authored by a linked user.
+
+    *total* is the connection's ``totalCount``: the number of commits on the whole pull request,
+    the same on every page.
+    """
     return {
         "repository": {
             "pullRequest": {
                 "commits": {
-                    "totalCount": 0,
+                    "totalCount": total,
                     "edges": [
                         {
                             "node": {
@@ -187,9 +221,9 @@ def test_an_author_past_page_one_is_listed(tmp_path: Path) -> None:
     result = _committers(
         tmp_path,
         {
-            "": _page(["alice"], has_next=True, end_cursor="C1"),
-            "C1": _page(["bob"], has_next=True, end_cursor="C2"),
-            "C2": _page(["carol", "alice"], has_next=False, end_cursor="C3"),
+            "": _page(["alice"], has_next=True, end_cursor="C1", total=4),
+            "C1": _page(["bob"], has_next=True, end_cursor="C2", total=4),
+            "C2": _page(["carol", "alice"], has_next=False, end_cursor="C3", total=4),
         },
     )
 
@@ -198,17 +232,17 @@ def test_an_author_past_page_one_is_listed(tmp_path: Path) -> None:
 
 @_needs_node
 def test_a_single_page_pull_request_asks_once(tmp_path: Path) -> None:
-    result = _committers(tmp_path, {"": _page(["alice"], has_next=False, end_cursor="C1")})
+    result = _committers(tmp_path, {"": _page(["alice"], has_next=False, end_cursor="C1", total=1)})
 
     assert result == {"names": ["alice"], "asked": [""]}
 
 
-@pytest.mark.parametrize("bad_cursor", [None, "", "C1"])
+@pytest.mark.parametrize("bad_cursor", [None, "", "C1", 7])
 @_needs_node
 def test_a_next_page_with_no_new_cursor_fails_instead_of_looping(
-    tmp_path: Path, bad_cursor: str | None
+    tmp_path: Path, bad_cursor: str | int | None
 ) -> None:
-    """``hasNextPage`` with a missing, empty or repeated cursor raises rather than re-asking.
+    """``hasNextPage`` with a missing, empty, repeated or non-string cursor raises.
 
     The action turns the raise into a failed step, so the required ``cla`` check reds rather than
     passing on a list it could not finish reading.
@@ -216,14 +250,45 @@ def test_a_next_page_with_no_new_cursor_fails_instead_of_looping(
     result = _committers(
         tmp_path,
         {
-            "": _page(["alice"], has_next=True, end_cursor="C1"),
-            "C1": _page(["bob"], has_next=True, end_cursor=bad_cursor),
+            "": _page(["alice"], has_next=True, end_cursor="C1", total=3),
+            "C1": _page(["bob"], has_next=True, end_cursor=bad_cursor, total=3),  # type: ignore[arg-type]
         },
     )
 
     assert "error" in result, result
     assert "graphql call to get the committers details failed" in result["error"]
+    assert "no new cursor" in result["error"]
     assert result["asked"] == ["", "C1"]
+
+
+@_needs_node
+def test_a_cursor_cycle_fails_instead_of_looping(tmp_path: Path) -> None:
+    """A cursor seen two pages back is not new either: C1, C2, C1 raises on the third page."""
+    result = _committers(
+        tmp_path,
+        {
+            "": _page(["alice"], has_next=True, end_cursor="C1", total=9),
+            "C1": _page(["bob"], has_next=True, end_cursor="C2", total=9),
+            "C2": _page(["carol"], has_next=True, end_cursor="C1", total=9),
+        },
+    )
+
+    assert "no new cursor" in result.get("error", ""), result
+    assert result["asked"] == ["", "C1", "C2"]
+
+
+@_needs_node
+def test_a_read_shorter_than_total_count_fails(tmp_path: Path) -> None:
+    """A last page that leaves commits unread -- a capped connection, say -- raises.
+
+    Without this a pull request whose commit list stops short of ``totalCount`` would be checked
+    against the authors read so far, and an author past the stop would never be asked to sign.
+    """
+    result = _committers(
+        tmp_path, {"": _page(["alice"], has_next=False, end_cursor="C1", total=300)}
+    )
+
+    assert "read 1 of 300 pull request commits" in result.get("error", ""), result
 
 
 # --- Static pins, which run without Node ------------------------------------------------------
@@ -242,3 +307,12 @@ def test_the_bundle_follows_pagination() -> None:
     assert "while (hasNextPage)" in factory
     assert "cursor: cursor" in factory
     assert "cursor: ''" not in factory
+
+
+@pytest.mark.parametrize("index", range(len(provenance.BUNDLE_PATCHES)))
+def test_every_patch_carries_the_marker_comment(index: int) -> None:
+    """The README says a grep for ``MessageFoundry patch`` finds every patched span; hold it to that."""
+    upstream, patched = provenance.BUNDLE_PATCHES[index]
+
+    assert b"MessageFoundry patch" in patched
+    assert b"MessageFoundry patch" not in upstream

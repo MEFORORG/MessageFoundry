@@ -248,8 +248,12 @@ VENDORING_HEADER = (
 #:    escaped by lodash's ``escapeRegExp``; the patch adds the ``^`` and ``$``.
 #: 2-4. BACKLOG #5645 item 2: ``getCommitters`` read ONE page of 100 commits with an empty cursor
 #:    and never followed ``pageInfo.hasNextPage``, so an author first seen past page one was not in
-#:    the list a sign comment is recorded against. The patch loops on ``endCursor``, and raises
-#:    when a further page is claimed with no new cursor, which the action reports as a failed step.
+#:    the list a sign comment is recorded against. The patch loops on ``endCursor``. It raises when
+#:    a further page is claimed with a cursor that is missing or already seen, or when the commits
+#:    read fall short of ``totalCount``; the action reports either as a failed step.
+#:
+#: Every patched span carries a ``MessageFoundry patch`` comment, so a grep of the bundle finds all
+#: of them.
 BUNDLE_PATCHES: tuple[tuple[bytes, bytes], ...] = (
     (
         b"            return new RegExp(regex).test(committer);\n",
@@ -262,23 +266,34 @@ BUNDLE_PATCHES: tuple[tuple[bytes, bytes], ...] = (
         b"            // MessageFoundry patch (BACKLOG #5645): read every page of commits.\n"
         b"            let cursor = '';\n"
         b"            let hasNextPage = true;\n"
+        b"            let read = 0;\n"
+        b"            let total;\n"
+        b"            const seenCursors = new Set(['']);\n"
         b"            while (hasNextPage) {\n"
         b"            let response = yield",
     ),
     (
         b"                cursor: ''\n            });\n",
-        b"                cursor: cursor\n            });\n",
+        b"                cursor: cursor // MessageFoundry patch (BACKLOG #5645)\n            });\n",
     ),
     (
         b"            });\n            filteredCommitters = committers.filter(",
         b"            });\n"
-        b"            const pageInfo = response.repository.pullRequest.commits.pageInfo;\n"
-        b"            hasNextPage = pageInfo.hasNextPage === true;\n"
-        b"            if (hasNextPage && (typeof pageInfo.endCursor !== 'string' || "
-        b"pageInfo.endCursor === '' || pageInfo.endCursor === cursor)) {\n"
+        b"            // MessageFoundry patch (BACKLOG #5645): stop after the last page, and fail on a\n"
+        b"            // cursor already seen or a read shorter than totalCount.\n"
+        b"            const commits = response.repository.pullRequest.commits;\n"
+        b"            read += commits.edges.length;\n"
+        b"            total = commits.totalCount;\n"
+        b"            hasNextPage = commits.pageInfo.hasNextPage === true;\n"
+        b"            if (hasNextPage && (typeof commits.pageInfo.endCursor !== 'string' || "
+        b"seenCursors.has(commits.pageInfo.endCursor))) {\n"
         b"                throw new Error('pagination reported a next page with no new cursor');\n"
         b"            }\n"
-        b"            cursor = pageInfo.endCursor;\n"
+        b"            cursor = commits.pageInfo.endCursor;\n"
+        b"            seenCursors.add(cursor);\n"
+        b"            }\n"
+        b"            if (typeof total === 'number' && read < total) {\n"
+        b"                throw new Error(`read ${read} of ${total} pull request commits`);\n"
         b"            }\n"
         b"            filteredCommitters = committers.filter(",
     ),
@@ -402,11 +417,15 @@ def digest_mode_summary() -> str:
 
 
 def split_vendoring_header(bundle: bytes) -> bytes:
-    """Return *bundle* with its vendoring header removed, which is the upstream blob.
+    """Return *bundle* with its vendoring header removed: the PATCHED body, not the upstream blob.
+
+    Pass the result to :func:`revert_bundle_patches` to get the upstream blob; digesting this
+    return value directly gives the patched body's digest, which is deliberately not
+    :data:`UPSTREAM_BUNDLE_SHA256`.
 
     Raises :class:`ValueError` when the file does not start with :data:`VENDORING_HEADER`, because
-    then the derivation this record rests on -- body digest equals the upstream blob digest -- is
-    not the thing being measured any more.
+    then the derivation this record rests on -- reverted body digest equals the upstream blob
+    digest -- is not the thing being measured any more.
     """
     if not bundle.startswith(VENDORING_HEADER):
         raise ValueError(
@@ -537,8 +556,9 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
             "dist/index.js is NOT the upstream bundle; it is a patched fork (owner ruling "
             "2026-11-23). BACKLOG #5644 item 2 anchors checkAllowList's wildcard pattern to the "
             "whole name. BACKLOG #5645 item 2 makes getCommitters follow GraphQL pagination past "
-            "the first 100 commits. The component hash below is the patched file; the upstream "
-            "digest above is the unpatched body.",
+            "the first 100 commits. The component's hashes entry is the patched file; the "
+            "upstream bundle-sha256 property is the unpatched body. The component's pedigree "
+            "names the upstream ancestor and lists the patches as unofficial.",
         ),
         (
             "messagefoundry:vendored:action-yml-local-change",
@@ -600,6 +620,52 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
                 "purl": f"pkg:github/{UPSTREAM_REPO}@{UPSTREAM_COMMIT}",
                 "licenses": [{"license": {"id": "Apache-2.0"}}],
                 "hashes": [{"alg": "SHA-256", "content": digests[BUNDLE_PATH]}],
+                # CycloneDX's own record of a modified component, so a tool and not only a reader
+                # of the messagefoundry:* properties sees that this is not the upstream artifact.
+                "pedigree": {
+                    "ancestors": [
+                        {
+                            "type": "application",
+                            "bom-ref": f"upstream:pkg:github/{UPSTREAM_REPO}@{UPSTREAM_COMMIT}",
+                            "name": "cla-assistant-lite",
+                            "version": UPSTREAM_TAG,
+                            "purl": f"pkg:github/{UPSTREAM_REPO}@{UPSTREAM_COMMIT}",
+                            "hashes": [{"alg": "SHA-256", "content": UPSTREAM_BUNDLE_SHA256}],
+                        }
+                    ],
+                    "patches": [
+                        {
+                            "type": "unofficial",
+                            "resolves": [
+                                {
+                                    "type": "security",
+                                    "name": "BACKLOG #5644 item 2",
+                                    "description": (
+                                        "checkAllowList anchors a wildcard allowlist entry to "
+                                        "the whole name."
+                                    ),
+                                }
+                            ],
+                        },
+                        {
+                            "type": "unofficial",
+                            "resolves": [
+                                {
+                                    "type": "security",
+                                    "name": "BACKLOG #5645 item 2",
+                                    "description": (
+                                        "getCommitters follows GraphQL pagination past the "
+                                        "first 100 commits."
+                                    ),
+                                }
+                            ],
+                        },
+                    ],
+                    "notes": (
+                        "Hand edits to the compiled bundle; the exact spans are BUNDLE_PATCHES in "
+                        "scripts/security/build_cla_action_provenance.py."
+                    ),
+                },
                 "externalReferences": [
                     {
                         "type": "vcs",

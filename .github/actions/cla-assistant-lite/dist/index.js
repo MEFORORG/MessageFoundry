@@ -81,6 +81,9 @@ function getCommitters() {
             // MessageFoundry patch (BACKLOG #5645): read every page of commits.
             let cursor = '';
             let hasNextPage = true;
+            let read = 0;
+            let total;
+            const seenCursors = new Set(['']);
             while (hasNextPage) {
             let response = yield octokit_1.octokit.graphql(`
         query($owner:String! $name:String! $number:Int! $cursor:String!){
@@ -123,7 +126,7 @@ function getCommitters() {
                 owner: github_1.context.repo.owner,
                 name: github_1.context.repo.repo,
                 number: github_1.context.issue.number,
-                cursor: cursor
+                cursor: cursor // MessageFoundry patch (BACKLOG #5645)
             });
             response.repository.pullRequest.commits.edges.forEach(edge => {
                 const committer = extractUserFromCommit(edge.node.commit);
@@ -138,12 +141,20 @@ function getCommitters() {
                     committers.push(user);
                 }
             });
-            const pageInfo = response.repository.pullRequest.commits.pageInfo;
-            hasNextPage = pageInfo.hasNextPage === true;
-            if (hasNextPage && (typeof pageInfo.endCursor !== 'string' || pageInfo.endCursor === '' || pageInfo.endCursor === cursor)) {
+            // MessageFoundry patch (BACKLOG #5645): stop after the last page, and fail on a
+            // cursor already seen or a read shorter than totalCount.
+            const commits = response.repository.pullRequest.commits;
+            read += commits.edges.length;
+            total = commits.totalCount;
+            hasNextPage = commits.pageInfo.hasNextPage === true;
+            if (hasNextPage && (typeof commits.pageInfo.endCursor !== 'string' || seenCursors.has(commits.pageInfo.endCursor))) {
                 throw new Error('pagination reported a next page with no new cursor');
             }
-            cursor = pageInfo.endCursor;
+            cursor = commits.pageInfo.endCursor;
+            seenCursors.add(cursor);
+            }
+            if (typeof total === 'number' && read < total) {
+                throw new Error(`read ${read} of ${total} pull request commits`);
             }
             filteredCommitters = committers.filter((committer) => {
                 return committer.id !== 41898282;

@@ -36,9 +36,49 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "56d0c3a0040652604c89e797ef8e0df02b35ee19b3822deec8a60c3a3958a473"
+          "content": "d8b3c70ee49fb590fff88f698bcd3c850ce20e01b26801d7ff2ef13a852990f9"
         }
       ],
+      "pedigree": {
+        "ancestors": [
+          {
+            "type": "application",
+            "bom-ref": "upstream:pkg:github/contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08",
+            "name": "cla-assistant-lite",
+            "version": "v2.6.1",
+            "purl": "pkg:github/contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08",
+            "hashes": [
+              {
+                "alg": "SHA-256",
+                "content": "a44111084c0d4782206c04b4276292f7fec6d1f7a33525512fbeef3242079dfb"
+              }
+            ]
+          }
+        ],
+        "patches": [
+          {
+            "type": "unofficial",
+            "resolves": [
+              {
+                "type": "security",
+                "name": "BACKLOG #5644 item 2",
+                "description": "checkAllowList anchors a wildcard allowlist entry to the whole name."
+              }
+            ]
+          },
+          {
+            "type": "unofficial",
+            "resolves": [
+              {
+                "type": "security",
+                "name": "BACKLOG #5645 item 2",
+                "description": "getCommitters follows GraphQL pagination past the first 100 commits."
+              }
+            ]
+          }
+        ],
+        "notes": "Hand edits to the compiled bundle; the exact spans are BUNDLE_PATCHES in scripts/security/build_cla_action_provenance.py."
+      },
       "externalReferences": [
         {
           "type": "vcs",
@@ -76,7 +116,7 @@
         },
         {
           "name": "messagefoundry:vendored:bundle-local-change",
-          "value": "dist/index.js is NOT the upstream bundle; it is a patched fork (owner ruling 2026-11-23). BACKLOG #5644 item 2 anchors checkAllowList's wildcard pattern to the whole name. BACKLOG #5645 item 2 makes getCommitters follow GraphQL pagination past the first 100 commits. The component hash below is the patched file; the upstream digest above is the unpatched body."
+          "value": "dist/index.js is NOT the upstream bundle; it is a patched fork (owner ruling 2026-11-23). BACKLOG #5644 item 2 anchors checkAllowList's wildcard pattern to the whole name. BACKLOG #5645 item 2 makes getCommitters follow GraphQL pagination past the first 100 commits. The component's hashes entry is the patched file; the upstream bundle-sha256 property is the unpatched body. The component's pedigree names the upstream ancestor and lists the patches as unofficial."
         },
         {
           "name": "messagefoundry:vendored:action-yml-local-change",
@@ -112,7 +152,7 @@
         },
         {
           "name": "messagefoundry:recorded-files:sha256:.github/actions/cla-assistant-lite/dist/index.js",
-          "value": "56d0c3a0040652604c89e797ef8e0df02b35ee19b3822deec8a60c3a3958a473"
+          "value": "d8b3c70ee49fb590fff88f698bcd3c850ce20e01b26801d7ff2ef13a852990f9"
         },
         {
           "name": "messagefoundry:recorded-files:sha256:.github/actions/cla-assistant-lite/upstream-package-lock.json",

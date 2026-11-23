@@ -379,14 +379,29 @@ def test_the_gate_sees_a_patch_applied_twice(tree: Path) -> None:
     assert any("bundle patch 1 occurs 2 times" in p for p in problems), problems
 
 
-def test_the_gate_sees_a_reverted_patch(tree: Path) -> None:
-    """Undoing a patch -- restoring upstream's unanchored pattern -- reds the check too."""
+@pytest.mark.parametrize("index", range(len(provenance.BUNDLE_PATCHES)))
+def test_the_gate_sees_a_reverted_patch(tree: Path, index: int) -> None:
+    """Undoing a patch -- restoring upstream's unanchored pattern, say -- reds the check too."""
     bundle = tree / provenance.BUNDLE_PATH
-    upstream, patched = provenance.BUNDLE_PATCHES[0]
+    upstream, patched = provenance.BUNDLE_PATCHES[index]
     bundle.write_bytes(bundle.read_bytes().replace(patched, upstream))
 
     problems = provenance.check(tree)
-    assert any("bundle patch 1 occurs 0 times" in p for p in problems), problems
+    assert any(f"bundle patch {index + 1} occurs 0 times" in p for p in problems), problems
+
+
+def test_a_patch_moved_to_another_site_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The post-revert uniqueness check, which is what refuses a patch applied at a second site.
+
+    Synthetic, because the real upstream spans each occur once: an upstream span ``U`` that occurs
+    twice once reverted means the body could carry the patch at either site and revert to the same
+    bytes, so the derivation alone could not say which site was reviewed.
+    """
+    monkeypatch.setattr(provenance, "BUNDLE_PATCHES", ((b"<U>", b"<P>"),))
+    assert provenance.revert_bundle_patches(b"a <P> b") == b"a <U> b"
+
+    with pytest.raises(ValueError, match="upstream text occurs 2 times"):
+        provenance.revert_bundle_patches(b"a <U> b <P> c")
 
 
 def test_the_gate_sees_an_edited_record(tree: Path) -> None:
