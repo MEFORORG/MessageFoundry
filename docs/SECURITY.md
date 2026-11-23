@@ -1694,7 +1694,8 @@ record checked against its integrity seal: `GET /users`, `GET /users/{user_id}/p
 and in the web console (BACKLOG #5559) at least these. `GET /ui/users` answers 200 and lists a
 failing account by its id alone; to a caller holding `users:manage` it links that account's
 delete to `GET /ui/users/{user_id}/delete-confirm`, which, for a record its checked read refuses
-with 423, shows a confirmation naming the id alone rather than answering 423.
+with 423, shows a confirmation naming the id alone rather than the 423 this paragraph gives a
+failing record.
 `GET /ui/users/{user_id}`,
 `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown

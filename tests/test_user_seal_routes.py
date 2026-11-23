@@ -490,10 +490,11 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
 
 
 #: The console sentences this PR's code change needs in that statement (Lander hold 7090810151):
-#: the users list's delete goes through the confirmation page, gated to ``users:manage``, which
-#: answers a record its checked read refuses with 423 rather than the 423; and the post-action
-#: pages' fallback is stated once, in ``_shown_name``'s docstring, which this statement points at.
-#: Case-insensitive regexes over the whitespace-normalised statement.
+#: the users list links a failing account's delete, for a ``users:manage`` holder only, to the
+#: confirmation page, which shows a page in place of the 423 its checked read answers for that
+#: record, inside the report interval or not and for a record Vault transit cannot verify too; and
+#: the post-action pages' fallback is stated once, in ``_shown_name``'s docstring, which this
+#: statement points at. Case-insensitive regexes over the whitespace-normalised statement.
 _CONSOLE_SENTENCES = {
     "the list's delete is the confirmation's, for users:manage": (
         r"to a caller holding `users:manage` it links that account's delete to "
@@ -501,7 +502,8 @@ _CONSOLE_SENTENCES = {
     ),
     "the confirmation answers a refused record rather than the 423": (
         r"delete-confirm`, which, for a record its checked read refuses with 423, shows a "
-        r"confirmation naming the id alone rather than answering 423"
+        r"confirmation naming the id alone rather than the 423 this paragraph gives a failing "
+        r"record"
     ),
     "the post-action fallback points at _shown_name": (
         r"rather than answering 423\. What those pages show and log when that read fails is "
