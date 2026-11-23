@@ -237,6 +237,54 @@ function Get-UnplaceableCwdReason {
     return ''
 }
 
+# The checkout $Path sits in: the nearest directory, $Path itself included, that holds a .git file or
+# directory, normalised. '' when nothing up the chain is a checkout. Pure filesystem, for the reason
+# Get-OwningGitCommonDir gives.
+function Get-OwningCheckoutRoot([string]$Path) {
+    $cur = $Path
+    for ($i = 0; $i -lt 64 -and $cur; $i++) {
+        if (Test-Path -LiteralPath (Join-Path $cur '.git')) { return (ConvertTo-Norm $cur) }
+        $parent = Split-Path $cur -Parent
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
+    }
+    return ''
+}
+
+# Why a record whose cwd matched a registered worktree BY PATH PREFIX is still a fault (BACKLOG #5599).
+# Returns '' when the match stands.
+#
+# A worktree that git has stopped listing can sit INSIDE one it still lists: EnterWorktree puts them at
+# <checkout>/.claude/worktrees/<slug>. Its path then starts with the outer worktree's, so the prefix
+# match folded its session into the outer one, and the fence reported itself available on a roster
+# that had no entry for the inner checkout. The evidence is the same as Get-UnplaceableCwdReason's,
+# scoped to the matched worktree:
+#
+#   * THE DIRECTORY IS STILL THERE. The nearest checkout above the cwd is not the matched worktree, and
+#     its .git pointer names this repository. A checkout of another repository nested inside, such as a
+#     clone, keeps the match, as it did before.
+#   * THE DIRECTORY IS GONE. The cwd is under <matched>/.claude/worktrees/, the nested naming.
+function Get-NestedUnplaceableReason {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Cwd,
+        [Parameter(Mandatory)][string]$MatchNorm,
+        [string]$RepoCommonNorm
+    )
+    if (-not $Cwd) { return '' }
+    if (Test-Path -LiteralPath $Cwd) {
+        $root = Get-OwningCheckoutRoot $Cwd
+        if (-not $root -or $root -eq $MatchNorm) { return '' }
+        if (-not $RepoCommonNorm) { return '' }
+        if ((Get-OwningGitCommonDir $Cwd) -ne $RepoCommonNorm) { return '' }
+        return 'cwd is a checkout of this repository nested inside a listed worktree, which `git worktree list` no longer carries, so it can be attributed to no worktree and clears none'
+    }
+    if ((ConvertTo-Norm $Cwd).StartsWith("$MatchNorm/.claude/worktrees/")) {
+        return 'cwd no longer exists and is named as a worktree nested inside a listed worktree, so the session in it can be attributed to no worktree and clears none'
+    }
+    return ''
+}
+
 <#
 Map every session record onto the worktree it was launched in, fenced for liveness, with a receipt.
 
@@ -319,7 +367,10 @@ function Get-WorktreeOccupancy {
     # nowhere to go -- which is how a silent `continue` there stayed invisible for as long as it did.
     $placed = @()
     foreach ($e in $records) {
-        if (-not $e.Record.cwd) {
+        # Read through Get-RecordField, so a record missing the field answers $null under a caller's
+        # Set-StrictMode rather than throwing (BACKLOG #5599, S33-78).
+        $recCwd = [string](Get-RecordField $e.Record 'cwd')
+        if (-not $recCwd) {
             $faults += [pscustomobject]@{ File = $e.File; Why = 'no cwd in the record, so it cannot be placed in any worktree' }
             continue
         }
@@ -328,7 +379,7 @@ function Get-WorktreeOccupancy {
         # descendant of it -- a session cd'd into a subdirectory is still that worktree's session.
         # LONGEST match wins, or a nested worktree (.claude/worktrees/x) folds into the primary and
         # gets reported as colliding in a checkout it is nowhere near.
-        $cwdNorm = ConvertTo-Norm $e.Record.cwd
+        $cwdNorm = ConvertTo-Norm $recCwd
         $match = $null
         foreach ($k in $wtIndex.Keys) {
             if ($cwdNorm -eq $k -or $cwdNorm.StartsWith("$k/")) {
@@ -336,6 +387,11 @@ function Get-WorktreeOccupancy {
             }
         }
         if ($match) {
+            $nested = Get-NestedUnplaceableReason -Cwd $recCwd -MatchNorm (ConvertTo-Norm $match.Path) -RepoCommonNorm $repoCommonNorm
+            if ($nested) {
+                $faults += [pscustomobject]@{ File = $e.File; Why = $nested }
+                continue
+            }
             $placed += [pscustomobject]@{ Entry = $e; Match = $match }
             continue
         }
@@ -344,7 +400,7 @@ function Get-WorktreeOccupancy {
         # repo's session is none of this fence's business and must not cost a refusal. A checkout of
         # THIS repo that git has stopped listing is a session the fence cannot see, and every worktree
         # it then clears is cleared on an incomplete roster.
-        $why = Get-UnplaceableCwdReason -Cwd ([string]$e.Record.cwd) -PrimaryNorm $primaryNorm -RepoCommonNorm $repoCommonNorm
+        $why = Get-UnplaceableCwdReason -Cwd $recCwd -PrimaryNorm $primaryNorm -RepoCommonNorm $repoCommonNorm
         if ($why) { $faults += [pscustomobject]@{ File = $e.File; Why = $why } }
     }
 
@@ -377,22 +433,26 @@ function Get-WorktreeOccupancy {
         catch { $live = @{ State = "UNREADABLE"; Detail = "record could not be fenced: $($_.Exception.Message)" } }
 
         $matchNorm = ConvertTo-Norm $match.Path
-        $sid = [string]$rec.sessionId
+        $sid = [string](Get-RecordField $rec 'sessionId')
         # A non-numeric pid would throw on this cast; keep it reportable rather than letting the cast
         # take the whole caller down.
         $recPid = 0
-        try { $recPid = [int]$rec.pid } catch { $recPid = 0 }
+        try { $recPid = [int](Get-RecordField $rec 'pid') } catch { $recPid = 0 }
+        # A startedAt that is missing, not a number or out of range reports '' rather than throwing
+        # out of the whole roster (BACKLOG #5599, S33-78).
+        $startedUtc = Get-RecordStartedUtc $rec
+        $started = if ($null -ne $startedUtc) { $startedUtc.ToLocalTime().ToString("o") } else { '' }
         $sessions += [pscustomobject]@{
             State        = $live.State
             Detail       = $live.Detail
             SessionId    = $sid
             Short        = if ($sid) { $sid.Substring(0, [Math]::Min(8, $sid.Length)) } else { "?" }
             Pid          = $recPid
-            Cwd          = [string]$rec.cwd
-            Entrypoint   = [string]$rec.entrypoint
-            Kind         = [string]$rec.kind
+            Cwd          = [string](Get-RecordField $rec 'cwd')
+            Entrypoint   = [string](Get-RecordField $rec 'entrypoint')
+            Kind         = [string](Get-RecordField $rec 'kind')
             Root         = $entry.Root
-            StartedAt    = if ($null -ne $rec.startedAt) { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$rec.startedAt).LocalDateTime.ToString("o") } else { "" }
+            StartedAt    = $started
             WorktreePath = $match.Path
             Worktree     = if ($matchNorm -eq $primaryNorm) { "primary" } else { Split-Path $match.Path -Leaf }
             IsPrimary    = ($matchNorm -eq $primaryNorm)

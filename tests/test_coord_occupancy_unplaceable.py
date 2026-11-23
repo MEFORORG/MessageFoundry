@@ -85,7 +85,15 @@ class Fixture:
         """The path ``scripts/worktree/new.ps1`` gives a sibling worktree: ``<primary>-<name>``."""
         return self.repo.parent / f"{self.repo.name}-{name}"
 
-    def write_session(self, *, cwd: Path | str, session_id: str, pid: int | None = None) -> Path:
+    def write_session(
+        self,
+        *,
+        cwd: Path | str,
+        session_id: str,
+        pid: int | None = None,
+        drop: tuple[str, ...] = (),
+        started_at: object = 1767225600000,
+    ) -> Path:
         """A registry record. The pid is dead by construction: faults are counted before the
         liveness fence runs, so no test here needs a live process."""
         procid = never_live_pid() if pid is None else pid
@@ -93,7 +101,7 @@ class Fixture:
             "pid": procid,
             "sessionId": session_id,
             "cwd": str(cwd),
-            "startedAt": 1767225600000,
+            "startedAt": started_at,
             "version": "2.1.219",
             "peerProtocol": 1,
             "kind": "interactive",
@@ -101,13 +109,16 @@ class Fixture:
             "name": session_id[:8],
             "nameSource": "derived",
         }
+        for key in drop:
+            del rec[key]
         f = self.root / "sessions" / f"{session_id}.json"
         f.write_text(json.dumps(rec), encoding="utf-8")
         return f
 
-    def occupancy(self) -> dict[str, Any]:
+    def occupancy(self, *, strict: bool = False) -> dict[str, Any]:
         ps = (
-            f". '{self.box / 'occupancy.ps1'}'; "
+            ("Set-StrictMode -Version Latest; " if strict else "")
+            + f". '{self.box / 'occupancy.ps1'}'; "
             f"Get-WorktreeOccupancy -Repo '{self.repo}' -ConfigRoot '{self.root}' "
             "| ConvertTo-Json -Depth 6"
         )
@@ -235,3 +246,85 @@ def test_another_repositorys_session_does_not_make_this_fence_unavailable(fx: Fi
     )
     assert occ["Available"] is True, occ["Detail"]
     assert occ["RecordsExamined"] == 4
+
+
+# --- BACKLOG #5599: a deregistered worktree NESTED inside a listed one ------------------------------
+
+
+def _deregister(fx: Fixture, path: Path, branch: str) -> None:
+    """Add ``path`` as a worktree, then remove its admin entry, as a failed ``remove --force`` does."""
+    _git(fx.repo, "worktree", "add", "-q", "-b", branch, str(path))
+    admin = fx.repo / ".git" / "worktrees" / path.name
+    assert admin.is_dir(), f"git did not register the worktree where expected: {admin}"
+    shutil.rmtree(admin)
+
+
+def test_a_deregistered_nested_worktree_on_disk_is_unplaceable(fx: Fixture) -> None:
+    """``EnterWorktree`` nests a worktree at ``<primary>/.claude/worktrees/<slug>``. Once git stops
+    listing it, its path still starts with the primary's, and the prefix match folded the session
+    into the primary: placed, counted, and the fence Available on a roster with no entry for it."""
+    inner = fx.repo / ".claude" / "worktrees" / "inner"
+    _deregister(fx, inner, "inner-branch")
+    planted = fx.write_session(cwd=inner, session_id="abababab-1111")
+
+    occ = fx.occupancy()
+
+    assert occ["Available"] is False, occ
+    assert occ["RecordsUnplaceable"] == 1, occ
+    assert str(planted) in " ".join(occ["UnplaceableFiles"]), occ
+    assert occ["Sessions"] == [], "the session was still attributed to the primary"
+
+
+def test_a_gone_nested_worktree_is_unplaceable(fx: Fixture) -> None:
+    """The same, with the directory gone: only the nested naming is left as evidence."""
+    gone = fx.repo / ".claude" / "worktrees" / "gone" / "sub"
+    fx.write_session(cwd=gone, session_id="acacacac-2222")
+
+    occ = fx.occupancy()
+
+    assert occ["Available"] is False, occ
+    assert occ["RecordsUnplaceable"] == 1, occ
+    assert occ["Sessions"] == []
+
+
+def test_a_listed_nested_worktree_and_a_primary_subdirectory_still_place(fx: Fixture) -> None:
+    """The other direction. A nested worktree git still lists, a subdirectory of the primary, and a
+    clone of another repository inside the primary all place as before, and the fence stays
+    available. Without this the two tests above pass against a matcher that faults everything."""
+    listed = fx.repo / ".claude" / "worktrees" / "listed"
+    _git(fx.repo, "worktree", "add", "-q", "-b", "listed-branch", str(listed))
+    subdir = fx.repo / "docs"
+    subdir.mkdir()
+    clone = fx.repo / "vendor" / "other"
+    clone.mkdir(parents=True)
+    _git(clone, "init", "-q", "-b", "main")
+
+    fx.write_session(cwd=listed, session_id="adadadad-3333")
+    fx.write_session(cwd=subdir, session_id="aeaeaeae-4444")
+    fx.write_session(cwd=clone, session_id="afafafaf-5555")
+
+    occ = fx.occupancy()
+
+    assert occ["Available"] is True, occ["Detail"]
+    assert occ["RecordsUnplaceable"] == 0, occ["UnplaceableFiles"]
+    where = {s["SessionId"]: s["Worktree"] for s in occ["Sessions"]}
+    assert where == {
+        "adadadad-3333": "listed",
+        "aeaeaeae-4444": "primary",
+        "afafafaf-5555": "primary",
+    }
+
+
+def test_a_record_with_missing_or_bad_fields_does_not_throw_under_strict_mode(fx: Fixture) -> None:
+    """S33-78. A caller that sets ``Set-StrictMode`` and dot-sources this library made a missing
+    ``kind`` or ``entrypoint`` throw, and a ``startedAt`` out of range threw from the cast outside
+    any ``try``, taking the whole roster down rather than reporting the record."""
+    fx.write_session(cwd=fx.repo, session_id="babababa-6666", drop=("kind", "entrypoint"))
+    fx.write_session(cwd=fx.repo, session_id="bcbcbcbc-7777", started_at=10**30)
+
+    occ = fx.occupancy(strict=True)
+
+    assert occ["Available"] is True, occ["Detail"]
+    rows = {s["SessionId"]: s for s in occ["Sessions"]}
+    assert rows["babababa-6666"]["Kind"] == "" and rows["babababa-6666"]["Entrypoint"] == ""
+    assert rows["bcbcbcbc-7777"]["StartedAt"] == ""
