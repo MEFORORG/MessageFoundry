@@ -209,7 +209,7 @@
       const n = Number(meta ? meta.getAttribute('content') : NaN);
       return Number.isSafeInteger(n) ? n : undefined;
     }
-    for (const inp of document.querySelectorAll('input.edit, select.edit')) {
+    for (const inp of document.querySelectorAll('input.edit, select.edit, textarea.edit')) {
       inp.addEventListener('change', () => {
         // A route's handlers field (data-list) posts its comma-separated names as a list, empties
         // dropped, the shape the engine's set_route takes (BACKLOG #5941). A field left with no name is
@@ -220,6 +220,18 @@
         } else if (inp.dataset.list === 'true') {
           const names = inp.value.split(',').map((h) => h.trim()).filter((h) => h.length > 0);
           value = names.length > 0 ? names : undefined;
+        } else if (inp.dataset.lines !== undefined) {
+          // A multi-line Comment (BACKLOG #5841): the engine refuses a text whose line count changed,
+          // so a changed count is put back unposted, with a toast saying why.
+          const want = Number(inp.dataset.lines);
+          if (inp.value.split('\n').length !== want) {
+            vscode.postMessage({
+              command: 'cutInfo',
+              text: `This comment spans ${want} lines, so its text must keep ${want} lines. ` +
+                'Add or delete a Comment step to change the count, or edit the file as code.',
+            });
+            value = undefined;
+          }
         }
         if (value === undefined) {
           inp.value = inp.defaultValue;

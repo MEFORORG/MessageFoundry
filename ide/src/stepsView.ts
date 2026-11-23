@@ -1225,14 +1225,16 @@ function pageHtml(
     .params { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 6px; }
     .params .field { display: flex; flex-direction: column; gap: 2px; min-width: 120px; }
     .params .field label { font-size: 11px; color: var(--vscode-descriptionForeground); }
-    .params .field input { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px;
+    .params .field input, .params .field textarea { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px;
                            color: var(--vscode-foreground); background: var(--vscode-input-background);
                            border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 2px;
                            padding: 2px 6px; }
     /* An editable (recognized-row) field is focusable; a read-only field (code/control, or an argument
        the lens can't round-trip) is visibly muted. */
-    .params .field input:disabled { opacity: 0.6; cursor: default; }
-    .params .field input.edit:focus { outline: 1px solid var(--vscode-focusBorder); }
+    .params .field input:disabled, .params .field textarea:disabled { opacity: 0.6; cursor: default; }
+    .params .field input.edit:focus, .params .field textarea.edit:focus { outline: 1px solid var(--vscode-focusBorder); }
+    /* A multi-line Comment (BACKLOG #5841) edits in a textarea whose row count is its line count. */
+    .params .field textarea { resize: none; min-width: 320px; }
     /* ADR 0104 §2.3 field picker: the ⋮ button sits beside its input (the input keeps flexing, so free-text
        stays first-class). Only a pickable path/segment slot gets the .edit-row wrapper. */
     .params .field .edit-row { display: flex; align-items: stretch; gap: 3px; }

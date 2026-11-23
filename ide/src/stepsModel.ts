@@ -496,13 +496,12 @@ function rowParams(row: LensRow): ParamField[] {
     return [{ name: "handlers", value: names.length > 0 ? names.join(", ") : "(dynamic selection)" }];
   }
   if (row.kind === "note") {
-    // BACKLOG #5841. A one-line Comment shows and edits its text in a field. A pragma (read-only) and a
-    // multi-line run get none: one text box cannot hold a newline, and the engine refuses a text whose
-    // line count changed. Those show their raw lines in the row body instead (renderRowHtml).
+    // BACKLOG #5841. A Comment shows and edits its text in a field: one line in a text input, a
+    // multi-line run in a textarea that keeps its line count (renderLiteralInputHtml). A pragma gets
+    // none, since the engine refuses to edit one (ADR 0076 A.4); its raw line shows in the row body
+    // instead (renderRowHtml).
     const text = row.text;
-    return text !== undefined && row.pragma !== true && !text.includes("\n")
-      ? [{ name: "text", value: text }]
-      : [];
+    return text !== undefined && row.pragma !== true ? [{ name: "text", value: text }] : [];
   }
   return paramsToFields(row.params);
 }
@@ -3378,6 +3377,17 @@ export function resolveWidget(
   return { kind: "text" };
 }
 
+/** A multi-line Comment's text as a textarea, editable or read-only (BACKLOG #5841). Pure. */
+function noteTextareaHtml(value: string, attrs: string, readOnly: boolean): string {
+  const lines = value.split("\n").length;
+  // The HTML parser drops one newline right after <textarea>, so one is always written there: a Comment
+  // whose first line is a bare `#` (empty text) would otherwise lose that line from the field.
+  const body = `\n${escapeHtml(value)}`;
+  return readOnly
+    ? `<textarea readonly disabled rows="${lines}">${body}</textarea>`
+    : `<textarea class="edit" ${attrs} rows="${lines}" data-lines="${lines}">${body}</textarea>`;
+}
+
 /** The edit coordinates every editable control of one param carries, echoed back on edit (F7). */
 function editCoordAttrs(handlerName: string, row: RowViewModel, name: string): string {
   return (
@@ -3415,6 +3425,12 @@ function renderLiteralInputHtml(
   // stale-guard round-trip is unchanged; with no schema (the read-only callers) every param resolves
   // to `text`, so this markup is byte-identical to before.
   const attrs = editCoordAttrs(handlerName, row, p.name);
+  if (row.kind === "note" && p.value.includes("\n")) {
+    // BACKLOG #5841: a multi-line Comment edits in a textarea. The engine refuses a text whose line
+    // count differs from the note's span, so `data-lines` lets the page put a changed count back
+    // unposted rather than send an edit certain to fail.
+    return noteTextareaHtml(p.value, attrs, false);
+  }
   const widget = resolveWidget(row.action, p.name, schema);
   let input: string;
   if (widget.kind === "enum" && widget.choices) {
@@ -3643,6 +3659,10 @@ function renderParamsHtml(
       if (editable.has(p.name)) {
         return `<div class="field">${label}${renderLiteralInputHtml(p, handlerName, row, schema)}</div>`;
       }
+      if (row.kind === "note" && p.value.includes("\n")) {
+        // An input would drop the line breaks, so a read-only multi-line Comment keeps its textarea.
+        return `<div class="field">${label}${noteTextareaHtml(p.value, "", true)}</div>`;
+      }
       return (
         `<div class="field">${label}` +
         `<input type="text" readonly disabled value="${escapeHtml(p.value)}" /></div>`
@@ -3711,8 +3731,8 @@ export function renderRowHtml(
     : "";
   // A field is editable only when the handler name is known (the write path); read-only callers pass "".
   const editable = new Set(handlerName ? (row.editableParams ?? []) : []);
-  // A note with no text field (a pragma, or a multi-line run) shows its verbatim lines read-only, as a
-  // code row does, rather than a blank body (BACKLOG #5841).
+  // A note with no text field (a pragma) shows its verbatim lines read-only, as a code row does, rather
+  // than a blank body (BACKLOG #5841).
   const body =
     row.kind === "code" || (row.kind === "note" && row.params.length === 0)
       ? `<pre class="code">${escapeHtml(row.code ?? "")}</pre>`
