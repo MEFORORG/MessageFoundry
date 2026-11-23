@@ -91,7 +91,7 @@ defined segment, because batch splitting can leave one on a message. Every dropp
 borrows a slot-bearing structure under another message code (`ADT^A01^MFN_M01`). Under the same
 code, MSH-9.2 decides: a dropped segment in `MFN^M02^MFN_M01` is refused, because `MFN_M02` is a
 structure of its own, while some same-code borrows keep the exemption, at least `PGL^PC7^PGL_PC6`
-in 2.5, a Z event with no structure of that name in `hl7apy`, such as `QBP^Z44^QBP_Q15`, and a
+in 2.5, a Z event with no structure of that name in `hl7apy`, such as `QBP^Z44^QBP_Q15` in 2.5, and a
 table 0003 event with none, such as `MFN^M14^MFN_M01` or even `MFN^A01^MFN_M01`. The exact
 rule is in `_exempts_defined_segments` in [`validate.py`](../messagefoundry/parsing/validate.py).
 Where the slot is required and its group is present, `hl7apy`'s own check

@@ -352,7 +352,8 @@ def _has_any_segment_slot(name: str, classname: str, hl7_version: str) -> bool:
 
 
 def _exempts_defined_segments(message: Any) -> bool:
-    """True if ``message``'s structure has the "any HL7 segment" slot and is its own.
+    """True if ``message``'s structure has the "any HL7 segment" slot and MSH-9 passes the
+    consistency check below, which some borrowed structures pass too.
 
     hl7apy takes the structure from MSH-9.3 when one is given, so ``ADT^A01^MFN_M01`` would
     borrow MFN_M01's slot for an ADT body. The exemption holds only where MSH-9.1 names the
@@ -363,10 +364,11 @@ def _exempts_defined_segments(message: Any) -> bool:
     stripped and upper-cased, it keeps the exemption. Otherwise, where hl7apy's tables have a
     structure named ``<MSH-9.1>_<MSH-9.2>``, it gets none: ``MFN^M02^MFN_M01``, since MFN_M02 is
     a structure, and ``QBP^Z73^QBP_Q15`` in 2.5, since QBP_Z73 is one. Otherwise it keeps the
-    exemption where MSH-9.2 starts with Z, a site-defined event (``QBP^Z44^QBP_Q15``) of which
-    table 0003 lists none, or is a trigger event in the version's HL7 table 0003 as hl7apy ships
+    exemption where MSH-9.2 starts with Z, taken as a site-defined event (``QBP^Z44^QBP_Q15``)
+    that table 0003 need not list, or is a value in the version's HL7 table 0003 as hl7apy ships
     it, and gets none for any other value (empty, lower-case, padded or made up, such as
-    ``XY1``). So ``PGL^PC7^PGL_PC6`` in 2.5 keeps it, one structure serving several trigger
+    ``XY1``). Any Z-led value passes the Z test (``MFN^Zebra^MFN_M01``), and the table holds at
+    least one placeholder that is no event (``Varies`` from 2.4), which passes too. So ``PGL^PC7^PGL_PC6`` in 2.5 keeps it, one structure serving several trigger
     events (PGL_PC6 serves PC6 to PC8, for one). So does an event in the table that the borrowed
     structure does not serve in the standard, such as ``MFN^M14^MFN_M01``, or one of another
     message's family, such as ``MFN^A01^MFN_M01``: hl7apy has no table of which structure serves
@@ -388,7 +390,7 @@ def _exempts_defined_segments(message: Any) -> bool:
     structures, events = _structures_and_events(message.version)
     if own in structures:
         return False
-    # A site-defined Z event borrows a structure by design, and table 0003 lists none.
+    # A site-defined Z event borrows a structure by design, and table 0003 need not list it.
     return event.startswith("Z") or event in events
 
 
