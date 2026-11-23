@@ -589,7 +589,7 @@ def test_a_keyed_store_with_encrypted_rows_is_refused_at_open(
     assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
     error = _error(capsys)
     # The open may have written before it, so not "nothing was written" (BACKLOG #5067).
-    assert "did not land, but the open may" in error
+    assert "this command makes did not land" in error
     # The OPEN refused, not the later audit append: the store's own text names the key variable,
     # and the append branch's wording is absent.
     assert "MEFOR_STORE_ENCRYPTION_KEY" in error
@@ -629,7 +629,7 @@ def test_a_row_the_open_cannot_decrypt_is_could_not_start(
     error = _error(capsys)
     # The CipherError arm's text, not another could-not-start refusal that also exits 2. The open
     # may have written before it, so not "nothing was written" (BACKLOG #5067).
-    assert "no configured key decrypts" in error and "did not land, but the open may" in error
+    assert "no configured key decrypts" in error and "this command makes did not land" in error
     assert "nothing was written" not in error.lower(), error
 
 
@@ -667,7 +667,7 @@ def test_a_busy_store_that_refuses_the_audit_row_keeps_exit_1(
     error = _error(capsys)
     assert "audit row goes first" in error and str(raised) in error
     # The append follows a full open, which may have written (BACKLOG #5067).
-    assert "did not land, but the open may" in error
+    assert "this command makes did not land" in error
     assert "nothing was written" not in error.lower(), error
     assert _notify_email(db, _ADMIN) is None
     assert _audit_rows(db) == []
@@ -951,3 +951,24 @@ def test_help_names_the_host_gate(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--username" in out and "--email" in out
     assert "same host gate as admin-unlock" in out
     assert "engine stopped" in out
+
+
+def test_a_locked_read_after_the_open_is_no_cannot_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: a "database is locked" from the account read, after the open returned, does
+    not read as "cannot open the store", and names what the open may have changed. Exit 2.
+
+    Mutation: send that case to ``_emit_store_open_error`` again."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "locked-read.db"
+    _seed(db)
+
+    async def locked(*_a: object, **_k: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MessageStore, "get_user_by_username", locked)
+    assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "the store failed after it opened (OperationalError)" in error, error
+    assert "cannot open the store" not in error and "may already have changed" in error, error

@@ -3908,7 +3908,7 @@ def test_admin_unlock_exits_2_when_the_open_refuses_for_a_missing_key(
     assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 2
     error = json.loads(capsys.readouterr().out)["error"]
     # What the open may have changed before it (BACKLOG #5067).
-    assert "holds no key" in error and "did not land, but the open may" in error
+    assert "holds no key" in error and "this command makes did not land" in error
 
 
 def test_admin_unlock_reports_a_defect_rather_than_a_refusal(

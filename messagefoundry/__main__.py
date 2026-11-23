@@ -10051,14 +10051,31 @@ def _binds_salt(store: StoreSettings) -> bool:
     return store.cipher_provider == "aesgcm" and store.aad_bind
 
 
-def _open_steps_left_behind(store: StoreSettings, *, keyed: bool) -> str:
+def _open_steps_left_behind(store: StoreSettings, *, keyed: bool, returned: bool = False) -> str:
     """What a refusal left behind when it can follow the open's own writing steps (BACKLOG
     #5067): sentences, the last with no full stop, as :func:`_open_refusal_left_behind` returns
     them. Never "nothing was written", since an open ran. ``keyed`` is whether the open was
     keyed, as far as the caller knows: a keyed open may bind a salt (:func:`_binds_salt`) and
     write an empty chain's genesis record, and a keyless one does neither. Where
-    :func:`_open_changes` names nothing, it says the open may have written all the same."""
+    :func:`_open_changes` names nothing, it says the open may have written all the same.
+
+    ``returned`` says the caller knows the open had returned before the refusal. Otherwise the
+    refusal may have come before the open reached its writing steps, at least from the cipher
+    build, which runs before the open connects, so the text names what it may have changed only
+    as a possibility and asserts no write."""
     listed = _open_changes(store, salt=keyed and _binds_salt(store), genesis=keyed)
+    if not returned:
+        if not listed:
+            return (
+                "The change this command makes did not land. The open may or may not have reached "
+                "its own writing steps before this refusal, so the database may or may not have "
+                "changed"
+            )
+        return (
+            "The change this command makes did not land. The open may or may not have reached "
+            f"its own writing steps before this refusal; if it did, it may have changed at least "
+            f"{listed}"
+        )
     if not listed:
         return (
             "The change this command makes did not land, but the open's own steps may already "
@@ -10082,7 +10099,9 @@ def _opened_left_behind(exc: BaseException, store: StoreSettings, *, keyed: bool
     """What a refusal raised after an open returned left behind (BACKLOG #5067): what
     :func:`_open_refusal_left_behind` says for ``exc``, else :func:`_open_steps_left_behind`, so
     it never says nothing was written. ``keyed`` is whether a store key is configured."""
-    return _open_refusal_left_behind(exc, store) or _open_steps_left_behind(store, keyed=keyed)
+    return _open_refusal_left_behind(exc, store) or _open_steps_left_behind(
+        store, keyed=keyed, returned=True
+    )
 
 
 def _kept_key_sentence(kept: Path) -> str:
@@ -10208,7 +10227,7 @@ def _provision_open_refusal(
 
     left = _open_refusal_left_behind(exc, store)
     if left is None and opened:
-        left = _open_steps_left_behind(store, keyed=keyed)
+        left = _open_steps_left_behind(store, keyed=keyed, returned=True)
     if kept is not None:
         held = _kept_key_sentence(kept)
         tail = (
@@ -10780,13 +10799,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         if not precheck_opened:
             return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
         # A read after the pre-check's open returned (BACKLOG #5067): no "cannot open", and no key
-        # was shown yet. The class only: a driver's message can quote a stored value.
+        # was shown yet. Exit 2, as the open's own error exits. The class only: a driver's message
+        # can quote a stored value.
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-        return _emit_error(
+        _emit_error(
             f"the store failed after it opened ({type(exc).__name__}). Refusing to provision. "
             f"{left}",
             as_json=args.json,
         )
+        return 2
     except FileExistsError as exc:
         # Vault BACKLOG #3411: a host blob or a handoff is already in the custody directory.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
@@ -11023,21 +11044,28 @@ def _provision_admin(args: argparse.Namespace) -> int:
         Under a shown key it names the entry: keep it once the write has started, or, where the
         refusal came before any account write (a refused first INSERT), delete it, since no seed
         was stored (BACKLOG #5067)."""
-        entry = ""
-        if totp_secret is not None:
+        if not write_started:
+            # The first INSERT itself was refused: no account row and no seed (BACKLOG #5067).
             entry = (
-                f".{keep_the_entry()}"
-                if write_started
-                else ". If you added the entry this run showed to the authenticator app, delete "
-                "it: its seed was never stored"
+                ""
+                if totp_secret is None
+                else " If you added the entry this run showed to the authenticator app, delete "
+                "it: its seed was never stored."
+            )
+            return _emit_error(
+                f"the store refused this command's first account write ({type(exc).__name__}), "
+                "so no account was written. Once no other provision-admin run is in progress, run "
+                "the command again. If it is refused the same way again, the store has a fault "
+                f"this command cannot repair.{entry}",
+                as_json=args.json,
             )
         return _emit_error(
             f"the store refused one of this command's writes ({type(exc).__name__}), so the "
             "Administrator may be "
             "missing or incomplete. Once no other provision-admin run is in progress, run the "
             "command again: it completes a partly written account, or says why it cannot. If it "
-            "is refused the same way again, the store has a fault this command cannot repair"
-            + entry,
+            "is refused the same way again, the store has a fault this command cannot repair."
+            + keep_the_entry(),
             as_json=args.json,
         )
 
@@ -11185,17 +11213,21 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # not a path that is not a database. A lost username race arrives as the refusal above.
         return refused_write(exc)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        # Exit 2 either way, as before. The key was shown, so either way the text says what to do
+        # with its entry (BACKLOG #5067).
         if not store_opened:
-            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-        # After the open returned, such as a lock during the writes (BACKLOG #5067): the store
-        # opened, so this is no "cannot open". Exit 1, this command's refusal, as an integrity
-        # refusal exits. The class only: a driver's message can quote a stored value.
+            # The create open's own error, such as a --db in a directory this shell cannot write.
+            unopened = f"cannot open the store at {settings.store.path}: {_store_error_text(exc)}"
+            _emit_error(after_the_key(unopened, unopened), as_json=args.json)
+            return 2
+        # After the open returned, such as a lock during the writes: the store opened, so this is
+        # no "cannot open". The class only: a driver's message can quote a stored value.
         refusal = f"the store failed after it opened ({type(exc).__name__})"
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-        return _emit_error(
-            after_the_key(refusal, f"{refusal}. Refusing to provision. {left}"),
-            as_json=args.json,
+        _emit_error(
+            after_the_key(refusal, f"{refusal}. Refusing to provision. {left}"), as_json=args.json
         )
+        return 2
     except Exception as exc:
         # The server backends' integrity refusals, which share no class with sqlite3's. Matched by
         # MRO name as the service matches them; anything else propagates as it did before.
@@ -11414,6 +11446,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     # invocation bound's pass re-raised (BACKLOG #5608).
     bound_open_errors = _invocation_bound_open_errors()
 
+    # Set once the open below has returned, so a store error after it is no "cannot open" (#5067).
+    notify_opened = False
+
     async def run() -> tuple[str, str, str]:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
         try:
@@ -11446,6 +11481,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # error propagates as before.
             _raise_if_bound_refused(exc, bound_open_errors)
             raise
+        nonlocal notify_opened
+        notify_opened = True
         try:
             user = await store.get_user_by_username(wanted)
             if user is None:
@@ -11522,7 +11559,15 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         _emit_error(_invocation_bound_refusal(bound.failure, settings.store), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        if not notify_opened:
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        # A read after the open returned, such as a lock while the engine runs: no "cannot open",
+        # and the open may have written (BACKLOG #5067). Exit 2, as before. The class only.
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        _emit_error(
+            f"the store failed after it opened ({type(exc).__name__}). {left}", as_json=args.json
+        )
+        return 2
     if outcome == "open-refused":
         # The store could not be opened, so the command could not start: exit 2, the code ADR 0171
         # Amendment C gives "could not start" (BACKLOG #2124, a seat decision under owner

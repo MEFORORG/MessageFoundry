@@ -1056,7 +1056,7 @@ def test_a_seed_that_does_not_open_at_the_write_is_a_refusal_not_a_race(
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
     # What the open may have changed before it (BACKLOG #5067), and no replacement.
-    assert "did not land, but the open may" in error and "delete it" in error
+    assert "this command makes did not land" in error and "delete it" in error
     assert "enrolled again" not in error
     monkeypatch.setattr(MessageStore, "open_totp_secret", real_open)
     assert _state(db) == before
@@ -1139,5 +1139,5 @@ def test_a_store_failure_after_the_write_open_says_what_the_open_may_have_change
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
     error = _error(capsys)
     assert "the store failed before the replacement (RuntimeError)" in error, error
-    assert "did not land, but the open may" in error and "delete it" in error, error
+    assert "this command makes did not land" in error and "delete it" in error, error
     assert "nothing was written" not in error.lower(), error

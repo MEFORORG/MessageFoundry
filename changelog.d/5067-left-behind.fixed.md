@@ -15,9 +15,11 @@
   `admin-set-notify-email`'s refused audit append, in `admin-reset-totp` a store failure raised
   after an open returned, and in `provision-admin` a key-resolution, hop or SQLite store refusal
   raised after its pre-check or write open returned. A store keyed by the `vault_transit` cipher
-  counts as keyed here. It says the change the command makes did not land, and names at least what the open
-  may have changed, such as the schema, the salt record, the audit chain's genesis record and, on
-  SQL Server under `[store].schema_management = auto`, the snapshot options; where it can name
-  none, it says the open's own steps may have written. At least a store pin refusal under the
+  counts as keyed here. It says the change the command makes did not land, and names what the open may have
+  changed, such as the schema, the salt record, the audit chain's genesis record and, on SQL
+  Server under `[store].schema_management = auto`, the snapshot options. Where the command
+  cannot tell whether the open reached its writing steps, as for a cipher refusal that can come
+  before the open connects, it says the open may or may not have reached them and names those
+  changes only as possible. At least a store pin refusal under the
   host key provider, and a refusal about the account itself, such as a disabled Administrator,
   still say nothing was written. (`BACKLOG #5067`)

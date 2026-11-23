@@ -38,9 +38,10 @@ _ROLLED_BACK = "rolled its schema batch back and wrote no schema marker"
 _BOUND_NO_ROW = "No account or audit row was written"
 _BOUND_MAY_HAVE = "may already have changed the database"
 _UNUSED_ENTRY = "If you added the entry this run showed to the authenticator app, delete it"
-_OWN_WRITES = (
-    "change this command makes did not land, but the open may already have changed the database"
-)
+#: The opening every left-behind text shares (BACKLOG #5067).
+_OWN_WRITES = "The change this command makes did not land"
+#: Where only the refusal's class is known, the open may not have reached its writing steps.
+_MAY_OR_MAY_NOT = "The open may or may not have reached its own writing steps"
 _KEEP_ENTRY = "keep it for now: its seed may be stored"
 
 #: ``(backend, schema_management)`` -> whether the refusal names the database setting.
@@ -699,6 +700,7 @@ _STEPS: dict[tuple[str, str, str], tuple[bool, bool, bool, bool] | None] = {
     ("postgres", "external", "keyless"): None,
 }
 _MAY_HAVE_WRITTEN = "the open's own steps may already have written to the database"
+_MAY_HAVE_CHANGED = "the database may or may not have changed"
 
 
 def _steps_refusal(kind: str) -> Exception:
@@ -713,7 +715,7 @@ def _assert_steps(out: str, expected: tuple[bool, bool, bool, bool] | None) -> N
     assert "synthetic_table" in out, out
     assert "nothing was written" not in out.lower(), out
     if expected is None:
-        assert _MAY_HAVE_WRITTEN in out and _OWN_WRITES not in out, out
+        assert _MAY_HAVE_CHANGED in out and "at least" not in out, out
         return
     schema, options, salt, genesis = expected
     assert _OWN_WRITES in out, out
@@ -926,8 +928,9 @@ def test_a_refused_first_insert_says_the_shown_entry_has_no_seed(
     captured = capsys.readouterr()
     out = captured.out + captured.err
     assert code == 1, out
-    assert "the store refused one of this command's writes (IntegrityError)" in out, out
-    assert "delete it: its seed was never stored" in out and _KEEP_ENTRY not in out, out
+    assert "the store refused this command's first account write (IntegrityError)" in out, out
+    assert "so no account was written" in out and "partly written account" not in out, out
+    assert "delete it: its seed was never stored." in out and _KEEP_ENTRY not in out, out
 
 
 def test_a_refusal_after_the_pre_check_open_says_what_the_open_may_have_changed(
@@ -979,7 +982,8 @@ def test_an_open_that_names_no_step_still_never_says_nothing_was_written() -> No
         schema_management=SchemaManagement.EXTERNAL,
         cipher_provider="vault_transit",
     )
-    assert _MAY_HAVE_WRITTEN in _open_steps_left_behind(store, keyed=False)
+    assert _MAY_HAVE_WRITTEN in _open_steps_left_behind(store, keyed=False, returned=True)
+    assert _MAY_HAVE_CHANGED in _open_steps_left_behind(store, keyed=False)
     keyed = _open_steps_left_behind(store, keyed=True)
     assert "the audit chain's genesis record" in keyed and "salt record" not in keyed, keyed
     # A refused audit row of the command's own follows a full open too.
@@ -1014,10 +1018,8 @@ def test_a_locked_store_after_the_write_open_is_no_cannot_open(
 
     Mutation: send that arm to ``_emit_store_open_error`` again; it then says cannot open."""
     _service_raises(monkeypatch, sqlite3.OperationalError("database is locked"), wrote=wrote)
-    code = main(_provision_sqlite(shell))
-    captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert code == 1, out
+    # Exit 2, as main exited on this arm.
+    out = _run(_provision_sqlite(shell), capsys)
     assert "the store failed after it opened (OperationalError)" in out, out
     assert "cannot open the store" not in out, out
     if wrote:
@@ -1046,3 +1048,48 @@ def test_a_transit_keyed_open_names_the_genesis_record(
         KeyProviderError("synthetic"), transit.store, keyed=_open_is_keyed(transit)
     )
     assert "the audit chain's genesis record" in left, left
+
+
+# Manager rulings on round-d8699b00a1 (BACKLOG #5067).
+
+
+def test_a_cipher_refusal_at_the_open_asserts_no_write(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cipher refusal the open raised may come before it connects (the cipher build), so the
+    text says the open may or may not have reached its writing steps and names a change only as a
+    possibility.
+
+    Mutation: word the class-inferred text as "may already have changed" again."""
+    from messagefoundry.store.crypto import CipherError
+
+    _open_refuses_with(monkeypatch, CipherError("synthetic cipher build refusal"))
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert _MAY_OR_MAY_NOT in out and "if it did, it may have changed at least" in out, out
+    assert "may already have changed" not in out, out
+
+
+def test_the_create_open_s_own_database_error_names_the_shown_entry(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The write's create open raising a ``sqlite3.DatabaseError`` itself, after the key was
+    shown, says to delete the entry, and exits 2 as main did.
+
+    Mutation: send that case to ``_emit_store_open_error`` again; the advice is then missing."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store import base
+
+    async def opening(*_args: object, create: bool = False, **_kwargs: object) -> object:
+        if not create:
+            raise base.StoreNotFoundError("synthetic: no store yet")
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    monkeypatch.setattr(
+        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+    )
+    out = _run(_provision_sqlite(shell), capsys)
+    assert "cannot open the store at" in out and "unable to open database file" in out, out
+    assert _UNUSED_ENTRY in out, out
