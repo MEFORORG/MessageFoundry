@@ -723,3 +723,35 @@ def test_every_template_compiles_and_matches_its_own_shape() -> None:
             r"\{([a-z_]+)\}", lambda m: samples.get(m.group(1), "1.2.826.0.1.3680043.2.1"), text
         )
         assert dicom_module._screened_line(filled) is not None, text
+
+
+# --- The repairs after the third review (BACKLOG #6637) --------------------------------------------
+
+
+def test_a_line_in_a_hold_is_screened_when_a_host_removed_the_filter() -> None:
+    log = logging.getLogger("pynetdicom.utils")
+    line = f"Invalid 'Affected SOP Instance UID' value '{_PLANTED}' - must not exceed 64 characters"
+    log.removeFilter(dicom_module._PEER_VALUE_FILTER)
+    try:
+        with dicom_module._logs_held() as held:
+            written = _written(log, lambda logger: logger.error(line))
+    finally:
+        log.addFilter(dicom_module._PEER_VALUE_FILTER)
+    assert held == []  # CONTROL: with no filter, nothing held it, so it went to the handler
+    assert written  # CONTROL: the handler did write the line
+    assert _PLANTED not in written
+
+
+def test_a_held_line_is_still_held_and_screened_once_written() -> None:
+    log = logging.getLogger("pynetdicom.utils")
+    line = f"Invalid 'Affected SOP Instance UID' value '{_PLANTED}' - must not exceed 64 characters"
+
+    def emit(logger: logging.Logger) -> None:
+        with dicom_module._logs_held() as held:
+            logger.error(line)
+        assert len(held) == 1  # the filter still holds it
+        dicom_module._write_held(held)
+
+    written = _written(log, emit)
+    assert "value '[redacted]' - must not exceed 64 characters" in written
+    assert _PLANTED not in written

@@ -672,10 +672,10 @@ def test_a_hold_inside_another_hands_back_to_it() -> None:
     log = logging.getLogger("pynetdicom.utils")
     with dicom_module._logs_held() as outer:
         with dicom_module._logs_held() as inner:
-            log.warning("inner")
-        log.warning("outer")
-    assert [r.getMessage() for r in inner] == ["inner"]
-    assert [r.getMessage() for r in outer] == ["outer"]
+            log.warning("Network timeout reached")
+        log.warning("Association Released")
+    assert [r.getMessage() for r in inner] == ["Network timeout reached"]
+    assert [r.getMessage() for r in outer] == ["Association Released"]
     assert getattr(dicom_module._PRE_READ, "held", None) is None
 
 

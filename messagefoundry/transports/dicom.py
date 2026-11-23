@@ -547,7 +547,6 @@ _FILTERED_LOGGERS = (
     "pynetdicom.transport",
     "pynetdicom.utils",
 )
-_FILTERED_LOGGER_NAMES = frozenset(_FILTERED_LOGGERS)
 
 #: The modules whose warnings are ignored: pydicom's ``warn_and_log`` raises a ``UserWarning`` with
 #: the same text as its log line, value included, and unignored it goes to stderr, which the Windows
@@ -738,20 +737,15 @@ _PEER_VALUE_FILTER = _PeerValueFilter()
 def _screening_record_factory(previous: Callable[..., logging.LogRecord]) -> Any:
     """A log record factory that screens each record of a library logger as it is made and leaves
     every other logger's alone. This is what covers a logger no filter is on, such as one created
-    after the install, one that does not propagate, and a host with its own handlers. A record a
-    hold will catch is left for the filter, which holds it and screens it when it is written."""
+    after the install, one that does not propagate, and a host with its own handlers. A record
+    inside :func:`_logs_held` is screened here too, so a logger whose filter a host removed writes
+    no raw line; the filter still holds the record where it is on."""
 
     def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
         record = previous(*args, **kwargs)
         name = str(record.name)
         # startswith first: this runs on every record of every logger in the process.
-        if (
-            name.startswith(("pynetdicom", "pydicom"))
-            and name.partition(".")[0] in _LIBRARY_ROOTS
-            and not (
-                name in _FILTERED_LOGGER_NAMES and getattr(_PRE_READ, "held", None) is not None
-            )
-        ):
+        if name.startswith(("pynetdicom", "pydicom")) and name.partition(".")[0] in _LIBRARY_ROOTS:
             _screen_record(record)
         return record
 
