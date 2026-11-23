@@ -7710,7 +7710,9 @@ that route, they then write no `monitoring:read` grant row. A held 429 the route
 because one of those checks refused first, writes no log line. The scope and permission refusals
 write no throttled row either. The serve-hop and new-address refusals do write the held 429's
 `auth.gate_refused` row (reason `throttled`) before they are answered, so such a request leaves a
-decision row even when the refusal writes none of its own. Like every gate decision row, it is not
+decision row even when the refusal writes none of its own. That row also records what the caller
+was answered: `answered_status` (403) and `answered_reason` (`serve_hop`, or the new-address
+refusal's `step_up`). Like every gate decision row, it is not
 written for a GET while `[security].audit_all_authorization_decisions` is off. A
 reveal value that will fail validation is charged and refused at the gate like any other read.
 The limiter records no refused attempt, so once the budget is spent a reveal those checks refuse

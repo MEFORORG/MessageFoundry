@@ -5728,18 +5728,14 @@ def create_app(
         # serve hop and the new address), and each is answered as before pacing. With the budget
         # spent none of them writes the monitoring:read grant row main wrote: the scope and
         # permission refusals write only their denial row (owner ruling 2026-11-23). Every hop or
-        # new-address refusal also writes the held throttled row before it propagates, where the
-        # gate records decisions: the hop refusal writes no row of its own and a repeated
-        # new-address row is deduped, so without it such a request would leave no decision row
-        # (vault BACKLOG #1191). A scoped caller's dashboard carries no outbound rows at all.
+        # new-address refusal also writes the held throttled row, naming the 403 and the reason it
+        # answered with, before it propagates, where the gate records decisions: the hop refusal
+        # writes no row of its own and a repeated new-address row is deduped, so without it such
+        # a request would leave no decision row (vault BACKLOG #1191). A scoped caller's dashboard
+        # carries no outbound rows at all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
-            await _refuse_reveal_without_view_summary(request, identity)
-            try:
-                await _refuse_reveal_phi_read(request)
-            except HTTPException:
-                await record_deferred_monitoring_refusal(request)
-                raise
+            await _refuse_reveal(request, identity)
         await raise_deferred_monitoring_refusal(request)
         if reveal is not None:
             _charge_reveal(request, identity)
@@ -5798,8 +5794,8 @@ def create_app(
     ) -> list[ConnectionRow]:
         """The dashboard rows, channel-scoped, with ``error`` gated and masked on every row and
         lifted on the rows of the ONE connection ``reveal`` names (BACKLOG #2443). The caller has
-        already passed the refusals of :func:`_refuse_reveal` and :func:`_charge_reveal` for any
-        ``reveal``; the stats socket passes none."""
+        already passed :func:`_refuse_reveal` and :func:`_charge_reveal` for any ``reveal``; the
+        stats socket passes none."""
         rows = await _connection_rows(engine, identity)
         if reveal is None:  # the stats socket, every second, and every bare load
             return [redact_unauthorized(r, identity) for r in rows]
@@ -6802,8 +6798,8 @@ def create_app(
         ``messages:view_summary`` data (BACKLOG #2443). ``reveal`` is an event or alert id, or a
         connection name on ``GET /connections`` and, for its ``reveal=true`` flag, on
         ``GET /connections/{name}/metadata``. ``GET /connections`` does not call this: it calls
-        the parts of :func:`_refuse_reveal` itself, then raises any held monitoring-read 429,
-        then :func:`_charge_reveal`. A caller without that permission is refused,
+        :func:`_refuse_reveal`, then raises any held monitoring-read 429, then
+        :func:`_charge_reveal`. A caller without that permission is refused,
         and the refusal is audited as
         ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
         also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
@@ -6822,19 +6818,32 @@ def create_app(
         return not (_matched_route_path(request) or "").startswith("/ui/")
 
     async def _refuse_reveal(request: Request, identity: Identity) -> None:
-        """The refusals of :func:`_admit_reveal`, without its PHI-read charge. ``GET
-        /connections`` calls its two parts itself, to answer them before a held
-        monitoring-read 429."""
+        """The refusals of :func:`_admit_reveal`, without its PHI-read charge, so ``GET
+        /connections`` can answer them before a held monitoring-read 429."""
         await _refuse_reveal_without_view_summary(request, identity)
         await _refuse_reveal_phi_read(request)
 
     async def _refuse_reveal_phi_read(request: Request) -> None:
-        """The PHI-read refusals of a reveal over HTTP: the serve hop and the new address."""
-        if _reveal_over_http(request):
+        """The PHI-read refusals of a reveal over HTTP: the serve hop and the new address.
+
+        Where a monitoring-read 429 is held for the request (``GET /connections``), each refusal
+        writes that held decision's throttled row, recording the 403 it answers and its own
+        reason, before it propagates (:func:`record_deferred_monitoring_refusal`); elsewhere
+        that call is a no-op."""
+        if not _reveal_over_http(request):
+            return
+        try:
             enforce_phi_read_hop(request)
-            # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
-            # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+        except HTTPException as refused:
+            await record_deferred_monitoring_refusal(request, refused, answered_reason="serve_hop")
+            raise
+        # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
+        # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+        try:
             await refuse_from_new_address(request)
+        except HTTPException as refused:
+            await record_deferred_monitoring_refusal(request, refused)
+            raise
 
     def _charge_reveal(request: Request, identity: Identity) -> None:
         """The PHI-read charge of :func:`_admit_reveal`, run after :func:`_refuse_reveal`."""

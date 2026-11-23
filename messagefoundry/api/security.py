@@ -2092,12 +2092,18 @@ async def raise_deferred_monitoring_refusal(request: Request) -> None:
     raise held.refusal
 
 
-async def record_deferred_monitoring_refusal(request: Request) -> None:
+async def record_deferred_monitoring_refusal(
+    request: Request, answered: HTTPException, *, answered_reason: str | None = None
+) -> None:
     """Write the ``auth.gate_refused`` row (reason ``throttled``) of a monitoring-read 429 a
     :func:`require_monitoring_read` gate held for this request, and drop the held refusal, without
-    raising it or logging it. For a route body whose own refusal is about to propagate in place of
-    the held 429 and may write no denial row of its own, at least the serve-hop refusal and a
-    new-address refusal whose row was deduped. The row is written only where
+    raising it or logging it. For a route body whose own refusal ``answered`` is about to
+    propagate in place of the held 429 and may write no denial row of its own, at least the
+    serve-hop refusal and a new-address refusal whose row was deduped.
+
+    The row keeps the throttle fact and also records what the caller was answered:
+    ``answered_status`` is ``answered``'s status, and ``answered_reason`` is ``answered_reason``
+    where given, else the reason a :class:`_GateRefusal` carries. It is written only where
     :func:`_audited_permission` names one, as on the gate's own refusals. A no-op where nothing is
     held."""
     held = getattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR, None)
@@ -2105,8 +2111,19 @@ async def record_deferred_monitoring_refusal(request: Request) -> None:
         return
     delattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR)
     decision = held.decision
-    await _record_gate_refusal(
-        request, decision.auth, decision.identity, decision.permissions, held.refusal
+    audited = _audited_permission(request, decision.permissions)
+    if audited is None:
+        return
+    if answered_reason is None and isinstance(answered, _GateRefusal):
+        answered_reason = answered.reason
+    await decision.auth.audit_gate_refused(
+        decision.identity,
+        audited,
+        request.url.path,
+        reason=held.refusal.reason,
+        client=client_ip(request),
+        answered_status=answered.status_code,
+        answered_reason=answered_reason,
     )
 
 

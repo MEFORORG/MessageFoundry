@@ -22158,10 +22158,16 @@ class AuthService:
         *,
         reason: str,
         client: str | None,
+        answered_status: int | None = None,
+        answered_reason: str | None = None,
     ) -> None:
         """Audit a request refused by a check its gate makes AFTER the permission check passed
         (BACKLOG #1197, ASVS 16.3.2), such as a stale step-up (``reason`` ``step_up``) or the
         per-actor pacing (``throttled``).
+
+        ``answered_status`` and ``answered_reason``, when given, record a different refusal the
+        caller was actually answered with, as when a held monitoring-read 429 is recorded but a
+        route's own refusal is returned in its place (vault BACKLOG #1191).
 
         The caller holds ``permission``, so this is not :meth:`audit_permission_denied`: that row
         says the permission was missing, and the denial-burst detector counts it.
@@ -22171,7 +22177,14 @@ class AuthService:
         await self._audit(
             "auth.gate_refused",
             actor=identity.username,
-            detail=_json({"permission": permission.value, "path": path, "reason": reason}),
+            detail=_json(
+                {"permission": permission.value, "path": path, "reason": reason}
+                | (
+                    {}
+                    if answered_status is None
+                    else {"answered_status": answered_status, "answered_reason": answered_reason}
+                )
+            ),
             client=client,
         )
 

@@ -313,9 +313,12 @@ async def test_a_reveal_from_a_new_address_is_refused_for_it_with_the_budget_spe
         "10.9.9.9"
     ]
     on_path = _decisions_on(rows, "/connections")
-    assert [(a, d.get("reason")) for a, d in on_path] == [
-        ("auth.gate_refused", "throttled"),
-        ("auth.gate_refused", "throttled"),
+    # Each row keeps the throttle fact, and records what the caller was actually answered.
+    assert [
+        (a, d.get("reason"), d.get("answered_status"), d.get("answered_reason")) for a, d in on_path
+    ] == [
+        ("auth.gate_refused", "throttled", 403, "step_up"),
+        ("auth.gate_refused", "throttled", 403, "step_up"),
     ], on_path
 
 
@@ -334,7 +337,9 @@ async def test_a_serve_hop_refusal_over_the_budget_writes_a_throttled_row(engine
         assert "PHI read refused" in refused.json()["detail"]
     rows = await engine.store.list_audit(limit=1000)
     on_path = _decisions_on(rows, "/connections")
-    assert [(a, d.get("reason")) for a, d in on_path] == [("auth.gate_refused", "throttled")]
+    assert [
+        (a, d.get("reason"), d.get("answered_status"), d.get("answered_reason")) for a, d in on_path
+    ] == [("auth.gate_refused", "throttled", 403, "serve_hop")], on_path
 
 
 async def test_an_invalid_reveal_over_the_budget_writes_a_decision_row(engine: Engine) -> None:
