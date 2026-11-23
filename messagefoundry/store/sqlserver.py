@@ -6948,6 +6948,28 @@ class SqlServerStore:
         for mid in sorted(set(message_ids)):
             await self._applock(cur, f"mefor:finalize:{mid}")
 
+    async def _prepare_orphan_dead_letters(
+        self, orphans: Sequence[Any], error: str, now: float, *, by_destination: bool
+    ) -> list[tuple[Any, str | None, tuple[str, tuple[Any, ...]] | None]]:
+        """For each startup orphan row ``(id, message_id, name)``: the row, its sealed
+        ``last_error``, and its ``dead`` event statement (``None`` when the verbosity gate drops it),
+        the event naming the row's destination when ``by_destination``.
+
+        A sweep calls this BEFORE :meth:`_lock_finalize_batch`, so the finalize applocks it then
+        holds to the commit never wait on the Transit pool (BACKLOG #3929)."""
+        prepared: list[tuple[Any, str | None, tuple[str, tuple[Any, ...]] | None]] = []
+        for row in orphans:
+            last_error = await self._aenc(error, aad=cell_aad("queue", "last_error", row[0]))
+
+            # The defaults bind this row's values. Why a call, not the bound method: see _event.
+            def build(
+                mid: str = row[1], dest: str | None = row[2] if by_destination else None
+            ) -> tuple[str, tuple[Any, ...]]:
+                return self._event_stmt(mid, "dead", dest, error, now)
+
+            prepared.append((row, last_error, await self._prepare_event("dead", error, build)))
+        return prepared
+
     async def _maybe_finalize(self, cur: Any, message_id: str, now: float) -> None:
         """Recompute and persist a message's terminal disposition — the SOLE authority for it. Scans
         ALL stages of ``queue`` so a delivered handler can't finalize the message while a sibling
@@ -7761,18 +7783,22 @@ class SqlServerStore:
                     await self._insert_outbound(
                         cur, message_id, channel_id, dest_name, payload, now
                     )
-                await self._applock(cur, f"mefor:finalize:{message_id}")
-                await cur.execute(
-                    "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
-                )
                 event = {
                     MessageStatus.ROUTED: "routed",
                     MessageStatus.FILTERED: "filtered",
                     MessageStatus.UNROUTED: "unrouted",
                 }.get(disposition, "routed")
-                await self._event(
-                    cur, message_id, event, None, f"{len(deliveries)} destination(s)", now
+                detail = f"{len(deliveries)} destination(s)"
+                # Built before the finalize applock, which then never waits on the Transit pool.
+                built = await self._prepare_event(
+                    event, detail, lambda: self._event_stmt(message_id, event, None, detail, now)
                 )
+                await self._applock(cur, f"mefor:finalize:{message_id}")
+                await cur.execute(
+                    "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
+                )
+                if built is not None:
+                    await cur.execute(*built)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -7828,13 +7854,19 @@ class SqlServerStore:
                     await self._insert_routed(
                         cur, message_id, channel_id, handler_name, payload, now
                     )
+                event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
+                detail = f"{len(handlers)} handler(s)"
+                # Built before the finalize applock, which then never waits on the Transit pool.
+                built = await self._prepare_event(
+                    event, detail, lambda: self._event_stmt(message_id, event, None, detail, now)
+                )
                 await self._applock(cur, f"mefor:finalize:{message_id}")
                 await cur.execute(
                     _SQL_UPDATE_MESSAGE_STATUS,
                     _update_message_status_params(disposition.value, message_id),
                 )
-                event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
-                await self._event(cur, message_id, event, None, f"{len(handlers)} handler(s)", now)
+                if built is not None:
+                    await cur.execute(*built)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -7903,6 +7935,15 @@ class SqlServerStore:
                         ),
                     )
                     self.body_copies += 1  # A1: parity with the unbatched _insert_routed (H copies)
+                event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
+                detail = f"{len(handlers)} handler(s)"
+                # Built before the finalize applock, which then never waits on the Transit pool. The
+                # #63 verbosity gate can't no-op inside _event_stmt (it always builds the statement), so
+                # a dropped event OMITS the batch member; the messages.status UPDATE is unaffected
+                # (count-and-log is separate). Why a lambda: see _event.
+                built = await self._prepare_event(
+                    event, detail, lambda: self._event_stmt(message_id, event, None, detail, now)
+                )
                 # applock is a result-consuming GATE: it closes the inserts' group; rc<0 raises -> rollback.
                 arow = await acc.read_one(_SQL_APPLOCK, _applock_params(resource, timeout_ms))
                 _applock_result(arow, resource)
@@ -7910,23 +7951,8 @@ class SqlServerStore:
                     _SQL_UPDATE_MESSAGE_STATUS,
                     _update_message_status_params(disposition.value, message_id),
                 )
-                event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
-                # #63 verbosity gate — can't no-op inside _event_stmt (it always builds the statement),
-                # so conditionally OMIT the batch member. The messages.status UPDATE above is unaffected
-                # (count-and-log is separate).
-                if should_record_event(event, self._message_events):
-                    # Built on the loop, as the bound-method form built it. Why a lambda: see _event.
-                    routed_detail = f"{len(handlers)} handler(s)"
-                    acc.add(
-                        *(
-                            await cipher_call(
-                                self._cipher,
-                                lambda: self._event_stmt(
-                                    message_id, event, None, routed_detail, now
-                                ),
-                            )
-                        )
-                    )
+                if built is not None:
+                    acc.add(*built)
                 await acc.flush()  # [UPDATE_STATUS, (INSERT_EVENT?)] as one round-trip
                 await self._commit(conn)
             except Exception:
@@ -8442,7 +8468,16 @@ class SqlServerStore:
                     # BACKLOG #5752: two rows of one message to one destination (two handlers) would read
                     # the same MAX unlocked and collide on the response PK, rolling back a delivery the
                     # partner already accepted. The per-message finalize applock, which _maybe_finalize
-                    # re-takes at the end as a no-op, serializes the read.
+                    # re-takes at the end as a no-op, serializes the read. The delivered event is built
+                    # before it, so the lock does not also wait on the Transit pool for that.
+                    delivered_detail = f"attempt {attempts} (response {outcome})"
+                    delivered = await self._prepare_event(
+                        "delivered",
+                        delivered_detail,
+                        lambda: self._event_stmt(
+                            message_id, "delivered", destination_name, delivered_detail, now
+                        ),
+                    )
                     await self._applock(cur, f"mefor:finalize:{message_id}")
                     await cur.execute(
                         "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
@@ -8550,14 +8585,8 @@ class SqlServerStore:
                         handler_name=handler_name,
                         now=now,
                     )
-                    await self._event(
-                        cur,
-                        message_id,
-                        "delivered",
-                        destination_name,
-                        f"attempt {attempts} (response {outcome})",
-                        now,
-                    )
+                    if delivered is not None:
+                        await cur.execute(*delivered)
                     # Finalizer last; preceded by the SELECT above so its applock is not the first statement.
                     await self._maybe_finalize(cur, message_id, now)
                     await self._commit(conn)
@@ -10230,22 +10259,19 @@ class SqlServerStore:
                     await self._commit(conn)
                     return 0
                 error = "handler removed from registry"
+                # Sealed and built first: the finalize applocks are then never held on the pool.
+                prepared = await self._prepare_orphan_dead_letters(
+                    orphans, error, now, by_destination=False
+                )
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
-                for row in orphans:
+                for row, last_error, built in prepared:
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
                         " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (
-                            OutboxStatus.DEAD.value,
-                            now,
-                            (
-                                await self._aenc(error, aad=cell_aad("queue", "last_error", row[0]))
-                            ),  # H4
-                            now,
-                            row[0],
-                        ),
+                        (OutboxStatus.DEAD.value, now, last_error, now, row[0]),  # H4
                     )
-                    await self._event(cur, row[1], "dead", None, error, now)
+                    if built is not None:
+                        await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
                 await self._commit(conn)
             except Exception:
@@ -10289,22 +10315,19 @@ class SqlServerStore:
                     await self._commit(conn)
                     return 0
                 error = "inbound removed from registry"
+                # Sealed and built first: the finalize applocks are then never held on the pool.
+                prepared = await self._prepare_orphan_dead_letters(
+                    orphans, error, now, by_destination=False
+                )
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
-                for row in orphans:
+                for row, last_error, built in prepared:
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
                         " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (
-                            OutboxStatus.DEAD.value,
-                            now,
-                            (
-                                await self._aenc(error, aad=cell_aad("queue", "last_error", row[0]))
-                            ),  # H4
-                            now,
-                            row[0],
-                        ),
+                        (OutboxStatus.DEAD.value, now, last_error, now, row[0]),  # H4
                     )
-                    await self._event(cur, row[1], "dead", None, error, now)
+                    if built is not None:
+                        await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
                 await self._commit(conn)
             except Exception:
@@ -13325,22 +13348,19 @@ class SqlServerStore:
                     await self._commit_read(conn)  # read-only release (M-6), uncounted (A1)
                     return 0
                 error = "destination removed from outbound registry"
+                # Sealed and built first: the finalize applocks are then never held on the pool.
+                prepared = await self._prepare_orphan_dead_letters(
+                    orphans, error, now, by_destination=True
+                )
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
-                for row in orphans:
+                for row, last_error, built in prepared:
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
                         " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (
-                            OutboxStatus.DEAD.value,
-                            now,
-                            (
-                                await self._aenc(error, aad=cell_aad("queue", "last_error", row[0]))
-                            ),  # H4
-                            now,
-                            row[0],
-                        ),
+                        (OutboxStatus.DEAD.value, now, last_error, now, row[0]),  # H4
                     )
-                    await self._event(cur, row[1], "dead", row[2], error, now)
+                    if built is not None:
+                        await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
                 await self._commit(conn)
             except Exception:
