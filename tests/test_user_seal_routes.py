@@ -19,10 +19,9 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import re
-import types
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import httpx
 import pytest
@@ -470,8 +469,8 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     for fact in (
         "`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`",
-        "only the first refusal under a report key in each report interval",
-        "writes no `integrity.authority_seal_failed` row and raises no alert",
+        "only the first refusal of an account in each report interval",
+        "adds no row and no alert",
         "one absent on a re-read reads as gone",
         "A row still there after every check raced fails closed",
         "One that keeps changing the row's own `id` still can",
@@ -490,14 +489,13 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         assert "audit row and alert" not in row and "audited and alerted" not in row, row
 
 
-#: The console sentences this PR's code change needs in that statement (Lander hold 7090810151):
-#: the users list links a failing account's delete, for a ``users:manage`` holder only, to the
-#: confirmation page, which shows a page in place of the 423 its checked read answers for that
-#: record, inside the report interval or not and for a record Vault transit cannot verify too; and
-#: the post-action pages' fallback is stated once, in ``_shown_name``'s docstring, which this
-#: statement points at. Lander hold 7091484059 added the two answer sentences the confirmation
-#: made false, which are not console sentences, and the page's own-account case.
-#: Case-insensitive regexes over the whitespace-normalised statement.
+#: The console sentences this PR's code change needs in that statement (Lander hold 7090810151,
+#: narrowed by decision d20261123T104714846-26b436 to main's text plus these): the users list
+#: links a failing account's delete, for a ``users:manage`` holder only, to the confirmation page,
+#: which shows a page in place of the 423 its checked read answers for that record; the page's
+#: own-account case; and the interval sentence, which main had answering every refusal 423 or
+#: listed as failed, names the confirmation's page. Case-insensitive regexes over the
+#: whitespace-normalised statement.
 _CONSOLE_SENTENCES = {
     "the list's delete is the confirmation's, for users:manage": (
         r"to a caller holding `users:manage` it links that account's delete to "
@@ -508,36 +506,10 @@ _CONSOLE_SENTENCES = {
         r"confirmation naming the id alone rather than the 423 this paragraph gives a failing "
         r"record"
     ),
-    "the post-action fallback points at _shown_name": (
-        r"rather than answering 423\. What those pages show and log when that read fails is "
-        r"stated in the docstring of `_shown_name`"
-    ),
-    # Lander hold 7091484059: the confirmation catches the 423 and answers 200, so the two
-    # sentences that said every refusal answers 423 or is listed as failed were narrowed, and the
-    # page's own-account case is stated. Lander hold 7095706239: the interval sentence names the
-    # confirmation beside its deferral, the Vault transit one says the record is refused at its
-    # first check, and the report key is the part and the id.
-    "the interval sentence defers to the per-route answers": (
-        r"gets the answer its reader gives a failing record, which is not a 423 at least for "
-        r"`GET /ui/users/\{user_id\}/delete-confirm`"
-    ),
-    "the Vault transit sentence says the record is refused at its first check": (
-        r"a record Vault transit cannot verify is refused at the first check that cannot verify "
-        r"it, rather than after two failing reads, and then gets the answer its reader gives a "
-        r"failing record\. It is reported under `integrity\.authority_seal_unverifiable`"
-    ),
-    "the report key is user and the read row's id": (
-        r"These reads report it under the key `user:` followed by the id of the row they read, "
-        r"which `AuthService\._user_seal_failed` builds; a record Vault transit cannot verify is "
-        r"reported apart, on a key and an interval of its own"
-    ),
-    "the unverifiable report key": (
-        r"on a report key of its own, `unverifiable:user:` followed by the account's id, which "
-        r"`AuthService\._user_seal_unverifiable` builds"
-    ),
-    "the single-check refusals are a floor": (
-        r"except at least these, refused at a single failing check: a record Vault transit "
-        r"cannot verify"
+    # Lander hold 7091484059: the confirmation catches the 423 and answers 200, so the sentence
+    # that said every refusal inside the interval answers 423 or is listed as failed names it.
+    "the interval sentence names the confirmation's page": (
+        r"answers 423, lists the account as failed or, on the delete confirmation, shows its page"
     ),
     "the confirmation for the caller's own account has no form": (
         r"Where the id in its path is the caller's own, that page shows a note that the caller "
@@ -545,9 +517,10 @@ _CONSOLE_SENTENCES = {
     ),
 }
 
-#: The pre-hold wording of those two sentences (Lander hold 7091484059), each regex beside the
-#: sentence it was written against: it must match that sentence, its positive control, and must
-#: not match the statement, since the confirmation answers 200 rather than either.
+#: Main's wording of the interval and Vault transit sentences (Lander hold 7091484059), each
+#: regex beside the sentence it was written against: it must match that sentence, its positive
+#: control, and must not match the statement, since the confirmation answers 200 rather than
+#: either.
 _UNSCOPED = {
     r"answers 423 or lists the account as failed": (
         "A refusal inside that interval, from any of these routes or any other reader of the same "
@@ -557,32 +530,6 @@ _UNSCOPED = {
     r"answered the same way, a 423 or listed as failed": (
         "a record Vault transit cannot verify is answered the same way, a 423 or listed as "
         "failed, but reported under `integrity.authority_seal_unverifiable`"
-    ),
-}
-
-#: Overclaims Lander hold 7095706239 asked to keep out of the statement, restored from this
-#: branch's earlier bans and widened to the wording the hold found: each regex with the earlier
-#: sentences it was written against, every one of which it must match, as its positive controls.
-#: The throttle keys on ``user:`` and the read row's id (``AuthService._user_seal_failed``), and
-#: an unverifiable record on a key of its own, not on the account alone; a record Vault transit
-#: cannot verify is refused at the first check it cannot verify, not after two failing reads; and
-#: that is not the only such case.
-_REMOVED: dict[str, tuple[str, tuple[str, ...]]] = {
-    "any reader of the same account": (
-        r"other reader of the same account",
-        ("from any of these routes or any other reader of the same account in that process",),
-    ),
-    "an unverifiable record answered as a failing one": (
-        r"cannot verify[^.;]*answered as a (failing record|record that fails its seal)",
-        (
-            "a record Vault transit cannot verify is answered as a failing record is, but reported",
-            "a record Vault transit cannot verify is refused at the first check that cannot verify "
-            "it, with no further read, and then answered as a record that fails its seal is",
-        ),
-    ),
-    "a counted exception": (
-        r"(?<!at least )\bone exception\b",
-        ("One exception: a `users` row with a timestamp or counter cell that does not parse",),
     ),
 }
 
@@ -608,37 +555,3 @@ def test_the_security_doc_does_not_state_the_423_without_the_confirmation(overcl
     text = _SECURITY_MD.read_text("utf-8")
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     assert not re.search(overclaim, body, re.IGNORECASE), overclaim
-
-
-class _KeyRecorder:
-    """A stand-in for the service's seal-failure throttle: records each key and reports none."""
-
-    def __init__(self) -> None:
-        self.keys: list[str] = []
-
-    def due(self, key: str) -> bool:
-        self.keys.append(key)
-        return False
-
-
-async def test_the_report_keys_the_security_doc_names_are_the_ones_the_throttle_receives() -> None:
-    """The statement names two report keys by the methods that build them (Lander hold
-    7095706239): the throttle receives ``user:<id>`` from a failing record and
-    ``unverifiable:user:<id>`` from one Vault transit cannot verify. Each method is run on a
-    stand-in service whose throttle reports nothing, so neither writes, logs or pages."""
-    recorder = _KeyRecorder()
-    service: Any = types.SimpleNamespace(_seal_failures_reported=recorder)
-    service._report_seal_failure = types.MethodType(AuthService._report_seal_failure, service)
-    await AuthService._user_seal_failed(service, "u1")
-    await AuthService._user_seal_unverifiable(service, "u1", cast(Any, None))
-    assert recorder.keys == ["user:u1", "unverifiable:user:u1"]
-
-
-@pytest.mark.parametrize("name", sorted(_REMOVED))
-def test_the_security_doc_drops_the_overclaim(name: str) -> None:
-    shape, controls = _REMOVED[name]
-    for control in controls:
-        assert re.search(shape, control, re.IGNORECASE), (name, control)
-    text = _SECURITY_MD.read_text("utf-8")
-    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
-    assert not re.search(shape, body, re.IGNORECASE), name

@@ -1702,32 +1702,21 @@ caller cannot delete their own account, and no delete form.
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
 account's name the same way; when the record fails its seal, they name the account by its id and
-still show what was issued, rather than answering 423. What those pages show and log when that
-read fails is stated in the docstring of `_shown_name` in
-[`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
-A failing record is reported
-and rate-limited per report key, in each engine process: only the first refusal under a report
-key in each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) is reported, and
-the report logs a WARNING, writes the `integrity.authority_seal_failed` audit row and raises the
-`integrity_drift` alert. These reads report it under the key `user:` followed by the id of the
-row they read, which `AuthService._user_seal_failed` builds; a record Vault transit cannot verify
-is reported apart, on a key and an interval of its own, as this paragraph says below. A later
-refusal under the same key inside that interval,
-from any of these routes or any other reader in that process, gets the answer its reader gives a
-failing record, which is not a 423 at least for `GET /ui/users/{user_id}/delete-confirm` and the
-console pages shown after something was issued, both stated above, and writes no
-`integrity.authority_seal_failed` row and raises no alert.
-Each engine
+still show what was issued, rather than answering 423. A failure is reported
+per account and rate-limited, in each engine process: only the first refusal of an account in
+each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
+the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
+inside that interval, from any of these routes or any other reader of the same account in that
+process, answers 423, lists the account as failed or, on the delete confirmation, shows its page,
+and adds no row and no alert. Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
 so an account it forgot is reported again on its next refusal. A
-record is refused after two failing reads that name the same account, or when it fails closed as
-this paragraph says below, except at least these, refused at a single failing check: a record
-Vault transit cannot verify, as this paragraph says below, and a `users` row with a timestamp or
-counter cell that does not parse, on the first read, with no re-read, on a store with or without
-an integrity key.
-A list read lists such a `users` row as failing even when the row is restored before its check,
+record is refused only after two failing reads that name the same account, or when it fails
+closed as this paragraph says below. One exception: a `users` row with a timestamp or counter cell
+that does not parse is refused on the first read, with no re-read, on a store with or without an
+integrity key, and a list read lists it as failing even when the row is restored before its check,
 or leaves it out when its id cell is empty or not text (BACKLOG #5505). A `totp_recovery_codes` cell that does not parse as a JSON list reads as
 holding no codes; on a store with an integrity key, one changed outside the store fails the
 record's seal first. A check whose row is
@@ -1749,11 +1738,9 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-refused at the first check that cannot verify it, rather than after two failing reads, and then
-gets the answer its reader gives a failing record. It is reported under
-`integrity.authority_seal_unverifiable` rather than `integrity.authority_seal_failed`, and paged
-under its own capped subject, on a report key of its own, `unverifiable:user:` followed by the
-account's id, which `AuthService._user_seal_unverifiable` builds, and an interval of its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
+answered the same way, but reported under
+`integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
+its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
 lists nothing, pages `authority-seal-transit` and writes no audit row.
 
 A custom role save checks the role name (BACKLOG #5785) after its gate. Where
