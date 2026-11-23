@@ -823,7 +823,8 @@ _UNSCANNABLE_RE_PATTERNS = {
     #
     # Read on 2026-11-23 by running this file's own matchers over every built pattern:
     # ``_has_nested_quantifier`` flagged none. The patterns are applied with ``fullmatch``, at
-    # ``_screened_line`` in ``transports/dicom.py``. A template has at most two unbounded runs. Where
+    # ``_screened_line`` in ``transports/dicom.py``. They are safe only under ``fullmatch``: at least
+    # one is slow under ``.search``. A template has at most two unbounded runs. Where
     # it has two, they cannot trade characters: ``quoted_uid`` stops at the quote that follows it,
     # and ``{indent}{hex_dump}`` is spaces then a hex digit.
     "messagefoundry/transports/_dicom_log_lines.py": ("''.join(parts)",),
