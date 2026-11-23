@@ -447,8 +447,9 @@ class AlertTransport(Protocol):
     :meth:`NotifierAlertSink._handle` counts a send that returned as delivered (BACKLOG #5907 step
     4): a send that swallows its own failure reads as delivered.
     A send that raises ``CancelledError`` without the drain being cancelled loses that transport's
-    alert, logged, and the siblings go on. A send must end promptly once cancelled: on a drain
-    cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
+    alert, logged, and the siblings go on. A send must end promptly once cancelled, and end it by
+    raising ``CancelledError``, since a send that returns reads as having taken the alert: on a
+    drain cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
     ``aclose()``.
 
     ``recipients`` (#146) is the per-rule EMAIL recipient override the matching rule carried (``None`` =
@@ -2683,9 +2684,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         siblings do or when. A sibling that failed fast and one the drain's cancel cut count alike,
         and a send left running past the cut's grace that then returns takes the alert off then.
         A send the cut ended before it returned does not count, even if its channel took the
-        alert: a send through ``asyncio.to_thread``, as both shipped transports' are, ends at once
-        on the cancel while its worker thread runs on, and a delivery that thread then makes is
-        not counted."""
+        alert: a send through ``asyncio.to_thread``, as at least :class:`WebhookTransport`'s and
+        :class:`EmailTransport`'s are, ends at once on the cancel while its worker thread runs on,
+        and a delivery that thread then makes is not counted."""
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
         # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.
@@ -2786,11 +2787,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 event.get("connection"),
             )
             return
-        sends = [asyncio.create_task(deliver(t)) for t in chosen]
+        sends = [asyncio.create_task(deliver(t), name=t.name) for t in chosen]
         try:
             await asyncio.wait(sends)
         except asyncio.CancelledError:
-            await self._cut_sends(sends, chosen)
+            await self._cut_sends(sends)
             raise
         escaped: list[BaseException] = []
         for transport, task in zip(chosen, sends, strict=True):
@@ -2810,20 +2811,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if escaped:
             raise escaped[0]  # what deliver let out, raised once every send has ended
 
-    async def _cut_sends(
-        self,
-        sends: list[asyncio.Task[None]],
-        chosen: list[AlertTransport],
-    ) -> None:
+    async def _cut_sends(self, sends: list[asyncio.Task[None]]) -> None:
         """The drain was cancelled during an event's sends (BACKLOG #5907): pass the cancel on to
         each, every repeat of it too, and wait at most :data:`_DRAIN_CANCEL_GRACE_SECONDS` for
-        them to end. The transports whose send was still running are named in one WARNING, as a
-        failed send is, and a send still running after the grace is left, held and counted in
-        another."""
-        running = [t.name for t, task in zip(chosen, sends, strict=True) if not task.done()]
+        them to end. The transports whose send was still running at the cancel are named in one
+        WARNING, which says nothing of how each send then ends, and a send still running after the
+        grace is left, held and counted in another."""
+        running = [task.get_name() for task in sends if not task.done()]  # named by _handle
         if running:
             # Transport names only, nothing of the alert, as the left-send line below is a count.
-            log.warning("alert transport(s) %s cut with the drain", ", ".join(running))
+            log.warning(
+                "alert transport(s) %s still sending when the drain was cancelled",
+                ", ".join(running),
+            )
         for task in sends:
             task.cancel()
             task.add_done_callback(self._settle_cut_send)

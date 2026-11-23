@@ -446,13 +446,17 @@ async def test_an_alert_the_email_took_counts_as_delivered_whatever_the_webhook_
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the email took it
     assert sink.undelivered == 0
-    assert "not confirmed delivered" not in caplog.text
     if webhook_kind == "hangs-until-cut":
         assert webhook.entered.is_set()  # the control: the webhook did hang
-        assert "alert transport(s) webhook cut with the drain" in caplog.text
+        assert (
+            "alert transport(s) webhook still sending when the drain was cancelled" in caplog.text
+        )
+        assert "did not drain" in caplog.text  # the unwind still logs the cut
+        assert "0 alert(s) not confirmed delivered" in caplog.text
     else:
         assert webhook.calls == 1  # the control: the webhook did run and fail
         assert "alert transport webhook failed" in caplog.text
+        assert "did not drain" not in caplog.text
 
 
 class _CancelIgnoringEmail(_HealthyEmail):
@@ -481,13 +485,13 @@ async def test_a_send_left_past_the_cut_takes_the_alert_off_when_it_takes_it() -
     sink = NotifierAlertSink([email])
     sink.start()
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
-    await asyncio.wait_for(email.entered.wait(), 5.0)
-    task = sink._task
-    assert task is not None
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
     try:
+        await asyncio.wait_for(email.entered.wait(), 5.0)
+        task = sink._task
+        assert task is not None
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5.0)
         assert sink.undelivered == 1  # cut, and nothing had taken it
         assert len(sink._left_sends) == 1  # the control: the send was left running
     finally:
