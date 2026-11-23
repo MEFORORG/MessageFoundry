@@ -2612,9 +2612,10 @@ _PASSTHROUGH_DECORATORS: Final = frozenset(
 )
 #: Decorators that may be called first, the call returning the decorator itself.
 _CALLED_DECORATORS: Final = frozenset({"functools.wraps", "functools.lru_cache", "pytest.fixture"})
-#: Shape decorators whose result is a plain function, the kind of object a bare def makes, that
-#: hands a call on to what they wrap, so the kind of object bound tells nothing;
-#: :attr:`_Reading.outer` reads them as :data:`_UNNAMED`.
+#: Shape decorators that hand a call on to what they wrap. ``singledispatch`` returns a plain
+#: function, the kind of object a bare def makes; ``singledispatchmethod`` returns a
+#: ``singledispatchmethod`` descriptor, not a function. :attr:`_Reading.outer` reads both as
+#: :data:`_UNNAMED`.
 _DELEGATING_DECORATORS: Final = frozenset(
     {"functools.singledispatch", "functools.singledispatchmethod"}
 )
