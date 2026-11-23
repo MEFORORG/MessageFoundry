@@ -582,6 +582,114 @@ class _ThreadClient:
         self.release.atexit = False
 
 
+#: How long after a failed token renewal the next attempt is made, in seconds (BACKLOG #5609).
+_RENEW_RETRY_S = 60.0
+
+
+def _int_field(mapping: object, key: str) -> int | None:
+    """``mapping[key]`` when ``mapping`` is a mapping and the value a real int, else ``None``."""
+    value = mapping.get(key) if isinstance(mapping, Mapping) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _renewable(mapping: object) -> bool:
+    """Whether a Vault token reply says ``renewable: true``; anything else reads as not renewable."""
+    return isinstance(mapping, Mapping) and mapping.get("renewable") is True
+
+
+class _TokenRenewal:
+    """Renews the store token for a cipher that outlives the token's TTL (BACKLOG #5609).
+
+    :func:`build_transit_cipher` reads the token once, so without this a periodic token, or a
+    renewable token with a TTL, would lapse in a long-running ``serve`` and every Transit call
+    after that would be refused until the store was opened again. :meth:`start` reads the token's
+    TTL and renewability with ``auth/token/lookup-self``. A renewable token with a TTL is then
+    renewed with ``auth/token/renew-self`` once half of its remaining TTL has passed, on the next
+    Transit call after that. A token with no TTL is not renewed, because it does not expire. A
+    token that is not renewable is not renewed either, and that is logged at WARNING once, with
+    its TTL. Vault still ends any token at its max TTL; this does not change that.
+
+    A renewal runs on whichever thread's call finds it due, with that thread's client, and at most
+    one runs at a time; other threads go on without waiting. A failed lookup or renewal is logged
+    by its exception class alone, rate-limited, and never fails the Transit call that ran it: a
+    failed renewal is tried again after :data:`_RENEW_RETRY_S`, or after half the TTL the token
+    has left when that is sooner."""
+
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        self._clock = time.monotonic if clock is None else clock
+        self._lock = threading.Lock()
+        #: When the next renewal is due, on ``clock``; ``None`` when none is to be made.
+        self._next_at: float | None = None
+        #: When the token lapses unless renewed, as last read, on ``clock``.
+        self._expires_at = 0.0
+
+    def start(self, client: Any) -> None:
+        """Read the token's TTL and renewability, and schedule its first renewal."""
+        try:
+            response: Any = client.auth.token.lookup_self()
+        except Exception as exc:  # noqa: BLE001 -- logged by class; the cipher still serves
+            name = type(exc).__name__
+            _warn_quietly(
+                lambda: (
+                    "store Vault token: lookup-self failed (%s), so the engine does not renew the "
+                    "token; if it has a TTL, Transit calls fail once it expires",
+                    name,
+                )
+            )
+            return
+        data = response.get("data") if isinstance(response, Mapping) else None
+        self._schedule(_int_field(data, "ttl"), _renewable(data))
+
+    def _schedule(self, ttl: int | None, renewable: bool) -> None:
+        if ttl is None or ttl <= 0:
+            self._next_at = None  # no TTL: the token does not expire
+            return
+        if not renewable:
+            self._next_at = None
+            _warn_quietly(
+                lambda: (
+                    "store Vault token is not renewable and expires in %d s; Transit calls fail "
+                    "after that until the store is opened again with a new token",
+                    ttl,
+                )
+            )
+            return
+        now = self._clock()
+        self._expires_at = now + ttl
+        self._next_at = now + ttl / 2
+
+    def maybe_renew(self, client: Any) -> None:
+        """Renew the token with ``client`` when a renewal is due, else do nothing."""
+        due = self._next_at
+        if due is None or self._clock() < due:
+            return
+        if not self._lock.acquire(blocking=False):
+            return  # another thread is renewing
+        try:
+            due = self._next_at
+            if due is None or self._clock() < due:
+                return
+            try:
+                response: Any = client.auth.token.renew_self()
+            except Exception as exc:  # noqa: BLE001 -- logged by class; retried, never raised
+                now = self._clock()
+                self._next_at = now + min(_RENEW_RETRY_S, max(1.0, (self._expires_at - now) / 2))
+                kind = type(exc)
+                _warn_when_due(
+                    lambda: ("store Vault token renewal", kind),
+                    lambda: (
+                        "store Vault token renewal failed (%s); it is tried again on a later "
+                        "Transit call",
+                        kind.__name__,
+                    ),
+                )
+                return
+            auth = response.get("auth") if isinstance(response, Mapping) else None
+            self._schedule(_int_field(auth, "lease_duration"), _renewable(auth))
+        finally:
+            self._lock.release()
+
+
 class TransitCipher(_UnmarkedPolicy):
     """Bulk at-rest cipher whose crypto runs inside Vault/OpenBao Transit — the DEK never enters heap."""
 
@@ -602,7 +710,10 @@ class TransitCipher(_UnmarkedPolicy):
         *,
         allow_unmarked: bool = False,
         client_factory: Callable[[], Any] | None = None,
+        token_renewal: _TokenRenewal | None = None,
     ) -> None:
+        #: Renews the store token on a Transit call once it is due (BACKLOG #5609); ``None``: never.
+        self._token_renewal = token_renewal
         # BACKLOG #5963: requests does not document its Session as thread-safe, and this cipher is
         # called on the event loop and in worker threads. With a ``client_factory`` each thread
         # keeps its own client, ``client`` serving the thread that builds the cipher, and this
@@ -633,7 +744,14 @@ class TransitCipher(_UnmarkedPolicy):
         ``decrypt`` single and batch, read it through :meth:`_thread_client` before their request's
         handler, which turns a build failure into :func:`_build_failure`'s error. The audit-key
         paths read it where they send their request, so a build failure there meets the handling
-        a failed request does."""
+        a failed request does. A token renewal that is due runs here first, on the client returned
+        (BACKLOG #5609); it never raises."""
+        client = self._current_client()
+        if self._token_renewal is not None:
+            self._token_renewal.maybe_renew(client)
+        return client
+
+    def _current_client(self) -> Any:
         if self._client_factory is None:
             return self._shared_client
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
@@ -1450,7 +1568,8 @@ def build_transit_cipher(
     # Read once, and every client this cipher builds takes this token: the startup client below,
     # each thread's own on its first call there, and each rebuild after close_connections (BACKLOG
     # #5963). A token replaced afterwards, in the environment or the secrets directory, is not seen
-    # by any of them until the store is opened again.
+    # by any of them until the store is opened again. The token itself is renewed while it is
+    # renewable (BACKLOG #5609, _TokenRenewal).
     addr, token = store_vault_hop()
     # The CA anchor is read once too, like the address and token, and handed to every thread's own
     # client (BACKLOG #5963). Not everything is: each build still reads the settings object, and
@@ -1522,12 +1641,15 @@ def build_transit_cipher(
             f"[store].cipher_provider={PROVIDER_NAME!r} could not reach a Vault transit key "
             f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {vault_failure_text(exc)}."
         ) from exc
+    renewal = _TokenRenewal()
+    renewal.start(client)
     return TransitCipher(
         client,
         key_name,
         audit_key=audit_key,
         allow_unmarked=settings.allow_unmarked_ciphertext,
         client_factory=build_client,
+        token_renewal=renewal,
     )
 
 
@@ -1540,8 +1662,10 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
     ``transit/decrypt/<data key>``; :meth:`TransitCipher.audit_hmac` updates
     ``transit/hmac/<audit key>``, which is the data key when no audit key is set, and the audit
     walk's check (:meth:`TransitCipher.verify_audit_hmac`, BACKLOG #2720) and the row seal check
-    (:meth:`TransitCipher.verify_seal_hmac`, ADR 0217) update ``transit/verify/<audit key>``. Raises
-    :class:`KeyProviderError` when the data-key name is not set, as the cipher itself does."""
+    (:meth:`TransitCipher.verify_seal_hmac`, ADR 0217) update ``transit/verify/<audit key>``. The
+    token renewal (:class:`_TokenRenewal`, BACKLOG #5609) reads ``auth/token/lookup-self`` and
+    updates ``auth/token/renew-self``. Raises :class:`KeyProviderError` when the data-key name is
+    not set, as the cipher itself does."""
     key_name, audit_key = _key_names()
     read, update = frozenset({"read"}), frozenset({"update"})
     return {
@@ -1551,4 +1675,6 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
         f"{TRANSIT_MOUNT}/keys/{audit_key}": read,
         f"{TRANSIT_MOUNT}/hmac/{audit_key}": update,
         f"{TRANSIT_MOUNT}/verify/{audit_key}": update,
+        "auth/token/lookup-self": read,
+        "auth/token/renew-self": update,
     }

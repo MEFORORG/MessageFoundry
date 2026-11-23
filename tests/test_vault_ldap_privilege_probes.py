@@ -15,6 +15,7 @@ paths a recording fake sees the engine's own provider call, so the two cannot dr
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import logging
 import os
@@ -560,9 +561,25 @@ class _RecordingTransit:
         return {"data": {"valid": True}}
 
 
+class _RecordingToken:
+    """The token endpoints the Transit cipher's renewal calls (BACKLOG #5609), recorded alike."""
+
+    def __init__(self, transit: _RecordingTransit) -> None:
+        self._paths = transit.paths
+
+    def lookup_self(self) -> dict[str, Any]:
+        self._paths.add("auth/token/lookup-self")
+        return {"data": {"ttl": 60, "renewable": True}}
+
+    def renew_self(self) -> dict[str, Any]:
+        self._paths.add("auth/token/renew-self")
+        return {"auth": {"lease_duration": 60, "renewable": True}}
+
+
 class _TransitClient:
     def __init__(self, transit: _RecordingTransit) -> None:
         self.secrets = type("S", (), {"transit": transit})()
+        self.auth = type("A", (), {"token": _RecordingToken(transit)})()
 
 
 def test_the_kek_paths_are_the_ones_the_key_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -591,7 +608,14 @@ def test_the_transit_paths_are_the_ones_the_cipher_calls(
     else:
         monkeypatch.setenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", audit_key)
     monkeypatch.setattr(crypto_transit, "_build_client", lambda a, t, **_: _TransitClient(transit))
+    now = [0.0]
+    monkeypatch.setattr(
+        crypto_transit,
+        "_TokenRenewal",
+        functools.partial(crypto_transit._TokenRenewal, lambda: now[0]),
+    )
     cipher = crypto_transit.build_transit_cipher(StoreSettings())
+    now[0] += 31  # past half the token's 60 s TTL, so the next call renews it
     aad = cell_aad("messages", "raw", 1)
     cipher.decrypt(cipher.encrypt("synthetic", aad=aad), aad=aad)
     cipher.audit_hmac(b"synthetic row")
