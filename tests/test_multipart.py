@@ -828,6 +828,22 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-epilogue-delims": ("parsed", [("file", "a.hl7", b"MSH|body")], []),
 }
 
+#: The refusal texts #5787 adds, one per cause (multipart._locate_parts).
+_PREAMBLE_REFUSAL = (
+    "multipart body holds boundary delimiter text that does not start a line, before the first "
+    "line that starts with the delimiter"
+)
+_NO_LINE_START_REFUSAL = "multipart body holds boundary delimiter text, but none starts a line"
+_CLOSE_TAIL_REFUSAL = (
+    "multipart line that starts with the close delimiter has text after it other than spaces or "
+    "tabs"
+)
+_DELIM_TAIL_REFUSAL = (
+    "multipart line that starts with a boundary delimiter has text after it other than spaces, "
+    "tabs or the two dashes of a close; a body built with a longer boundary than its "
+    "Content-Type names can be refused this way"
+)
+
 #: The rows #5787's second half moves: delimiter text in the middle of a line after the first
 #: delimiter (now part content), a close marker with other text after it on its line, and delimiter
 #: text mid-line before the first delimiter line (both now refused).
@@ -844,16 +860,12 @@ _ANCHORED_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "close-then-epilogue": (
         "refused",
         "MultipartError",
-        "multipart close delimiter is followed by other text on its line, or the body uses "
-        "another boundary than its Content-Type names",
+        _CLOSE_TAIL_REFUSAL,
     ),
     # The first delimiter text sits mid-line, so the body is refused rather than read as empty.
-    "close-in-preamble": (
-        "refused",
-        "MultipartError",
-        "multipart body's first boundary delimiter is not at the start of a line, or the body "
-        "uses another boundary than its Content-Type names",
-    ),
+    # No delimiter text in it starts a line, so the refusal says that rather than naming a first
+    # delimiter line the body does not have.
+    "close-in-preamble": ("refused", "MultipartError", _NO_LINE_START_REFUSAL),
 }
 
 
@@ -905,15 +917,17 @@ def test_the_same_body_without_its_close_marker_is_refused(
     terminator check runs last. (``parse_single_file_upload`` refuses a no-file or two-file body
     after the walk, so an unterminated one of those now gets the terminator refusal there.) A row
     #5787 moved to a refusal keeps that refusal, except close-then-epilogue, whose unterminated form
-    has no close left to refuse and gets the terminator refusal. For the rows that keep it, this arm
-    is no control of the terminator check, since the terminated body is refused the same way."""
+    is a delimiter line with text after it and gets that refusal. For the rows that keep it, this
+    arm is no control of the terminator check, since the terminated body is refused the same way."""
     marker = _close_marker(content_type)
     unterminated = body.replace(marker, marker[:-2])
     assert marker not in unterminated
     with pytest.raises(MultipartError) as caught:
         parse_multipart_form(content_type, unterminated, max_file_bytes=1024)
     main = _ANCHORED_OUTCOMES.get(case, _MAIN_OUTCOMES[case])
-    if main[0] == "refused" and case != "close-then-epilogue":
+    if case == "close-then-epilogue":
+        assert (type(caught.value), str(caught.value)) == (MultipartError, _DELIM_TAIL_REFUSAL)
+    elif main[0] == "refused":
         assert (type(caught.value).__name__, str(caught.value)) == main[1:]
     elif case == "wk-epilogue-delims":
         assert "more parts than the limit" in str(caught.value)
@@ -1036,13 +1050,30 @@ def test_a_first_delimiter_at_a_line_start_parses(prefix: bytes) -> None:
 def test_delimiter_text_before_the_first_delimiter_line_is_refused(body: bytes) -> None:
     """Delimiter text that does not start a line, before any that does, is refused with a 400
     (BACKLOG #5787, design item b). Before #5787 that text was taken as the first delimiter, so
-    close-marker text there was taken as the close of an empty body."""
+    close-marker text there was taken as the close of an empty body. Each body has a line that
+    starts with the delimiter, so the refusal names the text before it, not the delimiter line."""
     for parse in (parse_multipart_form, parse_single_file_upload):
-        with pytest.raises(
-            MultipartError, match="first boundary delimiter is not at the start"
-        ) as c:
+        with pytest.raises(MultipartError) as c:
             parse(_CT_B, body, max_file_bytes=1024)
-        assert type(c.value) is MultipartError
+        assert (type(c.value), str(c.value)) == (MultipartError, _PREAMBLE_REFUSAL)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"pre --B-- post",
+        b" --B\r\n" + _FP + b"MSH|x",
+        b"pre--B\r\n" + _FP + b"MSH|x --B-- end",
+    ],
+    ids=["close-only-mid-line", "space-no-close", "mid-line-close"],
+)
+def test_delimiter_text_none_of_which_starts_a_line_is_refused_as_such(body: bytes) -> None:
+    """A body whose delimiter text is all mid-line has no first delimiter line to name, so its
+    refusal says no delimiter starts a line (a 400)."""
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError) as c:
+            parse(_CT_B, body, max_file_bytes=1024)
+        assert (type(c.value), str(c.value)) == (MultipartError, _NO_LINE_START_REFUSAL)
 
 
 @pytest.mark.parametrize(
@@ -1064,8 +1095,99 @@ def test_the_new_refusals_rank_after_the_size_and_part_checks(
 ) -> None:
     """A body with a part the walk reaches that breaks a size or part limit gets that refusal (413
     for an oversize file part), as before #5787, not the close-tail or first-delimiter one."""
-    with pytest.raises(MultipartError, match=message):
+    with pytest.raises(MultipartError, match=message) as caught:
         parse_multipart_form(_CT_B, make(), max_file_bytes=1024)
+    expected = MultipartError if "more parts" in message else MultipartTooLargeError
+    assert type(caught.value) is expected
+
+
+@pytest.mark.parametrize(
+    ("make", "expected"),
+    [
+        (
+            lambda: b"--B\r\n" + _FP + b"x" * 2000 + b"\r\n--Bnote\r\n" + _FP + b"y\r\n--B--",
+            MultipartTooLargeError,
+        ),
+        (
+            lambda: (
+                b"".join(b"--B\r\n" + _field("f", b"v") + b"\r\n" for _ in range(17))
+                + b"--Bnote\r\n--B--"
+            ),
+            MultipartError,
+        ),
+    ],
+    ids=["oversize", "part-cap"],
+)
+def test_the_delimiter_tail_refusal_ranks_after_the_size_and_part_checks(
+    make: Callable[[], bytes], expected: type[MultipartError]
+) -> None:
+    """The delimiter-tail refusal, like the other #5787 refusals, comes after the size and part
+    checks on the parts the walk reached before the bad line."""
+    with pytest.raises(MultipartError) as caught:
+        parse_multipart_form(_CT_B, make(), max_file_bytes=1024)
+    assert type(caught.value) is expected
+    assert str(caught.value) != _DELIM_TAIL_REFUSAL
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"--B\r\n" + _FP + b"line1\n--Bnote\nline3\r\n--B--\r\n",
+        b"--B\r\n" + _FP + b"line1\r--B\x00\r\nline3\r\n--B--\r\n",
+        b"--B \tx\r\n" + _FP + b"MSH|x\r\n--B--\r\n",
+        b"--BX\r\n" + _FP + b"MSH|x\r\n--BX--\r\n",
+    ],
+    ids=["text-in-file", "nul-after-bare-cr", "padding-then-text-first", "longer-boundary"],
+)
+def test_a_delimiter_followed_by_other_text_is_refused(body: bytes) -> None:
+    """A line that starts with ``--<boundary>`` and then anything but ``--``, padding and a line
+    end is refused with a 400, the first delimiter included. Before this check such a line was
+    read as a delimiter, which cut the file there, or for a body built with ``BX`` where ``B`` is
+    declared, refused it as truncated."""
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError) as c:
+            parse(_CT_B, body, max_file_bytes=1024)
+        assert (type(c.value), str(c.value)) == (MultipartError, _DELIM_TAIL_REFUSAL)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [b"\r\n", b"\n", b"\r\r\n", b" \t \r\n", b"\t\n"],
+    ids=["crlf", "lf", "cr-run", "padding-crlf", "padding-lf"],
+)
+def test_a_delimiter_with_padding_and_a_line_end_still_counts(tail: bytes) -> None:
+    """Padding and then a CR, an LF or a CRLF after a delimiter: each delimiter still counts, and
+    both parts are read."""
+    body = b"--B" + tail + _FP + b"1\r\n--B" + tail + _field("n", b"v") + b"\r\n--B--\r\n"
+    form = parse_multipart_form(_CT_B, body, max_file_bytes=1024)
+    assert [f.data for f in form.files] == [b"1"]
+    assert form.fields == {"n": "v"}
+
+
+def test_a_long_padding_run_after_a_delimiter_is_read_in_one_scan() -> None:
+    """The padding after a delimiter is read by one search for its end, so a long run costs the
+    walk no more Python lines than a short one. The floor: the instrument sees the parse, and it
+    sees each further delimiter line, so a per-line or per-byte loop would show."""
+
+    def lines(padding: int, fields: int = 1) -> int:
+        delim = b"--B" + b" " * padding + b"\r\n"
+        body = (
+            delim
+            + _FP
+            + b"MSH|x\r\n"
+            + b"".join(delim + _field(f"f{i}", b"v") + b"\r\n" for i in range(fields))
+            + b"--B--\r\n"
+        )
+
+        def run() -> None:
+            assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
+
+        return _python_lines(run)
+
+    short = lines(1)
+    assert short > 0  # the instrument sees the parse at all
+    assert lines(1, fields=4) > short  # and each further delimiter line costs Python lines
+    assert lines(1_000_000) == short
 
 
 @pytest.mark.parametrize(
@@ -1077,9 +1199,9 @@ def test_a_close_marker_followed_by_other_text_is_refused(tail: bytes) -> None:
     the body mid-file, so the rest of the file is not dropped."""
     body = b"--B\r\n" + _FP + b"line1\n--B--" + tail + b"\nline3\r\n--B--\r\n"
     for parse in (parse_multipart_form, parse_single_file_upload):
-        with pytest.raises(MultipartError, match="close delimiter is followed by other text") as c:
+        with pytest.raises(MultipartError) as c:
             parse(_CT_B, body, max_file_bytes=1024)
-        assert type(c.value) is MultipartError
+        assert (type(c.value), str(c.value)) == (MultipartError, _CLOSE_TAIL_REFUSAL)
 
 
 @pytest.mark.parametrize(
