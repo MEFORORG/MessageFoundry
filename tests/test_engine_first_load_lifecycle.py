@@ -279,23 +279,58 @@ async def test_an_expiry_refusal_comes_before_the_graph_starts(
         await eng.stop()
 
 
-async def test_a_cancelled_clustered_first_load_leaves_a_kept_runner_supervised(
+@pytest.mark.parametrize("still_leader", [True, False])
+async def test_a_kept_clustered_runner_is_supervised_only_on_a_standby(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, still_leader: bool
+) -> None:
+    """On a leader the supervisor would start the graph of a reload that did not apply."""
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    coord = _FlipCoordinator(leader=True)
+    eng = await _engine(tmp_path, coordinator=coord)
+    await eng.start()
+    reached = _hold_start(monkeypatch)
+    _failing_teardown(monkeypatch)
+    task = asyncio.create_task(eng._first_load(load_config(cfg), {"K": "new"}))
+    await asyncio.wait_for(reached.wait(), 15)
+    coord.leader = still_leader
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    try:
+        assert eng._registry_runner is not None
+        assert (eng._graph_supervisor is not None) is (not still_leader)
+    finally:
+        monkeypatch.undo()
+        await eng.stop()
+
+
+async def test_a_clustered_first_load_cancelled_before_its_start_installs_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = tmp_path / "cfg"
     _graph(cfg, tmp_path)
     eng = await _engine(tmp_path, coordinator=_FlipCoordinator(leader=True))
     await eng.start()
-    reached = _hold_start(monkeypatch)
-    _failing_teardown(monkeypatch)
+    before = eng._env_values
+    calls = _record_starts(monkeypatch)
+    in_bring_up = asyncio.Event()
+
+    async def held(*args: Any, **kwargs: Any) -> Any:
+        in_bring_up.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(eng.store, "dead_letter_missing_destinations", held)
     task = asyncio.create_task(eng._first_load(load_config(cfg), {"K": "new"}))
-    await asyncio.wait_for(reached.wait(), 15)
+    await asyncio.wait_for(in_bring_up.wait(), 15)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     try:
-        assert eng._registry_runner is not None
-        assert eng._graph_supervisor is not None
+        assert calls == []
+        assert eng._registry_runner is None
+        assert eng._env_values is before
+        assert eng._graph_supervisor is None
     finally:
         monkeypatch.undo()
         await eng.stop()

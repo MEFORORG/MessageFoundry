@@ -7021,10 +7021,19 @@ class RegistryRunner:
 
     # Set by a cancelled start() only when its teardown ran to completion (BACKLOG #5705).
     _start_cancel_unwound: bool = False
+    # Set once a start() holds the reload lock, so before it can have built anything.
+    _start_entered: bool = False
+
+    @property
+    def start_entered(self) -> bool:
+        """Whether any :meth:`start` got past the reload lock. False means nothing was built."""
+        return self._start_entered
 
     @property
     def start_cancel_unwound(self) -> bool:
-        """Whether the last :meth:`start` was cancelled and fully tore down what it had built.
+        """Whether the last :meth:`start` was cancelled and its teardown ran to completion over
+        everything registered. A source or connector the cancel caught inside its own bring-up
+        is not registered yet, so no teardown reaches it, and True does not cover it.
         False means a caller must keep this runner so a later stop can reach what is left:
         ``has_residual_state`` cannot say, since it omits at least the router, transform and
         response workers, the background tasks, the executors and the sandbox sessions."""
@@ -7049,6 +7058,7 @@ class RegistryRunner:
         ``warn_query_credentials`` says. ``None`` checks every lookup CA here."""
         self._start_cancel_unwound = False
         async with self._reload_lock:
+            self._start_entered = True
             if self._running:
                 return
             if self._sources or self._workers or self._destinations or self._dispatchers:

@@ -1683,8 +1683,10 @@ class Engine:
             raise RuntimeError("the engine is stopping, so the first load started no runner")
         # Bad connector -> WiringError (422), before any start. The check awaits a worker thread,
         # so it runs on a runner that is not installed yet: installed first, a concurrent reload
-        # could take it, unstarted, as the live runner in that window. Nothing yields between
-        # add_registry below and the start taking the runner's reload lock.
+        # could take it, unstarted, as the live runner in that window. On a single node nothing
+        # yields between add_registry below and the start taking the runner's reload lock. On a
+        # cluster the bring-up yields there, with the runner visible to unlocked readers, and
+        # _first_load_lock is what keeps a concurrent reload off it.
         checker = self._check_runner(registry, lane_anchor_check=self._lane_anchor_check)
         # Vault BACKLOG #3582: a lookup its CA check fails is isolated, as at a start, and a CA
         # the build could not load is met as a trust anchor first. The
@@ -1720,15 +1722,18 @@ class Engine:
             else:
                 await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
         except asyncio.CancelledError:
-            # BACKLOG #5705: cleared only when the cancelled start finished its own teardown.
-            # Otherwise the runner may still hold live state, so it stays, with the values it was
-            # built from, where engine.stop() can reach it. On a cluster the supervisor then owns
-            # it, since nothing else would start it or converge what is left.
+            # BACKLOG #5705: cleared when the cancelled start finished its own teardown, or on a
+            # cluster never began. Otherwise the runner may still hold live state, so it stays,
+            # with the values it was built from, where engine.stop() can reach it.
             installed = self._registry_runner
-            if installed is not None and installed.start_cancel_unwound:
+            if installed is not None and (
+                installed.start_cancel_unwound or not installed.start_entered
+            ):
                 self._registry_runner = None
                 self._env_values = previous_env_values
-            elif clustered:
+            elif clustered and not self._coordinator.is_leader():
+                # Only to bring the residue down on a standby. On a leader the supervisor would
+                # start the graph of a reload that did not apply.
                 self._ensure_graph_supervisor()
             raise
         except Exception:
@@ -1739,8 +1744,9 @@ class Engine:
                 and (installed.running or installed.has_residual_state)
             ):
                 # A demotion's stop failed after the start, or a failed start's teardown did:
-                # clearing would orphan live listeners, so the supervisor converges them.
-                self._ensure_graph_supervisor()
+                # clearing would orphan live listeners. Supervised on a standby only, as above.
+                if not self._coordinator.is_leader():
+                    self._ensure_graph_supervisor()
                 raise
             # Don't leave a half-started runner: a later reload would take the "runner exists"
             # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
@@ -2868,10 +2874,13 @@ class Engine:
         # the warm never competes with recover_on_promotion/reset_stale_inflight for the pool) and just
         # before the workers start — the delivery burst it actually targets. Fire-and-forget so it never
         # blocks bring-up; a no-op on SQLite or when [store].warm_pool is off.
-        await self._fire_pool_warm()
         # BACKLOG #5743: a clustered first load reaches here with no supervisor for stop() to
-        # quiesce, so a stop may have passed this runner during the awaits above. Nothing yields
-        # from this read to the start taking the runner's reload lock.
+        # quiesce, so a stop may have passed this runner during the awaits above. Read before the
+        # warm, whose task that stop would not cancel, and again after it, since it can yield.
+        # Nothing yields from the second read to the start taking the runner's reload lock.
+        if self._stopping:
+            return
+        await self._fire_pool_warm()
         if self._stopping:
             return
         if fhir_lookup_refused is None:
