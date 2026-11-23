@@ -2619,17 +2619,38 @@ _DELEGATING_DECORATORS: Final = frozenset(
 )
 
 
-def _outer_decorator(decorators: list[ast.expr], origins: list[str | None]) -> str | None:
+def _lru_cache_factory(call: ast.Call) -> bool:
+    """Whether a call of ``lru_cache`` returns a decorator rather than a cache wrapper around its
+    argument: every positional argument, and ``maxsize``, is a literal number or ``None``."""
+    sizes = [*call.args, *(k.value for k in call.keywords if k.arg == "maxsize")]
+    return all(
+        isinstance(s, ast.Constant) and (s.value is None or isinstance(s.value, int)) for s in sizes
+    )
+
+
+def _outer_decorator(
+    decorators: list[ast.expr], origins: list[str | None], rebound: frozenset[str] = frozenset()
+) -> str | None:
     """The outermost of `decorators` that is not a passthrough one (:data:`_PASSTHROUGH_DECORATORS`):
     its origin if it is a shape decorator that fixes what the name is bound to, else
-    :data:`_UNNAMED`; ``None`` if there is none. A decorator called where it is not one of
-    :data:`_CALLED_DECORATORS`, or such a one left uncalled where only its call decorates
-    (``functools.wraps``), is read as :data:`_UNNAMED`."""
+    :data:`_UNNAMED`; ``None`` if there is none. Read as :data:`_UNNAMED`, at least: a decorator
+    called where it is not one of :data:`_CALLED_DECORATORS`, or such a one left uncalled where only
+    its call decorates (``functools.wraps``); a call of a call; ``lru_cache`` given anything but a
+    size (:func:`_lru_cache_factory`); and a decorator naming any of `rebound`, the names an
+    enclosing loop body binds, whose origin on a later pass the reading never sees."""
     for decorator, origin in zip(decorators, origins, strict=True):
-        called = isinstance(decorator, ast.Call)
-        if origin is None or (called and origin not in _CALLED_DECORATORS):
+        call = decorator if isinstance(decorator, ast.Call) else None
+        if origin is None or (call is not None and origin not in _CALLED_DECORATORS):
             return _UNNAMED
-        if origin == "functools.wraps" and not called:
+        if call is not None and not isinstance(call.func, (ast.Name, ast.Attribute)):
+            return _UNNAMED
+        if origin == "functools.wraps" and call is None:
+            return _UNNAMED
+        if origin == "functools.lru_cache" and call is not None and not _lru_cache_factory(call):
+            return _UNNAMED
+        if _ANY_NAME in rebound or any(
+            isinstance(n, ast.Name) and n.id in rebound for n in ast.walk(decorator)
+        ):
             return _UNNAMED
         if origin in _PASSTHROUGH_DECORATORS:
             continue
@@ -2717,6 +2738,35 @@ class _Reading:
         return all("builtins.staticmethod" in self.decorators.get(n, ()) for n in (m, s))
 
     classes: dict[ast.ClassDef, _ScopeState] = field(default_factory=dict)
+    #: The names the loop bodies enclosing the statement being read bind (:func:`_loop_bound`).
+    loop_bound: frozenset[str] = frozenset()
+
+
+#: In :func:`_loop_bound`, a ``from m import *``, which may bind any name.
+_ANY_NAME: Final = "*"
+
+
+def _loop_bound(body: list[ast.stmt]) -> frozenset[str]:
+    """Every name a statement anywhere in `body` may bind, nested scopes included, so more than
+    the loop's own scope binds; :data:`_ANY_NAME` stands for all of them."""
+    names: set[str] = set()
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+                names.add(node.id)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    names.add(_ANY_NAME if alias.name == "*" else alias.asname or alias.name)
+                    names.add(alias.name.split(".")[0])
+            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+                names.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                names.add(node.rest)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                names.update(node.names)
+    return frozenset(names)
 
 
 def _resolve(expr: ast.expr, state: _ScopeState) -> str | None:
@@ -2933,7 +2983,7 @@ def _run_stmt(
             _SAME_SHAPE.get(origin, origin) for origin in origins if origin in _SHAPE_DECORATORS
         )
         if not isinstance(node, ast.ClassDef):
-            reading.outer[node] = _outer_decorator(node.decorator_list, origins)
+            reading.outer[node] = _outer_decorator(node.decorator_list, origins, reading.loop_bound)
         if outer is None:  # a `global` anywhere inside binds a MODULE name, never a class member
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Global):
@@ -3016,9 +3066,16 @@ def _run_stmt(
             for name in _target_names(node.target):
                 state.bind(name)
         cut = []
-        ran = _run_block(
-            node.body, state, reading, outer, generous=generous, sink=cut if generous else sink
-        )
+        # The body is read once, as its first pass: a decorator there that names anything the loop
+        # binds may resolve otherwise on a later pass.
+        enclosing = reading.loop_bound
+        reading.loop_bound = enclosing | _loop_bound([node])
+        try:
+            ran = _run_block(
+                node.body, state, reading, outer, generous=generous, sink=cut if generous else sink
+            )
+        finally:
+            reading.loop_bound = enclosing
         if generous and sink is not None:
             sink.extend(cut)
         broke = cut if generous and _has_break(node.body) else []
@@ -3148,12 +3205,45 @@ def _signature_clause(
     )
 
 
+#: What a name is bound to with each shape decorator outermost, for :func:`_outer_clause`.
+_OUTER_BINDS: Final = {
+    "builtins.property": "a property object, which is not callable",
+    "builtins.staticmethod": "a staticmethod, whose callers pass every parameter",
+    "builtins.classmethod": "a classmethod, which a call through its class passes the class first",
+    "functools.cache": "a cache wrapper, whose call results are cached",
+    "functools.lru_cache": "a cache wrapper, whose call results are cached",
+    "functools.cached_property": "a cached_property object, which is not callable",
+    "contextlib.contextmanager": "a function whose call returns a context manager",
+    "contextlib.asynccontextmanager": "a function whose call returns an async context manager",
+    "typing.overload": "an overload stub, which raises NotImplementedError when called",
+    "typing_extensions.overload": "an overload stub, which raises NotImplementedError when called",
+}
+
+
+class _OuterClause(str):
+    """A refusal clause from :func:`_outer_clause`. It carries its own `tail`, what the change
+    does, because the tail :func:`_screen_mutation` gives a signature clause is not true of it."""
+
+    tail: str
+
+
 def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) -> str:
     mine, live = (f"shape decorator {o}" if o else "no shape decorator" for o in outer)
-    return (
+    clause = _OuterClause(
         f"redefines {qual}() with {mine} outermost where {path} has {live} (as this screen "
         "resolves them), so the name is bound to a different shape"
     )
+    binds = [
+        _OUTER_BINDS.get(o, f"what {o} returns") if o else "the function the def itself makes"
+        for o in outer
+    ]
+    clause.tail = (
+        f"Applied, the name is bound to {binds[0]}, where {path} binds it to {binds[1]}, so the "
+        "observable may go red for that change and not for the reintroduction. Copy the live "
+        "decorators; the mutation lives in a different repository from the symbol it shadows, so "
+        "nothing else keeps the two in step"
+    )
+    return clause
 
 
 def _node_mismatch(
@@ -3290,6 +3380,11 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         mismatch = _scope_mismatch(
             walked[1].defs, walked[0].defs, "", a.mutation_path, reading, method=False
         )
+    if isinstance(mismatch, _OuterClause):
+        findings.problems.append(
+            f"{cell_id}: absence claim PROVE-ERROR — the mutation {mismatch}. {mismatch.tail}"
+        )
+        return False
     if mismatch is not None:
         findings.problems.append(
             f"{cell_id}: absence claim PROVE-ERROR — the mutation {mismatch}. "
