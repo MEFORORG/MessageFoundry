@@ -826,17 +826,39 @@ def _drop_library_text_from_chain(exc: BaseException) -> None:
     the runner's write of the failure to the store then raises, the worker's fault log prints that
     whole chain, and the engine's redaction does not recognise a refused UID. ``from None`` would
     leave it on ``__context__``, so both links are set. The class stays, for diagnosis and for the
-    retry classification's tests; ``__new__`` runs none of the library's own initialiser."""
+    retry classification's tests; ``__new__`` runs none of the library's own initialiser. This never
+    raises: it runs on the way out of a delivery failure, and a raise here would replace that failure
+    with an internal error, which can stop the lane."""
     link = exc.__cause__ if exc.__cause__ is not None else exc.__context__
-    bare: BaseException | None = None
-    if link is not None:
-        kind = type(link)
-        try:
-            bare = kind.__new__(kind)
-        except Exception as failed:  # noqa: BLE001 - a third-party class; the chain just ends
-            logger.debug("A DICOM exception's class was dropped: %s", type(failed).__name__)
+    bare = None if link is None else _empty_exception_like(link, exc)
     exc.__context__ = None
     exc.__cause__ = bare  # also sets __suppress_context__
+
+
+def _empty_exception_like(link: BaseException, exc: BaseException) -> BaseException | None:
+    """A new, empty exception of ``link``'s class, or ``None`` when its ``__new__`` gives anything
+    else. That method is the library's code, so what it returns is checked: it could be no exception
+    at all, which ``__cause__`` refuses with a ``TypeError``, or a held instance with text on it.
+
+    ``BaseException`` is caught because a class can raise anything here, and nothing else can arrive:
+    this runs on the SCU's worker thread, where no ``KeyboardInterrupt`` is delivered."""
+    kind = type(link)
+    try:
+        bare = kind.__new__(kind)
+        if (
+            type(bare) is kind
+            and bare is not link
+            and bare is not exc
+            and not bare.args
+            and not vars(bare)
+            and bare.__cause__ is None
+            and bare.__context__ is None
+            and bare.__traceback__ is None
+        ):
+            return bare
+    except BaseException as failed:  # noqa: BLE001 - see the docstring
+        logger.debug("A DICOM exception's class was dropped: %s", type(failed).__name__)
+    return None
 
 
 def _raised_at(exc: BaseException) -> str:

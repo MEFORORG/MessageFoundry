@@ -1062,3 +1062,79 @@ async def test_each_refusal_the_scu_raises_carries_no_library_text_on_its_chain(
     assert seen == 2  # CONTROL: the cause is still there, by its class
     assert type(raised.value.__cause__) is library
     assert _UID not in "".join(traceback.format_exception(raised.value))
+
+
+def _exception_whose_bare_new(gives: Callable[[Any], Any]) -> Exception:
+    """A library-style exception holding the refusal, whose ``__new__`` with no arguments, the call
+    the chain scrub makes, returns what ``gives`` does."""
+
+    class Odd(Exception):
+        raised: Exception
+
+        def __new__(cls, *args: Any) -> Any:
+            return super().__new__(cls, *args) if args else gives(cls)
+
+    Odd.raised = Odd(_REFUSAL)
+    return Odd.raised
+
+
+def _with_text_on_an_attribute(kind: Any) -> Any:
+    bare = Exception.__new__(kind)
+    bare.detail = _REFUSAL
+    return bare
+
+
+@pytest.mark.parametrize(
+    "gives",
+    [
+        lambda kind: _REFUSAL,
+        lambda kind: ValueError(_REFUSAL),
+        lambda kind: kind(_REFUSAL),
+        lambda kind: kind.raised,
+        lambda kind: type("Sub", (kind,), {})(_REFUSAL),
+        _with_text_on_an_attribute,
+        _raiser(TypeError(_REFUSAL)),
+        _raiser(SystemExit(_REFUSAL)),
+    ],
+    ids=[
+        "a-string",
+        "another-exception",
+        "a-populated-instance",
+        "the-raised-instance",
+        "a-subclass",
+        "text-on-an-attribute",
+        "raises",
+        "raises-a-base-exception",
+    ],
+)
+def test_the_chain_scrub_never_raises_and_keeps_no_library_text(
+    gives: Callable[[Any], Any],
+) -> None:
+    from messagefoundry.transports.base import DeliveryError
+
+    library = _exception_whose_bare_new(gives)
+    error = DeliveryError("the screened line")
+    error.__cause__ = library
+    dicom_module._drop_library_text_from_chain(error)
+    assert error.__context__ is None
+    assert error.__cause__ is not library
+    assert error.__cause__ is None or not (error.__cause__.args or vars(error.__cause__))
+    written = "".join(traceback.format_exception(error))
+    assert "the screened line" in written  # CONTROL
+    assert _UID not in written, written
+
+
+async def test_a_library_class_that_cannot_be_rebuilt_still_fails_as_a_delivery_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pynetdicom.association import Association
+
+    from messagefoundry.transports.base import DeliveryError
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    library = _exception_whose_bare_new(lambda kind: _REFUSAL)
+    monkeypatch.setattr(Association, "send_c_store", _raiser(library))
+    with _storage_scp() as port, pytest.raises(DeliveryError) as raised:
+        await _scu(port).send(_carry(make_sr_part10()))
+    assert _UID not in "".join(traceback.format_exception(raised.value))
