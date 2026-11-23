@@ -3488,8 +3488,9 @@ class _PinGatedExecutor(ThreadPoolExecutor):
     ``tests/test_store_pin_connect_refusal.py`` drives the installed aioodbc's own
     ``create_pool``, at its fill and at a grow, over a stub ``pyodbc.connect``, and fails if
     the shape changes. It runs only where the ``sqlserver`` extra is installed, at least in CI's
-    path-gated ``sqlserver-store`` leg, which a change to the aioodbc pin or the lock files alone
-    may not start, so run it by hand with the extra installed on any such change."""
+    ``sqlserver-store`` leg. That leg runs in the merge queue and nightly, but on a pull request
+    only when the paths it watches change, so a pull request that changes only the aioodbc pin
+    and the lock files first runs it in the merge queue."""
 
     def __init__(self, spec: AnchorSpec, **kwargs: Any) -> None:
         super().__init__(**kwargs)

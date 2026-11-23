@@ -67,7 +67,7 @@ def _fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
 
 
-def _winerror(code: object, message: str) -> OSError:
+def _winerror(code: Any, message: str) -> OSError:
     """An ``OSError`` carrying a Windows error code on any platform. CPython sets ``winerror``
     only on Windows, so elsewhere it is set by hand, as the read would see it there."""
     exc = OSError(errno.EINVAL, message)
@@ -219,10 +219,18 @@ async def test_a_swapped_pin_does_not_lift_its_own_refusal(
         FileNotFoundError(2, "No such file or directory"),  # mid-renewal, between unlink and write
         PermissionError(13, "The process cannot access the file"),  # a scanner's lock
         _winerror(64, "The specified network name is no longer available"),  # a share dropped
+        _winerror(1236, "The network connection was aborted by the local system"),
         ConnectionResetError(104, "Connection reset by peer"),
         OSError(errno.EIO, "Input/output error"),
     ],
-    ids=["renewal-by-rename", "scanner-lock", "winerror-64", "connection-reset", "eio"],
+    ids=[
+        "renewal-by-rename",
+        "scanner-lock",
+        "winerror-64",
+        "winerror-1236",
+        "connection-reset",
+        "eio",
+    ],
 )
 async def test_a_pin_that_cannot_be_read_sets_no_hold(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: OSError
@@ -240,24 +248,6 @@ async def test_a_pin_that_cannot_be_read_sets_no_hold(
     with pytest.raises(TrustAnchorError, match="could not read the trust anchor"):
         await run_anchor_preflight(_specs(settings), store, enforcing=True)
     refuse_connect_after_pin_refusal(settings)
-
-
-async def test_a_pipe_or_device_at_the_pin_path_sets_the_hold(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A pipe or device swapped in for the pin is refused as not a regular file, an ``OSError``
-    that is a verdict, not a read the next check may not repeat, so it holds new connects shut.
-    Red under: every ``OSError`` exempted from the hold (head 3ee826a4d6a)."""
-    settings = _settings(_pin(tmp_path))
-
-    def not_regular(_spec: Any) -> Any:
-        raise OSError(22, "not a regular file")
-
-    monkeypatch.setattr(ta, "evaluate_anchor", not_regular)
-    with pytest.raises(TrustAnchorError):
-        await run_anchor_preflight(_specs(settings), store, enforcing=True)
-    with pytest.raises(StorePinConnectRefused):
-        refuse_connect_after_pin_refusal(settings)
 
 
 async def test_an_acl_that_could_not_be_read_sets_the_hold(
@@ -503,19 +493,22 @@ async def test_the_installed_aioodbc_submits_its_connect_in_the_shape_the_gate_r
 @pytest.mark.parametrize(
     "fault",
     [
+        OSError(errno.EINVAL, "not a regular file"),  # a pipe or device swapped in for the pin
         BrokenPipeError(errno.EPIPE, "The pipe has been ended"),  # a pipe at the path, on Windows
         _winerror(87, "The parameter is incorrect"),  # a code outside the network set
         _winerror(["64"], "a winerror that is not an int"),
     ],
-    ids=["broken-pipe", "winerror-87", "winerror-not-int"],
+    ids=["not-a-regular-file", "broken-pipe", "winerror-87", "winerror-not-int"],
 )
 async def test_a_read_fault_outside_the_transient_set_sets_the_hold(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: OSError
 ) -> None:
-    """The negative controls for the transient set: a pipe fault, a Windows code outside the
-    network set, and a ``winerror`` that is not an int each set the hold. Red under: every
-    ``ConnectionError`` counted transient, any ``winerror`` counted transient, or a membership
-    test that raises on a value it cannot hash."""
+    """A pipe or device swapped in for the pin is refused as not a regular file, an ``OSError``
+    that is a verdict, so it holds new connects shut. Red under: every ``OSError`` exempted from
+    the hold (head 3ee826a4d6a). The rest are negative controls for the transient set: a pipe
+    fault, a Windows code outside the network set, and a ``winerror`` that is not an int each set
+    the hold. Red under: every ``ConnectionError`` counted transient or a membership test that
+    raises on a value it cannot hash (head 8b95d592962), or any ``winerror`` counted transient."""
     settings = _settings(_pin(tmp_path))
 
     def unreadable(_spec: Any) -> Any:
@@ -526,3 +519,28 @@ async def test_a_read_fault_outside_the_transient_set_sets_the_hold(
         await run_anchor_preflight(_specs(settings), store, enforcing=True)
     with pytest.raises(StorePinConnectRefused):
         refuse_connect_after_pin_refusal(settings)
+
+
+async def test_the_store_pool_dials_through_the_gated_executor(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the store's own pool open, over the installed aioodbc and a stub
+    ``pyodbc.connect``: under a hold, ``SqlServerStore._create_pool`` is refused before it dials.
+    Red under: a ``_create_pool`` that builds a plain executor or does not hand it to the pool.
+    Skipped without the ``sqlserver`` extra; it runs where that extra is installed."""
+    pytest.importorskip("aioodbc")
+    pytest.importorskip("pyodbc")
+    from messagefoundry.store import sqlserver
+
+    dialled: list[str] = []
+
+    def connect(dsn: str, **_kwargs: Any) -> object:
+        dialled.append(dsn)
+        raise AssertionError("dialled")
+
+    monkeypatch.setattr(sys.modules["pyodbc"], "connect", connect)
+    monkeypatch.setattr(sqlserver, "disable_driver_manager_pooling", lambda: None)
+    settings = await _refuse_at(store, _pin(tmp_path), enforcing=True)
+    with pytest.raises(StorePinConnectRefused):
+        await SqlServerStore._create_pool(settings, maxsize=1)
+    assert dialled == []
