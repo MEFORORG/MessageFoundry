@@ -44,9 +44,10 @@ class X12ValidationError(X12Error):
 
     **A damaged install can land here too.** An index that lost a map's entry reads as having no
     map, so it is this error, which a Handler's ``except ValueError`` would dead-letter. A refusal
-    from a walk that raised logs its exception class at WARNING, rate-limited, so a run of one class
-    can show an operator the damage. The two refusals with no exception to name log nothing: pyx12
-    wrote no report ("does not look like an X12 data file"), or its report could not be read.
+    from a walk that raised logs its exception class at WARNING, rate-limited. The two refusals with
+    no exception to name log nothing: pyx12 wrote no report ("does not look like an X12 data file"),
+    or its report could not be read. A map whose content is wrong but still parses can produce a
+    wrong validation result, with no exception or log line.
 
     The X12 analog of
     :class:`~messagefoundry.parsing.fhir.errors.FhirValidationError`. A *failed validation* (a pass

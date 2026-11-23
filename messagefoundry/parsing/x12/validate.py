@@ -379,10 +379,7 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     errors, if the ``[x12]`` extra is absent or too old, if pyx12's params cannot be built, or if
     the walk raises a type :func:`~messagefoundry.parsing.x12._deps.is_x12_install_fault` names. The
     last two keep only the exception's class name and chain nothing. The first chains its
-    ``ImportError``, which is raised before any interchange is read.
-
-    **A damaged install does not always reach that path**: :class:`X12ValidationError` says when it
-    does not, and :func:`_note_walk_refusal` what an operator then sees."""
+    ``ImportError``, which is raised before any interchange is read."""
     if isinstance(raw, (bytes, bytearray)):  # noqa: SIM108
         text = bytes(raw).decode("utf-8", "replace")
     else:

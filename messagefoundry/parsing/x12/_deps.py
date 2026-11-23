@@ -54,10 +54,7 @@ def is_x12_install_fault(exc: Exception) -> bool:
     ``ImportError``, XML ``ParseError`` and a defusedxml refusal each mean the install or its config
     is at fault. That is read from pyx12 4.1.0's source. A refusal is matched by class name because
     pyx12 raises the upstream package's class, which is not the engine's vendored one, and an import
-    here could raise and chain the exception being classified.
-
-    It is a statement about types only, so it does not catch every damaged install:
-    :class:`~messagefoundry.parsing.x12.errors.X12ValidationError` says what the rest do."""
+    here could raise and chain the exception being classified."""
     return isinstance(exc, (OSError, ImportError, ParseError)) or any(
         cls.__name__ == "DefusedXmlException" and cls.__module__.endswith("defusedxml.common")
         for cls in type(exc).__mro__
