@@ -2288,7 +2288,9 @@ class UserSealRefused(RuntimeError):
     writes the audit row and raises the alert only for the first failure of the account in each report interval
     (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
     service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
-    may still delete it. The admin routes answer it 423. A record Vault transit cannot verify is
+    may still delete it. ``auth_routes._checked_user``, and so the JSON admin routes that read an
+    account through it, answer it 423; docs/SECURITY.md, *What an admin user read reports*, states
+    what at least some web console pages answer. A record Vault transit cannot verify is
     refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 

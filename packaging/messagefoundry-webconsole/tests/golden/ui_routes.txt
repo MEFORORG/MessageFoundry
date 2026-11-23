@@ -55,6 +55,7 @@ GET /ui/uploaded-logs/upload-form
 GET /ui/users
 GET /ui/users/new
 GET /ui/users/{user_id}
+GET /ui/users/{user_id}/delete-confirm
 GET /ui/users/{user_id}/federated-identity
 GET /ui/users/{user_id}/federated-identity/unlink-confirm
 MOUNT /ui/static
