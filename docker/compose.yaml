@@ -338,25 +338,32 @@ services:
     # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 999
     # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and is refused.
     # Without them Postgres does not start, so no ha engine does. The entrypoint below checks
-    # them first and exits naming what is wrong, before the image's own entrypoint runs, so a
-    # start with ./pg-tls empty, or a key Postgres would refuse, initializes nothing; fix the
-    # files and start again (`docker compose logs postgres` shows the refusal). The check is
-    # not Postgres's own: a key that does not match the certificate, or a file that is not
-    # PEM, passes it, and that start still initializes the mefor-pg volume without creating
-    # the messagefoundry database. The health check then never passes, because it queries that
-    # database, so no engine starts against it. Recover by removing that one volume, never
-    # `down -v`, which also removes the default engine's store: docker compose --profile ha
-    # down, then
+    # them first and exits naming what is wrong, before the image's own entrypoint runs: at
+    # least a missing or empty file, an encrypted key, a key whose owner or mode Postgres
+    # refuses, and a file the postgres account cannot read. A start it refuses initializes
+    # nothing, so fix the files and start again (`docker compose logs postgres` shows why).
+    # The check is not Postgres's own, and a file Postgres refuses for another reason passes
+    # it, at least a key that does not match the certificate and a file that is not PEM. That
+    # start still initializes the mefor-pg volume without creating the messagefoundry
+    # database. The health check then never passes, because it queries that database, so no
+    # engine starts against it. Recover by removing that one volume, never `down -v`, which
+    # also removes the default engine's store: docker compose --profile ha down, then
     #   docker volume rm <project>_mefor-pg
     # This server still accepts a plaintext session from another client on the compose network;
     # the engines never open one.
     # Reads the certificate and key paths from the command's ssl_cert_file and ssl_key_file, so
-    # the check always reads the files Postgres would. `$$` is a literal `$` to compose.
+    # the check reads the files the server is told to load. A command that does not start the
+    # server, such as `docker compose run postgres psql ...`, goes straight to the image's
+    # entrypoint, as it did before. `$$` is a literal `$` to compose.
     entrypoint:
       - "sh"
       - "-c"
       - |
         set -eu
+        case "$${1:-}" in
+          postgres|-*) ;;
+          *) exec docker-entrypoint.sh "$$@" ;;
+        esac
         crt=; key=
         for a in "$$@"; do
           case "$$a" in
@@ -364,11 +371,12 @@ services:
             ssl_key_file=*) key="$${a#ssl_key_file=}" ;;
           esac
         done
-        die() { echo "error: refusing to start Postgres, so nothing was initialized: $$*. Put server.crt and server.key in ./pg-tls as the postgres service's comment in docker/compose.yaml says, then start again." >&2; exit 1; }
+        die() { echo "error: refusing to start Postgres before the image's entrypoint runs: $$*. Fix server.crt and server.key in ./pg-tls as the postgres service's comment in docker/compose.yaml says, then start again." >&2; exit 1; }
         [ -n "$$crt" ] && [ -n "$$key" ] || die "the command names no ssl_cert_file or no ssl_key_file"
         for f in "$$crt" "$$key"; do
           [ -f "$$f" ] && [ -s "$$f" ] || die "$$f is missing or empty"
         done
+        ! grep -q ENCRYPTED "$$key" || die "$$key is encrypted, and this command sets no ssl_passphrase_command"
         pg=$$(id -u postgres)
         owner=$$(stat -L -c %u "$$key")
         mode=$$(stat -L -c %a "$$key")
@@ -408,9 +416,11 @@ services:
     # Over TCP, not the Unix socket: during initialization the image runs a temporary server on
     # the socket alone, which a socket probe reports ready. The query also fails when the
     # messagefoundry database is missing, which pg_isready alone does not see. The image trusts
-    # a 127.0.0.1 login, so the probe needs no password.
+    # a 127.0.0.1 login, so the probe needs no password. The probe fails for the whole first
+    # initialization, so start_period keeps those failures from counting toward retries.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U mefor -d messagefoundry && psql -h 127.0.0.1 -U mefor -d messagefoundry -XtAqc 'select 1' >/dev/null"]
+      start_period: 120s
       interval: 5s
       timeout: 3s
       retries: 10
