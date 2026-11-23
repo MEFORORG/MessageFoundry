@@ -448,10 +448,10 @@ class AlertTransport(Protocol):
     as delivered (BACKLOG #5907 step 4): a send that swallows its own failure reads as delivered.
     A send that raises ``CancelledError`` before a drain cancel reached it, as
     :meth:`NotifierAlertSink._handle` decides that, loses that transport's alert, logged, and the
-    cancel ends that send's child task, not its siblings or the drain. A send must end promptly once cancelled: on a drain
-    cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
-    ``aclose()``. A send the drain's cancel reached never counts as delivered, whether it raises
-    or returns.
+    cancel ends that send's child task, not its siblings or the drain. A send must end promptly
+    once cancelled: on a drain cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS`
+    is left running, past ``aclose()``. A send the drain's cancel reached never counts as
+    delivered, whether it raises or returns.
 
     ``recipients`` (#146) is the per-rule EMAIL recipient override the matching rule carried (``None`` =
     the transport's own default); ``context`` (#138) carries the extra non-PHI template values the
@@ -2714,11 +2714,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         }
 
         # The sends the drain's cancel reached while they ran, filled by _cut_sends before it
-        # passes the cancel on: none of them counts as delivered, whatever it then does. A cancel
-        # a send meets before _cut_sends has put it here is logged as that transport's loss,
-        # whoever requested it, and still ends the send: at least the transport itself, or another
-        # canceller in the loop pass the drain's cancel is requested in. A cancel delivered to the
-        # send after _cut_sends ran, a current_task().cancel() included, reads as the drain's.
+        # passes the cancel on: none of them counts as delivered, whatever it then does. The
+        # line is drawn when a CancelledError reaches deliver's handler, not when the send first
+        # meets the cancel: one that reaches it before _cut_sends has put the send here is logged
+        # as that transport's loss, whoever requested it, and still ends the send. A send still
+        # running when _cut_sends runs, one that awaits a cleanup after meeting its own cancel
+        # included, is put here first, and its CancelledError then reads as the drain's.
         reached: set[asyncio.Task[None]] = set()
         # The sends whose own cancel deliver has already logged.
         logged_cancel: set[asyncio.Task[None] | None] = set()
