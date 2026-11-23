@@ -65,11 +65,13 @@ async def _drive(
     ends_early: bool = False,
     headers: tuple[tuple[bytes, bytes], ...] = (),
     send_fails: bool = False,
+    query_string: bytes = b"",
 ) -> _Run:
     """Send ``chunks`` as a body, one ``receive`` each, with neither framing header by default.
 
     ``ends_early`` is a client that goes away with the body unfinished. ``headers`` adds request
-    headers. ``send_fails`` is a client gone by the time a response starts."""
+    headers. ``send_fails`` is a client gone by the time a response starts. ``query_string`` is
+    the raw query, which an ASGI host passes through undecoded."""
     scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -78,7 +80,7 @@ async def _drive(
         "scheme": "http",
         "path": path,
         "raw_path": path.encode(),
-        "query_string": b"",
+        "query_string": query_string,
         "root_path": "",
         "headers": [
             (b"host", _DNS_HOST.encode()),
@@ -217,6 +219,49 @@ async def test_the_larger_cap_is_only_the_upload_routes() -> None:
     run = await _drive(app, _chunks(_CHUNKS_AT_CAP + 1))
     assert run.status == 413
     assert reads == []
+
+
+@pytest.mark.parametrize("declares", [False, True], ids=["undeclared", "declared"])
+@pytest.mark.parametrize(
+    "path",
+    ["/up\tloads", "/uploads\n", "/ui/uploaded-logs/up\rload"],
+    ids=["tab", "lf", "cr"],
+)
+async def test_a_path_that_only_normalizes_to_an_upload_route_keeps_the_default_cap(
+    path: str, declares: bool
+) -> None:
+    """URL parsing drops a decoded TAB, CR or LF, so the cap must read the scope's path."""
+    body_size = _MAX_REQUEST_BODY_BYTES * 2
+    app, reads = _app_with_probe(path)
+    app.state.upload_store = SimpleNamespace(max_bytes=body_size)
+    headers = ((b"content-length", str(body_size).encode()),) if declares else ()
+    run = await _drive(app, _chunks(_CHUNKS_AT_CAP * 2), path=path, headers=headers)
+    assert run.status == 413
+    assert reads == []
+
+
+@pytest.mark.parametrize(
+    ("chunk_count", "headers"),
+    [
+        (_CHUNKS_AT_CAP + 1, ()),
+        (1, ((b"content-length", str(_MAX_REQUEST_BODY_BYTES + 1).encode()),)),
+    ],
+    ids=["counted", "declared"],
+)
+async def test_a_non_utf8_query_string_does_not_stop_the_413(
+    chunk_count: int,
+    headers: tuple[tuple[bytes, bytes], ...],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The refusal reads the path from the scope: ``request.url`` would decode this query and raise."""
+    app, reads = _app_with_probe()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        run = await _drive(app, _chunks(chunk_count), headers=headers, query_string=b"a=\xff")
+    assert run.status == 413
+    assert reads == []
+    assert any(
+        "rejected oversized request body on /probe" in r.getMessage() for r in caplog.records
+    )
 
 
 async def test_a_refusal_is_logged(caplog: pytest.LogCaptureFixture) -> None:

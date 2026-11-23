@@ -106,7 +106,7 @@ register_ui_action(
 # kept its path while its criteria POST became ``.../filter`` (BACKLOG #1184). Both moved the POST.
 #
 # Here the POST is the half pinned from OUTSIDE this package: ``api/app.py``'s ``_UPLOAD_BODY_PATHS``
-# matches ``request.url.path`` against an EXACT frozenset to lift the 1 MiB request-body cap, so
+# matches ``scope["path"]`` against an EXACT frozenset to lift the 1 MiB request-body cap, so
 # moving the POST means an engine-package edit or large uploads start failing at the cap. That is the
 # whole of the reason. (The doc-drift tests naming this path are substring checks and would have
 # tolerated either spelling — do not cite them as a constraint; the frozenset is the only hard pin.)

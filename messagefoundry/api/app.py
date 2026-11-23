@@ -5225,7 +5225,7 @@ def create_app(
                 _log.warning(
                     "oversized request body on %s from %s after a response started: "
                     "no 413 was sent, and the route's read got a disconnect",
-                    scrub_log_argument(request.url.path),
+                    scrub_log_argument(request.scope["path"]),
                     scrub_log_argument(client_ip(request) or "unknown"),
                 )
             else:
@@ -5237,7 +5237,7 @@ def create_app(
                 except OSError as exc:  # the client went away; the route still gets its disconnect
                     _log.warning(
                         "could not send the 413 for an oversized request body on %s from %s: %s",
-                        scrub_log_argument(request.url.path),
+                        scrub_log_argument(request.scope["path"]),
                         scrub_log_argument(client_ip(request) or "unknown"),
                         type(exc).__name__,
                     )
@@ -5262,8 +5262,10 @@ def create_app(
 
     def _body_cap(request: Request) -> int:
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
+        # The scope's decoded path: request.url drops a TAB, CR or LF from it, and raises on a query
+        # string that is not UTF-8, which would stop the refusal.
         upload_store = getattr(request.app.state, "upload_store", None)
-        if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS:
+        if upload_store is not None and request.scope["path"] in _UPLOAD_BODY_PATHS:
             return int(upload_store.max_bytes)
         return _MAX_REQUEST_BODY_BYTES
 
@@ -5271,7 +5273,7 @@ def create_app(
         _log.warning(
             "rejected %s on %s from %s",
             what,
-            scrub_log_argument(request.url.path),
+            scrub_log_argument(request.scope["path"]),
             scrub_log_argument(client_ip(request) or "unknown"),
         )
         # On HTTP/1.x, `Connection: close` makes the server drop the connection after every refusal,
