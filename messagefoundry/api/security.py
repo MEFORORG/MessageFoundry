@@ -1634,7 +1634,8 @@ async def refuse_from_new_address(request: Request) -> None:
     ``auth.new_address_reverify_required`` and a notice, deduped and capped per session as
     :meth:`AuthService.flag_new_client_ip` says.
 
-    It is NOT in :func:`require`, deliberately: the base gate carries the monitoring polls, and an
+    It is NOT in :func:`require` or :func:`require_monitoring_read`, deliberately: those gates carry
+    the monitoring polls, and an
     operator whose address changes behind a NAT pool would be refused on every one until a step-up.
 
     Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on, and one more
@@ -1993,7 +1994,7 @@ def require_monitoring_read(*permissions: Permission) -> Callable[[Request], Awa
 
     Charged at ADMISSION, before the route does its work. A throttled read is logged (not silent),
     answered 429 with the actor's ``Retry-After``, and recorded as an ``auth.gate_refused`` row with
-    reason ``throttled``. It does not ask the new-address question: :func:`refuse_from_new_address`
+    reason ``throttled`` wherever :func:`_audited_permission` names one (on by default). It does not ask the new-address question: :func:`refuse_from_new_address`
     says why the monitoring polls stay outside it. No pace on the embedding/no-auth path (there is
     no per-actor identity to key on)."""
 

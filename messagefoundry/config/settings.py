@@ -9554,8 +9554,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
       older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
       before it is counted. A negative count refuses more, so it is not named; the admin-write
-      count and the two monitoring-read counts refuse a negative value at load (BACKLOG #3293), so
-      only the others reach here. A NaN or infinite
+      count (BACKLOG #3293) and the two monitoring-read counts (vault BACKLOG #1191) refuse a
+      negative value at load, so only the others reach here. A NaN or infinite
       window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
       ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
       admits a faster burst.
