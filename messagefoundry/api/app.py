@@ -5699,7 +5699,9 @@ def create_app(
         # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
         # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
         # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
-        # behind a 429. A scoped caller's dashboard carries no outbound rows at all.
+        # behind the PHI-read 429. It can still be hidden behind the monitoring-read 429: that pace
+        # (require_monitoring_read) is charged in this route's dependency, before this check runs.
+        # A scoped caller's dashboard carries no outbound rows at all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
         await _admit_reveal(request, identity, reveal)

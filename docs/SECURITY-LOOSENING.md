@@ -1175,9 +1175,11 @@ count is above `0` (vault BACKLOG #2613).
 > `0` or less (the load refuses it). With the limiter off, its parts are not named again.
 > `monitoring_read_rate_limit_global` ships **off** (`0`), so no value of it is looser than the
 > default and it is never named.
-- **What you lose:** the per-account pace on six `monitoring:read` GETs
+- **What you lose:** the per-account pace on six `monitoring:read` GETs of the JSON API
   ([SECURITY.md](SECURITY.md), *Monitoring-read pacing*, names them). One signed-in account can make
-  the engine rebuild the wiring graph and scan the store faster, up to as fast as it answers.
+  the engine rebuild the wiring graph and scan the store through those routes faster, up to as fast
+  as it answers. With the pace on, the same work stays reachable unpaced through the web console's
+  in-process reads and the `/ws/stats` socket; that section, *What it does not charge*, says how.
 - **When acceptable:** a monitoring tool on one known account that polls faster than the default
   allows, on a host no untrusted client can reach. Prefer a modest raise to turning it off.
 - **Compensating controls:** keep sessions short, and restrict who reaches the API with

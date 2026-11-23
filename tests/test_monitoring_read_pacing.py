@@ -68,8 +68,10 @@ async def _service(engine: Engine, **overrides: object) -> AuthService:
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service), client=("127.0.0.1", 123))
+def _client(engine: Engine, service: AuthService, *, serve_ui: bool = False) -> httpx.AsyncClient:
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, serve_ui=serve_ui), client=("127.0.0.1", 123)
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -203,17 +205,18 @@ async def test_the_web_console_reads_are_not_charged(engine: Engine) -> None:
     dependency never runs and the account's budget is untouched (docs/SECURITY.md, *Monitoring-read
     pacing*, *What it does not charge*)."""
     service = await _service(engine, monitoring_read_rate_limit_per_actor=1)
-    transport = httpx.ASGITransport(
-        app=create_app(engine, auth=service, serve_ui=True), client=("127.0.0.1", 123)
-    )
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+    async with _client(engine, service, serve_ui=True) as c:
         r = await c.post(
             "/ui/login",
             data={"username": "vw", "password": PW},
             headers={"Sec-Fetch-Site": "same-origin"},
         )
-        assert r.status_code in (200, 303), r.status_code
-        for path in ("/ui/nav-status", "/ui/connections", "/ui/monitoring/live"):
+        # A failed sign-in also answers 303, so the session cookie is what proves it worked.
+        assert r.status_code == 303 and c.cookies.get("mf_session"), r.status_code
+        # Signed out, these pages answer 303; a 200 here means the signed-in handler ran. Each
+        # calls a paced handler (``/ui/connections`` the ``GET /connections`` one,
+        # ``/ui/monitoring/live`` the ``GET /graph/edges`` and ``/metrics/history`` ones).
+        for path in ("/ui/connections", "/ui/monitoring/live"):
             for _ in range(3):
                 assert (await c.get(path)).status_code == 200, path
         # The same account's budget of 1 is still whole: one bearer read is admitted, the next

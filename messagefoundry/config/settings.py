@@ -9884,9 +9884,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         out.append(
             (
                 "monitoring_read_rate_limit_enabled",
-                "the six paced monitoring reads (the wiring graph, status, stats, metrics and "
-                "the connections dashboard) have NO pace -- one signed-in account may make the "
-                "engine rebuild the graph and scan the store as fast as it answers",
+                "the six paced monitoring reads (the wiring graph, status, stats, metrics, "
+                "metrics history and the connections dashboard) have NO pace on the JSON API -- "
+                "one signed-in account may make the engine rebuild the graph and scan the store "
+                "through them as fast as it answers",
             )
         )
     elif _window(
@@ -9906,8 +9907,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             ),
             off=(
                 "there is no per-account monitoring-read limit, so one signed-in account may "
-                "drive the graph rebuild and the store scans as fast as the engine answers (only "
-                "an all-users limit, if one is set, holds)"
+                "drive the graph rebuild and the store scans through the six JSON routes as fast "
+                "as the engine answers (only an all-users limit, if one is set, holds)"
             ),
         )
 

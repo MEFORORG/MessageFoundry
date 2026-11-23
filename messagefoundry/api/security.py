@@ -1635,8 +1635,7 @@ async def refuse_from_new_address(request: Request) -> None:
     :meth:`AuthService.flag_new_client_ip` says.
 
     It is NOT in :func:`require` or :func:`require_monitoring_read`, deliberately: those gates carry
-    the JSON API's repeated monitoring reads, such as the test harness monitor's poll and a
-    ``/metrics`` scraper, and an operator whose address changes behind a NAT pool would be refused
+    the JSON API's repeated monitoring reads, such as a ``/metrics`` scraper, and an operator whose address changes behind a NAT pool would be refused
     on every one until a step-up. The web console's in-process reads go through ``require_ui`` and
     reach neither gate.
 
@@ -1994,8 +1993,8 @@ def require_monitoring_read(*permissions: Permission) -> Callable[[Request], Awa
     #1191, ASVS 15.2.2). Five of them cost store or parse work per call: ``/graph/edges`` rebuilds
     the wiring graph, and ``/status``, ``/stats``, ``/metrics`` and ``/connections`` read aggregates
     whose cost grows with the store. ``/metrics/history`` copies an in-memory ring and reads no
-    store; it is paced with them because the console's Flow and trends page reads it beside
-    ``/graph/edges``. The console itself is not charged: it calls these handlers in process
+    store; it was put in the set because the console's Flow and trends page reads it beside
+    ``/graph/edges``, so its pace bounds only JSON clients, because the console is not charged: it calls these handlers in process
     through ``require_ui`` (``messagefoundry_webconsole/_auth.py``), so this dependency never runs
     for it. The six share one budget per account, per API process. docs/SECURITY.md,
     *Monitoring-read pacing*, says the default's basis.

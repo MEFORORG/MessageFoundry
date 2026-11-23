@@ -4702,7 +4702,8 @@ alone:
    belongs to a reverse proxy, declare that proxy in `[api].trusted_proxies`, so the engine
    compares the address the proxy forwards. Failing that, turning the signal off is the
    [named loosening](SECURITY-LOOSENING.md#authadmin_new_ip_step_up--false--a-new-client-address-mid-session-goes-unchallenged).
-   **The base gate (`require`) still never asks, deliberately.** The monitoring polls ride it, and
+   **The base gate (`require`) and `require_monitoring_read` still never ask, deliberately.** The
+   JSON monitoring reads ride them, and
    an operator whose address changes behind a NAT pool, or behind a proxy not listed in
    `[api].trusted_proxies`, would otherwise be refused on every poll until a step-up. So a token
    replayed from a new address still reads the non-PHI monitoring routes. It is
@@ -7688,18 +7689,12 @@ Vault BACKLOG #1191 (ASVS 15.2.2). `require_monitoring_read` gates six `monitori
 `GET /graph/edges`, `/status`, `/stats`, `/metrics`, `/metrics/history` and `/connections`. Five of
 them cost work per call: `/graph/edges` rebuilds the wiring graph, and `/status`, `/stats`,
 `/metrics` and `/connections` read aggregates whose cost grows with the store. `/metrics/history`
-copies the in-memory metrics ring and reads no store; it is paced with them because the console's
-Flow and trends page reads it beside `/graph/edges`. The gate charges a per-actor sliding window at
+copies the in-memory metrics ring and reads no store; it was put in the set because the console's
+Flow and trends page reads it beside `/graph/edges`, but the console is not charged (below), so
+its pace bounds only JSON clients. The gate charges a per-actor sliding window at
 admission, before the route's own work. The six routes share ONE budget per account: a read of any
 of them spends it. The budget is in-process, per API process, so N engine shards multiply it by N
 (*Business-logic limits* above).
-
-Other `monitoring:read` reads that cost work are **not** charged. At least `GET /events`,
-`GET /connections/{name}/events` and `GET /config/provenance` stay on plain `require`, and the
-`/ws/stats` socket runs the connections-dashboard read (`_dashboard_rows`, the work behind
-`GET /connections`) once per frame, a frame a second, with no charge here. The socket cap of 64 is
-per API process, not per account, so one account may hold all 64: about 3,840 such reads a minute,
-with no 429.
 
 **Key.** `identity.user_id` of the bearer session the request presents. A Prometheus-style scraper
 on `/metrics` authenticates the same way, so it draws the bucket of the account its token belongs
@@ -7712,7 +7707,9 @@ charged clients in this repository are at least:
 
 - the standalone test harness's monitor (`harness/monitor.py`), which reads `GET /stats` and
   `GET /connections` every 1.5 s (`_POLL_INTERVAL_MS`), at most 80 charged reads per minute per open
-  monitor window. Its dead-letter read is not paced;
+  monitor window. Its third read, `GET /dead-letters`, is not charged here: it rides
+  `require_phi_read`, so it spends the PHI-read budget (`phi_read_rate_limit_*`, 120 per 60 s by
+  default) at 40 a minute per window, and that budget binds first;
 - a scraper on `/metrics`, 4 per minute at a 15 s scrape;
 - the load harness's poller, 3 charged reads per sample as one account, 720 per minute at the
   0.25 s interval two of its profiles use. The engines it spawns therefore run with the pace off
@@ -7728,14 +7725,26 @@ it running); and the Flow and trends page's `/ui/monitoring/live` every 5 s call
 `GET /graph/edges` and `GET /metrics/history` handlers. The worst page is Flow and trends: 24 + 4 =
 28 handler calls per minute per tab. Five tabs plus a 15 s `/metrics` scrape is 144 per minute;
 four times that is 576, and 600 is a round figure chosen above it. The tab count of five and the
-margin of four are judgments, not measurements. Against the charged clients above, 600 per minute
-admits seven harness monitor windows (560) on one account, plus a `/metrics` scrape. The global
-count ships off, as `phi_read_rate_limit_global` does.
+margin of four are judgments, not measurements. The count leaves out the Connections page's
+`/ws/stats` socket, which this pace never charges and whose per-frame work is described below. Against
+the charged clients above, 600 per minute admits seven harness monitor windows (560) on one account,
+but the monitor's dead-letter read stops the account at three windows on the PHI-read default. The
+global count ships off, as `phi_read_rate_limit_global` does.
 
 **What it does not charge.** The console calls these handlers in process, through `require_ui`,
 so the route's own dependency does not run and a console tab spends none of this budget; a console
-tab makes no HTTP request to the six routes. A value looser than the default is named by
-`security_loosenings()`; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) has its row.
+tab makes no HTTP request to the six routes. So a signed-in console session that loops
+`/ui/monitoring/live`, `/ui/connections` or `/ui/nav-status` drives the same work with no 429.
+
+Other `monitoring:read` reads that cost work are not charged either. At least `GET /events`,
+`GET /connections/{name}/events` and `GET /config/provenance` stay on plain `require`, and the
+`/ws/stats` socket, a frame a second, runs the `/stats` store aggregate on every frame and, where
+the web console is served, the connections-dashboard read (`_dashboard_rows`, the work behind
+`GET /connections`) too, with no charge here. The socket cap of 64 is per API process, not per
+account, so one account may hold all 64: about 3,840 of each such read a minute, with no 429.
+
+A value looser than the default is named by `security_loosenings()`;
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) has its row.
 
 ## Audit
 
