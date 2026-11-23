@@ -3191,7 +3191,8 @@ def driver_sqlstate_of(
     ``args[0]`` is its message. Otherwise ``args[0]``, if it reads as a SQLSTATE, as pyodbc's
     does. None for any error that is no known driver's, so a ``KeyError('MRN42')`` is never read
     as one, and None for a SQLite error, whose ``args[0]`` is its message (vault BACKLOG #1661).
-    :func:`safe_traceback` names a driver error's SQLSTATE by it. The DATABASE connector reads its own state, which can differ from this one.
+    :func:`safe_traceback` names a driver error's SQLSTATE by it. The DATABASE connector reads its
+    own state, which can differ from this one.
 
     A class whose driver test raises counts as no driver's here, where :func:`raised_by_a_driver`
     answers ``True`` to withhold its text: here ``True`` would read its argument as a SQLSTATE. A

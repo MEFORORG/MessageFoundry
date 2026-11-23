@@ -2813,9 +2813,11 @@ def _sqlstate(exc: BaseException) -> str | None:
     ``args[0]`` is its message; for one, :func:`_shown_state` names a state only from the error's
     own ``sqlstate`` attribute, and only when that equals the state read. What this returns is an
     exact ``str`` copy (:func:`~messagefoundry.redaction.sqlstate_text`). It reads no attribute but
-    ``args``, with ``getattr`` and a default, so an error arm can call it before its cleanup; its
-    class is read with ``type()``, since ``isinstance`` falls back to ``exc.__class__``, which a
-    class can define to raise (engine PR 3163)."""
+    ``args``, with ``getattr`` and a default, and reads the class with ``type()``, since
+    ``isinstance`` falls back to ``exc.__class__``, which a class can define to raise (engine PR
+    3163). That is a bound, not a guarantee that it never raises: an ``args`` that raises other
+    than ``AttributeError`` when read, or a tuple subclass whose item read raises, propagates, and
+    a caller that runs it before its cleanup skips that cleanup."""
     if issubclass(type(exc), UnicodeError) or is_a_sqlite_error(exc):
         return None
     return _shaped_state(getattr(exc, "args", ()))
