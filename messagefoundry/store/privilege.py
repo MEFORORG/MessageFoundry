@@ -482,8 +482,9 @@ class StorePrivilegeReport:
     excess: tuple[str, ...] = ()
     detail: str = ""
     #: Grants the probe could NOT read and named (BACKLOG #6015 item 2). An OBSERVED report carries
-    #: them only beside an over-grant it found, since what WAS read already refuses, and the summary
-    #: names them, so the log line and the alert do not imply the rest was read. Some UNOBSERVABLE
+    #: them only beside an over-grant it found, so the over-grant WAS read and is weighed as one
+    #: (under enforce with no accepted opt-out, it refuses), and the summary names them, so the log
+    #: line and the alert do not imply the rest was read. Some UNOBSERVABLE
     #: reports carry them too. An empty tuple does not mean every grant was read: at least a probe
     #: that raised or returned no row reads nothing and names nothing here.
     unread: tuple[str, ...] = ()

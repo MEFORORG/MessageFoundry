@@ -5191,8 +5191,8 @@ class SqlServerStore:
         schema, ``VIEW DEFINITION`` on the default schema and ``dbo``, the audit-table rights) are
         weighed after the excess (#6714): unread with nothing else found, the report is
         ``UNOBSERVABLE``; unread beside an over-grant that WAS read, it stays ``OBSERVED`` and names
-        them in :attr:`~messagefoundry.store.privilege.StorePrivilegeReport.unread`, so the start
-        still refuses on what was read."""
+        them in :attr:`~messagefoundry.store.privilege.StorePrivilegeReport.unread`, so the
+        over-grant is weighed as one (under enforce with no accepted opt-out, the start refuses)."""
         server_cols = [
             f"IS_SRVROLEMEMBER(?) AS srv_{i}" for i in range(len(SQLSERVER_FIXED_SERVER_ROLES))
         ]
