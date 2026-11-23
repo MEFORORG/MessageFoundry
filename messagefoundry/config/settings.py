@@ -7720,7 +7720,9 @@ class DrSettings(_Section):
 
     ``enabled``/``activate`` are read at engine start (the DR run-profile is a startup decision, ADR
     0048); a deployment is either a DR box (``enabled = true``) or it is not. ``activate = true`` (or
-    the operator endpoint) declares this box should run under the DR profile this boot.
+    the operator endpoint) declares this box should run under the DR profile this boot. Without
+    ``enabled``, ``activate = true`` is refused at load, where it was silently ignored (BACKLOG
+    #5965).
     """
 
     # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
@@ -7729,7 +7731,7 @@ class DrSettings(_Section):
     # Whether this DR box should come up UNDER the DR run-profile on this boot (the startup activation
     # latch — distinct from the runtime POST /dr/activate endpoint, which re-evaluates the graph). When
     # enabled but activate=false the box is provisioned-but-passive: it does NOT bind the priority feeds
-    # until an operator activates it. A no-op unless enabled.
+    # until an operator activates it. Refused at load unless enabled (BACKLOG #5965).
     activate: bool = False
     activation_mode: DrActivationMode = DrActivationMode.MANUAL
     # The DR run-profile threshold: start ONLY connections whose resolved priority rank >= this tier's
@@ -7755,7 +7757,8 @@ class DrSettings(_Section):
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
     # which needs seed_dir below. A URL is rejected (the seed is local/UNC only, like the
-    # backup destination — no new egress).
+    # backup destination — no new egress). With seed_dir also empty, enabled is refused at load: no
+    # activation could ever name a seed (BACKLOG #5965 item 1). Whitespace-only is refused too.
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
@@ -7769,7 +7772,8 @@ class DrSettings(_Section):
     # the #102 server-DB seed gate cross-checks it against the restored DB's OWN latest successful dr_backup
     # archive — a VINTAGE FLOOR a bare boolean attestation cannot give (a stale/wrong native restore's
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
-    # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
+    # byte-unchanged. A URL is rejected (local/UNC only, like seed_archive). Whitespace-only is
+    # refused, and so is any value on a SQLite store, where no check reads it (BACKLOG #5965 item 1).
     restore_token: str = ""
     # Environment variable NAMES the takeover and release hooks are given, beyond the allowlist
     # messagefoundry/childenv.py hook_environment builds: a cloud profile, a proxy, a credential
@@ -7798,6 +7802,19 @@ class DrSettings(_Section):
             )
         return value
 
+    @field_validator("seed_archive", "seed_dir", "restore_token")
+    @classmethod
+    def _path_not_blank(cls, value: str, info: ValidationInfo) -> str:
+        # "" switches each off. A blank or space-padded value is a path activation would try to open
+        # as written and abort on every time, during the disaster (BACKLOG #5965 item 1).
+        if value and not value.strip():
+            raise ValueError(f"[dr].{info.field_name} must be a non-blank path (or omit it)")
+        if value != value.strip():
+            raise ValueError(
+                f"[dr].{info.field_name} must not begin or end with whitespace; remove the padding"
+            )
+        return value
+
     @field_validator("takeover_timeout_seconds")
     @classmethod
     def _positive_timeout(cls, value: float) -> float:
@@ -7818,11 +7835,11 @@ class DrSettings(_Section):
     @field_validator("seed_dir")
     @classmethod
     def _seed_dir_absolute(cls, value: str) -> str:
-        # "" switches request-named archives off. A blank-but-present or relative value would
-        # instead resolve against the service's working directory and quietly open that. So blank
-        # reads as "" and relative fails at load. "Absolute" is judged for THIS platform, the one
-        # that will resolve it: a rooted path with no drive is relative on Windows.
-        value = value.strip()
+        # "" switches request-named archives off. A relative value would instead resolve against
+        # the service's working directory and quietly open that, so it fails at load; a blank or
+        # padded one is refused above, as seed_archive's is (BACKLOG #5965). "Absolute" is judged
+        # for THIS platform, the one that will resolve it: a rooted path with no drive is relative
+        # on Windows.
         if value and not os.path.isabs(value):
             # The value is not quoted: a URL that _looks_like_url missed could carry a
             # credential (vault BACKLOG #2600).
@@ -7851,6 +7868,31 @@ class DrSettings(_Section):
                 "[dr].activation_mode='auto' is not yet supported — automatic HA-pair-loss detection "
                 "and self-promotion are deferred to a future ADR (ADR 0048); use activation_mode='manual' "
                 "(the default) and the RBAC-gated POST /dr/activate operator action"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _activate_needs_enabled(self) -> DrSettings:
+        # BACKLOG #5965: without enabled the engine never read activate, so a box an operator
+        # meant to bring up under the DR run-profile came up as an ordinary engine with nothing
+        # said. With enabled it is the startup latch, unchanged.
+        if self.activate and not self.enabled:
+            raise ValueError(
+                "[dr].activate = true needs [dr].enabled = true: it brings a DR box up under the "
+                "DR run-profile, and has no meaning on a box that is not a DR box"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _enabled_names_a_seed(self) -> DrSettings:
+        # BACKLOG #5965 item 1: with neither set, every activation aborts for want of a seed, and
+        # that is found only during the disaster. seed_archive names one; seed_dir lets the
+        # POST /dr/activate request name one.
+        if self.enabled and not self.seed_archive and not self.seed_dir:
+            raise ValueError(
+                "[dr].enabled = true needs [dr].seed_archive or [dr].seed_dir: with neither, "
+                "POST /dr/activate could never name the cold seed it verifies, so every activation "
+                "would abort"
             )
         return self
 
@@ -8519,9 +8561,9 @@ class ServiceSettings(_InputHidingModel):
         return self
 
     @model_validator(mode="after")
-    def _dr_activate_not_clustered(self) -> ServiceSettings:
-        """A DR box coming up under the DR run-profile must not also be a ``[cluster]`` member (ADR 0096
-        rider). The two govern DIFFERENT things — ``[dr].activate`` gates which *connections* start (the
+    def _dr_not_clustered(self) -> ServiceSettings:
+        """A DR box must not also be a ``[cluster]`` member (ADR 0096 rider). The two govern
+        DIFFERENT things — an activated ``[dr]`` box gates which *connections* start (the
         priority-threshold run-profile, ADR 0048), while ``[cluster].enabled`` makes the node contend for
         *leadership* of a shared store — and combining them is a topology error: a warm DR-site engine
         should be a NON-PROMOTABLE cluster member (``[cluster].promotable = false``) OR a cold/manually
@@ -8530,11 +8572,12 @@ class ServiceSettings(_InputHidingModel):
         Spans two sections, so it lives here (not on either section, which can't see the other).
 
         ``[dr].enabled`` is refused with ``[cluster].enabled`` as well, whatever ``activate`` says
-        (vault BACKLOG #3263). A provisioned DR box that is not activated is passive: it binds no
-        listener and delivers nothing (ADR 0048). As a cluster member it could win the lease and
-        then serve nothing, and ``POST /dr/activate`` would make it the lease-contending DR box
-        the check above refuses at boot."""
-        if (self.dr.enabled or self.dr.activate) and self.cluster.enabled:
+        (vault BACKLOG #3263); ``activate`` without ``enabled`` is refused on its own (BACKLOG
+        #5965). A provisioned DR box that is not activated is passive: it binds no listener and
+        delivers nothing (ADR 0048). As a cluster member it could win the lease and then serve
+        nothing, and ``POST /dr/activate`` would make it the lease-contending DR box described
+        above."""
+        if self.dr.enabled and self.cluster.enabled:
             key = "[dr].activate" if self.dr.activate else "[dr].enabled"
             raise ValueError(
                 f"{key} cannot be combined with [cluster].enabled: the DR run-profile gates which "
@@ -8544,6 +8587,20 @@ class ServiceSettings(_InputHidingModel):
                 "engine cold (or manually promoted) with [cluster] disabled, or make the warm DR node a "
                 "NON-PROMOTABLE cluster member ([cluster].enabled=true, [cluster].promotable=false) "
                 "instead of a [dr] box."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _dr_restore_token_needs_a_server_db(self) -> ServiceSettings:
+        """``[dr].restore_token`` is read only by the server-DB seed gate (BACKLOG #223), so on a
+        SQLite store it was a silent no-op an operator could take for provenance protection
+        (BACKLOG #5965 item 1). SQLite's own seed check verifies the whole store, so there is
+        nothing for it to add. Refused, as ``[store].db_schema`` is off Postgres; the message names no
+        configured value."""
+        if self.dr.restore_token and self.store.backend is StoreBackend.SQLITE:
+            raise ValueError(
+                "[dr].restore_token applies only to a Postgres or SQL Server store; on SQLite no "
+                "check reads it (the cold-seed archive verifies the whole store instead). Remove it"
             )
         return self
 

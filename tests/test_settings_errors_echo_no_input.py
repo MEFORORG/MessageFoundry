@@ -253,8 +253,24 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
     "cluster_on_sqlite": (_auth(), {"cluster": {"enabled": True}}, "[cluster].enabled requires"),
     "dr_and_cluster": (
         _auth(),
-        {"cluster": {"enabled": True}, "dr": {"activate": True}, "store": dict(_POSTGRES)},
-        "[dr].activate cannot be combined",
+        {
+            "cluster": {"enabled": True},
+            "dr": {"enabled": True, "seed_archive": "seed.mfbak"},
+            "store": dict(_POSTGRES),
+        },
+        "[dr].enabled cannot be combined",
+    ),
+    # BACKLOG #5965: the three [dr] refusals added at load.
+    "dr_activate_without_enabled": (
+        _auth(),
+        {"dr": {"activate": True}},
+        "[dr].activate = true needs [dr].enabled",
+    ),
+    "dr_enabled_without_a_seed": (_auth(), {"dr": {"enabled": True}}, "needs [dr].seed_archive"),
+    "dr_restore_token_on_sqlite": (
+        _auth(),
+        {"dr": {"restore_token": "token.json"}},
+        "[dr].restore_token applies only",
     ),
     # Generic: a type error, a field validator, and a section that is not a mapping.
     "type_error_in_a_field": (
