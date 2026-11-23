@@ -3002,7 +3002,7 @@ class RestDestination(DestinationConnector):
         # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a build
         # this refuses logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
         from messagefoundry.transports.http_auth import (
-            refuse_authorization_signer_beside_digest,
+            refuse_authorization_signer_beside_credential,
             refuse_http_digest_conflicts,
         )
 
@@ -3103,8 +3103,11 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
-        refuse_authorization_signer_beside_digest(
+        # BACKLOG #5526 item 6: under the Authorization name the signature would replace the
+        # configured or minted credential _post writes before it.
+        refuse_authorization_signer_beside_credential(
             None if self._signer is None else self._signer.header_name,
+            s,
             digest=digest_selected,
             connection=config.name,
         )
