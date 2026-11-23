@@ -62,8 +62,10 @@ def _refuse_hostless_or_off_allowlist(url: str, allowed_hosts: Sequence[str]) ->
     does not admit. Private: ``url`` must already have passed ``refuse_url_credentials``, whose
     screen keeps urlsplit's own netloc-quoting ``ValueError`` from being raised here.
 
-    The host is judged as urllib dials it: percent-decoded, as ``urllib.request.Request`` decodes
-    it before ``http.client`` validates it. A decoded host ``http.client`` could not send (a
+    The host is judged percent-decoded, as ``urllib.request.Request`` decodes it before
+    ``http.client`` validates it. That is not every step of the dial: ``http.client`` also
+    strips a pair of brackets, so a host written as ``%5b...%5d`` is judged with brackets
+    the dial drops. A decoded host ``http.client`` could not send (a
     space, a control character or a non-ASCII character, written as ``%20``, ``%0d%0a`` or
     ``%7f`` say), or one holding ``/``, ``?`` or a backslash, is refused without naming it, and
     the allowlist judges the decoded host, so
@@ -121,8 +123,8 @@ def refuse_unbuildable_webhook_url(url: str, allowed_hosts: Sequence[str]) -> st
     candidate = url.strip(_STRIPPED_BY_BOTH)
     if candidate != candidate.strip():
         raise ValueError(
-            f"{_SETTING} starts or ends with a non-ASCII space; the value is not repeated here, "
-            "since its path can carry the webhook's token"
+            f"{_SETTING} starts or ends with a non-ASCII whitespace character; the value is not "
+            "repeated here, since its path can carry the webhook's token"
         )
     if unsendable_request_target(candidate, sent_as_is=True):
         raise ValueError(
