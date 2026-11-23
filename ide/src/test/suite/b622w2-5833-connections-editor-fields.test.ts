@@ -122,17 +122,13 @@ let ce!: ConfigEditors;
 
 if (NODE_SIDE) {
   // Loaded fresh against this stub, and the cache put back afterwards, so another node-side suite's
-  // modules keep the stub they were bound to (see new-route-containment.test.ts).
-  const fresh = [
-    "../../configEditors",
-    "../../cli",
-    "../../connectionEditor",
-    "../../connectionSchema",
-    "../../connectionSchemaModel",
-    "../../webviewMessaging",
-  ].map((m) => require.resolve(m));
-  const saved = new Map(fresh.map((f) => [f, require.cache[f]]));
-  for (const f of fresh) {
+  // modules keep the stub they were bound to (see new-route-containment.test.ts). Every module of the
+  // extension's own is dropped, not a named list, so none that configEditors pulls in transitively
+  // stays cached bound to this stub and to the fake CLI below.
+  const outDir = path.resolve(__dirname, "..", "..");
+  const ours = (f: string): boolean => f.startsWith(outDir) && !f.includes(`${path.sep}test${path.sep}`);
+  const saved = new Map(Object.entries(require.cache).filter(([f]) => ours(f)));
+  for (const f of saved.keys()) {
     delete require.cache[f];
   }
   loader._load = function (request: string, parent: unknown, isMain: boolean): unknown {
@@ -144,12 +140,11 @@ if (NODE_SIDE) {
     (require("../../cli") as { runJson: unknown }).runJson = fakeRunJson;
   } finally {
     loader._load = realLoad;
+    for (const f of Object.keys(require.cache).filter(ours)) {
+      delete require.cache[f];
+    }
     for (const [f, entry] of saved) {
-      if (entry) {
-        require.cache[f] = entry;
-      } else {
-        delete require.cache[f];
-      }
+      require.cache[f] = entry;
     }
   }
 }
@@ -202,10 +197,13 @@ providerSuite("connections custom editor answers the form's fields request (BACK
     return token;
   }
 
+  // The handler awaits the rebuild and then posts or drops the reply before it resolves, so no wait
+  // is needed after it.
+  const ask = (token: string): Promise<void> =>
+    handler!({ command: "fields", transport: "file", direction: "inbound", settings: {}, __mfChannel: token });
+
   test("a transport change is answered with the new transport's field groups", async () => {
-    const token = await open();
-    await handler!({ command: "fields", transport: "file", direction: "inbound", settings: {}, __mfChannel: token });
-    await settle(() => posts.some((p) => p.command === "fields"));
+    await ask(await open());
     const reply = posts.find((p) => p.command === "fields");
     assert.ok(reply, `no fields reply was posted; posts: ${JSON.stringify(posts)}`);
     const keys = JSON.stringify(reply.groups);
@@ -214,9 +212,12 @@ providerSuite("connections custom editor answers the form's fields request (BACK
   });
 
   test("a request from a page that is no longer showing gets no reply", async () => {
-    await open();
-    await handler!({ command: "fields", transport: "file", direction: "inbound", settings: {}, __mfChannel: "stale" });
-    await new Promise((r) => setTimeout(r, 50));
+    const token = await open();
+    await ask("stale");
     assert.ok(!posts.some((p) => p.command === "fields"), "a stale page's request was answered");
+    // Control: the same request from the page that is showing IS answered, so the silence above is
+    // the stale-page drop and not a rebuild that failed.
+    await ask(token);
+    assert.ok(posts.some((p) => p.command === "fields"), "the live page's request was not answered");
   });
 });
