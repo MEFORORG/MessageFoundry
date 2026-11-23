@@ -697,7 +697,7 @@ function Hide-PowerShellSpans([string]$Text) {
 # THE PER-SITE TEXTS (BACKLOG #5607). Bash decides a `$((` or word-start `((` site by matching its
 # parens as arithmetic reads them, where quotes and escapes count and a `#` or `<<` is only text: if
 # the `)` closing the inner `(` is followed by `)`, the site is arithmetic, and otherwise it is read
-# again as a subshell, `$(` or `(` around a `(`, whose end a command's own reading finds. The refined
+# again as a subshell, `$(` or `(` around a `(`. The refined
 # view decides each site by backtracking, and past its budget it gives up on the whole command:
 # measured, about 45 nested `$((cmd) )` levels. This pass decides the sites in one pass with a
 # stack, and names texts for the caller to read on their own, after every other view:
@@ -712,9 +712,11 @@ function Hide-PowerShellSpans([string]$Text) {
 # Where a `#`, or a line end after a `<<`, falls inside a subshell site before its decision, or the
 # site never closes, this pass finds the site's end again by a command's reading, and the sites it
 # found inside give no text of their own; the site's own text, read by the views above, stands for
-# them. That matches bash for a `$((` site holding a heredoc, whose body bash reads as data. Bash
-# reads at least a word-start `((` site holding a heredoc otherwise, and runs the body's lines;
-# such a walk stays allowed, as on main. Single-quoted text outside arithmetic, `$'...'` and heredoc
+# them. That matches bash for at least a `$((` site holding a whole heredoc, whose body bash reads
+# as data. It does not match bash for at least a `$((` site holding a `#`, whose end bash finds by
+# matching parens, so the re-read can run past it and add a false deny; nor for a word-start `((`
+# site holding a heredoc, whose body's lines bash runs and which stays allowed, as on main.
+# Single-quoted text outside arithmetic, `$'...'` and heredoc
 # bodies hold no site. It still does not read at least these: a case pattern's `)`, a `((` glued to
 # a keyword, and a substitution in a heredoc body. Past its step budget it returns $null, and the
 # caller then adds nothing. With -From, it reads a command from that offset inside an open `(` and
@@ -865,9 +867,11 @@ function Get-SiteTexts([string]$Text, [int]$From = -1) {
                 $s = $f.Site
                 if ($next -ceq ')') { $s.Dec = 'arith' }
                 else {
-                    # A subshell: the rest of it is a command. Each `<<` read so far opens a heredoc
-                    # whose body starts at the next line end, unless one already passed inside the
-                    # site, which then has its end found again below.
+                    # A subshell: the rest of it is read as a command. Each `<<` read so far is read
+                    # as opening a heredoc whose body starts at the next line end, unless one already
+                    # passed inside the site, which then has its end found again below. Bash does
+                    # that for a word-start `((` site; for a `$((` site it takes no body from the
+                    # lines after the site and runs them, and a walk there can be missed.
                     $s.Dec = 'sub'
                     $frames[$frames.Count - 1].U = $false
                     if (-not $s.Unc) { foreach ($p in $s.Sh) { & $readDelim ($p + 2) } }
@@ -1114,9 +1118,9 @@ try {
     # has been judged and allowed, their bounds are appended, and a throw or a budget giving up
     # returns that allow. The budgets bound how much text they read, not the time it takes to judge
     # it, and that time counts against the timeout this guard shares with the hooks run after it in
-    # the same dispatch. Each
-    # text is read under the plain, bash and refined views, one text per call, so the loop judges it
-    # before the next is read. Built only for a command holding `((` or `$[`.
+    # the same dispatch. Each text is read under the plain and bash views, and under the refined view
+    # where it holds a quote and fits the budget, one text per call, so the loop judges it before the
+    # next is read. Built only for a command holding `((` or `$[`.
     $sitePending = @{ Value = ($tool -cne 'PowerShell' -and
         ($cmd.IndexOf('((', [StringComparison]::Ordinal) -ge 0 -or $cmd.IndexOf('$[', [StringComparison]::Ordinal) -ge 0))
         Site = $null; Next = 0; Spent = 0 }
