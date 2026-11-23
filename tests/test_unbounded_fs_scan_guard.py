@@ -1162,8 +1162,9 @@ def test_every_command_the_base_denies_is_still_denied(tmp_path: Path, chunk: in
     assert len(old) == len(new) == len(rows)
     # The floor: a run in which both copies failed open would compare nothing.
     assert old.count("1") > len(rows) // 4, f"the base denied only {old.count('1')} commands"
-    # Each chunk holds a quarter of the 800 two-site rows plus its share of the corpora, so a
-    # chunk under 200 rows means the row source shrank and the comparison below proves less.
+    # A floor on what was compared. Each chunk measured 260 or 261 rows, of which 200 are its
+    # quarter of the two-site rows, so this catches at least those rows collapsing. It does not
+    # catch the corpus rows dropping out, or part of the two-site rows going.
     assert len(rows) >= 200, f"chunk {chunk} compared only {len(rows)} commands"
     lost = [rows[i] for i in range(len(rows)) if old[i] == "1" and new[i] == "0"]
     assert lost == [], f"{len(lost)} commands the base denies are now allowed: {lost[:10]}"

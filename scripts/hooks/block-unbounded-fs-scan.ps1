@@ -716,14 +716,20 @@ function Hide-PowerShellSpans([string]$Text) {
 # as data. It does not match bash for at least a `$((` site holding a `#`, whose end bash finds by
 # matching parens, so the re-read can run past it and add a false deny; nor for a word-start `((`
 # site holding a heredoc, whose body's lines bash runs and which stays allowed, as on main.
-# Outside arithmetic, single-quoted text, `$'...'` text and the body of a heredoc whose delimiter is
-# quoted hold no site in bash. This pass reads every heredoc body as data, whatever its delimiter.
-# It still does not read at least these: a case pattern's `)`, a `((` glued to a keyword, a `$'...'`
-# inside arithmetic, where bash reads the `$` and the quote as literal text and a substitution
-# inside it still runs, and a substitution in the body of a heredoc whose delimiter is unquoted,
-# which bash runs. Past its step budget it returns $null, and the
-# caller then adds nothing. With -From, it reads a command from that offset inside an open `(` and
-# returns where that `(` closes.
+# Outside arithmetic and outside a `${...}` within double quotes, none of these holds a site in bash:
+# single-quoted text, `$'...'` text, and the body of a heredoc whose delimiter is quoted. This pass
+# skips all three, and it also skips the body of a heredoc whose delimiter is unquoted. It still does
+# not read at least these:
+#   - a case pattern's `)`, and a `((` glued to a keyword;
+#   - a `$'...'` inside arithmetic. Bash drops its `$` and decodes its escapes before the expansion,
+#     so a substitution in it runs, including one spelled with escapes such as `\x24(`;
+#   - a `'` inside a `${...}` within double quotes, which bash reads as a literal character, so a
+#     site after it runs;
+#   - a heredoc delimiter it captures only part of, such as `<<END-X`. The pass then reads the body as
+#     running past the real terminator, so a site on a later line is skipped;
+#   - a substitution in the body of a heredoc whose delimiter is unquoted, which bash runs.
+# Past its step budget it returns $null, and the caller then adds nothing. With -From, it reads a
+# command from that offset inside an open `(` and returns where that `(` closes.
 function Get-SiteTexts([string]$Text, [int]$From = -1) {
     $len = $Text.Length
     $steps = 0
