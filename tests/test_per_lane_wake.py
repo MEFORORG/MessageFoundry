@@ -364,7 +364,9 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
 
     All three files are written in one step, with no sleep between them, so more than one row may
     be pending in a lane at once. Nothing here checks that one was. The order checked is delivery
-    against arrival, so it holds whatever order the file source took the files in."""
+    against arrival, so it holds whatever order the file source took the files in. The cost: a
+    burst usually reaches a busy worker, so a defect that loses only the wakes after a lane's
+    first is less likely to show here than with the spaced writes this replaced."""
     inbox, out_a, out_b = tmp_path / "in", tmp_path / "a", tmp_path / "b"
     inbox.mkdir()
     reg = _delivery_registry(inbox, out_a, out_b)
@@ -395,7 +397,8 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
     # Every message reached PROCESSED under per-lane wake, and each destination was sent them in
     # arrival (ingest = rowid = seq) order: B12 leaves the FIFO claim untouched, and only the wake
     # timing differs (#285 / ADR 0059). The order is read from the "delivered" events rather than
-    # assumed from the file names, so a FIFO-claim fault fails it and an intake reorder does not.
+    # assumed from the file names, so an intake reorder does not fail it. A FIFO-claim fault fails
+    # it only on a run where two or more rows were pending in one lane at a claim.
     msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert len(msgs) == 3 and all(m["status"] == MessageStatus.PROCESSED.value for m in msgs)
     cur = await store._db.execute(
