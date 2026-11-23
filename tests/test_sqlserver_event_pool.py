@@ -13,7 +13,8 @@ call on the bounded Transit pool. Two rules keep that from costing availability:
 
 That second rule does not cover every seal under the lock. At least ``complete_with_response``
 still seals the reply body, detail, headers and re-ingress reference after taking the lock, since
-their associated data holds the response sequence read under it; ``claim_fifo_heads`` builds an
+each cell's associated data, or the reference's own text, holds the response sequence read under
+it; ``claim_fifo_heads`` builds an
 idempotent-skip event after an earlier head's finalize; and an audit append seals its MAC under
 the locks ``cancel_queued`` takes.
 
@@ -189,8 +190,32 @@ async def test_no_event_statement_is_built_under_a_finalize_applock(case: str) -
         # A sweep's sealed last_error is built with its event, before the locks too.
         assert not any(held for _thread, _aad, held in cipher.sealed)
     # Built early, still executed late: each event INSERT runs after the first finalize applock.
-    statements = [sql for sql, _params in _statements(cur)]
-    first_lock = next(i for i, sql in enumerate(statements) if "sp_getapplock" in sql)
+    executed = _statements(cur)
+    statements = [sql for sql, _params in executed]
+    first_lock = next(
+        i
+        for i, (sql, params) in enumerate(executed)
+        if "sp_getapplock" in sql and any(str(p).startswith("mefor:finalize:") for p in params)
+    )
     inserts = [i for i, sql in enumerate(statements) if sql == ss._SQL_INSERT_EVENT]
     assert len(inserts) == len(events), (inserts, len(events))
     assert all(i > first_lock for i in inserts), statements
+
+
+@pytest.mark.parametrize("batched", [False, True])
+async def test_a_thinned_event_is_built_and_written_nowhere(batched: bool) -> None:
+    """Under ``message_events = "off"`` the routine ``routed`` event is dropped: no seal, no INSERT,
+    and the handoff still commits its status UPDATE."""
+    store = h.bare_store(batch=batched)
+    store._message_events = "off"
+    cipher = _BlockingCipher()
+    store._cipher = cipher
+    cur: Any = h.BatchRecCursor() if batched else h.AsyncRecCursor()
+    cipher.cursor = cur
+    conn = h.RecConn()
+    assert await h.drive_async(store, "route_handoff", cursor=cur, conn=conn, **h.ROUTE_KWARGS)
+    statements = [sql for sql, _params in _statements(cur)]
+    assert ss._SQL_INSERT_EVENT not in statements
+    assert ss._SQL_UPDATE_MESSAGE_STATUS in statements
+    assert not [aad for _thread, aad, _held in cipher.sealed if _event_aad(aad)]
+    assert conn.commits == 1
