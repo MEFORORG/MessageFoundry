@@ -256,17 +256,22 @@ def bool_setting(settings: Mapping[str, Any], key: str, *, default: bool) -> boo
     ``bool(settings.get(key, True))`` reads an explicit ``None`` as ``False``, which turns a
     default-on check such as ``tls_verify`` OFF (vault BACKLOG #3230). ``bool("")`` does the same,
     so an empty string is unset too (vault BACKLOG #3533 item 11); for a default-off setting that
-    reads as it did. Any other value is read with ``bool()``, as before. A literal empty string on
-    a boolean setting is refused at load and at the builds ``config.wiring.refuse_bool_literals``
-    names, so there the empty-string rule serves only a mapping that reached this reader some
-    other way.
+    reads as it did. A literal empty string on a boolean setting is refused at load and at the
+    builds ``config.wiring.refuse_bool_literals`` names, so there the empty-string rule serves only
+    a mapping that reached this reader some other way.
+
+    Any other value must be a real ``bool``, and anything else raises :class:`ValueError` naming
+    ``key`` (:func:`require_flag`, vault BACKLOG #3234). ``bool()`` read ``0`` as off and
+    ``"false"`` as on, so a connector built directly from a ``Source`` or ``Destination``, which
+    passes neither refusal above, could turn a default-on check off. An unresolved ``env()``
+    reference is not a ``bool`` either: a reader that runs before resolution handles it first.
 
     Use it for a transport setting with a default, such as a TLS check, and read it the same way in
     every connector and every reader that reports on it, so the two cannot disagree. Use
     :func:`flag_from_settings` instead for a hop-policy flag (``tls_hop_attested`` and its kin), or
-    another setting that defaults off and must refuse a value that is not a real ``bool``."""
+    another setting that defaults off and must refuse an empty string too."""
     value = settings.get(key)
-    return default if value is None or value == "" else bool(value)
+    return default if value is None or value == "" else require_flag(value, key)
 
 
 def _check_flag_with_reason(

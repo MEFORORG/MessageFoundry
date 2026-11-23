@@ -884,8 +884,8 @@ async def test_a_long_error_still_names_the_member(
 
 
 async def test_a_non_hl7_head_names_the_head(store: MessageStore) -> None:
-    # Vault BACKLOG #5100: the head's parse for BHS-11 is that member's own step, so a non-HL7 head
-    # names the head, not the last member.
+    # Vault BACKLOG #5100: the head's MSH-10 read for BHS-11 is that member's own step, so a
+    # non-HL7 head, which that read parses in full and refuses, names the head, not the last member.
     mids, ids = await _enqueue(store, ["not an HL7 message at all", _hl7_with_value("clean")])
     col = _Collector()
     runner, _ = _batch_runner(store, col)

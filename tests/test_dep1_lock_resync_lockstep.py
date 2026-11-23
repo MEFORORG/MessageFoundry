@@ -29,12 +29,13 @@ _ROOT = Path(__file__).resolve().parent.parent
 _WORKFLOWS = _ROOT / ".github" / "workflows"
 _GATE = _WORKFLOWS / "security.yml"
 _RESYNC = _WORKFLOWS / "dependabot-lock-resync.yml"
-#: The files the resync derives from the core, sqlserver and harness lock exports, and the command
-#: that derives them (BACKLOG #1812, #1955).
+#: The files the resync derives from the core, sqlserver, postgres and harness lock exports, and the
+#: command that derives them (BACKLOG #1812, #1955, #5933).
 _CLOSURES = frozenset(
     {
         "security/runtime-closure-core.txt",
         "security/runtime-closure-sqlserver.txt",
+        "security/runtime-closure-postgres.txt",
         "security/runtime-closure-harness.txt",
     }
 )

@@ -40,12 +40,18 @@ from messagefoundry.parsing._builtin_hl7 import (
     filled_default_collides,
 )
 from messagefoundry.parsing.message import COLLIDING_DELIMITERS_WRITE, Message
-from messagefoundry.parsing.peek import enforce_expansion_budget, normalize, starts_with_msh
+from messagefoundry.parsing.peek import (
+    enforce_expansion_budget,
+    normalize,
+    parse_or_refuse,
+    starts_with_msh,
+)
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 __all__ = [
     "batch_member_collides",
     "encode_batch",
+    "head_control_id",
     "split_batch",
     "split_batch_bytes",
     "one_message_bytes",
@@ -493,9 +499,10 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), run on
     ``norm`` itself, the text encode_batch frames: a head a parse refuses for its escapes raises
     the same ``HL7PeekError`` here, whatever its caller checked. On the delivery path that text is
-    the hydrated head, and the caller's own parse of the head's stored payload checks the same
-    budget first, so there this is a second check, not the only one. What else a parse checks in the
-    rest of the head is not checked: at least a later header line too short to read."""
+    the hydrated head. The caller's own read (:func:`head_control_id`) checks the same budget on
+    the head's stored payload, which is other text wherever a document was re-attached, so on
+    the hydrated text this check is the one that runs. What else a parse checks in the rest of
+    the head is not checked: at least a later header line too short to read."""
     line = _first_line_head(norm)
     # The parse's _encoding_chars returns exactly what _extract_separators reads from this line,
     # a short MSH-2 filled with the same defaults (BACKLOG #5972), so any MSH line the parse would
@@ -510,6 +517,42 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
         raise CollidingDelimitersRefused(COLLIDING_DELIMITERS_WRITE)
     field_sep, comp_sep, rep_sep, sub_sep, esc = _extract_separators(line)
     return field_sep, comp_sep, rep_sep, esc, sub_sep
+
+
+#: A header line after the first that is too short for the parse to read (``_builtin_hl7.parse``
+#: refuses one): a line that is a header ID alone, or the text's last line once the parse's strip
+#: leaves only a header ID there. A literal, so the static ReDoS scanner can read it; a test
+#: holds its IDs to HEADER_IDS.
+_SHORT_LATER_HEADER = re.compile(r"\r(?:MSH|BHS|FHS)(?:\r|\s*\Z)")
+
+
+def head_control_id(text: str) -> str | None:
+    """MSH-10 of a batch's head member as stored, what ``Message.parse(text).control_id``
+    returns, read from its first line alone where that gives the same result (BACKLOG #5919).
+
+    A full parse of a large head to read one field copied the whole head. For a head whose first
+    line opens with ``MSH`` after whitespace and holds MSH-1 and one more character, the parse's
+    escape budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`) is checked on
+    the whole text, as the parse checks it first, and that one line is parsed. The MSH segment is
+    split from its own line and separators alone, so its MSH-10 is the full parse's. Every other
+    head, and one the full parse could refuse for a later line or read differently, is parsed in
+    full, so it reads or raises exactly as the parse does: at least an ``FHS``/``BHS``-led or
+    non-HL7 head, one with a later header line too short to read, and one whose first line ends in
+    whitespace, which the parse's strip keeps or drops depending on what follows."""
+    norm = normalize(text)
+    end = len(norm)
+    start = _whitespace_end(norm, 0, end)
+    cr = norm.find("\r", start)
+    stop = end if cr == -1 else cr
+    if (
+        norm.startswith(_MSH, start)
+        and stop - start >= _SEPARATORS_WIDTH
+        and not norm[stop - 1].isspace()
+        and _SHORT_LATER_HEADER.search(norm, stop) is None
+    ):
+        enforce_expansion_budget(norm)
+        return Message(parse_or_refuse(norm[start:stop])).control_id
+    return Message.parse(norm).control_id
 
 
 def _framed(text: str) -> tuple[str, ...]:
