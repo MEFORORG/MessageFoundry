@@ -2,24 +2,23 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Rules 3c, 3d, 3 and 3b also judge rewritten readings of the whole command (BACKLOG #5655 step 3).
 
-The hook's Get-AddedCommandReadings returns the command as given, then at most these rewrites: a git
-word the owning-word search skips (``\\git``, ``/usr/bin/git``, on Windows and macOS ``GIT``) spelled
-``git``, a posix backtick substitution spelled ``$( )``, a judged inner invocation hoisted to where the
-shell runs it, and the outer invocation with its closed ``$( )`` replaced by ``_``. Each is judged by
-the same rules after the command as given, so a rewrite can only add a deny.
+The hook's Get-AddedCommandReadings note says what the rewrites are. Each is judged by the same rules
+after the command as given, so a rewrite can only add a deny.
 
 Each ``DENIED`` row was measured ALLOW at ``BASELINE`` (origin/main when this was built). The
 differential test runs this file's rows, and the rows it can harvest from the parametrize marks of
 the earlier quoted-path file, through both the shipped hook and the hook as it stood at ``BASELINE``,
 and fails on any of those inputs the baseline denies and the shipped hook allows. A harvested row runs
 from the cwd it names, or from outside where it names none, so it can differ from the context its own
-test uses; rows with other placeholders, and tests with no parametrize mark, are not harvested. It also
+test uses; rows with other placeholders, rows no rewrite could act on, and tests with no parametrize
+mark, are not harvested. It also
 checks that each ``DENIED`` row really was an ALLOW there, so a row that pinned nothing new would be
 seen. The differential is skipped in a clone that does not hold ``BASELINE``.
 """
 
 from __future__ import annotations
 
+import re
 import shutil
 import string
 import subprocess
@@ -146,6 +145,25 @@ DENIED: list[tuple[str, str, str, str]] = [
         "Bash",
         "SHARED PRIMARY",
     ),
+    # Review round e115e5da59: a PowerShell comment holding an apostrophe, and an arithmetic `<<`.
+    (
+        "# don't\ncd {p}; echo $(Get-Date); git -C {o} log $(git reset --hard)",
+        "outside",
+        "PowerShell",
+        "SHARED PRIMARY",
+    ),
+    (
+        "<# it's #>\ncd {p}; echo $(Get-Date); git -C {o} log $(git reset --hard)",
+        "outside",
+        "PowerShell",
+        "SHARED PRIMARY",
+    ),
+    (
+        "echo $((1<<2))\ncd {p} && echo $(date); git -C {o} log $(git reset --hard)",
+        "outside",
+        "Bash",
+        "SHARED PRIMARY",
+    ),
     # Inside DOUBLE quotes bash runs a backtick and a `$( )`, so the reset really runs.
     (
         'git commit -m "never run {bt}git reset --hard{bt} here"',
@@ -158,6 +176,13 @@ DENIED: list[tuple[str, str, str, str]] = [
 
 #: Rows that hold only where `GIT` runs git: Windows here; macOS is rewritten too but not run in CI.
 DENIED_WINDOWS: list[tuple[str, str, str, str]] = [
+    # Review round e115e5da59: an unrewritten `GIT` inside double quotes was dropped by the hoist.
+    (
+        'cd {p} && echo $(date); git -C {o} log "$(GIT reset --hard)"',
+        "outside",
+        "Bash",
+        "SHARED PRIMARY",
+    ),
     ("GIT reset --hard", "primary", "PowerShell", "SHARED PRIMARY"),
     ("GIT config {k}", "primary", "PowerShell", "SHARED git"),
     ("GIT reset --hard", "primary", "Bash", "SHARED PRIMARY"),
@@ -183,6 +208,21 @@ ALLOWED: list[tuple[str, str, str]] = [
     ("Write-Output $(git log --grep reset)", "primary", "PowerShell"),
     ("git -C {wt} log $(git -C {wt} log --format=%H --grep reset)", "primary", "Bash"),
     ('git commit -m "fix; see $(git log -1)"', "wt", "Bash"),
+    # Review round e115e5da59: quoting starts afresh inside `"$( )"`, so a quoted heredoc or a single
+    # quote there is literal, as the shell reads it. This is the usual commit-message idiom.
+    (
+        "git commit -m \"$(cat <<'EOF'\nUse {bt}git checkout {b}{bt} there.\nEOF\n)\"",
+        "wt",
+        "Bash",
+    ),
+    (
+        "git commit -m \"$(cat <<'EOF'\nRun {bt}git -C {p} worktree remove {wt}{bt} later.\nEOF\n)\"",
+        "outside",
+        "Bash",
+    ),
+    ("echo \"$(echo 'never {bt}git reset --hard{bt}')\"", "primary", "Bash"),
+    ("x=\"$(printf '%s' '{bt}git -C {p} config {k}{bt}')\"", "outside", "Bash"),
+    ("Write-Output \"$(Write-Output '$(git reset --hard)')\"", "primary", "PowerShell"),
     ("git -C '{o}' -c user.name=$(git config user.name) config {k}", "outside", "Bash"),
     ("git -C '{o}' -c user.name=$(git config user.name) config {k}", "outside", "PowerShell"),
     ("\\git -C '{o}' -c user.name=$(git log -1) config {k}", "outside", "Bash"),
@@ -377,7 +417,15 @@ def _differential_rows() -> list[tuple[str, str, str]]:
     own = [(r[0], r[1], r[2]) for r in DENIED + ALLOWED] + ALREADY_DENIED
     if sys.platform == "win32":
         own += [(r[0], r[1], r[2]) for r in DENIED_WINDOWS]
-    return sorted(set(own + _quoted_file_rows()))
+    # A harvested row is kept only where a rewrite could apply to it. Without one the hook judges the
+    # command as given alone, which is the baseline's own pass, so the row would cost two launches and
+    # measure nothing the rows kept here do not.
+    harvested = [r for r in _quoted_file_rows() if _REWRITE_TRIGGER.search(r[0])]
+    return sorted(set(own + harvested))
+
+
+#: Text a rewrite could act on: a substitution, a backtick, or a git word the rewrites respell.
+_REWRITE_TRIGGER = re.compile(r"\$\(|`|\{bt\}|\\git|/git|(?i:git\.exe)|\bGIT\b")
 
 
 @pytest.mark.parametrize("row", _differential_rows(), ids=lambda r: f"{r[2]}-{r[1]}-{r[0]}")

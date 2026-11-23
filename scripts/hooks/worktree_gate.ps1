@@ -1219,8 +1219,11 @@ function Test-TrueSeparatorIn([string]$Text) {
 # lost, so a shape the rewrites would refuse is allowed as it was before them; where it calls literal
 # text code, or `_` stands where a path was, the cost is a false deny. Neither can remove a deny, because
 # the command as given is judged first, by the readings that ran before this existed. At least these
-# are not rewritten: a single-quoted interpreter payload (`bash -c '... `git reset --hard` ...'`, which
-# the scan recurses into as code), a nested `$( )`, and a command longer than $maxRewrite characters.
+# are not rewritten or not refused: a single-quoted interpreter payload (`bash -c '... `git reset
+# --hard` ...'`, which the scan recurses into as code); a hoist of a `$( )` with a bracket inside it;
+# a bare verb as the last word of a hoisted command (`$(git stash)`, `$(git reset)`), read as the
+# command as given reads it, so as no verb; any judged `$( )` after the first eight; and a command
+# longer than $maxRewrite characters.
 function Get-QuoteStateMap([string]$Text, [string]$Convention) {
     # One character per input character: N code, D double-quoted or heredoc text that still expands,
     # S literal, E a character an escape makes literal.
@@ -1229,6 +1232,9 @@ function Get-QuoteStateMap([string]$Text, [string]$Convention) {
     $map = [char[]]::new($Text.Length)
     $heredoc = [regex]::new('\G(?<!<)<<(-?)[ \t]*(?:''(\w+)''|"(\w+)"|\\(\w+)|(\w+))')
     $pending = [System.Collections.Generic.List[object]]::new()
+    # The open `$( )` substitutions, each with the state and bracket depth its `)` returns to.
+    $subs = [System.Collections.Generic.List[object]]::new()
+    $depth = 0
     $state = 'N'
     $i = 0
     while ($i -lt $Text.Length) {
@@ -1248,23 +1254,52 @@ function Get-QuoteStateMap([string]$Text, [string]$Convention) {
         if ($c -eq $esc -and $i + 1 -lt $Text.Length) {
             $map[$i] = $state; $map[$i + 1] = 'E'; $i += 2; continue
         }
+        $opensSub = $c -eq [char]'$' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]'('
         if ($state -eq 'D') {
             $map[$i] = 'D'
             if ($c -eq [char]'"') { $state = 'N' }
+            elseif ($opensSub) {
+                # Quoting starts afresh inside `"$( )"`, as Find-SubstitutionEnd says; the `)` that
+                # closes it returns here.
+                $subs.Add([pscustomobject]@{ State = 'D'; Depth = $depth }); $depth = 0
+                $map[$i + 1] = 'N'; $state = 'N'; $i += 2; continue
+            }
             $i++; continue
         }
         $map[$i] = 'N'
+        if ($opensSub) {
+            $subs.Add([pscustomobject]@{ State = 'N'; Depth = $depth }); $depth = 0
+            $map[$i + 1] = 'N'; $i += 2; continue
+        }
+        if ($c -eq [char]'(') { $depth++; $i++; continue }
+        if ($c -eq [char]')') {
+            if ($depth -gt 0) { $depth-- }
+            elseif ($subs.Count -gt 0) {
+                $back = $subs[$subs.Count - 1]; $subs.RemoveAt($subs.Count - 1)
+                $state = $back.State; $depth = $back.Depth
+            }
+            $i++; continue
+        }
         if ($posix -and $c -eq [char]'$' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]"'") {
             $map[$i + 1] = 'S'; $state = 'A'; $i += 2; continue
         }
         if ($c -eq [char]"'") { $map[$i] = 'S'; $state = 'S'; $i++; continue }
         if ($c -eq [char]'"') { $map[$i] = 'D'; $state = 'D'; $i++; continue }
-        if ($posix -and $c -eq [char]'#' -and ($i -eq 0 -or " `t`r`n;&|(".Contains([string]$Text[$i - 1]))) {
-            # A comment runs to the end of its line; the line break stays code, for a pending heredoc.
+        if ($Convention -eq 'pwsh' -and $c -eq [char]'<' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]'#') {
+            # A PowerShell block comment, up to its `#>`.
+            $close = $Text.IndexOf('#>', $i + 2, [System.StringComparison]::Ordinal)
+            $stop = $(if ($close -lt 0) { $Text.Length } else { $close + 2 })
+            for ($j = $i; $j -lt $stop; $j++) { $map[$j] = 'S' }
+            $i = $stop; continue
+        }
+        if ($c -eq [char]'#' -and ($i -eq 0 -or " `t`r`n;&|(".Contains([string]$Text[$i - 1]))) {
+            # A comment, in either shell, runs to the end of its line; the line break stays code, for a
+            # pending heredoc.
             while ($i -lt $Text.Length -and $Text[$i] -ne [char]"`n") { $map[$i] = 'S'; $i++ }
             continue
         }
-        if ($posix -and $c -eq [char]'<') {
+        # Not inside brackets, where `<<` is an arithmetic shift (`$((1<<2))`), not a heredoc.
+        if ($posix -and $c -eq [char]'<' -and $depth -eq 0) {
             $h = $heredoc.Match($Text, $i)
             if ($h.Success) {
                 $quoted = -not $h.Groups[5].Success
@@ -1354,16 +1389,20 @@ function Get-AddedCommandReadings([string]$Cmd, [string]$Convention) {
     if (@([regex]::Matches($Cmd, $gitWord, $opts) | Where-Object { $_.Value -cne 'git' }).Count -gt 0) {
         $named = Edit-UnquotedMatches $Cmd (Get-QuoteStateMap $Cmd $Convention) $gitWord 'git' $opts
     }
+    $namedMap = $null
     if ($Convention -eq 'posix' -and $named.Contains([char]'`')) {
         # A one-line span opened by a backtick the shell runs, with its quotes paired: an odd quote
         # inside one leaves bash looking for its match, and such a command does not run at all.
-        $named = Edit-UnquotedMatches $named (Get-QuoteStateMap $named $Convention) `
+        $before = $named
+        $namedMap = Get-QuoteStateMap $named $Convention
+        $named = Edit-UnquotedMatches $named $namedMap `
             '`((?:[^`''"\r\n]|''[^''\r\n]*''|"[^"`\r\n]*")*)`' '$$($1)' $plain -InDouble
+        if ($named -cne $before) { $namedMap = $null }
     }
     if ($named -cne $Cmd) { $named }
     $subst = '\$\(([^()\r\n]*)\)'
     if ($named -notmatch $subst) { return }
-    $namedMap = Get-QuoteStateMap $named $Convention
+    if ($null -eq $namedMap) { $namedMap = Get-QuoteStateMap $named $Convention }
     # A HOISTED INNER INVOCATION: the text before a closed one-line `$(`, cut after its last true
     # separator or line break outside quotes, then the inner command, so it is read where the shell
     # runs it (`echo
@@ -4186,9 +4225,13 @@ if ($tool -in @("Bash", "PowerShell")) {
     if (-not $givenCmd) { exit 0 }
     # Rules 3c, 3d, 3 and 3b judge each of Get-AddedCommandReadings' strings, the command as given
     # first. The body below is dot-sourced, so the first pass runs in this scope exactly as it ran
-    # inline; an allow inside it is a `return`, which ends that pass and starts the next. The body
-    # keeps its pre-#5655 indent so this change does not rewrite every line of it.
-    foreach ($cmd in @(Get-AddedCommandReadings $givenCmd (Get-HostConvention $tool))) { . {
+    # inline; an allow inside it is a `return`, which ends that pass and starts the next. The rewrites
+    # are computed only once the command as given is allowed. The body keeps its pre-#5655 indent so
+    # this change does not rewrite every line of it.
+    foreach ($pass in @('given', 'rewritten')) {
+    $passCmds = $(if ($pass -eq 'given') { , $givenCmd } else {
+            @(Get-AddedCommandReadings $givenCmd (Get-HostConvention $tool) | Select-Object -Skip 1) })
+    foreach ($cmd in @($passCmds)) { . {
 
     # -----------------------------------------------------------------------------------------------
     # Rule 3c -- a git CONFIG write that disarms the SHARED repository. `config` changes no tree, so the
@@ -5803,6 +5846,7 @@ If none of those fit, STOP and tell the user: "I need to change the primary chec
 worktree gate blocked it." The primary's HEAD belongs to the user, not to a session.
 "@
     } }
+    }
     exit 0
 }
 
