@@ -16,6 +16,7 @@ import functools
 import io
 import logging
 import re
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -29,11 +30,14 @@ import pytest
 pytest.importorskip("pydicom", reason="DICOM log tests need the [dicom] extra")
 pytest.importorskip("pynetdicom", reason="DICOM log tests need the [dicom] extra")
 
+from messagefoundry.store.base import StoreAcquireTimeout  # noqa: E402
 from messagefoundry.transports import _dicom_log_lines as lines  # noqa: E402
 from messagefoundry.transports import dicom as dicom_module  # noqa: E402
 from tests import _dicom_log_census as census  # noqa: E402
 
 _PLANTED = "DOE^JANE^PLANTED"
+#: A refused UID, which the engine's general redaction does not recognise.
+_UID = "1.02.999.PLANTED"
 _WITHHELD = "line withheld: it matches no pinned template"
 _FORMAT = "%(name)s|%(levelname)s|%(message)s"
 
@@ -794,3 +798,99 @@ def test_notes_that_read_as_false_are_not_written() -> None:
     written = logging.Formatter("%(message)s").format(record)
     assert "ValueError: Network timeout reached" in written  # CONTROL: the traceback is written
     assert _PLANTED not in written
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        StoreAcquireTimeout("sqlite: store pool acquire timed out after 5s"),
+        # The CONTROL: the engine's log chain already withholds what is printed under a driver error.
+        sqlite3.OperationalError("database is locked"),
+    ],
+    ids=["store-acquire-timeout", "driver-error"],
+)
+async def test_a_store_fault_on_a_failed_delivery_logs_no_library_text(
+    fault: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The real delivery arm: the send fails, the arm's write of that failure to the store raises,
+    # so the new error's context is the DeliveryError, and the worker's fault log prints the chain.
+    from pynetdicom.association import Association
+
+    from messagefoundry.config.models import RetryPolicy
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.logging_setup import RedactionFilter
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner, _WorkerFaultLog
+    from messagefoundry.store import MessageStore
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    refusal = f"Invalid 'Affected SOP Instance UID' value '{_UID}' - must not exceed 64 characters"
+
+    def refuse(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(refusal)
+
+    async def locked(*args: Any, **kwargs: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(Association, "send_c_store", refuse)
+    store = await MessageStore.open(tmp_path / "chain.db")
+    try:
+        payload = _carry(make_sr_part10())
+        await store.enqueue_message(
+            channel_id="IB", raw=payload, deliveries=[("OB_SCU", payload)], now=100.0
+        )
+        item = await store.claim_next_fifo("OB_SCU")
+        assert item is not None
+        with _storage_scp() as port:
+            runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+            runner._destinations["OB_SCU"] = _scu(port)
+            runner._retry["OB_SCU"] = RetryPolicy()
+            runner._simulate["OB_SCU"] = False
+            monkeypatch.setattr(store, "mark_failed", locked)
+            with pytest.raises(type(fault)) as raised:
+                await runner._process_delivery_item("OB_SCU", item)
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactionFilter())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    log = logging.getLogger("messagefoundry.pipeline.wiring_runner")
+    log.addHandler(handler)
+    try:
+        _WorkerFaultLog("delivery", "OB_SCU").failed(
+            raised.value, "delivery worker %r: unexpected error"
+        )
+    finally:
+        log.removeHandler(handler)
+    written = stream.getvalue()
+    assert type(fault).__name__ in written and "DeliveryError" in written  # CONTROL
+    assert "RuntimeError" in written  # the cause is still named, by its class
+    assert _UID not in written, written
+
+
+async def test_each_refusal_the_scu_raises_carries_no_library_text_on_its_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pynetdicom.association import Association
+
+    from messagefoundry.transports.base import NegativeAckError
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    def refuse(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise ValueError(f"cannot encode {_UID}")
+
+    monkeypatch.setattr(Association, "send_c_store", refuse)
+    with _storage_scp() as port, pytest.raises(NegativeAckError) as raised:
+        await _scu(port).send(_carry(make_sr_part10()))
+    link: BaseException | None = raised.value
+    seen = 0
+    while link is not None:
+        assert _UID not in str(link)
+        seen += 1
+        link = link.__cause__ or link.__context__
+    assert seen == 2  # CONTROL: the cause is still there, by its class

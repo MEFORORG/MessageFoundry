@@ -819,6 +819,26 @@ def _safe_library_exc(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {safe_text(line)}" if line else type(exc).__name__
 
 
+def _drop_library_text_from_chain(exc: BaseException) -> None:
+    """Replace what ``exc`` was raised from with an empty exception of the same class.
+
+    A delivery error's own text is screened, but its chain still held the library's exception. If
+    the runner's write of the failure to the store then raises, the worker's fault log prints that
+    whole chain, and the engine's redaction does not recognise a refused UID. ``from None`` would
+    leave it on ``__context__``, so both links are set. The class stays, for diagnosis and for the
+    retry classification's tests; ``__new__`` runs none of the library's own initialiser."""
+    link = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+    bare: BaseException | None = None
+    if link is not None:
+        kind = type(link)
+        try:
+            bare = kind.__new__(kind)
+        except Exception as failed:  # noqa: BLE001 - a third-party class; the chain just ends
+            logger.debug("A DICOM exception's class was dropped: %s", type(failed).__name__)
+    exc.__context__ = None
+    exc.__cause__ = bare  # also sets __suppress_context__
+
+
 def _raised_at(exc: BaseException) -> str:
     """Where ``exc`` was raised, as file, line and function. These are code, so they say where an
     engine fault is when :func:`_safe_library_exc` has withheld its message."""
@@ -3015,9 +3035,10 @@ class DicomScuDestination(DestinationConnector):
         ``unanswered-over-ceiling`` refusal has already dropped its own."""
         try:
             self._store_object(object_bytes)
-        except NegativeAckError as exc:
-            if exc.permanent:
+        except DeliveryError as exc:
+            if isinstance(exc, NegativeAckError) and exc.permanent:
                 self._forget_object(object_bytes)
+            _drop_library_text_from_chain(exc)
             raise
 
     def _store_object(self, object_bytes: bytes) -> None:
