@@ -88,10 +88,15 @@ yet, so the override adds to that object.
 **Refuse at startup.** Each hook this module overrides is checked when the class is built,
 against the server class it is handed. So is every attribute the two sans-I/O steps above read
 or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
-error. That check sees a name that is no longer assigned. It cannot see a name the server still
-assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
-another object, and no test covers either case. The checked hooks are: the HTTP protocol's ``send_400_response``, its
-``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
+error. That check sees a name that is no longer assigned. Among what it cannot see: a name the
+server still assigns and has stopped reading, and ``self.<name> = ...`` told apart from the same
+name assigned on another object. Tests in ``tests/test_header_floor_wire.py`` catch some such
+cases at the versions the lock pins; this class-build check does not. For ``close_sent``, the
+shutdown test ends by calling ``shutdown`` on a parser-rejected connection the floor marked,
+which raises if uvicorn's ``shutdown`` drops its ``close_sent`` check; the same test shows that
+raise with the flag cleared. A ``shutdown`` that stops reading the flag some other way need not
+fail it. The checked hooks are: the HTTP protocol's ``send_400_response``, its ``cycle`` and
+``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response``, ``default_headers``, ``send``, and the ``disconnected``, ``message_event``
 and ``response_complete`` it reads, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
@@ -398,7 +403,8 @@ def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
         # effect, uvicorn's shutdown sends a close frame on a conn that never opened, which
         # raises InvalidState (measured at uvicorn 0.54.0). This proves each name is still
         # ASSIGNED somewhere in the class chain, which catches a rename. It does not prove
-        # uvicorn still READS them; nothing does.
+        # uvicorn still READS them; the module docstring, "Refuse at startup", names the test
+        # that covers uvicorn's shutdown reading close_sent.
         _require_assigned(base, "handshake_complete", hook="data_received")
         _require_assigned(base, "close_sent", hook="data_received")
         _require_assigned(base, "transport", hook="data_received")

@@ -832,14 +832,14 @@ SITES: dict[str, Site] = {
         "Archive member names joined only to compare against the paths the restore writes; the "
         "restore itself gates every name.",
     ),
-    "messagefoundry/pipeline/dr_backup.py::_refuse_existing_destination": Site(
-        1, REVIEWED, "Fixed sidecar suffixes on the operator's --to path, tested for existence."
-    ),
     "messagefoundry/pipeline/dr_backup.py::_restore_blocking": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
     ),
     "messagefoundry/pipeline/dr_backup.py::_staging_root_for": Site(
         1, INTERNAL, "A fixed directory name under the operator's destination."
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_store_names": Site(
+        1, REVIEWED, "Fixed sidecar suffixes on the operator's --to path, tested for existence."
     ),
     "messagefoundry/pipeline/dr_backup.py::_sweep_owned": Site(
         1,

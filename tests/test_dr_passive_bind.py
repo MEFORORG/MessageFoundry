@@ -24,7 +24,9 @@ from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import _alert_control_action
 from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
+from messagefoundry.config.wiring import PortConflictError
 from messagefoundry.pipeline import Engine
+from tests.test_connection_scheduler import _hold_port
 from tests.test_dr_running_config_dir import _BOTH_OUTBOUNDS, _CRIT, _NORM, _free_ports
 from tests.test_dr_running_config_dir import _write_tiered_graph as _write_graph
 
@@ -368,7 +370,20 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
     """Leaving the standby writes the profile's markers at once, so a scheduler tick or an alert
     rule between an activation's flip and its reload binds no feed below the threshold. Red at
     ``dcbeb5de0b``, which purged every inbound marker there. The ``operator_started`` case is an
-    ``auto_start = false`` feed a reload on the passive box parked after an operator start."""
+    ``auto_start = false`` feed a reload on the passive box parked after an operator start.
+
+    Cause of the 2026-10-13 ubuntu failure (BACKLOG #3456), read from job 115229267670's log and
+    the code at that run's head, ``a6e9a49f5b``: most consistent with the probe, and not proven.
+    The control after the operator start read False, and that start had returned. At that head a
+    bind that failed raised ``PortConflictError`` out of ``start_inbound``, read from that head's
+    ``_start_inbound_unsafe`` (the test after this one checks the same raise at today's code), so
+    a port something else held would have failed the start, not the probe. A passive box holds
+    no source for this feed, so the start did not return early on an old one. The probe of that
+    day read any ``OSError`` and its own 2s timeout as "not bound", in a suite that ran 26:25.
+    At least one other suspect stays open: a listener that bound and then closed before the probe
+    would be refused, and that probe read a refusal the same way. The control now names whether
+    the runner still holds the feed's source, which that case does not settle, and the probe
+    fails on no answer rather than reading it as unbound."""
     cfg = tmp_path / "cfg"
     _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
@@ -392,3 +407,25 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
         assert set(rr.filtered_inbound()) == {_NORM}
         await _alert_control_action(engine, "restart_inbound", _NORM, default_target=False)
         assert not await _accepts(norm_port)
+
+
+async def test_an_operator_start_onto_a_held_port_raises_rather_than_reading_unbound(
+    tmp_path: Path,
+) -> None:
+    """A port another socket holds fails the operator start itself, at today's code: the step the
+    cause in :func:`test_an_activation_parks_the_normal_feed_before_its_reload_runs` reads from
+    an older head (BACKLOG #3456). The ``inbound_failed`` record came after that head."""
+    cfg = tmp_path / "cfg"
+    _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=False)
+    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+        rr = engine.registry_runner
+        assert rr is not None
+        holder = _hold_port(norm_port)
+        try:
+            assert await _accepts(norm_port)  # control: the holder answers on the feed's port
+            with pytest.raises(PortConflictError, match="already bound there"):
+                await rr.start_inbound(_NORM, operator=True)
+            assert not rr.inbound_running(_NORM)
+            assert rr.inbound_failed(_NORM) is not None
+        finally:
+            holder.close()
