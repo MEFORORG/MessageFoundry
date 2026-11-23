@@ -277,6 +277,105 @@ def test_restore_refuses_existing_wal_sidecar(tmp_path, key_b64, capsys) -> None
     assert not dest.exists()  # nothing was written next to the sidecar
 
 
+def test_restore_refuses_a_dangling_wal_symlink(tmp_path, key_b64, capsys) -> None:
+    # `Path.exists()` follows a link, so a dangling store.db-wal symlink read as free, and SQLite
+    # would write the new store's WAL through it. Any name at a sidecar path is refused, links too.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dr = tmp_path / "dr"
+    dr.mkdir()
+    link = dr / "restored.db-wal"
+    try:
+        os.symlink(dr / "nowhere", link)
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"this platform cannot create a symlink here: {exc}")
+
+    rc = main(["restore", archive, "--to", str(dr / "restored.db"), "--service-config", toml])
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "refusing to overwrite" in err and "-wal" in err
+    assert sorted(p.name for p in dr.iterdir()) == ["restored.db-wal"]  # nothing written
+    assert link.is_symlink() and not (dr / "nowhere").exists()  # the link is left as it was
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        pytest.param(
+            ".", marks=pytest.mark.skipif(sys.platform != "win32", reason="Win32 strips it")
+        ),
+        pytest.param(
+            " ", marks=pytest.mark.skipif(sys.platform != "win32", reason="Win32 strips it")
+        ),
+        # Refused on every host: a POSIX host can write to an NTFS volume over SMB.
+        "::$DATA",
+    ],
+)
+def test_restore_refuses_a_to_that_windows_opens_as_another_name(
+    tmp_path, key_b64, capsys, suffix
+) -> None:
+    # `store.db.`, `store.db ` and `store.db::$DATA` all open `store.db` on Windows, but the sidecar
+    # names derived from them (`store.db.-wal` and so on) are not the ones SQLite will use, so a stale
+    # `store.db-wal` passed the never-overwrite check, beside a store SQLite would replay it over.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dr = tmp_path / "dr"
+    dr.mkdir()
+    stale = dr / "restored.db-wal"
+    stale.write_bytes(b"stale wal")
+
+    rc = main(
+        ["restore", archive, "--to", str(dr / "restored.db") + suffix, "--service-config", toml]
+    )
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "refusing --to" in err and "plain file name" in err
+    assert sorted(p.name for p in dr.iterdir()) == ["restored.db-wal"]  # nothing written
+    assert stale.read_bytes() == b"stale wal"
+
+
+def test_restore_refuses_a_sidecar_planted_during_the_decrypt(
+    tmp_path, key_b64, capsys, monkeypatch
+) -> None:
+    # The up-front check runs before the decrypt; the exclusive create covers only the store's own
+    # name. A sidecar that appears in between is caught by the second read just before placement.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dr = tmp_path / "dr"
+    dr.mkdir()
+    dest = dr / "restored.db"
+    planted = dr / "restored.db-wal"
+    real_verify = dr_backup._verify_extracted_store
+
+    def _plant_a_sidecar(snap, manifest):
+        counts = real_verify(snap, manifest)
+        planted.write_bytes(b"planted wal")
+        return counts
+
+    monkeypatch.setattr(dr_backup, "_verify_extracted_store", _plant_a_sidecar)
+
+    rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "refusing to overwrite" in err and "-wal" in err
+    assert sorted(p.name for p in dr.iterdir()) == [
+        "restored.db-wal"
+    ]  # nothing placed, staging gone
+    assert planted.read_bytes() == b"planted wal"
+
+
+def test_a_fault_reading_a_sidecar_name_is_a_refusal_not_a_free_name(tmp_path, monkeypatch) -> None:
+    # `os.path.lexists` answers False for every OSError, so a fault would read as a free name. Only a
+    # name proven absent is free.
+    real_lstat = os.lstat
+
+    def _denied(path, *args, **kwargs):
+        if str(path).endswith("-shm"):
+            raise PermissionError(13, "denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _denied)
+    with pytest.raises(dr_backup.BackupError, match="cannot tell whether"):
+        dr_backup._refuse_existing_destination(tmp_path / "restored.db", None)
+
+
 # --- (3) the archive must verify before anything lands -----------------------
 
 
