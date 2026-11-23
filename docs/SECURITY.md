@@ -7703,14 +7703,15 @@ admission, before the route's own work. On `GET /connections` with a valid `reve
 BACKLOG #2620). So with the budget spent those refusals still answer with their own status and
 record what the pre-pacing route recorded: an `auth.channel_denied` or `auth.permission_denied`
 row, or the new-address refusal's deduped `auth.new_address_reverify_required` row; the serve-hop
-refusal writes none. Unlike
-that route, they then write no `monitoring:read` grant row. A held 429 the route never
+refusal writes none of its own. Unlike
+that route, they then write no `monitoring:read` grant row. The serve-hop and new-address refusals
+also write the held 429's `auth.gate_refused` row (reason `throttled`) before they are answered,
+with no log line, so each such request still leaves a decision row. A held 429 the route never
 raises, at least because one of those checks refused first, writes no throttled row or log line. A
 reveal value that will fail validation is charged and refused at the gate like any other read.
 The limiter records no refused attempt, so once the budget is spent a reveal those checks refuse
-spends nothing more: that path is not paced. Most such refusals write their denial row, but a
-serve-hop refusal, and a new-address refusal whose row was deduped, leave no row of any kind for
-that request. The six routes share ONE budget per account: a read of any of them spends
+spends nothing more: that path is not paced. Each such refusal leaves at least one row: its
+denial row, or the throttled row above. The six routes share ONE budget per account: a read of any of them spends
 it. The budget is in-process, per API process, so N engine shards multiply it by N
 (*Business-logic limits* above).
 

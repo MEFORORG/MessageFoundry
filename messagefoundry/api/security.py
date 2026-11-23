@@ -1630,8 +1630,8 @@ async def refuse_from_new_address(request: Request) -> None:
     The step-up gates already asked this. The PHI reads and the paced writes did not, so on a
     first deployment a bearer token replayed from a second address would have read message bodies
     and started or stopped connections with no signal. Callers: :func:`require_phi_read`,
-    :func:`require_paced` and the HTTP reveal path in ``api/app.py`` (``_refuse_reveal``, which
-    ``_admit_reveal`` and ``GET /connections`` call). It gives
+    :func:`require_paced` and the HTTP reveal path in ``api/app.py``
+    (``_refuse_reveal_phi_read``, which ``_admit_reveal`` and ``GET /connections`` reach). It gives
     them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
     ``POST /me/reauth`` from the new address, which re-anchors the session. An ``oidc`` session is
     sent to the IdP step-up instead (:func:`_step_up_refusal`). A first sighting writes
@@ -1642,7 +1642,8 @@ async def refuse_from_new_address(request: Request) -> None:
     the JSON API's repeated monitoring reads, and a JSON client whose address changes behind a NAT
     pool, or behind a proxy not listed in ``[api].trusted_proxies``, would be refused on every one
     until a step-up. The web console's in-process reads go through ``require_ui`` and reach neither
-    gate. A monitoring ``reveal`` read does ask, through ``_refuse_reveal`` in ``api/app.py``.
+    gate. A monitoring ``reveal`` read does ask, through ``_refuse_reveal_phi_read`` in
+    ``api/app.py``.
 
     Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on, and one more
     on a refusal, to pick its wording. The gate has
@@ -2088,6 +2089,23 @@ async def raise_deferred_monitoring_refusal(request: Request) -> None:
         request, decision.auth, decision.identity, decision.permissions, held.refusal
     )
     raise held.refusal
+
+
+async def record_deferred_monitoring_refusal(request: Request) -> None:
+    """Write the ``auth.gate_refused`` row (reason ``throttled``) of a monitoring-read 429 a
+    :func:`require_monitoring_read` gate held for this request, and drop the held refusal, without
+    raising it or logging it. For a route body whose own refusal is about to propagate in place of
+    the held 429 and writes no denial row of its own, at least the serve-hop refusal and a
+    new-address refusal whose row was deduped, so the request still leaves a decision row. A no-op
+    where nothing is held."""
+    held = getattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR, None)
+    if not isinstance(held, _DeferredRefusal):
+        return
+    delattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR)
+    decision = held.decision
+    await _record_gate_refusal(
+        request, decision.auth, decision.identity, decision.permissions, held.refusal
+    )
 
 
 def _charge_monitoring_read(

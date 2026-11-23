@@ -22,6 +22,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Row
 from tests._admin_account import create_local_user_chosen
@@ -302,12 +303,38 @@ async def test_a_reveal_from_a_new_address_is_refused_for_it_with_the_budget_spe
         assert (await a.get("/status", headers=h)).status_code == 200
         assert (await a.get("/status", headers=h)).status_code == 429  # the budget is spent
     async with _client(engine, service, ip="10.9.9.9") as b:
-        r = await b.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
-        assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), r.text
+        # The second request from the same, already-flagged address gets no new-address row (it
+        # is deduped), so the throttled row is the only record it leaves.
+        for _ in range(2):
+            r = await b.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
+            assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), r.text
     rows = await engine.store.list_audit(limit=1000)
     assert [d.get("seen_ip") for d in _actions(rows, "auth.new_address_reverify_required")] == [
         "10.9.9.9"
     ]
+    on_path = _decisions_on(rows, "/connections")
+    assert [(a, d.get("reason")) for a, d in on_path] == [
+        ("auth.gate_refused", "throttled"),
+        ("auth.gate_refused", "throttled"),
+    ], on_path
+
+
+async def test_a_serve_hop_refusal_over_the_budget_writes_a_throttled_row(engine: Engine) -> None:
+    """The serve-hop refusal writes no row of its own, so with the budget spent the held
+    decision's throttled row is written before the 403 propagates, and no grant row."""
+    service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
+    app = create_app(engine, auth=service)
+    app.state.phi_read_hop_disposition = HopDisposition.REFUSE
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 123))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _bearer(c, "op")
+        assert (await c.get("/status", headers=h)).status_code == 200
+        refused = await c.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
+        assert refused.status_code == 403, refused.text
+        assert "PHI read refused" in refused.json()["detail"]
+    rows = await engine.store.list_audit(limit=1000)
+    on_path = _decisions_on(rows, "/connections")
+    assert [(a, d.get("reason")) for a, d in on_path] == [("auth.gate_refused", "throttled")]
 
 
 async def test_an_invalid_reveal_over_the_budget_writes_a_decision_row(engine: Engine) -> None:
