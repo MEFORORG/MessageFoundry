@@ -1852,19 +1852,25 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
             notifier.start()
             sends_cut_before = notifier.sends_cut
             wait = bound * _INNER_SHARE
-            cut = ""
+            was_cut = False
             try:
                 async with asyncio.timeout(wait) as deadline:
                     await notifier.aclose()
             except TimeoutError:
                 if not deadline.expired():
                     raise
-                cut = f"the alert notifier did not drain within {wait:.2f}s; "
+                was_cut = True
             # BACKLOG #5907: a cut that reached a running send is logged at a zero count too,
-            # since a send cut beside one that took the alert leaves no count. A count only: an
+            # since a send cut beside one that took the alert leaves no count. Counts only: an
             # alert's content can carry a partner's text (docs/PHI.md).
-            cut_a_send = bool(cut) and notifier.sends_cut > sends_cut_before
-            if cut_a_send or notifier.undelivered:
+            sends_cut = notifier.sends_cut - sends_cut_before if was_cut else 0
+            if sends_cut or notifier.undelivered:
+                cut = (
+                    f"the alert notifier did not drain within {wait:.2f}s, "
+                    f"cutting {sends_cut} running send(s); "
+                    if was_cut
+                    else ""
+                )
                 _log.error(
                     "startup unwind: %s%d alert(s) not confirmed delivered",
                     cut,

@@ -464,9 +464,15 @@ class _SlowToCloseSink(NotifierAlertSink):
     """A sink whose close stalls after its drain has delivered everything, so the unwind's wait
     cuts a close that has no send running."""
 
+    stall_cut = False
+
     async def aclose(self) -> None:
         await super().aclose()
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.stall_cut = True
+            raise
 
 
 async def test_a_cut_that_reached_no_running_send_and_lost_nothing_logs_nothing(
@@ -483,6 +489,7 @@ async def test_a_cut_that_reached_no_running_send_and_lost_nothing_logs_nothing(
     caplog.set_level(logging.WARNING)
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the control: delivered
+    assert sink.stall_cut  # the control: the unwind's wait was cut
     assert sink.undelivered == 0
     assert "did not drain" not in caplog.text
     assert "not confirmed delivered" not in caplog.text
@@ -512,22 +519,34 @@ class _CancelSwallowingWebhook:
 
     name = "webhook"
 
-    def __init__(self) -> None:
+    def __init__(self, *, uncancel: bool = False) -> None:
         self.entered = asyncio.Event()
+        self.uncancel = uncancel
 
     async def send(self, event: dict[str, Any], **_kw: Any) -> None:
         self.entered.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if self.uncancel and task is not None:
+                task.uncancel()
             return
 
 
-async def test_a_send_that_swallows_the_cut_and_returns_does_not_count_as_delivered() -> None:
+@pytest.mark.parametrize("uncancel", [False, True], ids=["swallows", "swallows-and-uncancels"])
+async def test_a_send_that_swallows_the_cut_and_returns_does_not_count_as_delivered(
+    caplog: pytest.LogCaptureFixture, uncancel: bool
+) -> None:
     """BACKLOG #5907 step 4: a send that returned counted as delivered even when the drain's
-    cancel had reached it and it swallowed the cancel, though it sent nothing. It stays counted."""
-    webhook = _CancelSwallowingWebhook()
+    cancel had reached it and it swallowed the cancel, though it sent nothing. It stays counted,
+    the delivery observer is not told, and a WARNING names the transport, also when the send
+    clears its task's cancel request."""
+    webhook = _CancelSwallowingWebhook(uncancel=uncancel)
     sink = NotifierAlertSink([webhook])
+    observed: list[str] = []
+    sink.set_delivery_observer(lambda name, _event: observed.append(name))
+    caplog.set_level(logging.WARNING)
     sink.start()
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
     await asyncio.wait_for(webhook.entered.wait(), 5.0)
@@ -538,7 +557,53 @@ async def test_a_send_that_swallows_the_cut_and_returns_does_not_count_as_delive
         await asyncio.wait_for(task, 5.0)
     assert not sink._left_sends  # the control: the send returned within the grace
     assert sink.undelivered == 1
+    assert observed == []
+    assert "alert transport webhook returned after the drain's cancel reached it" in caplog.text
     assert sink.sends_cut == 1
+
+
+class _TakeThenSelfCancelEmail(_HealthyEmail):
+    """Waits for a release, takes the alert, cancels its own task and returns."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.entered.set()
+        await self.release.wait()
+        await super().send(event)
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+
+
+async def test_a_send_that_returns_before_the_cut_reaches_it_counts_though_it_cancelled_itself(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #5907 step 4: a send that takes the alert, cancels its own task and returns in
+    the loop pass the drain is cancelled in returned before the cut reached it, so it counts and
+    the observer is told. Its own cancel is not the drain's."""
+    webhook, email = _BlackholedTransport(), _TakeThenSelfCancelEmail()
+    sink = NotifierAlertSink([webhook, email])
+    observed: list[str] = []
+    sink.set_delivery_observer(lambda name, _event: observed.append(name))
+    caplog.set_level(logging.WARNING)
+    sink.start()
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    await asyncio.wait_for(asyncio.gather(webhook.entered.wait(), email.entered.wait()), 5.0)
+    task = sink._task
+    assert task is not None
+    email.release.set()  # the email's send resumes in the same pass as the drain's cancel
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5.0)
+    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the control: it took it
+    assert sink.undelivered == 0
+    assert observed == ["email"]
+    assert "returned after the drain's cancel reached it" not in caplog.text
+    assert sink.sends_cut == 1  # only the webhook was still running
 
 
 async def test_a_send_left_past_the_cut_does_not_count_when_it_returns() -> None:

@@ -393,9 +393,9 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     @property
     def undelivered(self) -> int:
         """How many items were queued and not yet reported delivered, a count only (BACKLOG
-        #5907): an item leaves it when :meth:`_handle` calls its ``delivered`` callback, at any
-        time, a cancelled drain included. What counts as delivered is each subclass's
-        :meth:`_handle`, for alerts :meth:`NotifierAlertSink._handle`."""
+        #5907): an item leaves it when :meth:`_handle` calls its ``delivered`` callback. What
+        counts as delivered, and when a call can still come, is each subclass's :meth:`_handle`,
+        for alerts :meth:`NotifierAlertSink._handle`."""
         return self._undelivered
 
     def start(self) -> None:
@@ -444,13 +444,13 @@ class AlertTransport(Protocol):
     #5907), so a send must not rely on a sibling's having run first; each gets its own shallow copy
     of the event.
     A send returns once its channel took the alert and raises when it did not, since
-    :meth:`NotifierAlertSink._handle` counts a send that returned as delivered (BACKLOG #5907 step
-    4): a send that swallows its own failure reads as delivered.
+    :meth:`NotifierAlertSink._handle` counts a send that returned before a drain cancel reached it
+    as delivered (BACKLOG #5907 step 4): a send that swallows its own failure reads as delivered.
     A send that raises ``CancelledError`` without the drain being cancelled loses that transport's
-    alert, logged, and the siblings go on. A send must end promptly once cancelled, and end it by
-    raising ``CancelledError``, since a send that returns reads as having taken the alert: on a
-    drain cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
-    ``aclose()``.
+    alert, logged, and the siblings go on. A send must end promptly once cancelled: on a drain
+    cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
+    ``aclose()``. A send the drain's cancel reached never counts as delivered, whether it raises
+    or returns.
 
     ``recipients`` (#146) is the per-rule EMAIL recipient override the matching rule carried (``None`` =
     the transport's own default); ``context`` (#138) carries the extra non-PHI template values the
@@ -1373,7 +1373,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # BACKLOG #5909: set by stop_control, so a rule firing after the shutdown clear logs why.
         self._control_stopped = False
         # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
-        # raising. None, as `serve` leaves it, changes nothing.
+        # raising before a drain cancel reached it. None, as `serve` leaves it, changes nothing.
         self._delivery_observer: Callable[[str, dict[str, Any]], None] | None = None
 
     # --- AlertSink emit methods (sync, non-blocking) -------------------------
@@ -2072,7 +2072,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def set_delivery_observer(self, observer: Callable[[str, dict[str, Any]], None] | None) -> None:
         """Wire (or clear) a callback told ``(transport name, event)`` each time a transport's send
         returns without raising: the relay accepted every recipient, or the webhook answered 2xx
-        (vault BACKLOG #3849). The offline ``provision-admin`` uses it to tell a page that went out
+        (vault BACKLOG #3849). A send a drain cancel reached before it returned is not told, as
+        :meth:`_handle` says. The offline ``provision-admin`` uses it to tell a page that went out
         from one the notifier only accepted. Called on the event loop as each send returns, in no
         set order across transports; an observer that raises is logged and never stops the drain."""
         self._delivery_observer = observer
@@ -2711,6 +2712,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             "cooldown_seconds": event.pop("_cooldown_seconds", None),
         }
 
+        # The sends the drain's cancel reached while they ran, filled by _cut_sends before it
+        # passes the cancel on: none of them counts as delivered, whatever it then does.
+        reached: set[asyncio.Task[None]] = set()
+
         # The task handling this event, and its cancel count on entry. Each send runs in a child
         # task made below, and a transport can cancel that child itself with
         # current_task().cancel(), so only a rise in the drain's own count marks the drain's cancel.
@@ -2773,8 +2778,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                         exc_info=True,
                     )
                 return
-            me = asyncio.current_task()
-            if drain_cancelled() and me is not None and me.cancelling():
+            if asyncio.current_task() in reached:
                 # The drain's cancel reached this send, which swallowed it and returned: whether
                 # its channel took the alert is unknown, so it does not count. A transport name
                 # only, as on the cut's own line.
@@ -2813,7 +2817,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         try:
             await asyncio.wait(sends)
         except asyncio.CancelledError:
-            await self._cut_sends(sends)
+            await self._cut_sends(sends, reached)
             raise
         escaped: list[BaseException] = []
         for transport, task in zip(chosen, sends, strict=True):
@@ -2833,13 +2837,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if escaped:
             raise escaped[0]  # what deliver let out, raised once every send has ended
 
-    async def _cut_sends(self, sends: list[asyncio.Task[None]]) -> None:
+    async def _cut_sends(
+        self, sends: list[asyncio.Task[None]], reached: set[asyncio.Task[None]]
+    ) -> None:
         """The drain was cancelled during an event's sends (BACKLOG #5907): pass the cancel on to
         each, every repeat of it too, and wait at most :data:`_DRAIN_CANCEL_GRACE_SECONDS` for
-        them to end. The transports whose send was still running at the cancel are named in one
+        them to end. The sends still running at the cancel go into ``reached`` first, which keeps
+        each from counting as delivered (:meth:`_handle`); their transports are named in one
         WARNING, which says nothing of how each send then ends, and a send still running after the
         grace is left, held and counted in another."""
-        running = [task.get_name() for task in sends if not task.done()]  # named by _handle
+        reached.update(task for task in sends if not task.done())
+        running = [task.get_name() for task in sends if task in reached]  # named by _handle
         self._sends_cut += len(running)
         if running:
             # Transport names only, nothing of the alert, as the left-send line below is a count.
