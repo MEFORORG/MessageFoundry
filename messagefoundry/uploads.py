@@ -103,8 +103,8 @@ _ORPHAN_TMP_RE = re.compile(
 
 # How stale a leftover must look before the orphan sweep will remove it. A write in THIS process is
 # protected by ``_inflight_names``, an exact identity test, and not by this floor. For a write in
-# another process, at least a sibling engine shard's, this age test is the only protection, and
-# ``max_bytes`` bounds that write's size, not how long it can stall:
+# another process, at least a sibling engine shard's, this age test is the main protection this
+# pass has, and ``max_bytes`` bounds that write's size, not how long it can stall:
 # :meth:`UploadStore._sweep_orphans_sync` states what that leaves open. An hour matches the default
 # prune cadence and sits far outside a healthy write.
 _ORPHAN_MIN_AGE_SECONDS = 3600.0
@@ -1801,9 +1801,10 @@ class UploadStore:
 
     def _iter_sidecars(self) -> Iterator[tuple[str, Path]]:
         """Every ``(file_id, sidecar path)`` pair in the uploads root, as :meth:`_walk_sidecars`
-        yields them, which holds the ONE definition of "a file of ours". The listing scan consumes
-        this, and the re-seal pass consumes :meth:`_walk_sidecars` itself, so the id shape and the
-        sidecar suffix cannot drift apart between them. Anything else in the directory (an
+        yields them, which holds the definition of "a file of ours" for those two. The listing scan
+        consumes this, and the re-seal pass consumes :meth:`_walk_sidecars` itself, so the id shape
+        and the sidecar suffix cannot drift apart between them. The orphan sweep derives a sidecar
+        name from a body name itself, from the same ``_FILE_ID_RE`` and ``_META_SUFFIX``. Anything else in the directory (an
         operator's stray file, a temp file, an id that fails the strict 32-hex shape) is not ours
         and is skipped without being opened. A root that is not a directory yields nothing here,
         since the first save creates it."""
@@ -4241,8 +4242,8 @@ class UploadStore:
         the uploads root for the life of the directory, outside the retention window this module
         promises, and (under a configured key) as ciphertext ``rotate-key`` would never re-seal.
 
-        **This pass UNLINKS, so it refuses any name it cannot positively identify as ours.** A name
-        matching neither exact shape is an operator's own file and is never touched, the same way
+        **This pass UNLINKS, so it refuses any name that does not match one of its two shapes.** A
+        name matching neither is treated as an operator's own file and is never touched, the same way
         :meth:`_iter_sidecars` skips it. A ``.blob`` whose sidecar exists but cannot be DECRYPTED is
         kept, because this pass checks that the sidecar's name exists without opening it — a
         rotated-away key can no more destroy data here than it can in the age pass.
@@ -4264,7 +4265,8 @@ class UploadStore:
         **The floor reads an mtime, which proves less than "abandoned".** ``stat`` follows a link,
         so a new link to an old file is past the floor the moment it appears, as is a body restored
         with its mtime preserved. With no sidecar reported, that name is unlinked. The mtime is
-        whatever the writer's clock set, and it is compared with this host's.
+        the stamp the file system recorded, and it is compared with this host's clock. Which clock
+        stamped it can differ by file system and is not asserted here.
 
         A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
         too, the pass stops and returns what it removed, logged at ERROR with the root's own error.
@@ -4275,12 +4277,14 @@ class UploadStore:
         every name a write in this process currently holds, and a held name is skipped outright, so
         the threshold never adjudicates a race this process can see. ``_ORPHAN_MIN_AGE_SECONDS`` is
         the floor for everything else. A file the registry cannot see can come from at least a
-        process that DIED mid-write (every in-process failure, cancellation included, now cleans up
-        after itself), a sibling engine shard sharing this ``uploads_dir``, or a restore.
+        process that DIED mid-write (an in-process failure, cancellation included, removes its own
+        temp, though that unlink suppresses ``OSError`` and can leave one behind), a sibling engine shard sharing this ``uploads_dir``, or a restore.
 
-        **A sibling shard's stalled write is a residual, in two forms.** ``_inflight_names`` does
-        not reach another process, so only the floor stands between this pass and a write stalled
-        past it. Stalled before a temp's ``os.replace``, it can have that temp removed underneath
+        **A sibling shard's stalled write is a residual, in at least two forms.**
+        ``_inflight_names`` does not reach another process, so the floor, and for a body the sidecar
+        re-check, are what stand between this pass and a write stalled past it. On Windows an open
+        handle can also block the unlink. The first form covers a ``save``'s temp and a stalled
+        ``rotate-key`` re-seal's temp, which share the temp shape. Stalled before a temp's ``os.replace``, it can have that temp removed underneath
         it: the ``os.replace`` then raises and its ``save`` fails, nothing is published
         half-written, and the operator retries. Stalled after its body landed and before its
         sidecar did, it can LOSE THE BODY: this pass sees a body past the floor with no sidecar and
@@ -4350,7 +4354,8 @@ class UploadStore:
                 # Already gone (a sibling shard's sweep), held open by another process, or not a file
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
                 # a random tag, never a body. What is_name_absent does not read as gone is logged,
-                # since a body whose sidecar cannot be checked stays until someone looks. A dangling
+                # since a body whose sidecar cannot be checked is left for a later pass, which unlinks it
+                # if the fault has cleared and the sidecar still reads as absent. A dangling
                 # link can read as gone too, since the stat follows it: on POSIX with any part of
                 # its target missing, and on Windows with only the target's last part missing.
                 quiet = is_name_absent(exc) or not self._link_logged.first(f"orphan sweep {name}")
@@ -4365,7 +4370,7 @@ class UploadStore:
             # ASCII only in the message itself: a stock Windows cp1252 console raises
             # UnicodeEncodeError on the em dashes this module's prose uses freely.
             _log.warning(
-                "uploaded-logs: removed an abandoned %s (%s): a write started and never landed",
+                "uploaded-logs orphan sweep removed %s %s: past the age floor, and its sidecar read as absent",
                 kind,
                 name,
             )
