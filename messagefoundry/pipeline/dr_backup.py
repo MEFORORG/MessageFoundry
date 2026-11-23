@@ -4969,14 +4969,12 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
 
 #: What decided a :func:`_decrypt_check` verdict. ``cell`` is, under a key, at least a sealed value
 #: that did not open, other than one :func:`gave_no_verdict` reads as the key service's
-#: (``outage``). A single-value Transit decrypt answered 2xx, whose body arrived whole and parsed,
-#: with no ``data.plaintext`` is ``cell``; a truncated body or a read timeout is ``outage``. A batch
-#: result that carries neither ``plaintext`` nor ``error`` is ``cell`` only where every result of
-#: its batch echoes its own place as its reference. Where some result echoes a reference but not
-#: every one echoes its own place, ``_batch_replies`` in ``crypto_transit`` refuses the reply, and
-#: the whole batch is ``outage``. Where no result echoes one, each value is asked for alone and
-#: reads as a single-value decrypt.
-#: It is also a value that opened
+#: (``outage``). Which Transit replies give no verdict is for
+#: :meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt` and
+#: :meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt_many` to say, and the two do
+#: not always agree: at least a reply hvac returns unparsed (a 2xx other than 200, a 200 body that
+#: is not JSON, or one cut short where no length framed it) is ``cell`` for a value asked for alone
+#: and ``outage`` for a value asked for in a batch. ``cell`` is also a value that opened
 #: but its reader refuses (a ``QueueTagError``); a value whose AAD the open refused (an
 #: ``AADComponentError``); a marker in another ASCII case; and, on a surface the keyed store sealed
 #: and without ``allow_unmarked_ciphertext``, a value with no marker. ``damaged`` is a BLOB, or a
