@@ -1305,6 +1305,7 @@ def test_a_slot_on_a_library_exception_cannot_carry_text_onto_the_chain() -> Non
 
     class Slotted(Exception):
         __slots__ = ("detail",)
+        detail: str
 
         def __new__(cls, *args: Any) -> Any:
             made = super().__new__(cls, *args)
