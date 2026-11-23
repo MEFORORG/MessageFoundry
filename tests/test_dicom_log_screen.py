@@ -982,7 +982,9 @@ def _unsendable(patch: pytest.MonkeyPatch) -> None:
 def _no_instance_uid(patch: pytest.MonkeyPatch) -> None:
     from pynetdicom.association import Association
 
-    real = dicom_module.load_dcmread()
+    from messagefoundry.parsing.dicom._deps import load_dcmread
+
+    real = load_dcmread()
 
     def read(*args: Any, **kwargs: Any) -> Any:
         dataset = real(*args, **kwargs)
