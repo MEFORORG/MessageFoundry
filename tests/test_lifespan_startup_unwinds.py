@@ -425,9 +425,9 @@ async def test_an_alert_the_email_took_while_the_webhook_was_cut_is_still_counte
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5907 step 4: a rule selects [webhook, email], the webhook is blackholed and the
-    email takes the one alert. On the cut drain the sink took the alert off its count because a
-    transport had taken it, so the unwind logged nothing, and the cut webhook send was reported
-    nowhere. An alert whose handling the cut ended stays counted."""
+    email takes the one alert. The cut ends the alert's handling, so it stays counted and the
+    unwind logs it, though a transport took it: a count that dropped it there would leave the
+    cut webhook send reported nowhere."""
     monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", 1.5)
     monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
     webhook, email = _BlackholedTransport(), _HealthyEmail()

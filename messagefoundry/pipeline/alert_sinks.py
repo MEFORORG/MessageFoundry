@@ -2663,8 +2663,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Send the event to each transport its rule selected, and return whether at least one
         of them took it (BACKLOG #5907 step 4): a send that returned, the point at which the
         delivery observer is told. A drain cancelled during the sends leaves the alert in
-        :attr:`undelivered`, whether or not a send had returned, since a send the cut ended did
-        not take it."""
+        :attr:`undelivered`, whether or not a send had returned, so the alert stays counted when
+        the cut ended a selected transport's send before it took the alert."""
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
         # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.

@@ -1833,9 +1833,9 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     and a tight cut would drop the page that explains this refusal. The test that pins #2597,
     test_the_alert_fires_even_when_the_start_then_fails, fails at or after engine.start(), so it
     runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
-    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered,
-    which also holds an alert whose sends all failed before the cut; a drain that ends in time logs
-    that count too, when it is not zero.
+    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered
+    when that count is not zero, which also holds an alert whose sends all failed before the cut; a
+    drain that ends in time logs that count too, when it is not zero.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
     alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). On a cut, the
     count includes an alert one transport took while another had not finished; on a drain that
