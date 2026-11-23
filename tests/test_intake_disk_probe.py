@@ -66,16 +66,15 @@ class _Probe:
                 self.running -= 1
                 self.finished += 1
 
-    async def finish_hung(self) -> None:
-        """Let every hung call end, and give its completion time to reach the event loop."""
+    async def finish_hung(self, monitor: IntakeBoundMonitor) -> None:
+        """Let every hung call end, and wait until its completion has reached the event loop."""
         self.hang = False
         self.release.set()
-        for _ in range(1000):
-            if self.finished == self.started:
-                break
+        for _ in range(2000):
+            if self.finished == self.started and monitor._disk_probe is None:
+                return
             await asyncio.sleep(0.005)
-        assert self.finished == self.started
-        await asyncio.sleep(0.05)
+        raise AssertionError("the hung probe's completion never reached the event loop")
 
 
 class _Store:
@@ -133,7 +132,7 @@ async def test_a_hung_probe_across_many_ticks_runs_one_thread(
         await monitor.check_once()
     await asyncio.sleep(0.05)  # a queued extra probe would have entered the fake by now
     assert probe.started == 1, "a tick started a probe while an earlier one was still blocked"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
 
 
 async def test_a_late_high_reading_does_not_release_a_held_pause(
@@ -148,7 +147,7 @@ async def test_a_late_high_reading_does_not_release_a_held_pause(
     probe.free_mib = HIGH_MIB
     await _tick_into_hang(monitor, probe, monkeypatch)  # leaves a probe that will report HIGH
     probe.free_mib = LOW_MIB
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
     assert gate.reasons == {DISK_REASON}, "a result nobody was waiting for released the pause"
 
     await monitor.check_once()
@@ -164,7 +163,7 @@ async def test_a_late_low_reading_does_not_newly_hold(
     probe.free_mib = LOW_MIB
     await _tick_into_hang(monitor, probe, monkeypatch)
     probe.free_mib = HIGH_MIB
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
     assert gate.is_open, "a result nobody was waiting for started a pause"
     await monitor.check_once()
     assert probe.started == 2 and gate.is_open
@@ -187,7 +186,7 @@ async def test_a_result_landing_during_a_later_tick_is_not_consumed(
     await monitor.check_once()
     assert gate.reasons == {DISK_REASON}, "a later tick consumed an earlier tick's reading"
     assert probe.started == 2, "a tick started a probe before the earlier one had been cleared"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
 
 
 async def test_a_late_failure_is_neither_logged_nor_left_unretrieved(
@@ -207,7 +206,7 @@ async def test_a_late_failure_is_neither_logged_nor_left_unretrieved(
         probe.error = late
         with caplog.at_level(logging.DEBUG, logger=_LOGGER):
             await _tick_into_hang(monitor, probe, monkeypatch)
-            await probe.finish_hung()
+            await probe.finish_hung(monitor)
             gc.collect()  # an unretrieved exception is reported when its task is collected
             await asyncio.sleep(0)
     finally:
@@ -227,7 +226,7 @@ async def test_recovery_once_the_hung_probe_finishes(
     for _ in range(3):
         await monitor.check_once()
     assert gate.reasons == {DISK_REASON}, "an unmeasured disk is not evidence that it recovered"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
     probe.free_mib = HIGH_MIB
     await monitor.check_once()
     assert gate.is_open, "the first probe after the hang ended must be able to release"
@@ -262,4 +261,4 @@ async def test_stop_does_not_wait_for_a_hung_probe(tmp_path: Path, probe: _Probe
     await asyncio.wait_for(monitor.stop(), 2.0)
     assert gate.is_open
     assert probe.running == 1, "control: the probe really was still blocked through the stop"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
