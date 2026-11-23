@@ -1826,9 +1826,9 @@ one whose CA file is a connection's `tls_ca_file`, `[alerts].email_tls_ca_file` 
 self-signed root also in it, and applies section 14's start rule, worded for a server chain. An
 intermediate beside its root is admitted: the chain runs on through it to the root, and the start
 rule then asks for the intermediate's own CRL too. The running-hop reload applies the same start
-rule. On the `system` and `augment` arms it refuses the build, since the start rule needs a CRL
-from every CA a hop loads; `docs/CONFIGURATION.md`, the `[tls].crl_check_chain` row, states the
-reason and the operator's choices. A REST connection's ECH sidecar hop checks no `[tls]` CRL against
+rule. On the `system` and `augment` arms it refuses the build, since the engine cannot tell at
+build which of the OS trust store's CAs a partner chains through, so it cannot judge the CRL file
+complete. `docs/CONFIGURATION.md`, the `[tls].crl_check_chain` row, gives the operator's choices. A REST connection's ECH sidecar hop checks no `[tls]` CRL against
 its partner, leaf or chain, since the sidecar verifies the partner. LDAPS, OIDC, the log forwarder and the Postgres store, which
 have CRL settings of their own, keep the leaf check.
 
