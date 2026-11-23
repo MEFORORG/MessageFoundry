@@ -67,6 +67,7 @@ import errno
 import fnmatch
 import ftplib  # nosec B402 — plain FTP is gated: cleartext credentials are refused (see _validate_common); FTPS/SFTP are the encrypted defaults
 import hashlib
+import heapq
 import io
 import itertools
 import logging
@@ -80,6 +81,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from operator import itemgetter
 from pathlib import PurePath
 from typing import Any, Literal, NamedTuple, TypeVar
 
@@ -151,6 +153,7 @@ from messagefoundry.transports.file import (
     _check_template_fits,
     _content_matches_encoded,
     _prune_unlisted,
+    _Step,
     render_filename,
     scan_inbound_file,
 )
@@ -777,9 +780,10 @@ class _RemoteClient(abc.ABC):
     def ensure_dir(self, remote_dir: str) -> bool:
         """Best-effort create ``remote_dir`` (ignore "already exists"). Returns **True only when THIS
         call created it** (#114) — the destination logs that, so a delivery landing in a directory the
-        engine just invented is distinguishable from a normal one. A create the server refuses (at
-        least no permission, a racing creator) returns False: nothing was created here. At least a
-        failed connection and, on SFTP, a refused ``stat`` of the path raise instead."""
+        engine just invented is distinguishable from a normal one. An FTP 5xx reply to the create (at
+        least no permission, a racing creator) and any OS error from the SFTP ``mkdir``, a timeout
+        included, return False: nothing was created here. At least a failed connection, an FTP 4xx
+        reply to the create and a refused SFTP ``stat`` of the path raise instead."""
 
 
 def _ftps_ssl_context(
@@ -3025,251 +3029,305 @@ class RemoteFileSource(SourceConnector):
         # Keyed so two entries that list one name never compare a None mtime with a str.
         listing = sorted(entries, key=lambda entry: (entry.name, entry.size))
         self._prune_memories(listing)
-        retries_left = self._stuck_retry_allowance()
         # Counted over the whole listing, not in the loop below, which can stop early. Only an entry
         # the pattern would have read counts. So a narrow pattern such as *.hl7 skips a subdirectory
         # or a stray file, but a broad one such as * counts them, since NLST cannot tell a directory
         # from a file. An entry whose last part is empty, "." or ".." names no file and never counts.
         self._log_other_form(sum(1 for e in listing if e.other_form and self._reads(e.name)))
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
+        # BACKLOG #5750: remembered rejects due a retry, by name, for the retry pass below.
+        due: dict[str, tuple[float, _Listed]] = {}
+        stopped = False
+        reached = len(listing)
         for position, entry in enumerate(listing):
-            name, size, mtime = entry.name, entry.size, entry.mtime
             if self._stop.is_set():
-                break  # shutting down — leave the rest for the next start (at-least-once)
+                stopped = True  # shutting down — leave the rest for the next start (at-least-once)
+                break
             if self._at_ceiling(disposed, len(listing) - position):
+                reached = position
                 break
-            if not _is_contained_name(name):
-                # #1238 (ASVS 5.3.2): the server chose this name. Refuse it HERE — at the source,
-                # before the pattern filter — because the raw name reaches at least four consumers
-                # (the retrieve path, the error/oversize move, the after_read disposition, and the
-                # leave-mode dedup key), and a per-consumer check would keep missing one: the
-                # consumer set grew at every measurement pass and never shrank.
-                # NOT quarantined: moving it would join the hostile name onto a directory, which is
-                # the very operation being refused. Left in place, and logged on every poll rather
-                # than once, except for the other-form entry described below. No name is logged:
-                # this arm has refused the name as an unsafe path component, so it is the one place
-                # that must not hand it to `safe_name` either. The host:dir and the fact of a
-                # refusal are the signal.
-                #
-                # This comment used to justify that by asserting "names are not logged at INFO+
-                # elsewhere in this source". Nine WARNING sites below falsified it (BACKLOG #1748),
-                # which made a real control rest on a false premise (CLAUDE.md §11, SDS-3.7). Those
-                # sites now route through `safe_name`, so the claim would be true today — it is gone
-                # anyway, because this arm's reason never depended on what the others do.
-                #
-                # An FTP NLST entry in another listing form, with no traversal shape, gets no line
-                # here (BACKLOG #1130). It was counted above instead, and logged at most every
-                # OTHER_FORM_WARNING_SECONDS, so an operator can tell a server's listing format from
-                # an attack. One the pattern would not read is refused with no line at all: like a
-                # bare name the pattern skips, it is not a file this poller would ever read.
-                #
-                # No connection event either (BACKLOG #1621 records only the quarantine arms below).
-                # The entry stays and is refused again every poll, so an event here would write one
-                # store row per poll interval for as long as the partner leaves it, which is why the
-                # quarantine arms record only a move that completed.
-                if not entry.other_form:
-                    logger.warning(
-                        "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
-                        "(not a single safe name); left in place, not retrieved",
-                        _where(self._host, self._remote_dir),
-                    )
-                continue
-            if not self._reads(name):
-                continue
-            # BACKLOG #5750: a reject that could not be moved, unchanged since, is skipped unread and
-            # uncharged until its retry falls due and a retry slot is free. Before the ledger read,
-            # so a skip costs no store call, and a slot bounds the store calls of the retries too.
-            # A skip drops any settle sighting, which must come from consecutive polls.
-            stuck = self._stuck_reject(name, size, mtime)
-            if stuck is not None:
-                if retries_left == 0 or time.monotonic() < stuck.due:
-                    self._settle_seen.pop(name, None)
-                    continue
-                retries_left -= 1
-            path = posixpath.join(self._remote_dir, name)
-            # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
-            # then the durable ledger). Keyed on a HASHED id (path + size + the listed mtime where the
-            # server gives one, BACKLOG #2758) — never a cleartext filename.
-            forms = self._file_key_forms(name, size, mtime) if self._after_read == "leave" else None
-            file_key = None if forms is None else forms[0]
-            if forms is not None and await self._leave_already_ingested(forms):
-                if mtime is None:
-                    self._log_undetectable_skip(name, size, forms[0])
-                continue
-            if forms is not None and self._stop.is_set():
-                break  # a stop met during the ledger read: retrieve nothing the bound must then cut
-            if not self._settled(name, size, mtime):
-                # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
-                # Nothing is read, moved or charged against the per-tick budget. A due retry settles
-                # too: a file being rewritten in place can pass through the size it was remembered at.
-                continue
-            if stuck is not None:
-                # A due retry spends none of the budget, so rejects sorted first cannot hold back
-                # the valid files behind them. Its wait restarts before the read.
-                due = time.monotonic() + STUCK_RETRY_SECONDS
-                self._stuck[name] = (stuck._replace(due=due), 0)
-            charge = 0 if stuck is not None else 1
-            if self._max_file_bytes is not None and size > self._max_file_bytes:
-                # Transport-level reject *before* any bytes are read — parallels the File source's
-                # oversize guard. It never became a "received message", so there's no store
-                # disposition; move it to the error dir and log it (never a silent drop).
-                # THIS GATE TRUSTS THE SERVER. `size` came out of the remote directory listing, so a
-                # hostile or malfunctioning share passes it by under-reporting; the same budget is
-                # therefore charged again below against the bytes actually read.
-                logger.warning(
-                    "REMOTEFILE file %s (listed at %s bytes) exceeds max_file_bytes (%s); routing "
-                    "to error dir",
-                    safe_name(name),
-                    size,
-                    self._max_file_bytes,
-                )
-                if await self._quarantine(path, name, size, mtime):
-                    await self._emit_event(
-                        "file_oversize",
-                        reason=f"listed at {size} bytes, exceeds max_file_bytes "
-                        f"{self._max_file_bytes}",
-                    )
-                disposed += charge
-                continue
-            try:
-                raw = await asyncio.to_thread(
-                    self._client.retrieve, path, max_bytes=self._max_file_bytes
-                )
-            except _RemoteOversize:
-                # The share DELIVERED more than it listed. Same disposition as the listing-size gate
-                # above — quarantine + log, never a silent drop — and deliberately NOT the transient
-                # arm below: leaving it in place would re-pull the same oversized body every poll.
-                # The body is already discarded; nothing partial reaches the pipeline.
-                logger.warning(
-                    "REMOTEFILE file %s delivered more than max_file_bytes (%s) despite a smaller "
-                    "listed size; routing to error dir",
-                    safe_name(name),
-                    self._max_file_bytes,
-                )
-                if await self._quarantine(path, name, size, mtime):
-                    await self._emit_event(
-                        "file_oversize",
-                        reason=f"delivered more than max_file_bytes {self._max_file_bytes} "
-                        f"despite listing {size} bytes",
-                    )
-                disposed += charge
-                continue
-            except _RemoteChanged as exc:
-                # BACKLOG #116: a partner is still writing this file in place, so what was read may be
-                # a cut-off message. Leave it for the next poll; not charged, since it did not move.
-                logger.warning(
-                    "REMOTEFILE %s: %s changed while it was retrieved (%s bytes before, %d read, %s "
-                    "after); not emitted, left in place for the next poll",
-                    _where(self._host, self._remote_dir),
-                    safe_name(name),
-                    exc.before,
-                    exc.read,
-                    exc.after,
-                )
-                # Still moving, so it must settle again from its latest size (#2071).
-                self._remember_size(name, exc.read if exc.after is None else exc.after, mtime)
-                continue
-            except _RemoteError as exc:
-                # Transient (locked / vanished mid-poll): leave it in place to retry next poll rather
-                # than quarantine a healthy file. Logged, never silently swallowed.
-                logger.warning(
-                    "REMOTEFILE could not retrieve %s (will retry next poll): %s",
-                    safe_name(name),
-                    safe_exc(exc, file_name=name),
-                )
-                continue
-            # Content-vs-type magic-byte check (ASVS 5.2.2), the local File source's own helper: the raw
-            # bytes, then for a text type on a non-ASCII encoding the head decoded with `encoding`, so a
-            # UTF-16 or UTF-32 drop is not quarantined for its BOM (BACKLOG #5684). The dispatch is
-            # _content_matches_declared's (hl7v2→MSH/FHS/BHS, x12→ISA, dicom→preamble+DICM,
-            # json/fhir→{/[, xml→<; binary/text unchecked). The remote dir is a less-trusted source, so a
-            # drop whose leading bytes contradict its declared content_type is quarantined before its bytes
-            # reach the pipeline. The former None-skips-sniff carve-out was REMOVED (ASVS 5.2.2): the check
-            # now ALWAYS runs, converging onto the local source's semantics — the helper's None arm already
-            # means hl7v2, so a content_type=None drop is sniffed as HL7 (a binary drop is quarantined to
-            # .error, not delivered raw).
-            if not _content_matches_encoded(self.content_type, raw, self._encoding):
-                # Like the oversize / scan-reject cases it never became a "received message", so there
-                # is no store disposition; preserve it in .error and log it (never a silent drop).
-                declared = (self.content_type or ContentType.HL7V2).value
-                logger.warning(
-                    "REMOTEFILE file %s does not match its declared content type %r "
-                    "(no matching magic bytes); routing to error dir",
-                    safe_name(name),
-                    declared,
-                )
-                if await self._quarantine(path, name, size, mtime):
-                    await self._emit_event(
-                        "file_content_mismatch",
-                        reason=f"does not match declared content type {declared}",
-                    )
-                disposed += charge
-                continue
-            try:
-                await asyncio.to_thread(scan_inbound_file, raw, name)
-            except ScanRejected as exc:
-                # A configured pre-ingest scanner (AV/ICAP/plugin) rejected the content before it
-                # entered the pipeline (ASVS 5.4.3) — the control that matters most for a remote /
-                # less-trusted drop source. Quarantine + log; like the oversize reject above it never
-                # became a "received message", so there's no store disposition.
-                scrubbed = safe_exc(exc, file_name=name)
-                logger.warning(
-                    "REMOTEFILE file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
-                    safe_name(name),
-                    scrubbed,
-                )
-                if await self._quarantine(path, name, size, mtime):
-                    await self._emit_event("file_scan_rejected", reason=scrubbed)
-                disposed += charge
-                continue
-            except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
-                # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
-                # rejection. Fail closed (ASVS 5.4.3): never emit unscanned content from a less-trusted
-                # remote source. Unlike a ScanRejected we don't quarantine a possibly-healthy file on a
-                # scanner outage — leave it in place so the next poll re-runs the scan once the scanner
-                # recovers (at-least-once, mirroring the transient-retrieve path). Logged, never a silent
-                # pass-through, and scoped to THIS file so a hiccup can't abort the poll's remaining files.
-                logger.warning(
-                    "REMOTEFILE file %s: pre-ingest scan hook errored (%s); leaving in place, will retry",
-                    safe_name(name),
-                    safe_exc(exc, file_name=name),
-                )
-                continue
-            try:
-                stopped = await self._hand_off(raw)
-            except Exception as exc:
-                # The handler records every message-level outcome itself and returns, so an exception
-                # escaping here is an infrastructure failure (the durable store write failed). Leave the
-                # file in place so the next poll retries (at-least-once) — moving it would drop a
-                # received-but-unrecorded message (mirrors the File source's M-15).
-                logger.warning(
-                    "REMOTEFILE handler failed for %s (will retry next poll): %s",
-                    safe_name(name),
-                    safe_exc(exc, file_name=name),
-                )
-                if stuck is not None:
-                    # A retry that passed every gate keeps its memory through a store outage, on
-                    # the short wait, so the outage does not re-read it outside the retry slots.
-                    due = time.monotonic() + STUCK_TRANSIENT_RETRY_SECONDS
-                    self._stuck[name] = (stuck._replace(due=due), 0)
-                continue
-            self._stuck.pop(name, None)  # it passed every gate, so it is no longer a reject
-            if stopped:
-                # A stop arrived before the file's last message: the whole file stays, and the next
-                # start hands it over again (at-least-once, as the File source does). Break, not
-                # return, so the prune below still bounds what this poll recorded.
+            step = await self._examine(entry)
+            if step is _Step.STOP:
+                stopped = True
                 break
-            await self._after_processing(path, name, len(raw))
-            disposed += charge
-            if file_key is not None:
-                # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
-                # Only a durable write counts, so a broken ledger does not draw a prune.
-                newly_recorded += await self._leave_record(file_key)
+            if step is _Step.DUE:
+                due.setdefault(entry.name, (self._stuck[entry.name][0].due, entry))
+            elif step is not _Step.FREE:
+                disposed += 1
+                newly_recorded += step is _Step.RECORDED
+        if not stopped:
+            newly_recorded += await self._retry_stuck(listing[reached:], due)
         if newly_recorded and self.processed_ledger is not None:
             # Bound growth (age + count), only when something new. A store call, so the stop bound
             # waits for it rather than cutting it (#4685).
             with self._stop_guard.store_call():
                 await self.processed_ledger.prune()
+
+    async def _retry_stuck(
+        self, unreached: list[_Listed], due: dict[str, tuple[float, _Listed]]
+    ) -> int:
+        """Examine the remembered rejects due a retry, earliest due first, up to
+        :meth:`_stuck_retry_allowance`, and return how many files that recorded in the ledger
+        (BACKLOG #5750). The pass mirrors the one in
+        :meth:`~messagefoundry.transports.file.FileSource._scan_once`.
+
+        ``due`` holds those the poll's pass met. ``unreached`` is the listing past the ceiling's
+        break, whose due rejects join them, or a sustained backlog would keep them waiting. A due
+        reject with no slot stays due for a later poll and drops any settle sighting, which must
+        come from consecutive polls."""
+        now = time.monotonic()
+        for entry in unreached if self._stuck else ():
+            stuck = self._stuck_reject(entry.name, entry.size, entry.mtime)
+            if stuck is not None and stuck.due <= now:
+                due.setdefault(entry.name, (stuck.due, entry))
+        slots = heapq.nsmallest(self._stuck_retry_allowance(), due.values(), key=itemgetter(0))
+        for name in due.keys() - {entry.name for _, entry in slots}:
+            self._settle_seen.pop(name, None)
+        recorded = 0
+        for _, entry in slots:
+            if self._stop.is_set():
+                break
+            step = await self._examine(entry, retry=True)
+            if step is _Step.STOP:
+                break
+            recorded += step is _Step.RECORDED
+        return recorded
+
+    async def _examine(self, entry: _Listed, *, retry: bool = False) -> _Step:
+        """Take one listing entry as far as it goes this poll, and say what that cost (:class:`_Step`).
+        ``retry`` is a remembered reject due a retry (BACKLOG #5750), which :meth:`_retry_stuck` runs
+        after every other entry. It takes the ledger and settle gates, and once past them is read and
+        judged afresh, so a retry that now passes is ingested. Nothing it does charges the budget."""
+        name, size, mtime = entry.name, entry.size, entry.mtime
+        if not _is_contained_name(name):
+            # #1238 (ASVS 5.3.2): the server chose this name. Refuse it HERE — at the source,
+            # before the pattern filter — because the raw name reaches at least four consumers
+            # (the retrieve path, the error/oversize move, the after_read disposition, and the
+            # leave-mode dedup key), and a per-consumer check would keep missing one: the
+            # consumer set grew at every measurement pass and never shrank.
+            # NOT quarantined: moving it would join the hostile name onto a directory, which is
+            # the very operation being refused. Left in place, and logged on every poll rather
+            # than once, except for the other-form entry described below. No name is logged:
+            # this arm has refused the name as an unsafe path component, so it is the one place
+            # that must not hand it to `safe_name` either. The host:dir and the fact of a
+            # refusal are the signal.
+            #
+            # This comment used to justify that by asserting "names are not logged at INFO+
+            # elsewhere in this source". Nine WARNING sites below falsified it (BACKLOG #1748),
+            # which made a real control rest on a false premise (CLAUDE.md §11, SDS-3.7). Those
+            # sites now route through `safe_name`, so the claim would be true today — it is gone
+            # anyway, because this arm's reason never depended on what the others do.
+            #
+            # An FTP NLST entry in another listing form, with no traversal shape, gets no line
+            # here (BACKLOG #1130). It was counted above instead, and logged at most every
+            # OTHER_FORM_WARNING_SECONDS, so an operator can tell a server's listing format from
+            # an attack. One the pattern would not read is refused with no line at all: like a
+            # bare name the pattern skips, it is not a file this poller would ever read.
+            #
+            # No connection event either (BACKLOG #1621 records only the quarantine arms below).
+            # The entry stays and is refused again every poll, so an event here would write one
+            # store row per poll interval for as long as the partner leaves it, which is why the
+            # quarantine arms record only a move that completed.
+            if not entry.other_form:
+                logger.warning(
+                    "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
+                    "(not a single safe name); left in place, not retrieved",
+                    _where(self._host, self._remote_dir),
+                )
+            return _Step.FREE
+        if not self._reads(name):
+            return _Step.FREE
+        # BACKLOG #5750: a reject that could not be moved, unchanged since, is skipped unread and
+        # uncharged until its retry falls due, and then waits for the retry pass. Before the ledger
+        # read, so a skip costs no store call, and a slot bounds the store calls of the retries too.
+        # A skip drops any settle sighting, which must come from consecutive polls.
+        stuck = self._stuck_reject(name, size, mtime)
+        if retry and stuck is None:
+            return _Step.FREE  # its listing moved on, so a later poll examines it as new
+        if stuck is not None and not retry:
+            if time.monotonic() >= stuck.due:
+                return _Step.DUE
+            self._settle_seen.pop(name, None)
+            return _Step.FREE
+        path = posixpath.join(self._remote_dir, name)
+        # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
+        # then the durable ledger). Keyed on a HASHED id (path + size + the listed mtime where the
+        # server gives one, BACKLOG #2758) — never a cleartext filename.
+        forms = self._file_key_forms(name, size, mtime) if self._after_read == "leave" else None
+        file_key = None if forms is None else forms[0]
+        if forms is not None and await self._leave_already_ingested(forms):
+            if mtime is None:
+                self._log_undetectable_skip(name, size, forms[0])
+            # A retry the ledger holds is finished with, so it must stop taking a retry slot.
+            self._stuck.pop(name, None)
+            return _Step.FREE
+        if forms is not None and self._stop.is_set():
+            return (
+                _Step.STOP
+            )  # met during the ledger read: retrieve nothing the bound must then cut
+        if not self._settled(name, size, mtime):
+            # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
+            # Nothing is read, moved or charged against the per-tick budget. A due retry settles
+            # too: a file being rewritten in place can pass through the size it was remembered at.
+            if retry and name not in self._settle_seen:
+                # The settle memory is full and refused it, so it would stay due and, being the
+                # earliest, hold a retry slot on every poll. It waits instead.
+                self._delay_retry(name, STUCK_RETRY_SECONDS)
+            return _Step.FREE
+        if retry:
+            # Its wait restarts before the read, so an arm below that leaves it in place leaves it
+            # waiting rather than due on every poll.
+            self._delay_retry(name, STUCK_RETRY_SECONDS)
+        if self._max_file_bytes is not None and size > self._max_file_bytes:
+            # Transport-level reject *before* any bytes are read — parallels the File source's
+            # oversize guard. It never became a "received message", so there's no store
+            # disposition; move it to the error dir and log it (never a silent drop).
+            # THIS GATE TRUSTS THE SERVER. `size` came out of the remote directory listing, so a
+            # hostile or malfunctioning share passes it by under-reporting; the same budget is
+            # therefore charged again below against the bytes actually read.
+            logger.warning(
+                "REMOTEFILE file %s (listed at %s bytes) exceeds max_file_bytes (%s); routing "
+                "to error dir",
+                safe_name(name),
+                size,
+                self._max_file_bytes,
+            )
+            if await self._quarantine(path, name, size, mtime):
+                await self._emit_event(
+                    "file_oversize",
+                    reason=f"listed at {size} bytes, exceeds max_file_bytes {self._max_file_bytes}",
+                )
+            return _Step.CHARGED
+        try:
+            raw = await asyncio.to_thread(
+                self._client.retrieve, path, max_bytes=self._max_file_bytes
+            )
+        except _RemoteOversize:
+            # The share DELIVERED more than it listed. Same disposition as the listing-size gate
+            # above — quarantine + log, never a silent drop — and deliberately NOT the transient
+            # arm below: leaving it in place would re-pull the same oversized body every poll.
+            # The body is already discarded; nothing partial reaches the pipeline.
+            logger.warning(
+                "REMOTEFILE file %s delivered more than max_file_bytes (%s) despite a smaller "
+                "listed size; routing to error dir",
+                safe_name(name),
+                self._max_file_bytes,
+            )
+            if await self._quarantine(path, name, size, mtime):
+                await self._emit_event(
+                    "file_oversize",
+                    reason=f"delivered more than max_file_bytes {self._max_file_bytes} "
+                    f"despite listing {size} bytes",
+                )
+            return _Step.CHARGED
+        except _RemoteChanged as exc:
+            # BACKLOG #116: a partner is still writing this file in place, so what was read may be
+            # a cut-off message. Leave it for a later poll; not charged, since it did not move.
+            logger.warning(
+                "REMOTEFILE %s: %s changed while it was retrieved (%s bytes before, %d read, %s "
+                "after); not emitted, left in place for a later poll",
+                _where(self._host, self._remote_dir),
+                safe_name(name),
+                exc.before,
+                exc.read,
+                exc.after,
+            )
+            # Still moving, so it must settle again from its latest size (#2071).
+            self._remember_size(name, exc.read if exc.after is None else exc.after, mtime)
+            return _Step.FREE
+        except _RemoteError as exc:
+            # Transient (locked / vanished mid-poll): leave it in place to retry on a later poll
+            # rather than quarantine a healthy file. Logged, never silently swallowed.
+            logger.warning(
+                "REMOTEFILE could not retrieve %s (will retry on a later poll): %s",
+                safe_name(name),
+                safe_exc(exc, file_name=name),
+            )
+            return _Step.FREE
+        # Content-vs-type magic-byte check (ASVS 5.2.2), the local File source's own helper: the raw
+        # bytes, then for a text type on a non-ASCII encoding the head decoded with `encoding`, so a
+        # UTF-16 or UTF-32 drop is not quarantined for its BOM (BACKLOG #5684). The dispatch is
+        # _content_matches_declared's (hl7v2→MSH/FHS/BHS, x12→ISA, dicom→preamble+DICM,
+        # json/fhir→{/[, xml→<; binary/text unchecked). The remote dir is a less-trusted source, so a
+        # drop whose leading bytes contradict its declared content_type is quarantined before its bytes
+        # reach the pipeline. The former None-skips-sniff carve-out was REMOVED (ASVS 5.2.2): the check
+        # now ALWAYS runs, converging onto the local source's semantics — the helper's None arm already
+        # means hl7v2, so a content_type=None drop is sniffed as HL7 (a binary drop is quarantined to
+        # .error, not delivered raw).
+        if not _content_matches_encoded(self.content_type, raw, self._encoding):
+            # Like the oversize / scan-reject cases it never became a "received message", so there
+            # is no store disposition; preserve it in .error and log it (never a silent drop).
+            declared = (self.content_type or ContentType.HL7V2).value
+            logger.warning(
+                "REMOTEFILE file %s does not match its declared content type %r "
+                "(no matching magic bytes); routing to error dir",
+                safe_name(name),
+                declared,
+            )
+            if await self._quarantine(path, name, size, mtime):
+                await self._emit_event(
+                    "file_content_mismatch",
+                    reason=f"does not match declared content type {declared}",
+                )
+            return _Step.CHARGED
+        try:
+            await asyncio.to_thread(scan_inbound_file, raw, name)
+        except ScanRejected as exc:
+            # A configured pre-ingest scanner (AV/ICAP/plugin) rejected the content before it
+            # entered the pipeline (ASVS 5.4.3) — the control that matters most for a remote /
+            # less-trusted drop source. Quarantine + log; like the oversize reject above it never
+            # became a "received message", so there's no store disposition.
+            scrubbed = safe_exc(exc, file_name=name)
+            logger.warning(
+                "REMOTEFILE file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
+                safe_name(name),
+                scrubbed,
+            )
+            if await self._quarantine(path, name, size, mtime):
+                await self._emit_event("file_scan_rejected", reason=scrubbed)
+            return _Step.CHARGED
+        except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
+            # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
+            # rejection. Fail closed (ASVS 5.4.3): never emit unscanned content from a less-trusted
+            # remote source. Unlike a ScanRejected we don't quarantine a possibly-healthy file on a
+            # scanner outage — leave it in place so the next poll re-runs the scan once the scanner
+            # recovers (at-least-once, mirroring the transient-retrieve path). Logged, never a silent
+            # pass-through, and scoped to THIS file so a hiccup can't abort the poll's remaining files.
+            logger.warning(
+                "REMOTEFILE file %s: pre-ingest scan hook errored (%s); leaving in place, will retry",
+                safe_name(name),
+                safe_exc(exc, file_name=name),
+            )
+            return _Step.FREE
+        try:
+            stopped = await self._hand_off(raw)
+        except Exception as exc:
+            # The handler records every message-level outcome itself and returns, so an exception
+            # escaping here is an infrastructure failure (the durable store write failed). Leave the
+            # file in place so a later poll retries (at-least-once) — moving it would drop a
+            # received-but-unrecorded message (mirrors the File source's M-15).
+            logger.warning(
+                "REMOTEFILE handler failed for %s (will retry on a later poll): %s",
+                safe_name(name),
+                safe_exc(exc, file_name=name),
+            )
+            if retry:
+                # A retry that passed every gate keeps its memory through a store outage, on
+                # the short wait, so the outage does not re-read it outside the retry slots.
+                self._delay_retry(name, STUCK_TRANSIENT_RETRY_SECONDS)
+            return _Step.FREE
+        self._stuck.pop(name, None)  # it passed every gate, so it is no longer a reject
+        if stopped:
+            # A stop arrived before the file's last message: the whole file stays, and the next
+            # start hands it over again (at-least-once, as the File source does). The poll ends
+            # here, and its prune still bounds what it recorded.
+            return _Step.STOP
+        await self._after_processing(path, name, len(raw))
+        # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
+        # Only a durable write counts, so a broken ledger does not draw a prune.
+        if file_key is not None and await self._leave_record(file_key):
+            return _Step.RECORDED
+        return _Step.CHARGED
 
     async def _hand_off(self, raw: bytes) -> bool:
         """Hand one retrieved file to the pipeline, one message at a time; return True when a stop
@@ -3400,12 +3458,17 @@ class RemoteFileSource(SourceConnector):
             self._stuck_full_logged = False  # drained: a memory that fills again is logged again
 
     def _stuck_retry_allowance(self) -> int:
-        """How many remembered rejects one poll may read again (BACKLOG #5750). One over it stays
-        due for a later poll, and so does one past the point where a poll stops at its ceiling."""
+        """How many remembered rejects one poll may examine again (BACKLOG #5750). One over it stays
+        due for a later poll; :meth:`_retry_stuck` takes the earliest due first."""
         cap = self._poll_max_files
         if cap is None:
             return STUCK_RETRIES_PER_SCAN_MAX
         return min(STUCK_RETRIES_PER_SCAN_MAX, max(1, cap // 10))
+
+    def _delay_retry(self, name: str, wait: float) -> None:
+        """Make the remembered reject at ``name`` due its retry ``wait`` seconds from now."""
+        seen = self._stuck[name][0]
+        self._stuck[name] = (seen._replace(due=time.monotonic() + wait), 0)
 
     def _stuck_reject(self, name: str, size: int, mtime: str | None) -> _StuckReject | None:
         """The remembered reject at ``name`` if it still lists as it did, else None. A file whose
@@ -3446,6 +3509,9 @@ class RemoteFileSource(SourceConnector):
                 )
             return
         wait = STUCK_TRANSIENT_RETRY_SECONDS if first else STUCK_RETRY_SECONDS
+        if mtime is None and not first:
+            # A listing that lost the time keeps the one already known, so a later change shows.
+            mtime = self._stuck[name][0].mtime
         self._stuck[name] = (_StuckReject(size, mtime, time.monotonic() + wait), 0)
         if first:
             logger.warning(

@@ -5111,14 +5111,15 @@ stated once at `STUCK_RETRY_SECONDS` in
 [`transports/file.py`](../messagefoundry/transports/file.py). Under `leave` on `File(...)`, the gap
 stands as described. On `Sftp(...)`/`Ftp(...)`, in every `after_read` mode (BACKLOG #5750), a similar
 memory narrows it: such a file is skipped unread and uncharged until its listed size or modification
-time changes or its retry falls due, and the same two exceptions apply. It differs from `File(...)` in
-at least three ways. The first wait is `STUCK_TRANSIENT_RETRY_SECONDS` and each later one
-`STUCK_RETRY_SECONDS`, whatever the failure, because a remote failure does not say reliably whether it
-will clear; only a retry that passes every gate and then fails its hand-off takes the short wait again.
-A due retry settles over two polls first. One poll takes at most a tenth of `poll_max_files` of them
-(at least one, at most `STUCK_RETRIES_PER_SCAN_MAX`). And retries run in listing order inside the
-pass, so one past the ceiling's break waits for a later poll, and one sorted first is read before the
-healthy files behind it. A replacement listing the same size and time is seen only by the retry.
+time changes or its retry falls due, and the same two exceptions apply. Its retries also run in a
+separate pass after the poll's other files, earliest due first, those past the ceiling's break
+included. It differs from `File(...)` in at least two ways. The first wait is
+`STUCK_TRANSIENT_RETRY_SECONDS` and each later one `STUCK_RETRY_SECONDS`, whatever the failure, because
+a remote failure does not say reliably whether it will clear; only a retry that passes every gate and
+then fails its hand-off takes the short wait again. And one poll examines at most a tenth of
+`poll_max_files` of them (at least one, at most `STUCK_RETRIES_PER_SCAN_MAX`), so when more are due than
+that, a retry waits past its back-off for its turn. A replacement listing the same size and time is
+seen only by the retry.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it

@@ -63,9 +63,9 @@ def _leave(
     return src
 
 
-def _make_due(src: Any, name: str) -> None:
+def _make_due(src: Any, name: str, due: float = 0.0) -> None:
     seen, missed = src._stuck[name]
-    src._stuck[name] = (seen._replace(due=0.0), missed)
+    src._stuck[name] = (seen._replace(due=due), missed)
 
 
 def test_the_sftp_directory_check_raises_on_a_refused_stat() -> None:
@@ -315,21 +315,149 @@ async def test_due_retries_past_the_allowance_cost_no_ledger_read(
 async def test_a_retry_held_back_by_the_allowance_does_not_keep_an_old_sighting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """b is due but has no slot while a takes the only one, so what the first poll saw of b must not
-    admit a partial rewrite that only the last poll lists."""
+    """b settles on the only slot, then loses it to a, which is due earlier. What b's sighting saw
+    must not admit a partial rewrite that only the last poll lists."""
     client = _read_only({"/in/a.hl7": _BAD, "/in/b.hl7": _BAD})
     src = _leave(monkeypatch, client, poll_max_files=5)  # a retry allowance of one
     await _settle(src)
-    await src._poll_once()  # a is rejected and remembered
-    await src._poll_once()  # b too
-    _make_due(src, "a.hl7")
-    _make_due(src, "b.hl7")
-    await src._poll_once()  # a takes the slot and settles
-    await src._poll_once()  # a is read; b has no slot
-    partial = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
-    client.files["/in/b.hl7"] = partial
+    await src._poll_once()  # both are rejected and remembered
+    _make_due(src, "b.hl7", 1.0)
+    _make_due(src, "a.hl7", 2.0)
+    await src._poll_once()  # b takes the slot and settles
+    assert "b.hl7" in src._settle_seen
+    _make_due(src, "a.hl7", 0.5)  # as a reject one listing missed comes back due before b
+    await src._poll_once()  # a takes the slot and settles; b has none
+    client.files["/in/b.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    await src._poll_once()  # a is read; b still has no slot
     await src._poll_once()  # b's first sighting of this content
     assert src._handler.bodies == [], "a single listing must not admit it"
+
+
+async def test_a_skipped_reject_does_not_keep_an_old_sighting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retrieve that saw the file change records a sighting and leaves the reject waiting. The
+    poll that skips it must drop that sighting, or the first listing after its wait admits it."""
+    client = _read_only({"/in/a.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    src._settle_seen["a.hl7"] = ((len(_BAD), None), 0)
+    await src._poll_once()  # not due, so skipped
+    client.files["/in/a.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    _make_due(src, "a.hl7")
+    await src._poll_once()  # its first sighting of this content
+    assert src._handler.bodies == [], "a single listing must not admit it"
+    assert _retrieved(client, "/in/a.hl7") == 1
+
+
+async def test_a_due_retry_already_in_the_ledger_does_not_hold_a_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _read_only({"/in/a.hl7": _BAD, "/in/b.hl7": _BAD})
+    src = _leave(monkeypatch, client, poll_max_files=5)  # a retry allowance of one
+    await _settle(src)
+    await src._poll_once()  # both are rejected and remembered
+    await src.processed_ledger.mark_processed(src._file_key("a.hl7", len(_BAD), None))
+    _make_due(src, "a.hl7")
+    _make_due(src, "b.hl7")
+    for _ in range(4):
+        await src._poll_once()
+    assert _retrieved(client, "/in/b.hl7") == 2, "the retry sorted after it still runs"
+    assert _retrieved(client, "/in/a.hl7") == 1, "a file the ledger holds is not read again"
+    assert "a.hl7" not in src._stuck
+    assert "/in/a.hl7" in client.files
+
+
+async def test_a_due_retry_the_full_settle_memory_refuses_gives_up_its_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(remotefile, "SETTLE_SEEN_MAX", 2)
+    client = _read_only(
+        {"/in/a.hl7": _BAD, "/in/b.hl7": _BAD, "/in/x.txt": b"x", "/in/y.txt": b"y"}
+    )
+    src = _leave(monkeypatch, client, poll_max_files=5)  # a retry allowance of one
+    await _settle(src)
+    await src._poll_once()  # both are rejected and remembered
+    assert sorted(src._stuck) == ["a.hl7", "b.hl7"]
+    src._settle_seen.update({"x.txt": ((1, None), 0), "y.txt": ((1, None), 0)})
+    _make_due(src, "a.hl7")
+    _make_due(src, "b.hl7")
+    await src._poll_once()  # a takes the slot and the memory refuses it
+    assert src._stuck["a.hl7"][0].due > time.monotonic()
+    await src._poll_once()  # so b gets the slot rather than waiting behind a
+    assert src._stuck["b.hl7"][0].due > time.monotonic()
+
+
+async def test_every_stuck_reject_gets_its_retry_when_slots_are_scarce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fifty minutes of 30-second polls with one slot each. In name order the last never ran."""
+    names = [f"bad{i:02}.hl7" for i in range(40)]
+    client = _read_only({f"/in/{name}": _BAD for name in names})
+    src = _leave(monkeypatch, client, poll_max_files=10)  # a retry allowance of one
+    await _settle(src)
+    for _ in range(4):
+        await src._poll_once()  # the ceiling lets ten through a poll
+    assert len(src._stuck) == len(names)
+    for _ in range(100):
+        for name, (seen, missed) in list(src._stuck.items()):
+            src._stuck[name] = (seen._replace(due=seen.due - 30.0), missed)
+        await src._poll_once()
+    never = [name for name in names if _retrieved(client, f"/in/{name}") < 2]
+    assert never == []
+
+
+async def test_a_due_retry_past_the_ceiling_is_not_held_back_by_a_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _read_only({"/in/z.hl7": _BAD})
+    src = _leave(monkeypatch, client, poll_max_files=1)
+    await _settle(src)
+    await src._poll_once()
+    client.files |= {"/in/a.hl7": _GOOD, "/in/b.hl7": _GOOD}
+    _make_due(src, "z.hl7")
+    await src._poll_once()  # a and b are first seen; z takes the slot and settles
+    await src._poll_once()  # a spends the budget, so the pass stops before b and z
+    assert src._handler.bodies == [_GOOD]
+    assert _retrieved(client, "/in/b.hl7") == 0
+    assert _retrieved(client, "/in/z.hl7") == 2
+
+
+@pytest.mark.parametrize("failure", ["retrieve", "hand_off"])
+async def test_a_failed_retry_does_not_promise_the_next_poll(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    """A remembered reject waits its back-off, so the log must not say the next poll retries it."""
+    client = _read_only({"/in/a.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    client.files["/in/a.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    _make_due(src, "a.hl7")
+    await _settle(src)
+    if failure == "retrieve":
+        client._retrieve_exc = _RemoteError("synthetic retrieve failure", permanent=False)
+    else:
+        src._handler = _RecordingHandler(exc=RuntimeError("synthetic store failure"))
+    caplog.clear()
+    await src._poll_once()
+    assert "will retry" in caplog.text
+    assert "next poll" not in caplog.text
+
+
+async def test_a_listing_without_a_time_does_not_erase_the_remembered_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected again on a poll whose listing lost the time, the file must still show a later
+    change of it, or a replacement waits for the retry."""
+    client = _read_only({"/in/a.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    size = len(_BAD)
+    src._remember_stuck("a.hl7", size, "20261123080000")
+    src._remember_stuck("a.hl7", size, None)
+    assert src._stuck["a.hl7"][0].mtime == "20261123080000"
+    assert src._stuck_reject("a.hl7", size, "20261123090000") is None
 
 
 async def test_a_retry_whose_hand_off_fails_keeps_its_memory_on_the_short_wait(
