@@ -8462,10 +8462,13 @@ class PostgresStore:
             await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
             dead: list[Any] = []
             for row in orphans:
-                # The read took no row lock, so a row may have left the read's statuses before this
-                # write (at least cancelled, completed, dead-lettered or purged). The status term
-                # leaves such a row as it is, and its zero rowcount skips the row's event, finalize
-                # and count.
+                # The read took no row lock, so a row's status may change after the read. A change
+                # that committed before this UPDATE applies (at least a cancel, completion,
+                # dead-letter or purge) leaves the row outside the status term, and the zero
+                # rowcount skips the row's event, finalize and count. A change still in flight is
+                # not always skipped: at least mark_done, dead_letter_now and cancel_queued take the
+                # row lock before the message's finalize lock, which this sweep already holds, so
+                # one of them can deadlock against this UPDATE (SQLSTATE 40P01) instead.
                 result = await conn.execute(
                     "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
                     " owner=NULL, lease_expires_at=NULL WHERE id=$5 AND status IN ($6, $7)",
