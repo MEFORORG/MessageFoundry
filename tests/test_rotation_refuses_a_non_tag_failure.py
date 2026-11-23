@@ -114,7 +114,8 @@ async def test_control_sqlite_rotation_skips_a_queue_cell_that_fails_its_tag(
     db = tmp_path / "rotate.db"
     old_key, new_key = generate_key(), generate_key()
     await _queue_store_under(db, old_key)
-    _set_payload(db, _aes(old_key).encrypt("SYNTH", aad=b"another-cell"))
+    wrong_cell = _aes(old_key).encrypt("SYNTH", aad=b"another-cell")
+    _set_payload(db, wrong_cell)
 
     rotated = await MessageStore.open(
         db, cipher=make_cipher(new_key, retired_b64=[old_key], write_v2=True)
@@ -124,7 +125,15 @@ async def test_control_sqlite_rotation_skips_a_queue_cell_that_fails_its_tag(
             await rotated.reencrypt_to_active()
     finally:
         await rotated.close()
-    assert "queue.payload value(s) that do not open under their own row's tag" in caplog.text
+    assert "rotation left 1 queue.payload value(s) that do not open" in caplog.text
+    side = sqlite3.connect(db, timeout=30)
+    try:
+        (after,) = side.execute(
+            "SELECT payload FROM queue WHERE destination_name='OB_A'"
+        ).fetchone()
+    finally:
+        side.close()
+    assert after == wrong_cell, "the tag-failed cell was rewritten instead of left as it was"
 
 
 # --- PostgreSQL and SQL Server, through the tagged loop -------------------------------------------

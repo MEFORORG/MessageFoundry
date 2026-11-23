@@ -867,8 +867,9 @@ def test_serve_never_stashes_a_declared_proxys_certificate(
 ) -> None:
     """Through ``serve``: with mTLS, a cert-identity map and ``[api].trusted_proxies`` declared, the
     HTTP class uvicorn is handed does not stash the certificate a declared proxy presents, and does
-    stash the same certificate from another peer. This reads only what ``serve`` hands uvicorn, so
-    on the code before the fix it fails on the stash itself, not on a missing name."""
+    stash the same certificate from another peer. It reads only what ``serve`` hands uvicorn and
+    names nothing the fix added, so lifted out of this module (whose imports do name such things),
+    it fails on the code before the fix on the stash itself, not on a missing name."""
     from messagefoundry.__main__ import main
     from messagefoundry.store.crypto import generate_key
     from tests.test_api_tls import SAMPLES_CONFIG, _self_signed
@@ -899,9 +900,10 @@ def test_serve_never_stashes_a_declared_proxys_certificate(
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     http_cls: Any = captured["http"]
     assert "connection_made" in vars(http_cls), "serve did not hand uvicorn the shim"
-    # The server's own connection_made needs a live loop and config; stand it down so only the
-    # shim's enrichment runs.
-    monkeypatch.setattr(http_cls.__mro__[1], "connection_made", lambda self, transport: None)
+    # uvicorn's own connection_made needs a live loop and config; stand down the first class from
+    # outside this package, so the shim and every layer of ours beneath it still run.
+    server_base = next(c for c in http_cls.__mro__ if not c.__module__.startswith("messagefoundry"))
+    monkeypatch.setattr(server_base, "connection_made", lambda self, transport: None)
 
     def _connect(peer: tuple[str, int]) -> dict[str, Any]:
         protocol: Any = object.__new__(http_cls)
