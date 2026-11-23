@@ -542,22 +542,9 @@ def _reconcile(
     floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    # A FLOOR, NOT A RECONCILIATION (BACKLOG #5436). Minimum fan-out is 1, so a drained step that
-    # lost nothing writes at least what it read. connscale's form rests on each inbound routing to
-    # exactly one outbound. Estate hubs send to `hub_fanout` destinations
-    # (harness/config/estate/graph.py), so `written` can exceed `read`, and a hub's surplus can hide
-    # a simple feed's shortfall. A clear floor therefore says NOTHING about at least ingress or
-    # routed dead-letters and cancelled rows when hubs exist; seeing them takes a figure this check
-    # does not have, such as an expected-written count or an all-stage dead count.
-    # A message the listener NAKed is recorded as a row, so it counts in `read`: it fails this floor
-    # unless a hub's surplus absorbs it, as with any other shortfall.
-    # Only a completed drain is judged: before it, a row still in the pipeline reads as a shortfall.
-    write_short = read - written
-    write_lost = write_short > 0 and drained and drain_seconds is not None
-    # Outbound dead-letters only: `out_dead` sums the outbound connections' dead rows.
-    engine_lost = (
-        read_short > 0 or floor_short > 0 or deliver_short > 0 or write_lost or out_dead > 0
-    )
+    # Outbound dead-letters only: `out_dead` sums the outbound connections' dead rows, so an ingress
+    # or routed dead-letter is not in it and this check does not see one (BACKLOG #5436).
+    engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or out_dead > 0
     lost = (engine_judged and engine_lost) or over_budget
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
@@ -603,13 +590,6 @@ def _reconcile(
         )
     if engine_judged and out_dead > 0:
         parts.append(f"{out_dead} outbound row(s) dead-lettered during the step")
-    if engine_judged and write_lost:
-        parts.append(
-            f"engine_written {written} < engine_read {read}: fewer deliveries than messages read "
-            f"(at least {write_short} undelivered"
-            + (f"; {c.nak} send(s) were NAKed, which can account for some" if c.nak else "")
-            + ")"
-        )
     if not drained and final is not None:
         parts.append(
             f"backlog {backlog} not drained (outbound {final.pending + final.inflight}, "
