@@ -586,6 +586,9 @@ class TransitCipher(_UnmarkedPolicy):
     """Bulk at-rest cipher whose crypto runs inside Vault/OpenBao Transit — the DEK never enters heap."""
 
     encrypts = True
+    #: Every call is a Transit HTTP round trip, so :func:`~messagefoundry.store.row_seal.cipher_call`
+    #: runs it on the row-seal Transit pool rather than inline (BACKLOG #3929).
+    blocks_on_io = True
     #: This cipher cannot name the keys it holds, and its UnauthenticatedCipherError is Vault's
     #: AEAD refusal of the value itself, never a key it lacks, so
     #: :func:`~messagefoundry.store.cell_tag.open_tagged_cell` reads it as tag drift (BACKLOG #5650).
@@ -1398,6 +1401,8 @@ class _TransitAuditMac:
     :class:`~messagefoundry.store.crypto.AuditMacVerifier` over one cipher (BACKLOG #2720)."""
 
     __slots__ = ("_cipher",)
+    #: Each MAC and each check is a Transit round trip (BACKLOG #3929).
+    blocks_on_io = True
 
     def __init__(self, cipher: TransitCipher) -> None:
         self._cipher = cipher
