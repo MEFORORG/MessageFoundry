@@ -198,8 +198,11 @@ def _digest(
     OAuth2 flags, and SMART token URL, are not themselves ``env()`` references: the build refuses
     Digest beside a bearer provider, so none crosses there. Where one of them is an ``env()``
     reference, the provider may resolve off, so the mode still reads as Digest. An ``env()``
-    OAuth2 token URL does not count: one that resolves blank refuses the build
-    (``http_auth.refuse_oauth2_settings``) rather than turning the provider off."""
+    OAuth2 token URL is not counted. Beside a written ``oauth2_enabled``, as
+    ``with_oauth2_client_credentials`` writes it, one that resolves blank refuses the build
+    (``http_auth.refuse_oauth2_settings``). With no ``oauth2_enabled`` key, one that resolves to
+    nothing leaves the provider off and Digest can cross, and this reading does not list it: a
+    known gap (BACKLOG #5526 item 9, review round-117c3b9418)."""
     from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
 
     mode = _resolved_setting(settings, "http_auth", None, env_values or {})

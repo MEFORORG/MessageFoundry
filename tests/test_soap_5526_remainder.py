@@ -226,8 +226,9 @@ def test_the_census_reads_no_digest_beside_a_literal_smart_token_url() -> None:
 
 
 def test_the_census_reads_no_digest_beside_an_oauth2_token_url_from_env() -> None:
-    """Item 9: an ``env()`` OAuth2 token URL that resolves blank refuses the build rather than
-    turning the provider off, so Digest cannot cross there and none is listed, as on main."""
+    """Item 9: beside the ``oauth2_enabled`` the composer writes, an ``env()`` OAuth2 token URL
+    that resolves blank refuses the build rather than turning the provider off, so no Digest is
+    listed for it. The no-flag case is a known gap (see ``_digest``)."""
     settings = _oauth(Rest(url=URL)).settings
     settings["http_auth"] = EnvRef("MF_HTTP_AUTH_SYNTHETIC")
     settings["oauth2_token_url"] = EnvRef("MF_TOKEN_URL_SYNTHETIC")
