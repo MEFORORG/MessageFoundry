@@ -1677,18 +1677,16 @@ async def test_hitting_the_step_up_return_audit_backstop_pages_once_a_window(
         await store.close()
 
 
-@pytest.mark.parametrize("window", [0.0, -1.0])
-async def test_a_window_of_zero_or_less_removes_the_whole_step_up_return_audit_budget(
-    window: float,
-) -> None:
-    """BACKLOG #3965. RED when: with a window of 0 or less a negative global still refuses rows
-    with no account behind them, and pages on every one, though the docs say that window removes
-    the whole budget."""
+async def test_a_window_of_zero_removes_the_whole_step_up_return_audit_budget() -> None:
+    """BACKLOG #3965. RED when: with a window of 0 a tiny global still refuses rows with no
+    account behind them, and pages on every one, though the docs say that window removes the whole
+    budget. A negative window or global is refused at load (BACKLOG #5318), so a global of 1, the
+    tightest that loads, stands in for the negative one this test first planted."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(
             store,
-            AuthSettings(login_rate_limit_window_seconds=window, login_rate_limit_global=-1),
+            AuthSettings(login_rate_limit_window_seconds=0.0, login_rate_limit_global=1),
         )
         pages: list[str] = []
         service._step_up_return_audit_alert = pages.append
