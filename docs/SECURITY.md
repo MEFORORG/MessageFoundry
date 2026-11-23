@@ -1740,11 +1740,12 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-answered as a record that fails its seal is, but reported under
+refused at the first check that cannot verify it, with no further read, and then answered as a
+record that fails its seal is, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. Apart from the answers the next two sentences state, a Vault transit Outage on any
 account these reads check answers 503 with `Retry-After` and lists nothing; it pages
-`authority-seal-transit` and writes no audit row.
+`authority-seal-transit` and writes no audit row of its own.
 At least the pages that read the name through `_shown_name` catch a 423 or a 503 from that read
 and answer 200, and `GET /ui/users/{user_id}/delete-confirm` does the same for a 423. When
 the delete that `POST /ui/users/{user_id}/delete` runs refuses with a status other than 404, and
