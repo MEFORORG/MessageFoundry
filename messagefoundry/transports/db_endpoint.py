@@ -90,9 +90,12 @@ def split_generic_server(server: str) -> tuple[str, str]:
 
 
 def names_no_host(server: str) -> bool:
-    """Whether ``server`` leaves a host unnamed: blank, a bare port, empty brackets, or an empty
-    entry on either side of a comma (BACKLOG #5512). A driver has to pick such a destination
-    itself, so no reading here can place the hop."""
+    """Whether ``server`` is blank, a bare port or empty brackets, or has an empty entry on either
+    side of a comma (BACKLOG #5512). A driver has to pick such a destination itself, so no reading
+    here can place the hop.
+
+    **Not every value with no host.** A single colon reads as ``host:port``, so a protocol prefix
+    with nothing after it, such as ``tcp:``, counts as naming the host ``tcp``."""
     return not all(split_generic_server(entry)[0] for entry in server.split(","))
 
 

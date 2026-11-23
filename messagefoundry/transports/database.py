@@ -2259,7 +2259,8 @@ def _build_connection(
     generic arm's own refusal is :func:`generic_cleartext_hop_guard`, called by the connectors beside
     this dispatcher rather than from inside it, so a direct DSN-shape caller (tests, checks) still gets
     a string back without a hop decision it did not ask for. The exception is a generic ``server``
-    that names no host, which :func:`_build_odbc_dsn` refuses at every posture (BACKLOG #5512).
+    that :func:`~messagefoundry.transports.db_endpoint.names_no_host` matches, which
+    :func:`_build_odbc_dsn` refuses at every posture (BACKLOG #5512).
 
     ``connection`` names the declaring connection in that WARNING (#333); it is used on the generic path
     only, since the SQL Server preset refuses rather than warns."""
