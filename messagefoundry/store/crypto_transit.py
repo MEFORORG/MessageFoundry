@@ -619,7 +619,9 @@ class _TokenRenewal:
     that is sooner, and its warning is rate-limited; once the token has expired, renewal stops."""
 
     def __init__(self, clock: Callable[[], float] | None = None) -> None:
-        self._clock = time.monotonic if clock is None else clock
+        # Wall-clock time, because Vault counts a token's TTL on its own clock: a monotonic clock
+        # does not advance while a host or VM is suspended, and the renewal would then come late.
+        self._clock = time.time if clock is None else clock
         self._lock = threading.Lock()
         #: When the next renewal is due, on ``clock``; ``None`` when none is to be made.
         self._next_at: float | None = None
@@ -627,21 +629,29 @@ class _TokenRenewal:
         self._expires_at = 0.0
         #: The lease the last renewal granted, so a shorter one (the max TTL near) is reported.
         self._last_lease: int | None = None
+        #: The TTL is not known yet because lookup-self failed; the next due call looks again.
+        self._lookup_pending = False
 
     def start(self, client: Any) -> None:
-        """Read the token's TTL and renewability, and schedule its first renewal."""
+        """Read the token's TTL and renewability, and schedule its first renewal. A failed read is
+        tried again on a Transit call after :data:`_RENEW_RETRY_S`, so one transient failure does
+        not turn renewal off for the life of the cipher."""
         try:
             response: Any = client.auth.token.lookup_self()
         except Exception as exc:  # noqa: BLE001 -- logged by class; the cipher still serves
-            name = type(exc).__name__
-            _warn_quietly(
+            self._lookup_pending = True
+            self._next_at = self._clock() + _RENEW_RETRY_S
+            kind = type(exc)
+            _warn_when_due(
+                lambda: ("store Vault token lookup", kind),
                 lambda: (
-                    "store Vault token: lookup-self failed (%s), so the engine does not renew the "
-                    "token; if it has a TTL, Transit calls fail once it expires",
-                    name,
-                )
+                    "store Vault token: lookup-self failed (%s), so the engine cannot yet tell "
+                    "when the token expires; it looks again on a later Transit call",
+                    kind.__name__,
+                ),
             )
             return
+        self._lookup_pending = False
         data = response.get("data") if isinstance(response, Mapping) else None
         self._schedule(_int_field(data, "ttl"), _renewable(data))
 
@@ -673,6 +683,9 @@ class _TokenRenewal:
         try:
             due = self._next_at
             if due is None or self._clock() < due:
+                return
+            if self._lookup_pending:
+                self.start(client)
                 return
             try:
                 response: Any = client.auth.token.renew_self()

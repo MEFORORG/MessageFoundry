@@ -496,11 +496,13 @@ def test_fleet_finds_a_deregistered_relative_path_checkout(
     assert "git worktree list" in proc.stderr, proc.stderr
 
 
-def test_a_scan_that_throws_is_an_unavailable_repository_not_a_crash(
+def test_a_record_the_fence_cannot_convert_no_longer_breaks_another_repos_scan(
     repo: Path, other_repo: Path, config_root: Path
 ) -> None:
-    """A record the fence cannot convert, in another repository, used to throw out of that repo's
-    scan and end the whole -Fleet run with exit 1. The default run never places that record."""
+    """A non-numeric startedAt, in another repository, used to throw out of that repo's scan, which
+    Get-FleetScan turned into an UNAVAILABLE repository. Since BACKLOG #5599 (S33-78) the occupancy
+    library reads startedAt through Get-RecordStartedUtc, so the record is read and the scan stands.
+    The default run never places that record."""
     write_session(config_root, pid=os.getpid(), cwd=repo, session_id="b8b8b8b8-0008")
     bad = {"pid": 4242, "sessionId": "c9c9c9c9-0009", "cwd": str(other_repo), "startedAt": "abc"}
     (config_root / "sessions" / "bad.json").write_text(json.dumps(bad), encoding="utf-8")
@@ -510,8 +512,8 @@ def test_a_scan_that_throws_is_an_unavailable_repository_not_a_crash(
     )  # control: default is unaffected
 
     proc = run_raw(repo, config_root, "-Fleet", "-Json")  # run_raw asserts rc 0
-    assert "UNAVAILABLE" in proc.stderr, proc.stderr
-    assert [r["Short"] for r in json.loads(proc.stdout)] == ["b8b8b8b8"]
+    assert "UNAVAILABLE" not in proc.stderr, proc.stderr
+    assert "b8b8b8b8" in [r["Short"] for r in json.loads(proc.stdout)]
 
 
 def test_fleet_with_an_unresolvable_repo_says_it_was_not_scanned(

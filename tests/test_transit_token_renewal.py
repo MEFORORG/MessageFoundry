@@ -103,6 +103,8 @@ def _cipher(
     token = _Token(clock, ttl=ttl, renewable=renewable)
     transit = _ExpiringTransit(token)
     _use_fake(monkeypatch, transit)
+    # The rate limit is process-global; a fresh one per test, so no earlier warning hides this one.
+    monkeypatch.setattr(crypto_transit, "_logged_at", {})
     monkeypatch.setattr(crypto_transit, "_build_client", lambda addr, token, **_: _Client(transit))
     monkeypatch.setattr(
         crypto_transit, "_TokenRenewal", functools.partial(crypto_transit._TokenRenewal, clock)
@@ -221,6 +223,40 @@ def test_a_shorter_lease_than_before_is_reported_as_the_max_ttl_nearing(
     clock.now += 60
     cipher.encrypt("value")  # second: 40 s, capped
     assert "granted 40 s, less than the 100 s before" in caplog.text
+
+
+def test_a_failed_lookup_at_open_is_tried_again_so_renewal_still_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    token = _Token(clock, ttl=100, renewable=True)
+    real = token.lookup_self
+    calls = {"n": 0}
+
+    def flaky() -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("vault unreachable")
+        return real()
+
+    monkeypatch.setattr(token, "lookup_self", flaky)
+    transit = _ExpiringTransit(token)
+    _use_fake(monkeypatch, transit)
+    monkeypatch.setattr(crypto_transit, "_logged_at", {})
+    monkeypatch.setattr(crypto_transit, "_build_client", lambda addr, token, **_: _Client(transit))
+    monkeypatch.setattr(
+        crypto_transit, "_TokenRenewal", functools.partial(crypto_transit._TokenRenewal, clock)
+    )
+    cipher = build_transit_cipher(StoreSettings())
+    sealed = cipher.encrypt("value")
+    clock.now += 61  # the lookup is tried again: TTL 39 s left, renewal due in about 20 s
+    assert cipher.decrypt(sealed) == "value"
+    assert calls["n"] == 2
+    clock.now += 25  # renewed before the token's expiry at 100 s
+    assert cipher.decrypt(sealed) == "value"
+    assert token.renewals == 1
+    clock.now += 60  # past the first TTL
+    assert cipher.decrypt(sealed) == "value"
 
 
 def test_the_renewal_paths_are_in_the_capabilities_the_probe_asks_for(
