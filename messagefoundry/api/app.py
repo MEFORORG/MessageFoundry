@@ -49,6 +49,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
@@ -1050,6 +1051,73 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
 
 #: Which namespace each alert control action restarts (BACKLOG #2528).
 _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
+
+#: Which side of the graph raises each alert event type (BACKLOG #3378). ``"outbound"`` marks a type
+#: whose emitters, read on 2026-11-22, raise it only for an outbound lane. ``GET /alerts/rules``
+#: reads only that value: it withholds a rule of an ``"outbound"`` type, or of a type missing here,
+#: from a channel-scoped caller. The other values are notes, not checked per emitter: ``"inbound"``
+#: and ``"both"`` for the side or sides read, ``"none"`` for a type whose settings comment keys it
+#: on something other than a connection name. A test pins the keys to
+#: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
+_ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        # RegistryRunner._note_lane_unhealthy and _note_lane_config_fault, outbound lanes only.
+        "connection_error": "outbound",
+        # _maybe_alert_stall reads the OUTBOUND stage; the in-flight watch passes no stall threshold
+        # to the inbound stages.
+        "message_stall": "outbound",
+        # Raised per stage, the inbound stages included, or by an inbound or an outbound stop.
+        "connection_stopped": "both",
+        "queue_buildup": "both",
+        "saturation": "both",
+        "lane_stuck": "both",
+        # certs_from_registry keys a certificate on an inbound's or an outbound's name, and on labels
+        # such as "api" that are not connection names.
+        "cert_expiry": "both",
+        # Keyed by the inbound's name (config.settings).
+        "sandbox_worker_refused": "inbound",
+        **dict.fromkeys(
+            (
+                "storage_threshold",
+                "secret_rotation",
+                "integrity_drift",
+                "gcm_invocations",
+                "update_available",
+                "backup_failed",
+                "store_privilege_warning",
+                "vault_privilege_warning",
+                "leadership_acquired",
+                "dr_activated",
+                "initial_credential_expiring",
+                "log_write_failed",
+                "log_forward_failed",
+                "approval_stale_requester",
+                "approval_too_early",
+                "approval_approver_provenance",
+                "administrator_granted",
+                "no_enabled_administrator",
+                "audit_write_failed",
+                "audit_offbox_copy_missing",
+                "ad_reconcile_aborted",
+                "ad_session_revoked",
+                "ad_reconcile_held",
+                "intake_paused",
+                "config_changed",
+                "crl_reload_refused",
+                "signin_failure_burst",
+                "access_denied_burst",
+                "body_view_burst",
+                "bulk_export",
+                "log_level_debug",
+                "posture_loosened",
+                "peer_refused_burst",
+                "remote_debug_refused",
+                "store_restored",
+            ),
+            "none",
+        ),
+    }
+)
 
 
 async def _alert_control_action(
@@ -4926,8 +4994,8 @@ def create_app(
     # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set. ON by default
     # since BACKLOG #1277; `serve` passes the resolved [diagnostics].audit_all_authz over the top.
     app.state.audit_all_authz = audit_all_authz
-    # Loaded [alerts] config for the read-only /alerts/rules view (independent of engine; may be None,
-    # in which case the route falls back to all-off defaults). The lifespan path sets the live value.
+    # Loaded [alerts] config for the read-only /alerts/rules view (may be None, in which case the
+    # route falls back to all-off defaults; a scoped caller's view also reads the engine's graph). The lifespan path sets the live value.
     app.state.alerts_settings = alerts_settings
     # [service] service-status reporting (L6a): default-off; the managed lifespan sets the live value,
     # here it backs the direct-construction (test) path.
@@ -6311,7 +6379,11 @@ def create_app(
         deployment, and a caller's in-scope inbound on a sibling engine shard is no denial. Both
         give the same refusal for an outbound and for a name outside the scope, and so does the web
         console's flag route for a direction that names neither side. A change to that refusal has
-        to be made in at least those three places."""
+        to be made in at least those three places. :func:`alerts_rules` reads the same
+        ``inbound_names()`` set for a scoped caller in its own code. The two differ at least with no
+        graph loaded, where this route lets an in-scope name reach the engine and that one
+        withholds every rule naming a connection, and on a name the runner also knows as an
+        outbound, which that one withholds and this one admits for ``direction=inbound``."""
         rr = engine.registry_runner
         wrong_direction = req.direction != "inbound"
         if identity.allowed_channels is not None and (
@@ -10592,18 +10664,21 @@ def create_app(
         # CoreHandlers seam, and the seam digest does not cover keyword names.
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> AlertsConfig:
-        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine
-        access; the store is touched only for the audit row below. No secrets: the webhook URL, SMTP
-        password and username are never returned — transports are reported present-or-not. Gated by
-        monitoring:read like /stats.
+        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). The engine is
+        read for its graph's connection names; the store is touched only for the audit row below.
+        No secrets: the webhook URL, SMTP password and username are never returned — transports are
+        reported present-or-not. Gated by monitoring:read like /stats.
 
         A channel-scoped caller sees only the rules that name no connection outside its scope
         (BACKLOG #1152): ``connection`` is ``"*"`` or a name in its scope, and ``control_target``
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
         ``IB_ACME_*``, is withheld.
 
-        What such a caller reads of each rule's ``id``, and why, is stated once in
-        ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG #3378).
+        Which further rules such a caller is denied, and what it reads of each rule's ``id``, are
+        stated once in ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG
+        #3378). The alert-instance reads and acts were left as they were on purpose, so a scoped
+        operator keeps handling its listed outbound's alerts. The same paragraph says who decided
+        that and on what reading of the owner's ruling.
 
         A read that withholds at least one rule writes an audit row; see
         :func:`_audit_alert_rules_withheld`."""
@@ -10611,13 +10686,47 @@ def create_app(
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
 
+        # Read from app.state, not a dependency: the console calls this handler across the seam.
+        engine: Engine | None = getattr(request.app.state, "engine", None)
+        rr = engine.registry_runner if engine is not None else None
+        scoped = _user.allowed_channels is not None
+        # An allowlist (BACKLOG #3378 item 4; the batch Manager's 2026-11-22 reading of the owner's
+        # 2026-11-04 ruling that part 4 "stays strict"): a scoped caller reaches a name only when
+        # it is in its scope AND an inbound of the deployment, the set the flag route's scope test
+        # reads (on an engine shard, every engine shard's inbounds), AND not an outbound this
+        # runner knows, a name declared on both sides included, since a rule on it can match the
+        # outbound's events. Read once per scoped request.
+        inbounds = rr.registry.inbound_names() if scoped and rr is not None else frozenset[str]()
+
+        def reachable(name: str) -> bool:
+            if not _user.can_access_channel(name):
+                return False
+            if not scoped:
+                return True
+            return rr is not None and name in inbounds and not rr.knows_outbound(name)
+
         def visible(rule: AlertRule) -> bool:
-            return (rule.connection == "*" or _user.can_access_channel(rule.connection)) and (
-                rule.control_target is None or _user.can_access_channel(rule.control_target)
+            if not (rule.connection == "*" or reachable(rule.connection)):
+                return False
+            if rule.control_target is not None and not reachable(rule.control_target):
+                return False
+            if not scoped:
+                return True
+            # restart_outbound acts on an outbound whatever the graph holds, a name that is also an
+            # inbound and a "*" rule's firing connection included. An action or an event type with
+            # no side recorded is withheld too, so a new one fails closed.
+            if rule.control_action is not None and (
+                _CONTROL_ACTION_SIDE.get(rule.control_action, "outbound") == "outbound"
+            ):
+                return False
+            # An event type only an outbound raises makes the rule an outbound rule, a "*" one
+            # included. "any" matches every side, as connection_stopped does, so it shows.
+            return rule.event_type == "any" or (
+                _ALERT_EVENT_SIDE.get(rule.event_type, "outbound") != "outbound"
             )
 
         rules = [r for r in alerts.rules if visible(r)]
-        show_ids = _user.allowed_channels is None
+        show_ids = not scoped
 
         config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),

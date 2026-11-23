@@ -2315,10 +2315,13 @@ the same permission set on the same method reds CI until it is listed here.
 > manual", and shows a race as a refused save with the edits kept.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
-> caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
+> caller `GET /channels`, `GET /connections`, `GET /events` and `GET /graph/edges`
 > return only their own inbound connections, and every **shared outbound** is suppressed outright
 > rather than relabelled — its dashboard row, its graph node and its live status all disappear, because
 > an outbound spans channels and its state can reflect another channel's downstream.
+> `GET /alerts/active` is narrowed differently: it filters alert instances by exact scope
+> membership of their `connection`, so a scoped caller sees the instances of every name its scope
+> lists, an outbound's included. An alert on an outbound its scope does not list is not shown.
 > `GET /connections/{name}/events` and `GET /connections/{name}/metadata` answer 403 outside the scope.
 > What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
@@ -2383,8 +2386,26 @@ the same permission set on the same method reds CI until it is listed here.
 > all-channels caller 404 with no row (BACKLOG #3378).
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it. Each rule it shows has a null `id` (BACKLOG
-> #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
+> scope, and `control_target` is unset or in it. Each name a rule carries must also be an inbound
+> in `Registry.inbound_names()`, the set the flag route's scope test reads, even when the scope
+> lists it (BACKLOG #3378). The owner ruled on 2026-11-04 that this part "stays strict", which the
+> batch 606 Manager recorded as a scoped caller seeing no outbound rules; this allowlist is the
+> batch Manager's 2026-11-22 reading of that ruling. So a rule
+> naming an outbound, or a name that
+> exists nowhere, is withheld from a scoped caller, and with no graph loaded every rule that
+> names a connection is. A name the runner also knows as an outbound
+> (`RegistryRunner.knows_outbound`, which counts a reload-dropped outbound still draining), a
+> name declared on both sides included, is withheld too, since a rule on it can match the outbound's events. Every
+> `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
+> its action names the outbound side. So is every rule whose event type only an outbound raises,
+> a `"*"` rule included: `_ALERT_EVENT_SIDE` in `messagefoundry/api/app.py` records each type's
+> side, and an event type or action with no side recorded is withheld too. A type both sides
+> raise, and `any`, still show on a `"*"` rule, though such a rule also matches outbound events.
+> The alert-instance routes were left as they were, on
+> purpose. The batch Manager decided this on 2026-11-22. It read the owner's ruling as covering
+> rules and flagging, not instances. What the ack, resolve, suspend and resume routes admit is in their bullet under
+> *Single-route data rules*, below. Each rule it shows has a null `id`
+> (BACKLOG #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
 > connection name in it, and nothing here reliably tells a label that names one from one that
 > does not. An
 > all-channels caller reads every id. A withheld id writes no audit row, since the rule itself is
@@ -2401,7 +2422,9 @@ the same permission set on the same method reds CI until it is listed here.
 > writes. The console's alerts page does not poll, which `test_ui_object_scope.py` pins; a page
 > that polled would need the row coalesced. The counts are a disclosure in their own right. A
 > scoped caller that holds `audit:read`, such as an Auditor, reads in `GET /audit` how many rules
-> lie outside its scope. A `logs:view` holder reads them in the ERROR line a lost row leaves.
+> it was not shown. That count includes at least rules outside its scope, rules withheld by the
+> inbound, outbound, `restart_outbound` and event-type tests above, and, with no graph loaded, every rule that names a
+> connection, so it is not a count of rules outside the scope alone. A `logs:view` holder reads them in the ERROR line a lost row leaves.
 > Without either, one extra write's latency can show that some rule was withheld. It cannot show
 > which rules or how many. Why it is not
 > `auth.channel_denied` is in `_audit_alert_rules_withheld` in
