@@ -270,12 +270,11 @@ async def test_an_inbound_dropped_during_the_router_still_delivers(
         await runner.stop()
 
 
-async def test_a_reload_dropping_the_whole_feed_does_not_strand_an_outbound_row(
+async def test_a_reload_dropping_the_whole_feed_refuses_the_row(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    """The dropped-inbound case runs on the SERVED graph. Finishing it on the replaced graph would
-    let the old handler commit an outbound row to a connection no worker serves, which
-    ``transform_one`` otherwise refuses."""
+    """The dropped-inbound case runs on the SERVED graph. Finishing it on the replaced graph was
+    measured to deliver the row to the outbound the reload removed, where this refuses it."""
     gate = _Gate()
     runner = await _start(_graph(tmp_path, _gated(gate)), store)
     try:
@@ -288,7 +287,8 @@ async def test_a_reload_dropping_the_whole_feed_does_not_strand_an_outbound_row(
             "SELECT COUNT(*) FROM queue WHERE stage = ?", (Stage.OUTBOUND.value,)
         )
         row = await cur.fetchone()
-        assert row is not None and row[0] == 0, "an outbound row was stranded"
+        assert row is not None and row[0] == 0, "an outbound row was committed"
+        assert not (tmp_path / "out" / "FEEDGONE.hl7").exists()
     finally:
         gate.release()
         await runner.stop()

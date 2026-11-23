@@ -12659,7 +12659,7 @@ class RegistryRunner:
         Not when the reload removed this inbound: a restart would reach the missing-inbound STOP, and
         nothing re-arms a worker that stops while a later reload restores the inbound. That row
         continues on the served graph, whose ``transform_one`` still refuses a handler or an outbound
-        the reload removed, so no outbound row is committed to a lane nobody drains."""
+        the reload removed, so the row is not sent to a connection the operator just took away."""
         if self.registry is read or name not in self.registry.inbound:
             return False
         if repass >= self._INGRESS_RELOAD_REPASSES:
