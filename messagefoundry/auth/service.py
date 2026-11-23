@@ -4374,8 +4374,8 @@ class AuthService:
         # (_step_up_return_audit_floor, charged only past the backstop), so the ceiling never
         # silences a named user outright; a source with no account gets no such row, because
         # client addresses are the caller's to multiply and accounts are not. A row it stops pages
-        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0 or less, which
-        # removes the whole budget (a negative global would otherwise refuse every row there).
+        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0, which removes
+        # the whole budget. The load refuses a negative window or global (BACKLOG #5318).
         backstop_on = (
             settings.login_rate_limit_enabled and settings.login_rate_limit_window_seconds > 0
         )
@@ -12443,8 +12443,9 @@ class AuthService:
         multi-session revocations record it. The count includes lapsed rows the cap ended, which
         the validator already refused; the store returns one count for both.
         """
+        # 0 = unlimited; the load refuses a negative cap (BACKLOG #5318).
         cap = self._settings.max_sessions_per_user
-        if not cap or cap <= 0:
+        if not cap:
             return
         user = await self._load_user(user_id)
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it

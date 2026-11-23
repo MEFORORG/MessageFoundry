@@ -410,7 +410,6 @@ _SIGN_IN_OFF_VALUES = [
     ("login_rate_limit_per_ip", 0),
     ("login_rate_limit_global", 0),
     ("login_rate_limit_window_seconds", 0.0),
-    ("login_rate_limit_window_seconds", -1.0),
     ("lockout_minutes", 0),
     ("lockout_minutes", -5),
     ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING + 1),
@@ -437,7 +436,6 @@ _LOOSER_THAN_DEFAULT = [
     ("phi_read_rate_limit_per_actor", 121),
     ("phi_read_rate_limit_per_actor", 1_000_000_000),
     ("phi_read_rate_limit_window_seconds", 0.0),
-    ("phi_read_rate_limit_window_seconds", -1.0),
     ("phi_read_rate_limit_window_seconds", 59.0),
     ("phi_read_rate_limit_window_seconds", 1e-6),
     ("admin_write_rate_limit_enabled", False),
@@ -452,7 +450,6 @@ _LOOSER_THAN_DEFAULT = [
     ("mfa_verify_min_elapsed_seconds", 0.5),
     ("mfa_verify_min_elapsed_seconds", 1e-6),
     ("max_sessions_per_user", 0),
-    ("max_sessions_per_user", -1),
     ("max_sessions_per_user", 6),
     ("max_sessions_per_user", 1_000_000_000),
     # Vault BACKLOG #2600 step 4: the step-up window, the TOTP skew and the temporary-password life.
@@ -475,15 +472,14 @@ _LOOSER_THAN_DEFAULT = [
 #: (field, value at or stricter than its shipped default). None is named. The defaults are listed
 #: too, so a direction flipped to ">=" or "<=" reds here.
 _STRICTER_OR_DEFAULT = [
-    # A negative count refuses more. A NaN or infinite window is refused at load (vault BACKLOG
-    # #2466), so it is in _NON_FINITE_WINDOWS below and not here.
+    # A negative count or window is refused at load (BACKLOG #5318), and a NaN or infinite window
+    # too (vault BACKLOG #2466), so neither has a row here; the refusals are pinned in
+    # test_settings_load_bounds.py and _NON_FINITE_WINDOWS below.
     ("login_rate_limit_per_ip", 10),
     ("login_rate_limit_per_ip", 9),
     ("login_rate_limit_per_ip", 1),
-    ("login_rate_limit_per_ip", -1),
     ("login_rate_limit_global", 60),
     ("login_rate_limit_global", 59),
-    ("login_rate_limit_global", -1),
     ("login_rate_limit_window_seconds", 60.0),
     ("login_rate_limit_window_seconds", 61.0),
     ("lockout_minutes", 15),
@@ -497,7 +493,6 @@ _STRICTER_OR_DEFAULT = [
     ("lockout_max_minutes", 1441),
     ("phi_read_rate_limit_per_actor", 120),
     ("phi_read_rate_limit_per_actor", 119),
-    ("phi_read_rate_limit_per_actor", -1),
     # The all-users PHI-read count ships OFF, so no value of it is looser.
     ("phi_read_rate_limit_global", 0),
     ("phi_read_rate_limit_global", 1),
@@ -869,7 +864,6 @@ def test_a_reconciler_knob_is_not_named_while_no_reconciler_runs(field: str, val
         ("oidc_jwks_min_refetch_seconds", 3600, False),  # no longer than the default TTL
         ("oidc_jwks_min_refetch_seconds", 299, True),
         ("oidc_jwks_min_refetch_seconds", 0, True),  # no amplification bound at all
-        ("oidc_jwks_min_refetch_seconds", -1, True),
         ("oidc_jwks_min_refetch_seconds", 3601, True),  # a withdrawn key verifies longer
         ("oidc_flow_ttl_seconds", 300, False),
         ("oidc_flow_ttl_seconds", 30, False),
@@ -881,10 +875,8 @@ def test_a_reconciler_knob_is_not_named_while_no_reconciler_runs(field: str, val
         ("oidc_max_age_seconds", 86_400, True),  # the load refuses anything above
         # Only ever lowers a session's end below what the token and the absolute cap allow.
         ("oidc_session_max_hours", None, False),
-        ("oidc_session_max_hours", 0, False),
         ("oidc_session_max_hours", 1, False),
         ("oidc_session_max_hours", 1000, False),
-        ("oidc_session_max_hours", -1, False),
     ],
 )
 def test_an_oidc_knob_is_named_only_in_its_looser_direction(
@@ -935,11 +927,10 @@ def test_the_breaker_direction_is_the_consumers() -> None:
 
 
 def test_a_password_floor_of_zero_says_there_is_none() -> None:
-    """At 0 or less ``PasswordPolicy`` refuses nothing for length, so the entry says off, not
-    shorter. Still no configured value in either text."""
+    """At 0 ``PasswordPolicy`` refuses nothing for length, so the entry says off, not shorter.
+    Still no configured value in either text. A negative floor is refused at load (BACKLOG #5318)."""
     off = _risk(AuthSettings(password_min_length=0), "password_min_length")
     assert off is not None and "NO length floor" in off
-    assert off == _risk(AuthSettings(password_min_length=-3), "password_min_length")
     shorter = _risk(AuthSettings(password_min_length=8), "password_min_length")
     assert shorter is not None and "shorter than the default of 15" in shorter
     assert "NO length floor" not in shorter
@@ -1157,10 +1148,9 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
     assert admitted(off, addresses=1) == 200
     assert admitted(off, addresses=1, ceremony=True) == 200
 
-    for window in (0.0, -1.0):
-        no_window = AuthSettings(login_rate_limit_window_seconds=window)
-        assert admitted(no_window, addresses=1) == 200
-        assert admitted(no_window, addresses=1, ceremony=True) == 200
+    no_window = AuthSettings(login_rate_limit_window_seconds=0.0)
+    assert admitted(no_window, addresses=1) == 200
+    assert admitted(no_window, addresses=1, ceremony=True) == 200
 
     no_per_ip = AuthSettings(login_rate_limit_per_ip=0)
     assert admitted(no_per_ip, addresses=1) == 60  # only the all-clients limit holds
@@ -1170,10 +1160,11 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
     assert admitted(no_global, addresses=50) == 200  # a spread spray is never refused
 
     # The values the registry does NOT name, because each refuses more: none may admit more than
-    # the default does.
-    assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1) <= 10
-    assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1, ceremony=True) <= 10
-    assert admitted(AuthSettings(login_rate_limit_global=-1), addresses=50) <= 60
+    # the default does. A negative count is refused at load (BACKLOG #5318), so the smallest
+    # working count stands in.
+    assert admitted(AuthSettings(login_rate_limit_per_ip=1), addresses=1) <= 10
+    assert admitted(AuthSettings(login_rate_limit_per_ip=1), addresses=1, ceremony=True) <= 10
+    assert admitted(AuthSettings(login_rate_limit_global=1), addresses=50) <= 60
 
 
 #: The two [auth] windows that were bare floats (vault BACKLOG #2466), and the values no float
@@ -1199,10 +1190,10 @@ def test_a_non_finite_window_from_the_environment_is_refused(field: str, text: s
 
 
 @pytest.mark.parametrize("field", _BARE_WINDOWS)
-@pytest.mark.parametrize("value", [0.0, -1.0, 1e-6, 3600.0, 86400.0])
+@pytest.mark.parametrize("value", [0.0, 1e-6, 3600.0, 86400.0])
 def test_a_finite_window_still_loads(field: str, value: float) -> None:
-    """The control for the refusals around it: a finite value up to the cap loads. A window of 0 or
-    less stays the named off value it was."""
+    """The control for the refusals around it: a finite value from 0 up to the cap loads. A window
+    of 0 stays the named off value it was; a negative one is refused (BACKLOG #5318)."""
     assert getattr(AuthSettings(**{field: value}), field) == value  # type: ignore[arg-type]
 
 
@@ -1428,10 +1419,7 @@ def _oidc(**over: object) -> AuthSettings:
     [
         (512, False),  # the default
         (511, False),
-        (1, False),
-        # FlowCache refuses at len >= cap, so 0 or less refuses EVERY flow: stricter, not off.
-        (0, False),
-        (-1, False),
+        (1, False),  # the least the load accepts (BACKLOG #5318): 0 refused every flow
         (513, True),
         (1_000_000_000, True),  # the value the vault measured as silently lifting the cap
     ],

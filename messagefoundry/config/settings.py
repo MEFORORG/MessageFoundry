@@ -3562,9 +3562,10 @@ class AuthSettings(_Section):
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
     # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). Sign-ins still
     # owing a second factor are capped apart, so they never evict a full session (BACKLOG #2076).
-    # 0 = unlimited.
+    # 0 = unlimited. A negative cap is refused at load (BACKLOG #5318): it used to read as unlimited
+    # too, a second spelling of off that nobody means.
     # Default 5 (WP-10): generous for a few devices/console instances.
-    max_sessions_per_user: int = 5
+    max_sessions_per_user: int = Field(default=5, ge=0)
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
     # re-verified its credential -- at login, via POST /me/reauth, or with a code at
     # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
@@ -3686,7 +3687,9 @@ class AuthSettings(_Section):
     admin_new_ip_step_up: bool = True
 
     # Local-password policy — ASVS 5.0-aligned (WP-3): length-first, no mandatory composition.
-    password_min_length: int = 15
+    # 0 sets no floor (a loosening security_loosenings() names); a negative is refused at load
+    # (BACKLOG #5318), as a second spelling of 0.
+    password_min_length: int = Field(default=15, ge=0)
     # Character-class requirements are OFF by default (ASVS forbids mandatory composition) but kept
     # as opt-in knobs for deployments with a legacy standard that still mandates them.
     password_require_uppercase: bool = False
@@ -3929,8 +3932,10 @@ class AuthSettings(_Section):
     oidc_authorization_endpoint: str | None = None  # https, pinned
     oidc_token_endpoint: str | None = None  # https, pinned
     oidc_jwks_uri: str | None = None  # https, pinned
-    # Defence-in-depth allow-list: every OIDC endpoint host must appear here (the model-validator
-    # checks it, and jwks/flow re-check before each outbound call). Refused empty when enabled.
+    # Defence-in-depth allow-list: every OIDC endpoint host must appear here. Only the
+    # model-validator reads it, at load; no OIDC runtime module checks it again before an outbound
+    # call (BACKLOG #5318 item 1). The pinned URLs cannot change without a restart, which re-runs
+    # the validator. Refused empty when enabled.
     oidc_allowed_endpoints: list[str] = Field(default_factory=list)
     # The engine's OWN back-channel TLS trust for the IdP. transports/rest.py uses OpenSSL's default
     # trust, which does NOT consult the Windows machine store — a domain-issued / self-signed IdP cert
@@ -3973,8 +3978,11 @@ class AuthSettings(_Section):
     # while oidc_require_mfa_claim is off (BACKLOG #2325). A whitespace-only value loads as None.
     oidc_acr_values: str | None = None
     oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
-    oidc_jwks_ttl_seconds: int = 3600
-    oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
+    # 0 serves no key as fresh, so each unknown or stale lookup asks for a fetch, still throttled by
+    # the refetch bound below; 0 there removes that bound. A negative is refused for both (BACKLOG
+    # #5318): the consumers read it as 0.
+    oidc_jwks_ttl_seconds: int = Field(default=3600, ge=0)
+    oidc_jwks_min_refetch_seconds: int = Field(default=300, ge=0)  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     # The FLOOR beside that ceiling (BACKLOG #2301, ASVS 2.4.2), PROVISIONAL: a callback that returns
     # sooner than this after its flow started is refused as "federated sign-in failed". A step-up
@@ -3995,8 +4003,13 @@ class AuthSettings(_Section):
     # are both on. A value oidc_mfa_amr_values also accepts is refused at load while the claim
     # gate is on: every token the gate admits by it would skip the floor, the floor off in effect.
     oidc_callback_floor_exempt_amr: list[str] = Field(default_factory=list)
-    oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
-    oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
+    # Reject-when-full (never evict — that is a login DoS). At least 1 (BACKLOG #5318): 0 or less
+    # refused every federated sign-in and step-up.
+    oidc_flow_cache_max: int = Field(default=512, ge=1)
+    # G2: cap below id_token.exp if tighter is wanted. None = no cap. At least 1 (BACKLOG #5318):
+    # the service skips a falsy cap, so 0 meant no cap, and a negative one ended every federated
+    # session as it was minted.
+    oidc_session_max_hours: int | None = Field(default=None, ge=1)
     # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
     # user's authentication AT THE IdP and the end of the engine session it mints. Sent as `max_age` on
     # every authorization request, so a conforming IdP re-authenticates only when its own SSO session
@@ -4011,32 +4024,39 @@ class AuthSettings(_Section):
     # Login rate limiting (AUTH-RATE) — in-process sliding window in front of the per-account
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
     # deployment must also front the API with a proxy/WAF limiter. 0 disables a limit, and a window
-    # of 0 or less disables both. A count above its default, a window below it, and each off value is
+    # of 0 disables both. A negative count or window is refused at load (BACKLOG #5318): a negative
+    # per-address count refused every attempt after an address's first, a negative global count
+    # refused every attempt, the first included, and a negative window was a second spelling of 0.
+    # A count above its default, a window below it, and each off value is
     # a LOOSENING that `security_loosenings()` names (BACKLOG #1131); so are the
     # PHI-read, admin-write, session-cap and OIDC flow-cache limits below.
     login_rate_limit_enabled: bool = True
-    login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
-    login_rate_limit_global: int = 60  # max attempts across all clients per window
+    login_rate_limit_per_ip: int = Field(default=10, ge=0)  # max attempts per client IP per window
+    login_rate_limit_global: int = Field(default=60, ge=0)  # max attempts, all clients, per window
     # No nan/inf (vault BACKLOG #2466): the limiter prunes a hit once it is older than the window,
     # and no hit is ever older than a NaN or +inf one. The counts then fill once and never drain, so
     # after login_rate_limit_global attempts every sign-in would be refused until a restart. A huge
     # finite window does the same in practice, so it is capped (_RATE_WINDOW_MAX_SECONDS). -inf is
-    # refused with them; 0 and a finite negative still load, as the named off value above.
+    # refused with them, and so is a finite negative; 0 still loads, as the named off value above.
     login_rate_limit_window_seconds: float = Field(
-        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+        default=60.0, ge=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
     # Anti-automation on the authenticated PHI-read endpoints (WP-8, ASVS 2.4.1): a per-actor sliding
     # window over /messages, /messages/{id}, /dead-letters — bounds scripted PHI harvesting on top of
     # pagination + access auditing. Generous by default (clears console/human use); in-process only,
-    # so an exposed deployment must also front a proxy/WAF limiter. 0 disables that dimension.
+    # so an exposed deployment must also front a proxy/WAF limiter. 0 disables that dimension; a
+    # negative count or window is refused at load, as for the sign-in limits (BACKLOG #5318).
     phi_read_rate_limit_enabled: bool = True
-    phi_read_rate_limit_per_actor: int = 120  # max PHI reads per user per window
-    phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
+    phi_read_rate_limit_per_actor: int = Field(
+        default=120, ge=0
+    )  # max PHI reads per user per window
+    # Max PHI reads across all users per window (0 = off).
+    phi_read_rate_limit_global: int = Field(default=0, ge=0)
     # No nan/inf, for the reason login_rate_limit_window_seconds gives: the count would fill once
     # and then refuse every PHI read until a restart. Capped for the same reason.
     phi_read_rate_limit_window_seconds: float = Field(
-        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+        default=60.0, ge=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
@@ -9567,8 +9587,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
       older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
-      before it is counted. A negative count refuses more, so it is not named; the admin-write
-      count refuses a negative value at load (BACKLOG #3293), so only the others reach here. A NaN or infinite
+      before it is counted. The load refuses a negative count or window (BACKLOG #3293 for the
+      admin-write count, #5318 for the sign-in and PHI-read ones), so none reaches here. A NaN or infinite
       window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
       ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
       admits a faster burst.
@@ -9578,10 +9598,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       lower ceiling is looser, and one equal to ``lockout_minutes`` turns the doubling off. A ceiling
       at the default or above is not named even when it equals ``lockout_minutes``: every lock then
       lasts at least as long as the default's longest.
-    * ``_enforce_session_cap`` skips a ``max_sessions_per_user`` of 0 or less, and a higher cap keeps
-      more sessions live.
+    * ``_enforce_session_cap`` skips a ``max_sessions_per_user`` of 0, and a higher cap keeps more
+      sessions live. The load refuses a negative cap (BACKLOG #5318).
     * ``FlowCache`` refuses a new federated flow once it holds ``oidc_flow_cache_max`` pending ones, so
-      a higher cap holds more and 0 or less refuses every flow, which is stricter, not looser.
+      a higher cap holds more. The load refuses a cap below 1 (BACKLOG #5318), which refused every
+      flow.
 
     A part of a limiter is named only while that limiter is built, as ``email_tls_verify`` sits under
     ``email_use_tls``: with the limiter off, a weak count or window changes nothing and would only
@@ -9747,7 +9768,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             f"the window of the per-address and all-clients sign-in limits, and of {ceremonies},"
         ),
         off=(
-            "the sign-in rate-limit window is zero or negative, which ages every attempt out "
+            "the sign-in rate-limit window is zero, which ages every attempt out "
             "before it is counted -- neither the per-address nor the all-clients sign-in "
             f"limit holds, and nor does {ceremonies}, although login_rate_limit_enabled "
             "still reads as on"
@@ -9854,7 +9875,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         auth.phi_read_rate_limit_window_seconds,
         what="the PHI-read rate-limit window",
         off=(
-            "the PHI-read rate-limit window is zero or negative, which ages every read out before "
+            "the PHI-read rate-limit window is zero, which ages every read out before "
             "it is counted -- no PHI-read limit holds, although phi_read_rate_limit_enabled still "
             "reads as on"
         ),
@@ -9987,11 +10008,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 )
             )
 
-    # --- concurrent sessions (ASVS 7.1.2). 0 or less means unlimited, so a negative cap is off too.
+    # --- concurrent sessions (ASVS 7.1.2). 0 means unlimited; the load refuses a negative cap.
     sessions = auth.max_sessions_per_user
     _count(
         "max_sessions_per_user",
-        max(sessions, 0),
+        sessions,
         what="the per-user cap on live sessions",
         so=(
             "a user may hold that many sessions at once before the oldest is revoked, and more "
@@ -10004,8 +10025,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         ),
     )
 
-    # --- the federated sign-in flow cache. Built only with OIDC on. It refuses at the cap, so 0 or
-    # less refuses every flow, which is stricter; only a cap above the default is looser.
+    # --- the federated sign-in flow cache. Built only with OIDC on. It refuses at the cap, and the
+    # load refuses a cap below 1, so only a cap above the default is looser.
     if auth.oidc_enabled:
         _count(
             "oidc_flow_cache_max",
