@@ -1214,12 +1214,7 @@ def test_in_pipeline_trace_dedups_unified_store_sum(monkeypatch) -> None:
     n = 4
     urls = [f"http://h{i}" for i in range(n)]
     stop = asyncio.Event()
-    seq = [
-        n * 100,
-        n * 200,
-        n * 300,
-        n * 400,
-    ]  # each shard reports the SAME whole-store depth; poller SUMS
+    seq = [100, 200, 300, 400]  # the poller's reading is already one store view (BACKLOG #5950)
 
     class _FakePoller:
         def __init__(self, urls, *a, **k):
@@ -1242,10 +1237,10 @@ def test_in_pipeline_trace_dedups_unified_store_sum(monkeypatch) -> None:
     out: list[list[float]] = []
     asyncio.run(_shardcert._sample_in_pipeline_trace(urls, stop, out, interval=0.001))
     vals = [v for _, v in out]
-    # every recorded point is the SINGLE-store view (summed N× ÷ N), never the N× aggregate
-    assert vals == [100.0, 200.0, 300.0, 400.0]  # NOT the raw summed [400, 800, 1200, 1600]
-    assert float(n * 400) not in vals  # 1600 (the raw summed high point) never appears
-    # de-inflating every point divides the least-squares slope by N — the coupling with _SLOPE_FLAT_TOL=0.25
+    # Recorded as read: a second division by the engine shard count would under-report (BACKLOG #5950).
+    assert vals == [100.0, 200.0, 300.0, 400.0]
+    assert all(isinstance(v, float) for v in vals)  # the trace's JSON shape is unchanged
+    # The slope stays on the single-store scale, the coupling with _SLOPE_FLAT_TOL=0.25.
     slope = in_pipeline_slope(out)
     assert slope is not None and slope > 0
 
@@ -1272,12 +1267,13 @@ def test_peak_sampler_dedups(monkeypatch) -> None:
             self._i += 1
             if self._i >= 3:
                 stop.set()
-            return SimpleNamespace(in_pipeline=n * 250)  # summed high-water
+            return SimpleNamespace(in_pipeline=1)  # one row left, below the engine shard count
 
     monkeypatch.setattr(_shardcert, "EnginePoller", _FakePoller)
     out = [0]
     asyncio.run(_shardcert._sample_in_pipeline_peak(urls, stop, out, interval=0.001))
-    assert out[0] == 250  # the SINGLE-store high-water, not n×250
+    # BACKLOG #5950: the old `// n` read this residual as 0.
+    assert out[0] == 1
 
 
 # --- D1 (finding-2 fix): the honest rate uses the RELIABLE engine drain, not the advisory drive drain -

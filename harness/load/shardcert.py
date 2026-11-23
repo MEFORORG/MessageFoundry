@@ -1592,15 +1592,12 @@ async def _sample_in_pipeline_peak(
     drive stays byte-identical."""
     poller = EnginePoller(urls, RIG_SESSION, origin=time.perf_counter())
     await poller.open()
-    # De-dup the unified-store gauge: each shard's /stats in_pipeline counts the WHOLE store and the poller
-    # SUMS across the N shard URLs, so the aggregate is N× the true fleet backlog (#841). Divide by the
-    # distinct-shard count to record a SINGLE store view as the high-water.
-    n_shards = max(1, len(set(urls)))
     try:
         while not stop.is_set():
             sample = await poller.sample_once()
             if sample is not None:
-                depth = sample.in_pipeline // n_shards
+                # Already a single store view (BACKLOG #5950), so it is not divided again.
+                depth = sample.in_pipeline
                 if depth > out[0]:
                     out[0] = depth
             with contextlib.suppress(TimeoutError):
@@ -1625,17 +1622,14 @@ async def _sample_in_pipeline_trace(
     t0 = origin if origin is not None else time.perf_counter()
     poller = EnginePoller(urls, RIG_SESSION, origin=t0)
     await poller.open()
-    # De-inflate the unified-store in_pipeline: each shard's gauge counts the whole store and the poller
-    # sums the N shard URLs (#841). Divide by the distinct-shard count so the recorded trace is a SINGLE
-    # store view — which ALSO de-inflates the least-squares SLOPE by the same N, removing the accidental
-    # N× slope sensitivity the soak's flat-or-draining gate would otherwise apply (paired with the tightened
-    # _SLOPE_FLAT_TOL in shardcert_ladder.py and the bounded soak drain, D2).
-    n_shards = max(1, len(set(urls)))
+    # The poller's in_pipeline is already a SINGLE store view (BACKLOG #5950), so the trace and its
+    # least-squares SLOPE carry no N× sensitivity into the soak's flat-or-draining gate (paired with the
+    # tightened _SLOPE_FLAT_TOL in shardcert_ladder.py and the bounded soak drain, D2).
     try:
         while not stop.is_set():
             sample = await poller.sample_once()
             if sample is not None:
-                out.append([round(time.perf_counter() - t0, 3), sample.in_pipeline / n_shards])
+                out.append([round(time.perf_counter() - t0, 3), float(sample.in_pipeline)])
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=interval)
     finally:
@@ -2006,9 +2000,9 @@ async def run_shardcert(
         engine_done=(final.done if final else 0),
         # -1 = no poller sample, so an unmeasured dead count fails the pass bars rather than reading clean.
         engine_dead=(final.dead if final else -1),
-        # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
-        # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
-        in_pipeline_final=(final.in_pipeline // max(1, len(ids_list)) if final else -1),
+        # Already a single store view (BACKLOG #5950). This value feeds ShardCertReport.ok/drained, unlike
+        # the advisory drive-side poller cross-checks.
+        in_pipeline_final=(final.in_pipeline if final else -1),
         drained=drain_s is not None,
         drain_seconds=drain_s,
         stranded_nonterminal=stranded,
@@ -3293,10 +3287,9 @@ class ShardCertEngineReport:
     node_pids: dict[str, tuple[str, int | None]] = field(default_factory=dict)
     # Soak-only (default empty ⇒ the correctness/climb path is unchanged): a bounded in-HOLD trace of the
     # fleet's OWN /stats in_pipeline gauge, ``[[elapsed_s, in_pipeline], ...]``, sampled when
-    # ``sample_in_pipeline=True``. Each shard's /stats in_pipeline counts the WHOLE unified store and the
-    # poller sums the N shard URLs, so the sampler DE-DUPS by dividing each reading by the distinct-shard
-    # count (#841) — the recorded absolute value AND the derived slope are a single store view, not N×. The
-    # TREND (flat/draining vs monotonic growth) is the sustainable-vs-slow-saturation discriminator the
+    # ``sample_in_pipeline=True``. Each engine shard's /stats in_pipeline counts the WHOLE unified store and
+    # the poller reads it once (BACKLOG #5950), so the recorded value AND the derived slope are a single
+    # store view, not N×. The TREND (flat/draining vs monotonic growth) is the sustainable-vs-slow-saturation discriminator the
     # PR-C2 soak needs — a slow-saturation plateau looks lossless for ~60s but its backlog slope is
     # positive. Metadata only (a gauge count over time — never a payload / control-id).
     in_pipeline_trace: list[list[float]] = field(default_factory=list)
@@ -3745,10 +3738,9 @@ async def run_shardcert_engine(
                 await coord.await_message(abort_signal, timeout=_ABORT_MARKER_GRACE)
                 rung_aborted = True
         engine_dead = final.dead if final else 0
-        # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This is
-        # stored on ShardCertEngineReport AND posted in the ENGINE_DRAINED gate, so the two-box report's
-        # engine_in_pipeline_final is the TRUE fleet backlog, not N× it.
-        in_pipeline_final = final.in_pipeline // max(1, len(ids_list)) if final else -1
+        # Already a single store view (BACKLOG #5950). This is stored on ShardCertEngineReport AND posted
+        # in the ENGINE_DRAINED gate, so the two-box report's engine_in_pipeline_final is the fleet backlog.
+        in_pipeline_final = final.in_pipeline if final else -1
         # On an abort the store's stranded/dead are a teardown artifact, not a measurement — do not read them
         # (they would only re-confirm the fabricated collapse). A genuine failed drain still reads them.
         if rung_aborted:
@@ -4810,9 +4802,8 @@ class ShardCertDriveReport:
         nothing would ever sustain.
 
         Deliberately does NOT gate on the poller terms (``drained``, ``engine_dead``, ``engine_done``):
-        they are read from the engine ``/stats`` REMOTELY and are UNRELIABLE on a unified store — the
-        gauges SUM ``done``/``dead`` over all engine shard APIs (4× overcount) and ``await_drain`` zeroes/misses
-        under load (the exact metric ``mf-bench-attribution-policy`` + the C1 runbook say to NEVER gate
+        they are read from the engine ``/stats`` REMOTELY and are UNRELIABLE on a unified store —
+        ``await_drain`` zeroes/misses under load (the exact metric ``mf-bench-attribution-policy`` + the C1 runbook say to NEVER gate
         on). The strand / dead-at-any-stage authority is the ENGINE half's report, which reads the store
         DIRECTLY (store-truth) and owns that verdict; the sinks are the DRIVE box's only reliable truth.
         The poller terms remain as ADVISORY cross-check fields (see ``render``/``to_json_dict``)."""
@@ -4895,8 +4886,8 @@ class ShardCertDriveReport:
             # ARTIFACT 2: the pool this rung ran on, on the SINGLE-RUNG path too — the one that used to be
             # hand-scraped from /status, which is exactly what this artifact set out to end.
             f"  {self.pool.render()}",
-            # ADVISORY poller cross-check, NOT gated (unreliable on a unified store: 4x shard-API
-            # overcount / zeroes under load; the engine half's DIRECT store-truth owns strand/dead).
+            # ADVISORY poller cross-check, NOT gated (unreliable on a unified store: zeroes under
+            # load; the engine half's DIRECT store-truth owns strand/dead).
             f"  advisory (poller x-check, NOT gated): engine_done={self.engine_done} "
             f"engine_dead={self.engine_dead} in_pipeline_final={self.in_pipeline_final} "
             f"drained={self.drained}",
@@ -5026,9 +5017,9 @@ class ShardCertDriveReport:
                 ),
             },
             "advisory_poller": {
-                # Poller cross-check, NOT gated: unreliable on a unified store (4x shard-API overcount
-                # on done/dead; await_drain zeroes/misses under load). Retained for telemetry; the
-                # engine half's DIRECT store-truth is the strand/dead authority.
+                # Poller cross-check, NOT gated: unreliable on a unified store (await_drain
+                # zeroes/misses under load). Retained for telemetry; the engine half's DIRECT
+                # store-truth is the strand/dead authority.
                 "note": "poller cross-check, NOT gated (unreliable on a unified store)",
                 "engine_done": self.engine_done,
                 "engine_dead": self.engine_dead,

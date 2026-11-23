@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cluster-wide aggregation in :class:`~harness.load.enginepoll.EnginePoller`.
 
-A ``supervise`` cluster spreads inbounds across several shard APIs; the poller must poll EVERY shard
-and SUM their /stats so the no-loss reconcile + drain see true cluster totals. These drive the poller
-with FAKE per-shard samples (no live engine) and assert: (1) a cluster sample is the per-field sum
-across shards; (2) one shard being briefly unreachable skips the whole sample (no too-low aggregate);
+A ``supervise`` cluster spreads inbounds across several engine shard APIs over one store; the poller
+must poll EVERY engine shard, sum the per-engine-shard counters and read the store-wide gauges once
+(BACKLOG #5950), so the no-loss reconcile + drain see true cluster totals. These drive the poller
+with FAKE per-shard samples (no live engine) and assert: (1) a cluster sample aggregates each field
+that way; (2) one shard being briefly unreachable skips the whole sample (no too-low aggregate);
 (3) ``await_drain`` only completes once ALL shards report ``in_pipeline == 0`` and an empty backlog.
 
 The real :meth:`EnginePoller._sample_sync` aggregation is exercised end-to-end — only the per-shard
@@ -17,12 +18,15 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from harness.load import enginepoll
 from harness.load.enginepoll import EnginePoller, _ShardSample
+from messagefoundry.api import create_app
 from messagefoundry.api.models import (
     DbInfo,
     EngineInfo,
@@ -30,6 +34,19 @@ from messagefoundry.api.models import (
     StatsResponse,
     SystemStatus,
 )
+from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings, StoreBackend
+from messagefoundry.config.wiring import (
+    ConnectionSpec,
+    InboundConnection,
+    OutboundConnection,
+    Registry,
+    Send,
+)
+from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.sharding import filter_registry_for_shard, require_unified_store
+
+_SYNTHETIC_HL7 = "MSH|^~\\&|SYNTH|SYNTH|||20260101000000||ADT^A01|C1|P|2.5.1\rPID|1||000000^^^SYN\r"
 
 
 def _shard(
@@ -50,8 +67,10 @@ def _shard(
     committed_txns: int = 0,
     claim_lock_timeouts: int = 0,
     claim_head_skips: int = 0,
+    store_path: str = "srv/unified",
 ) -> _ShardSample:
     return _ShardSample(
+        store_path=store_path,
         pending=pending,
         inflight=inflight,
         done=done,
@@ -109,23 +128,158 @@ def test_duplicate_engine_urls_are_deduped() -> None:
     assert poller._urls == ["http://shard-a", "http://shard-b"]
 
 
-def test_sample_is_per_field_sum_across_shards(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sample_sums_per_engine_shard_counters_and_not_store_wide_gauges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5950: on one store every engine shard reports the SAME store-wide gauges.
+
+    Mutation: sum any of the six gauges again. Red, at three times the true value."""
+    store: dict[str, Any] = {
+        "pending": 4,
+        "inflight": 2,
+        "done": 40,
+        "dead": 1,
+        "in_pipeline": 6,
+        "db_size_bytes": 4096,
+    }
     poller = _poller_over(
         [
-            [_shard(read=100, written=90, pending=3, inflight=2, in_pipeline=5, queue_depth=5)],
-            [_shard(read=50, written=40, pending=1, inflight=0, in_pipeline=1, queue_depth=1)],
-            [_shard(read=10, written=10, pending=0, inflight=0, in_pipeline=0, queue_depth=0)],
+            [_shard(read=100, written=90, out_dead=3, queue_depth=5, **store)],
+            [_shard(read=50, written=40, out_dead=1, queue_depth=1, **store)],
+            [_shard(read=10, written=10, out_dead=0, queue_depth=0, **store)],
         ],
         monkeypatch,
     )
     sample = asyncio.run(poller.sample_once())
     assert sample is not None
-    assert sample.read == 160  # 100 + 50 + 10
-    assert sample.written == 140  # 90 + 40 + 10
-    assert sample.outbound_backlog == 6  # (3+2) + (1+0) + 0
-    assert sample.backlog == 6  # max(outbound 6, in_pipeline 6) (BACKLOG #5435)
-    assert sample.in_pipeline == 6  # 5 + 1 + 0
-    assert sample.queue_depth == 6  # 5 + 1 + 0
+    # Per engine shard: each reports only its own inbounds' rows, so the sum is the cluster total.
+    assert sample.read == 160
+    assert sample.written == 140
+    assert sample.out_dead == 4
+    assert sample.queue_depth == 6
+    # Store-wide: one reading of the one store.
+    assert (sample.pending, sample.inflight, sample.done, sample.dead) == (4, 2, 40, 1)
+    assert (sample.in_pipeline, sample.db_size_bytes) == (6, 4096)
+    assert sample.outbound_backlog == 6
+    assert sample.backlog == 6
+
+
+def test_a_residual_below_the_engine_shard_count_is_not_read_as_drained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5950, the fail-closed case. The engine shards read the store one after another, so
+    the last rows can be visible to one of them only. The old sum-then-floor-divide read that as 0:
+    ``(2 + 0 + 0) // 3 == 0``. Mutation: restore the sum and the division. Red."""
+    poller = _poller_over(
+        [[_shard(in_pipeline=2)], [_shard(in_pipeline=0)], [_shard(in_pipeline=0)]],
+        monkeypatch,
+    )
+    sample = asyncio.run(poller.sample_once())
+    assert sample is not None
+    assert sample.in_pipeline == 2
+    assert sample.backlog == 2
+
+
+def test_engine_shards_on_different_stores_still_add_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #5950: ``max`` holds only within one store (ADR 0063).
+
+    ``--shard-engine`` and ``connscale-remote`` take URLs from the operator, and nothing makes those
+    engines share a store. A plain max there could hide a new dead letter: store A at 5 and store B
+    going 0 to 1 reads 5 both times, a delta of 0. Mutation: take a plain max. Red."""
+    before = _poller_over(
+        [
+            [_shard(dead=5, store_path="srv/a")],
+            [_shard(dead=0, store_path="srv/b")],
+            [_shard(dead=5, store_path="srv/a")],
+        ],
+        monkeypatch,
+    )
+    after = _poller_over(
+        [
+            [_shard(dead=5, store_path="srv/a")],
+            [_shard(dead=1, store_path="srv/b")],
+            [_shard(dead=5, store_path="srv/a")],
+        ],
+        monkeypatch,
+    )
+    first = asyncio.run(before.sample_once())
+    second = asyncio.run(after.sample_once())
+    assert first is not None and second is not None
+    assert (first.dead, second.dead) == (5, 6)  # A counted once, B added
+
+
+def test_the_one_store_premise_is_enforced_for_engine_shards() -> None:
+    """ADR 0063, the premise the max rests on: more than one engine shard needs a server store that
+    they all share, and a single-file store is refused."""
+    with pytest.raises(ValueError, match="ONE"):
+        require_unified_store(StoreBackend.SQLITE, ["a", "b"])
+    require_unified_store(StoreBackend.POSTGRES, ["a", "b"])
+
+
+async def test_connection_rows_are_per_engine_shard_over_one_store(tmp_path: Path) -> None:
+    """BACKLOG #5950: what makes the SUM right for read/written/queue_depth, on the real route.
+
+    Two engine shards over one store, run in turn. Each ``/connections`` must carry only its own
+    inbound's source and edge rows. Mutation: drop the ``cid not in reg.inbound`` skip in
+    ``_connection_rows``. Red, because each edge would then appear on both engine shards."""
+    (tmp_path / "out").mkdir()
+    reg = Registry()
+    for name in ("a", "b"):
+        inbox = tmp_path / f"in_{name}"
+        inbox.mkdir()
+        reg.add_inbound(
+            InboundConnection(
+                f"IB_{name.upper()}",
+                ConnectionSpec(
+                    ConnectorType.FILE,
+                    {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.05},
+                ),
+                router="r",
+                shard=name,
+            )
+        )
+    reg.add_outbound(
+        OutboundConnection(
+            "out1", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("out1", m))
+
+    db = tmp_path / "unified.db"
+    reads: dict[str, int] = {}
+    edges: dict[str, set[object]] = {}
+    for shard in ("a", "b"):
+        engine = await Engine.create(
+            db, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+        )
+        try:
+            engine.add_registry(filter_registry_for_shard(reg, shard))
+            await engine.start()
+            # Seeded after start because `read` counts from the engine's start. Both inbounds' rows
+            # are in the one store each time, so only the route's filter can tell them apart.
+            for channel, copies in (("IB_A", 2), ("IB_B", 3)):
+                for i in range(copies):
+                    await engine.store.enqueue_message(
+                        channel_id=channel,
+                        raw=_SYNTHETIC_HL7,
+                        deliveries=[("out1", _SYNTHETIC_HL7)],
+                        control_id=f"{shard}-{channel}-{i}",
+                    )
+            transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                rows = (await client.get("/connections")).json()
+        finally:
+            await engine.stop()
+        reads[shard] = sum(r["read"] for r in rows if r["read"] is not None)
+        edges[shard] = {
+            r["channel_id"]
+            for r in rows
+            if r["role"] == "destination" and r["destination"] == "out1"
+        }
+
+    assert reads == {"a": 2, "b": 3}  # each engine shard counts its own, so the sum is 5
+    assert edges == {"a": {"IB_A"}, "b": {"IB_B"}}
 
 
 def test_committed_txns_sums_across_shards(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -191,7 +345,7 @@ def _stats(
     )
 
 
-def _status() -> SystemStatus:
+def _status(path: str = ":memory:") -> SystemStatus:
     return SystemStatus(
         engine=EngineInfo(
             version="0",
@@ -204,7 +358,7 @@ def _status() -> SystemStatus:
         ),
         kpis=EngineKpis(),
         db=DbInfo(
-            path=":memory:",
+            path=path,
             size_bytes=4096,
             disk_free_bytes=1,
             disk_free_status="observed",
@@ -219,8 +373,9 @@ def _status() -> SystemStatus:
 class _StatsClient:
     """A stand-in for an opened ``EngineClient``: the three reads ``_sample_shard`` performs."""
 
-    def __init__(self, stats: StatsResponse) -> None:
+    def __init__(self, stats: StatsResponse, store_path: str = ":memory:") -> None:
         self._stats = stats
+        self._store_path = store_path
 
     def stats(self) -> StatsResponse:
         return self._stats
@@ -229,7 +384,26 @@ class _StatsClient:
         return []
 
     def status(self) -> SystemStatus:
-        return _status()
+        return _status(self._store_path)
+
+
+@pytest.mark.parametrize(
+    ("paths", "done", "size"),
+    [(("srv/one", "srv/one"), 40, 4096), (("srv/one", "srv/two"), 80, 8192)],
+)
+def test_store_identity_is_read_off_the_status_body(
+    paths: tuple[str, str], done: int, size: int
+) -> None:
+    """BACKLOG #5950: the real ``_sample_shard`` carries ``/status`` ``db.path`` into the aggregate.
+
+    Every other arm here fakes that read. Mutation: stop passing ``store_path``. Red on the
+    two-store row, which would then read one store's figures."""
+    poller = EnginePoller(["http://a", "http://b"], None, origin=time.perf_counter())
+    stats = _stats(claim_lock_timeouts=0, in_pipeline=0, committed_txns=0)
+    poller._clients = [_StatsClient(stats, path) for path in paths]  # type: ignore[misc]
+    sample = asyncio.run(poller.sample_once())
+    assert sample is not None
+    assert (sample.done, sample.db_size_bytes) == (done, size)
 
 
 def test_sample_shard_reads_claim_lock_timeouts_off_the_stats_body() -> None:

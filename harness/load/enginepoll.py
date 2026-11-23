@@ -31,9 +31,10 @@ that.
 **Cluster-wide aggregation.** A ``messagefoundry supervise`` cluster spreads inbounds across several
 shard subprocesses, each with its own API. The poller takes a **list** of engine base-URLs (the
 primary ``--engine`` plus any ``--shard-engine``, de-duped), polls each in turn off the event loop,
-and **sums** each shard's read/written/pending/inflight/in_pipeline/queue_depth/dead into one cluster
-sample (the sum is order-independent, so the sequential per-shard reads need no ordering), whose
-``backlog`` is then derived from those sums (see :attr:`EngineSample.backlog`) — so the no-loss
+**sums** each engine shard's read/written/out_dead/queue_depth, and reads the store-wide gauges once
+per store (:meth:`EnginePoller._sample_sync`, BACKLOG #5950). Both are order-independent, so the
+sequential reads need no ordering. The sample's
+``backlog`` is then derived from those (see :attr:`EngineSample.backlog`) — so the no-loss
 reconcile compares cluster-aggregate ``read``/``written``/``backlog`` against the (already cluster-
 aggregate) client ``sent``/``sink_received``, and drain requires **every** shard to empty. With a
 single URL (the default) a sample is byte-identical to the one-shard behavior.
@@ -97,6 +98,23 @@ def _first_not_none[T](values: Iterable[_T | None]) -> _T | None:
     return None
 
 
+def _store_wide(shards: Sequence[_ShardSample], read: Callable[[_ShardSample], int]) -> int:
+    """One reading of a store-wide gauge: the ``max`` per store, added across stores (BACKLOG #5950).
+
+    Engine shards on one store (ADR 0063) each report that store's whole figure, so adding them
+    would multiply it. The URLs of ``--shard-engine`` and ``connscale-remote`` come from the
+    operator and nothing makes those engines share a store, so a plain ``max`` could hide a change
+    on a smaller store. A store named two ways counts twice, which over-reports and never hides.
+    The reverse is not caught: two separate stores reporting the same ``db.path``, such as one
+    SQLite path on two hosts, read as one store.
+
+    Zero exactly when every reading is zero, so the drain and no-loss terms keep their verdict."""
+    per_store: dict[str, int] = {}
+    for shard in shards:
+        per_store[shard.store_path] = max(per_store.get(shard.store_path, 0), read(shard))
+    return sum(per_store.values())
+
+
 def _pool_attr(status: Any, name: str) -> int | None:
     """Read ``status.pool.<name>`` (the server-only pool field), or ``None`` on SQLite / an older
     engine whose ``SystemStatus`` has no ``pool`` field."""
@@ -122,8 +140,10 @@ def _pool_wait_attr(status: Any, name: str) -> float | None:
 @dataclass(frozen=True)
 class EngineSample:
     """One engine-side observation. ``read``/``written``/``done``/``dead`` are cumulative since engine
-    start, so run totals are last − first. Under a multi-shard cluster every field is the **sum**
-    across all polled shards."""
+    start, so run totals are last − first. Under a multi-engine-shard cluster the per-engine-shard
+    counters are the **sum** across all polled engine shards, and the store-wide gauges (``pending``,
+    ``inflight``, ``done``, ``dead``, ``in_pipeline``, ``db_size_bytes``) are one reading of the
+    shared store; :meth:`EnginePoller._sample_sync` states the rule (BACKLOG #5950)."""
 
     elapsed_s: float
     pending: int  # outbound stage, status=pending
@@ -219,9 +239,8 @@ class EngineSample:
         left every accepted message in ingress or routed with this reading 0, and a reconcile run on
         a timed-out drain passed. ``in_pipeline`` already counts the outbound rows, so the two are
         not summed; they come from separate store reads, so the larger one is the fail-closed read.
-        On a cluster sample the max is taken over the summed totals, and on a unified store every
-        engine shard reports the whole store's ``in_pipeline``, so a nonzero reading can be up to N
-        times the true count. Only whether it is zero decides a verdict. An older engine without
+        On a cluster sample both are already one reading of the shared store (BACKLOG #5950), and
+        only whether the result is zero decides a verdict. An older engine without
         ``in_pipeline`` reads 0 there and keeps the outbound reading.
 
         The emitted ``no_loss.backlog`` changes meaning with this, under unbumped report
@@ -294,6 +313,8 @@ class _ShardSample:
     #: The engine's OWN configured pool maximum (``status.pool.max_size``) — see EngineSample.pool_max_size.
     pool_max_size: int | None = None
     poller_requests: int = 0  # this shard's poller request count at its /stats read (#2794)
+    #: Which store this engine shard reports on (``/status`` ``db.path``), BACKLOG #5950.
+    store_path: str = ""
 
 
 #: The pool ``acquire_wait`` MEAN measured on the STEP-2 rig at the ~16 msg/s broadcast plateau, where the
@@ -950,8 +971,8 @@ class EnginePoller:
         Drain requires ``backlog == 0``, which folds in the *aggregate* ``in_pipeline`` (no
         NOT-DONE rows in ANY stage of ANY shard — ingress, routed, or outbound) with the outbound
         reading, per-edge ``queue_depth`` at zero, and ``read``/``written`` unchanged across a
-        poll. Because the cluster sample sums every shard, this only completes once **every** shard reports ``in_pipeline == 0`` and an
-        empty backlog. The ``in_pipeline`` gauge (from ``/stats``) closes the prior blind spot: a
+        poll. The store-wide ``max`` is zero only when every reading is, so this only completes once
+        **every** engine shard reports ``in_pipeline == 0`` and an empty backlog. The ``in_pipeline`` gauge (from ``/stats``) closes the prior blind spot: a
         fully **stalled** router/transform leaves the outbound backlog at 0 but ``in_pipeline > 0``,
         so it no longer reads as drained.
 
@@ -1022,7 +1043,14 @@ class EnginePoller:
         self._clients = clients
 
     def _sample_sync(self) -> EngineSample | None:
-        """Sample every shard and SUM into one cluster observation.
+        """Sample every engine shard and aggregate into one cluster observation.
+
+        Per-engine-shard counters (``read``, ``written``, ``out_dead``, ``queue_depth``, the process
+        counters) are summed: ``/connections`` carries only the inbounds in that engine's registry.
+        The six store-wide gauges (``pending``, ``inflight``, ``done``, ``dead``, ``in_pipeline``,
+        ``db_size_bytes``) are not: every engine shard reports the whole store, so they take the
+        ``max``. **That max is valid only among engine shards sharing ONE store (ADR 0063)**, so
+        :func:`_store_wide` applies it per ``/status`` ``db.path`` and adds across different ones.
 
         Reachability mirrors the single-shard semantics: a shard that is transiently unreachable makes
         the whole sample unavailable (return ``None`` → skip this tick, keep polling), rather than
@@ -1040,16 +1068,16 @@ class EnginePoller:
         # the first (informational only — neither feeds the no-loss check).
         return EngineSample(
             elapsed_s=time.perf_counter() - self._origin,
-            pending=sum(s.pending for s in shard_samples),
-            inflight=sum(s.inflight for s in shard_samples),
-            done=sum(s.done for s in shard_samples),
-            dead=sum(s.dead for s in shard_samples),
+            pending=_store_wide(shard_samples, lambda s: s.pending),
+            inflight=_store_wide(shard_samples, lambda s: s.inflight),
+            done=_store_wide(shard_samples, lambda s: s.done),
+            dead=_store_wide(shard_samples, lambda s: s.dead),
             read=sum(s.read for s in shard_samples),
             written=sum(s.written for s in shard_samples),
             out_dead=sum(s.out_dead for s in shard_samples),
             queue_depth=sum(s.queue_depth for s in shard_samples),
-            in_pipeline=sum(s.in_pipeline for s in shard_samples),
-            db_size_bytes=sum(s.db_size_bytes for s in shard_samples),
+            in_pipeline=_store_wide(shard_samples, lambda s: s.in_pipeline),
+            db_size_bytes=_store_wide(shard_samples, lambda s: s.db_size_bytes),
             journal_mode=shard_samples[0].journal_mode,
             synchronous=shard_samples[0].synchronous,
             uptime_s=max(s.uptime_s for s in shard_samples),
@@ -1180,4 +1208,6 @@ class EnginePoller:
             pool_acquire_wait_count=int(_pool_wait_attr(status, "count") or 0),
             pool_acquire_wait_mean_ms=float(_pool_wait_attr(status, "mean_ms") or 0.0),
             poller_requests=requests_at_stats,
+            # A reply that names no store is kept apart, so its gauges add as they always did.
+            store_path=getattr(status.db, "path", None) or f"<unnamed store {index}>",
         )
