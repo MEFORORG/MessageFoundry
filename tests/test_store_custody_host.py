@@ -308,7 +308,7 @@ def test_a_key_file_left_in_the_secrets_directory_is_not_taken_for_no_key(tmp_pa
     secrets = _own_custody_directory(tmp_path / "secrets")
     (secrets / "handoff.key").write_bytes(b"not read")
     environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
-    with pytest.raises(HostCustodyRefused, match="move that file into") as refused:
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere") as refused:
         load_host_custody(_settings(tmp_path), enforcing=True, environ=environ)
     assert not isinstance(refused.value, HostCustodyMissing)
     assert f"handoff.key in {secrets}" in str(refused.value)
@@ -318,12 +318,12 @@ def test_a_key_file_left_in_the_secrets_directory_is_not_taken_for_no_key(tmp_pa
         load_host_custody(
             _settings(tmp_path), enforcing=True, environ={"MEFOR_SECRETS_DIRECTORY": str(secrets)}
         )
-    assert "move that file into" not in str(read.value)
+    assert "host custody was found elsewhere" not in str(read.value)
     # With no secrets directory, beside a SQLite store, where a mint with neither variable writes.
     (secrets / "handoff.key").unlink()
     beside = tmp_path / "handoff.key"
     beside.write_bytes(b"not read")
-    with pytest.raises(HostCustodyRefused, match="move that file into") as refused:
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere") as refused:
         load_host_custody(
             _settings(tmp_path),
             enforcing=True,
@@ -331,7 +331,7 @@ def test_a_key_file_left_in_the_secrets_directory_is_not_taken_for_no_key(tmp_pa
         )
     assert f"{beside.name} in {beside.parent}" in str(refused.value)
     # A mint is stopped the same way, before anything is minted.
-    with pytest.raises(HostCustodyRefused, match="move that file into"):
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere"):
         mint_target(
             _settings(tmp_path),
             service_account=None,
@@ -369,9 +369,9 @@ def test_a_file_beside_the_store_refuses_another_provider_and_the_way_on_leaves_
     tmp_path: Path,
 ) -> None:
     """A host mint with neither variable writes beside the store, so a file there refuses another
-    provider whatever is set. The refusal names the file, tells nobody to change it, and its way
-    on, a copy of the database in a directory that holds no key file, clears it with the file
-    still where it was."""
+    provider whatever is set. The refusal names the file and tells nobody to change it, and its
+    way on for a file that is not this store's, docs/SERVICE.md's new data directory, clears it
+    with the file still where it was."""
     secrets = _own_custody_directory(tmp_path / "secrets")
     beside = tmp_path / "master.key"
     beside.write_bytes(b"not read")
@@ -382,9 +382,9 @@ def test_a_file_beside_the_store_refuses_another_provider_and_the_way_on_leaves_
     }
     refusal = foreign_custody_refusal(settings, environ=environ)
     assert refusal is not None and f"master.key in {tmp_path}" in refusal, refusal
-    assert "leave it where it is" in refusal, refusal
+    assert "where it is, and delete nothing" in refusal, refusal
     assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
-    # Following it: the store's database copied into a new directory, and the store pointed there.
+    # Following it: the store in a new data directory that holds neither file.
     copied = _own_custody_directory(tmp_path / "copied")
     moved_store = settings.model_copy(update={"path": str(copied / "store.db")})
     assert foreign_custody_refusal(moved_store, environ=environ) is None
@@ -406,7 +406,7 @@ def test_the_other_provider_refusal_keeps_its_text_through_the_key_seams(
             seam(settings)
         text = str(refused.value)
         assert f"master.key in {tmp_path}" in text, (seam.__name__, text)
-        assert "leave it where it is" in text, (seam.__name__, text)
+        assert "where it is, and delete nothing" in text, (seam.__name__, text)
 
 
 @pytest.mark.parametrize("where", ["same", "inside", "around"])
@@ -442,7 +442,7 @@ def test_the_stores_own_key_file_beside_it_is_not_taken_for_a_host_blob(tmp_path
 def test_the_left_behind_refusal_gives_a_way_on_that_leaves_another_stores_file(
     tmp_path: Path,
 ) -> None:
-    """The move is offered only for a file that is this store's; otherwise the way on leaves it."""
+    """The refusal names the file and leaves it, and its way on is docs/SERVICE.md's procedure."""
     custody_dir = _own_custody_directory(tmp_path / "custody")
     (tmp_path / "handoff.key").write_bytes(b"not read")
     with pytest.raises(HostCustodyRefused) as refused:
@@ -452,7 +452,115 @@ def test_the_left_behind_refusal_gives_a_way_on_that_leaves_another_stores_file(
             environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
         )
     text = str(refused.value)
-    assert "If none is this store's" in text and "leave it where it is" in text, text
+    assert f"handoff.key in {tmp_path}" in text, text
+    assert custody_host._LEAVE_KEY_FILES_STEP in text, text
+    assert not _advises_changing(text), text
+
+
+def _service_md_section(title: str) -> str:
+    """The text of docs/SERVICE.md's section headed ``title``, up to the next heading of its level
+    or above; fails when no such heading is there."""
+    text = (Path(__file__).resolve().parents[1] / "docs" / "SERVICE.md").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    heads = [i for i, line in enumerate(lines) if line.lstrip("#").strip() == title]
+    assert len(heads) == 1 and lines[heads[0]].startswith("#"), (title, heads)
+    level = len(lines[heads[0]]) - len(lines[heads[0]].lstrip("#"))
+    body = []
+    for line in lines[heads[0] + 1 :]:
+        if line.startswith("#") and len(line) - len(line.lstrip("#")) <= level:
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def test_each_key_file_refusal_points_at_one_service_md_procedure_and_states_no_file_steps(
+    tmp_path: Path,
+) -> None:
+    """Manager design rule 2026-11-22 (vault BACKLOG #3411): a refusal that found a key file it
+    cannot tie to this store names it, says to leave every key file and delete nothing, and points
+    at one docs/SERVICE.md procedure by its title, which is there. It carries no file procedure of
+    its own: no copy of a directory's contents, no move. The other-provider refusal's closing is
+    that procedure, not keep_the_key_step's new-secrets-directory step, which does not clear a
+    file beside the store (review round-001caa04b0 item 3)."""
+    title = custody_host._SERVICE_PROCEDURE_TITLE
+    assert f"'{title}'" in custody_host._LEAVE_KEY_FILES_STEP
+    (tmp_path / "master.key").write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
+    foreign = foreign_custody_refusal(settings, environ={})
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    with pytest.raises(HostCustodyRefused) as refused:
+        load_host_custody(
+            _settings(tmp_path),
+            enforcing=True,
+            environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
+        )
+    assert foreign is not None
+    for text in (foreign, str(refused.value)):
+        flat = " ".join(text.split())
+        assert f"master.key in {tmp_path}" in flat, flat
+        assert "Leave each key file named here where it is, and delete nothing" in flat, flat
+        assert f"docs/SERVICE.md, '{title}'" in flat, flat
+        for step in ("copy everything", "copy into it", "same volume", "move that file"):
+            assert step not in flat, (step, flat)
+    assert "To go on without it" not in foreign, foreign
+    assert custody_host.keep_the_key_step(settings, new_store=False) not in foreign, foreign
+    # The procedure states what clears each place: a new data directory for a file beside the
+    # store, and the move rule within one volume and across volumes.
+    section = " ".join(_service_md_section(title).split())
+    for needed in ("-DataDir", "-SecretsDir", "-CustodyDir", "Delete nothing", "Across volumes"):
+        assert needed in section, (needed, section)
+
+
+def test_the_custody_and_secrets_overlap_is_compared_where_each_resolves(tmp_path: Path) -> None:
+    """Review round-001caa04b0 item 4: a custody directory reached through a link into the secrets
+    directory, or spelled in another case where the platform folds case, is refused; the control is
+    a sibling reached the same way."""
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    alias = tmp_path / "alias"
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(secrets), str(alias))
+    else:
+        alias.symlink_to(secrets, target_is_directory=True)
+    linked = {"MEFOR_SECRETS_DIRECTORY": str(secrets), "MEFOR_CUSTODY_DIRECTORY": str(alias / "c")}
+    refusal = custody_host._own_directory_refusal(linked)
+    assert refusal is not None and "is, holds or sits inside" in refusal, refusal
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    (tmp_path / "other").mkdir()
+    if sys.platform == "win32":
+        _winapi.CreateJunction(str(sibling), str(tmp_path / "salias"))
+    else:
+        (tmp_path / "salias").symlink_to(sibling, target_is_directory=True)
+    control = {**linked, "MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "salias" / "c")}
+    assert custody_host._own_directory_refusal(control) is None
+    if os.path.normcase("A") == os.path.normcase("a"):
+        cased = {**linked, "MEFOR_CUSTODY_DIRECTORY": str(secrets).upper() + os.sep + "c"}
+        assert custody_host._own_directory_refusal(cased) is not None
+
+
+def test_the_custody_texts_name_the_directory_variables_as_literals() -> None:
+    """Review round-001caa04b0 item 11: a variable name reaching stderr is written as a literal,
+    never through SECRETS_DIRECTORY_VARIABLE (CodeQL alert 315 reads that constant as a secret).
+    The literals are pinned to the constants the engine reads."""
+    from messagefoundry.engine_secrets import (
+        CUSTODY_DIRECTORY_VARIABLE,
+        SECRETS_DIRECTORY_VARIABLE,
+    )
+
+    source = Path(custody_host.__file__).read_text(encoding="utf-8")
+    for constant in ("SECRETS_DIRECTORY_VARIABLE", "CUSTODY_DIRECTORY_VARIABLE"):
+        assert "{" + constant + "}" not in source, constant
+    assert (SECRETS_DIRECTORY_VARIABLE, CUSTODY_DIRECTORY_VARIABLE) == (
+        "MEFOR_SECRETS_DIRECTORY",
+        "MEFOR_CUSTODY_DIRECTORY",
+    )
+    with pytest.raises(HostCustodyRefused, match="^MEFOR_CUSTODY_DIRECTORY must be an absolute"):
+        custody_host.custody_directory(
+            StoreSettings(), environ={"MEFOR_CUSTODY_DIRECTORY": "relative"}
+        )
 
 
 def test_a_relative_secrets_variable_counts_as_unset_for_the_search(
@@ -483,11 +591,11 @@ def test_the_left_behind_check_reads_beside_the_store_with_both_variables_set(
     beside = tmp_path / "handoff.key"
     beside.write_bytes(b"not read")
     both = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
-    with pytest.raises(HostCustodyRefused, match="move that file into") as refused:
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere") as refused:
         load_host_custody(_settings(tmp_path), enforcing=True, environ=both)
     assert not isinstance(refused.value, HostCustodyMissing)
     assert f"handoff.key in {tmp_path}" in str(refused.value), refused.value
-    with pytest.raises(HostCustodyRefused, match="move that file into"):
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere"):
         mint_target(_settings(tmp_path), service_account=None, enforcing=True, environ=both)
     with pytest.raises(HostCustodyMissing):
         load_host_custody(
@@ -605,8 +713,8 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     assert condition < low.index(keep), refusal
     assert ". " not in low[condition : low.index(_KEY_SETTINGS_OUT)], refusal
     assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
-    assert custody_host.keep_the_key_step(settings, new_store=False) in refusal, refusal
-    # The file is left in place, and the way on runs the store from somewhere else (Manager
+    assert custody_host.keep_the_key_step(settings, new_store=False) not in refusal, refusal
+    # The file is left in place, and the way on is docs/SERVICE.md's procedure (Manager
     # ruling 2026-11-22, vault BACKLOG #3411).
     assert custody_host._LEAVE_KEY_FILES_STEP in refusal, refusal
     assert "mints this store's key" not in refusal, refusal  # only the host provider mints
@@ -2065,9 +2173,10 @@ async def _never_started_pin_text(directory: Path) -> str:
     return str(refused.value)
 
 
-#: Phrases the guard takes out of every text first: one reports what failed, and one forbids a
-#: change (the kept-key warning's "Keep both, and do not delete either").
-_NOT_CHANGING_WHAT_EXISTS = ("could not be removed", "do not delete either")
+#: Phrases the guard takes out of every text first: one reports what failed, and the others forbid
+#: a change (the kept-key warning's "Keep both, and do not delete either", and the key-file
+#: refusals' "and delete nothing").
+_NOT_CHANGING_WHAT_EXISTS = ("could not be removed", "do not delete either", "and delete nothing")
 
 #: foreign_custody_refusal's own remedy, which changes settings only. Allowed for that text alone.
 _KEY_SETTINGS_OUT = "remove every other store key setting"
@@ -2360,7 +2469,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         (fallback, "run with the custody directory that holds the store's host blob"),
         ("which names the way on",),
         (fallback,),
-        (fallback, "set [store].key_provider = 'host'", "leave it where it is"),
+        ("set [store].key_provider = 'host'", "where it is, and delete nothing", "docs/SERVICE.md"),
         (fallback, "leaves it in place"),
         ("Run the command again with that file in place",),
         (fallback, "This run minted it and nothing was written under it"),

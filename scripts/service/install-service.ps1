@@ -981,8 +981,9 @@ function New-RestrictedDirectory {
     if ($owner -ne $OwnerSid -or -not $acl.AreAccessRulesProtected) {
         # The custody directory may hold a store's only key, so its refusal never says remove.
         $remedy = if ($What -eq "the custody directory") {
-            "Check who made it. A master.key or handoff.key in it may be a store's only key: do not " +
-                "delete it; follow docs/SERVICE.md 'Reinstalling over a kept custody directory'."
+            "Check who made it. Leave every key file in it where it is, and delete nothing: a " +
+                "master.key or handoff.key there may be the only copy of a store's key on this " +
+                "host. Then follow docs/SERVICE.md 'When a refusal names master.key or handoff.key'."
         } else { "Remove it, check who made it, and re-run the installer." }
         throw ("'$Path' was there before this install made it (its owner is $owner), so it is not " +
             "the restricted folder the install asked for. $remedy")
@@ -1180,10 +1181,18 @@ function Get-CustodyDirProblem {
     }
     if (-not (Test-Path -LiteralPath $Path)) { return "" }
     if (-not $Named) {
-        return ("it already exists and the service does not name it. It may hold master.key or " +
-            "handoff.key, which may be the only copy of a store's key on this host, so do not " +
-            "delete it or anything in it; follow docs/SERVICE.md 'Reinstalling over a kept " +
-            "custody directory'")
+        # What it holds decides the text: an empty folder is not said to hold a key. A listing that
+        # fails reads as one $null item, never as empty.
+        $held = @(try { Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop } catch { $null })
+        if ($held.Count -eq 0) {
+            return ("it already exists, holds nothing, and the service does not name it, so it is " +
+                "not a folder this install made. Check who made it, and follow docs/SERVICE.md 'When a refusal names master.key or handoff.key'")
+        }
+        $what = if ($null -eq $held[0]) { "could not be listed, so it may hold master.key or handoff.key" }
+                else { "holds $($held.Count) item(s), such as '$($held[0].Name)'" }
+        return ("it already exists, the service does not name it, and it $what. Leave every key " +
+            "file in it where it is, and delete nothing: master.key or handoff.key there may be " +
+            "the only copy of a store's key on this host. Follow docs/SERVICE.md 'When a refusal names master.key or handoff.key'")
     }
     $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($AcceptedOwners -notcontains $owner) {
@@ -1344,9 +1353,10 @@ function Get-SettingsKeyProvider {
       do. Other forms can misread either way: at least a header it does not recognize (a tab, or a
       quoted key with a space or punctuation) leaves the lines after it credited to the table
       before it, and a triple quote in a comment or a one-line string, or a multi-line string
-      holding the other delimiter, can make it misread every line after it. What the installer does
-      with the answer is an early refusal: the engine applies its own key custody refusals at start
-      whatever this returns.
+      holding the other delimiter, can make it misread every line after it. The answer decides, at
+      least, whether the installer refuses a shared account for the host provider, makes a custody
+      directory and names it to the service, and accepts -CustodyDir. The engine applies its own key
+      custody refusals at start whatever this returns.
     #>
     param([Parameter(Mandatory)][string]$Path)
     $value = '(?:"(?<v>[^"\\]*)"|''(?<v>[^'']*)'')'
@@ -3057,8 +3067,9 @@ if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Le
 # --- key custody: [store].key_provider = 'host' (vault BACKLOG #3411, S3 slice B3c) --------------------
 # On a rerun, a MEFOR_STORE_KEY_PROVIDER in the service's NSSM environment (AppEnvironmentExtra)
 # wins over the settings file, as an environment variable does at start. No other environment is
-# read here, the machine's included. Refused before anything acts. Get-SettingsKeyProvider says
-# what it reads, and why the engine's own refusal at start does not rest on it.
+# read here, the machine's included. The answer decides the account refusal below, made before
+# anything acts, and whether the custody directory is made and named and -CustodyDir accepted.
+# Get-SettingsKeyProvider says what it reads, and that the engine's refusals do not rest on it.
 $RegisteredKeyProvider = Get-RegisteredEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_STORE_KEY_PROVIDER"
 $HostCustody = if ($null -ne $RegisteredKeyProvider) { $RegisteredKeyProvider -ceq "host" }
                else { (Get-SettingsKeyProvider -Path $ServiceConfig) -ceq "host" }
@@ -3081,8 +3092,8 @@ if ($HostCustody) {
 # handoff provision-admin leaves, so it must add a file where those two live. The secrets directory
 # is administrator-written (ADR 0214), so they get a directory of their own, named to the service as
 # MEFOR_CUSTODY_DIRECTORY, which the engine reads in place of MEFOR_SECRETS_DIRECTORY for them.
-# Judged here, before anything acts, by the secrets directory's rules, and made before the service
-# is registered; restricted (Set-CustodyDirAcl) once the account resolves.
+# Judged here, before anything acts, by the secrets directory's rules; made, restricted
+# (Set-CustodyDirAcl) and named once the account resolves, after the service is registered.
 $CustodyDirNamed = $false
 $CustodyDirMadeHere = $false
 if (-not $HostCustody) {
@@ -3181,24 +3192,9 @@ if (-not $SecretsDirNamed -or -not (Test-Path -LiteralPath $SecretsDir)) {
     $heldProblem = Get-SecretsDirHeldProblem -Path $SecretsDir
     if ($heldProblem) { throw "-SecretsDir '$SecretsDir' cannot be the secrets directory: $heldProblem." }
 }
-# The custody directory the same way (vault BACKLOG #3411): made restricted in one step, and then
-# empty, since a key file in it that this install did not see made would be read as the store's.
-if ($HostCustody) {
-    $CustodyParent = Split-Path -Parent $CustodyDir
-    if (-not (Test-Path -LiteralPath $CustodyParent)) { New-AdminOnlyFolder -Path $CustodyParent }
-    if (-not $CustodyDirNamed -or -not (Test-Path -LiteralPath $CustodyDir)) {
-        New-RestrictedDirectory -Path $CustodyDir -What "the custody directory"
-        $CustodyDirMadeHere = $true
-        $custodyHeld = @(Get-ChildItem -LiteralPath $CustodyDir -Force -ErrorAction Stop)
-        if ($custodyHeld.Count -ne 0) {
-            throw ("-CustodyDir '$CustodyDir' cannot be the custody directory: it holds " +
-                "$($custodyHeld.Count) item(s) the installer did not put there, such as " +
-                "'$($custodyHeld[0].Name)'. Check who wrote them. A master.key or handoff.key there " +
-                "may be a store's only key: do not delete it; follow docs/SERVICE.md 'Reinstalling " +
-                "over a kept custody directory'.")
-        }
-    }
-}
+# The custody directory is made LATER, just before it is restricted and named to the service (vault
+# BACKLOG #3411): a refusal between its making and its naming would leave a folder the service does
+# not name, which the next run refuses.
 # NB the data-dir + config-dir ACL lockdown is applied LATER, AFTER the service is registered and its
 # ObjectName (run-as account) is set - see "ACLs" below. The default run-as is now a per-service VIRTUAL
 # account (NT SERVICE\<ServiceName>, #224), whose SID does NOT resolve for icacls until the service
@@ -3608,6 +3604,32 @@ if ($HostCustody) {
     # Each refusal below removes the directory only when this run made it and it holds nothing
     # (Remove-CustodyDirMadeHere), so the re-run it asks for can make it again; any other
     # directory is left, and a re-run over a service that names it accepts it.
+    #
+    # Made here, restricted in one step as the secrets directory is, and then empty, since a key
+    # file in it that this install did not see made would be read as the store's. Made this late,
+    # just before it is named, so that a refusal earlier in the run leaves no folder behind.
+    try {
+        $CustodyParent = Split-Path -Parent $CustodyDir
+        if (-not (Test-Path -LiteralPath $CustodyParent)) { New-AdminOnlyFolder -Path $CustodyParent }
+        if (-not $CustodyDirNamed -or -not (Test-Path -LiteralPath $CustodyDir)) {
+            # Read before the call: CreateDirectory succeeds on a folder that is already there.
+            $CustodyDirMadeHere = -not (Test-Path -LiteralPath $CustodyDir)
+            New-RestrictedDirectory -Path $CustodyDir -What "the custody directory"
+            $custodyHeld = @(Get-ChildItem -LiteralPath $CustodyDir -Force -ErrorAction Stop)
+            if ($custodyHeld.Count -ne 0) {
+                throw ("-CustodyDir '$CustodyDir' cannot be the custody directory: it holds " +
+                    "$($custodyHeld.Count) item(s) the installer did not put there, such as " +
+                    "'$($custodyHeld[0].Name)'. Check who wrote them. Leave every key file in it " +
+                    "where it is, and delete nothing: a master.key or handoff.key there may be the " +
+                    "only copy of a store's key on this host. Then follow docs/SERVICE.md 'When a " +
+                    "refusal names master.key or handoff.key'.")
+            }
+        }
+    } catch {
+        $removed = Remove-CustodyDirMadeHere -Path $CustodyDir -MadeHere:$CustodyDirMadeHere
+        throw ("$($_.Exception.Message)$removed " +
+            "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it has no custody directory to write its store key file in')")
+    }
     try { Set-CustodyDirAcl -Path $CustodyDir -Account $ServiceAccount }
     catch {
         $removed = Remove-CustodyDirMadeHere -Path $CustodyDir -MadeHere:$CustodyDirMadeHere
@@ -3632,8 +3654,9 @@ if ($HostCustody) {
     if ($replacedCustodyDir -and -not $CustodyDirNamed) {
         Write-Warning ("The service's MEFOR_CUSTODY_DIRECTORY named '$replacedCustodyDir' and now " +
             "names '$CustodyDir', as -CustodyDir asked. The engine reads no key file from the old " +
-            "directory. If master.key or handoff.key is there, do not delete it; follow " +
-            "docs/SERVICE.md 'Reinstalling over a kept custody directory'.")
+            "directory. Leave every key file there where it is, and delete nothing: a master.key " +
+            "or handoff.key there may be the only copy of a store's key on this host. Then follow " +
+            "docs/SERVICE.md 'When a refusal names master.key or handoff.key'.")
     }
     Write-Host "  Custody: '$CustodyDir', named to the service as MEFOR_CUSTODY_DIRECTORY (docs/SERVICE.md)."
 }

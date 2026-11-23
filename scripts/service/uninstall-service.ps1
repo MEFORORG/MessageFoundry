@@ -288,6 +288,9 @@ function Get-UninstallResidueNotice {
         [string]$CustodyDir,
         # The key files found in it, master.key or handoff.key, read before the notice.
         [string[]]$CustodyFiles = @(),
+        # The directory could not be read as there, so $CustodyFiles may be missing a key file: at
+        # least a drive that is offline, which reads as absent without an error.
+        [switch]$CustodyUnconfirmed,
         # Measured from the config dir's own ACL, not assumed from a switch this script never saw.
         [switch]$ConfigInheritanceStripped,
         # Path of the nssm.exe the registration starts, only when it is actually on disk.
@@ -366,9 +369,15 @@ function Get-UninstallResidueNotice {
             $lines += "                   this host: never delete it. It keeps its own entry for $who,"
             $lines += "                   which -RemoveAccountAces does not take off the file."
         }
+        if ($CustodyUnconfirmed) {
+            # A drive that is offline reads as absent, so not finding a file proves nothing.
+            $lines += "                   This script could not confirm what it holds. It may still"
+            $lines += "                   hold master.key or handoff.key, the store's key and maybe"
+            $lines += "                   its only copy on this host: never delete either."
+        }
         $lines += "                   A reinstall refuses this directory while the new service does"
-        $lines += "                   not name it: see docs/SERVICE.md 'Reinstalling over a kept"
-        $lines += "                   custody directory'."
+        $lines += "                   not name it: see docs/SERVICE.md 'When a refusal names"
+        $lines += "                   master.key or handoff.key'."
     }
 
     if ($CachedNssm) {
@@ -980,11 +989,16 @@ $custodyAceRemoved = $false
 # Which key files the custody directory holds, so the notice names only those (vault BACKLOG #3411).
 # A read that fails, such as a drive that is gone, must not stop the uninstall before its notice.
 $custodyFiles = @()
+# Test-Path reads an offline drive, or a folder this account cannot see, as absent without an
+# error, so the notice keeps its warning unless the directory itself is read as there.
+$custodyUnconfirmed = $false
 if ($custodyDir) {
     try {
+        $custodyUnconfirmed = -not (Test-Path -LiteralPath $custodyDir -PathType Container)
         $custodyFiles = @(foreach ($name in @("master.key", "handoff.key")) {
                 if (Test-Path -LiteralPath ([IO.Path]::Combine($custodyDir, $name))) { $name } })
     } catch {
+        $custodyUnconfirmed = $true
         $unreadable += ("the key files in the custody directory '$custodyDir' ($($_.Exception.Message)) " +
             "- check it for master.key and handoff.key, and do not delete either")
     }
@@ -1039,6 +1053,7 @@ Get-UninstallResidueNotice `
     -SecretsDir $secretsDir `
     -CustodyDir $custodyDir `
     -CustodyFiles $custodyFiles `
+    -CustodyUnconfirmed:$custodyUnconfirmed `
     -ConfigInheritanceStripped:$configProtected `
     -CachedNssm $cachedNssm `
     -WerImages $werImages `

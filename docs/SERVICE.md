@@ -293,12 +293,8 @@ all, so a mint run without the variable does not lead to a second key.
 
 **Reinstalling over a kept custody directory.** The install script refuses an existing custody
 directory the service does not name, as after an uninstall, and it never removes one that holds
-anything: `master.key` or `handoff.key` there may be the only copy of a store's key on this host,
-so do not delete either. To go on, re-run the install script with `-CustodyDir` naming a new
-folder. Then, with the service stopped, move each key file from the kept directory into the new
-one as an administrator, on the same volume so it keeps its own access list, and start the
-service. The same move applies to a key file left in a custody directory the service named before
-a `-CustodyDir` change.
+anything. [When a refusal names master.key or handoff.key](#when-a-refusal-names-masterkey-or-handoffkey)
+says how to go on.
 
 **Minting.** Set the variable in the elevated shell that runs `provision-admin --service-account`,
 to the same path, so the handoff lands where the service looks:
@@ -321,6 +317,59 @@ the service account and the operator can both open the store, in either order. T
 > **absolute** `[store].path` / `--db` to keep it in place (absolute paths bypass the root), or accept the
 > new location. The startup CWD-mismatch WARNING names the resolved paths so any move is visible. Deployments
 > without `--project-root`, or with an absolute DB path, are unchanged.
+
+#### When a refusal names master.key or handoff.key
+
+This is the one procedure for going on past a refusal that names `master.key` or `handoff.key`, the
+host key provider's files ([The custody directory](#the-custody-directory-under-the-host-key-provider)).
+The engine and the install and uninstall scripts point here when they find one where they cannot
+tie it to this service's store, at least: a key file beside a store that another key provider
+opens, a key file outside the custody directory the service names, and an existing custody
+directory the service does not name, as after an uninstall. Neither the engine nor the scripts can
+tell whose key a file holds, and either file may be the only copy of a store's key on this host.
+
+1. **Delete nothing, and leave every key file where it is**, in every directory the refusal names,
+   unless step 3 sends you to move one; then move it only as step 5 says.
+2. **Stop the service** (`Stop-Service <ServiceName>`) if it is installed, and work from an
+   elevated shell.
+3. **If the file holds this store's key**, as when this store was set up under
+   `[store].key_provider = 'host'`:
+   - When the refusal says `[store].key_provider` is another provider, make the settings change
+     the refusal names. No file moves.
+   - When the file sits outside the custody directory the service names, move it into that
+     directory as step 5 says.
+   - When the install script refuses a kept custody directory, re-run it with `-CustodyDir` naming
+     a new folder that does not exist yet, which it creates restricted
+     ([The custody directory](#the-custody-directory-under-the-host-key-provider)). Then move each
+     key file from the kept directory into the new one as step 5 says.
+4. **If the file is another store's, or you cannot tell**, this store needs places that hold
+   neither file. Let the install script make each one new and restricted, rather than making or
+   filling a folder by hand. Re-run it with the option for where the file is:
+   - beside the store's database: `-DataDir` naming a new folder that does not exist yet, and no
+     `-DbPath`, so the store is `<DataDir>\messagefoundry.db` in a directory the script creates and
+     restricts. A `-DbPath` outside `-DataDir` names a folder the script grants nothing on.
+   - in the directory `MEFOR_SECRETS_DIRECTORY` names: `-SecretsDir` naming a new folder that does
+     not exist yet. Then add this service's secret files to it as
+     [the secrets directory](#protect-the-store-encryption-key-at-rest-wp-11d) says.
+   - in the directory `MEFOR_CUSTODY_DIRECTORY` names: under the host provider, `-CustodyDir`
+     naming a new folder that does not exist yet. Under another provider the service reads no
+     custody directory of its own, so take the `MEFOR_CUSTODY_DIRECTORY` entry out of its NSSM
+     `AppEnvironmentExtra` list, keeping the other entries.
+
+   A new data directory starts a new, empty store. Never copy another store's database, or any
+   key file, into it. To keep this store's own data, move its database file, and the `-wal` and
+   `-shm` files beside it when they are there, into the new data directory as step 5 says.
+5. **Moving a file.** Within one volume, move it as an administrator
+   (`Move-Item -LiteralPath <file> -Destination <directory>`): the file keeps its own owner and
+   access list, which the engine checks exactly on a key file. Across volumes a move is a copy,
+   and a plain copy takes the new directory's list in place of the file's own, so the engine
+   refuses a key file copied that way. Copy a key file with its owner and list instead
+   (`robocopy <from directory> <to directory> <file name> /COPY:DATSO /B`). Check that
+   `icacls <file>` prints the same entries for the copy as for the original, and that
+   `(Get-Acl -LiteralPath <file>).Owner` prints the same owner, and keep the original where it is
+   until the service has started and opened its store from the copy. Copy the database files
+   across volumes the same way, and keep their originals until then too.
+6. **Start the service**, and read its log for a refusal ([Verify it's running](#verify-its-running)).
 
 ## Update to a new build (restart vs reinstall)
 
@@ -1295,7 +1344,7 @@ list below says what it covers.
 | The `DataDir` tree — logs and message store | Your data | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
 | The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself only when no other service installed with the same `-NssmDir` remains and you are not reinstalling |
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
-| Under `[store].key_provider = 'host'`, the custody directory `MEFOR_CUSTODY_DIRECTORY` names, with `master.key` (and `handoff.key` before the first start), and the run-as account's read and add-file entry on it | The files hold the store's key, maybe its only copy on this host. Each file carries its own access-control entry for the account, and `-RemoveAccountAces` takes the account's entry off the directory only, not off the files. A reinstall refuses the kept directory while the new service does not name it | Keep the directory and its files while the store is kept; never delete them. `-RemoveAccountAces` removes the directory's entry. To reinstall, see [Reinstalling over a kept custody directory](#the-custody-directory-under-the-host-key-provider) |
+| Under `[store].key_provider = 'host'`, the custody directory `MEFOR_CUSTODY_DIRECTORY` names, with `master.key` (and `handoff.key` before the first start), and the run-as account's read and add-file entry on it | The files hold the store's key, maybe its only copy on this host. Each file carries its own access-control entry for the account, and `-RemoveAccountAces` takes the account's entry off the directory only, not off the files. A reinstall refuses the kept directory while the new service does not name it | Keep the directory and its files while the store is kept; never delete them. `-RemoveAccountAces` removes the directory's entry. To reinstall, see [When a refusal names master.key or handoff.key](#when-a-refusal-names-masterkey-or-handoffkey) |
 | The `SeServiceLogonRight` ("Log on as a service") grant | Setting the service's run-as account does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
 | Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |

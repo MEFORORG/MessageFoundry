@@ -301,8 +301,8 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
     tmp_path: Path,
 ) -> None:
     """CALL-SITE guard: the custody directory is judged with the secrets directory's rules before
-    NSSM is resolved, made restricted before the service is registered, restricted after the
-    secrets directory once the account resolves, and named to the service. Each step sits under
+    NSSM is resolved, and made restricted, restricted for the account and named to the service
+    after the secrets directory, once the service is registered. Each step sits under
     the host provider's branch, and -CustodyDir is refused without it."""
     facts = _preflight_facts(tmp_path)
     # Read by line: the call offsets count the file's own line endings, which read_text folds.
@@ -328,7 +328,9 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
     )
     host = _sole_call(facts, "Get-HostCustodyAccountProblem")
     assert host["start"] < check["start"] < nssm
-    assert creates["start"] < registered < secrets_lock["start"] < lock["start"] < named["start"]
+    # Made just before it is restricted and named (review round-001caa04b0 item 5), so a refusal
+    # earlier in the run leaves no folder the service does not name for the next run to refuse.
+    assert registered < secrets_lock["start"] < creates["start"] < lock["start"] < named["start"]
     # Each act is inside an `if ($HostCustody)` block.
     lines = text.splitlines()
     for call in (creates, lock, named):
@@ -342,14 +344,21 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
     flat = " ".join(text.split())
     refusal = flat.index('throw ("Could not name the custody directory')
     assert "Disable-RefusedService" in flat[refusal : refusal + 600], flat[refusal : refusal + 600]
-    # Both custody refusals after registration remove only a directory this run made, and ask for
-    # a re-run; neither tells anyone to add the variable by hand or to remove a directory.
+    # A refusal while it is made disables the service too, and "made here" is read before the
+    # create, which succeeds on a folder already there.
+    made = flat.index("$CustodyDirMadeHere = -not (Test-Path -LiteralPath $CustodyDir)")
+    create = flat.index('New-RestrictedDirectory -Path $CustodyDir -What "the custody directory"')
+    assert made < create, (made, create)
+    window = flat[create : flat.index("Set-CustodyDirAcl -Path $CustodyDir", create)]
+    assert "Disable-RefusedService" in window and "Remove-CustodyDirMadeHere" in window, window
+    # Each custody refusal after registration removes only a directory this run made; none
+    # tells anyone to add the variable by hand or to remove a directory.
     removals = [
         c
         for c in facts["commands"]
         if c["name"] == "Remove-CustodyDirMadeHere" and c["start"] > registered
     ]
-    assert len(removals) == 2, removals
+    assert len(removals) == 3, removals
     assert all("-MadeHere:$CustodyDirMadeHere" in c["text"] for c in removals), removals
     naming = flat[refusal : refusal + 800]
     assert "Re-run the installer" in naming, naming
@@ -382,6 +391,12 @@ def test_the_uninstaller_names_the_custody_directory_and_removes_its_grant(
     window = uninstall[uninstall.rindex("try {", 0, probe) : probe + 400]
     assert "[IO.Path]::Combine($custodyDir, $name)" in window and "$unreadable +=" in window, window
     assert "Join-Path $custodyDir" not in uninstall
+    # The warning stays unless the directory itself reads as there (review round-001caa04b0 item 6).
+    assert "-CustodyUnconfirmed:$custodyUnconfirmed" in notice["text"], notice["text"]
+    assert (
+        "$custodyUnconfirmed = -not (Test-Path -LiteralPath $custodyDir -PathType Container)"
+        in uninstall
+    )
 
 
 def test_the_uninstall_notice_says_what_the_custody_directory_keeps(tmp_path: Path) -> None:
@@ -397,13 +412,23 @@ def test_the_uninstall_notice_says_what_the_custody_directory_keeps(tmp_path: Pa
         "handoff.key holds the store's key",
         "It keeps its own entry for 'NT SERVICE\\MessageFoundry'",
         "A reinstall refuses this directory",
-        "Reinstalling over a kept custody directory",
+        "When a refusal names master.key or handoff.key",
     ):
         assert needed in flat, (needed, flat)
     handoff_only = " ".join(
         _notice(tmp_path, {**_FULL_FACTS, "CustodyFiles": ["handoff.key"]}).split()
     )
-    assert "handoff.key holds" in handoff_only and "master.key" not in handoff_only, handoff_only
+    assert "handoff.key holds" in handoff_only, handoff_only
+    assert "master.key holds" not in handoff_only, handoff_only
+    # Review round-001caa04b0 item 6: an offline drive reads as absent without an error, so a
+    # directory not read as there keeps the never-delete warning with no file named. The control:
+    # a directory read as there, holding neither file, carries no such warning.
+    warning = "It may still hold master.key or handoff.key"
+    unread = {**_FULL_FACTS, "CustodyFiles": [], "CustodyUnconfirmed": True}
+    unconfirmed = " ".join(_notice(tmp_path, unread).split())
+    assert warning in unconfirmed and "never delete either" in unconfirmed, unconfirmed
+    read = " ".join(_notice(tmp_path, {**unread, "CustodyUnconfirmed": False}).split())
+    assert warning not in read, read
     nobody = " ".join(
         _notice(tmp_path, {**both, "ServiceAccount": "", "ServiceAccountSid": ""}).split()
     )
@@ -419,10 +444,14 @@ def test_the_custody_directory_check_accepts_a_named_one_and_never_says_remove(
     """Get-CustodyDirProblem: a re-run over a service whose environment names the directory, with
     an owner each install sets (here this account, which an unelevated test can own), accepts it;
     the same directory the service does not name is refused without telling anyone to remove it.
+    An empty one is refused without being said to hold a key (review round-001caa04b0 item 5).
     Remove-CustodyDirMadeHere removes only a directory this run made that holds nothing."""
     assert _SCRIPT is not None
     kept = tmp_path / "kept"
     kept.mkdir()
+    (kept / "master.key").write_bytes(b"k")
+    empty = tmp_path / "empty"
+    empty.mkdir()
     made = tmp_path / "made"
     made.mkdir()
     full = tmp_path / "full"
@@ -435,6 +464,7 @@ def test_the_custody_directory_check_accepts_a_named_one_and_never_says_remove(
   [pscustomobject]@{{
     named = [string](Get-CustodyDirProblem -Path {_psq(str(kept))} -ServiceName 'NoSuchSvc-w7' -Named -AcceptedOwners @($mySid))
     unnamed = [string](Get-CustodyDirProblem -Path {_psq(str(kept))} -ServiceName 'NoSuchSvc-w7' -AcceptedOwners @($mySid))
+    empty = [string](Get-CustodyDirProblem -Path {_psq(str(empty))} -ServiceName 'NoSuchSvc-w7' -AcceptedOwners @($mySid))
     owner = [string](Get-CustodyDirProblem -Path {_psq(str(kept))} -ServiceName 'NoSuchSvc-w7' -Named)
     made = [string](Remove-CustodyDirMadeHere -Path {_psq(str(made))} -MadeHere)
     full = [string](Remove-CustodyDirMadeHere -Path {_psq(str(full))} -MadeHere)
@@ -454,8 +484,13 @@ def test_the_custody_directory_check_accepts_a_named_one_and_never_says_remove(
     ]
     got = json.loads(_ok(_extract(_SCRIPT, names, body), tmp_path).strip().splitlines()[-1])
     assert got["named"] == "", got
-    assert "does not name it" in got["unnamed"] and "do not delete" in got["unnamed"], got
-    assert not re.search(r"\bremov", got["unnamed"], re.IGNORECASE), got
+    assert "does not name it" in got["unnamed"] and "delete nothing" in got["unnamed"], got
+    assert "When a refusal names master.key or handoff.key" in got["unnamed"], got
+    assert "holds 1 item(s), such as 'master.key'" in got["unnamed"], got
+    assert "holds nothing" in got["empty"] and "may hold" not in got["empty"], got
+    assert "may be the only copy" not in got["empty"], got
+    for text in (got["unnamed"], got["empty"]):
+        assert not re.search(r"\bremov", text, re.IGNORECASE), text
     assert "owner" in got["owner"], got  # the control: this account is not an install's owner
     assert not made.exists() and "was removed" in got["made"], got
     assert (full / "master.key").exists() and got["full"] == "", got

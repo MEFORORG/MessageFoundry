@@ -164,7 +164,13 @@ def custody_directory(
     if variable is not None:
         path = Path(environ[variable].strip())
         if not path.is_absolute():
-            raise _recorded_as(HostCustodyRefused, f"{variable} must be an absolute path")
+            # Named as a literal: this text reaches stderr (keep_the_key_step says why).
+            name = (
+                "MEFOR_CUSTODY_DIRECTORY"
+                if variable == CUSTODY_DIRECTORY_VARIABLE
+                else "MEFOR_SECRETS_DIRECTORY"
+            )
+            raise _recorded_as(HostCustodyRefused, f"{name} must be an absolute path")
         return path
     if settings.backend is StoreBackend.SQLITE and settings.path != ":memory:":
         return Path(settings.path).resolve().parent
@@ -191,25 +197,28 @@ def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
     store's data directory is not judged here.
 
     Refused first, whether or not it exists: a custody directory that is, holds or sits inside
-    the directory ``MEFOR_SECRETS_DIRECTORY`` names, compared as written after normalizing. The
+    the directory ``MEFOR_SECRETS_DIRECTORY`` names, compared where each resolves to
+    (:func:`_overlaps`), so a link or another spelling of the same place does not pass. The
     service may add files to its custody directory, and the secrets directory is
     administrator-written (ADR 0214), so the two must stay apart."""
     raw = environ.get(CUSTODY_DIRECTORY_VARIABLE, "").strip()
     secrets = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
-    if raw and secrets and os.path.isabs(raw) and os.path.isabs(secrets):
-        own, shared = (os.path.normcase(os.path.normpath(p)) for p in (raw, secrets))
-        try:
-            overlap = os.path.commonpath([own, shared]) in (own, shared)
-        except ValueError:  # different drives
-            overlap = False
-        if overlap:
-            return (
-                f"the custody directory {CUSTODY_DIRECTORY_VARIABLE} names is, holds or sits inside "
-                f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names. The service may add "
-                "files to its custody directory, and must not be able to add one to the secrets "
-                f"directory, so do not give it that right there: set {CUSTODY_DIRECTORY_VARIABLE}, "
-                "here and in the service's environment, to a directory of its own outside it"
-            )
+    if (
+        raw
+        and secrets
+        and os.path.isabs(raw)
+        and os.path.isabs(secrets)
+        and _overlaps(raw, secrets)
+    ):
+        # The variables are named as literals: this text reaches stderr (keep_the_key_step says
+        # why).
+        return (
+            "the custody directory MEFOR_CUSTODY_DIRECTORY names is, holds or sits inside the "
+            "secrets directory MEFOR_SECRETS_DIRECTORY names. The service may add files to its "
+            "custody directory, and must not be able to add one to the secrets directory, so do "
+            "not give it that right there: set MEFOR_CUSTODY_DIRECTORY, here and in the service's "
+            "environment, to a directory of its own outside it"
+        )
     if not raw or not os.path.lexists(raw):
         # Nothing there: a read finds no file, and a mint refuses the missing directory itself.
         return None
@@ -225,10 +234,20 @@ def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
         else "Make it owned by the account the engine runs as, mode 0700, in a folder only that "
         "account or root may write"
     )
-    return (
-        f"the custody directory {CUSTODY_DIRECTORY_VARIABLE} names is not restricted: {problem}. "
-        f"{remedy}"
-    )
+    return f"the custody directory MEFOR_CUSTODY_DIRECTORY names is not restricted: {problem}. {remedy}"
+
+
+def _overlaps(first: str, second: str) -> bool:
+    """Whether the directory ``first`` is, holds or sits inside ``second``, each compared where it
+    resolves to: links followed as far as the path exists (:func:`os.path.realpath`, which on
+    Windows also reads a short 8.3 name as the long one for the part that exists), then
+    case-folded where the platform folds case (:func:`os.path.normcase`). Two paths on different
+    drives do not overlap."""
+    own, shared = (os.path.normcase(os.path.realpath(p)) for p in (first, second))
+    try:
+        return os.path.commonpath([own, shared]) in (own, shared)
+    except ValueError:  # different drives
+        return False
 
 
 def _custody_paths(directory: Path) -> tuple[Path, Path]:
@@ -306,8 +325,8 @@ def foreign_custody_refusal(
     the blob minted for it. A directory setting that is not an absolute path is passed over here,
     and the directories the other setting names are still looked in.
 
-    The way on never changes a file it found (PR 2804 fifth hold; Manager ruling 2026-11-22):
-    :data:`_LEAVE_KEY_FILES_STEP`, then :func:`keep_the_key_step`."""
+    The way on changes no file it found (PR 2804 fifth hold; Manager ruling 2026-11-22): after the
+    settings change for a blob that holds this store's key, :data:`_LEAVE_KEY_FILES_STEP`."""
     environ = os.environ if environ is None else environ
     found = _key_files_outside(settings, None, environ)
     if settings.encryption_key_file:
@@ -327,24 +346,22 @@ def foreign_custody_refusal(
         "set [store].key_provider = 'host' and remove every other store key setting, with "
         "[store].cipher_provider = 'aesgcm', which that provider needs. The engine cannot tell "
         "whether the blob holds this store's key, so it leaves the file in place. "
-        f"{_LEAVE_KEY_FILES_STEP}. {keep_the_key_step(settings, new_store=False, environ=environ)}"
+        f"{_LEAVE_KEY_FILES_STEP}"
     )
 
 
-#: The way on from :func:`foreign_custody_refusal` when a file it found is not this store's own,
-#: stated once (Manager ruling 2026-11-22 on vault BACKLOG #3411). It changes no file it found:
-#: each may be another store's only key. Platform-neutral.
+#: The section of docs/SERVICE.md that holds the one procedure for going on past a refusal that
+#: names a key file (Manager design rule 2026-11-22 on vault BACKLOG #3411). The engine's texts
+#: name it and state no file procedure of their own; tests check the heading is there.
+_SERVICE_PROCEDURE_TITLE = "When a refusal names master.key or handoff.key"
+
+#: The way on from a refusal that found a key file it cannot tie to this store
+#: (:func:`foreign_custody_refusal`, :func:`_left_outside_the_custody_directory`). It changes no
+#: file: each may be another store's only key.
 _LEAVE_KEY_FILES_STEP = (
-    "Each file named here may be another store's only key: leave it where it is. To go on, run "
-    "this store from places that hold neither master.key nor handoff.key. For a file beside the "
-    "store's database, with the engine stopped, copy everything in the database's directory other "
-    "than those two files, the database's -wal and -shm files and any other file or folder the "
-    "engine keeps there among them, into a new directory, and point the "
-    "store at the copied database by its absolute path, with --db or [store].path, here and "
-    "wherever the service names it. For a file "
-    "in the directory MEFOR_CUSTODY_DIRECTORY or MEFOR_SECRETS_DIRECTORY names, set that variable, "
-    "here and in the service's environment, to a new directory, and copy into it every file the "
-    "old one holds other than master.key and handoff.key"
+    "Leave each key file named here where it is, and delete nothing: each may be the only copy of "
+    "a store's key on this host. To go on, follow docs/SERVICE.md, "
+    f"'{_SERVICE_PROCEDURE_TITLE}'"
 )
 
 
@@ -483,9 +500,9 @@ def custody_refusal_at_open(exc: BaseException) -> HostCustodyRefused:
     chain and then flushes the replaced class's log line (BACKLOG #4882)."""
     return _read_refusal(
         "the store's key custody could not be read or checked at the open: check "
-        f"[store].key_provider, the custody directory ({CUSTODY_DIRECTORY_VARIABLE}, else "
-        f"{SECRETS_DIRECTORY_VARIABLE}, else a SQLite store's data directory) and the host file "
-        "and handoff in it",
+        "[store].key_provider, the custody directory (MEFOR_CUSTODY_DIRECTORY, else "
+        "MEFOR_SECRETS_DIRECTORY, else a SQLite store's data directory) and the host file and "
+        "handoff in it",
         exc,
     )
 
@@ -714,13 +731,13 @@ def _left_outside_the_custody_directory(
     if not found:
         return None
     named = "; ".join(f"{p.name} in {p.parent}" for p in found)
+    # The variable is named as a literal: this text reaches stderr (keep_the_key_step says why).
     return (
         f"no host blob or handoff is in the custody directory {directory}, which "
-        f"{CUSTODY_DIRECTORY_VARIABLE} names, but host custody was found elsewhere "
-        f"({named}), where a mint run with other variables writes it. If one holds this store's "
-        f"key, move that file into {directory} with an account that may write there, on the same "
-        "volume so it keeps its own access list, and try again; a key minted now would not open "
-        f"a store that key made. If none is this store's: {_LEAVE_KEY_FILES_STEP}"
+        "MEFOR_CUSTODY_DIRECTORY names, but host custody was found elsewhere "
+        f"({named}), where a mint run with other variables writes it. A key minted now would not "
+        "open a store that key made, so none is read or minted here. "
+        f"{_LEAVE_KEY_FILES_STEP}"
     )
 
 
@@ -750,8 +767,8 @@ def check_host_custody_settings(
         raise _recorded_as(
             HostCustodyRefused,
             "[store].key_provider = 'host' needs a directory for the host blob: set "
-            f"{CUSTODY_DIRECTORY_VARIABLE} or {SECRETS_DIRECTORY_VARIABLE}, since this store has "
-            "no data directory of its own",
+            "MEFOR_CUSTODY_DIRECTORY or MEFOR_SECRETS_DIRECTORY, since this store has no data "
+            "directory of its own",
         )
     refusal = _own_directory_refusal(environ)
     if refusal is not None:
