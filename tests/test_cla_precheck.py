@@ -217,7 +217,7 @@ def test_a_repeated_commit_is_a_fault_too() -> None:
 def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
     """The reviewer's case: page one is [malformed, octo], page two [new-person, unsigned]. The
     malformed commit must still count toward the first page, or new-person slides into the
-    action's simulated view and its refusal is lost. A null author is now refused under rule 1,
+    first page's keys and rule 2's refusal is lost. A null author is now refused under rule 1,
     so the malformed shape here is one GitHub never sends: this guards the slot-keeping path as
     defence in depth, and test_only_a_readable_unlinked_commit_keys_the_actions_view covers it
     for a refused commit."""
@@ -232,7 +232,9 @@ def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
 
 
 def test_an_author_first_seen_past_the_hundredth_commit_is_refused() -> None:
-    """BACKLOG #5645: the action never reads commit 101, so its new author is never checked."""
+    """BACKLOG #5645: upstream's action never read commit 101, so its new author went unchecked.
+    The patched action reads past page one and asks that author to sign; rule 2 refuses them too,
+    until they sign."""
     refusals = _verdict("new_author_past_100")
     assert len(refusals) == 1 and "new-person" in refusals[0]
 
@@ -252,8 +254,8 @@ def test_the_actions_view_is_the_first_page_however_short_it_is() -> None:
 
 
 def test_an_author_past_the_first_page_who_signed_is_not_refused() -> None:
-    """The action never sees this author, but the signature file it keeps already holds their id,
-    so refusing would be a false refusal of a signed contributor."""
+    """The author is first seen past page one, and the signature file the action keeps already
+    holds their id, so refusing would be a false refusal of a signed contributor."""
     read = fetch_commits(_Replay("new_author_past_100"), "MEFORORG", "MessageFoundry", 7)
     calls: list[int] = []
 
