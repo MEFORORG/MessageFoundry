@@ -22,6 +22,7 @@ import io
 import logging
 import socket
 import struct
+import sys
 import threading
 import time
 import traceback
@@ -977,7 +978,9 @@ def _a_request_with_credentials() -> Any:
     item.positive_response_requested = 0
     item.primary_field = _PLANTED_USERNAME.encode("ascii")
     item.secondary_field = _PLANTED_PASSWORD.encode("ascii")
-    pdu.user_information.user_data.append(item)
+    user_information = pdu.user_information
+    assert user_information is not None
+    user_information.user_data.append(item)
     decoded = A_ASSOCIATE_RQ()
     decoded.decode(pdu.encode())
     return decoded
@@ -1401,6 +1404,10 @@ def test_the_scu_puts_the_warnings_filter_back_on_a_host_that_reset_it() -> None
     assert not [w for w in caught if _PLANTED in str(w.message)]
 
 
+_CONTEXT_AWARE = bool(getattr(sys.flags, "context_aware_warnings", 0))
+
+
+@pytest.mark.skipif(_CONTEXT_AWARE, reason="warnings.filters is not the list in force there")
 def test_the_warnings_filters_are_not_reinstalled_while_they_are_first(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1473,6 +1480,7 @@ def test_the_scu_ignores_pydicoms_copies_before_it_reads_the_object(
     assert warned() == []
 
 
+@pytest.mark.skipif(_CONTEXT_AWARE, reason="its control needs the flag off")
 def test_context_aware_warnings_always_reinstall(monkeypatch: pytest.MonkeyPatch) -> None:
     # There, warnings.filters is not the list in force, so it cannot say the ignores are in place.
     calls: list[str] = []
@@ -1513,6 +1521,95 @@ def test_the_engines_error_text_keeps_a_codec_errors_byte_out() -> None:
         b"\xc3\x28".decode("ascii")
     assert "0xc3" in str(raised.value)  # CONTROL
     assert "0xc3" not in dicom_module._safe_library_exc(raised.value)
+
+
+def test_a_numeric_elements_raw_bytes_never_reach_the_log_or_the_error_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from pydicom.errors import BytesLengthException
+    from pydicom.values import convert_numbers
+
+    planted = b"S3CRETVAL"
+    with pytest.raises(BytesLengthException) as raised:
+        convert_numbers(planted, True, "H")
+    exc = raised.value
+    assert planted.decode() in str(exc)  # CONTROL
+    text = dicom_module._safe_library_exc(exc)
+    assert planted.decode() not in text
+    assert "Instead received [redacted] with length 9 and struct format 'H'" in text
+    lines = _logged("pynetdicom.dsutils", exc, caplog)
+    assert lines
+    assert not [line for line in lines if planted.decode() in line], lines
+
+
+def test_a_message_that_holds_another_is_replaced_whole() -> None:
+    # The outer message is short and sits inside its cause's, which also names a second value.
+    outer = "Invalid 'A' value 'FIRSTVAL' - must not exceed 16 characters"
+    inner = f"With tag (0000,1000): {outer}\nInvalid value for VR UI: 'SECONDVAL'."
+    try:
+        try:
+            raise ValueError(inner)
+        except ValueError as cause:
+            raise ValueError(outer) from cause
+    except ValueError as exc:
+        info = (ValueError, exc, exc.__traceback__)
+        record = logging.LogRecord("pynetdicom.dimse", logging.ERROR, __file__, 1, exc, (), info)
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    written = logging.Formatter("%(message)s").format(record)
+    assert "FIRSTVAL" not in written and "SECONDVAL" not in written, written
+    assert _REDACTED_MARK in written
+
+
+@pytest.mark.parametrize("dump", ["_receive_associate_rq", "_send_associate_rq"])
+def test_the_dump_of_extended_negotiation_writes_no_application_information(
+    dump: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pynetdicom import _handlers
+    from pynetdicom.pdu import A_ASSOCIATE_RQ
+    from pynetdicom.pdu_items import SOPClassExtendedNegotiationSubItem
+
+    pdu = A_ASSOCIATE_RQ()
+    pdu.decode(_captured_request())
+    item = SOPClassExtendedNegotiationSubItem()
+    item.sop_class_uid = "1.2.840.10008.1.1"
+    item.service_class_application_information = b"S3CRETVAL"
+    user_information = pdu.user_information
+    assert user_information is not None
+    user_information.user_data.append(item)
+    hexed = "  ".join(format(byte, "02x") for byte in b"S3CRETVAL")
+
+    def dumped() -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            getattr(_handlers, dump)(cast("Event", SimpleNamespace(pdu=pdu)))
+        return [r.getMessage() for r in caplog.records]
+
+    with _filter_removed():  # CONTROL: the dump writes the bytes as hex
+        assert [line for line in dumped() if hexed in line]
+    lines = dumped()
+    assert lines
+    assert not [line for line in lines if hexed in line], lines
+    assert "    [redacted]" in lines
+
+
+async def test_the_scp_puts_the_warning_ignores_back_at_each_c_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scp import _scu_cstore
+
+    calls: list[str] = []
+    install = dicom_module._ignore_pydicom_value_warnings
+
+    def counted() -> None:
+        calls.append(threading.current_thread().name)
+        install()
+
+    async with _running_scp({"timeout_seconds": 5.0}) as scp:
+        monkeypatch.setattr(dicom_module, "_ignore_pydicom_value_warnings", counted)
+        established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
+    assert established and status == 0x0000
+    assert calls, "the C-STORE callback did not put the ignores back"
 
 
 def _with_a_note() -> BaseException:

@@ -577,6 +577,16 @@ _REFUSALS: tuple[_Shape, ...] = (
         anywhere=True,
         warning=r'Value "(?s:.*)" is not valid for elements with a VR of ',
     ),
+    # A numeric element whose length is no multiple of its VR's size: pydicom quotes its raw bytes.
+    _Shape(
+        re.compile(r"Instead received "),
+        " with length ",
+        re.compile(
+            r" with length \d+ and struct format '[^'\n]*' which corresponds to bytes per value of "
+            r"\d+\."
+        ),
+        anywhere=True,
+    ),
 )
 _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
     # An object's SOP class and transfer syntax, as the SCU found no accepted context for them.
@@ -617,6 +627,8 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
         # A user identity's fields, in clear in the dump of an association request either way: never
         # kept, whatever they spell, and the bracket pynetdicom opens goes with the value.
         _Shape(re.compile(r" +(?:Username|Password): ")),
+        # pretty_bytes' hex of an extended negotiation item's application information.
+        _Shape(re.compile(r" +(?=[0-9a-f]{2}(?:  [0-9a-f]{2})*$)")),
     ),
 }
 
@@ -849,7 +861,8 @@ def _redact_traceback(
         record.exc_info = None
         record.exc_text = f"{type(exc).__name__} (traceback withheld: its value was not redacted)"
         return
-    for message, redacted in redactions:
+    # Longest first: a shorter message replaced first would break the match of one that holds it.
+    for message, redacted in sorted(redactions, key=lambda pair: len(pair[0]), reverse=True):
         rendered = rendered.replace(message, redacted)
     record.exc_info, record.exc_text = None, rendered
 
@@ -2570,6 +2583,7 @@ class DicomScpSource(SourceConnector):
         DIMSE status int. Any failure is caught and returned as a failure status; it must never raise
         (that would break the association). Logs carry only routing-safe identifiers."""
         try:
+            _ignore_pydicom_value_warnings()  # a filter changed since the start would bring them back
             requestor = event.assoc.requestor
             peer_ip = str(getattr(requestor, "address", "") or "")
             calling_ae = str(getattr(requestor, "ae_title", "") or "")

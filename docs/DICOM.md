@@ -320,8 +320,9 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   DS lines, as lines and as refusals inside such an exception; pynetdicom's `No presentation context for`
   line, which keeps its SOP class and transfer syntax only when both are conformant or named in pydicom's
   UID dictionary; the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
-  association acceptance and a DIMSE message; and the username and password of a user identity in the
-  dump of an association request, received or sent, which are never kept. A dump field otherwise keeps at
+  association acceptance and a DIMSE message; and the username and password of a user identity and the
+  hex of an extended negotiation item's application information in those dumps, which are never kept. A
+  dump field otherwise keeps at
   least these values: an empty one; a
   conformant UID; a name in pydicom's UID dictionary, on a field that is no instance UID; and, on the AE title
   fields and on Their Implementation Version Name, a value that passes pynetdicom's AE title check, which an
@@ -341,12 +342,16 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   written only where the command set itself ends the association. Where a later PDU ends it, before
   pynetdicom reads the message, that read's lines are written nowhere. A line on any other logger is written
   twice. pydicom also raises each of its lines above as a `UserWarning`, which would carry the value to
-  stderr. A warnings filter, installed at import, at each SCP start and before each SCU association, ignores
-  those copies and no other pydicom warning; a host that resets the process's warnings filters between those
-  points brings the copy back until the next one. The filter also renders a codec error on these loggers
+  stderr. A warnings filter, installed at import, at each SCP start, at each C-STORE the SCP serves and
+  before each SCU read and association, ignores those copies and no other pydicom warning; a host that resets
+  the process's warnings filters between those points brings the copy back until the next one, and the SCP's
+  pre-read of a command set is not one of them. Under context-aware warnings, the free-threaded default, the
+  filter is installed at every one of those points, which also repeats another library's once-per-location
+  warning. The filter also renders a codec error on these loggers
   without the byte it failed on, for a host whose handlers lack the engine's log chain. The engine's
   own C-STORE lines name an object's SOP class and instance UIDs only when they are conformant, and `[redacted]`
-  otherwise, and redact a refused value from a library error they quote.
+  otherwise, and redact a refused value of a shape the filter knows from a library error they quote; a
+  library error of another shape is quoted through `safe_exc` alone.
 - **Egress is fail-closed.** A DIMSE destination is gated by `[egress].allowed_tcp`; a DICOMweb destination by
   `[egress].allowed_http` — both enforced at load/reload/start.
 
