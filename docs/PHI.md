@@ -2766,7 +2766,12 @@ still pass:
   dotted groups with no colon before them in the run, such as `1.2.4000::5`, and an IPv4-mapped or
   IPv4-compatible one whose IPv4 part sits inside more than four dotted groups after the
   last colon, neither first nor last, such as `::ffff:10.0.0.1.8.8.8.8.10.0.0.1`
-  (BACKLOG #5654). It reads text folded too, so an address in fullwidth digits or colons counts.
+  (BACKLOG #5654). The check also reads the text folded to compatibility form (NFKC), so text
+  in fullwidth digits or colons, or with a circled digit, is refused when its folded form reads
+  as a routable address, such as `2600<U+FF1A><U+FF1A>1`. Folded text that reads as an allowed
+  address passes, as that address would: `fe80<U+FF1A><U+FF1A>1` folds to `fe80::1`, and
+  `::<U+2460>` to `::1`. A fullwidth character written as hex escapes is not folded, because
+  each pair decodes to a character of its own (next item), so `2600\XEFBC9A\\XEFBC9A\1` passes.
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
   An invisible character written that way still hides a dashed SSN, a punctuated phone number or
@@ -2779,9 +2784,12 @@ colon-written EUI-64 device id such as `00:1A:2B:FF:FE:3C:4D:5E`. At least these
 `Decade::`, whose hex run is too long to be an address group, and `Xfe80::`, which reads as an
 allowed link-local address.
 
-The IPv6 check also refuses, without an address in them, text such as `a:b.c.d::1` and
-`fe80::1.2::3`, and fullwidth or circled-digit text that folds to an address shape. It fails
-closed on these: a shape it cannot rule out counts as an address (BACKLOG #5654).
+The IPv6 check also cuts a run at each dot that has a colon before it in the run and a colon in
+the group after it, and reads each piece as a run of its own. So text a reader may not take for
+an address is refused when a piece reads as a routable one: `a:b.c.d::1` is refused for `d::1`,
+and `fe80::1.2::3` for `2::3`. Both pieces are readable IPv6 addresses outside the allowed
+ranges, so such a hit names a real address: treat it as you would `2::3` written alone, and do
+not dismiss it from the shape of the text around it (BACKLOG #5654).
 
 In a message whose field separator is `:`, every IPv6 address is cut into separate fields, none
 of which holds it, and there is no cut-across-fields check for IPv6 as there is for the SSN and
@@ -2803,9 +2811,11 @@ these still get through, on both anonymizers:
   such a rest too.
 - A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
   it. The detectors read that digit as part of a longer number.
-- A cut shape in the header line, which this check skips whole. Of the shape checks, the IPv6
-  one reads the header's unmapped fields and also the components an `id`, `mrn`, `ssn` or `dln`
-  rule keeps in a header field; the SSN and phone ones read there only those kept components.
+- A cut shape in the header line, which this check skips whole. Of the one-field shape checks,
+  the IPv6 one reads the header fields no rule rewrites, and MSH-2 past its encoding characters.
+  In a header field an `id`, `mrn`, `ssn` or `dln` rule rewrites, the IPv6, SSN and phone checks
+  read the components past component 1 that the rule keeps; the SSN and phone checks read no
+  other part of the header.
 
 With `require_full_coverage` on, such a message is refused for as long as nobody decides the
 fields that carry the rest of the shape. A `keep` on each of them would let it through. That

@@ -25,7 +25,11 @@ already-pseudonymized field is never re-flagged:
   punctuated NANP phone, an ``MR``/``MRN`` id type in a whole component, its first
   subcomponent or any subcomponent of component 5, 7 or 13, a routable IPv6 address, and a line
   whose segment id is
-  malformed; the IPv6 detector also reads the MSH header, MSH-2 past its encoding characters and the fields from MSH-3 on that no rule rewrites, and the SSN and phone checks read the components a rule keeps in a header field), plus a dashed SSN or punctuated phone that the message's own field separator cut
+  malformed; the IPv6 detector also reads the MSH header, MSH-2 past its encoding characters and
+  the fields from MSH-3 on that no rule rewrites, and in a header field an ``id``, ``mrn``,
+  ``ssn`` or ``dln`` rule rewrites, the SSN, phone and IPv6 checks read only the components past
+  component 1 that the rule keeps), plus a dashed SSN or punctuated phone that the message's own
+  field separator cut
   across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to
   avoid the mass false-positives a broad digit-run search would produce on HL7 bodies (ADR 0030
   §5). A name, an undashed number or a date in an unmapped field
@@ -1453,7 +1457,9 @@ def refusal_advice(
 UNMAPPED_SCOPE_NOTE = (
     "Beyond the partner-token and IPv4 scan of the whole message, the leak-check looks in these "
     "fields only for a dashed SSN, a punctuated phone number, an MR/MRN-typed identifier and a "
-    "routable IPv6 address, and in the MSH header for a routable IPv6 address alone. A "
+    "routable IPv6 address. In the MSH header past its encoding characters, it looks for a "
+    "routable IPv6 address in the fields no rule rewrites, and for a dashed SSN, a punctuated phone number and a routable IPv6 "
+    "address in the components past the first that an id, mrn, ssn or dln rule keeps. A "
     "name, an undashed number or a date in one of them passes, so review this list before you "
     "share the dataset."
 )
