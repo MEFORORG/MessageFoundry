@@ -379,7 +379,7 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
         assert head < at < end, call["text"]
     assert "-CustodyDir is used only under [store].key_provider = 'host'" in text
     # A custody variable the installer could not write refuses and disables the service, as a
-    # lockdown failure does: without it the service reads the secrets directory for its key file.
+    # lockdown failure does: without it the service reads its key file elsewhere.
     flat = " ".join(text.split())
     refusal = flat.index('throw ("Could not name the custody directory')
     assert "Disable-RefusedService" in flat[refusal : refusal + 600], flat[refusal : refusal + 600]

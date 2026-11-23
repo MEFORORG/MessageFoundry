@@ -525,6 +525,11 @@ def test_each_key_file_refusal_points_at_one_service_md_procedure_and_states_no_
         "It is still read by at least SYSTEM",
         "SeBackupPrivilege",
         "in this step they may be another store's",
+        # PR 3168 hold at comment 7111305444, items 4, 7 and 8.
+        "leave this store's database, with its `-wal` and `-shm` files, out of that move",
+        "a new data directory for a SQLite store, a new database for a server store",
+        "`chown root:root <file>`",
+        "into a directory root owns with mode 0700",
     ):
         assert needed in section, (needed, section)
     for gone in (

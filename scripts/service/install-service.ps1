@@ -909,9 +909,9 @@ function Get-OtherServiceNamingPath {
       protected Windows services deny administrators that read, and none of them is an NSSM service.
 
       A SECOND SERVICE ON THE SAME -DataDir GETS THE SAME DEFAULT secrets directory, and
-      Set-SecretsDirAcl removes every account's entry but its own service's. So adopting the
-      directory would strip the first service's read, and sharing it would let each service read
-      the other's secrets. The installer refuses instead.
+      Set-SecretsDirAcl removes every Allow entry but its own service's and the two admin ones. So
+      adopting the directory would strip the first service's read, and sharing it would let each
+      service read the other's secrets. The installer refuses instead.
     #>
     param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Path,
@@ -3715,8 +3715,8 @@ if ($HostCustody) {
             "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'its first start cannot write its store key file as the custody directory needs')")
     }
     # A refusal, not a warning: unless the variable names this directory, the service reads its key
-    # file elsewhere (the secrets directory, or a custody directory an earlier install named), so a
-    # key provision-admin mints here as SERVICE.md says lands where the service does not look.
+    # file elsewhere (at least the secrets directory, a custody directory an earlier install named,
+    # or beside the store), so a key provision-admin mints here lands where the service does not look.
     $custodyNamingError = $null
     $replacedCustodyDir = $null
     try {
@@ -3726,8 +3726,9 @@ if ($HostCustody) {
         $removed = Remove-CustodyDirMadeHere -Path $CustodyDir -MadeHere:$CustodyDirMadeHere
         throw ("Could not name the custody directory in the service's environment " +
             "($custodyNamingError). Unless MEFOR_CUSTODY_DIRECTORY names it, the service looks for its " +
-            "key file elsewhere, in the secrets directory or a custody directory an earlier install " +
-            "named, so a key provision-admin mints here lands where the service does not look.$removed " +
+            "key file elsewhere, at least in the secrets directory, a custody directory an earlier " +
+            "install named, or beside the store, so a key provision-admin mints here lands where " +
+            "the service does not look.$removed " +
             "Re-run the installer. " +
             "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it would not find its custody directory')")
     }

@@ -284,8 +284,9 @@ install script's own grant to the service there is read, and the engine refuses 
 account, so nothing guarantees the service read only there: a rerun keeps an explicit grant to
 the service account itself, such as the write the Vault Agent sink route
 ([CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)) gives it.
-Of the entries the script does not set itself, only an explicit grant to the service account
-and an explicit Deny entry survive: the script turns inheritance off (`/inheritance:r`), which
+Of the entries the script does not set itself, at least an explicit grant to the service
+account, an explicit Deny entry, and an explicit SYSTEM or Administrators entry with other
+inheritance flags survive: the script turns inheritance off (`/inheritance:r`), which
 drops every inherited entry, and removes every other account's Allow entry, a group's included.
 So when the install script reads
 `[store].key_provider = 'host'` it also makes a **custody directory** of its own for those two
@@ -386,11 +387,14 @@ tell whose key a file holds, and either file may be the only copy of a store's k
    this step they may be another store's.
 
    Under the host provider, leave this store's database, with its `-wal` and `-shm` files, out of
-   that move, on the `-CustodyDir` route as well as the `-DataDir` one. The new store needs a key
-   that `messagefoundry provision-admin --service-account` mints for it, and `provision-admin`
-   refuses to mint for a SQLite store that already exists, because a new key cannot open it. So
-   under that provider the `-CustodyDir` route needs a new data directory too, and then
-   `provision-admin` run again for the new store before step 6.
+   that move, whichever route above you take. The new store needs a key that
+   `messagefoundry provision-admin --service-account` mints for it, and `provision-admin` refuses
+   to mint for a SQLite store that exists or a server database that holds data, because a new key
+   cannot open it. So under that provider every route above needs a new store too: a new data
+   directory for a SQLite store, a new database for a server store. Then run `provision-admin`
+   again for the new store before step 6, with the arguments the engine's refusal names, at least
+   `--db` naming the new SQLite path by its absolute path, and `MEFOR_CUSTODY_DIRECTORY` set in
+   that shell to the custody directory the service names.
 5. **Moving a file.** Within one volume, move it as an administrator
    (`Move-Item -LiteralPath <file> -Destination <directory>`): the file keeps its own owner and
    access list, which the engine checks exactly on a key file. Across volumes a move is a copy,
@@ -439,17 +443,17 @@ variable that names the file's directory, `MEFOR_SECRETS_DIRECTORY` or `MEFOR_CU
 to a new directory owned by the account the engine runs as, mode 0700, in a folder only that
 account or root may write, and add the engine's other secret files to a new secrets directory. A move
 within one file system keeps the file's owner and mode; across file systems, copy it keeping them
-(`cp -p`, as root). Once the engine has opened its store from the copy, take the engine
-account's access to a `master.key` original away, since the file stays owned by that account
-with mode 0600 wherever it moves. Record its owner and mode first
-(`stat -c '%U:%G %a' <file>`) and keep that record with it, so they can be restored if the engine
-ever has to read it again. Then make root its owner (`chown root:root <file>`, keeping mode 0600),
-and move it, within its file system, into a directory root owns with mode 0700, so the engine
-account can neither read it nor rename or delete it; keep it there. On Windows, set a kept
-`master.key` original's owner and list as step 5 says rather than only moving it, and delete a
-`handoff.key` original once the service has started from the copy, as step 5 says. Delete the
-`api-generated-cert.pem` and `api-generated-key.pem` originals once the engine presents the copied
-pair, as step 5 says.
+(`cp -p`, as root). Once the engine has opened its store from the copy, take the engine account's
+access to a `master.key` original away, since the file stays owned by that account with mode 0600
+wherever it moves. Record its owner and mode first (`stat -c '%u:%g %a' <file>`, numeric ids, since
+the engine's account may have no passwd entry) and keep that record with it, so they can be
+restored if the engine ever has to read it again. Then make root its owner (`chown root:root
+<file>`, keeping mode 0600), and move it, within its file system, into a directory root owns with
+mode 0700, so the engine account can neither read it nor rename or delete it; keep it there. On
+Windows, set a kept `master.key` original's owner and list as step 5 says rather than only moving
+it, and delete a `handoff.key` original once the service has started from the copy, as step 5 says.
+Delete the `api-generated-cert.pem` and `api-generated-key.pem` originals once the engine presents
+the copied pair, as step 5 says.
 
 ## Update to a new build (restart vs reinstall)
 
