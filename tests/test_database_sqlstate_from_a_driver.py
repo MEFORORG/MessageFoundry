@@ -3,7 +3,8 @@
 """Only a database driver's own error NAMES a SQLSTATE in text (engine PR 3150 open findings 1,
 5 and 6); an error shaped like one is still classified by it. The connector's reading
 (``_log_sqlstate``, ``_shown_state``) and the traceback line's (``redaction.driver_sqlstate_of``)
-are separate, and neither reads an asyncpg error's ``args[0]``, its message, as a SQLSTATE.
+are separate. The connector still classifies an asyncpg error by the shape of its ``args[0]``,
+its message, as before; neither reading names a state read from it in text.
 Also two log-path changes in the same module (vault BACKLOG #1661, added items 5 and 6).
 
 Each test was red on the code before its fix, except at least those whose docstring calls it a
@@ -432,14 +433,15 @@ _ASYNCPG_SHAPES = [_AsyncpgMessage, _AsyncpgClientMessage, _AsyncpgNoneState]
 
 @pytest.mark.parametrize("make", _ASYNCPG_SHAPES)
 def test_the_traceback_line_never_reads_a_message_as_a_sqlstate(make: type[Exception]) -> None:
-    """Red on the branch head before this fix (2c4ced1906e): the connector's readings fell back to
-    ``args[0]``, asyncpg's message, so ``_log_sqlstate`` returned ``MRN42``, and the traceback line
-    did too for an absent or None ``sqlstate``."""
+    """Red on the branch head before this fix (2c4ced1906e): ``_safe_db_error`` named ``[MRN42]``,
+    asyncpg's message read from ``args[0]``, and the traceback line did too for an absent or None
+    ``sqlstate``. Classification by that shape is kept, as on 2c4ced1906e; only the text changes."""
     exc = _raised(make(_VALUE))
     assert _VALUE not in safe_traceback((type(exc), exc, None))
-    assert database._log_sqlstate(exc) is None
-    assert database._sqlstate(exc) is None
-    assert _VALUE not in database._safe_db_error(exc)
+    assert database._log_sqlstate(exc) == _VALUE  # classified by shape, as on 2c4ced1906e
+    assert database._sqlstate(exc) == _VALUE
+    assert database._shown_state(_VALUE, exc) is None
+    assert database._safe_db_error(exc) == f"{make.__name__} [message withheld]"
 
 
 def test_an_asyncpg_sqlstate_attribute_is_still_read() -> None:
@@ -451,17 +453,23 @@ def test_an_asyncpg_sqlstate_attribute_is_still_read() -> None:
     assert "[23505] [driver message withheld]" in safe_traceback((type(exc), exc, None))
 
 
-async def test_an_asyncpg_message_in_a_send_is_not_named_as_a_state() -> None:
-    """Red on the branch head before this fix (2c4ced1906e): the send's arm read ``args[0]`` and
-    dead-lettered the message as ``database rejected the statement [MRN42]``, code ``MRN42``, the
-    text the alert carries. With no state it is an internal error, which the runner logs and
-    alerts by its type; the runner still stores ``safe_exc`` of it, the message included, as
-    ``last_error``, as it does for any internal error."""
+async def test_an_asyncpg_message_in_a_send_is_dead_lettered_naming_no_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Red on the branch head before this fix (2c4ced1906e): the send's arm dead-lettered the
+    message as ``database rejected the statement [MRN42]``, code ``MRN42``, the text the runner
+    stores as ``last_error`` and the alert carries. It is still dead-lettered by the same arm, a
+    permanent rejection after a rollback, as on 2c4ced1906e; its text and code name no state."""
     conn = _FakeConn(_FakeCursor(_AsyncpgClientMessage(_VALUE)))
     dest = _dest()
     dest._pool = _FakePool(conn)
-    with pytest.raises(_AsyncpgClientMessage):
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(NegativeAckError) as refused:
         await dest.send('{"mrn": "1", "val": "x"}')
+    assert str(refused.value) == "database rejected the statement [SQLSTATE withheld]"
+    assert refused.value.permanent and refused.value.code == "db"
+    assert _VALUE not in safe_exc(refused.value)  # what the runner stores as last_error
+    assert _VALUE not in caplog.text
     assert conn.rolledback
 
 

@@ -2807,26 +2807,27 @@ def _sqlstate(exc: BaseException) -> str | None:
     way, but its state may be a value, so only a driver's own error names it in text
     (:func:`_shown_state`; vault BACKLOG #1661, engine PR 3150 finding 1). Never for a
     ``UnicodeError``, whose first argument is the codec name, nor for a SQLite error, whose
-    ``args[0]`` is its message, nor for an asyncpg error, whose ``args[0]`` is its message too
-    (:func:`~messagefoundry.redaction.args_hold_a_message`). It reads no attribute but ``args``,
-    with ``getattr`` and a default, so an error arm can call it before its cleanup."""
-    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or args_hold_a_message(exc):
+    ``args[0]`` is its message. An asyncpg error is classified by the same shape, though its
+    ``args[0]`` is its message, and :func:`_shown_state` never names a state read that way. It
+    reads no attribute but ``args``, with ``getattr`` and a default, so an error arm can call it
+    before its cleanup."""
+    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc):
         return None
     return _shaped_state(getattr(exc, "args", ()))
 
 
 def _log_sqlstate(exc: BaseException) -> str | None:
     """:func:`_sqlstate`, read first from asyncpg's ``sqlstate`` attribute when that is a SQLSTATE,
-    for the arms that classify an error a PostgreSQL store's driver may raise. An asyncpg error
-    whose attribute is absent, None or no SQLSTATE reads as none, as :func:`_sqlstate` reads it,
-    never by ``args[0]``, which is asyncpg's message: a message such as ``MRN42`` would otherwise
-    be classified, and printed, as a state. Never for a ``UnicodeError`` or an exception that
-    holds one, whose text a codec name can make read like a SQLSTATE. Like :func:`_sqlstate`, it
-    classifies; :func:`_shown_state` says what text names."""
+    for the arms that classify an error a PostgreSQL store's driver may raise. Past an attribute
+    that is absent, None or no SQLSTATE it reads ``args[0]`` by shape, as :func:`_sqlstate` does,
+    an asyncpg error's included, whose ``args[0]`` is its message; :func:`_shown_state` never
+    names a state read that way. Never for a ``UnicodeError`` or an exception that holds one,
+    whose text a codec name can make read like a SQLSTATE. Like :func:`_sqlstate`, it classifies;
+    :func:`_shown_state` says what text names."""
     if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
     state = getattr(exc, "sqlstate", None)
-    return state if reads_as_a_sqlstate(state) else _sqlstate(exc)
+    return state if reads_as_a_sqlstate(state) else _shaped_state(getattr(exc, "args", ()))
 
 
 def _shaped_state(args: object) -> str | None:
@@ -2839,8 +2840,21 @@ def _shown_state(state: str | None, exc: BaseException) -> str | None:
     """``state`` as text may name it: a driver's own error's SQLSTATE, and ``None`` for any other
     error's, whose first argument may be a value such as ``KeyError('MRN42')``'s (engine PR 3150,
     finding 1). The failure is still classified by ``state``; only its text is withheld. A class
-    whose driver test raises names nothing (:func:`~messagefoundry.redaction.known_driver_error`)."""
-    return state if state is not None and known_driver_error(exc) else None
+    whose driver test raises names nothing (:func:`~messagefoundry.redaction.known_driver_error`).
+    Nor does an asyncpg error whose ``state`` is not its ``sqlstate`` attribute: that state was
+    read from ``args[0]``, which is asyncpg's message, such as ``MRN42``
+    (:func:`~messagefoundry.redaction.args_hold_a_message`). An attribute that raises when read
+    names nothing."""
+    if state is None or not known_driver_error(exc):
+        return None
+    if args_hold_a_message(exc):
+        try:
+            attribute = getattr(exc, "sqlstate", None)
+        except Exception:  # noqa: BLE001 - an unreadable attribute names nothing, as the docstring says
+            return None
+        if attribute != state:
+            return None
+    return state
 
 
 def _connection_lost(exc: BaseException | None) -> bool:
@@ -2898,9 +2912,10 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     result-code name inside the brackets when it has one (:func:`_withheld`; engine PR 2658, finding
     4). Under ``withhold``, which says ``exc`` is held by a driver error as a link of its chain
     (:func:`_redacted_copy`), an error no driver raised renders as ``<type> [driver message
-    withheld]`` before any state is read. Otherwise, an error that carries a SQLSTATE but is no
-    known driver's own (:func:`_shown_state`), a class whose driver test raises included, renders
-    as ``<type> [message withheld]``, and anything else with no SQLSTATE keeps the ``safe_exc``
+    withheld]`` before any state is read. Otherwise, an error whose state :func:`_shown_state`
+    does not name renders as ``<type> [message withheld]``: at least an error that is no known
+    driver's own, a class whose driver test raises, and an asyncpg error whose state was read from
+    its message; and anything else with no SQLSTATE keeps the ``safe_exc``
     rendering, which is the more useful text for a bug or an unreachable host. That is a bound,
     not a guarantee:
     an error a driver raises as a builtin type with any other arguments, or wraps in another
@@ -2922,7 +2937,7 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
         state = _log_sqlstate(exc)
         if state is None:
             return _withheld(exc) if driver else safe_exc(exc)
-        if not known_driver_error(exc):  # its arguments may carry a value: name no state
+        if _shown_state(state, exc) is None:  # its arguments may carry a value: name no state
             return f"{type(exc).__name__} [message withheld]"
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring

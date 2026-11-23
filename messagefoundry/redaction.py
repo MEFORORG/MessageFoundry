@@ -3156,16 +3156,15 @@ def reads_as_a_sqlstate(value: object) -> TypeIs[str]:
 def driver_sqlstate_of(
     exc: BaseException, *, attribute: bool = True, past_attribute: bool = False
 ) -> str | None:
-    """The SQLSTATE a database driver's own error names: asyncpg's ``sqlstate`` attribute when it
-    :func:`reads_as_a_sqlstate` and ``attribute`` says to read it, else ``args[0]`` when that does.
-    ``args[0]`` is read past an attribute that is set but is no SQLSTATE only when
-    ``past_attribute`` says so. An asyncpg error (:func:`args_hold_a_message`) is never read from
-    ``args[0]``, which is its message, so one whose attribute is absent, None or no SQLSTATE, such
-    as a client-side error, names none. None for any other exception, so a
-    ``KeyError('MRN42')`` is never read as one, and None for a SQLite error, whose ``args[0]`` is
-    its message (vault BACKLOG #1661). :func:`safe_traceback` names a driver error's SQLSTATE by
-    it; the DATABASE connector classifies any error by its shape and names a state only for a
-    driver's own error.
+    """The SQLSTATE a known driver's own error (:func:`known_driver_error`) names, read in this
+    order. When ``attribute`` is true, the ``sqlstate`` attribute of any such driver's error, if it
+    :func:`reads_as_a_sqlstate`; an attribute that is set but is no SQLSTATE then ends the read
+    with None unless ``past_attribute`` is true. Then None for an error from a package in
+    :func:`args_hold_a_message`, at least asyncpg, whose ``args[0]`` is its message. Otherwise
+    ``args[0]``, if it reads as a SQLSTATE, as pyodbc's does. None for any error that is no known
+    driver's, so a ``KeyError('MRN42')`` is never read as one, and None for a SQLite error, whose
+    ``args[0]`` is its message (vault BACKLOG #1661). :func:`safe_traceback` names a driver error's
+    SQLSTATE by it. The DATABASE connector reads its own state, which can differ from this one.
 
     A class whose driver test raises counts as no driver's here, where :func:`raised_by_a_driver`
     answers ``True`` to withhold its text: here ``True`` would read its argument as a SQLSTATE. A
@@ -3201,8 +3200,9 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
     link (vault BACKLOG #1661, added item 3). A driver's message can quote a value the statement
     carried, such as a duplicate key, so it is withheld. A driver error keeps the SQLSTATE
-    :func:`driver_sqlstate_of` reads: asyncpg's ``sqlstate``, or ``args[0]`` for a driver other
-    than asyncpg, when that is five characters of SQL's alphabet; a SQLite error keeps only its result-code name, since its ``args[0]`` is its message. A
+    :func:`driver_sqlstate_of` reads, with its defaults, which says which attribute or argument
+    that is for which drivers; a SQLite error keeps only its result-code name, since its
+    ``args[0]`` is its message. A
     link under a driver error is withheld whole, since a driver can raise its error from the
     builtin one its codec raised, whose text can quote the value too. An attribute that raises
     when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
