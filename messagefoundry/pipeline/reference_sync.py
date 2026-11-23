@@ -533,10 +533,10 @@ class ReferenceSyncRunner:
     in its values, so a reload that adds or rotates a value reaches the next sync (vault BACKLOG #5698).
 
     ``graph_generation`` names the committed graph ``specs`` reads, or ``None`` where no graph is
-    known to be committed. Overlapping loads of one set are ordered in this process only: a load
-    writes only while the generation it read its specs under is still current, and never over a
-    load that started after it (BACKLOG #5892). Writes by a former leader or another engine shard
-    are not ordered by this.
+    known to be committed. Overlapping loads of one set are ordered in this process only: just
+    before its store write, a load is dropped if its generation is no longer current or a load
+    that started after it has written (BACKLOG #5892). A reload that commits during that write is
+    not seen by it. Writes by a former leader or another engine shard are not ordered by this.
     """
 
     def __init__(
@@ -585,6 +585,7 @@ class ReferenceSyncRunner:
         # BACKLOG #5892: load start order, the last start each set has written, and a per-set lock
         # held across the check and the write only, so a wedged source read holds nothing.
         self._load_sequence = 0
+        self._load_replaced = False  # a load was dropped for its graph; _run goes again at once
         self._written_sequence: dict[str, int] = {}
         self._write_locks: dict[str, KeyedLock] = {}
 
@@ -622,12 +623,15 @@ class ReferenceSyncRunner:
         # One isolated pass per interval; a pass error is logged and the loop continues (a sync hiccup
         # must never take the engine down). Cooperatively cancellable via _stop.
         while not self._stop.is_set():
+            self._load_replaced = False
             try:
                 await self.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("reference sync pass failed; will retry next interval")
+            if self._load_replaced:
+                continue  # BACKLOG #5892: not left unloaded until the next interval
             await self._sleep(self._settings.refresh_interval_seconds)
 
     async def _sleep(self, delay: float) -> None:
@@ -753,6 +757,7 @@ class ReferenceSyncRunner:
             generation = current
         if generation is None or generation != current:
             # BACKLOG #5892: a reload committed mid-pass, so this source read would be discarded.
+            self._load_replaced = True
             log.debug("reference set %r: pass is on a replaced graph; not loaded", spec.name)
             return False
         # BACKLOG #5892: taken before the env() read below, which is part of what this load read.
@@ -805,6 +810,7 @@ class ReferenceSyncRunner:
         version = f"v{int(self._clock())}-{uuid4().hex[:8]}"
         async with hold_keyed_lock(self._write_locks, spec.name):
             if generation != self._graph_generation():
+                self._load_replaced = True
                 log.debug("reference set %r: load is from a replaced graph; not written", spec.name)
                 return False
             if self._written_sequence.get(spec.name, 0) > started:

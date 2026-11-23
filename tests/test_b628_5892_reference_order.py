@@ -256,6 +256,90 @@ async def test_load_from_a_replaced_graph_does_not_land_after_a_committed_reload
         await store.close()
 
 
+async def test_values_follow_the_commit_not_the_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass after the commit reads the reload's values, before the engine has been handed them,
+    and a pass during a refused reload never reads the refused values."""
+    _by_host(monkeypatch)
+    store = await MessageStore.open(tmp_path / "r.db")
+    runner, references = await _engine_on_graph(store, tmp_path)
+    real_reconcile = runner._reconcile_outbounds
+    try:
+        seen: list[Any] = []
+
+        async def read_then_refuse(*_a: Any, **_k: Any) -> None:
+            seen.append(dict(references._env_values()))
+            raise RuntimeError("refused")
+
+        monkeypatch.setattr(runner, "_reconcile_outbounds", read_then_refuse)
+        with pytest.raises(RuntimeError, match="refused"):
+            await runner.reload(_graph(tmp_path, _REFUSED), {"HOST": "refused"})
+        assert seen == [{}]
+
+        monkeypatch.setattr(runner, "_reconcile_outbounds", real_reconcile)
+        await runner.reload(_graph(tmp_path, _NEXT), {"HOST": "next"})
+        assert references._env_values() == {"HOST": "next"}
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+async def test_a_same_graph_reapply_keeps_an_in_flight_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    in_flight = _Read({"K": _COMMITTED})
+    _by_host(monkeypatch, {_COMMITTED: in_flight})
+    store = await MessageStore.open(tmp_path / "r.db")
+    runner, references = await _engine_on_graph(store, tmp_path)
+    load = asyncio.create_task(references.sync_all())
+    try:
+        await asyncio.wait_for(in_flight.entered.wait(), _BOUND)
+        before = runner.committed_graph()[0]
+        await runner.reload()  # as a DR activation re-applies the running graph
+        assert runner.committed_graph()[0] == before
+        in_flight.release.set()
+        assert (await asyncio.wait_for(load, _BOUND)).synced == 1
+        assert store.reference_view()["codes"] == {"K": _COMMITTED}
+    finally:
+        in_flight.release.set()
+        await asyncio.gather(load, return_exceptions=True)
+        await runner.stop()
+        await store.close()
+
+
+async def test_loop_reloads_a_set_whose_load_was_replaced_without_waiting_an_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replaced, current = _Read({"A": "REPLACED"}), _Read({"A": "CURRENT"})
+    current.release.set()
+    _script(monkeypatch, {"codes": [replaced, current]})
+    generation = [1]
+    store = await MessageStore.open(tmp_path / "r.db")
+    runner = ReferenceSyncRunner(
+        store,
+        lambda: [_spec()],
+        ReferenceSettings(refresh_interval_seconds=3600),
+        graph_generation=lambda: generation[0],
+        egress=_EGRESS,
+    )
+    runner.start()
+    try:
+        await asyncio.wait_for(replaced.entered.wait(), _BOUND)
+        generation[0] = 2
+        replaced.release.set()
+        await asyncio.wait_for(current.entered.wait(), _BOUND)
+        for _ in range(200):
+            if "codes" in store.reference_view():
+                break
+            await asyncio.sleep(0.01)
+        assert store.reference_view()["codes"] == {"A": "CURRENT"}
+    finally:
+        replaced.release.set()
+        await runner.stop()
+        await store.close()
+
+
 async def test_a_graph_that_cannot_be_named_loads_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
