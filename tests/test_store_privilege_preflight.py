@@ -739,11 +739,16 @@ async def test_one_null_role_column_is_enough_to_stop_the_observation(
     store = _sqlserver_probe(
         monkeypatch,
         _probe_row(database_roles=_DOCUMENTED_SQLSERVER, unread=("db_owner",)),
+        # auto, where these three roles are the documented grant: nothing over-granted is read, so
+        # the report stays unobserved (owner ruling 2026-11-23 on #6015 item 1 keeps a READ
+        # over-grant, such as db_ddladmin under external, OBSERVED).
+        schema_management=SchemaManagement.AUTO,
     )
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
     assert "database role db_owner" in report.detail
-    assert "1 of 19 probed grant(s)" in report.detail
+    # BACKLOG #6015 item 6: the denominator says what it counts, since the probe reads more grants.
+    assert "1 of the 19 role and CONTROL grant(s) probed" in report.detail
     # What DID read is still reported: a partial read can only understate an over-grant, never invent one.
     assert set(_DOCUMENTED_SQLSERVER) <= set(report.database_roles)
 
@@ -757,6 +762,7 @@ async def test_a_null_direct_permission_column_is_not_read_either(
     store = _sqlserver_probe(
         monkeypatch,
         _probe_row(database_roles=_DOCUMENTED_SQLSERVER, control_server=None),
+        schema_management=SchemaManagement.AUTO,  # the documented grant: no over-grant read
     )
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
@@ -767,15 +773,110 @@ async def test_a_partial_read_still_names_the_over_grant_it_did_see(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Losing a confirmed ``sysadmin`` because a NEIGHBOURING column was unreadable would trade one
-    false-clean for another. The read is incomplete AND the principal is a superuser; say both."""
+    false-clean for another. The read is incomplete AND the principal is a superuser; say both.
+
+    Owner ruling 2026-11-23 on BACKLOG #6015 item 1 ("Refuse when read"): this pin read
+    UNOBSERVABLE under #1234, which only warns under enforce. A read over-grant now keeps the
+    report OBSERVED with the over-grant in ``excess``, so it refuses under enforce, and the unread
+    column is still reported, in ``unread`` and the detail."""
     store = _sqlserver_probe(
         monkeypatch,
         _probe_row(server_roles=("sysadmin",), unread=("db_owner",)),
     )
     report = await store.probe_principal_privileges()
-    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert report.status is StorePrivilegeStatus.OBSERVED
     assert report.server_roles == ("sysadmin",)
-    assert "what DID read as held: server role sysadmin" in report.detail
+    assert report.excess == ("server role sysadmin",)
+    assert report.unread == ("database role db_owner",)
+    assert "database role db_owner" in report.detail
+    assert "not read: database role db_owner" in report.summary()
+
+
+@pytest.mark.parametrize(
+    ("server_roles", "database_roles", "control_db", "unread"),
+    [
+        (("sysadmin",), (), 0, ("db_owner",)),
+        ((), ("db_datareader", "db_datawriter", "db_owner"), 0, ("sysadmin",)),
+        ((), ("db_datareader", "db_datawriter"), 1, ("sysadmin",)),
+    ],
+    ids=["sysadmin", "db_owner", "control-database"],
+)
+async def test_a_read_over_grant_refuses_under_enforce_beside_an_unread_role(
+    monkeypatch: pytest.MonkeyPatch,
+    server_roles: tuple[str, ...],
+    database_roles: tuple[str, ...],
+    control_db: int,
+    unread: tuple[str, ...],
+) -> None:
+    """Owner ruling 2026-11-23 on BACKLOG #6015 item 1: a login READ as sysadmin or db_owner, or
+    holding a read CONTROL, is refused under enforce even when another role column is unread."""
+    row = _probe_row(
+        server_roles=server_roles,
+        database_roles=database_roles,
+        control_db=control_db,
+        unread=unread,
+    )
+    store = _sqlserver_probe(monkeypatch, row)
+    report = await store.probe_principal_privileges()
+    # The over-grant arm, not an unobserved one: OBSERVED, with the read over-grant in the excess.
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess
+    with pytest.raises(StorePrivilegeError, match="BEYOND the documented least-privilege grant"):
+        await run_store_privilege_preflight(store, require_least_privilege=False, enforcing=True)
+
+
+async def test_a_read_control_is_named_as_read_beside_an_unread_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read CONTROL SERVER or database CONTROL was in the excess but missing from "what DID read
+    as held", so a refusing report's detail said "nothing" was read as held."""
+    row = _probe_row(
+        database_roles=("db_datareader", "db_datawriter"),
+        control_server=1,
+        control_db=1,
+        unread=("sysadmin",),
+    )
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert "control server" in report.excess
+    held = report.detail.split("what DID read as held:", 1)[1]
+    assert "nothing" not in held
+    assert "control server" in held
+    assert "CONTROL on database MessageFoundry" in held
+
+
+def test_the_posture_keeps_the_unread_grants_of_an_over_granted_report() -> None:
+    """A report OBSERVED with unread grants hands them on: the registry's over-grant entry names
+    them, so it does not read as a complete observation."""
+    report = StorePrivilegeReport(
+        backend=StoreBackend.SQLSERVER,
+        status=StorePrivilegeStatus.OBSERVED,
+        excess=("server role sysadmin",),
+        unread=("database role db_owner",),
+    )
+    posture = report.posture()
+    assert posture.unread == ("database role db_owner",)
+    entry = _names(posture)["store_principal_over_granted"]
+    assert "not read" in entry
+    assert "database role db_owner" in entry
+    # The other direction: with nothing unread, the entry adds no such clause.
+    assert (
+        "not read"
+        not in _names(_clean(("server role sysadmin",)).posture())["store_principal_over_granted"]
+    )
+
+
+async def test_an_unread_role_with_nothing_over_granted_read_still_only_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other direction of the ruling: with no over-grant read, the report stays UNOBSERVABLE,
+    which warns and starts under enforce."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"), unread=("sysadmin",))
+    store = _sqlserver_probe(monkeypatch, row)
+    report = await run_store_privilege_preflight(
+        store, require_least_privilege=False, enforcing=True
+    )
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
 
 
 async def test_a_null_read_refuses_under_a_declared_requirement(
@@ -928,6 +1029,162 @@ async def test_sqlserver_an_unread_external_grant_never_softens_a_found_over_gra
     assert "not read" in report.detail
     with pytest.raises(StorePrivilegeError):
         await run_store_privilege_preflight(store, require_least_privilege=False, enforcing=True)
+
+
+async def test_an_over_grant_summary_names_the_external_grants_it_could_not_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6015 item 2: an unread external-only grant beside a found over-grant was named in
+    ``detail`` alone, so the log line and the alert, which carry the summary, said nothing of it."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter", "db_owner"))
+    row["create_table"] = None
+    store = _sqlserver_probe(monkeypatch, row)
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.unread == ("create table on database MessageFoundry",)
+    assert "not read: create table on database MessageFoundry" in report.summary()
+    assert report.audit_detail()["unread"] == ["create table on database MessageFoundry"]
+
+
+async def test_an_unobserved_report_carries_its_unread_grants_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An UNOBSERVABLE report names its unread grants in the structured field as well, on the
+    external-only path and on the fixed-role path."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
+    row["create_table"] = None
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert report.unread == ("create table on database MessageFoundry",)
+    role_row = _probe_row(database_roles=("db_datareader", "db_datawriter"), unread=("db_owner",))
+    report = await _sqlserver_probe(monkeypatch, role_row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert report.unread == ("database role db_owner",)
+
+
+def test_an_observed_report_cannot_be_clean_with_grants_unread() -> None:
+    """``finding`` reads only status and excess, so OBSERVED with nothing found and something unread
+    would classify as clean. The type refuses that shape rather than rely on each backend."""
+    with pytest.raises(ValueError, match="unread"):
+        StorePrivilegeReport(
+            backend=StoreBackend.SQLSERVER,
+            status=StorePrivilegeStatus.OBSERVED,
+            unread=("create table on database MessageFoundry",),
+        )
+
+
+async def test_a_held_alter_on_an_unresolved_default_schema_is_still_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NULL default schema beside a held ALTER gave an empty schema name, which the comparator
+    read as no grant: a false clean. It is named under the unresolved label instead."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
+    row["default_schema"] = None
+    row["alter_schema"] = 1
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert "ALTER on schema (unresolved default schema)" in report.excess
+
+
+async def test_an_unread_alter_names_its_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The unread label names the schema, as the held label and the VIEW DEFINITION labels do."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
+    row["alter_schema"] = None
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.unread == ("ALTER on schema dbo",)
+
+
+def test_a_report_with_nothing_unread_keeps_its_summary() -> None:
+    """The other direction: no unread grant adds no clause."""
+    report = _clean(("database role db_owner",))
+    assert report.unread == ()
+    assert "not read" not in report.summary()
+
+
+async def test_the_alter_schema_probe_quotes_the_default_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6015 item 4: ``HAS_PERMS_BY_NAME`` parses its securable as a name, so the schema is
+    passed through ``QUOTENAME`` as the VIEW DEFINITION columns beside it already were."""
+    store = _sqlserver_probe(monkeypatch, _probe_row(database_roles=_DOCUMENTED_SQLSERVER))
+    seen: list[str] = []
+    real = store._fetchone
+
+    async def _capture(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        seen.append(sql)
+        result: dict[str, Any] | None = await real(sql, params)
+        return result
+
+    monkeypatch.setattr(store, "_fetchone", _capture)
+    await store.probe_principal_privileges()
+    assert (
+        "HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'ALTER') AS alter_schema"
+        in (seen[0])
+    )
+    assert "HAS_PERMS_BY_NAME(SCHEMA_NAME()," not in seen[0]
+
+
+async def test_an_incomplete_read_names_held_schema_ddl_rights_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6714 item 3: a held CREATE TABLE or ALTER on the schema beside an unread role is
+    named. Since the owner ruling of 2026-11-23 (#6015 item 1) both are read over-grants under
+    external, so they are named in the excess of an OBSERVED report; this asserts the excess, not
+    the detail's "what DID read as held" list."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"), unread=("db_owner",))
+    row["create_table"] = 1
+    row["alter_schema"] = 1
+    store = _sqlserver_probe(monkeypatch, row)
+    report = await store.probe_principal_privileges()
+    # Owner ruling 2026-11-23 (#6015 item 1): both rights are read over-grants under external, so
+    # the report is OBSERVED with them in the excess and the unread role named beside them.
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert "create table on database MessageFoundry" in report.excess
+    assert "ALTER on schema dbo" in report.excess
+    assert report.unread == ("database role db_owner",)
+
+
+async def test_an_incomplete_read_under_auto_does_not_list_schema_ddl_rights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under auto those rights are prescribed, so they are not listed as findings there."""
+    row = _probe_row(database_roles=_DOCUMENTED_SQLSERVER, unread=("db_owner",))
+    row["create_table"] = 1
+    row["alter_schema"] = 1
+    store = _sqlserver_probe(monkeypatch, row, schema_management=SchemaManagement.AUTO)
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert "create table on database" not in report.detail
+
+
+def test_db_securityadmin_suppresses_the_view_definition_line() -> None:
+    """BACKLOG #6714 item 2: ``db_securityadmin`` carries ``VIEW DEFINITION`` on the database, so
+    naming the role names the fix, as ``db_owner`` does; the line would restate one grant as two."""
+    excess = sqlserver_excess(
+        server_roles=(),
+        database_roles=("db_datareader", "db_datawriter", "db_securityadmin"),
+        control_server=False,
+        control_database=False,
+        database="MessageFoundry",
+        external=True,
+        view_definition=("dbo",),
+    )
+    assert excess == ("database role db_securityadmin",)
+
+
+def test_probed_grant_lives_in_the_leaf_and_the_login_probe_calls_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6015 items 7 and 8: one rule, in the leaf both packages may import, so the store
+    probe and the partner-login probe cannot drift apart."""
+    from messagefoundry import sqlserver_roles
+    from messagefoundry.transports import database
+
+    assert probed_grant is sqlserver_roles.probed_grant
+    # Call-through, not a copy: a stub that reads every answer as held turns all-zero into findings.
+    monkeypatch.setattr(database, "probed_grant", lambda value: True)
+    reading = database.classify_login_roles((0,) * len(database._LOGIN_ROLE_PROBE_ROLES))
+    assert reading.verdict is database.LoginRoleVerdict.OVER_GRANTED
 
 
 async def test_a_zero_read_is_a_real_negative_and_is_not_confused_with_a_null(
@@ -1327,6 +1584,21 @@ async def test_posture_route_reports_an_observed_over_grant(engine: Engine) -> N
     assert body["store_privilege"]["excess"] == ["server role sysadmin"]
     switches = [entry["switch"] for entry in body["loosenings"]]
     assert "store_principal_over_granted" in switches
+
+
+async def test_posture_route_reports_the_unread_grants_beside_an_over_grant(engine: Engine) -> None:
+    body = await _posture(
+        engine,
+        store_privilege=StorePrivilegePosture(
+            status=StorePrivilegeStatus.OBSERVED,
+            excess=("server role sysadmin",),
+            unread=("database role db_owner",),
+        ),
+    )
+    # The view's shape is the web-console seam, so the signal rides the loosening entry's risk text.
+    risk = {e["switch"]: e["risk"] for e in body["loosenings"]}["store_principal_over_granted"]
+    assert "not read" in risk
+    assert "database role db_owner" in risk
 
 
 async def test_posture_route_reports_an_unobservable_probe(engine: Engine) -> None:
