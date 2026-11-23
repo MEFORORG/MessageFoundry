@@ -1194,7 +1194,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "row, never a value. Exit 0 PASS, 1 FAIL (at least: a value that does not decrypt, a BLOB "
         "where the store writes text, a non-blank value with no at-rest marker on a surface the "
         "keyed store has sealed, or a walk stopped part way, by a VACUUM, a lock, a lost "
-        "connection, an unreadable row or the key service), 2 could not start, 3 NOT COVERED (a "
+        "connection, an unreadable row or the key service), 2 could not start, 3 NOT_COVERED (a "
         "PostgreSQL or SQL Server store whose catalog does not show this login a table or column "
         "the cipher inventory expects, at least through a missing grant, so those cells were not "
         "read), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
@@ -13250,16 +13250,12 @@ def _cipher_audit(args: argparse.Namespace) -> int:
 
     A server store's schema is the build's, so every cell of the inventory asked for must be
     visible in its catalog read. One that is not, a table or a column, was not read, at least
-    because the login lacks a grant on it: that is NOT COVERED, never a PASS over the rest.
+    because the login lacks a grant on it: that is NOT_COVERED, never a PASS over the rest.
 
-    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT COVERED (a server store whose catalog hides an
+    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT_COVERED (a server store whose catalog hides an
     expected cell), 4 KEY_MISMATCH (a sealed value and no key resolved, the usual cause being a
     shell without the service's key). A FAIL or KEY_MISMATCH the visible cells earn leads 3."""
-    from messagefoundry.config.settings import (
-        StoreBackend,
-        hop_posture_from_ai,
-        keyless_opt_out_refusal,
-    )
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.redaction import safe_exc
     from messagefoundry.store.base import (
@@ -13334,6 +13330,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             return 2
         cells = tuple(c for c in inventory if c.table in set(args.table))
     stopped: str | None = None
+    # A VACUUM or other schema change stopped the SQLite walk, so a rowid locator may have moved.
+    interrupted = False
     audit = CipherAudit()
     # A server store's cells, and its `keyed_surface`, that its catalog read did not show this login.
     hidden: list[str] = []
@@ -13349,6 +13347,26 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         # the error is raised for one value, and its text is not this command's to print.
         cause = exc.__cause__
         return type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
+
+    def failing_value(found: CipherAudit) -> tuple[str, str] | None:
+        # The FAIL reason the values read earn and the first failing value's line: a value that
+        # did not open or a BLOB before an unmarked value the store refuses at read; None when
+        # every value read passes. The one ranking: the verdict below and a walk stopped part
+        # way both read it.
+        if found.failed or found.blob:
+            first = next(t.first_failure for t in found.tallies if t.first_failure)
+            return (
+                f"{found.failed} sealed value(s) did not open, and {found.blob} BLOB(s) sit where "
+                f"the store writes only text; the first: {first}"
+            ), first
+        if found.unmarked and not store.allow_unmarked_ciphertext:
+            first = next(t.first_unmarked for t in found.tallies if t.first_unmarked)
+            return (
+                f"{found.unmarked} non-blank value(s) on surfaces this keyed store has sealed "
+                "carry no at-rest marker, so the store refuses each at read: a damaged or "
+                f"stripped marker, or a planted row (BACKLOG #1169); the first: {first}"
+            ), first
+        return None
 
     if server:
         # A server store: opened read-only through `open_store`, which runs no DDL and none of the
@@ -13380,7 +13398,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 # A keyless open of a keyed store refused by the open itself: the key, not the
                 # store, so KEY_MISMATCH as the SQLite branch and the full restore-verify say it.
                 return False, CipherAudit(key_mismatch=safe_exc(exc)), None, []
-            except (RuntimeError, NotImplementedError, ValueError) as exc:
+            except (RuntimeError, ValueError) as exc:
                 # Nothing was read, so never the FAIL a dispatch floor's exit 1 would read as: at
                 # least a missing driver extra, or an engine refusal of this open. Could not start.
                 if isinstance(
@@ -13405,22 +13423,32 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 ]
                 if "keyed_surface" not in columns:
                     hidden.append("keyed_surface")
+                # Filled in place, so a walk that raises part way keeps what it had tallied and a
+                # failure found before the stop is still reported (BACKLOG #1719 item 1).
+                found = CipherAudit()
                 try:
-                    found = await audit_server_cipher_cells(
-                        source, server_cipher, cells=cells, chunk_rows=chunk_rows, columns=columns
+                    await audit_server_cipher_cells(
+                        source,
+                        server_cipher,
+                        cells=cells,
+                        chunk_rows=chunk_rows,
+                        columns=columns,
+                        into=found,
                     )
                 except walk_errors as exc:
-                    if is_store_shape_error(exc):
-                        # A table, column or grant the read needs, as `audit-verify` splits it:
-                        # nothing about a row, so could not start rather than FAIL.
-                        raise _StoreUnreachable() from exc
-                    # Part way: a lost connection, a timeout, a value the driver cannot read. The
-                    # rendering is the error's class and SQLSTATE, never a row's content.
-                    return server_cipher.encrypts, CipherAudit(), _store_error_text(exc), hidden
+                    error: Exception = exc
                 except key_service_down as exc:
-                    stop = stopped_by_key_service(exc)
-                    return server_cipher.encrypts, CipherAudit(), stop, hidden
-                return server_cipher.encrypts, found, None, hidden
+                    return server_cipher.encrypts, found, stopped_by_key_service(exc), hidden
+                else:
+                    return server_cipher.encrypts, found, None, hidden
+                if is_store_shape_error(error) and failing_value(found) is None:
+                    # A table, column or grant the read needs, as `audit-verify` splits it:
+                    # nothing about a row, so could not start rather than FAIL.
+                    raise _StoreUnreachable() from error
+                # Part way: a lost connection, a timeout, a value the driver cannot read, or a
+                # grant the walk met after it had found a failing value. The rendering is the
+                # error's class and SQLSTATE, never a row's content.
+                return server_cipher.encrypts, found, _store_error_text(error), hidden
             finally:
                 await _close_store_quietly(handle)
 
@@ -13453,9 +13481,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             # too, and neither creates a file.
             _emit_error(f"no store at {path} (check --db / [store].path)", as_json=as_json)
             return 2
-        # The instance's own posture, derived as `serve` derives it, for the Vault hops the cipher
-        # build can dial (vault BACKLOG #2983).
-        posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+        # The posture the server branch opens on, for the Vault hops the cipher build can dial
+        # (vault BACKLOG #2983); `_command_hop_posture` says what it is (BACKLOG #1719 item 11).
+        posture = _command_hop_posture(settings)
         try:
             cipher = build_store_cipher(store, posture=posture)
         except _key_unresolved() as exc:
@@ -13481,18 +13509,21 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                     as_json=as_json,
                 )
                 return 2
-            audit = audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows)
+            # Filled in place, so a stop part way keeps what was counted (BACKLOG #1719 item 1).
+            audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows, into=audit)
         except sqlite3.Error as exc:
             # Part way: a lock held past --busy-timeout, a disk error, a value the driver cannot
             # read. The rendering quotes no row's content.
             stopped = _store_error_text(exc)
         except CipherWalkInterrupted as exc:
             stopped = str(exc)
+            interrupted = True
         except key_service_down as exc:
             stopped = stopped_by_key_service(exc)
         finally:
             conn.close()
 
+    failing = failing_value(audit)
     if audit.key_mismatch is not None:
         status, code = "KEY_MISMATCH", 4
         reason = (
@@ -13503,24 +13534,21 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         status, code = "FAIL", 1
         reason = (
             f"the audit stopped part way on an error ({stopped}). The values after it were not "
-            "read, and the counts are not reported: treat the store as unaudited until a run that "
+            "read, and no counts are reported: treat the store as unaudited until a run that "
             "finishes says otherwise"
         )
-    elif audit.failed or audit.blob:
+        if failing is not None:
+            # The first failing line only: a count over the values read before the stop would
+            # read as the store's.
+            reason += f". Before it stopped, a value it read already fails: {failing[1]}"
+            if interrupted:
+                reason += (
+                    ". The change that stopped the walk may have renumbered the rowid that line "
+                    "names"
+                )
+    elif failing is not None:
         status, code = "FAIL", 1
-        first = next(t.first_failure for t in audit.tallies if t.first_failure)
-        reason = (
-            f"{audit.failed} sealed value(s) did not open, and {audit.blob} BLOB(s) sit where the "
-            f"store writes only text; the first: {first}"
-        )
-    elif audit.unmarked and not store.allow_unmarked_ciphertext:
-        status, code = "FAIL", 1
-        first = next(t.first_unmarked for t in audit.tallies if t.first_unmarked)
-        reason = (
-            f"{audit.unmarked} non-blank value(s) on surfaces this keyed store has sealed carry no "
-            "at-rest marker, so the store refuses each at read: a damaged or stripped marker, or a "
-            f"planted row (BACKLOG #1169); the first: {first}"
-        )
+        reason = failing[0]
     elif hidden:
         # A server schema is the build's own, so an expected cell the catalog read did not show
         # was hidden from this login (at least a missing grant) rather than never created. Its
@@ -13564,8 +13592,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             "on it, or let the service's open migrate the store, and run again"
         )
 
-    # A walk that stopped, on an error or on the key mismatch, has no counts worth printing: zeros
-    # would read as an empty store.
+    # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted
+    # before the stop would read as the whole store's.
     counted = stopped is None and audit.key_mismatch is None
     cell_rows = audit.tallies if counted else []
     if as_json:
