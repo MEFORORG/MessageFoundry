@@ -375,15 +375,21 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   `propagate = False` on a logger of its own. A traceback's frames and exception class names are written, since
   they are code. A failure inside the screen withholds the line. Matching is linear in the line's length.
 
-  A delivery error raised while the SCU stores an object holds, on its chain, an empty exception of the library's
-  class or nothing, and never the library's text. A failed association release cannot replace that error. It is
-  logged through the screen, and a Success or Warning status then counts as a transient failure, so the retry may
-  store the object a second time.
+  A delivery error raised while the SCU stores an object holds, on its chain, at most an engine exception that
+  names the library exception's class, with none of its text.
+
+  **A failed association release does not change the outcome.** The peer's status decides it. After a C-STORE, a
+  Success or Warning stays delivered and is not sent again, any other status keeps its own outcome, and a send
+  with no status stays a failure. After a C-ECHO, the test passes only on Success. The release failure is logged
+  through the screen and the association is aborted. If the abort raises too, that is logged the same way and
+  the engine makes no further attempt to end the association.
 
   **A library exception the SCU does not wrap keeps its text.** At least one raised while the SCU opens the
   association does. The delivery worker logs only its class, but the text would reach the row's `last_error`
   through `safe_exc`, which does not recognise a refused UID. If the worker's write of that error to the store
-  then fails with an error that is not a database driver's, its fault log prints the text as well.
+  then fails with an error that is not a database driver's, its fault log prints the text as well. Test
+  Connection has the same limit: an exception raised while it opens the association or sends the C-ECHO would
+  reach the result's detail through `safe_exc`.
 
   `tests/_dicom_log_census.py` scans both installed libraries' log and `warn_and_log` calls against a pinned
   census, so a call it can read that a library adds or rewords fails a test until it is read: at least a
