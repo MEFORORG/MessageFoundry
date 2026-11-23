@@ -134,6 +134,26 @@ def test_a_ca_file_holding_an_intermediate_refuses_the_build(
 
 
 @_BUILDERS
+def test_a_ca_file_holding_a_certificate_that_is_no_ca_refuses_the_build(
+    build: _Builder, two_tier: _TwoTier, tmp_path: Path
+) -> None:
+    """A pinned server leaf is not listed by get_ca_certs, and with PARTIAL_CHAIN cleared no chain
+    could end at it, so it is refused at build rather than at every handshake."""
+    bundle = tmp_path / "root-and-leaf.pem"
+    leaf = two_tier.client_bundle.read_text("ascii").split("-----END CERTIFICATE-----")[0]
+    bundle.write_text(
+        two_tier.root_file.read_text("ascii") + leaf + "-----END CERTIFICATE-----\n", "ascii"
+    )
+    with pytest.raises(ValueError, match=r"loads 1 certificate\(s\) that are not CAs"):
+        build(_anchor(two_tier.revokes_nothing, ca_file=bundle))
+
+
+def test_an_anchor_cannot_check_the_chain_without_a_crl() -> None:
+    with pytest.raises(ValueError, match="needs a crl_file"):
+        TrustAnchor(cafile="ca.pem", load_system_roots=False, crl_check_chain=True)
+
+
+@_BUILDERS
 def test_the_os_trust_store_arms_refuse_the_build(build: _Builder, two_tier: _TwoTier) -> None:
     """No CRL file names the OS roots, so the whole-chain check cannot hold on augment or system."""
     augment = _anchor(two_tier.revokes_nothing, internal_ca=two_tier.root_file, mode="augment")

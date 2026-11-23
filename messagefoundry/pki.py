@@ -1452,8 +1452,12 @@ def cas_not_self_signed(ca_ders: Iterable[bytes]) -> list[str]:
     """Each CA in ``ca_ders`` that is not self-signed, named with its serial number, sorted (vault
     BACKLOG #5511). A CA whose self-signature cannot be checked is listed too, failing closed."""
     issued = []
-    for der in ca_ders:
-        cert = x509.load_der_x509_certificate(der)
+    for index, der in enumerate(ca_ders, 1):
+        try:
+            cert = x509.load_der_x509_certificate(der)
+        except _UNREADABLE_CA:
+            issued.append(f"CA certificate {index}, which does not parse")
+            continue
         try:
             cert.verify_directly_issued_by(cert)
         except (ValueError, TypeError, InvalidSignature, UnsupportedAlgorithm):
@@ -1484,7 +1488,7 @@ def own_crl_reason(
         if outbound:
             return (
                 "it could not be checked against the CAs the hop loaded from its CA setting, "
-                f"{_OUTBOUND_CA_SETTINGS}: {exc}"
+                f"{_OUTBOUND_CA_SETTINGS}: {str(exc).replace('loaded client CA', 'loaded CA')}"
             )
         return (
             "it could not be checked against the client CAs the hop loaded from its client-CA "

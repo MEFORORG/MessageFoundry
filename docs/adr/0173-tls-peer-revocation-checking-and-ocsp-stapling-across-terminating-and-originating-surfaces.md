@@ -1824,7 +1824,7 @@ connection's `tls_ca_file` or a pinned `[tls].internal_ca_file`. There
 `build_verifying_client_context` refuses a CA file that loads a CA that is not self-signed, clears
 `VERIFY_X509_PARTIAL_CHAIN`, and applies section 14's start rule, worded for a server chain. The
 running-hop reload applies the same rule. On the `system` and `augment` arms it refuses the build,
-since no CRL file covers the OS roots. Hops with their own CRL setting keep the leaf check, at least
-LDAPS, OIDC, the log forwarder and the Postgres store.
+since no CRL file covers the OS roots. LDAPS, OIDC, the log forwarder and the Postgres store, which
+have CRL settings of their own, keep the leaf check.
 
 Pinned by `tests/test_outbound_crl_chain.py`.

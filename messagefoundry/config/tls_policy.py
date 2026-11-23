@@ -3319,11 +3319,15 @@ class TrustAnchor:
     #: configures one.
     crl_file: str | None = None
     #: Whether ``crl_file`` is checked against the peer's whole chain (``[tls].crl_check_chain``,
-    #: vault BACKLOG #5511). Only ever True beside a ``crl_file``.
+    #: vault BACKLOG #5511). True only beside a ``crl_file``, which construction checks.
     crl_check_chain: bool = False
     #: Where ``cafile`` came from, for a refusal to name: ``[tls].internal_ca_file``, or a
     #: connection's ``tls_ca_file`` with its name (vault BACKLOG #2370). Not part of equality.
     cafile_setting: str | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.crl_check_chain and self.crl_file is None:
+            raise ValueError("a trust anchor with crl_check_chain needs a crl_file to check")
 
     @property
     def narrows(self) -> bool:
@@ -3473,8 +3477,9 @@ def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
     raise ValueError(
         f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}. The "
         "whole-chain check needs a CRL from every CA in the chain, and [tls].crl_file holds none "
-        "for the OS trust store's roots, so the setting cannot be honoured here. Give the "
-        'connection its own tls_ca_file, or set [tls].trust_anchor_mode = "pinned", or unset '
+        "for the OS trust store's roots, so the setting cannot be honoured here. Pin this "
+        "hop's CA with its own CA setting, such as a connection's tls_ca_file, or set "
+        '[tls].internal_ca_file with [tls].trust_anchor_mode = "pinned", or unset '
         "[tls].crl_check_chain"
     )
 
@@ -3490,6 +3495,16 @@ def _require_self_signed_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
     cleared, so a chain must end at a root."""
     from messagefoundry.pki import cas_not_self_signed
 
+    stats = ctx.cert_store_stats()
+    if stats["x509"] != stats["x509_ca"]:
+        # get_ca_certs leaves out a certificate that is not a CA, such as a pinned server leaf,
+        # and with the flag cleared no chain could end at it.
+        raise ValueError(
+            f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
+            f"loads {stats['x509'] - stats['x509_ca']} certificate(s) that are not CAs. The "
+            "whole-chain check needs the chain to end at a root whose CRL is in [tls].crl_file. "
+            "Put only the root CA(s) in that CA file"
+        )
     issued = cas_not_self_signed(ctx.get_ca_certs(binary_form=True))
     if issued:
         raise ValueError(
@@ -3592,8 +3607,8 @@ def build_anchored_https_handler(
     :func:`build_asserted_https_handler`, so the suite list does not depend on the anchor."""
     if not anchor.narrows:
         return build_asserted_https_handler(connector=connector)
-    _refuse_chain_check_on_os_roots(anchor)  # vault BACKLOG #5511, before anything is built
     if anchor.load_system_roots:
+        _refuse_chain_check_on_os_roots(anchor)  # vault BACKLOG #5511, before anything is built
         # augment (and the CRL-only shape below): urllib's OWN context, with the internal CA and/or the
         # CRL loaded on top. Nothing is replayed because nothing is rebuilt -- the only changes are one
         # more trusted root and, with a CRL, the revocation flag.
