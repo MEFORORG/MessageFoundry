@@ -341,11 +341,12 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   written only where the command set itself ends the association. Where a later PDU ends it, before
   pynetdicom reads the message, that read's lines are written nowhere. A line on any other logger is written
   twice. pydicom also raises each of its lines above as a `UserWarning`, which would carry the value to
-  stderr. A warnings filter, installed at import and again at each SCP start, ignores those copies and no
-  other pydicom warning; a host that resets the process's
-  warnings filters after that brings the copy back. The engine's
+  stderr. A warnings filter, installed at import, at each SCP start and before each SCU association, ignores
+  those copies and no other pydicom warning; a host that resets the process's warnings filters between those
+  points brings the copy back until the next one. The filter also renders a codec error on these loggers
+  without the byte it failed on, for a host whose handlers lack the engine's log chain. The engine's
   own C-STORE lines name an object's SOP class and instance UIDs only when they are conformant, and `[redacted]`
-  otherwise.
+  otherwise, and redact a refused value from a library error they quote.
 - **Egress is fail-closed.** A DIMSE destination is gated by `[egress].allowed_tcp`; a DICOMweb destination by
   `[egress].allowed_http` — both enforced at load/reload/start.
 

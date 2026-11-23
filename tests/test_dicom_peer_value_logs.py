@@ -1343,6 +1343,100 @@ def test_the_no_presentation_context_line_is_still_pynetdicoms() -> None:
     assert 'msg += f" for the {role.upper()} role"' in source
 
 
+# --- A codec error on a filtered logger, on a host with no engine log chain (#6637, item 15) -------
+
+
+def test_a_codec_errors_byte_never_reaches_a_stock_handler(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # decode_bytes logs each UnicodeDecodeError it hits, and its str() names the byte.
+    from pynetdicom import utils
+
+    def decoded() -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG), pytest.raises(ValueError):
+            utils.decode_bytes(b"\xc3\x28")
+        return _formatted(list(caplog.records))
+
+    with _filter_removed():  # CONTROL: a stock formatter writes the byte, in the line and traceback
+        assert [line for line in decoded() if line.count("0xc3") >= 2]
+    lines = decoded()
+    assert lines
+    assert not [line for line in lines if "0xc3" in line], lines
+    assert [line for line in lines if "UnicodeDecodeError" in line], lines
+
+
+def test_a_codec_error_in_a_records_args_is_rendered_safely() -> None:
+    try:
+        b"\xc3\x28".decode("ascii")
+    except UnicodeDecodeError as exc:
+        record = logging.LogRecord(
+            "pynetdicom.events", logging.ERROR, __file__, 1, "failed: %s", (exc,), None
+        )
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    assert "0xc3" not in record.getMessage()
+
+
+# --- The SCU's warnings filter, and the engine's own error text (#6637, items 11 and 14) -----------
+
+
+def test_the_scu_puts_the_warnings_filter_back_on_a_host_that_reset_it() -> None:
+    from tests.test_dicom_scu import _scu
+
+    with warnings.catch_warnings(record=True) as caught:  # CONTROL: reset, the copy names the value
+        warnings.simplefilter("always")
+        dicom_module._read_command_set(_planted_command())
+    assert [w for w in caught if _PLANTED in str(w.message)]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _scu(1)._build_ae()
+        dicom_module._read_command_set(_planted_command())
+    assert not [w for w in caught if _PLANTED in str(w.message)]
+
+
+async def test_the_scus_delivery_error_names_no_refused_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pynetdicom.association import Association
+
+    from messagefoundry.transports.base import DeliveryError
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    def refuse(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(_REFUSAL)
+
+    monkeypatch.setattr(Association, "send_c_store", refuse)
+    with _storage_scp() as port, pytest.raises(DeliveryError) as raised:
+        await _scu(port).send(_carry(make_sr_part10()))
+    assert _PLANTED not in str(raised.value)
+    assert "value '[redacted]' - must not exceed 64 characters" in str(raised.value)
+
+
+async def test_the_scps_decode_error_line_names_no_refused_value(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pydicom.dataset import Dataset
+
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scp import _scu_cstore
+
+    def refuse(self: Any, *args: Any, **kwargs: Any) -> None:
+        raise ValueError(_REFUSAL)
+
+    data = make_sr_part10()
+    async with _running_scp({"timeout_seconds": 5.0}) as scp:
+        monkeypatch.setattr(Dataset, "save_as", refuse)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.dicom"):
+            await asyncio.to_thread(_scu_cstore, scp.sockport, data)
+    lines = [
+        r.getMessage() for r in caplog.records if "could not be decoded/encoded" in r.getMessage()
+    ]
+    assert lines, caplog.text
+    assert not [line for line in lines if _PLANTED in line], lines
+    assert [line for line in lines if "value '[redacted]'" in line], lines
+
+
 # --- A peer's DIMSE response that does not convert (vault BACKLOG #6637, item 4) -------------------
 
 _PLANTED_REFUSED = "1.02." + "9" * 70  # over 64 characters, so set_uid raises rather than warns

@@ -112,7 +112,7 @@ from messagefoundry.parsing.dicom._inflate import (
 )
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.redaction import _REDACTED, safe_exc, safe_traceback
+from messagefoundry.redaction import _REDACTED, prepare_log_record, safe_exc, safe_traceback
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
@@ -743,6 +743,12 @@ class _PeerValueFilter(logging.Filter):
             held.append(record)
             return False
         shapes = _SHAPES_BY_LOGGER.get(record.name, _REFUSALS)
+        # A codec error in the message or its args names a byte of what it failed on. The engine's
+        # log chain renders it safely, but a host's handler need not, so it is done here as well. The
+        # traceback is left out of this step and read below.
+        info, record.exc_info = record.exc_info, None
+        prepare_log_record(record)
+        record.exc_info = info
         try:
             text = record.getMessage()
         except Exception as failed:  # noqa: BLE001 - bad %-args, or a msg whose str() raises
@@ -777,7 +783,8 @@ def _redact_traceback(
     which redacting the record's own message does not reach. The traceback is rendered through
     :func:`~messagefoundry.redaction.safe_traceback` into ``exc_text`` and ``exc_info`` cleared, as
     ``prepare_log_record`` does, so a formatter writes the rendered copy and its codec-error lines
-    keep that function's protection. A traceback with no such message is left as it was.
+    keep that function's protection. A traceback with no such message is left as it was, unless it
+    holds a codec error, whose line only that rendering rewrites.
 
     The redaction is a replace of each message in the rendered text, so a message the rendering
     does not hold verbatim withholds the whole traceback. ``safe_traceback`` rewrites a line, or
@@ -798,9 +805,13 @@ def _redact_traceback(
             current = current.__cause__
         else:
             current = None if current.__suppress_context__ else current.__context__
+    info = (type(exc), exc, exc.__traceback__)
+    rendered = safe_traceback(info)
     if not redactions:
+        # Where safe_traceback rewrote a codec error's line, a stock formatter would write it raw.
+        if rendered != logging.Formatter().formatException(info):
+            record.exc_info, record.exc_text = None, rendered
         return
-    rendered = safe_traceback((type(exc), exc, exc.__traceback__))
     # All checked before any replace, since one link's message can repeat or hold another's.
     if any(message not in rendered for message, _ in redactions):
         record.exc_info = None
@@ -830,6 +841,13 @@ def _redact_flagged_peer_values() -> None:
 
 
 _redact_flagged_peer_values()
+
+
+def _safe_library_exc(exc: BaseException) -> str:
+    """:func:`~messagefoundry.redaction.safe_exc` of an exception pydicom or pynetdicom raised, with
+    a refusal's value redacted. ``redact()`` does not recognise a UID, so a refused one survives it."""
+    text = safe_exc(exc)
+    return _redacted_line(_REFUSALS, text) or text
 
 
 def _write_held(held: list[logging.LogRecord]) -> None:
@@ -2545,7 +2563,7 @@ class DicomScpSource(SourceConnector):
                     "DICOM C-STORE from %s (AE %r): object could not be decoded/encoded: %s",
                     peer_ip,
                     calling_ae,
-                    safe_exc(exc),
+                    _safe_library_exc(exc),
                 )
                 return _STATUS_CANNOT_UNDERSTAND
             # For the log lines below alone, so a value pydicom flags as it reads it goes no further.
@@ -2569,7 +2587,7 @@ class DicomScpSource(SourceConnector):
                 object_bytes, peer_ip=peer_ip, sop_instance=sop_instance, sop_class=sop_class
             )
         except Exception as exc:  # noqa: BLE001 - last-resort: a callback must never raise to pynetdicom
-            logger.error("DICOM C-STORE failed unexpectedly: %s", safe_exc(exc))
+            logger.error("DICOM C-STORE failed unexpectedly: %s", _safe_library_exc(exc))
             return _STATUS_CANNOT_UNDERSTAND
 
     def _raw_over_cap(self, event: Any, *, peer_ip: str, calling_ae: str) -> int | None:
@@ -2938,6 +2956,7 @@ class DicomScuDestination(DestinationConnector):
     def _build_ae(self) -> Any:
         from pynetdicom import AE
 
+        _redact_flagged_peer_values()  # the SCP's start does this too, and this host may have none
         ae = AE(ae_title=self._calling_ae_title)
         ae.acse_timeout = self._timeout
         ae.dimse_timeout = self._timeout
@@ -3049,7 +3068,8 @@ class DicomScuDestination(DestinationConnector):
             if final is not None:
                 raise final from exc
             raise DeliveryError(
-                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} failed: {safe_exc(exc)}"
+                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} failed: "
+                f"{_safe_library_exc(exc)}"
             ) from exc
         finally:
             assoc.release()
