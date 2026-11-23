@@ -6726,13 +6726,27 @@ class SqlServerStore:
         detail: str | None,
         now: float,
     ) -> None:
-        if not should_record_event(event, self._message_events):
-            return  # #63 verbosity gate — floor events always pass; routine ones thinnable
         # A lambda, not the bound method: the PHI logging inventory reads each _event_stmt call site.
-        sql, params = await cipher_call(
-            self._cipher, lambda: self._event_stmt(message_id, event, destination, detail, now)
+        built = await self._prepare_event(
+            event, detail, lambda: self._event_stmt(message_id, event, destination, detail, now)
         )
-        await cur.execute(sql, params)
+        if built is not None:
+            await cur.execute(*built)
+
+    async def _prepare_event(
+        self, event: str, detail: str | None, build: Callable[[], tuple[str, tuple[Any, ...]]]
+    ) -> tuple[str, tuple[Any, ...]] | None:
+        """``build()``, the :meth:`_event_stmt` statement for ``event`` and ``detail``, or ``None``
+        when the #63 verbosity gate drops ``event`` (floor events always pass).
+
+        A blank ``detail`` has nothing to encrypt, so its statement is built here on the loop. Any
+        other is built through :func:`cipher_call`, on the Transit pool under a cipher that blocks
+        on I/O (BACKLOG #3929)."""
+        if not should_record_event(event, self._message_events):
+            return None
+        if not detail:
+            return build()
+        return await cipher_call(self._cipher, build)
 
     def _event_sync(
         self,
