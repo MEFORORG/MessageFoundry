@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -448,6 +449,41 @@ async def test_a_client_stalling_the_413s_write_cannot_hold_the_deadline_open(
     messages = [r.getMessage() for r in caplog.records]
     assert any("413 not fully handed to the host" in m for m in messages)
     assert not any("413 was handed to the host" in m for m in messages)
+
+
+async def test_the_deadline_log_says_how_long_a_stalled_413_write_held_the_cut_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The deadline is due at once and the stalled write holds the cut for the grace, so the log's
+    figure must be the time the request took: the configured deadline says nothing about it."""
+    grace = 0.3
+    monkeypatch.setattr(request_timeout, "_REFUSAL_WRITE_GRACE_SECONDS", grace)
+    app, _, _, _, deadline_due_now = _app_whose_route_waits_after_the_disconnect(monkeypatch)
+
+    async def body_write_stalls(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            await asyncio.Event().wait()
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.request_timeout"):
+        await asyncio.wait_for(
+            _drive(
+                app,
+                [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)],
+                path=_OVER_CAP_ROUTE,
+                on_pull=deadline_due_now,
+                on_send=body_write_stalls,
+            ),
+            GENEROUS_DEADLINE_SECONDS,
+        )
+
+    found = [
+        m
+        for r in caplog.records
+        if (m := re.search(r"ended (\d+\.\d)s after it began", r.getMessage()))
+    ]
+    assert len(found) == 1
+    # Below the grace by a margin for the loop's clock resolution, which can run a timer early.
+    assert grace - 0.05 <= float(found[0][1]) < GENEROUS_DEADLINE_SECONDS
 
 
 async def test_the_deadline_log_does_not_claim_a_413_that_could_not_be_sent(

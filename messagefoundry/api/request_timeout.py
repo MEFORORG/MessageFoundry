@@ -122,6 +122,7 @@ class RequestTimeoutMiddleware:
         refusal_due: float | None = None  # the deadline's own time, while the 413 is being written
         refusal_handed_over = False
         route_running = True
+        began = get_running_loop().time()
 
         try:
             async with asyncio.timeout(seconds) as deadline:
@@ -176,9 +177,12 @@ class RequestTimeoutMiddleware:
                     # The deadline did its work on the route, so there is no error left to raise.
                     # The 413 was this request's response, whole or not, so no 503 follows it.
                     # A host's send can return for a client already gone, so this cannot say the
-                    # client received the 413, only that the host took it.
+                    # client received the 413, only that the host took it. The time is measured
+                    # because a write of the 413 can hold the cut up to the grace past the deadline.
                     _log.warning(
-                        "request cut off by its %.1fs deadline, still running %s, on %s %s",
+                        "request ended %.1fs after it began, cut off by its %.1fs deadline while "
+                        "still running %s, on %s %s",
+                        get_running_loop().time() - began,
                         seconds,
                         "after the body limit's 413 was handed to the host"
                         if refusal_handed_over
