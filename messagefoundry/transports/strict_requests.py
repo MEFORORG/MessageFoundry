@@ -907,7 +907,7 @@ def _stays_on_the_box(host: str, proxy: str | None) -> bool:
     ``tls_policy.is_loopback_hop_host``, which never resolves DNS, reached with no proxy. A
     loopback address behind a proxy is not on the box, because the proxy carries it elsewhere.
     A blank host is not either, because it names no hop at all."""
-    return not proxy and bool(host) and is_loopback_hop_host(host)
+    return not proxy and is_loopback_hop_host(host)
 
 
 def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str) -> None:
@@ -1496,7 +1496,7 @@ def _refuse_an_unrevoked_proxy_leg(
     if _crossed_unrevoked(
         connector=connector,
         # The leg ends at the proxy, so only the proxy's own host decides it, without DNS.
-        on_box=bool(host := (proxy_host or "").strip("[]")) and is_loopback_hop_host(host),
+        on_box=is_loopback_hop_host((proxy_host or "").strip("[]")),
         checks_revocation=lambda: crl_credited(context),
         revocation_attested=revocation_attested,
         attestation_section=attestation_section,

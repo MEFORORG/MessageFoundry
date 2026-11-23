@@ -7,11 +7,16 @@ as ``""`` took the on-box carve-out on its cleartext, revocation and trust-ancho
 host means different things to different callers, so the predicate no longer answers for them.
 Each caller here says what empty means where it stands:
 
-* a default that really is local: the HTTP listener binds ``127.0.0.1``, so it stays on-box;
 * an unconfigured feature: no log forwarder is built, so there is no hop to judge;
 * a gate where "remote" is the permissive answer: empty still counts as this host;
 * an unknown destination: the store, a generic ODBC ``server``, and every shared guard and trust
   anchor. It is judged off-box, so it fails closed.
+
+The fourth meaning, a default that really is local, is the HTTP listener's: a blank host binds
+loopback. ``test_offloopback_without_effective_peer_control_refused_by_posture`` in
+``tests/test_inbound_http_intake_auth.py`` pins it. The predicate's own answer is in
+``tests/test_tls_policy.py``, and ``is_never_proxied_host`` in
+``tests/test_loopback_hop_never_proxied.py``.
 
 Every case pairs the empty host with a control on a real host, so a site that refused everything,
 or allowed everything, would fail too. Nothing here touches the network.
@@ -25,12 +30,12 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth.trust_anchors import smtp_hop_anchor_spec
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import Destination
 from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
     AlertsSettings,
     AuthSettings,
     LoggingSettings,
-    StoreBackend,
     StoreSettings,
     TlsSettings,
     _names_this_host,
@@ -38,24 +43,23 @@ from messagefoundry.config.settings import (
     pinned_host_port,
 )
 from messagefoundry.config.tls_policy import (
+    TLS_REVOCATION_ATTESTED_ENV,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
-    RevocationHopGuard,
     TrustAnchorPolicy,
     active_hop_posture,
     is_loopback_hop_host,
     resolve_trust_anchor,
 )
-from messagefoundry.config.wiring import WiringError
-from messagefoundry.pipeline.wiring_runner import check_http_intake_auth
 from messagefoundry.restricted_file import _loopback_share_problem
 from messagefoundry.store.postgres import _build_ssl
-from messagefoundry.transports.bounded_read import is_never_proxied_host
-from messagefoundry.transports.database import DatabaseDestination, DatabaseSource
 from messagefoundry.transports.mllp import InsecureHopGuard
 from messagefoundry.transports.strict_requests import _stays_on_the_box
 from messagefoundry.transports.tcp import TcpDestination
+from tests.test_hop_refusal_db_inbound import _GENERIC_CONNECTORS
+from tests.test_hop_refusal_rawtcp import tcp_cfg
+from tests.test_hop_refusal_revocation import _guard, _pg
 
 ENFORCING = HopPosture(enforcing=True)
 REMOTE = "192.0.2.10"  # RFC 5737 TEST-NET-1: never routed
@@ -65,35 +69,8 @@ LOOPBACK = "127.0.0.1"
 @pytest.fixture(autouse=True)
 def _no_escape_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neither relaxation may mask a refusal these tests expect."""
-    monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
-    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-
-
-# --- the predicate ----------------------------------------------------------------------------
-
-
-def test_an_empty_host_is_not_loopback() -> None:
-    assert is_loopback_hop_host("") is False
-    # CONTROL: the three shapes that really do name this box still do.
-    assert all(is_loopback_hop_host(h) for h in ("localhost", "127.0.0.1", "::1"))
-
-
-# --- a default that really is local: the inbound HTTP listener --------------------------------
-
-
-def _http_source(host: str) -> Source:
-    return Source(type=ConnectorType.HTTP, settings={"host": host, "port": 8080})
-
-
-def test_a_blank_http_listener_host_binds_loopback_so_the_gate_passes_it() -> None:
-    """``HttpSource`` reads ``s.get("host") or "127.0.0.1"``, so a blank host binds loopback. The
-    gate has to read the same default, or it would refuse a listener that is not exposed."""
-    check_http_intake_auth(_http_source(""), "IB_HTTP", posture=ENFORCING)
-
-
-def test_the_http_listener_gate_still_refuses_an_exposed_bind() -> None:
-    with pytest.raises(WiringError, match="non-loopback host"):
-        check_http_intake_auth(_http_source("0.0.0.0"), "IB_HTTP", posture=ENFORCING)
+    monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
 
 
 # --- an unconfigured feature: the log forwarder -----------------------------------------------
@@ -122,6 +99,11 @@ def test_a_host_that_trims_to_nothing_is_not_a_separate_collector(host: str) -> 
     assert _names_this_host(host) is True
 
 
+@pytest.mark.parametrize("host", ["localhost", "LOCALHOST.", "app.localhost"])
+def test_names_this_host_still_reads_the_localhost_names(host: str) -> None:
+    assert _names_this_host(host) is True
+
+
 def test_names_this_host_still_reads_a_real_remote_as_remote() -> None:
     assert _names_this_host(REMOTE) is False
 
@@ -139,62 +121,34 @@ def test_a_key_share_whose_server_trims_to_nothing_is_still_refused() -> None:
 # --- an unknown destination: the store ---------------------------------------------------------
 
 
-def _pg(server: str | None) -> StoreSettings:
-    settings = StoreSettings(
-        backend=StoreBackend.POSTGRES, server=LOOPBACK, database="mefor", username="mefor"
-    )
+def _store_with_server(server: str | None) -> StoreSettings:
     # model_copy: the validator refuses a None server, and a blank one is the case it lets through.
-    return settings.model_copy(update={"server": server})
+    return _pg(LOOPBACK).model_copy(update={"server": server})
 
 
 @pytest.mark.parametrize("server", ["", None])
 def test_a_store_with_no_server_is_not_judged_on_box(server: str | None) -> None:
-    with pytest.raises(InsecureHopRefused, match="revocation"):
-        _build_ssl(_pg(server), posture=ENFORCING)
+    with pytest.raises(InsecureHopRefused, match=r"to \(no \[store\]\.server\):"):
+        _build_ssl(_store_with_server(server), posture=ENFORCING)
 
 
 def test_a_store_on_loopback_is_still_on_box() -> None:
-    assert _build_ssl(_pg(LOOPBACK), posture=ENFORCING) is not None
+    assert _build_ssl(_store_with_server(LOOPBACK), posture=ENFORCING) is not None
 
 
 # --- an unknown destination: a generic ODBC server -----------------------------------------------
 
 
-_GENERIC: dict[str, object] = {
-    "dialect": "generic",
-    "odbc_driver": "PostgreSQL Unicode",
-}
-
-
-def _generic_dest(server: str) -> Destination:
-    return Destination(
-        name="OB_DB_GEN",
-        type=ConnectorType.DATABASE,
-        settings={**_GENERIC, "server": server, "statement": "INSERT INTO t (x) VALUES (:x)"},
-    )
-
-
-def _generic_source(server: str) -> Source:
-    return Source(
-        name="IB_DB_GEN",
-        type=ConnectorType.DATABASE,
-        settings={**_GENERIC, "server": server, "poll_statement": "SELECT 1"},
-    )
-
-
-_GENERIC_CONNECTORS = [(DatabaseDestination, _generic_dest), (DatabaseSource, _generic_source)]
-
-
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
 def test_a_blank_generic_server_is_not_judged_on_box(
-    connector: Callable[[Any], object], config: Callable[[str], Any]
+    connector: Callable[[Any], object], config: Callable[..., Any]
 ) -> None:
     """A ``server`` of spaces passes the required-setting check and splits to an empty host. The
     driver is handed that text, so where it dials is not known here. CONTROL: real loopback."""
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused):
-        connector(config("  "))
+        connector(config(server="  "))
     with active_hop_posture(ENFORCING):
-        assert connector(config(LOOPBACK))
+        assert connector(config(server=LOOPBACK))
 
 
 # --- an unknown destination: the shared guards and the trust anchor -----------------------------
@@ -219,18 +173,9 @@ def test_the_cleartext_guard_refuses_an_empty_host() -> None:
 
 
 def test_the_revocation_guard_refuses_an_empty_host() -> None:
-    def disposition(host: str) -> HopDisposition | None:
-        return RevocationHopGuard.capture(
-            host=host,
-            cell="test",
-            description="test",
-            attested=False,
-            posture=ENFORCING,
-            connection=None,
-        ).disposition()
-
-    assert disposition("") is HopDisposition.REFUSE
-    assert disposition(LOOPBACK) is HopDisposition.ALLOW
+    with active_hop_posture(ENFORCING):
+        assert _guard("").disposition() is HopDisposition.REFUSE
+        assert _guard(LOOPBACK).disposition() is HopDisposition.ALLOW
 
 
 def test_a_trust_anchor_on_an_empty_host_keeps_the_ca_and_the_crl() -> None:
@@ -242,13 +187,7 @@ def test_a_trust_anchor_on_an_empty_host_keeps_the_ca_and_the_crl() -> None:
     assert (on_box.cafile, on_box.crl_file) == (None, None)
 
 
-# --- callers that already answer for an empty host themselves ------------------------------------
-
-
-def test_the_never_proxied_reader_reads_no_host_as_off_box() -> None:
-    assert is_never_proxied_host("") is False
-    assert is_never_proxied_host(None) is False
-    assert is_never_proxied_host(LOOPBACK) is True
+# --- callers that read the predicate's answer for an empty host ----------------------------------
 
 
 def test_a_vault_hop_with_a_blank_host_does_not_stay_on_the_box() -> None:
@@ -256,8 +195,9 @@ def test_a_vault_hop_with_a_blank_host_does_not_stay_on_the_box() -> None:
     assert _stays_on_the_box(LOOPBACK, None) is True
 
 
-def test_a_sidecar_entry_with_no_host_is_not_pinned() -> None:
-    assert pinned_host_port(":8123") is None
+@pytest.mark.parametrize("entry", [":8123", "[]:8123"])
+def test_a_sidecar_entry_with_no_host_is_not_pinned(entry: str) -> None:
+    assert pinned_host_port(entry) is None
     assert pinned_host_port(f"{LOOPBACK}:8123") == (LOOPBACK, 8123)
 
 
@@ -282,11 +222,7 @@ def test_a_bracketed_loopback_literal_reads_as_remote() -> None:
 
 @pytest.mark.parametrize(("host", "refused"), [("[::1]", True), ("::1", False)])
 def test_a_bracketed_loopback_tcp_hop_fails_closed(host: str, refused: bool) -> None:
-    config = Destination(
-        name="OB_TCP",
-        type=ConnectorType.TCP,
-        settings={"host": host, "port": 9100, "framing": "stx_etx"},
-    )
+    config: Destination = tcp_cfg(host)
     with active_hop_posture(ENFORCING):
         if refused:
             with pytest.raises(InsecureHopRefused):

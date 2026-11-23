@@ -312,7 +312,7 @@ from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.egress import warn_url_query_credentials_before_build
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
-from messagefoundry.transports.http_listener import reply_seconds
+from messagefoundry.transports.http_listener import DEFAULT_BIND_HOST, reply_seconds
 from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
@@ -16422,9 +16422,9 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
     """
     if source.type is not ConnectorType.HTTP:
         return
-    # A blank host binds loopback: this is HttpSource's own `s.get("host") or "127.0.0.1"` fallback,
-    # read here because the shared predicate does not take "" as loopback (BACKLOG #5512).
-    host = str(source.settings.get("host", "127.0.0.1")) or "127.0.0.1"
+    # A blank host binds HttpSource's own default, so the gate judges that address: the shared
+    # predicate does not take "" as loopback (BACKLOG #5512).
+    host = str(source.settings.get("host", DEFAULT_BIND_HOST)) or DEFAULT_BIND_HOST
     # CIDR-aware. Reused rather than minting another _LOOPBACK_HOSTS frozenset; the tree already
     # carries five same-named copies across two distinct contents.
     if is_loopback_hop_host(host):

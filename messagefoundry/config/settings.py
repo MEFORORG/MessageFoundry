@@ -5155,7 +5155,7 @@ def _names_this_host(host: str) -> bool:
 
     The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
     h = _bare_host(host)
-    if not h or is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
+    if not h or is_loopback_hop_host(h) or h.endswith(".localhost"):
         return True
     addr = _host_ip_literal(h)
     return addr is not None and (addr.is_loopback or addr.is_unspecified)
@@ -5539,7 +5539,7 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     number = int(port)
     # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
     # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
-    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+    if "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
         return None
     try:
         address = ipaddress.ip_address(host)

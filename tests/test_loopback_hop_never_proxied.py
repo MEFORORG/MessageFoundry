@@ -244,8 +244,8 @@ def test_the_rule_reads_a_host_exactly_as_the_cleartext_guard_does(
 
 
 def test_a_url_with_no_host_is_not_counted_as_on_box() -> None:
-    """The shared predicate reads an empty host as loopback, and the guard refuses a URL with no
-    host before it asks. This rule takes the guard's side: nothing unreadable goes direct."""
+    """The guard refuses a URL with no host before it asks the shared predicate. This rule takes
+    the guard's side: nothing unreadable goes direct."""
     assert is_never_proxied_host("127.0.0.1")
     assert not is_never_proxied_host("")
     assert not is_never_proxied_host(None)
@@ -495,10 +495,8 @@ def test_a_percent_encoded_host_goes_to_this_box_on_a_direct_leg() -> None:
     assert _dialled(opener, "http://%6cocalhost:18080/x") == "localhost:18080"
 
 
-def test_the_host_a_plain_rstrip_would_empty_stays_off_box() -> None:
-    """``http://./x`` names the host ``.``, which is remote. Stripped, it is the empty host, which
-    is remote too since BACKLOG #5512."""
+def test_a_lone_dot_host_reads_as_remote() -> None:
+    """``http://./x`` names the host ``.``, which is remote."""
     host = hop_url_host("http://./x", cell="test")
     assert host == "."
     assert not is_loopback_hop_host(host)
-    assert not is_loopback_hop_host(host.rstrip("."))

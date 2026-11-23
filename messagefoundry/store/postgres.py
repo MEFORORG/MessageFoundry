@@ -1784,9 +1784,6 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # verifying store hop unless revocation is really checked on it. Byte-identical when the posture is
     # unstamped / non-prod / loopback / CRL-checked; composes with (never loosens) the weakened-TLS
     # refusal above, which fires first.
-    # settings.server is str | None, and the load refuses only None. A blank one names no host, so
-    # this guard cannot place the hop and judges it off-box (BACKLOG #5512); the stand-in names the
-    # setting in the refusal, where a bare "" would leave a gap in the text.
     ctx = _verifying_context_at_open(settings)
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
@@ -1794,9 +1791,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # same builder (`_per_connection_ssl_connect`). With ssl_crl_file set it either sets the flag or
     # raises; unset, it leaves the flag clear. Either way the verdict reached here holds for every
     # connection the pool opens.
-    _refuse_store_revocation(
-        host=settings.server or "(no [store].server)", posture=posture, context=ctx
-    )
+    _refuse_store_revocation(host=settings.server, posture=posture, context=ctx)
     return ctx
 
 
@@ -2020,7 +2015,7 @@ _STORE_WAYS_ACROSS = (
 
 
 def _refuse_store_revocation(
-    *, host: str, posture: HopPosture | None, context: ssl.SSLContext | None = None
+    *, host: str | None, posture: HopPosture | None, context: ssl.SSLContext | None = None
 ) -> None:
     """Refuse a VERIFYING engine->store TLS hop that does no certificate revocation checking (#201).
 
@@ -2061,7 +2056,9 @@ def _refuse_store_revocation(
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
     RevocationHopGuard.capture(
-        host=host,
+        # The load refuses only a None server. A blank one names no host, so the guard cannot place
+        # the hop and judges it off-box (BACKLOG #5512); the stand-in names the setting in its text.
+        host=host or "(no [store].server)",
         cell="[store] Postgres TLS (verified TLS, no revocation check)",
         description=(
             "carries the PHI message store over verified TLS but performs no certificate revocation "
