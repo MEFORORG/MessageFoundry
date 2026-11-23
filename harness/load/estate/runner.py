@@ -503,12 +503,14 @@ def _reconcile(
     # reading" (the batch-box aggregate reads the -1).
     metrics_missing = base is None or final is None
     if base is None or final is None:
-        read, written, backlog = 0, 0, -1
+        read, written, backlog, out_dead = 0, 0, -1, 0
     else:
         read = final.read - base.read
         written = final.written - base.written
         # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
         backlog = final.backlog
+        # A delta, so dead rows from before this step do not count against it (BACKLOG #5436).
+        out_dead = final.out_dead - base.out_dead
     # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
     # the engine deltas may rest on it; the load copy's reasoning is the source of record. The
     # stranding budget reads only client counters, so it still proves a loss across it. A negative
@@ -539,7 +541,20 @@ def _reconcile(
     floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0
+    # A FLOOR, NOT A RECONCILIATION (BACKLOG #5436). Minimum fan-out is 1, so a drained step must
+    # write at least what it read. connscale can treat this as complete because each of its inbounds
+    # routes to exactly one outbound. Estate hubs send to `hub_fanout` destinations
+    # (harness/config/estate/graph.py), so `written` can exceed `read`, and a hub's surplus can hide
+    # a simple feed's shortfall. A clear floor therefore says NOTHING about ingress or routed
+    # dead-letters when hubs exist: that needs an expected-written figure or a store-truth all-stage
+    # dead count. Before the drain, a row still in the pipeline reads like a shortfall, so only a
+    # drained step is judged.
+    write_short = read - written
+    write_lost = write_short > 0 and drained
+    # Outbound dead-letters only: `out_dead` sums the outbound connections' dead rows.
+    engine_lost = (
+        read_short > 0 or floor_short > 0 or deliver_short > 0 or write_lost or out_dead > 0
+    )
     lost = (engine_judged and engine_lost) or over_budget
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
@@ -575,6 +590,13 @@ def _reconcile(
     if engine_judged and deliver_short > 0:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
+        )
+    if engine_judged and out_dead > 0:
+        parts.append(f"{out_dead} outbound row(s) dead-lettered during the step")
+    if engine_judged and write_lost:
+        parts.append(
+            f"engine_written {written} < engine_read {read}: fewer deliveries than messages read "
+            f"(at least {write_short} undelivered)"
         )
     if not drained and final is not None:
         parts.append(

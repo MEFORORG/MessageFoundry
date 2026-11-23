@@ -933,6 +933,100 @@ def test_estate_reconcile_clean_run_still_reports_the_flat_claim() -> None:
     assert result.detail == "read>=sent, sink_received>=written, backlog drained"
 
 
+# --- estate dead-letter and write floor (BACKLOG #5436) -------------------------------------------
+
+
+def test_estate_reconcile_outbound_dead_letters_are_loss() -> None:
+    c = Counters(sent=100, acked=100, sink_received=40)
+    final = replace(_sample(read=100, written=40), out_dead=60)
+    result = estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "60 outbound row(s) dead-lettered" in result.detail
+
+
+def test_estate_reconcile_outbound_dead_letter_masked_by_fanout_is_still_loss() -> None:
+    # The write floor cannot see this one (written >= read); only the dead arm can.
+    c = Counters(sent=100, acked=100, sink_received=150)
+    final = replace(_sample(read=100, written=150), out_dead=1)
+    result = estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "1 outbound row(s) dead-lettered" in result.detail
+    assert "fewer deliveries" not in result.detail
+
+
+def test_estate_reconcile_dead_letters_from_before_the_baseline_do_not_count() -> None:
+    base = replace(_BASE, out_dead=7)
+    final = replace(_RIG_FINAL, out_dead=7)
+    result = estate_reconcile(_RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET)
+    assert result.ok, result.detail
+
+
+def test_estate_reconcile_dead_count_that_fell_is_not_loss() -> None:
+    # A purge or replay lowers the gauge. The delta is negative, so the arm does not fire.
+    base = replace(_BASE, out_dead=7)
+    final = replace(_RIG_FINAL, out_dead=2)
+    result = estate_reconcile(_RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET)
+    assert result.ok, result.detail
+    assert "dead-lettered" not in result.detail
+
+
+def test_estate_reconcile_dead_delta_across_a_counter_reset_is_not_judged() -> None:
+    final = replace(_RIG_FINAL, out_dead=5)
+    result = estate_reconcile(
+        _RIG_CLEAN,
+        _BASE,
+        final,
+        unconfirmed_budget=_BUDGET,
+        counter_reset="the engine restarted mid-run",
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "dead-lettered" not in result.detail
+
+
+def test_estate_reconcile_drained_write_shortfall_is_loss() -> None:
+    # 60 dead at the routed stage: no outbound row exists, so out_dead stays 0.
+    c = Counters(sent=100, acked=100, sink_received=40)
+    result = estate_reconcile(c, _BASE, _sample(read=100, written=40), unconfirmed_budget=_BUDGET)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "fewer deliveries than messages read" in result.detail
+
+
+def test_estate_reconcile_undrained_write_shortfall_stays_inconclusive() -> None:
+    c = Counters(sent=100, acked=100, sink_received=40)
+    final = _staged(read=100, written=40, in_pipeline=60)
+    result = estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET)
+    assert not result.ok and result.inconclusive, result.detail
+    assert "fewer deliveries" not in result.detail
+
+
+def test_estate_reconcile_write_shortfall_across_a_counter_reset_is_not_judged() -> None:
+    c = Counters(sent=100, acked=100, sink_received=40)
+    result = estate_reconcile(
+        c,
+        _BASE,
+        _sample(read=100, written=40),
+        unconfirmed_budget=_BUDGET,
+        counter_reset="the engine restarted mid-run",
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "fewer deliveries" not in result.detail
+
+
+def test_estate_reconcile_hub_fanout_surplus_is_not_a_shortfall() -> None:
+    c = Counters(sent=100, acked=100, sink_received=300)
+    result = estate_reconcile(c, _BASE, _sample(read=100, written=300), unconfirmed_budget=_BUDGET)
+    assert result.ok, result.detail
+
+
+def test_estate_reconcile_known_limit_hub_surplus_masks_a_routed_dead_letter() -> None:
+    # PINS A KNOWN GAP, BACKLOG #5436 stays open on it. 60 simple-feed messages die at routed while
+    # 20 hubs at fan-out 4 write 80: written 120 >= read 100, out_dead 0. This must flip to a LOSS
+    # once the check has an expected-written figure or a store-truth all-stage dead count.
+    c = Counters(sent=100, acked=100, sink_received=120)
+    result = estate_reconcile(c, _BASE, _sample(read=100, written=120), unconfirmed_budget=_BUDGET)
+    assert result.ok, result.detail
+
+
 # --- the copies, and where they deliberately part ------------------------------------------------
 
 
