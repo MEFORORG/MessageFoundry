@@ -66,10 +66,12 @@ from harness.load.connscale.runner import (
 )
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import EngineNode, FailoverError, _await_port
+from messagefoundry.support.redact import redact_log_text
 from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
 
+_RESET_ERROR_CHARS = 1000  # past any store refusal's remedy; the text travels in the READY message
 _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
 _STOP_GRACE = 5.0
@@ -978,8 +980,8 @@ async def run_batch_engine(
                     await _reset_server_store(profile.store_backend, node_env)
                 except Exception as exc:
                     # Measuring on the prior cell's rows would be the confound above, so the cell
-                    # is missed. Type name only: a driver error's text can carry connection details.
-                    raise ConnScaleError(f"store reset failed: {type(exc).__name__}") from exc
+                    # is missed.
+                    raise ConnScaleError(_store_reset_failure(exc)) from exc
             await node.start()
             await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
             # Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a 0.0.0.0 listener);
@@ -1052,6 +1054,14 @@ async def run_batch_engine(
         finally:
             await _stop_cell_node(node, cell.cell_id, report)
     return report
+
+
+def _store_reset_failure(exc: Exception) -> str:
+    """Why a store reset failed, for the cell's error. The store's refusal names its remedy (the RCSI
+    statement a DBA runs, for one), so its text is kept. It goes through the redactor first, because
+    a driver error's text can carry connection details, and is escaped since it reaches a terminal."""
+    detail = redact_log_text(str(exc))[:_RESET_ERROR_CHARS]
+    return f"store reset failed: {type(exc).__name__}: {escape_for_terminal(detail)}"
 
 
 async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineReport) -> None:

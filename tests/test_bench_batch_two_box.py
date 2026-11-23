@@ -712,6 +712,30 @@ async def test_a_failed_store_reset_fails_the_cell_by_type_name_only_bug_5857(
 
 
 @pytest.mark.usefixtures("no_auth_env")
+async def test_a_failed_store_reset_keeps_the_remedy_and_drops_the_secret_bug_5857(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Before this path failed the cell, the store's refusal reached the operator through the engine's
+    # log tail. Failing earlier must not lose its remedy, and must not print the driver's secret.
+    remedy = (
+        "a DBA must run once: alter database [mefor_test] SET READ_COMMITTED_SNAPSHOT on"
+        " with rollback immediate"
+    )
+    _install_engine_fakes(monkeypatch)
+    monkeypatch.setattr(
+        bb, "_reset_server_store", _raiser(RuntimeError(f"{remedy}\n{_SECRET_TEXT}"))
+    )
+
+    report, readies = await _engine_report()
+
+    for text in [c.error or "" for c in report.cells] + [r["error"] for r in readies]:
+        assert "store reset failed: RuntimeError" in text
+        assert remedy in text
+        assert "not-a-real-one" not in text
+    assert "not-a-real-one" not in repr(report.to_json_dict())
+
+
+@pytest.mark.usefixtures("no_auth_env")
 async def test_a_cancelled_store_reset_stays_cancelled_bug_5857(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
